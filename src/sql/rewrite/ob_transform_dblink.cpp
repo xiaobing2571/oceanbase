@@ -12,17 +12,11 @@
 
 #define USING_LOG_PREFIX SQL_REWRITE
 #include "sql/rewrite/ob_transform_dblink.h"
-#include "sql/resolver/expr/ob_raw_expr.h"
-#include "sql/resolver/dml/ob_dml_stmt.h"
 #include "sql/resolver/dml/ob_merge_stmt.h"
-#include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/resolver/dml/ob_update_stmt.h"
 #include "sql/resolver/dml/ob_insert_all_stmt.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_optimizer_util.h"
-#include "sql/resolver/expr/ob_raw_expr_util.h"
-#include "common/ob_smart_call.h"
 
 
 namespace oceanbase
@@ -309,6 +303,8 @@ int ObTransformDBlink::inner_reverse_link_table(ObDMLStmt *stmt, uint64_t target
     LOG_WARN("failed to reverse link table", K(ret));
   } else if (OB_FAIL(reverse_link_sequence(*stmt, target_dblink_id))) {
     LOG_WARN("failed to reverse link sequence", K(ret));
+  } else if (OB_FAIL(reverse_link_udf(*stmt, target_dblink_id))) {
+    LOG_WARN("failed to reverse link udf", K(ret), K(target_dblink_id));
   } else if (OB_FAIL(formalize_link_table(stmt))) {
     LOG_WARN("failed to formalize link table", K(ret));
   }
@@ -357,9 +353,9 @@ int ObTransformDBlink::reverse_one_link_table(TableItem *table, uint64_t target_
       LOG_WARN("failed to write string", K(ret));
     }
   } else if (table->is_joined_table()) {
-    if (OB_FAIL(reverse_one_link_table(static_cast<JoinedTable*>(table)->left_table_, target_dblink_id))) {
+    if (OB_FAIL(SMART_CALL(reverse_one_link_table(static_cast<JoinedTable*>(table)->left_table_, target_dblink_id)))) {
       LOG_WARN("failed to reverse left_table_", K(ret));
-    } else if (OB_FAIL(reverse_one_link_table(static_cast<JoinedTable*>(table)->right_table_, target_dblink_id))) {
+    } else if (OB_FAIL(SMART_CALL(reverse_one_link_table(static_cast<JoinedTable*>(table)->right_table_, target_dblink_id)))) {
       LOG_WARN("failed to reverse right_table_", K(ret));
     }
   } else {
@@ -426,6 +422,32 @@ int ObTransformDBlink::reverse_link_sequence(ObDMLStmt &stmt, uint64_t target_db
   return ret;
 }
 
+int ObTransformDBlink::reverse_link_udf(ObDMLStmt &stmt, uint64_t target_dblink_id)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObRawExpr*, 2> udf_exprs;
+  if (OB_FAIL(stmt.get_udf_exprs(udf_exprs))) {
+    LOG_WARN("failed to get udf exprs", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < udf_exprs.count(); ++i) {
+    ObRawExpr *expr = udf_exprs.at(i);
+    if (OB_ISNULL(expr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpect null expr", K(ret));
+    } else if (expr->is_udf_expr()) {
+      ObUDFRawExpr *udf_expr = static_cast<ObUDFRawExpr*>(expr);
+      if (target_dblink_id != udf_expr->get_dblink_id()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("read local udf in dblink write not support", K(ret));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "read local udf in dblink write not support");
+      } else {
+        udf_expr->set_dblink_id(OB_INVALID_ID);
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTransformDBlink::reverse_link_table_for_temp_table(ObDMLStmt *root_stmt, uint64_t target_dblink_id)
 {
   int ret = OB_SUCCESS;
@@ -470,6 +492,8 @@ int ObTransformDBlink::pack_link_table(ObDMLStmt *stmt, bool &trans_happened)
       LOG_WARN("failed to reverse link table", K(ret));
     } else if (OB_FAIL(reverse_link_sequence(*stmt, is_reverse_link ? 0 : dblink_id))) {
       LOG_WARN("failed to reverse link sequence", K(ret));
+    } else if (OB_FAIL(reverse_link_udf(*stmt, is_reverse_link ? 0 : dblink_id))) {
+      LOG_WARN("failed to reverse link udf", K(ret), K(is_reverse_link), K(dblink_id));
     } else if (OB_FAIL(formalize_link_table(stmt))) {
       LOG_WARN("failed to formalize link table stmt", K(ret));
     } else if (lib::is_oracle_mode() &&
@@ -538,17 +562,35 @@ int ObTransformDBlink::check_link_expr_valid(ObRawExpr *expr, bool &is_valid)
   if (OB_ISNULL(expr)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null expr", K(ret));
-  } else if (expr->has_flag(CNT_PL_UDF) ||
-             expr->has_flag(CNT_SO_UDF) ||
+  } else if (expr->has_flag(CNT_SO_UDF) ||
              expr->has_flag(CNT_DYNAMIC_USER_VARIABLE)) {
     // special flag is invalid
   } else if (T_FUN_APPROX_COUNT_DISTINCT_SYNOPSIS == expr->get_expr_type() ||
              T_FUN_APPROX_COUNT_DISTINCT_SYNOPSIS_MERGE == expr->get_expr_type() ||
              T_FUN_SYS_ESTIMATE_NDV == expr->get_expr_type() ||
-             T_OP_GET_USER_VAR == expr->get_expr_type()) {
+             T_OP_GET_USER_VAR == expr->get_expr_type() ||
+             T_FUN_SUM_OPNSIZE == expr->get_expr_type()) {
     // special function is invalid
   } else if (expr->get_result_type().is_ext()) {
     // special type is invalid
+  } else if (expr->is_udf_expr()) {
+    ObUDFRawExpr *udf_expr = static_cast<ObUDFRawExpr *>(expr);
+    if (OB_ISNULL(udf_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("udf expr is NULL", K(ret));
+    } else if (OB_INVALID_ID == udf_expr->get_dblink_id()) {
+      // local udf need calc locally
+    } else {
+      ObRawExpr *param_expr = NULL;
+      bool has_ext_type = false;
+      for (int64_t i = 0; OB_SUCC(ret) && !has_ext_type && i < udf_expr->get_param_count(); i++) {
+        param_expr = udf_expr->get_param_expr(i);
+        if (NULL != param_expr) {
+          has_ext_type = udf_expr->get_result_type().is_ext();
+        }
+      }
+      is_valid = !has_ext_type;
+    }
   } else {
     is_valid = true;
   }
@@ -585,6 +627,27 @@ int ObTransformDBlink::collect_link_table(ObDMLStmt *stmt,
     LOG_WARN("failed to check stmt has invalid link expr", K(ret));
   } else if (has_special_expr) {
     all_table_from_one_dblink = false;
+  } else {
+    bool group_cnt_subquery = false;
+    for (int64_t i = 0; OB_SUCC(ret) && !group_cnt_subquery && i < sel_stmt->get_group_expr_size(); i ++) {
+      ObRawExpr *expr = nullptr;
+      if (OB_ISNULL(expr = sel_stmt->get_group_exprs().at(i))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null", K(ret));
+      } else if (expr->has_flag(CNT_SUB_QUERY)) {
+        group_cnt_subquery = true;
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !group_cnt_subquery && i < sel_stmt->get_rollup_expr_size(); i ++) {
+      ObRawExpr *expr = nullptr;
+      if (OB_ISNULL(expr = sel_stmt->get_rollup_exprs().at(i))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null", K(ret));
+      } else if (expr->has_flag(CNT_SUB_QUERY)) {
+        group_cnt_subquery = true;
+      }
+    }
+    all_table_from_one_dblink &= !group_cnt_subquery;
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_semi_info_size(); ++i) {
     TableItem *table = NULL;
@@ -639,6 +702,25 @@ int ObTransformDBlink::collect_link_table(ObDMLStmt *stmt,
       } else if (T_FUN_SYS_SEQ_NEXTVAL == expr->get_expr_type()) {
         ObSequenceRawExpr *seq_expr = static_cast<ObSequenceRawExpr*>(expr);
         if (dblink_id != seq_expr->get_dblink_id()) {
+          all_table_from_one_dblink = false;
+        }
+      }
+    }
+  }
+  // check udf
+  if (OB_SUCC(ret) && all_table_from_one_dblink) {
+    ObSEArray<ObRawExpr*, 2> udf_exprs;
+    if (OB_FAIL(stmt->get_udf_exprs(udf_exprs))) {
+      LOG_WARN("failed to get udf exprs", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && all_table_from_one_dblink && i < udf_exprs.count(); i++) {
+      ObRawExpr *expr = udf_exprs.at(i);
+      if (OB_ISNULL(expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpect null expr", K(ret));
+      } else if (expr->is_udf_expr()) {
+        ObUDFRawExpr *udf_expr = static_cast<ObUDFRawExpr*>(expr);
+        if (dblink_id != udf_expr->get_dblink_id()) {
           all_table_from_one_dblink = false;
         }
       }
@@ -1368,7 +1450,8 @@ int ObTransformDBlink::inner_pack_link_table(ObDMLStmt *stmt, LinkTableHelper &h
                                          helper.is_reverse_link_ ? 0
                                          : helper.dblink_id_))) {
     LOG_WARN("failed to reverse link table", K(ret));
-  } else if (ObOptimizerUtil::remove_item(stmt->get_condition_exprs(), helper.conditions_)) {
+  } else if (OB_FAIL(ObOptimizerUtil::remove_item(stmt->get_condition_exprs(),
+                                                  helper.conditions_))) {
     LOG_WARN("failed to remove item", K(ret));
   } else if (OB_FAIL(ObTransformUtils::replace_with_empty_view(ctx_,
                                                                stmt,
@@ -1402,8 +1485,6 @@ int ObTransformDBlink::formalize_link_table(ObDMLStmt *stmt)
     LOG_WARN("failed to formalize table name", K(ret));
   } else if (OB_FAIL(formalize_select_item(stmt))) {
     LOG_WARN("failed to formalize select item", K(ret));
-  } else if (OB_FAIL(formalize_bool_select_expr(stmt))) {
-    LOG_WARN("failed to formalize bool select item", K(ret));
   } else if (OB_FAIL(formalize_column_item(stmt))) {
     LOG_WARN("failed to formalize column item", K(ret));
   }
@@ -1425,7 +1506,8 @@ int ObTransformDBlink::extract_limit(ObDMLStmt *stmt, ObDMLStmt *&dblink_stmt)
             || stmt->is_fetch_with_ties()
             || NULL != stmt->get_limit_percent_expr()) {
     dblink_stmt = stmt;
-  } else if (ObTransformUtils::pack_stmt(ctx_, static_cast<ObSelectStmt *>(stmt), &child_stmt)) {
+  } else if (OB_FAIL(ObTransformUtils::pack_stmt(ctx_, static_cast<ObSelectStmt *>(stmt),
+                                                 false, &child_stmt))) {
     LOG_WARN("failed to pack the stmt", K(ret));
   } else {
     stmt->set_limit_offset(child_stmt->get_limit_expr(), child_stmt->get_offset_expr());
@@ -1580,76 +1662,6 @@ int ObTransformDBlink::formalize_select_item(ObDMLStmt *stmt)
   return ret;
 }
 
-int ObTransformDBlink::formalize_bool_select_expr(ObDMLStmt *stmt)
-{
-  int ret = OB_SUCCESS;
-  if (!lib::is_oracle_mode()) {
-    // do nothing
-  } else if (OB_ISNULL(stmt) || OB_ISNULL(ctx_) || OB_ISNULL(ctx_->expr_factory_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpect null stmt", K(ret));
-  } else if (stmt->is_select_stmt()) {
-    // formalize bool select expr p like `a > b` as
-    // case when p then 1 when not p then 0 else null
-    ObSelectStmt *select_stmt = static_cast<ObSelectStmt *>(stmt);
-    ObIArray<SelectItem> &select_items = select_stmt->get_select_items();
-    for (int64_t i = 0; OB_SUCC(ret) && i < select_items.count(); ++i) {
-      SelectItem &select_item = select_items.at(i);
-      ObCaseOpRawExpr *case_when_expr = NULL;
-      ObRawExpr *bool_expr = select_item.expr_;
-      ObRawExpr *not_expr = NULL;
-      ObConstRawExpr *one_expr = NULL;
-      ObConstRawExpr *zero_expr = NULL;
-      ObRawExpr *null_expr = NULL;
-      bool is_bool_expr = false;
-      if (OB_ISNULL(select_item.expr_)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected select item", K(ret));
-      } else if (OB_FAIL(ObRawExprUtils::check_is_bool_expr(select_item.expr_, is_bool_expr))) {
-        LOG_WARN("failed to check is bool expr", K(ret));
-      } else if (!is_bool_expr) {
-        // do nothing
-      } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*ctx_->expr_factory_,
-                                                              ObIntType,
-                                                              1,
-                                                              one_expr))) {
-        LOG_WARN("failed to build const number expr", K(ret));
-      } else if (OB_FAIL(ObRawExprUtils::build_not_expr(*ctx_->expr_factory_,
-                                                        bool_expr,
-                                                        not_expr))) {
-        LOG_WARN("failed to build not expr", K(ret));
-      } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*ctx_->expr_factory_,
-                                                              ObIntType,
-                                                              0,
-                                                              zero_expr))) {
-        LOG_WARN("failed to build const number expr", K(ret));
-      } else if (OB_FAIL(ObRawExprUtils::build_null_expr(*ctx_->expr_factory_, null_expr))) {
-        LOG_WARN("faile to build null expr", K(ret));
-      } else if (OB_FAIL(ctx_->expr_factory_->create_raw_expr(T_OP_CASE, case_when_expr))) {
-        LOG_WARN("create case expr failed", K(ret));
-      } else if (OB_ISNULL(case_when_expr)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("get unexpected null", K(ret), K(case_when_expr));
-      } else if (OB_FAIL(case_when_expr->add_when_param_expr(bool_expr))) {
-        LOG_WARN("failed to add when param expr", K(ret));
-      } else if (OB_FAIL(case_when_expr->add_then_param_expr(one_expr))) {
-        LOG_WARN("failed to add then expr", K(ret));
-      } else if (OB_FAIL(case_when_expr->add_when_param_expr(not_expr))) {
-        LOG_WARN("failed to add when param expr", K(ret));
-      } else if (OB_FAIL(case_when_expr->add_then_param_expr(zero_expr))) {
-        LOG_WARN("failed to add then expr", K(ret));
-      } else {
-        case_when_expr->set_default_param_expr(null_expr);
-        select_item.expr_ = case_when_expr;
-        if (OB_FAIL(case_when_expr->formalize(ctx_->session_info_))) {
-          LOG_WARN("failed to formalize expr", K(ret));
-        }
-      }
-    }
-  }
-  return ret;
-}
-
 int ObTransformDBlink::need_transform(const common::ObIArray<ObParentDMLStmt> &parent_stmts,
                                       const int64_t current_level,
                                       const ObDMLStmt &stmt,
@@ -1713,8 +1725,9 @@ int ObTransformDBlink::add_flashback_query_for_dblink(ObDMLStmt *stmt)
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpect null param", K(ret));
       } else if (!table_item->is_link_table()
-                 || TableItem::NOT_USING != table_item->flashback_query_type_) {
-      // do nothing if not dblink table or already have flashback query
+                 || TableItem::NOT_USING != table_item->flashback_query_type_
+                 || table_item->has_for_update()) {
+      // do nothing if not dblink table or already have flashback query or table has for update
       } else if (FALSE_IT(dblink_id = table_item->dblink_id_)) {
       } else if (table_item->is_reverse_link_) {
         need_add = true;
@@ -1751,7 +1764,6 @@ int ObTransformDBlink::add_flashback_query_for_dblink(ObDMLStmt *stmt)
         ObObj val;
         val.set_uint64(current_scn);
         c_expr->set_value(val);
-        c_expr->set_param(val);
         table_item->flashback_query_expr_ = c_expr;
         table_item->flashback_query_type_ = TableItem::USING_SCN;
       }

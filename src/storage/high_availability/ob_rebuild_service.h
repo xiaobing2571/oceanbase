@@ -22,6 +22,7 @@
 #include "share/scn.h"
 #include "ob_storage_ha_struct.h"
 #include "lib/hash/ob_hashmap.h"
+#include "share/rebuild_tablet/ob_rebuild_tablet_location.h"
 
 namespace oceanbase
 {
@@ -35,10 +36,13 @@ struct ObLSRebuildCtx final
   void reset();
   bool is_valid() const;
 
-  TO_STRING_KV(K_(ls_id), K_(type), K_(task_id));
+  TO_STRING_KV(K_(ls_id), K_(type), K_(task_id), K_(tablet_id_array), K_(src), K_(result));
   share::ObLSID ls_id_;
   ObLSRebuildType type_;
   share::ObTaskId task_id_;
+  common::ObArray<common::ObTabletID> tablet_id_array_;
+  ObRebuildTabletLocation src_;
+  int32_t result_;
 };
 
 struct ObLSRebuildInfoHelper
@@ -49,6 +53,7 @@ public:
       const ObLSRebuildInfo &new_info,
       bool &can_change);
   static int get_next_rebuild_info(
+      const share::ObLSID &ls_id,
       const ObLSRebuildInfo &curr_info,
       const ObLSRebuildType &rebuild_type,
       const int32_t result,
@@ -67,6 +72,7 @@ public:
   void destroy();
   void run1() final;
   void wakeup();
+  void fast_sleep();
   void stop();
   void wait();
   int start();
@@ -94,7 +100,9 @@ private:
       const ObLSRebuildCtx &rebuild_ctx,
       ObLS *ls,
       bool &can_rebuild);
-
+#ifdef ERRSIM
+  int errsim_manual_rebuild_();
+#endif
 private:
   static const int64_t SCHEDULER_WAIT_TIME_MS = 5 * 60 * 1000L; // 5min
   static const int64_t WAIT_SERVER_IN_SERVICE_TIME_MS = 1000; //1s
@@ -107,6 +115,7 @@ private:
   ObLSService *ls_service_;
   common::SpinRWLock map_lock_;
   LSRebuildCtxMap rebuild_ctx_map_;
+  int64_t fast_sleep_cnt_;
   DISALLOW_COPY_AND_ASSIGN(ObRebuildService);
 };
 
@@ -123,19 +132,20 @@ public:
 
 private:
   void wakeup_();
+  void fast_sleep_();
   int do_with_init_status_(const ObLSRebuildInfo &rebuild_info);
   int do_with_doing_status_(const ObLSRebuildInfo &rebuild_info);
   int do_with_cleanup_status_(const ObLSRebuildInfo &rebuild_info);
-
   int switch_next_status_(
       const ObLSRebuildInfo &curr_rebuild_info,
       const int32_t result);
   int generate_rebuild_task_();
-  int get_ls_info_(
-      const int64_t cluster_id,
-      const uint64_t tenant_id,
-      const share::ObLSID &ls_id,
-      share::ObLSInfo &ls_info);
+  int do_with_rebuild_ls_init_status_(
+      const ObLSRebuildInfo &rebuild_info);
+  int do_with_rebuild_tablet_init_status_(
+      const ObLSRebuildInfo &rebuild_info);
+  int generate_rebuild_ls_task_();
+  int generate_rebuild_tablet_task_();
 
 private:
   bool is_inited_;

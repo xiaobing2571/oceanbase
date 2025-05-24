@@ -12,11 +12,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_view_table_resolver.h"
-#include "share/schema/ob_table_schema.h"
-#include "common/sql_mode/ob_sql_mode_utils.h"
-#include "sql/parser/ob_parser.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "sql/ob_sql_utils.h"
+#include "share/catalog/ob_catalog_utils.h"
 namespace oceanbase
 {
 using namespace common;
@@ -37,6 +33,7 @@ int ObViewTableResolver::do_resolve_set_query(const ParseNode &parse_tree,
   child_resolver.set_current_view_item(current_view_item);
   child_resolver.set_parent_view_resolver(parent_view_resolver_);
   child_resolver.set_calc_found_rows(is_left_child && has_calc_found_rows_);
+  child_resolver.set_is_top_stmt(is_top_stmt());
   
   if (OB_FAIL(add_cte_table_to_children(child_resolver))) {
     LOG_WARN("failed to add cte table to children", K(ret));
@@ -52,6 +49,7 @@ int ObViewTableResolver::do_resolve_set_query(const ParseNode &parse_tree,
 int ObViewTableResolver::expand_view(TableItem &view_item)
 {
   int ret = OB_SUCCESS;
+  int tmp_ret = OB_SUCCESS;
   if (OB_ISNULL(session_info_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("session info is null");
@@ -60,9 +58,27 @@ int ObViewTableResolver::expand_view(TableItem &view_item)
   } else {
     // expand view as subquery which use view name as alias
     const ObTableSchema *view_schema = NULL;
-
-    if (OB_FAIL(schema_checker_->get_table_schema(session_info_->get_effective_tenant_id(), view_item.ref_id_, view_schema))) {
+    share::schema::ObSchemaGetterGuard *schema_guard = NULL;
+    uint64_t database_id = OB_INVALID_ID;
+    ObString old_database_name;
+    uint64_t old_database_id = session_info_->get_database_id();
+    ObSwitchCatalogHelper switch_catalog_helper;
+    if (OB_ISNULL(schema_checker_)
+        || OB_ISNULL(schema_guard = schema_checker_->get_schema_guard())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null", K(ret));
+    } else if (OB_FAIL(schema_guard->get_database_id(session_info_->get_effective_tenant_id(),
+                                                     view_item.database_name_,
+                                                     database_id))) {
+      LOG_WARN("failed to get database id", K(ret));
+    } else if (OB_FAIL(schema_checker_->get_table_schema(session_info_->get_effective_tenant_id(),
+                                                  view_item.ref_id_,
+                                                  view_schema))) {
       LOG_WARN("get table schema failed", K(view_item));
+    } else if (OB_FAIL(ob_write_string(*allocator_,
+                                       session_info_->get_database_name(),
+                                       old_database_name))) {
+      LOG_WARN("failed to write string", K(ret));
     } else {
       ObViewTableResolver view_resolver(params_, view_db_name_, view_name_);
       view_resolver.set_current_level(current_level_);
@@ -71,8 +87,35 @@ int ObViewTableResolver::expand_view(TableItem &view_item)
       view_resolver.set_current_view_item(view_item);
       view_resolver.set_parent_view_resolver(this);
       view_resolver.set_parent_namespace_resolver(parent_namespace_resolver_);
-      if (OB_FAIL(do_expand_view(view_item, view_resolver))) {
+      if (is_oracle_mode()) {
+        if (OB_FAIL(session_info_->set_default_database(view_item.database_name_))) {
+          LOG_WARN("failed to set default database name", K(ret));
+        } else {
+          session_info_->set_database_id(database_id);
+        }
+      } else {
+        if (session_info_->is_in_external_catalog()
+            && OB_FAIL(session_info_->set_internal_catalog_db(&switch_catalog_helper))) {
+          LOG_WARN("failed to set catalog", K(ret));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(do_expand_view(view_item, view_resolver))) {
         LOG_WARN("do expand view failed", K(ret));
+      }
+      if (is_oracle_mode()) {
+        if (OB_SUCCESS != (tmp_ret = session_info_->set_default_database(old_database_name))) {
+          ret = OB_SUCCESS == ret ? tmp_ret : ret; // 不覆盖错误码
+          LOG_WARN("failed to reset default database", K(ret), K(tmp_ret), K(old_database_name));
+        } else {
+          session_info_->set_database_id(old_database_id);
+        }
+      } else {
+        if (switch_catalog_helper.is_set()) {
+          if (OB_SUCCESS != (tmp_ret = switch_catalog_helper.restore())) {
+            ret = OB_SUCCESS == ret ? tmp_ret : ret;
+            LOG_WARN("failed to reset catalog", K(ret), K(tmp_ret));
+          }
+        }
       }
     }
   }
@@ -223,17 +266,18 @@ int ObViewTableResolver::resolve_subquery_info(const ObIArray<ObSubQueryInfo> &s
     subquery_resolver.set_parent_namespace_resolver(this);
     subquery_resolver.set_parent_view_resolver(parent_view_resolver_);
     subquery_resolver.set_current_view_item(current_view_item);
-    set_query_ref_expr(info.ref_expr_);
+    subquery_resolver.set_in_exists_subquery(info.parents_expr_info_.has_member(IS_EXISTS));
+    set_query_ref_exec_params(info.ref_expr_ == NULL ? NULL : &info.ref_expr_->get_exec_params());
     if (OB_FAIL(add_cte_table_to_children(subquery_resolver))) {
-            LOG_WARN("add CTE table to children failed", K(ret));
+      LOG_WARN("add CTE table to children failed", K(ret));
     } else if (is_only_full_group_by_on(session_info_->get_sql_mode())) {
       subquery_resolver.set_parent_aggr_level(info.parents_expr_info_.has_member(IS_AGG) ?
           current_level_ : parent_aggr_level_);
     }
-    if (OB_FAIL(do_resolve_subquery_info(info, subquery_resolver))) {
+    if (OB_SUCC(ret) && OB_FAIL(do_resolve_subquery_info(info, subquery_resolver))) {
       LOG_WARN("do resolve subquery info failed", K(ret));
     }
-    set_query_ref_expr(NULL);
+    set_query_ref_exec_params(NULL);
   }
   return ret;
 }

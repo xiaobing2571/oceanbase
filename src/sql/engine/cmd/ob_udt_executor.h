@@ -16,6 +16,7 @@
 #include "lib/container/ob_vector.h"
 #include "sql/parser/parse_node.h"
 #include "sql/resolver/ob_stmt_type.h"
+#include "src/share/schema/ob_udt_info.h"
 
 #define DEF_SIMPLE_EXECUTOR(name)                          \
   class name##Executor                                     \
@@ -36,8 +37,17 @@ class ObExecContext;
 class ObCreateUDTStmt;
 class ObDropUDTStmt;
 
+class ObCreateUDTExecutor
+{
+public:
+  ObCreateUDTExecutor() {}
+  virtual ~ObCreateUDTExecutor() {}
+  int execute(ObExecContext &ctx, ObCreateUDTStmt &stmt);
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObCreateUDTExecutor);
+};
+
 //参考alter system定义
-DEF_SIMPLE_EXECUTOR(ObCreateUDT);
 DEF_SIMPLE_EXECUTOR(ObDropUDT);
 
 }//namespace sql

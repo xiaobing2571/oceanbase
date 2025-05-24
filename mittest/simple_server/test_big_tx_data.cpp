@@ -1,3 +1,6 @@
+// owner: xuwang.txw
+// owner group: transaction
+
 /**
  * Copyright (c) 2023 OceanBase
  * OceanBase CE is licensed under Mulan PubL v2.
@@ -10,22 +13,9 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include <chrono>
-#include <gtest/gtest.h>
-#include <thread>
 #define protected public
 #define private public
-#include "share/ob_table_access_helper.h"
-#include "lib/ob_define.h"
-#include "observer/ob_server_struct.h"
-#include "share/rc/ob_tenant_base.h"
-#include "storage/ls/ob_ls_meta.h"
-#include "storage/ls/ob_ls.h"
-#include "storage/tx_storage/ob_ls_service.h"
-#include "env/ob_simple_cluster_test_base.h"
-#include "lib/mysqlclient/ob_mysql_result.h"
-#include "storage/tx_storage/ob_ls_handle.h"
-#include <iostream>
+#include "src/storage/tx_storage/ob_ls_map.h"
 
 #include "rewrite_function_for_test_big_tx_data.cpp"
 
@@ -64,7 +54,7 @@ class DoNothingOP : public ObITxDataCheckFunctor
 {
   virtual int operator()(const ObTxData &tx_data, ObTxCCCtx *tx_cc_ctx = nullptr) {
     UNUSED(tx_cc_ctx);
-    cout << "read tx data:" << tx_data.tx_id_.get_id() << ", undo cnt:" << tx_data.undo_status_list_.undo_node_cnt_ << endl;
+    cout << "read tx data:" << tx_data.tx_id_.get_id() << ", undo cnt:" << tx_data.op_guard_->get_undo_status_list().undo_node_cnt_ << endl;
     STORAGE_LOG_RET(INFO, 0, "read tx data", K(tx_data.tx_id_), K(lbt()));
     return OB_SUCCESS;
   }

@@ -12,7 +12,8 @@
 
 #define USING_LOG_PREFIX LIB
 #include "ob_geo_to_s2_visitor.h"
-#include "ob_srs_info.h"
+#include "lib/hash/ob_hashset.h"
+#include "lib/geo/ob_geo_dispatcher.h"
 
 namespace oceanbase {
 namespace common {
@@ -61,6 +62,7 @@ int ObWkbToS2Visitor::MakeS2Point(T_IBIN *geo, S2Cell *&res)
       LOG_WARN("failed to alloc s2cell", K(ret));
     } else {
       res = p;
+      bounder_.AddPoint(S2Point(latlng));
     }
   }
   return ret;
@@ -127,6 +129,7 @@ int ObWkbToS2Visitor::MakeProjS2Point(T_IBIN *geo, S2Cell *&res)
         LOG_WARN("failed to alloc s2cell", K(ret));
       } else {
         res = p;
+        bounder_.AddPoint(point);
       }
     }
   }
@@ -147,6 +150,8 @@ int ObWkbToS2Visitor::MakeS2Polyline(T_IBIN *geo, S2Polyline *&res)
       LOG_WARN("failed to add cell from point", K(ret));
     } else if (OB_FAIL(vector_push_back<S2LatLng>(vertices, latlng))) {
       LOG_WARN("failed to add vertice", K(ret));
+    } else {
+      bounder_.AddPoint(S2Point(latlng));
     }
   }
   if (OB_SUCC(ret)) {
@@ -176,6 +181,8 @@ int ObWkbToS2Visitor::MakeProjS2Polyline(T_IBIN *geo, S2Polyline *&res)
       LOG_WARN("failed to add cell from point", K(ret));
     } else if (OB_FAIL(vector_push_back<S2Point>(vertices, p))) {
       LOG_WARN("failed to add vertice", K(ret));
+    } else {
+      bounder_.AddPoint(p);
     }
   }
 
@@ -210,6 +217,8 @@ int ObWkbToS2Visitor::MakeS2Polygon(T_IBIN *geo, S2Polygon *&res)
         LOG_WARN("failed to add cell from point", K(ret));
       } else if (OB_FAIL(vector_push_back<S2Point>(vertices, tmp))) {
         LOG_WARN("failed to add vertice", K(ret));
+      } else {
+        bounder_.AddPoint(tmp);
       }
     }
     if (OB_SUCC(ret)) {
@@ -219,7 +228,8 @@ int ObWkbToS2Visitor::MakeS2Polygon(T_IBIN *geo, S2Polygon *&res)
         LOG_WARN("failed to alloc s2cell", K(ret));
       } else {
         loop->Normalize();
-        if (OB_FAIL(vector_emplace_back(s2poly, loop))) {
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(vector_emplace_back(s2poly, loop))) {
           LOG_WARN("failed to add loop", K(ret));
         }
       }
@@ -237,6 +247,8 @@ int ObWkbToS2Visitor::MakeS2Polygon(T_IBIN *geo, S2Polygon *&res)
         LOG_WARN("failed to add cell from point", K(ret));
       } else if (OB_FAIL(vector_push_back<S2Point>(vertices, tmp))) {
         LOG_WARN("failed to add vertice", K(ret));
+      } else {
+        bounder_.AddPoint(tmp);
       }
     }
     if (OB_SUCC(ret)) {
@@ -246,7 +258,8 @@ int ObWkbToS2Visitor::MakeS2Polygon(T_IBIN *geo, S2Polygon *&res)
         LOG_WARN("failed to alloc s2cell", K(ret));
       } else {
         loop->Normalize();
-        if (OB_FAIL(vector_emplace_back(s2poly, loop))) {
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(vector_emplace_back(s2poly, loop))) {
           LOG_WARN("failed to add loop", K(ret));
         }
       }
@@ -254,7 +267,8 @@ int ObWkbToS2Visitor::MakeS2Polygon(T_IBIN *geo, S2Polygon *&res)
   }
 
   S2Polygon* py = new S2Polygon(std::move(s2poly));
-  if (OB_ISNULL(py)) {
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(py)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("failed to alloc s2cell", K(ret));
   } else {
@@ -281,6 +295,8 @@ int ObWkbToS2Visitor::MakeProjS2Polygon(T_IBIN *geo, S2Polygon *&res)
         LOG_WARN("failed to add cell from point", K(ret));
       } else if (OB_FAIL(vector_push_back<S2Point>(vertices, tmp))) {
         LOG_WARN("failed to add vertice", K(ret));
+      } else {
+        bounder_.AddPoint(tmp);
       }
     }
     if (OB_SUCC(ret)) {
@@ -290,7 +306,8 @@ int ObWkbToS2Visitor::MakeProjS2Polygon(T_IBIN *geo, S2Polygon *&res)
         LOG_WARN("failed to alloc s2cell", K(ret));
       } else {
         loop->Normalize();
-        if (OB_FAIL(vector_emplace_back(s2poly, loop))) {
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(vector_emplace_back(s2poly, loop))) {
           LOG_WARN("failed to add loop", K(ret));
         }
       }
@@ -307,6 +324,8 @@ int ObWkbToS2Visitor::MakeProjS2Polygon(T_IBIN *geo, S2Polygon *&res)
         LOG_WARN("failed to add cell from point", K(ret));
       } else if (OB_FAIL(vector_push_back<S2Point>(vertices, tmp))) {
         LOG_WARN("failed to add vertice", K(ret));
+      } else {
+        bounder_.AddPoint(tmp);
       }
     }
     if (OB_SUCC(ret)) {
@@ -316,7 +335,8 @@ int ObWkbToS2Visitor::MakeProjS2Polygon(T_IBIN *geo, S2Polygon *&res)
         LOG_WARN("failed to alloc s2cell", K(ret));
       } else {
         loop->Normalize();
-        if (OB_FAIL(vector_emplace_back(s2poly, loop))) {
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(vector_emplace_back(s2poly, loop))) {
           LOG_WARN("failed to add loop", K(ret));
         }
       }
@@ -324,7 +344,8 @@ int ObWkbToS2Visitor::MakeProjS2Polygon(T_IBIN *geo, S2Polygon *&res)
   }
 
   S2Polygon* py = new S2Polygon(std::move(s2poly));
-  if (OB_ISNULL(py)) {
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(py)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("failed to alloc s2cell", K(ret));
   } else {
@@ -440,30 +461,23 @@ int64_t ObWkbToS2Visitor::get_cellids(ObS2Cellids &cells, bool is_query, bool ne
       LOG_WARN("fail to push_back cellid", K(ret));
     }
   } else {
-    S2CellUnion cellids;
-    S2RegionCoverer coverer(options_);
     uint32_t s2v_size = s2v_.size();
-
-    for (int i = 0; i < s2v_size; i++) {
-      S2CellUnion tmp = coverer.GetCovering(*s2v_[i]);
-      cellids = cellids.Union(tmp);
-    }
     if (need_buffer) {
       const int max_level_diff = 2;
-      cellids.Expand(distance, max_level_diff);
+      cell_union_.Expand(distance, max_level_diff);
     }
     if (s2v_size > 1) {
-      cellids.Normalize();
+      cell_union_.Normalize();
     }
     S2CellId prev_id = S2CellId::None();
-    for (int i = 0; OB_SUCC(ret) && i < cellids.size(); i++) {
-      if (OB_FAIL(cells.push_back(cellids[i].id()))) {
+    for (int i = 0; OB_SUCC(ret) && i < cell_union_.size(); i++) {
+      if (OB_FAIL(cells.push_back(cell_union_[i].id()))) {
         LOG_WARN("fail to push_back cellid", K(ret));
       }
       if (OB_SUCC(ret) && is_query) {
-        int level = cellids[i].level();
+        int level = cell_union_[i].level();
         while (OB_SUCC(ret) && (level -= options_.level_mod()) >= options_.min_level()) {
-          S2CellId ancestor_id = cellids[i].parent(level);
+          S2CellId ancestor_id = cell_union_[i].parent(level);
           if (prev_id != S2CellId::None() && prev_id.level() > level &&
               prev_id.parent(level) == ancestor_id) {
             break;
@@ -473,10 +487,137 @@ int64_t ObWkbToS2Visitor::get_cellids(ObS2Cellids &cells, bool is_query, bool ne
           }
         }
       }
-      prev_id = cellids[i];
+      prev_id = cell_union_[i];
     }
     if (OB_SUCC(ret) && has_reset_ && OB_FAIL(cells.push_back(exceedsBoundsCellID))) {
       LOG_WARN("fail to push_back cellid", K(ret));
+    }
+  }
+  return ret;
+}
+
+bool ObWkbToS2Visitor::is_full_range_cell_union(S2CellUnion &cellids)
+{
+  bool b_ret = false;
+  if (is_geog_) {
+    const uint8_t cell_faces = 6;
+    if (cellids.size() != cell_faces) {
+      // do nothing
+    } else {
+      uint8_t curr_faces = 0;
+      for (uint32_t i = 0; i < cellids.size(); i++) {
+        if (cellids[i].level() == 0) {
+          curr_faces++;
+          LOG_INFO("cell id", K(static_cast<uint64_t>(cellids[i].id())));
+        }
+      }
+      if (curr_faces == cell_faces) {
+        b_ret = true;
+      }
+    }
+  } else {
+    for (uint32_t i = 0; i < cellids.size() && !b_ret; i++) {
+        if (cellids[i].face() != 0) {
+          b_ret = true;
+          LOG_INFO("cell id", K(static_cast<uint64_t>(cellids[i].id())));
+        }
+      }
+  }
+  return b_ret;
+}
+
+int ObWkbToS2Visitor::get_s2_cell_union()
+{
+  int ret = OB_SUCCESS;
+  if (!invalid_) {
+    S2RegionCoverer coverer(options_);
+    uint32_t s2v_size = s2v_.size();
+    for (int i = 0; i < s2v_size; i++) {
+      S2CellUnion tmp = coverer.GetCovering(*s2v_[i]);
+      cell_union_ = cell_union_.Union(tmp);
+    }
+    if (is_full_range_cell_union(cell_union_)) {
+      S2LatLng margin = S2LatLng::FromDegrees(0.00001, 0.00001);
+      S2LatLngRect rect = bounder_.GetBound().Expanded(margin);
+      cell_union_ = coverer.GetCovering(rect);
+      mbr_ = rect;
+      LOG_INFO("generate new mbr: ", K(rect.lo().ToStringInDegrees().c_str()), K(rect.hi().ToStringInDegrees().c_str()));
+      S2cells_.clear();
+      for (uint8_t i = 0; i < 4 && OB_SUCC(ret); i++) {
+        if (OB_FAIL(add_cell_from_point(rect.GetVertex(i)))) {
+          LOG_WARN("fail to push_back cellid", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int64_t ObWkbToS2Visitor::get_cellids_and_unrepeated_ancestors(ObS2Cellids &cells,
+                                                               ObS2Cellids &ancestors,
+                                                               bool need_buffer,
+                                                               S1Angle distance)
+{
+  INIT_SUCC(ret);
+  if (invalid_) {
+    if (OB_FAIL(cells.push_back(exceedsBoundsCellID))) {
+      LOG_WARN("fail to push_back cellid", K(ret));
+    }
+  } else {
+    uint32_t s2v_size = s2v_.size();
+    hash::ObHashSet<uint64_t> cellid_set;
+    if (OB_FAIL(cellid_set.create(128, "CellidSet", "HashNode"))) {
+      LOG_WARN("failed to create cellid set", K(ret));
+    } else if (!cellid_set.created()) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("fail to init cellid set", K(ret));
+    } else {
+      if (need_buffer) {
+        const int max_level_diff = 2;
+        cell_union_.Expand(distance, max_level_diff);
+      }
+      if (s2v_size > 1) {
+        cell_union_.Normalize();
+      }
+      S2CellId prev_id = S2CellId::None();
+      for (int i = 0; OB_SUCC(ret) && i < cell_union_.size(); i++) {
+        int hash_ret = cellid_set.exist_refactored(cell_union_[i].id());
+        if (OB_HASH_NOT_EXIST == hash_ret) {
+          if (OB_FAIL(cellid_set.set_refactored(cell_union_[i].id()))) {
+            LOG_WARN("failed to add cellid into set", K(ret));
+          } else if (OB_FAIL(cells.push_back(cell_union_[i].id()))) {
+            LOG_WARN("fail to push_back cellid", K(ret));
+          }
+          if (OB_SUCC(ret)) {
+            int level = cell_union_[i].level();
+            while (OB_SUCC(ret) && (level -= options_.level_mod()) >= options_.min_level()) {
+              S2CellId ancestor_id = cell_union_[i].parent(level);
+              if (prev_id != S2CellId::None() && prev_id.level() > level &&
+                  prev_id.parent(level) == ancestor_id) {
+                break;
+              }
+              int ancestor_hash_ret = cellid_set.exist_refactored(ancestor_id.id());
+              if (OB_HASH_NOT_EXIST == ancestor_hash_ret) {
+                if (OB_FAIL(cellid_set.set_refactored(ancestor_id.id()))) {
+                  LOG_WARN("failed to add cellid into set", K(ret));
+                } else if (OB_FAIL(ancestors.push_back(ancestor_id.id()))) {
+                  LOG_WARN("fail to push_back cellid", K(ret));
+                }
+              } else if (OB_HASH_EXIST != ancestor_hash_ret) {
+                ret = ancestor_hash_ret;
+                LOG_WARN("fail to check if key exist", K(ret), K(i));
+              }
+            }
+          }
+        } else if (OB_HASH_EXIST != hash_ret) {
+          ret = hash_ret;
+          LOG_WARN("fail to check if key exist", K(ret), K(i));
+        }
+        prev_id = cell_union_[i];
+      }
+      if (OB_SUCC(ret) && has_reset_ && OB_FAIL(cells.push_back(exceedsBoundsCellID))) {
+        LOG_WARN("fail to push_back cellid", K(ret));
+      }
     }
   }
   return ret;
@@ -506,6 +647,8 @@ int64_t ObWkbToS2Visitor::get_mbr(S2LatLngRect &mbr, bool need_buffer, S1Angle d
   INIT_SUCC(ret);
   if (invalid_ || has_reset_) {
     mbr = S2LatLngRect::Full();
+  } else if (mbr_.is_empty()) {
+    // it's empty collection, do nothing
   } else {
     if (need_buffer) {
       mbr_ = mbr_.ExpandedByDistance(distance);
@@ -523,6 +666,9 @@ void ObWkbToS2Visitor::reset()
   S2cells_.clear();
   invalid_ = false;
   has_reset_ = true;
+  cell_union_.Clear();
+  // reset to empty rectangle
+  bounder_.~S2LatLngRectBounder();
 }
 
 template <typename ElementType>

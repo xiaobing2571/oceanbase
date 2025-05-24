@@ -12,12 +12,8 @@
 
 #define USING_LOG_PREFIX SQL_PC
 #include "ob_prepare_stmt_struct.h"
-#include "lib/utility/utility.h"
-#include "lib/utility/ob_print_utils.h"
 #include "sql/plan_cache/ob_ps_sql_utils.h"
 #include "sql/plan_cache/ob_ps_cache.h"
-#include "sql/resolver/cmd/ob_call_procedure_stmt.h"
-#include "sql/parser/parse_node.h"
 
 namespace oceanbase
 {
@@ -158,7 +154,7 @@ bool ObPsStmtItem::check_erase_inc_ref_count()
   return need_erase;
 }
 
-void ObPsStmtItem::dec_ref_count_check_erase()
+void ObPsStmtItem::dec_ref_count()
 {
   int ret = OB_SUCCESS;
   LOG_TRACE("ps item dec ref count", K(*this));
@@ -271,6 +267,7 @@ ObPsStmtInfo::ObPsStmtInfo(ObIAllocator *inner_allocator)
     ref_count_(1),
     question_mark_count_(0),
     can_direct_use_param_(false),
+    is_prexecute_(false),
     item_and_info_size_(0),
     last_closed_timestamp_(0),
     dep_objs_(NULL),
@@ -300,6 +297,7 @@ ObPsStmtInfo::ObPsStmtInfo(ObIAllocator *inner_allocator,
     ref_count_(1),
     question_mark_count_(0),
     can_direct_use_param_(false),
+    is_prexecute_(false),
     item_and_info_size_(0),
     last_closed_timestamp_(0),
     dep_objs_(NULL),
@@ -456,6 +454,7 @@ int ObPsStmtInfo::deep_copy(const ObPsStmtInfo &other)
     num_of_returning_into_ = other.num_of_returning_into_;
     is_sensitive_sql_ = other.is_sensitive_sql_;
     can_direct_use_param_ = other.can_direct_use_param();
+    is_prexecute_ = other.get_is_prexecute();
     item_and_info_size_ = other.item_and_info_size_;
     ps_item_ = other.ps_item_;
     tenant_version_ = other.tenant_version_;
@@ -606,23 +605,20 @@ bool ObPsStmtInfo::check_erase_inc_ref_count()
   return need_erase;
 }
 
-bool ObPsStmtInfo::dec_ref_count_check_erase()
+void ObPsStmtInfo::dec_ref_count()
 {
-  bool need_erase = false;
   LOG_TRACE("ps info dec ref count", K(*this));
-  int64_t ref_count = ATOMIC_SAF(&ref_count_, 1);
-  if (ref_count > 0) {
-    if (ref_count == 1) {
+  int64_t cur_ref_count = ATOMIC_LOAD(&ref_count_);
+  if (cur_ref_count > 1) {
+    if (cur_ref_count == 2) {
       last_closed_timestamp_ = common::ObTimeUtility::current_time();
     }
-    LOG_TRACE("ps info dec ref count", K(ref_count), K(*this));
-  } else if (0 == ref_count) {
-    need_erase = true;
-    LOG_INFO("free ps info", K(ref_count), K(*this), K(need_erase));
-  } else if (ref_count < 0) {
-    BACKTRACE_RET(ERROR, OB_ERR_UNEXPECTED, true, "ObPsStmtInfo %p ref count < 0, ref_count = %ld", this, ref_count);
+    LOG_TRACE("ps info dec ref count", K(cur_ref_count), K(*this));
+    ATOMIC_DEC(&ref_count_);
+  } else {
+    BACKTRACE_RET(ERROR, OB_ERR_UNEXPECTED, true, "ObPsStmtInfo %p, cur_ref_count = %ld", this, cur_ref_count);
   }
-  return need_erase;
+  return;
 }
 
 int64_t ObPsStmtInfo::to_string(char *buf, const int64_t buf_len) const
@@ -700,6 +696,17 @@ int TypeInfo::deep_copy(common::ObIAllocator *allocator,
     OX (elem_type_ = other->elem_type_);
     OX (is_elem_type_ = other->is_elem_type_);
     OX (is_basic_type_ = other->is_basic_type_);
+  }
+  return ret;
+}
+
+int ObPsSessionInfo::fill_param_types_with_null_type()
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i=0; OB_SUCC(ret) && i<num_of_params_; ++i) {
+    if (OB_FAIL(param_types_.push_back(obmysql::MYSQL_TYPE_NULL))) {
+      LOG_WARN("push null type into param_types_ failed", K(ret));
+    }
   }
   return ret;
 }

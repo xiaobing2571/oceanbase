@@ -55,13 +55,16 @@ public:
     common::ObString default_;
     common::ObString extra_;
     common::ObString privileges_;
-    sql::ObExprResType result_type_;
+    sql::ObRawExprResType result_type_;
+    int64_t is_hidden_;
+    bool is_string_lob_;
     int64_t get_data_length() const;
   };
   ObTableColumns();
   virtual ~ObTableColumns();
   virtual int inner_get_next_row(common::ObNewRow *&row);
   virtual void reset();
+  int init(uint64_t tenant_id);
   static int resolve_view_definition(
       common::ObIAllocator* allocator,
       sql::ObSQLSessionInfo *session,
@@ -73,13 +76,15 @@ public:
       bool throw_error);
   // skip inner added implicit cast and bool expr.
   static const sql::ObRawExpr *skip_inner_added_expr(const sql::ObRawExpr *expr);
-  static int set_null_and_default_according_binary_expr(const uint64_t tenant_id,
-                                                        const sql::ObSelectStmt *select_stmt,
-                                                        const sql::ObRawExpr *expr,
-                                                        share::schema::ObSchemaGetterGuard *schema_guard,
-                                                        bool &nullable,
-                                                        bool &has_default);
+  static int set_col_attrs_according_binary_expr(const uint64_t tenant_id,
+                                                 const sql::ObSelectStmt *select_stmt,
+                                                 const sql::ObRawExpr *expr,
+                                                 share::schema::ObSchemaGetterGuard *schema_guard,
+                                                 bool &nullable,
+                                                 bool &has_default,
+                                                 bool &is_string_lob);
   static int deduce_column_attributes(const bool is_oracle_mode,
+                                      const ObTableSchema &table_schema,
                                       const sql::ObSelectStmt *select_stmt,
                                       const sql::SelectItem &select_item,
                                       share::schema::ObSchemaGetterGuard *schema_guard,
@@ -87,8 +92,9 @@ public:
                                       char *column_type_str,
                                       int64_t column_type_str_len,
                                       ColumnAttributes &column_attributes,
-                                      bool skip_type_str);  // skip_type_str : when use ObTableColumns::deduce_column_attributes in create_view_resolver,
+                                      bool skip_type_str,  // skip_type_str : when use ObTableColumns::deduce_column_attributes in create_view_resolver,
                                                             // no field column_type_str, skip
+                                      ObIAllocator &allocator);
 private:
 
   enum DESC_COLUMN {
@@ -102,13 +108,13 @@ private:
     EXTRA,
     PRIVILEGES,
     COMMENT,
-    IS_HIDDEN
+    IS_HIDDEN,
   };
   int calc_show_table_id(uint64_t &show_table_id);
   int fill_row_cells(const share::schema::ObTableSchema &table_schema,
-                     const share::schema::ObColumnSchemaV2 &column_schema);
-  int fill_row_cells(const uint64_t tenant_id,
-                     const uint64_t table_id,
+                     const share::schema::ObColumnSchemaV2 &column_schema,
+                     bool &has_column_priv);
+  int fill_row_cells(const ObTableSchema &table_schema,
                      const sql::ObSelectStmt *select_stmt,
                      const sql::SelectItem &select_item);
   int set_null_and_default_according_binary_expr(const sql::ObSelectStmt *select_stmt,
@@ -135,7 +141,8 @@ private:
                    const int16_t default_length_semantics,
                    ObString &type_val);
   int fill_col_privs(
-      ObSessionPrivInfo &session_priv,
+      const ObSessionPrivInfo &session_priv,
+      const common::ObIArray<uint64_t> &enable_role_id_array,
       ObNeedPriv &need_priv, 
       ObPrivSet priv_set, 
       const char *priv_str,
@@ -147,6 +154,7 @@ private:
   char type_str_[common::OB_MAX_SYS_PARAM_NAME_LENGTH];
   char *column_type_str_;
   int64_t column_type_str_len_;
+  uint64_t min_data_version_;
   DISALLOW_COPY_AND_ASSIGN(ObTableColumns);
 };
 }//observer

@@ -14,8 +14,11 @@
 #define OCEANBASE_ROOTSERVICE_OBADMIN_DRTASK_UTIL_H_
 
 #include "logservice/palf/palf_handle_impl.h" // for PalfStat
+#include "share/ob_rpc_struct.h"
+
 namespace oceanbase
 {
+using namespace obrpc;
 namespace rootserver
 {
 
@@ -89,12 +92,14 @@ private:
   // params[in]  tenant_id, specified tenant_id
   // params[in]  ls_id, specified ls_id
   // params[in]  target_server, the replica to remove on which server
+  // params[in]  replica_type, the replica type to remove, could be R or C
   // params[out] ret_comment, failed reason
   // params[out] remove_non_paxos_arg, arg for remove-R task
   static int construct_remove_nonpaxos_task_arg_(
          const uint64_t &tenant_id,
          const share::ObLSID &ls_id,
          const common::ObAddr &target_server,
+         const ObReplicaType &replica_type,
          ObAdminDRTaskRetComment &ret_comment,
          ObLSDropNonPaxosReplicaArg &remove_nonpaxos_arg);
 
@@ -147,12 +152,12 @@ private:
   // params[in]  tenant_id, specified tenant_id
   // params[in]  ls_id, specified ls_id
   // params[out] orig_paxos_replica_number, orig paxos_replica_number
-  // params[out] data_source_server, data source
+  // params[out] leader_server, data source
   static int construct_default_params_for_add_command_(
          const uint64_t &tenant_id,
          const share::ObLSID &ls_id,
          int64_t &orig_paxos_replica_number,
-         common::ObAddr &data_source_server);
+         common::ObAddr &leader_server);
 
   // execute remove task
   // params[in]  command_arg, arg which contains admin_command

@@ -43,6 +43,10 @@ typedef ObNumStackAllocator<1> ObNumStackOnceAlloc;
 
 #define array_elements(A) ((uint) (sizeof(A)/sizeof(A[0])))
 
+template <typename T>
+class ObTextStringVectorResult;
+using ObTextStringDatumResult = ObTextStringVectorResult<common::ObIVector>;
+
 class ObExprUtil
 {
 public:
@@ -80,8 +84,6 @@ public:
                              common::ObIArray<size_t> &byte_offset);
   // 将double round到小数点后或者小数点前指定位置
   static double round_double(double val, int64_t dec);
-  // 将double round到小数点后指定位置，.5 -> 1 而不是0
-  static double round_double_nearest(double val, int64_t dec);
   static uint64_t round_uint64(uint64_t val, int64_t dec);
   // 将double trunc到小数点后或者小数点前指定位置
   static double trunc_double(double val, int64_t dec);
@@ -117,6 +119,12 @@ public:
   // e.g.:
   //   dump() need result is NLS_CHARACTERSET, but we can only generate ASCII string in code,
   //   this function is used to convert the result characterset.
+  static int set_expr_asscii_result(const ObExpr &expr,
+                                      ObEvalCtx &ctx,
+                                      ObTextStringDatumResult &out_res,
+                                      const ObString &ascii, const int64_t datum_idx,
+                                      const bool is_ascii,
+                                      const common::ObCollationType src_coll_type = CS_TYPE_UTF8MB4_BIN);
   static int set_expr_ascii_result(const ObExpr &expr,
                                 ObEvalCtx &ctx,
                                 common::ObDatum &expr_datum,
@@ -135,6 +143,11 @@ public:
                                       common::ObString &out_str,
                                       const common::ObCollationType &out_collation,
                                       common::ObIAllocator &alloc);
+  static int convert_string_collation_for_regexp(const common::ObString &in_str,
+                                                 const common::ObCollationType &in_collation,
+                                                 common::ObString &out_str,
+                                                 const common::ObCollationType &out_collation,
+                                                 common::ObIAllocator &alloc);
   static int need_convert_string_collation(const common::ObCollationType &in_collation,
                                            const common::ObCollationType &out_collation,
                                            bool &need_convert);
@@ -156,6 +169,7 @@ public:
                                   const common::ObCollationType& from_collation,
                                   const common::ObString &from_string,
                                   common::ObString &dest_string);
+  static int get_real_expr_without_cast(const ObExpr *expr, const ObExpr *&out_expr);
 
 private:
   static int get_int64_from_num(common::number::ObNumber &nmb,
@@ -227,6 +241,40 @@ int calc_##tritype##_expr(const ObExpr &expr, ObEvalCtx &ctx,                 \
   }                                                                           \
   return ret;                                                                 \
 }
+
+class ObSolidifiedVarsContext
+{
+public:
+  ObSolidifiedVarsContext() :
+    local_session_var_(NULL),
+    alloc_(NULL),
+    local_tz_wrap_(NULL)
+  {
+  }
+  ObSolidifiedVarsContext(ObLocalSessionVar *local_var, common::ObIAllocator *alloc) :
+    local_session_var_(local_var),
+    alloc_(alloc),
+    local_tz_wrap_(NULL)
+  {
+  }
+  virtual ~ObSolidifiedVarsContext()
+  {
+    if (NULL != local_tz_wrap_ && NULL != alloc_) {
+      local_tz_wrap_->~ObTimeZoneInfoWrap();
+      alloc_->free(local_tz_wrap_);
+      local_tz_wrap_ = NULL;
+    }
+  }
+  int get_local_tz_info(const sql::ObBasicSessionInfo *session, const common::ObTimeZoneInfo *&tz_info);
+  ObLocalSessionVar *get_local_vars() const { return local_session_var_; }
+  DECLARE_TO_STRING;
+private:
+  ObLocalSessionVar *local_session_var_;
+  common::ObIAllocator *alloc_;
+  //cached vars
+  ObTimeZoneInfoWrap *local_tz_wrap_;
+};
+
 //Get the merged values of solidified vars and current session vars
 //If a var is solidified, return the solidified value. Otherwise return currrent session value.
 //e.g. :
@@ -245,12 +293,12 @@ public:
   int get_local_nls_timestamp_tz_format(ObString &format);
   int get_local_nls_format_by_type(const ObObjType type, ObString &format_str);
   int get_max_allowed_packet(int64_t &max_size);
+  int get_compat_version(uint64_t &compat_version);
   //get the specified solidified var
-  int get_local_var(share::ObSysVarClassType var_type, share::schema::ObSessionSysVar *&sys_var);
+  int get_local_var(share::ObSysVarClassType var_type, ObSessionSysVar *&sys_var);
 private:
-  const share::schema::ObLocalSessionVar *local_session_var_;
+  const ObSolidifiedVarsContext *local_session_var_;
   const ObBasicSessionInfo *session_;
-  ObTimeZoneInfoWrap local_tz_wrap_;
 };
 
 }

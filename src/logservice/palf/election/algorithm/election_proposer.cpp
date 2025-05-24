@@ -11,18 +11,8 @@
  */
 
 
-#include "logservice/palf/election/message/election_message.h"
-#include "ob_role.h"
-#include "share/ob_occam_time_guard.h"
 #include "election_proposer.h"
-#include "common/ob_clock_generator.h"
 #include "election_impl.h"
-#include "lib/ob_errno.h"
-#include "lib/string/ob_string_holder.h"
-#include "logservice/palf/election/interface/election_msg_handler.h"
-#include "logservice/palf/election/utils/election_common_define.h"
-#include "logservice/palf/election/utils/election_member_list.h"
-#include "logservice/palf/palf_callback.h"
 
 namespace oceanbase
 {
@@ -54,6 +44,7 @@ struct ResponseChecker
       proposer->advance_ballot_number_and_reset_related_states_(msg.get_ballot_number(),
                                                                 "receive reject message");
       if (proposer->check_leader()) {
+        // ignore ret
         // 在check leader后可能卡住，做leader prepare时就已经不再是leader了
         // 但是没有关系，正确性是由prepare阶段保证的，check_leader的意义在于尽量避免无谓的leader prepare流程
         LOG_PHASE(WARN, phase, "leader message is rejected cause ballot number", K(msg.get_ballot_number()), K(proposer->prepare_success_ballot_));
@@ -719,7 +710,8 @@ int64_t ElectionProposer::to_string(char *buf, const int64_t buf_len) const
   int64_t pos = 0;
   if (OB_NOT_NULL(p_election_)) {
     common::databuff_printf(buf, buf_len, pos, "{ls_id:{id:%ld}", p_election_->id_);
-    common::databuff_printf(buf, buf_len, pos, ", addr:%s", to_cstring(p_election_->get_self_addr()));
+    common::databuff_printf(buf, buf_len, pos, ", addr:");
+    common::databuff_printf(buf, buf_len, pos, p_election_->get_self_addr());
   }
   common::databuff_printf(buf, buf_len, pos, ", role:%s", obj_to_string(role_));
   common::databuff_printf(buf, buf_len, pos, ", ballot_number:%ld", ballot_number_);
@@ -734,25 +726,26 @@ int64_t ElectionProposer::to_string(char *buf, const int64_t buf_len) const
   } else {
     common::databuff_printf(buf, buf_len, pos, ", lease_interval:%ldus", lease);
   }
-  common::databuff_printf(buf, buf_len, pos, ", memberlist_with_states:%s",
-                                                to_cstring(memberlist_with_states_));
+  common::databuff_printf(buf, buf_len, pos, ", memberlist_with_states:");
+  common::databuff_printf(buf, buf_len, pos, memberlist_with_states_);
   if (leader_lease_and_epoch_.is_valid()) {// 非有效的leader不打印lease信息
-    common::databuff_printf(buf, buf_len, pos, ", lease_and_epoch:%s",
-                                                  to_cstring(leader_lease_and_epoch_));
+    common::databuff_printf(buf, buf_len, pos, ", lease_and_epoch:");
+    common::databuff_printf(buf, buf_len, pos, leader_lease_and_epoch_);
   }
   if (switch_source_leader_ballot_ != INVALID_VALUE) {// 该变量与切主相关，只在切主过程中打印该变量
     common::databuff_printf(buf, buf_len, pos, ", switch_source_leader_ballot:%ld",
                                                   switch_source_leader_ballot_);
   }
   if (switch_source_leader_addr_.is_valid()) {// 该变量与切主相关，只在切主过程中打印该变量
-    common::databuff_printf(buf, buf_len, pos, ", switch_source_leader_addr:%s",
-                                                  to_cstring(switch_source_leader_addr_));
+    common::databuff_printf(buf, buf_len, pos, ", switch_source_leader_addr:");
+    common::databuff_printf(buf, buf_len, pos, switch_source_leader_addr_);
   }
   common::databuff_printf(buf, buf_len, pos, ", priority_seed:0x%lx", (unsigned long)p_election_->generate_inner_priority_seed_());
   common::databuff_printf(buf, buf_len, pos, ", restart_counter:%ld", restart_counter_);
   common::databuff_printf(buf, buf_len, pos, ", last_do_prepare_ts:%s", ObTime2Str::ob_timestamp_str_range<YEAR, USECOND>(last_do_prepare_ts_));
   if (OB_NOT_NULL(p_election_)) {
-    common::databuff_printf(buf, buf_len, pos, ", self_priority:%s", p_election_->priority_ == nullptr ? "NULL" : to_cstring(*(p_election_->priority_)));
+    common::databuff_printf(buf, buf_len, pos, ", self_priority:");
+    common::databuff_printf(buf, buf_len, pos, p_election_->priority_);
   }
   common::databuff_printf(buf, buf_len, pos, ", p_election:0x%lx}", (unsigned long)p_election_);
   return pos;

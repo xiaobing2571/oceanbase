@@ -11,20 +11,11 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
-#include "share/stat/ob_opt_column_stat_cache.h"
-#include "share/stat/ob_opt_table_stat.h"
-#include "share/stat/ob_opt_column_stat.h"
 #include "share/stat/ob_opt_stat_manager.h"
 #include "share/stat/ob_dbms_stats_export_import.h"
-#include "lib/mysqlclient/ob_mysql_proxy.h"
 #include "share/stat/ob_dbms_stats_utils.h"
 #include "observer/ob_sql_client_decorator.h"
-#include "share/object/ob_obj_cast.h"
-#include "share/stat/ob_opt_stat_sql_service.h"
 #include "share/stat/ob_dbms_stats_history_manager.h"
-#include "lib/mysqlclient/ob_mysql_transaction.h"
-#include "share/ob_lob_access_utils.h"
-#include "sql/engine/expr/ob_expr_util.h"
 
 namespace oceanbase {
 using namespace sql;
@@ -1030,7 +1021,7 @@ int ObDbmsStatsExportImport::get_opt_stat(ObExecContext &ctx,
             } else if (OB_FAIL(num_val.extract_valid_int64_with_trunc(int_val))) {
               LOG_WARN("extract_valid_int64_with_trunc failed", K(ret), K(num_val));
             } else if (int_val > 0) {
-              if (OB_UNLIKELY(col_stat->get_histogram().get_density() <= 0.0)) {
+              if (OB_UNLIKELY(col_stat->get_histogram().get_density() < 0.0)) {
                 ret = OB_ERR_UNEXPECTED;
                 LOG_WARN("get unexpected error", K(result_objs), K(ret), KPC(col_stat));
               } else if (col_stat->get_histogram().get_buckets().empty()) {

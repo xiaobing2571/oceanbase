@@ -12,13 +12,8 @@
 
 #define USING_LOG_PREFIX SQL_REWRITE
 
-#include "common/ob_common_utility.h"
-#include "common/ob_smart_call.h"
-#include "sql/ob_sql_context.h"
-#include "sql/resolver/expr/ob_raw_expr.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "sql/rewrite/ob_transform_simplify_set.h"
-#include "sql/rewrite/ob_transformer_impl.h"
 #include "sql/rewrite/ob_transform_utils.h"
 
 using namespace oceanbase::common;
@@ -74,14 +69,8 @@ int ObTransformSimplifySet::transform_one_stmt(common::ObIArray<ObParentDMLStmt>
       } 
     }
   }
-  if (OB_SUCC(ret)) {
-    if (!trans_happened) {
-      // do nothing
-    } else if (OB_FAIL(stmt->adjust_subquery_list())) {
-      LOG_WARN("failed to adjust subquery list", K(ret));
-    } else if (OB_FAIL(add_transform_hint(*stmt, NULL))) {
-      LOG_WARN("failed to add transform hint", K(ret));
-    }
+  if (OB_SUCC(ret) && trans_happened && OB_FAIL(add_transform_hint(*stmt, NULL))) {
+    LOG_WARN("failed to add transform hint", K(ret));
   }
   return ret;
 }

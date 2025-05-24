@@ -11,7 +11,6 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "lib/charset/ob_mysql_global.h"
 #include "lib/charset/ob_ctype.h"
 #include "lib/charset/ob_ctype_gbk_tab.h"
 
@@ -191,7 +190,7 @@ size_t ob_varlen_encoding_gbk_for_spacecmp(const struct ObCharsetInfo* cs,
   *is_valid_unicode = 1;
 
   // trim
-  while (*(se-1) == 0x20 && se>src) se--;
+  while (se > src && *(se-1) == 0x20) se--;
   for (;*is_valid_unicode && dst < de && src < se && nweights; nweights--)
   {
     int16_t space_cnt = 0;
@@ -263,30 +262,6 @@ static unsigned int mbcharlen_gbk(const ObCharsetInfo *cs __attribute__((unused)
                           unsigned int c)
 {
   return (isgbkhead(c)? 2 : 1);
-}
-static int func_uni_gbk_onechar(int code){
-  if ((code>=0x00A4)&&(code<=0x0451)) {
-    return(tab_uni_gbk0[code-0x00A4]);
-  } else if ((code>=0x2010)&&(code<=0x2312)) {
-    return(tab_uni_gbk1[code-0x2010]);
-  } else if ((code>=0x2460)&&(code<=0x2642)) {
-    return(tab_uni_gbk2[code-0x2460]);
-  } else if ((code>=0x3000)&&(code<=0x3129)) {
-    return(tab_uni_gbk3[code-0x3000]);
-  } else if ((code>=0x3220)&&(code<=0x32A3)) {
-    return(tab_uni_gbk4[code-0x3220]);
-  } else if ((code>=0x338E)&&(code<=0x33D5)) {
-    return(tab_uni_gbk5[code-0x338E]);
-  } else if ((code>=0x4E00)&&(code<=0x9FA5)) {
-    return(tab_uni_gbk6[code-0x4E00]);
-  } else if ((code>=0xE000)&&(code<=0xE864)) {
-    return(tab_uni_gbk_pua[code-0xE000]);
-  } else if ((code>=0xF92C)&&(code<=0xFA29)) {
-    return(tab_uni_gbk7[code-0xF92C]);
-  } else if ((code>=0xFE30)&&(code<=0xFFE5)) {
-    return(tab_uni_gbk8[code-0xFE30]);
-  }
-  return(0);
 }
 
 static int
@@ -369,6 +344,7 @@ static ObCollationHandler ob_collation_gbk_ci_handler =
 
 static ObCharsetHandler ob_charset_gbk_handler=
 {
+  NULL,
   ismbchar_gbk,
   mbcharlen_gbk,
   ob_numchars_mb,
@@ -391,14 +367,15 @@ static ObCharsetHandler ob_charset_gbk_handler=
   ob_strntoull_8bit,
   ob_strntod_8bit,
   ob_strntoull10rnd_8bit,
-  ob_scan_8bit
+  ob_scan_8bit,
+  skip_trailing_space
 };
 
 
 ObCharsetInfo ob_charset_gbk_chinese_ci=
 {
     28,0,0,
-    OB_CS_COMPILED|OB_CS_PRIMARY|OB_CS_STRNXFRM,
+    OB_CS_COMPILED|OB_CS_PRIMARY|OB_CS_STRNXFRM|OB_CS_CI,
     "gbk",
     "gbk_chinese_ci",
     "",
@@ -409,6 +386,8 @@ ObCharsetInfo ob_charset_gbk_chinese_ci=
     to_upper_gbk,
     sort_order_gbk,
     NULL,
+    NULL,
+    NULL,
     &ob_caseinfo_gbk,
     NULL,
     NULL,
@@ -417,6 +396,7 @@ ObCharsetInfo ob_charset_gbk_chinese_ci=
     1,
     1,
     2,
+    1,
     0,
     0xA967,
     ' ',
@@ -441,6 +421,8 @@ ObCharsetInfo ob_charset_gbk_bin=
     to_upper_gbk,
     NULL,
     NULL,
+    NULL,
+    NULL,
     &ob_caseinfo_gbk,
     NULL,
     NULL,
@@ -449,6 +431,7 @@ ObCharsetInfo ob_charset_gbk_bin=
     1,
     1,
     2,
+    1,
     0,
     0xFEFE,
     ' ',

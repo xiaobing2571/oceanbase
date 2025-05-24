@@ -3,7 +3,7 @@ CREATE OR REPLACE PACKAGE BODY dbms_ischeduler
   FUNCTION  PUSER() RETURN VARCHAR(128)
   BEGIN
     DECLARE current_user_name VARCHAR(128);
-    SELECT substring_index(current_user(), '@', 1) INTO current_user_name;
+    SELECT current_user() INTO current_user_name;
     RETURN current_user_name;
   END;
 
@@ -12,15 +12,6 @@ CREATE OR REPLACE PACKAGE BODY dbms_ischeduler
     DECLARE current_schema_name VARCHAR(128);
     SELECT database() INTO current_schema_name;
     RETURN current_schema_name;
-  END;
-
-  FUNCTION  NEXTVALS() RETURN BIGINT
-  BEGIN
-    DECLARE MYNUM   BIGINT;
-    DECLARE next_job_id   BIGINT;
-    SELECT MAX(job) INTO MYNUM FROM OCEANBASE.__ALL_TENANT_SCHEDULER_JOB;
-    SET next_job_id = ifnull(MYNUM, 1);
-    RETURN next_job_id;
   END;
 
   FUNCTION GET_AND_INCREASE_JOB_ID() RETURN BIGINT;
@@ -45,9 +36,7 @@ CREATE OR REPLACE PACKAGE BODY dbms_ischeduler
     SELECT 1 INTO DUMMY FROM OCEANBASE.__ALL_TENANT_SCHEDULER_JOB
       WHERE job_name = my_job_name AND POWNER = PUSER
             AND job != (SELECT MAX(job) FROM OCEANBASE.__ALL_TENANT_SCHEDULER_JOB);
-  -- EXCEPTION
-  --   WHEN NO_DATA_FOUND THEN
-  --     RAISE_APPLICATION_ERROR(-20000, 'ORA-23421: job ' || job_name || ' is not a job in the job queue');
+
   END;
 
   PROCEDURE do_create_job( IN job                BIGINT,
@@ -126,7 +115,6 @@ CREATE OR REPLACE PACKAGE BODY dbms_ischeduler
     SET final_start_date = ifnull(start_date, sysdate());
     SET final_next_date = final_start_date;
     SET final_end_date = ifnull(end_date, STR_TO_DATE('4000-01-01', '%Y-%m-%d %H:%i:%s'));
-
 
     SET my_interval = repeat_interval;
     SET my_flag = 0;

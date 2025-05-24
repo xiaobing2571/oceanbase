@@ -12,37 +12,20 @@
 
 #define USING_LOG_PREFIX COMMON
 
-#include "ob_resource_mgr.h"
-#include <new>
-#include <stdlib.h>
 
-#include "lib/alloc/memory_sanity.h"
-#include "lib/alloc/ob_malloc_time_monitor.h"
-#include "lib/oblog/ob_log.h"
-#include "lib/stat/ob_diagnose_info.h"
+#include "ob_resource_mgr.h"
 #include "lib/utility/utility.h"
-#include "lib/alloc/alloc_failed_reason.h"
+#include "lib/resource/ob_affinity_ctrl.h"
 
 namespace oceanbase
 {
 using namespace common;
 namespace lib
 {
-ObTenantMemoryMgr::ObTenantMemoryMgr()
-  : cache_washer_(NULL), tenant_id_(common::OB_INVALID_ID),
-    limit_(INT64_MAX), sum_hold_(0), rpc_hold_(0), cache_hold_(0),
-    cache_item_count_(0)
-{
-  for (uint64_t i = 0; i < common::ObCtxIds::MAX_CTX_ID; i++) {
-    ATOMIC_STORE(&(hold_bytes_[i]), 0);
-    ATOMIC_STORE(&(limit_bytes_[i]), INT64_MAX);
-  }
-}
-
 ObTenantMemoryMgr::ObTenantMemoryMgr(const uint64_t tenant_id)
   : cache_washer_(NULL), tenant_id_(tenant_id),
-    limit_(INT64_MAX), sum_hold_(0), rpc_hold_(0), cache_hold_(0),
-    cache_item_count_(0)
+    limit_(INT64_MAX), limiter_(INT64_MAX, 0),
+    cache_hold_(0), cache_item_count_(0)
 {
   for (uint64_t i = 0; i < common::ObCtxIds::MAX_CTX_ID; i++) {
     ATOMIC_STORE(&(hold_bytes_[i]), 0);
@@ -71,85 +54,43 @@ AChunk *ObTenantMemoryMgr::alloc_chunk(const int64_t size, const ObMemAttr &attr
       chunk = alloc_chunk_(size, attr);
       if (NULL == chunk) {
         update_hold(-hold_size, attr.ctx_id_, attr.label_, reach_ctx_limit);
-      } else if (attr.label_ == ObNewModIds::OB_KVSTORE_CACHE_MB) {
-        update_cache_hold(hold_size);
       }
     }
     BASIC_TIME_GUARD_CLICK("ALLOC_CHUNK_END");
-    if (!reach_ctx_limit && NULL != cache_washer_ && NULL == chunk && hold_size < cache_hold_
-        && attr.label_ != ObNewModIds::OB_KVSTORE_CACHE_MB) {
+    if (!reach_ctx_limit && NULL != cache_washer_ && NULL == chunk && hold_size < cache_hold_) {
       // try wash memory from cache
       ObICacheWasher::ObCacheMemBlock *washed_blocks = NULL;
-      bool wash_single_mb = true;
-      int64_t wash_size = hold_size;
-      if (attr.ctx_id_ == ObCtxIds::CO_STACK) {
-        wash_single_mb = false;
-      } else if (wash_size > INTACT_ACHUNK_SIZE) {
-        wash_size = wash_size + LARGE_REQUEST_EXTRA_MB_COUNT * INTACT_ACHUNK_SIZE;
-        wash_single_mb = false;
+      int64_t wash_size = hold_size + LARGE_REQUEST_EXTRA_MB_COUNT * INTACT_ACHUNK_SIZE;
+      while (!reach_ctx_limit && OB_SUCC(ret) && NULL == chunk && wash_size < cache_hold_) {
+        if (OB_FAIL(cache_washer_->sync_wash_mbs(tenant_id_, wash_size, washed_blocks))) {
+          LOG_WARN("sync_wash_mbs failed", K(ret), K_(tenant_id), K(wash_size));
+        } else {
+          // should return back to os, then realloc again
+          ObMemAttr cache_attr;
+          cache_attr.tenant_id_ = tenant_id_;
+          cache_attr.label_ = ObNewModIds::OB_KVSTORE_CACHE_MB;
+          ObICacheWasher::ObCacheMemBlock *next = NULL;
+          while (NULL != washed_blocks) {
+            AChunk *chunk = ptr2chunk(washed_blocks);
+            next = washed_blocks->next_;
+            free_chunk(chunk, cache_attr);
+            chunk = NULL;
+            washed_blocks = next;
+          }
+
+          if (update_hold(static_cast<int64_t>(hold_size), attr.ctx_id_, attr.label_,
+                          reach_ctx_limit)) {
+            chunk = alloc_chunk_(size, attr);
+            if (NULL == chunk) {
+              update_hold(-hold_size, attr.ctx_id_, attr.label_, reach_ctx_limit);
+            }
+          }
+        }
       }
 
-      if (wash_single_mb) {
-        if (OB_FAIL(cache_washer_->sync_wash_mbs(tenant_id_, wash_size,
-            wash_single_mb, washed_blocks))) {
-          LOG_WARN("sync_wash_mbs failed", K(ret), K_(tenant_id), K(wash_size), K(wash_single_mb));
-        } else if (NULL != washed_blocks->next_) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("not single memory block washed", K(ret), K(wash_single_mb));
-        } else {
-          chunk = ptr2chunk(washed_blocks);
-          const int64_t chunk_hold = static_cast<int64_t>(chunk->hold());
-          update_cache_hold(-chunk_hold);
-          if (!update_ctx_hold(attr.ctx_id_, chunk_hold)) {
-            // reach ctx limit
-            // The ctx_id here can be given freely, because ctx_id is meaningless when the label is OB_KVSTORE_CACHE_MB
-            update_hold(-chunk_hold, attr.ctx_id_,
-                        ObNewModIds::OB_KVSTORE_CACHE_MB, reach_ctx_limit);
-            free_chunk_(chunk, attr);
-            chunk = NULL;
-          }
-        }
-      } else {
-        const int64_t max_retry_count = 3;
-        int64_t retry_count = 0;
-        while (!reach_ctx_limit && OB_SUCC(ret) && NULL == chunk && wash_size < cache_hold_
-            && retry_count < max_retry_count) {
-          if (OB_FAIL(cache_washer_->sync_wash_mbs(tenant_id_, wash_size,
-              wash_single_mb, washed_blocks))) {
-            LOG_WARN("sync_wash_mbs failed", K(ret), K_(tenant_id), K(wash_size), K(wash_single_mb));
-          } else {
-            // should return back to os, then realloc again
-            ObMemAttr cache_attr;
-            cache_attr.tenant_id_ = tenant_id_;
-            cache_attr.label_ = ObNewModIds::OB_KVSTORE_CACHE_MB;
-            ObICacheWasher::ObCacheMemBlock *next = NULL;
-            while (NULL != washed_blocks) {
-              AChunk *chunk = ptr2chunk(washed_blocks);
-              next = washed_blocks->next_;
-              free_chunk(chunk, cache_attr);
-              washed_blocks = next;
-            }
-
-            if (update_hold(static_cast<int64_t>(hold_size), attr.ctx_id_, attr.label_,
-                            reach_ctx_limit)) {
-              chunk = alloc_chunk_(size, attr);
-              if (NULL == chunk) {
-                update_hold(-hold_size, attr.ctx_id_, attr.label_, reach_ctx_limit);
-              }
-            }
-          }
-          ++retry_count;
-          if (OB_SUCC(ret) && NULL == chunk) {
-            if (retry_count < max_retry_count) {
-              LOG_WARN("after wash from cache, still can't alloc large chunk from chunk_mgr, "
-                  "maybe alloc by other thread, need retry",
-                  K(retry_count), K(max_retry_count), K(size));
-            } else {
-              LOG_WARN("after wash from cache, still can't alloc large chunk from chunk_mgr, "
-                  "maybe alloc by other thread", K(max_retry_count), K(size));
-            }
-          }
-        }
+      if (OB_FAIL(ret)) {
+        LOG_WARN("after wash from cache, still can't alloc chunk from chunk_mgr, "
+                "maybe alloc by other thread", K(size), K(wash_size), K(ret));
       }
       BASIC_TIME_GUARD_CLICK("WASH_KVCACHE_END");
     }
@@ -165,9 +106,6 @@ void ObTenantMemoryMgr::free_chunk(AChunk *chunk, const ObMemAttr &attr)
     bool reach_ctx_limit = false;
     const int64_t hold_size = static_cast<int64_t>(chunk->hold());
     update_hold(-hold_size, attr.ctx_id_, attr.label_, reach_ctx_limit);
-    if (attr.label_ == ObNewModIds::OB_KVSTORE_CACHE_MB) {
-      update_cache_hold(-hold_size);
-    }
     free_chunk_(chunk, attr);
   }
 }
@@ -180,6 +118,7 @@ void *ObTenantMemoryMgr::alloc_cache_mb(const int64_t size)
   attr.tenant_id_ = tenant_id_;
   attr.prio_ = OB_NORMAL_ALLOC;
   attr.label_ = ObNewModIds::OB_KVSTORE_CACHE_MB;
+  attr.numa_id_ = AFFINITY_CTRL.get_numa_id();
   if (NULL != (chunk = alloc_chunk(size, attr))) {
     const int64_t all_size = CHUNK_MGR.aligned(size);
     SANITY_UNPOISON(chunk, all_size);
@@ -252,34 +191,24 @@ void ObTenantMemoryMgr::update_cache_hold(const int64_t size)
 bool ObTenantMemoryMgr::update_hold(const int64_t size, const uint64_t ctx_id,
                                     const lib::ObLabel &label, bool &reach_ctx_limit)
 {
-  bool updated = false;
+  bool updated = true;
   reach_ctx_limit = false;
-  if (size <= 0) {
-    ATOMIC_AAF(&sum_hold_, size);
-    updated = true;
-  } else {
-    if (sum_hold_ + size <= limit_) {
-      const int64_t nvalue = ATOMIC_AAF(&sum_hold_, size);
-      if (nvalue > limit_) {
-        ATOMIC_AAF(&sum_hold_, -size);
-      } else {
-        updated = true;
-      }
-    }
-  }
-  if (!updated) {
+  if (!limiter_.acquire(size)) {
+    updated = false;
     auto &afc = g_alloc_failed_ctx();
     afc.reason_ = TENANT_HOLD_REACH_LIMIT;
     afc.alloc_size_ = size;
     afc.tenant_id_ = tenant_id_;
-    afc.tenant_hold_ = sum_hold_;
+    afc.tenant_hold_ = get_sum_hold();
     afc.tenant_limit_ = limit_;
   } else if (label != ObNewModIds::OB_KVSTORE_CACHE_MB) {
     if (!update_ctx_hold(ctx_id, size)) {
-      ATOMIC_AAF(&sum_hold_, -size);
+      limiter_.acquire(-size);
       updated = false;
       reach_ctx_limit = true;
     }
+  } else {
+    update_cache_hold(size);
   }
   return updated;
 }
@@ -330,9 +259,9 @@ AChunk *ObTenantMemoryMgr::alloc_chunk_(const int64_t size, const ObMemAttr &att
 {
   AChunk *chunk = nullptr;
   if (OB_UNLIKELY(attr.ctx_id_ == ObCtxIds::CO_STACK)) {
-    chunk = CHUNK_MGR.alloc_co_chunk(static_cast<uint64_t>(size));
+    chunk = CHUNK_MGR.alloc_co_chunk(static_cast<uint64_t>(size), attr.numa_id_);
   } else {
-    chunk = CHUNK_MGR.alloc_chunk(static_cast<uint64_t>(size), OB_HIGH_ALLOC == attr.prio_);
+    chunk = CHUNK_MGR.alloc_chunk(static_cast<uint64_t>(size), attr.numa_id_, OB_HIGH_ALLOC == attr.prio_);
   }
   return chunk;
 }

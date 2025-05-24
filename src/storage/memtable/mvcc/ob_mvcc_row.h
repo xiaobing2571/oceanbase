@@ -21,14 +21,12 @@
 #include "storage/ob_i_store.h"
 #include "ob_row_latch.h"
 #include "storage/memtable/ob_memtable_data.h"
-#include "storage/ob_i_store.h"
 #include "storage/memtable/mvcc/ob_mvcc_define.h"
 
 namespace oceanbase
 {
 namespace memtable
 {
-
 static const uint8_t NDT_NORMAL = 0x0;
 static const uint8_t NDT_COMPACT = 0x1;
 class ObIMvccCtx;
@@ -36,6 +34,7 @@ class ObMemtable;
 class ObIMemtableCtx;
 class ObMemtableKey;
 class ObMvccRowCallback;
+class ObMvccWriteResult;
 
 #define ATOMIC_ADD_TAG(tag)                           \
   while (true) {                                      \
@@ -66,6 +65,7 @@ public:
     trans_version_(share::SCN::min_scn()),
     scn_(share::SCN::max_scn()),
     seq_no_(),
+    write_epoch_(0),
     tx_end_scn_(share::SCN::max_scn()),
     prev_(NULL),
     next_(NULL),
@@ -82,6 +82,7 @@ public:
   share::SCN trans_version_;
   share::SCN scn_;
   transaction::ObTxSEQ seq_no_;
+  int64_t write_epoch_;
   share::SCN tx_end_scn_;
   ObMvccTransNode *prev_;
   ObMvccTransNode *next_;
@@ -141,6 +142,10 @@ public:
   {
     return ATOMIC_LOAD(&flag_) & F_ELR;
   }
+  OB_INLINE void clear_elr()
+  {
+    ATOMIC_SUB_TAG(F_ELR);
+  }
   OB_INLINE void set_aborted()
   {
     ATOMIC_ADD_TAG(F_ABORTED);
@@ -165,6 +170,27 @@ public:
   {
     return ATOMIC_LOAD(&flag_) & F_DELAYED_CLEANOUT;
   }
+  OB_INLINE void set_incomplete()
+  {
+    ATOMIC_ADD_TAG(F_INCOMPLETE_STATE);
+  }
+  OB_INLINE void set_complete()
+  {
+    ATOMIC_SUB_TAG(F_INCOMPLETE_STATE);
+  }
+  OB_INLINE bool is_incomplete() const
+  {
+    return ATOMIC_LOAD(&flag_) & F_INCOMPLETE_STATE;
+  }
+  bool need_elr() const
+  {
+    blocksstable::ObDmlFlag dml_type = get_dml_flag();
+    return (dml_type == blocksstable::ObDmlFlag::DF_LOCK
+          || dml_type == blocksstable::ObDmlFlag::DF_UPDATE) &&
+            ObMvccTransNode::F_ELR != flag_ &&
+            ObMvccTransNode::F_COMMITTED != flag_ &&
+            ObMvccTransNode::F_ABORTED != flag_;
+  }
 
   // ===================== ObMvccTransNode Setter/Getter =====================
   blocksstable::ObDmlFlag get_dml_flag() const;
@@ -186,7 +212,7 @@ public:
   share::SCN get_tx_end_scn() const { return tx_end_scn_.atomic_load(); }
   share::SCN get_tx_version() const { return trans_version_.atomic_load(); }
   share::SCN get_scn() const { return scn_.atomic_load(); }
-
+  int64_t get_write_epoch() const { return write_epoch_; }
 private:
   // the row flag of the mvcc tx node
   static const uint8_t F_INIT;
@@ -196,7 +222,7 @@ private:
   static const uint8_t F_ELR;
   static const uint8_t F_ABORTED;
   static const uint8_t F_DELAYED_CLEANOUT;
-  static const uint8_t F_MUTEX;
+  static const uint8_t F_INCOMPLETE_STATE;
 
 public:
   // the snapshot flag of the snapshot version barrier
@@ -232,9 +258,10 @@ struct ObMvccRow
   static const uint8_t F_INIT = 0x0;
   static const uint8_t F_HASH_INDEX = 0x1;
   static const uint8_t F_BTREE_INDEX = 0x2;
-  static const uint8_t F_BTREE_TAG_DEL = 0x4;
-  static const uint8_t F_LOWER_LOCK_SCANED = 0x8;
-  static const uint8_t F_LOCK_DELAYED_CLEANOUT = 0x10;
+  static const uint8_t F_LOWER_ROW_EXIST_AND_SCANNED = 0x4;
+  static const uint8_t F_LOWER_ROW_DELETED_AND_SCANNED = 0x8;
+  static const uint8_t F_LOWER_ROW_SCANNED =
+    F_LOWER_ROW_EXIST_AND_SCANNED | F_LOWER_ROW_DELETED_AND_SCANNED;
 
   static const int64_t NODE_SIZE_UNIT = 1024;
   static const int64_t WARN_WAIT_LOCK_TIME = 1 *1000 * 1000;
@@ -279,10 +306,9 @@ struct ObMvccRow
   // has_insert returns whether node is inserted into the ObMvccRow
   // is_new_locked returns whether node represents the first lock for the operation
   // conflict_tx_id if write failed this field indicate the txn-id which hold the lock of current row
-  int mvcc_write(ObIMemtableCtx &ctx,
-                 const concurrent_control::ObWriteFlag write_flag,
-                 const transaction::ObTxSnapshot &snapshot,
+  int mvcc_write(storage::ObStoreCtx &ctx,
                  ObMvccTransNode &node,
+                 const bool check_exist,
                  ObMvccWriteResult &res);
 
   // mvcc_replay replay the tx node into the row
@@ -298,7 +324,8 @@ struct ObMvccRow
   // key is the row key for lock
   // ctx is the write txn's context, currently the tx_table is the only required field
   // lock_state is the check's result
-  int check_row_locked(ObMvccAccessCtx &ctx, storage::ObStoreRowLockState &lock_state);
+  int check_row_locked(ObMvccAccessCtx &ctx,
+                       storage::ObStoreRowLockState &lock_state);
 
   // insert_trans_node insert the tx node for replay
   // ctx is the write txn's context
@@ -342,18 +369,12 @@ struct ObMvccRow
   int wakeup_waiter(const ObTabletID &tablet_id, const ObMemtableKey &key);
 
   // ===================== ObMvccRow Checker Interface =====================
-  // is_partial checks whether mvcc row whose version below than version is completed
-  // TODO(handora.qc): handle it properly
-  bool is_partial(const int64_t version) const;
-  // is_del checks whether mvcc row whose version below than version is completed
-  // TODO(handora.qc): handle it properly
-  bool is_del(const int64_t version) const;
   // is_transaction_set_violation check the tsc problem for the row
   bool is_transaction_set_violation(const share::SCN snapshot_version);
 
   // ===================== ObMvccRow Getter Interface =====================
   // need_compact checks whether the compaction is necessary
-  bool need_compact(const bool for_read, const bool for_replay);
+  bool need_compact(const bool for_read, const bool for_replay, const bool is_delete_insert);
   // is_empty checks whether ObMvccRow has no tx node(while the row may be deleted)
   bool is_empty() const { return (NULL == ATOMIC_LOAD(&list_head_)); }
   // get_list_head gets the head tx node
@@ -388,29 +409,29 @@ struct ObMvccRow
   {
     ATOMIC_SUB_TAG(F_BTREE_INDEX);
   }
-  OB_INLINE bool is_btree_tag_del() const
-  {
-    return ATOMIC_LOAD(&flag_) & F_BTREE_TAG_DEL;
-  }
-  OB_INLINE void set_btree_tag_del()
-  {
-    ATOMIC_ADD_TAG(F_BTREE_TAG_DEL);
-  }
-  OB_INLINE void clear_btree_tag_del()
-  {
-    ATOMIC_SUB_TAG(F_BTREE_TAG_DEL);
-  }
   OB_INLINE void set_hash_indexed()
   {
     ATOMIC_ADD_TAG(F_HASH_INDEX);
   }
-  OB_INLINE bool is_lower_lock_scaned() const
+  OB_INLINE bool is_lower_row_scanned() const
   {
-    return ATOMIC_LOAD(&flag_) & F_LOWER_LOCK_SCANED;
+    return ATOMIC_LOAD(&flag_) & F_LOWER_ROW_SCANNED;
   }
-  OB_INLINE void set_lower_lock_scaned()
+  OB_INLINE bool is_lower_row_exist_and_scanned() const
   {
-    ATOMIC_ADD_TAG(F_LOWER_LOCK_SCANED);
+    return ATOMIC_LOAD(&flag_) & F_LOWER_ROW_EXIST_AND_SCANNED;
+  }
+  OB_INLINE bool is_lower_row_deleted_and_scanned() const
+  {
+    return ATOMIC_LOAD(&flag_) & F_LOWER_ROW_DELETED_AND_SCANNED;
+  }
+  OB_INLINE void set_lower_row_exist_and_scanned()
+  {
+    ATOMIC_ADD_TAG(F_LOWER_ROW_EXIST_AND_SCANNED);
+  }
+  OB_INLINE void set_lower_row_deleted_and_scanned()
+  {
+    ATOMIC_ADD_TAG(F_LOWER_ROW_DELETED_AND_SCANNED);
   }
   // ===================== ObMvccRow Helper Function =====================
   int64_t to_string(char *buf, const int64_t buf_len) const;
@@ -418,17 +439,16 @@ struct ObMvccRow
   void print_row();
 
   // ===================== ObMvccRow Private Function =====================
-  int mvcc_write_(ObIMemtableCtx &ctx,
-                  const concurrent_control::ObWriteFlag write_flag,
+  int mvcc_write_(storage::ObStoreCtx &ctx,
                   ObMvccTransNode &node,
-                  const transaction::ObTxSnapshot &snapshot,
                   ObMvccWriteResult &res);
 
   // ===================== ObMvccRow Protection Code =====================
-  // check double insert
-  int check_double_insert_(const share::SCN snapshot_version,
-                           ObMvccTransNode &node,
-                           ObMvccTransNode *prev);
+  // sanity check during mvcc_write
+  int mvcc_sanity_check_(const share::SCN snapshot_version,
+                         const concurrent_control::ObWriteFlag write_flag,
+                         ObMvccTransNode &node,
+                         ObMvccTransNode *prev);
 };
 
 }

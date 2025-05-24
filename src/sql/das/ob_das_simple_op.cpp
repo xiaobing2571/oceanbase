@@ -12,7 +12,6 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "sql/das/ob_das_simple_op.h"
-#include "sql/das/ob_das_ref.h"
 #include "storage/tx_storage/ob_access_service.h"
 #include "sql/engine/ob_exec_context.h"
 
@@ -220,7 +219,7 @@ int ObDASRangesCostOp::fill_task_result(ObIDASTaskResult &task_result, bool &has
   int ret = OB_SUCCESS;
   UNUSED(memory_limit);
 #if !defined(NDEBUG)
-  CK(typeid(task_result) == typeid(ObDASSplitRangesResult));
+  CK(typeid(task_result) == typeid(ObDASRangesCostResult));
 #endif
   if (OB_SUCC(ret)) {
     ObDASRangesCostResult &result = static_cast<ObDASRangesCostResult&>(task_result);
@@ -234,7 +233,7 @@ int ObDASRangesCostOp::decode_task_result(ObIDASTaskResult *task_result)
 {
   int ret = OB_SUCCESS;
 #if !defined(NDEBUG)
-  CK(typeid(*task_result) == typeid(ObDASSplitRangesResult));
+  CK(typeid(*task_result) == typeid(ObDASRangesCostResult));
   CK(task_id_ == task_result->get_task_id());
 #endif
   if (OB_SUCC(ret)) {

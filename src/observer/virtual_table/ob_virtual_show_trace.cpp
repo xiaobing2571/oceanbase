@@ -14,13 +14,8 @@
  * ---------------------------------------------------------------------------------------
  */
 #define USING_LOG_PREFIX SERVER
-#include "observer/virtual_table/ob_virtual_span_info.h"
 #include "observer/ob_sql_client_decorator.h"
-#include "lib/oblog/ob_log_module.h"
-#include "lib/trace/ob_trace.h"
 #include "observer/virtual_table/ob_virtual_show_trace.h"
-#include "lib/mysqlclient/ob_mysql_transaction.h"
-#include "observer/ob_server_struct.h"
 #include "sql/session/ob_sql_session_info.h"
 
 using namespace oceanbase::common;
@@ -109,7 +104,7 @@ int ObVirtualShowTrace::retrive_all_span_info()
                            effective_tenant_id_,
                            trace_id.ptr());
       LOG_TRACE("send inner sql to retrive records", KP(session_), K(session_->get_proxy_sessid()),
-                                                     K(session_->get_sessid()), K(table_name),
+                                                     K(session_->get_server_sid()), K(table_name),
                                                      K(tenant_id_), K(trace_id_), K(trace_id),
                                                      K(effective_tenant_id_), K(ObString(sql_len, sql)));
       if (sql_len >= OB_MAX_SQL_LENGTH || sql_len <= 0) {
@@ -332,7 +327,7 @@ int ObVirtualShowTrace::merge_span_info() {
     // do nothing
   } else {
     ObSEArray<sql::ObFLTShowTraceRec*, 16> tmp_arr;
-    std::sort(&show_trace_arr_.at(0), &show_trace_arr_.at(0) + show_trace_arr_.count(),
+    lib::ob_sort(&show_trace_arr_.at(0), &show_trace_arr_.at(0) + show_trace_arr_.count(),
         [](const sql::ObFLTShowTraceRec* rec1, const sql::ObFLTShowTraceRec* rec2) {
           if (NULL == rec1) {
             return true;
@@ -557,7 +552,8 @@ int ObVirtualShowTrace::find_child_span_info(sql::ObFLTShowTraceRec::trace_forma
          */
        }
 
-       if (OB_FAIL(tmp_arr.push_back(show_trace_arr_.at(i)))) {
+       if(OB_FAIL(ret)){
+       } else if (OB_FAIL(tmp_arr.push_back(show_trace_arr_.at(i)))) {
          LOG_WARN("failed to push back show trace value", K(ret), K(i));
        }
      } else {
@@ -569,7 +565,7 @@ int ObVirtualShowTrace::find_child_span_info(sql::ObFLTShowTraceRec::trace_forma
   if (tmp_arr.count() == 0) {
     // skipp sort
   } else {
-    std::sort(&tmp_arr.at(0), &tmp_arr.at(0) + tmp_arr.count(),
+    lib::ob_sort(&tmp_arr.at(0), &tmp_arr.at(0) + tmp_arr.count(),
         [](const sql::ObFLTShowTraceRec *rec1, const sql::ObFLTShowTraceRec *rec2) {
           if (NULL == rec1) {
             return true;
@@ -626,7 +622,8 @@ int ObVirtualShowTrace::find_child_span_info(sql::ObFLTShowTraceRec::trace_forma
                                     = sql::ObFLTShowTraceRec::trace_formatter::LineType::LT_NODE;
       }
     }
-    if (OB_ISNULL(tmp_arr.at(tmp_arr.count()-1))) {
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(tmp_arr.at(tmp_arr.count()-1))) {
       ret = OB_ERR_UNEXPECTED;
       SERVER_LOG(WARN, "record ptr is null");
     } else {

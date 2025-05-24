@@ -12,14 +12,8 @@
 
 #define USING_LOG_PREFIX COMMON
 
-#include "lib/utility/utility.h"
 #include "common/object/ob_obj_compare.h"
-#include "lib/utility/ob_hang_fatal_error.h"
-#include "common/object/ob_object.h"
-#include "lib/worker.h"
-#include "lib/json_type/ob_json_base.h" // for ObIJsonBase
 #include "lib/json_type/ob_json_bin.h" // for ObJsonBin
-#include "lib/wide_integer/ob_wide_integer_cmp_funcs.h"
 
 namespace oceanbase
 {
@@ -818,10 +812,8 @@ int ObObjCmpFuncs::cmp_func<ObEnumSetTC, ObUIntTC>(const ObObj &obj1, \
       } \
     } \
     ObString data_str; \
-    if (obj2.is_outrow_lob()) { \
-      LOG_ERROR("not support outrow lobs", K(obj1), K(obj2)); \
-      ret = CR_OB_ERROR; \
-    } else if (OB_FAIL(obj2.get_string(data_str))) { \
+    ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE); \
+    if (OB_FAIL(obj2.read_lob_data(tmp_allocator, data_str))) { \
       LOG_ERROR("invalid text object", K(obj1), K(obj2)); \
       ret = CR_OB_ERROR; \
     } else { \
@@ -853,10 +845,8 @@ int ObObjCmpFuncs::cmp_func<ObEnumSetTC, ObUIntTC>(const ObObj &obj1, \
       } \
     } \
     ObString data_str; \
-    if (obj2.is_outrow_lob()) { \
-      LOG_ERROR("not support outrow lobs", K(obj1), K(obj2)); \
-      ret = CR_OB_ERROR; \
-    } else if (OB_FAIL(obj2.get_string(data_str))) { \
+    ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE); \
+    if (OB_FAIL(obj2.read_lob_data(tmp_allocator, data_str))) { \
       LOG_ERROR("invalid text object", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
       ret = CR_OB_ERROR; \
     } else { \
@@ -910,13 +900,11 @@ int ObObjCmpFuncs::cmp_func<ObEnumSetTC, ObUIntTC>(const ObObj &obj1, \
     } \
     ObString data_str1; \
     ObString data_str2; \
-    if (obj1.is_outrow_lob() || obj2.is_outrow_lob()) { \
-      LOG_ERROR("not support outrow lobs", K(obj1), K(obj2)); \
-      ret = CR_OB_ERROR; \
-    } else if (OB_FAIL(obj1.get_string(data_str1))) { \
+    ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE); \
+    if (OB_FAIL(obj1.read_lob_data(tmp_allocator, data_str1))) { \
       LOG_ERROR("invalid text object1", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
       ret = CR_OB_ERROR; \
-    } else if (OB_FAIL(obj2.get_string(data_str2))) { \
+    } else if (OB_FAIL(obj2.read_lob_data(tmp_allocator, data_str2))) { \
       LOG_ERROR("invalid text object2", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
       ret = CR_OB_ERROR; \
     } else { \
@@ -949,13 +937,11 @@ int ObObjCmpFuncs::cmp_func<ObEnumSetTC, ObUIntTC>(const ObObj &obj1, \
     } \
     ObString data_str1; \
     ObString data_str2; \
-    if (obj1.is_outrow_lob() || obj2.is_outrow_lob()) { \
-      LOG_ERROR("not support outrow lobs", K(obj1), K(obj2)); \
-      ret = CR_OB_ERROR; \
-    } else if (OB_FAIL(obj1.get_string(data_str1))) { \
+    ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE); \
+    if (OB_FAIL(obj1.read_lob_data(tmp_allocator, data_str1))) { \
       LOG_ERROR("invalid text object1", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
       ret = CR_OB_ERROR; \
-    } else if (OB_FAIL(obj2.get_string(data_str2))) { \
+    } else if (OB_FAIL(obj2.read_lob_data(tmp_allocator, data_str2))) { \
       LOG_ERROR("invalid text object2", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
       ret = CR_OB_ERROR; \
     } else { \
@@ -1326,22 +1312,22 @@ int ObObjCmpFuncs::cmp_func<ObEnumSetTC, ObUIntTC>(const ObObj &obj1, \
     int result = 0;                                                                             \
     ObString data_str1;                                                                         \
     ObString data_str2;                                                                         \
-    if (obj1.is_outrow_lob() || obj2.is_outrow_lob()) {                                         \
-      ret = OB_NOT_SUPPORTED;                                                                   \
-      LOG_ERROR("not support outrow json lobs", K(ret), K(obj1), K(obj2));                      \
-    } else if (OB_FAIL(obj1.get_string(data_str1))) {                                           \
+    ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE);\
+    if (OB_FAIL(obj1.read_lob_data(tmp_allocator, data_str1))) {                                \
       ret = OB_ERR_UNEXPECTED;                                                                  \
       LOG_ERROR("invalid json lob object1", K(ret),                                             \
                 K(obj1.get_collation_type()), K(obj2.get_collation_type()),                     \
                 K(obj1), K(obj2));                                                              \
-    } else if (OB_FAIL(obj2.get_string(data_str2))) {                                           \
+    } else if (OB_FAIL(obj2.read_lob_data(tmp_allocator, data_str2))) {                         \
       ret = OB_ERR_UNEXPECTED;                                                                  \
       LOG_ERROR("invalid json lob object2", K(ret),                                             \
                 K(obj1.get_collation_type()), K(obj2.get_collation_type()),                     \
                 K(obj1), K(obj2));                                                              \
     } else {                                                                                    \
-      ObJsonBin j_bin1(data_str1.ptr(), data_str1.length());                                    \
-      ObJsonBin j_bin2(data_str2.ptr(), data_str2.length());                                    \
+      ObJsonBinCtx ctx1;                                                                        \
+      ObJsonBinCtx ctx2;                                                                        \
+      ObJsonBin j_bin1(data_str1.ptr(), data_str1.length(), &ctx1);                             \
+      ObJsonBin j_bin2(data_str2.ptr(), data_str2.length(), &ctx2);                             \
       ObIJsonBase *j_base1 = &j_bin1;                                                           \
       ObIJsonBase *j_base2 = &j_bin2;                                                           \
       if (OB_FAIL(j_bin1.reset_iter())) {                                                       \
@@ -1370,22 +1356,22 @@ int ObObjCmpFuncs::cmp_func<ObEnumSetTC, ObUIntTC>(const ObObj &obj1, \
     int result = CR_OB_ERROR;                                                                   \
     ObString data_str1;                                                                         \
     ObString data_str2;                                                                         \
-    if (obj1.is_outrow_lob() || obj2.is_outrow_lob()) {                                         \
-      LOG_WARN("not support outrow json lobs", K(obj1), K(obj2));                               \
-      ret = CR_OB_ERROR;                                                                        \
-    } else if (OB_FAIL(obj1.get_string(data_str1))) {                                           \
+    ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE);\
+    if (OB_FAIL(obj1.read_lob_data(tmp_allocator, data_str1))) {                                \
       LOG_WARN("invalid json lob object1",                                                      \
                 K(obj1.get_collation_type()), K(obj2.get_collation_type()),                     \
                 K(obj1), K(obj2));                                                              \
       ret = CR_OB_ERROR;                                                                        \
-    } else if (OB_FAIL(obj2.get_string(data_str2))) {                                           \
+    } else if (OB_FAIL(obj2.read_lob_data(tmp_allocator, data_str2))) {                         \
       LOG_WARN("invalid json lob object2",                                                      \
                 K(obj1.get_collation_type()), K(obj2.get_collation_type()),                     \
                 K(obj1), K(obj2));                                                              \
       ret = CR_OB_ERROR;                                                                        \
     } else {                                                                                    \
-      ObJsonBin j_bin1(data_str1.ptr(), data_str1.length());                                    \
-      ObJsonBin j_bin2(data_str2.ptr(), data_str2.length());                                    \
+      ObJsonBinCtx ctx1;                                                                        \
+      ObJsonBinCtx ctx2;                                                                        \
+      ObJsonBin j_bin1(data_str1.ptr(), data_str1.length(), &ctx1);                             \
+      ObJsonBin j_bin2(data_str2.ptr(), data_str2.length(), &ctx2);                             \
       ObIJsonBase *j_base1 = &j_bin1;                                                           \
       ObIJsonBase *j_base2 = &j_bin2;                                                           \
       if (OB_FAIL(j_bin1.reset_iter())) {                                                       \
@@ -1398,6 +1384,32 @@ int ObObjCmpFuncs::cmp_func<ObEnumSetTC, ObUIntTC>(const ObObj &obj1, \
         result = INT_TO_CR(result);                                                             \
       }                                                                                         \
     }                                                                                           \
+                                                                                                \
+    return result;                                                                              \
+  }
+
+
+#define DEFINE_CMP_FUNC_JSON_EXTEND()                                                           \
+  template <> inline                                                                            \
+  int ObObjCmpFuncs::cmp_func<ObJsonTC, ObExtendTC>(const ObObj &obj1,                          \
+                                                   const ObObj &/*obj2*/,                       \
+                                                   const ObCompareCtx &/*cmp_ctx*/)             \
+  {                                                                                             \
+    int result = INT_TO_CR(-1);                                                                 \
+                                                                                                \
+    return result;                                                                              \
+  }
+
+#define DEFINE_CMP_OP_FUNC_JSON_EXTEND(op, op_str)                                              \
+  template <> inline                                                                            \
+  int ObObjCmpFuncs::cmp_op_func<ObJsonTC, ObExtendTC, op>(const ObObj &obj1,                     \
+                                                         const ObObj &obj2,                     \
+                                                         const ObCompareCtx &cmp_ctx)           \
+  {                                                                                             \
+    OBJ_TYPE_CLASS_CHECK(obj1, ObJsonTC);                                                       \
+    OBJ_TYPE_CLASS_CHECK(obj2, ObExtendTC);                                                     \
+    UNUSED(cmp_ctx);                                                                            \
+    int result = INT_TO_CR(-1);                                                                 \
                                                                                                 \
     return result;                                                                              \
   }
@@ -2049,6 +2061,126 @@ int ObObjCmpFuncs::cmp_func<ObEnumSetInnerTC, real_tc>(const ObObj &obj1, \
     return -ObObjCmpFuncs::cmp_func<ObDecimalIntTC, ObNumberTC>(obj2, obj1, ctx);                  \
   }
 
+// ObUserDefinedSQLTC vs ObUserDefinedSQLTC
+// for udt nested null bitmap
+#define DEFINE_CMP_OP_FUNC_UDT_UDT(op, op_str)                                                \
+  template <> inline                                                                            \
+  int ObObjCmpFuncs::cmp_op_func<ObUserDefinedSQLTC, ObUserDefinedSQLTC, op>(const ObObj &obj1, \
+                                                         const ObObj &obj2,                     \
+                                                         const ObCompareCtx &cmp_ctx)           \
+  {                                                                                             \
+    OBJ_TYPE_CLASS_CHECK(obj1, ObUserDefinedSQLTC);                                                       \
+    OBJ_TYPE_CLASS_CHECK(obj2, ObUserDefinedSQLTC);                                                       \
+    ObCollationType cs_type = cmp_ctx.cmp_cs_type_; \
+    if (CS_TYPE_INVALID == cs_type) { \
+      if (obj1.get_collation_type() != obj2.get_collation_type() \
+          || CS_TYPE_INVALID == obj1.get_collation_type()) { \
+        LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "invalid collation", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
+      } else { \
+        cs_type = obj1.get_collation_type(); \
+      } \
+    } \
+	  return CS_TYPE_INVALID != cs_type \
+           ? static_cast<int>(ObCharset::strcmpsp(cs_type, obj1.v_.string_, obj1.val_len_, \
+                                                  obj2.v_.string_, obj2.val_len_, CALC_WITH_END_SPACE(obj1, obj2, cmp_ctx)) op_str 0) \
+           : CR_OB_ERROR; \
+  }
+
+#define DEFINE_CMP_FUNC_UDT_UDT()                                                             \
+  template <> inline                                                                            \
+  int ObObjCmpFuncs::cmp_func<ObUserDefinedSQLTC, ObUserDefinedSQLTC>(const ObObj &obj1,        \
+                                                const ObObj &obj2,                              \
+                                                const ObCompareCtx &cmp_ctx)                    \
+  {                                                                                             \
+    OBJ_TYPE_CLASS_CHECK(obj1, ObUserDefinedSQLTC);                                             \
+    OBJ_TYPE_CLASS_CHECK(obj2, ObUserDefinedSQLTC);                                             \
+    ObCollationType cs_type = cmp_ctx.cmp_cs_type_; \
+    if (CS_TYPE_INVALID == cs_type) { \
+      if (obj1.get_collation_type() != obj2.get_collation_type() \
+          || CS_TYPE_INVALID == obj1.get_collation_type()) { \
+        LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "invalid collation", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
+      } else { \
+        cs_type = obj1.get_collation_type(); \
+      } \
+    } \
+    return CS_TYPE_INVALID != cs_type \
+           ? INT_TO_CR(ObCharset::strcmpsp(cs_type, obj1.v_.string_, obj1.val_len_, \
+                                           obj2.v_.string_, obj2.val_len_, CALC_WITH_END_SPACE(obj1, obj2, cmp_ctx))) \
+           : CR_OB_ERROR; \
+  }
+
+#define DEFINE_CMP_OP_FUNC_COLLECTION_COLLECTION(op, op_str) \
+  template <> inline \
+  int ObObjCmpFuncs::cmp_op_func<ObCollectionSQLTC, ObCollectionSQLTC, op>(const ObObj &obj1, \
+                                                             const ObObj &obj2, \
+                                                             const ObCompareCtx &cmp_ctx) \
+  { \
+    int ret = CR_OB_ERROR; \
+    OBJ_TYPE_CLASS_CHECK(obj1, ObCollectionSQLTC);\
+    OBJ_TYPE_CLASS_CHECK(obj2, ObCollectionSQLTC);\
+    ObCollationType cs_type = cmp_ctx.cmp_cs_type_; \
+    if (CS_TYPE_INVALID == cs_type) { \
+      if (obj1.get_collation_type() != obj2.get_collation_type() \
+          || CS_TYPE_INVALID == obj1.get_collation_type()) { \
+        LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "invalid collation", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
+      } else { \
+        cs_type = obj1.get_collation_type(); \
+      } \
+    } \
+    ObString data_str1;\
+    ObString data_str2;\
+    ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE); \
+    if (OB_FAIL(obj1.read_lob_data(tmp_allocator, data_str1))) { \
+      LOG_ERROR("invalid text object1", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
+      ret = CR_OB_ERROR; \
+    } else if (OB_FAIL(obj2.read_lob_data(tmp_allocator, data_str2))) { \
+      LOG_ERROR("invalid text object2", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
+      ret = CR_OB_ERROR; \
+    } else { \
+      ret = CS_TYPE_INVALID != cs_type \
+            ? static_cast<int>(ObCharset::strcmpsp(cs_type, data_str1.ptr(), data_str1.length(), \
+                                                   data_str2.ptr(), data_str2.length(), \
+                                                   CALC_WITH_END_SPACE(obj1, obj2, cmp_ctx)) op_str 0) \
+            : CR_OB_ERROR; \
+    } \
+    return ret; \
+  }
+
+#define DEFINE_CMP_FUNC_COLLECTION_COLLECTION() \
+  template <> inline \
+  int ObObjCmpFuncs::cmp_func<ObCollectionSQLTC, ObCollectionSQLTC>(const ObObj &obj1, \
+                                                      const ObObj &obj2, \
+                                                      const ObCompareCtx &cmp_ctx) \
+  { \
+    int ret = CR_OB_ERROR; \
+    OBJ_TYPE_CLASS_CHECK(obj1, ObCollectionSQLTC);\
+    OBJ_TYPE_CLASS_CHECK(obj2, ObCollectionSQLTC);\
+    ObCollationType cs_type = cmp_ctx.cmp_cs_type_; \
+    if (CS_TYPE_INVALID == cs_type) { \
+      if (obj1.get_collation_type() != obj2.get_collation_type() \
+          || CS_TYPE_INVALID == obj1.get_collation_type()) { \
+        LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "invalid collation", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
+      } else { \
+        cs_type = obj1.get_collation_type(); \
+      } \
+    } \
+    ObString data_str1;\
+    ObString data_str2;\
+    ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE); \
+    if (OB_FAIL(obj1.read_lob_data(tmp_allocator, data_str1))) { \
+      LOG_ERROR("invalid text object1", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
+      ret = CR_OB_ERROR; \
+    } else if (OB_FAIL(obj2.read_lob_data(tmp_allocator, data_str2))) { \
+      LOG_ERROR("invalid text object2", K(obj1.get_collation_type()), K(obj2.get_collation_type()), K(obj1), K(obj2)); \
+    } else { \
+      ret = CS_TYPE_INVALID != cs_type \
+            ? INT_TO_CR(ObCharset::strcmpsp(cs_type, data_str1.ptr(), data_str1.length(), \
+                                                   data_str2.ptr(), data_str2.length(), \
+                                                   CALC_WITH_END_SPACE(obj1, obj2, cmp_ctx))) \
+            : CR_OB_ERROR; \
+    } \
+    return ret; \
+  }
 //==============================
 
 #define DEFINE_CMP_FUNCS(tc, type) \
@@ -2331,6 +2463,12 @@ int ObObjCmpFuncs::cmp_func<ObEnumSetInnerTC, real_tc>(const ObObj &obj1, \
 #define DEFINE_CMP_FUNCS_YEAR_YEAR() \
   DEFINE_CMP_FUNCS(ObYearTC, year);
 
+#define DEFINE_CMP_FUNCS_MYSQL_DATE_MYSQL_DATE() \
+  DEFINE_CMP_FUNCS(ObMySQLDateTC, mysql_date);
+
+#define DEFINE_CMP_FUNCS_MYSQL_DATETIME_MYSQL_DATETIME() \
+  DEFINE_CMP_FUNCS(ObMySQLDateTimeTC, mysql_datetime);
+
 #define DEFINE_CMP_FUNCS_DATETIME_OTIMESTAMP() \
     DEFINE_CMP_OP_FUNC_DT_OT(CO_EQ, ==); \
     DEFINE_CMP_OP_FUNC_DT_OT(CO_LE, <=); \
@@ -2506,6 +2644,24 @@ int ObObjCmpFuncs::cmp_func<ObEnumSetInnerTC, real_tc>(const ObObj &obj1, \
   DEFINE_CMP_OP_FUNC_GEOMETRY_GEOMETRY(CO_NE, !=); \
   DEFINE_CMP_FUNC_GEOMETRY_GEOMETRY()
 
+#define DEFINE_CMP_FUNCS_UDT_UDT() \
+  DEFINE_CMP_OP_FUNC_UDT_UDT(CO_EQ, ==); \
+  DEFINE_CMP_OP_FUNC_UDT_UDT(CO_LE, <=); \
+  DEFINE_CMP_OP_FUNC_UDT_UDT(CO_LT, < ); \
+  DEFINE_CMP_OP_FUNC_UDT_UDT(CO_GE, >=); \
+  DEFINE_CMP_OP_FUNC_UDT_UDT(CO_GT, > ); \
+  DEFINE_CMP_OP_FUNC_UDT_UDT(CO_NE, !=); \
+  DEFINE_CMP_FUNC_UDT_UDT()
+
+#define DEFINE_CMP_FUNCS_COLLECTION_COLLECTION() \
+  DEFINE_CMP_OP_FUNC_COLLECTION_COLLECTION(CO_EQ, ==); \
+  DEFINE_CMP_OP_FUNC_COLLECTION_COLLECTION(CO_LE, <=); \
+  DEFINE_CMP_OP_FUNC_COLLECTION_COLLECTION(CO_LT, < ); \
+  DEFINE_CMP_OP_FUNC_COLLECTION_COLLECTION(CO_GE, >=); \
+  DEFINE_CMP_OP_FUNC_COLLECTION_COLLECTION(CO_GT, > ); \
+  DEFINE_CMP_OP_FUNC_COLLECTION_COLLECTION(CO_NE, !=); \
+  DEFINE_CMP_FUNC_COLLECTION_COLLECTION()
+
 #define DEFINE_CMP_FUNCS_STRING_TEXT() \
   DEFINE_CMP_OP_FUNC_STRING_TEXT(CO_EQ, ==); \
   DEFINE_CMP_OP_FUNC_STRING_TEXT(CO_LE, <=); \
@@ -2579,6 +2735,15 @@ int ObObjCmpFuncs::cmp_func<ObEnumSetInnerTC, real_tc>(const ObObj &obj1, \
   DEFINE_CMP_OP_FUNC_EXT_XXX(CO_GT, CO_LT); \
   DEFINE_CMP_OP_FUNC_EXT_XXX(CO_NE, CO_NE); \
   DEFINE_CMP_FUNC_EXT_XXX()
+
+#define DEFINE_CMP_FUNCS_JSON_EXTEND() \
+  DEFINE_CMP_OP_FUNC_JSON_EXTEND(CO_EQ, ==); \
+  DEFINE_CMP_OP_FUNC_JSON_EXTEND(CO_LE, <=); \
+  DEFINE_CMP_OP_FUNC_JSON_EXTEND(CO_LT, < ); \
+  DEFINE_CMP_OP_FUNC_JSON_EXTEND(CO_GE, >=); \
+  DEFINE_CMP_OP_FUNC_JSON_EXTEND(CO_GT, > ); \
+  DEFINE_CMP_OP_FUNC_JSON_EXTEND(CO_NE, !=); \
+  DEFINE_CMP_FUNC_JSON_EXTEND()
 
 #define DEFINE_CMP_FUNCS_UNKNOWN_UNKNOWN() \
   DEFINE_CMP_FUNCS(ObUnknownTC, unknown);
@@ -2659,6 +2824,8 @@ DEFINE_CMP_FUNCS_TEXT_STRING();
 DEFINE_CMP_FUNCS_LOB_LOB();
 DEFINE_CMP_FUNCS_JSON_JSON();
 DEFINE_CMP_FUNCS_GEOMETRY_GEOMETRY();
+DEFINE_CMP_FUNCS_UDT_UDT();
+DEFINE_CMP_FUNCS_COLLECTION_COLLECTION();
 
 DEFINE_CMP_FUNCS_ENUMSETINNER_INT();
 DEFINE_CMP_FUNCS_ENUMSETINNER_UINT();
@@ -2676,6 +2843,9 @@ DEFINE_CMP_FUNCS_NULL_XXX();
 DEFINE_CMP_FUNCS_XXX_NULL();
 DEFINE_CMP_FUNCS_XXX_EXT();
 DEFINE_CMP_FUNCS_EXT_XXX();
+DEFINE_CMP_FUNCS_JSON_EXTEND();
+DEFINE_CMP_FUNCS_MYSQL_DATE_MYSQL_DATE();
+DEFINE_CMP_FUNCS_MYSQL_DATETIME_MYSQL_DATETIME();
 
 #define DEFINE_CMP_FUNCS_ENTRY(tc1, tc2) \
 { \
@@ -2685,10 +2855,11 @@ DEFINE_CMP_FUNCS_EXT_XXX();
   ObObjCmpFuncs::cmp_op_func<tc1, tc2, CO_GE>, \
   ObObjCmpFuncs::cmp_op_func<tc1, tc2, CO_GT>, \
   ObObjCmpFuncs::cmp_op_func<tc1, tc2, CO_NE>, \
-  ObObjCmpFuncs::cmp_func<tc1, tc2> \
+  ObObjCmpFuncs::cmp_func<tc1, tc2>,           \
+  NULL                                         \
 }
 
-#define DEFINE_CMP_FUNCS_ENTRY_NULL   {NULL, NULL, NULL, NULL, NULL, NULL, NULL}
+#define DEFINE_CMP_FUNCS_ENTRY_NULL   {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL}
 
 #define DECLARE_CMP_FUNCS_NULLSAFE_NULL_NULL \
   ObObjStrongCompare::compare_nullsafe_null_null
@@ -2777,6 +2948,8 @@ DEFINE_CMP_FUNCS_NULLSAFE_NULL_NULL
 DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObBitTC, ObBitTC, ObMaxTC, ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObDateTC, ObDateTC, ObMaxTC, ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObDateTimeTC, ObDateTimeTC, ObMaxTC, ObMaxTC)
+DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObMySQLDateTC, ObMySQLDateTC, ObMaxTC, ObMaxTC)
+DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObMySQLDateTimeTC, ObMySQLDateTimeTC, ObMaxTC, ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObDoubleTC, ObDoubleTC, ObMaxTC, ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObDoubleTC, ObEnumSetTC, ObMaxTC, ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObDoubleTC, ObFloatTC, ObMaxTC, ObMaxTC)
@@ -2843,745 +3016,15 @@ DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObDecimalIntTC, ObUIntTC, ObMaxTC, ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObDecimalIntTC, ObNumberTC, ObMaxTC, ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObDecimalIntTC, ObEnumSetTC, ObMaxTC, ObMaxTC)
 
+DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObUserDefinedSQLTC, ObUserDefinedSQLTC, ObMaxTC, ObMaxTC)
+DEFINE_CMP_FUNCS_NULLSAFE_ENTRY(ObCollectionSQLTC, ObCollectionSQLTC, ObMaxTC, ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObExtendTC)
 DEFINE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC)
 DEFINE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObExtendTC)
 DEFINE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC)
 }
 
-const obj_cmp_func_nullsafe ObObjCmpFuncs::cmp_funcs_nullsafe[ObMaxTC][ObMaxTC] =
-{
-  { // null
-    DECLARE_CMP_FUNCS_NULLSAFE_NULL_NULL,
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObExtendTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC), //bit
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),//setenun
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),//setenuninner
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),// otimestamp
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),// raw
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),//interval
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),//rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    DECLARE_CMP_FUNCS_NULLSAFE_LEFTNULL_ENTRY(ObMaxTC),// decimalint
-  },
-  { // int
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObIntTC, ObIntTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObIntTC, ObUIntTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObIntTC, ObFloatTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObIntTC, ObDoubleTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObIntTC, ObNumberTC, ObMaxTC, ObMaxTC),
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    NULL,  // unknown
-    NULL, //text
-    NULL,  // bit
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObIntTC, ObEnumSetTC, ObMaxTC, ObMaxTC),  // enumset
-    NULL,  //enumsetInner will not go here,
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObIntTC, ObDecimalIntTC, ObMaxTC, ObMaxTC) // decimal int
-  },
-  { // uint
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObUIntTC, ObIntTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObUIntTC, ObUIntTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObUIntTC, ObFloatTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObUIntTC, ObDoubleTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObUIntTC, ObNumberTC, ObMaxTC, ObMaxTC),
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    NULL,  // unknown
-    NULL, //text
-    NULL,  // bit
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObUIntTC, ObEnumSetTC, ObMaxTC, ObMaxTC),//enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObUIntTC, ObDecimalIntTC, ObMaxTC, ObMaxTC) // decimal int
-  },
-  { // float
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObFloatTC, ObIntTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObFloatTC, ObUIntTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObFloatTC, ObFloatTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObFloatTC, ObDoubleTC, ObMaxTC, ObMaxTC),
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    NULL,  // unknown
-    NULL, //text
-    NULL,  // bit
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObFloatTC, ObEnumSetTC, ObMaxTC, ObMaxTC),//enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // double
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDoubleTC, ObIntTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDoubleTC, ObUIntTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDoubleTC, ObFloatTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDoubleTC, ObDoubleTC, ObMaxTC, ObMaxTC),
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    NULL,  // unknown
-    NULL, //text
-    NULL,  // bit
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDoubleTC, ObEnumSetTC, ObMaxTC, ObMaxTC),//enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimstamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // number
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObNumberTC, ObIntTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObNumberTC, ObUIntTC, ObMaxTC, ObMaxTC),
-    NULL,  // float
-    NULL,  // double
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObNumberTC, ObNumberTC, ObMaxTC, ObMaxTC),
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    NULL,  // unknown
-    NULL, //text
-    NULL,  // bit
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObNumberTC, ObEnumSetTC, ObMaxTC, ObMaxTC),//enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObNumberTC, ObDecimalIntTC, ObMaxTC, ObMaxTC) // decimal int
-  },
-  { // datetime
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDateTimeTC, ObDateTimeTC, ObMaxTC, ObMaxTC),
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    NULL,  // unknown
-    NULL, //text
-    NULL,  // bit
-    NULL,  //enumset
-    NULL,  //enumsetInner will not go here
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDateTimeTC, ObDateTimeTC, ObMaxTC, ObMaxTC), // otimestamp
-    NULL, //raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimalint
-  },
-  { // date
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    NULL,  // datetime
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDateTC, ObDateTC, ObMaxTC, ObMaxTC),
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    NULL,  // unknown
-    NULL,  //text
-    NULL,  // bit
-    NULL,  // enumset
-    NULL,  //enumsetInner will not go here
-    NULL,  // otimestamp
-    NULL,  // raw
-    NULL,  // interval
-    NULL,  // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // time
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObTimeTC, ObTimeTC, ObMaxTC, ObMaxTC),
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    NULL,  // unknown
-    NULL, //text
-    NULL,  // bit
-    NULL,  // enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // year
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObYearTC, ObYearTC, ObMaxTC, ObMaxTC),
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    NULL,  // unknown
-    NULL, //text
-    NULL,  // bit
-    NULL,  // enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // string
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObStringTC, ObStringTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    NULL,  // unknown
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObStringTC, ObTextTC, ObMaxTC, ObMaxTC), //text
-    NULL,  // bit
-    NULL,  // enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // extend
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObExtendTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObExtendTC, ObExtendTC, ObExtendTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC), //text
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC), //enumset
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC), //enumsetInner
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC), // otimestamp
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC), // raw
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC), // interval
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC), // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObExtendTC, ObMaxTC, ObExtendTC, ObMaxTC), // decimalint
-  },
-  { // unknown
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObUnknownTC, ObUnknownTC, ObMaxTC, ObMaxTC),
-    NULL, //text
-    NULL,  // bit
-    NULL,  //enumset
-    NULL,  //enumsetInner
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // text
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObTextTC, ObStringTC, ObMaxTC, ObMaxTC),  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),  // extend
-    NULL,  // unknown
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObTextTC, ObTextTC, ObMaxTC, ObMaxTC), //  text
-    NULL,  // bit
-    NULL,  // enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // bit
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),  // extend
-    NULL,  // unknown
-    NULL, //  text
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObBitTC, ObBitTC, ObMaxTC, ObMaxTC),// bit
-    NULL,  //enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { //enumset
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetTC, ObIntTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetTC, ObUIntTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetTC, ObFloatTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetTC, ObDoubleTC, ObMaxTC, ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetTC, ObNumberTC, ObMaxTC, ObMaxTC),
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC),
-    NULL,  // unknown
-    NULL, //text
-    NULL,  //bit
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetTC, ObEnumSetTC, ObMaxTC, ObMaxTC),//enumset just for sort
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetTC, ObDecimalIntTC, ObMaxTC, ObMaxT)
-  },
-  { //enumsetInner
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetInnerTC, ObIntTC, ObMaxTC, ObMaxTC), //int
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetInnerTC, ObUIntTC, ObMaxTC, ObMaxTC),//uint
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetInnerTC, ObFloatTC, ObMaxTC, ObMaxTC), //float
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetInnerTC, ObDoubleTC, ObMaxTC, ObMaxTC),//double
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetInnerTC, ObNumberTC, ObMaxTC, ObMaxTC), //number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC), //extended
-    NULL,  // unknown
-    NULL,  //text
-    NULL,  //bit
-    NULL,  //enumset will not go here
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObEnumSetInnerTC, ObDecimalIntTC, ObMaxTC, ObMaxTC) // decimal int
-  },
-  { // otimestamp
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL, // int
-    NULL, // uint
-    NULL, // float
-    NULL, // double
-    NULL, // number
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObOTimestampTC, ObDateTimeTC, ObMaxTC, ObMaxTC),
-    NULL, // date
-    NULL, // time
-    NULL, // year
-    NULL, // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObMaxTC), // extended
-    NULL, // unknown
-    NULL, // text
-    NULL, // bit
-    NULL, // enumset
-    NULL, // enumsetInner will not go here
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObOTimestampTC, ObOTimestampTC, ObMaxTC, ObMaxTC), // otimestamp
-    NULL, //raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // raw
-   DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-   NULL, // int
-   NULL, // uint
-   NULL, // float
-   NULL, // double
-   NULL, // number
-   NULL, // datetime
-   NULL, // date
-   NULL, // time
-   NULL, // year
-   NULL, // string
-   DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObMaxTC),
-   NULL, // unknown
-   NULL, // text
-   NULL, // bit
-   NULL, // enumset
-   NULL, // enumsetInner will not go here
-   NULL, // otimestamp
-   DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObRawTC, ObRawTC, ObMaxTC, ObMaxTC), // raw
-   NULL, // interval
-   NULL, // rowid
-   NULL, // lob
-   NULL, // json
-   NULL, // geometry
-   NULL, // udt
-   NULL, // decimal int
-  },
-  { // interval
-   DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-   NULL, // int
-   NULL, // uint
-   NULL, // float
-   NULL, // double
-   NULL, // number
-   NULL, // datetime
-   NULL, // date
-   NULL, // time
-   NULL, // year
-   NULL, // string
-   DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObMaxTC),
-   NULL, // unknown
-   NULL, // text
-   NULL, // bit
-   NULL, // enumset
-   NULL, // enumsetInner will not go here
-   NULL, // otimestamp
-   NULL, // raw
-   DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObIntervalTC, ObIntervalTC, ObMaxTC, ObMaxTC), // interval
-   NULL, // rowid
-   NULL, // lob
-   NULL, // json
-   NULL, // geometry
-   NULL, // udt
-   NULL, // decimal int
-  },
-  { // rowid
-   DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-   NULL, // int
-   NULL, // uint
-   NULL, // float
-   NULL, // double
-   NULL, // number
-   NULL, // datetime
-   NULL, // date
-   NULL, // time
-   NULL, // year
-   NULL, // string
-   DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObMaxTC),
-   NULL, // unknown
-   NULL, // text
-   NULL, // bit
-   NULL, // enumset
-   NULL, // enumsetInner will not go here
-   NULL, // otimestamp
-   NULL, // raw
-   NULL, // interval
-   DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObRowIDTC, ObRowIDTC, ObMaxTC, ObMaxTC), // rowid
-   NULL, // lob
-   NULL, // json
-   NULL, // geometry
-   NULL, // udt
-   NULL, // decimal int
-  },
-  { // lob
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    NULL,  // extend
-    NULL,  // unknown
-    NULL,  // text
-    NULL,  // bit
-    NULL,  // enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObLobTC, ObLobTC, ObMaxTC, ObMaxTC), // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // json
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    NULL,  // extend
-    NULL,  // unknown
-    NULL,  // text
-    NULL,  // bit
-    NULL,  // enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObJsonTC, ObJsonTC, ObMaxTC, ObMaxTC), // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // geometry
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    NULL,  // extend
-    NULL,  // unknown
-    NULL,  // text
-    NULL,  // bit
-    NULL,  // enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObGeometryTC, ObGeometryTC, ObMaxTC, ObMaxTC), // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // udt
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC),
-    NULL,  // int
-    NULL,  // uint
-    NULL,  // float
-    NULL,  // double
-    NULL,  // number
-    NULL,  // datetime
-    NULL,  // date
-    NULL,  // time
-    NULL,  // year
-    NULL,  // string
-    NULL,  // extend
-    NULL,  // unknown
-    NULL,  // text
-    NULL,  // bit
-    NULL,  // enumset
-    NULL,  //enumsetInner will not go here
-    NULL, // otimestamp
-    NULL, // raw
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    NULL, // decimal int
-  },
-  { // decimal int
-    DECLARE_CMP_FUNCS_NULLSAFE_RIGHTNULL_ENTRY(ObMaxTC), // null
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDecimalIntTC, ObIntTC, ObMaxTC, ObMaxTC), // int
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDecimalIntTC, ObUIntTC, ObMaxTC, ObMaxTC), // uint
-    NULL, // float
-    NULL, // double
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDecimalIntTC, ObNumberTC, ObMaxTC, ObMaxTC), // number
-    NULL, // datetime
-    NULL, // date
-    NULL, // time
-    NULL, // year
-    NULL, // string
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObMaxTC, ObExtendTC, ObMaxTC, ObExtendTC), // extend
-    NULL, // unknown
-    NULL, // text
-    NULL, // bit
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDecimalIntTC, ObEnumSetTC, ObMaxTC, ObMaxTC), // enumset
-    NULL, // enumset inner
-    NULL, // otimestamp
-    NULL, // raw.
-    NULL, // interval
-    NULL, // rowid
-    NULL, // lob
-    NULL, // json
-    NULL, // geometry
-    NULL, // udt
-    DECLARE_CMP_FUNCS_NULLSAFE_ENTRY(ObDecimalIntTC, ObDecimalIntTC, ObMaxTC, ObMaxTC), // decimalint
-  }
-};
-
-const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
+const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC+1][ObMaxTC+1][CO_MAX+1] =
 {
   { // null
     DEFINE_CMP_FUNCS_ENTRY(ObNullTC, ObNullTC),
@@ -3610,6 +3053,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY(ObNullTC, ObMaxTC),//geometry
     DEFINE_CMP_FUNCS_ENTRY(ObNullTC, ObMaxTC),//udt
     DEFINE_CMP_FUNCS_ENTRY(ObNullTC, ObMaxTC), // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY(ObNullTC, ObMaxTC), // mysql date
+    DEFINE_CMP_FUNCS_ENTRY(ObNullTC, ObMaxTC), // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY(ObNullTC, ObMaxTC), // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // int
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3638,6 +3086,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY(ObIntTC, ObDecimalIntTC), // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // uint
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3666,6 +3119,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY(ObUIntTC, ObDecimalIntTC), // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // float
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3694,6 +3152,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL, // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // double
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3722,6 +3185,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // number
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3750,6 +3218,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY(ObNumberTC, ObDecimalIntTC), // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // datetime
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3778,6 +3251,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // date
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3806,6 +3284,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // time
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3834,6 +3317,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // year
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3862,6 +3350,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // string
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3890,6 +3383,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // extend
     DEFINE_CMP_FUNCS_ENTRY(ObExtendTC, ObNullTC),
@@ -3918,6 +3416,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY(ObExtendTC, ObMaxTC), // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY(ObExtendTC, ObMaxTC), // mysql date
+    DEFINE_CMP_FUNCS_ENTRY(ObExtendTC, ObMaxTC), // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // unknown
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3946,6 +3449,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // text
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -3974,6 +3482,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // bit
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -4002,6 +3515,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { //enumset
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -4030,6 +3548,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY(ObEnumSetTC, ObDecimalIntTC), // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { //enumsetInner
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -4058,6 +3581,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY(ObEnumSetInnerTC, ObDecimalIntTC), // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // otimestamp
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -4086,6 +3614,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // raw
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC),
@@ -4114,6 +3647,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // interval
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC), //null
@@ -4142,6 +3680,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // rowid
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC), //null
@@ -4170,6 +3713,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // lob
     DEFINE_CMP_FUNCS_ENTRY_NULL, //null
@@ -4198,6 +3746,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // json
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC), //null
@@ -4211,7 +3764,7 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // time
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // year
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // string
-    DEFINE_CMP_FUNCS_ENTRY_NULL,  //extend
+    DEFINE_CMP_FUNCS_ENTRY(ObJsonTC, ObExtendTC), //extend
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // unknown
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // text
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // bit
@@ -4226,6 +3779,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL, // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // geometry
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC), //null
@@ -4254,6 +3812,11 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY(ObGeometryTC, ObGeometryTC),  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // udt
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC), //null
@@ -4280,8 +3843,13 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //lob
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //json
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
-    DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
+    DEFINE_CMP_FUNCS_ENTRY(ObUserDefinedSQLTC, ObUserDefinedSQLTC), //  compare for udt nested null bitmap
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
   },
   { // decimalint
     DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC), //null
@@ -4310,6 +3878,176 @@ const obj_cmp_func ObObjCmpFuncs::cmp_funcs[ObMaxTC][ObMaxTC][CO_MAX] =
     DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
     DEFINE_CMP_FUNCS_ENTRY_NULL,  // udt
     DEFINE_CMP_FUNCS_ENTRY(ObDecimalIntTC, ObDecimalIntTC), // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
+  },
+  { // collection
+    DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC), //null
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // int
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // uint
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // float
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // double
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // number
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // date
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // time
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // year
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // string
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //extend
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // unknown
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // text
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // bit
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // enumset
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // enumsetInner will not go here
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // otimestamp
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // raw
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // interval
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //rowid
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //lob
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //json
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY(ObCollectionSQLTC, ObCollectionSQLTC), // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
+  },
+  { // mysql date
+    DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC), //null
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // uint
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // float
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // double
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // number
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // date
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // time
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // year
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // string
+    DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObExtendTC), // extend
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // unknown
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // text
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // bit
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // enumset
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // enumsetInner will not go here
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // otimestamp
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // raw
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // interval
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //rowid
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //lob
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //json
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // collection
+    DEFINE_CMP_FUNCS_ENTRY(ObMySQLDateTC, ObMySQLDateTC), // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
+  },
+  { // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC), //null
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // int
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // uint
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // float
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // double
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // number
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // date
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // time
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // year
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // string
+    DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObExtendTC), // extend
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // unknown
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // text
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // bit
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // enumset
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // enumsetInner will not go here
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // otimestamp
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // raw
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // interval
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //rowid
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //lob
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // json
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // udt
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY(ObMySQLDateTimeTC, ObMySQLDateTimeTC), // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
+  },
+  { // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY(ObMaxTC, ObNullTC), //null
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // int
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // uint
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // float
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // double
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // number
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // date
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // time
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // year
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // string
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //extend
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // unknown
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // text
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // bit
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // enumset
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // enumsetInner will not go here
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // otimestamp
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // raw
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // interval
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //rowid
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //lob
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //json
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //geometry
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  //udt
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL, // ObMaxTC
+  },
+  { // ObMaxTC
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // null
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // int
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // uint
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // float
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // double
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // number
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // date
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // time
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // year
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // string
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // extend
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // unknown
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // text
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // bit
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // enumset
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // enumsetInner will not go here
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // otimestamp
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // raw
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // interval
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // rowid
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // lob
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // json
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // geometry
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // udt
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // decimal int
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // collection
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // mysql date
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // mysql datetime
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // roaringbitmap
+    DEFINE_CMP_FUNCS_ENTRY_NULL,  // ObMaxTC
   },
 };
 
@@ -4336,29 +4074,18 @@ int ObObjCmpFuncs::compare_oper(const ObObj &obj1,
 {
   int ret = OB_SUCCESS;
   int cmp = CR_FALSE;
-  ObObjType type1 = obj1.get_type();
-  ObObjType type2 = obj2.get_type();
-  // maybe we should not check tc1, tc2 and cmp_op,
-  // because this function is so fundamental and performance related.
-  if (OB_UNLIKELY(ob_is_invalid_obj_type(type1)
-                  || ob_is_invalid_obj_type(type2)
-                  || ob_is_invalid_cmp_op_bool(cmp_op))) {
-    LOG_ERROR("invalid obj1 or obj2 or cmp_op", K(obj1), K(obj2), K(cmp_op));
+  obj_cmp_func cmp_op_func = NULL;
+  if (OB_UNLIKELY(false == can_cmp_without_cast(obj1.get_meta(),
+                                                obj2.get_meta(),
+                                                cmp_op,
+                                                cmp_op_func))) {
     ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("obj1 and obj2 can't compare", K(obj1), K(obj2), K(cmp_op));
   } else {
-    obj_cmp_func cmp_op_func = NULL;
-    if (OB_UNLIKELY(false == can_cmp_without_cast(obj1.get_meta(),
-                                                  obj2.get_meta(),
-                                                  cmp_op,
-                                                  cmp_op_func))) {
-      LOG_ERROR("obj1 and obj2 can't compare", K(obj1), K(obj2), K(cmp_op));
+    ObCompareCtx cmp_ctx(ObMaxType, cs_type, true, INVALID_TZ_OFF, default_null_pos());
+    if (OB_UNLIKELY(CR_OB_ERROR == (cmp = cmp_op_func(obj1, obj2, cmp_ctx)))) {
       ret = OB_ERR_UNEXPECTED;
-    } else {
-      ObCompareCtx cmp_ctx(ObMaxType, cs_type, true, INVALID_TZ_OFF, default_null_pos());
-      if (OB_UNLIKELY(CR_OB_ERROR == (cmp = cmp_op_func(obj1, obj2, cmp_ctx)))) {
-        LOG_ERROR("failed to compare obj1 and obj2", K(obj1), K(obj2), K(cmp_op));
-        ret = OB_ERR_UNEXPECTED;
-      }
+      LOG_ERROR("failed to compare obj1 and obj2", K(obj1), K(obj2), K(cmp_op));
     }
   }
   bret = static_cast<bool>(cmp);
@@ -4372,29 +4099,18 @@ bool ObObjCmpFuncs::compare_oper_nullsafe(const ObObj &obj1,
                                           ObCmpOp cmp_op)
 {
   int cmp = CR_FALSE;
-  ObObjType type1 = obj1.get_type();
-  ObObjType type2 = obj2.get_type();
-  // maybe we should not check tc1, tc2 and cmp_op,
-  // because this function is so fundamental and performance related.
-  if (OB_UNLIKELY(ob_is_invalid_obj_type(type1)
-                  || ob_is_invalid_obj_type(type2)
-                  || ob_is_invalid_cmp_op_bool(cmp_op))) {
-    LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "invalid obj1 or obj2 or cmp_op", K(obj1), K(obj2), K(cmp_op));
+  obj_cmp_func cmp_op_func = NULL;
+  if (OB_UNLIKELY(false == can_cmp_without_cast(obj1.get_meta(),
+                                                obj2.get_meta(),
+                                                cmp_op,
+                                                cmp_op_func))) {
+    LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "obj1 and obj2 can't compare", K(obj1), K(obj2), K(cmp_op));
     right_to_die_or_duty_to_live();
   } else {
-    obj_cmp_func cmp_op_func = NULL;
-    if (OB_UNLIKELY(false == can_cmp_without_cast(obj1.get_meta(),
-                                                  obj2.get_meta(),
-                                                  cmp_op,
-                                                  cmp_op_func))) {
-      LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "obj1 and obj2 can't compare", K(obj1), K(obj2), K(cmp_op));
+    ObCompareCtx cmp_ctx(ObMaxType, cs_type, true, INVALID_TZ_OFF, default_null_pos());
+    if (OB_UNLIKELY(CR_OB_ERROR == (cmp = cmp_op_func(obj1, obj2, cmp_ctx)))) {
+      LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "failed to compare obj1 and obj2", K(obj1), K(obj2), K(cmp_op));
       right_to_die_or_duty_to_live();
-    } else {
-      ObCompareCtx cmp_ctx(ObMaxType, cs_type, true, INVALID_TZ_OFF, default_null_pos());
-      if (OB_UNLIKELY(CR_OB_ERROR == (cmp = cmp_op_func(obj1, obj2, cmp_ctx)))) {
-        LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "failed to compare obj1 and obj2", K(obj1), K(obj2), K(cmp_op));
-        right_to_die_or_duty_to_live();
-      }
     }
   }
   return static_cast<bool>(cmp);
@@ -4453,29 +4169,17 @@ int ObObjCmpFuncs::compare(const ObObj &obj1,
                            int &cmp)
 {
   int ret = OB_SUCCESS;
-  ObObjType type1 = obj1.get_type();
-  ObObjType type2 = obj2.get_type();
   cmp = CR_EQ;
-  // maybe we should not check tc1 and tc2,
-  // because this function is so fundamental and performance related.
-  if (ob_is_invalid_obj_type(type1)
-                  || ob_is_invalid_obj_type(type2)) {
-    LOG_ERROR("invalid obj1 or obj2", K(obj1), K(obj2));
+  obj_cmp_func cmp_func = NULL;
+  if (OB_UNLIKELY(false == can_cmp_without_cast(obj1.get_meta(),
+                                                obj2.get_meta(),
+                                                CO_CMP,
+                                                cmp_func))) {
     ret = OB_ERR_UNEXPECTED;
-  } else {
-    obj_cmp_func cmp_func = NULL;
-    if (OB_UNLIKELY(false == can_cmp_without_cast(obj1.get_meta(),
-                                                  obj2.get_meta(),
-                                                  CO_CMP,
-                                                  cmp_func))) {
-      LOG_ERROR("obj1 and obj2 can't compare", K(obj1), K(obj2));
-      ret = OB_ERR_UNEXPECTED;
-    } else if (OB_UNLIKELY(CR_OB_ERROR == (cmp = cmp_func(obj1, obj2, cmp_ctx)))) {
-      LOG_ERROR("failed to compare obj1 and obj2", K(obj1), K(obj2));
-      ret = OB_ERR_UNEXPECTED;
-    } else {
-      // do nothing
-    }
+    LOG_ERROR("obj1 and obj2 can't compare", K(obj1), K(obj2));
+  } else if (OB_UNLIKELY(CR_OB_ERROR == (cmp = cmp_func(obj1, obj2, cmp_ctx)))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("failed to compare obj1 and obj2", K(obj1), K(obj2));
   }
   return ret;
 }
@@ -4486,28 +4190,16 @@ int ObObjCmpFuncs::compare_nullsafe(const ObObj &obj1,
                                     ObCompareCtx &cmp_ctx)
 {
   int cmp = CR_EQ;
-  ObObjType type1 = obj1.get_type();
-  ObObjType type2 = obj2.get_type();
-  // maybe we should not check tc1 and tc2,
-  // because this function is so fundamental and performance related.
-  if (ob_is_invalid_obj_type(type1)
-                  || ob_is_invalid_obj_type(type2)) {
-    LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "invalid obj1 or obj2", K(obj1), K(obj2));
+  obj_cmp_func cmp_func = NULL;
+  if (OB_UNLIKELY(false == can_cmp_without_cast(obj1.get_meta(),
+                                                obj2.get_meta(),
+                                                CO_CMP,
+                                                cmp_func))) {
+    LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "obj1 and obj2 can't compare", K(obj1), K(obj2));
     right_to_die_or_duty_to_live();
-  } else {
-    obj_cmp_func cmp_func = NULL;
-    if (OB_UNLIKELY(false == can_cmp_without_cast(obj1.get_meta(),
-                                                  obj2.get_meta(),
-                                                  CO_CMP,
-                                                  cmp_func))) {
-      LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "obj1 and obj2 can't compare", K(obj1), K(obj2));
-      right_to_die_or_duty_to_live();
-    } else if (OB_UNLIKELY(CR_OB_ERROR == (cmp = cmp_func(obj1, obj2, cmp_ctx)))) {
-      LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "failed to compare obj1 and obj2", K(obj1), K(obj2));
-      right_to_die_or_duty_to_live();
-    } else {
-      // do nothing
-    }
+  } else if (OB_UNLIKELY(CR_OB_ERROR == (cmp = cmp_func(obj1, obj2, cmp_ctx)))) {
+    LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "failed to compare obj1 and obj2", K(obj1), K(obj2));
+    right_to_die_or_duty_to_live();
   }
   return cmp;
 }

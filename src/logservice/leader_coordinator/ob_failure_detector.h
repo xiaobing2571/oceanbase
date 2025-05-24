@@ -18,6 +18,8 @@
 #include "lib/container/ob_array.h"
 #include "lib/lock/ob_spin_lock.h"
 #include "share/ob_occam_timer.h"
+#include "logservice/ipalf/ipalf_handle.h"
+#include "logservice/palf/palf_handle.h"        // PalfHandle
 
 namespace oceanbase
 {
@@ -96,6 +98,10 @@ public:
   bool is_clog_disk_has_full_error();
   bool is_data_disk_has_fatal_error();
   bool is_schema_not_refreshed();
+  bool is_data_disk_full() const
+  {
+    return has_add_disk_full_event_;
+  }
 private:
   bool check_is_running_() const { return is_running_; }
   int insert_event_to_table_(const FailureEvent &event, const ObFunction<bool()> &recover_operation, ObString info);
@@ -103,6 +109,10 @@ private:
   void detect_data_disk_io_failure_();
   void detect_palf_disk_full_();
   void detect_schema_not_refreshed_();
+  void detect_data_disk_full_();
+#ifdef OB_BUILD_ARBITRATION
+  void detect_election_silent_();
+#endif
 private:
   struct FailureEventWithRecoverOp {
     int init(const FailureEvent &event, const ObFunction<bool()> &recover_detect_operation);
@@ -111,6 +121,22 @@ private:
     ObFunction<bool()> recover_detect_operation_;
     TO_STRING_KV(K_(event));
   };
+
+#ifdef OB_BUILD_ARBITRATION
+  class GetElectionSilentFunctor
+  {
+  public:
+    GetElectionSilentFunctor(bool &is_election_silent) : is_election_silent_(is_election_silent) {}
+    int operator()(const palf::PalfHandle &palf_handle) {
+      if (true == palf_handle.is_election_silent()) {
+        is_election_silent_ = true;
+      }
+      return OB_SUCCESS;
+    }
+  private:
+    bool &is_election_silent_;
+  };
+#endif
   bool is_running_;
   common::ObArray<FailureEventWithRecoverOp> events_with_ops_;
   common::ObArray<common::ObAddr> tenant_server_list_;
@@ -121,6 +147,8 @@ private:
   bool has_add_data_disk_hang_event_;
   bool has_add_clog_full_event_;
   bool has_schema_error_;
+  bool has_add_disk_full_event_;
+  bool has_election_silent_event_;
   ObSpinLock lock_;
 };
 

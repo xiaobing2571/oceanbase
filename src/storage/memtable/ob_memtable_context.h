@@ -21,6 +21,7 @@
 #include "lib/utility/ob_macro_utils.h"
 #include "ob_clock_generator.h"
 #include "share/ob_define.h"
+#include "storage/ob_memtable_ctx_obj_pool.h"
 #include "storage/memtable/ob_memtable_interface.h"
 #include "storage/memtable/ob_memtable_mutator.h"
 #include "storage/memtable/ob_redo_log_generator.h"
@@ -181,16 +182,19 @@ public:
     ATOMIC_STORE(&alloc_size_, 0);
     return ret;
   }
-  void reset()
+  void reset(bool only_check = false)
   {
     if (OB_UNLIKELY(ATOMIC_LOAD(&free_count_) != ATOMIC_LOAD(&alloc_count_))) {
       TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "query allocator leak found", K(alloc_count_), K(free_count_), K(alloc_size_));
+      OB_SAFE_ABORT();
     }
-    allocator_.reset();
-    ATOMIC_STORE(&alloc_count_, 0);
-    ATOMIC_STORE(&free_count_, 0);
-    ATOMIC_STORE(&alloc_size_, 0);
-    ATOMIC_STORE(&is_inited_, false);
+    if (!only_check) {
+      allocator_.reset();
+      ATOMIC_STORE(&alloc_count_, 0);
+      ATOMIC_STORE(&free_count_, 0);
+      ATOMIC_STORE(&alloc_size_, 0);
+      ATOMIC_STORE(&is_inited_, false);
+    }
   }
   void *alloc(const int64_t size) override
   {
@@ -268,16 +272,19 @@ public:
     ATOMIC_STORE(&alloc_size_, 0);
     return ret;
   }
-  void reset()
+  void reset(bool only_check = false)
   {
     if (OB_UNLIKELY(free_count_ != alloc_count_)) {
       TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "callback memory leak found", K(alloc_count_), K(free_count_), K(alloc_size_));
+      OB_SAFE_ABORT();
     }
-    allocator_.reset();
-    ATOMIC_STORE(&alloc_count_, 0);
-    ATOMIC_STORE(&free_count_, 0);
-    ATOMIC_STORE(&alloc_size_, 0);
-    ATOMIC_STORE(&is_inited_, false);
+    if (!only_check) {
+      allocator_.reset();
+      ATOMIC_STORE(&alloc_count_, 0);
+      ATOMIC_STORE(&free_count_, 0);
+      ATOMIC_STORE(&alloc_size_, 0);
+      ATOMIC_STORE(&is_inited_, false);
+    }
   }
   void *alloc(const int64_t size) override
   {
@@ -316,7 +323,7 @@ private:
 
 class ObMemtable;
 typedef common::ObIDMap<ObIMemtableCtx, uint32_t> MemtableIDMap;
-class ObMemtableCtx final : public ObIMemtableCtx
+class ObMemtableCtx : public ObIMemtableCtx
 {
   using RWLock = common::SpinRWLock;
   using WRLockGuard = common::SpinWLockGuard;
@@ -332,11 +339,6 @@ public:
   int init(const uint64_t tenant_id);
   virtual void *old_row_alloc(const int64_t size) override;
   virtual void old_row_free(void *row) override;
-  virtual void *callback_alloc(const int64_t size) override;
-  virtual void callback_free(ObITransCallback *cb) override;
-  virtual ObOBJLockCallback *alloc_table_lock_callback(ObIMvccCtx &ctx,
-                                                       ObLockMemtable *memtable) override;
-  virtual void free_table_lock_callback(ObITransCallback *cb) override;
   virtual common::ObIAllocator &get_query_allocator();
   virtual void inc_lock_for_read_retry_count();
   // When row lock conflict occurs in a remote execution, record the trans id in
@@ -373,6 +375,7 @@ public:
                         const share::SCN final_scn);
   virtual int trans_clear();
   virtual int elr_trans_preparing();
+  virtual void elr_trans_revoke();
   virtual int trans_kill();
   virtual int trans_publish();
   virtual int trans_replay_begin();
@@ -424,34 +427,68 @@ public:
   void set_skip_checksum_calc() {
     trans_mgr_.set_skip_checksum_calc();
   }
-  bool is_for_replay() const { return trans_mgr_.is_for_replay(); }
   int64_t get_trans_mem_total_size() const { return trans_mem_total_size_; }
   void add_lock_for_read_elapse(const int64_t elapse) { lock_for_read_elapse_ += elapse; }
   int64_t get_lock_for_read_elapse() const { return lock_for_read_elapse_; }
-  int64_t get_pending_log_size() { return trans_mgr_.get_pending_log_size(); }
-  int64_t get_flushed_log_size() { return trans_mgr_.get_flushed_log_size(); }
   bool pending_log_size_too_large(const transaction::ObTxSEQ &write_seq_no);
-  void merge_multi_callback_lists_for_changing_leader();
-  void merge_multi_callback_lists_for_immediate_logging();
   void reset_pdml_stat();
   int clean_unlog_callbacks();
   int check_tx_mem_size_overflow(bool &is_overflow);
 public:
+  void on_key_duplication_retry(const ObMemtableKey& key,
+                                const ObMvccRow *value,
+                                const ObMvccWriteResult &res);
   void on_tsc_retry(const ObMemtableKey& key,
                     const share::SCN snapshot_version,
                     const share::SCN max_trans_version,
                     const transaction::ObTransID &conflict_tx_id);
   void on_wlock_retry(const ObMemtableKey& key, const transaction::ObTransID &conflict_tx_id);
   virtual int64_t to_string(char *buf, const int64_t buf_len) const;
-  virtual storage::ObTxTableGuard *get_tx_table_guard() override { return &tx_table_guard_; }
   virtual transaction::ObTransID get_tx_id() const override;
   virtual share::SCN get_tx_end_scn() const override;
 
-  // mainly used by revert ref
-  void reset_trans_table_guard();
   // statics maintainness for txn logging
   virtual void inc_unsubmitted_cnt() override;
   virtual void dec_unsubmitted_cnt() override;
+
+public: // callback
+  virtual void *alloc_mvcc_row_callback() override;
+  virtual void free_mvcc_row_callback(ObITransCallback *cb) override;
+  virtual storage::ObExtInfoCallback *alloc_ext_info_callback() override;
+  virtual void free_ext_info_callback(ObITransCallback *cb) override;
+  void *alloc_lock_link_node() { return mem_ctx_obj_pool_.alloc<transaction::tablelock::ObMemCtxLockOpLinkNode>(); }
+  void free_lock_link_node(void *ptr) { mem_ctx_obj_pool_.free<transaction::tablelock::ObMemCtxLockOpLinkNode>(ptr); }
+  void *alloc_table_lock_callback() { return mem_ctx_obj_pool_.alloc<transaction::tablelock::ObOBJLockCallback>(); }
+  virtual void free_table_lock_callback(ObITransCallback *cb) override
+  {
+    mem_ctx_obj_pool_.free<transaction::tablelock::ObOBJLockCallback>(cb);
+  }
+  virtual ObOBJLockCallback *create_table_lock_callback(ObIMvccCtx &ctx, ObLockMemtable *memtable) override
+  {
+    return lock_mem_ctx_.create_table_lock_callback(ctx, memtable);
+  }
+
+  bool is_for_replay() const { return trans_mgr_.is_for_replay(); }
+  int append_callback(ObITransCallback *cb) { return trans_mgr_.append(cb); }
+  int append_callback(ObITransCallback *head,
+                      ObITransCallback *tail,
+                      const int64_t length)
+  {
+    return trans_mgr_.append(head, tail, length);
+  }
+  int64_t get_pending_log_size() { return trans_mgr_.get_pending_log_size(); }
+  int64_t get_flushed_log_size() { return trans_mgr_.get_flushed_log_size(); }
+  int acquire_callback_list(const bool new_epoch)
+  { return trans_mgr_.acquire_callback_list(new_epoch); }
+  void revert_callback_list() { trans_mgr_.revert_callback_list(); }
+  void set_for_replay(const bool for_replay) { trans_mgr_.set_for_replay(for_replay); }
+  void inc_pending_log_size(const int64_t size) { trans_mgr_.inc_pending_log_size(size); }
+  void inc_flushed_log_size(const int64_t size) { trans_mgr_.inc_flushed_log_size(size); }
+  void *alloc_prio_link_node()
+  { return mem_ctx_obj_pool_.alloc<transaction::tablelock::ObMemCtxLockPrioOpLinkNode>(); }
+  void free_prio_link_node(void *ptr)
+  { mem_ctx_obj_pool_.free<transaction::tablelock::ObMemCtxLockPrioOpLinkNode>(ptr); }
+  int64_t get_write_epoch() const { return trans_mgr_.get_write_epoch(); }
 public:
   // tx_status
   enum ObTxStatus {
@@ -465,19 +502,24 @@ public:
   inline void set_tx_rollbacked() { ATOMIC_STORE(&tx_status_, ObTxStatus::ROLLBACKED); }
 public:
   // table lock.
+  int enable_lock_table(transaction::ObLSTxCtxMgr *ls_tx_ctx_mgr);
+  // for mintest
   int enable_lock_table(storage::ObTableHandleV2 &handle);
   transaction::tablelock::ObLockMemCtx &get_lock_mem_ctx() { return lock_mem_ctx_; }
+  int get_tx_seq_replay_idx(const transaction::ObTxSEQ seq) const
+  { return trans_mgr_.get_tx_seq_replay_idx(seq); }
   int check_lock_exist(const ObLockID &lock_id,
                        const ObTableLockOwnerID &owner_id,
                        const ObTableLockMode mode,
                        const ObTableLockOpType op_type,
                        bool &is_exist,
-                       ObTableLockMode &lock_mode_in_same_trans) const;
+                       uint64_t lock_mode_cnt_in_same_trans[]) const;
   int check_modify_schema_elapsed(const common::ObTabletID &tablet_id,
                                   const int64_t schema_version);
   int check_modify_time_elapsed(const common::ObTabletID &tablet_id,
                                 const int64_t timestamp);
   int iterate_tx_obj_lock_op(ObLockOpIterator &iter) const;
+  int iterate_tx_lock_priority_list(ObPrioOpIterator &iter) const;
   int check_lock_need_replay(const share::SCN &scn,
                              const transaction::tablelock::ObTableLockOp &lock_op,
                              bool &need_replay);
@@ -505,6 +547,15 @@ public:
   }
   void print_first_mvcc_callback();
   int get_callback_list_stat(ObIArray<ObTxCallbackListStat> &stats);
+  int get_lock_memtable(ObLockMemtable *&memtable)
+  {
+    return lock_mem_ctx_.get_lock_memtable(memtable);
+  }
+  int add_priority_record(const transaction::tablelock::ObTableLockPrioArg &arg,
+                          const transaction::tablelock::ObTableLockOp &lock_op);
+  int remove_priority_record(const transaction::tablelock::ObTableLockOp &lock_op);
+  int get_prio_op_array(transaction::tablelock::ObTableLockPrioOpArray &prio_op_array);
+  int prepare_prio_op_list(const transaction::tablelock::ObTableLockPrioOpArray &prio_op_array);
 private:
   int do_trans_end(
       const bool commit,
@@ -521,22 +572,21 @@ private:
   static int64_t get_us() { return ::oceanbase::common::ObTimeUtility::current_time(); }
   int reset_log_generator_();
   int reuse_log_generator_();
-  void inc_pending_log_size(const int64_t size)
-  {
-    trans_mgr_.inc_pending_log_size(size);
-  }
-  void inc_flushed_log_size(const int64_t size)
-  {
-    trans_mgr_.inc_flushed_log_size(size);
-  }
+
 public:
   inline ObRedoLogGenerator &get_redo_generator() { return log_gen_; }
 private:
   DISALLOW_COPY_AND_ASSIGN(ObMemtableCtx);
+
+  static const int8_t ELR_STATE_INIT = 0;
+  static const int8_t ELR_STATE_DONE = 1;
+  static const int8_t ELR_STATE_REVOKED = 2;
+
   RWLock rwlock_;
   common::ObByteLock lock_;
   int end_code_;
   int64_t tx_status_;
+  int8_t elr_state_;
   int64_t ref_;
   // allocate memory for callback when query executing
   ObQueryAllocator query_allocator_;
@@ -560,14 +610,16 @@ private:
   // Used to indicate whether mvcc row is updated or not.
   // When a statement is update or select for update, the value can be set ture;
   bool has_row_updated_;
-  storage::ObTxTableGuard tx_table_guard_;
   // For deaklock detection
   // The trans id of the holder of the conflict row lock
   // TODO(Handora), for non-local execution, if no-occupy-thread wait is implemented,
   // it should be carried back the same way as local execution
   common::ObArray<transaction::ObTransID> conflict_trans_ids_;
+  transaction::ObMemtableCtxObjPool mem_ctx_obj_pool_;
   // table lock mem ctx.
   transaction::tablelock::ObLockMemCtx lock_mem_ctx_;
+  // trans callback mgr
+  ObTransCallbackMgr trans_mgr_;
   bool is_inited_;
 };
 

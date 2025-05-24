@@ -17,6 +17,12 @@
 
 namespace oceanbase
 {
+
+namespace sql
+{
+  struct ObDiagnosisManager;
+}
+
 namespace common
 {
 
@@ -29,11 +35,13 @@ public:
     ObTableScanIterator = 1,
     ObLocalIndexLookupIterator = 2,
     ObGroupLookupOp = 3,
+    ObTextRetrievalOp = 4,
   };
 public:
   ObNewRowIterator() : type_(Other) {}
   explicit ObNewRowIterator(const IterType type) : type_(type) {}
   virtual ~ObNewRowIterator() {}
+  virtual int get_diagnosis_info(sql::ObDiagnosisManager* diagnosis_manager) { return OB_SUCCESS; };
   /**
    * get the next row and move the cursor
    *
@@ -56,7 +64,7 @@ public:
   // Iterate row interface for sql static typing engine.
   virtual int get_next_row()
   {
-    int ret = common::OB_NOT_IMPLEMENT;;
+    int ret = common::OB_NOT_IMPLEMENT;
     COMMON_LOG(WARN, "interface not implement", K(ret));
     return ret;
   }
@@ -65,7 +73,7 @@ public:
   virtual int get_next_rows(int64_t &count, int64_t capacity)
   {
     UNUSEDx(count, capacity);
-    int ret = common::OB_NOT_IMPLEMENT;;
+    int ret = common::OB_NOT_IMPLEMENT;
     COMMON_LOG(WARN, "interface not implement", K(ret));
     return ret;
   }

@@ -82,6 +82,8 @@ struct DupTableInterfaceStat
   int64_t dup_table_lease_log_sync_total_time_;
   int64_t dup_table_tablet_log_sync_total_time_;
 
+  int64_t dup_table_ls_leader_takeover_ts_;
+
   void reset()
   {
     dup_table_follower_read_succ_cnt_ = 0;
@@ -101,6 +103,8 @@ struct DupTableInterfaceStat
     dup_table_log_deser_total_time_ = 0;
     dup_table_lease_log_sync_total_time_ = 0;
     dup_table_tablet_log_sync_total_time_ = 0;
+
+    dup_table_ls_leader_takeover_ts_ = 0;
   }
 
   TO_STRING_KV(K(dup_table_follower_read_succ_cnt_),
@@ -115,7 +119,8 @@ struct DupTableInterfaceStat
                K(dup_table_log_replay_total_time_),
                K(dup_table_log_deser_total_time_),
                K(dup_table_lease_log_sync_total_time_),
-               K(dup_table_tablet_log_sync_total_time_));
+               K(dup_table_tablet_log_sync_total_time_),
+               K(dup_table_ls_leader_takeover_ts_));
 };
 
 #define DUP_LEASE_LIFE_PREFIX "[DupLeaseLife] "
@@ -993,6 +998,7 @@ public:
   {
     reset();
   }
+  ~ObDupTableLogOperator() { reset(); }
   void reuse();
   void reset();
 
@@ -1015,6 +1021,7 @@ public:
   int replay_succ();
 
   void print_statistics_log();
+  const char *get_cb_name() const override { return "DupTableLogOperator"; }
 
 public:
   void set_logging_scn(const share::SCN &scn);
@@ -1437,9 +1444,10 @@ public:
   {
     redo_sync_retry_set_.destroy();
     in_thread_pool_ = false;
+    is_created_ = false;
   }
   void destroy() { reset(); }
-  int init();
+  // int init();
   int iter_tx_retry_redo_sync();
   int push_back_redo_sync_object(ObTransID tx_id, share::ObLSID ls_id);
   void clear_in_thread_pool_flag() { ATOMIC_STORE(&in_thread_pool_, false);}
@@ -1447,6 +1455,7 @@ public:
 public:
   RedoSyncRetrySet redo_sync_retry_set_;
   bool in_thread_pool_;
+  bool is_created_;
 };
 
 } // namespace transaction

@@ -78863,7 +78863,7 @@ SQL: select * from t1, t2 where t1.c1 > any (select c2 from t2);
               "type":0
             },
             "linear_inter_expr":null,
-            "is_nested_aggr":false,
+            "expr_in_inner_stmt":false,
             "pl_agg_udf_expr":null
           },
           "is_alias":false,
@@ -79001,7 +79001,7 @@ SQL: select * from t1, t2 where t1.c1 > any (select c2 from t2);
             "type":0
           },
           "linear_inter_expr":null,
-          "is_nested_aggr":false,
+          "expr_in_inner_stmt":false,
           "pl_agg_udf_expr":null
         }
       ],
@@ -96135,7 +96135,7 @@ SQL: select max(k) from (select c1 * c2 as k from t2 where c2 in (select c2 from
           "dl":"",
           "type":0
         },
-        "is_nested_aggr":false,
+        "expr_in_inner_stmt":false,
         "pl_agg_udf_expr":null
       },
       "is_alias":false,
@@ -96353,7 +96353,7 @@ SQL: select max(k) from (select c1 * c2 as k from t2 where c2 in (select c2 from
         "dl":"",
         "type":0
       },
-      "is_nested_aggr":false,
+      "expr_in_inner_stmt":false,
       "pl_agg_udf_expr":null
     }
   ],
@@ -97032,7 +97032,7 @@ SQL: select max(c1 * c2) from t2 where c2 in (select c2 from t3);
           "dl":"",
           "type":0
         },
-        "is_nested_aggr":false,
+        "expr_in_inner_stmt":false,
         "pl_agg_udf_expr":null
       },
       "is_alias":false,
@@ -97250,7 +97250,7 @@ SQL: select max(c1 * c2) from t2 where c2 in (select c2 from t3);
         "dl":"",
         "type":0
       },
-      "is_nested_aggr":false,
+      "expr_in_inner_stmt":false,
       "pl_agg_udf_expr":null
     }
   ],
@@ -148454,7 +148454,7 @@ SQL: select * from t1 where c1 >ANY (select c1 from t2);
               "type":0
             },
             "linear_inter_expr":null,
-            "is_nested_aggr":false,
+            "expr_in_inner_stmt":false,
             "pl_agg_udf_expr":null
           },
           "is_alias":false,
@@ -148592,7 +148592,7 @@ SQL: select * from t1 where c1 >ANY (select c1 from t2);
             "type":0
           },
           "linear_inter_expr":null,
-          "is_nested_aggr":false,
+          "expr_in_inner_stmt":false,
           "pl_agg_udf_expr":null
         }
       ],
@@ -149862,7 +149862,7 @@ SQL: select * from t1 where c1 <ALL (select c1 from t2 limit 1);
               "type":0
             },
             "linear_inter_expr":null,
-            "is_nested_aggr":false,
+            "expr_in_inner_stmt":false,
             "pl_agg_udf_expr":null
           },
           "is_alias":false,
@@ -150030,7 +150030,7 @@ SQL: select * from t1 where c1 <ALL (select c1 from t2 limit 1);
                 "type":0
               },
               "linear_inter_expr":null,
-              "is_nested_aggr":false,
+              "expr_in_inner_stmt":false,
               "pl_agg_udf_expr":null
             },
              {
@@ -150192,7 +150192,7 @@ SQL: select * from t1 where c1 <ALL (select c1 from t2 limit 1);
             "type":0
           },
           "linear_inter_expr":null,
-          "is_nested_aggr":false,
+          "expr_in_inner_stmt":false,
           "pl_agg_udf_expr":null
         }
       ],
@@ -152442,7 +152442,7 @@ SQL: select * from t1 where 1 < ANY(select c1 from t2);
             "type":0
           },
           "linear_inter_expr":null,
-          "is_nested_aggr":false,
+          "expr_in_inner_stmt":false,
           "pl_agg_udf_expr":null
         }
 >>>>>>> de0eba8f08f... GIS sql syntax
@@ -155209,7 +155209,7 @@ SQL: select * from t1 where Exists (select c1 from t2 where c2 >ALL (select c1 f
                   "type":0
                 },
                 "linear_inter_expr":null,
-                "is_nested_aggr":false,
+                "expr_in_inner_stmt":false,
                 "pl_agg_udf_expr":null
               },
               "is_alias":false,
@@ -155377,7 +155377,7 @@ SQL: select * from t1 where Exists (select c1 from t2 where c2 >ALL (select c1 f
                     "type":0
                   },
                   "linear_inter_expr":null,
-                  "is_nested_aggr":false,
+                  "expr_in_inner_stmt":false,
                   "pl_agg_udf_expr":null
                 },
                  {
@@ -155539,7 +155539,7 @@ SQL: select * from t1 where Exists (select c1 from t2 where c2 >ALL (select c1 f
                 "type":0
               },
               "linear_inter_expr":null,
-              "is_nested_aggr":false,
+              "expr_in_inner_stmt":false,
               "pl_agg_udf_expr":null
             }
           ],

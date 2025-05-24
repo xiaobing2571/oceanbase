@@ -10,11 +10,9 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "storage/tx_table/ob_tx_table_interface.h"
 
-#include "storage/tx/ob_tx_data_functor.h"
+#include "ob_tx_table_interface.h"
 #include "storage/tx_table/ob_tx_table.h"
-#include "lib/oblog/ob_log_module.h"
 
 namespace oceanbase {
 namespace storage {
@@ -22,12 +20,12 @@ namespace storage {
 int ObTxTableGuard::init(ObTxTable *tx_table)
 {
   int ret = OB_SUCCESS;
-  reset();
 
   if (OB_ISNULL(tx_table)) {
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "tx_data_table is nullptr.");
   } else {
+    mini_cache_.reset();
     epoch_ = tx_table->get_epoch();
     tx_table_ = tx_table;
   }
@@ -52,6 +50,25 @@ int ObTxTableGuard::check_row_locked(const transaction::ObTransID &read_tx_id,
   if (OB_NOT_NULL(tx_table_)) {
     ObReadTxDataArg arg(data_tx_id, epoch_, mini_cache_);
     return tx_table_->check_row_locked(arg, read_tx_id, sql_sequence, lock_state);
+  } else {
+    return OB_NOT_INIT;
+  }
+}
+
+int ObTxTableGuard::load_tx_op(const transaction::ObTransID &tx_id, ObTxData &tx_data)
+{
+  /*
+   * when we load tx_op from tx_data just skip tx_data cache
+   * read tx_data from tx_data_sstable promise tx_op is complete (undo_action/mds etc)
+   */
+  if (OB_NOT_NULL(tx_table_)) {
+    ObReadTxDataArg arg(tx_id,
+                        epoch_,
+                        mini_cache_,
+                        true/*skip_cache*/);
+    LoadTxOpFunctor functor(tx_data);
+    functor.set_may_exist_undecided_state_in_tx_data_table();
+    return tx_table_->check_with_tx_data(arg, functor);
   } else {
     return OB_NOT_INIT;
   }
@@ -140,7 +157,8 @@ int ObTxTableGuard::cleanout_tx_node(const transaction::ObTransID tx_id,
   }
 }
 
-int ObTxTableGuard::get_recycle_scn(share::SCN &recycle_scn) { return tx_table_->get_recycle_scn(recycle_scn); }
+int ObTxTableGuard::get_recycle_scn(share::SCN &recycle_scn, const bool is_shared_minor)
+{ return tx_table_->get_recycle_scn(recycle_scn, is_shared_minor); }
 
 int ObTxTableGuard::self_freeze_task()
 {

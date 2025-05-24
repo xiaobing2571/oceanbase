@@ -11,14 +11,10 @@
  */
 #define USING_LOG_PREFIX SERVER
 #include "ob_table_filter.h"
-#include "ob_table_rpc_processor.h"
-#include "htable_filter_tab.hxx"
-#include "htable_filter_lex.hxx"
-#include "ob_table_aggregation.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::table;
-
+using namespace oceanbase::table::hfilter;
 
 inline bool ObTableComparator::is_numeric(const ObString &value)
 {
@@ -90,6 +86,27 @@ int ObTableComparator::compare_to(const ObIArray<ObString> &select_columns,
           cmp_ret = src_v == dest_v ? 0 :
                     (src_v > dest_v ? 1 : -1);
         }
+      } else if (ob_is_uint_tc(column_type)) {
+        // support uint8, uint16, uint24, uint32, uint64.
+        if (!is_numeric(comparator_value_)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("comparator value is not a number", K(ret), K_(comparator_value));
+        } else {
+          // has a border problem
+          // if comparator_value is bigger than UINT64_MAX, strtoul() will return ULONG_MAX(UINT64_MAX)
+          // so `< comparator_value` will filter the UINT64_MAX
+          // also when comparator_value = UINT64_MIN
+          char *endptr = nullptr;
+          uint64_t src_v = strtoul(comparator_value_.ptr(), &endptr, 10);
+          if (OB_ISNULL(endptr) || *endptr != '\0') {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("comparator value is not a valid number", K(ret), K_(comparator_value));
+          } else {
+            uint64_t dest_v = cell.get_uint64();
+            cmp_ret = src_v == dest_v ? 0 :
+                      (src_v > dest_v ? 1 : -1);
+          }
+        }
       } else if (ob_is_string_tc(column_type)) {
         // support varchar, char, varbinary, binary
         ObObj compare_obj;
@@ -103,7 +120,7 @@ int ObTableComparator::compare_to(const ObIArray<ObString> &select_columns,
       } else {
         // not support others
         ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "only for int and string, other column type");
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "only for double, int and string, other column type");
         LOG_WARN("do not support other column type, only for int, string", K(ret), K(column_type));
       }
     } else {
@@ -128,6 +145,53 @@ int ObTableCompareFilter::filter_row(const ObIArray<ObString> &select_columns, c
       filtered = true;
     } else {
       LOG_WARN("compare failed", K(ret));
+    }
+  }
+
+  return ret;
+}
+
+// statement is "ObTableCompareFilter $compare_op_name"
+int64_t ObTableCompareFilter::get_format_filter_string_length() const
+{
+  int64_t len = 0;
+
+  len += strlen("ObTableCompareFilter"); // "ObTableCompareFilter"
+  len += 1; // blank
+  len += (static_cast<ObTableComparator*>(comparator_))->get_column_name().length(); // "$column_name"
+  len += 1; // blank
+  len += strlen(FilterUtils::get_compare_op_name(cmp_op_)); // "$compare_op_name"
+
+  return len;
+}
+
+int ObTableCompareFilter::get_format_filter_string(char *buf, int64_t buf_len, int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+
+  if (OB_ISNULL(buf)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("buf is bull", KR(ret));
+  } else if (OB_ISNULL(comparator_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("comparator is bull", KR(ret));
+  } else {
+    const ObString &column_name = (static_cast<ObTableComparator*>(comparator_))->get_column_name();
+    int64_t n = snprintf(buf + pos, buf_len - pos, "ObTableCompareFilter ");
+    if (n < 0 || n > buf_len - pos) {
+      ret = OB_BUF_NOT_ENOUGH;
+      LOG_WARN("snprintf error or buf not enough", KR(ret), K(n), K(pos), K(buf_len));
+    } else {
+      pos += n;
+      strncat(buf + pos, column_name.ptr(), column_name.length());
+      pos += column_name.length();
+      int64_t n = snprintf(buf + pos, buf_len - pos, " %s", FilterUtils::get_compare_op_name(cmp_op_));
+      if (n < 0 || n > buf_len - pos) {
+        ret = OB_BUF_NOT_ENOUGH;
+        LOG_WARN("snprintf error or buf not enough", KR(ret), K(n), K(pos), K(buf_len));
+      } else {
+        pos += n;
+      }
     }
   }
 
@@ -227,6 +291,7 @@ int ObNormalTableQueryResultIterator::get_next_result(table::ObTableQueryResult 
   }
   return ret;
 }
+
 
 bool ObNormalTableQueryResultIterator::has_more_result() const
 {
@@ -342,13 +407,13 @@ int ObTableFilterOperator::parse_filter_string(common::ObIAllocator* allocator)
   int ret = OB_SUCCESS;
   const ObString &filter_str = query_->get_filter_string();
   if (filter_str.empty()) {
-    tfilter_ = NULL;
+    filter_ = NULL;
   } else if (NULL == allocator) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("allocator is nullptr", K(ret));
   } else if (OB_FAIL(filter_parser_.init(allocator))) {
     LOG_WARN("failed to init filter_parser_", K(ret));
-  } else if (OB_FAIL(filter_parser_.parse_filter(filter_str, tfilter_))) {
+  } else if (OB_FAIL(filter_parser_.parse_filter(filter_str, filter_))) {
     LOG_WARN("failed to parse filter", K(ret), K(filter_str));
   }
 
@@ -464,7 +529,7 @@ int ObTableFilterOperator::get_aggregate_result(table::ObTableQueryResult *&next
       }
 
       bool filtered = false;
-      if (OB_FAIL(tfilter_->filter_row(select_columns, *row, filtered))) {
+      if (OB_FAIL(filter_->filter_row(select_columns, *row, filtered))) {
         LOG_WARN("filter row error", K(ret));
         continue;
       } else if (filtered) {
@@ -545,7 +610,7 @@ int ObTableFilterOperator::get_normal_result(table::ObTableQueryResult *&next_re
       }
 
       bool filtered = false;
-      if (OB_FAIL(tfilter_->filter_row(select_columns, *row, filtered))) {
+      if (OB_FAIL(filter_->filter_row(select_columns, *row, filtered))) {
         LOG_WARN("filter row error", K(ret));
         continue;
       } else if (filtered) {

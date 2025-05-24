@@ -8,16 +8,11 @@
 // MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 // See the Mulan PubL v2 for more details.
 
-#include "logservice/ob_log_base_header.h"
 #include "ob_dup_table_base.h"
-#include "ob_dup_table_lease.h"
-#include "ob_dup_table_tablets.h"
-#include "storage/slog/ob_storage_logger.h"
-#include "storage/slog/ob_storage_log_replayer.h"
 #include "storage/tx/ob_trans_part_ctx.h"
 #include "storage/tx/ob_trans_service.h"
-#include "storage/tx_storage/ob_ls_handle.h"
 #include "storage/tx_storage/ob_ls_service.h"
+#include "storage/meta_store/ob_tenant_storage_meta_service.h"
 
 namespace oceanbase
 {
@@ -453,32 +448,11 @@ int ObDupTableLSCheckpoint::flush()
 
   SpinWLockGuard w_guard(ckpt_rw_lock_);
 
-  ObDupTableCkptLog slog_entry;
-
-  if (OB_SUCC(ret)) {
-    if (OB_FAIL(slog_entry.init(dup_ls_meta_))) {
-      DUP_TABLE_LOG(WARN, "init slog entry failed", K(ret), K(slog_entry), KPC(this));
-    }
-  }
-
-  if (OB_SUCC(ret)) {
-    ObStorageLogParam log_param;
-    log_param.data_ = &slog_entry;
-    log_param.cmd_ = ObIRedoModule::gen_cmd(ObRedoLogMainType::OB_REDO_LOG_TENANT_STORAGE,
-                                            ObRedoLogSubType::OB_REDO_LOG_UPDATE_DUP_TABLE_LS);
-    ObStorageLogger *slogger = nullptr;
-    if (OB_ISNULL(slogger = MTL(ObStorageLogger *))) {
-      ret = OB_ERR_UNEXPECTED;
-      DUP_TABLE_LOG(WARN, "get slog service failed", K(ret));
-    } else if (OB_FAIL(slogger->write_log(log_param))) {
-      DUP_TABLE_LOG(WARN, "fail to write ls meta slog", K(ret), K(log_param), KPC(this));
-    } else {
-      DUP_TABLE_LOG(INFO, "Write dup_table slog successfully", K(ret), K(log_param), KPC(this));
-    }
-  }
-
-  if (OB_SUCC(ret)) {
+  if (OB_FAIL(TENANT_STORAGE_META_SERVICE.update_dup_table_meta(dup_ls_meta_))) {
+    DUP_TABLE_LOG(WARN, "fail to update dup table meta", K(ret));
+  } else {
     lease_log_rec_scn_.reset();
+    DUP_TABLE_LOG(INFO, "Write dup_table slog successfully", K(ret), KPC(this));
   }
 
   return ret;
@@ -560,10 +534,8 @@ int ObDupTableLogOperator::submit_log_entry()
   int64_t max_ser_size = 0;
   bool submit_result = false;
   DupLogTypeArray type_array;
+
   if (OB_SUCC(ret)) {
-    if (OB_TMP_FAIL(tablet_mgr_ptr_->scan_readable_set_for_gc())) {
-      DUP_TABLE_LOG(WARN, "scan readable set failed", K(tmp_ret));
-    }
     if (OB_FAIL(prepare_serialize_log_entry_(max_ser_size, type_array))) {
       DUP_TABLE_LOG(WARN, "prepare serialize log entry failed", K(ret));
     } else if (!type_array.empty()) {
@@ -1111,8 +1083,8 @@ int ObDupTableLogOperator::retry_submit_log_block_()
       ret = OB_LOG_TOO_LARGE;
       DUP_TABLE_LOG(WARN, "Too large dup table log. We can not submit it", K(ret),
                     K(big_segment_buf_.is_completed()), KPC(this));
-    } else if (OB_FAIL(log_handler_->append(block_buf_, block_buf_pos, gts_base_scn, false, this,
-                                            logging_lsn_, logging_scn_))) {
+    } else if (OB_FAIL(log_handler_->append(block_buf_, block_buf_pos, gts_base_scn, false,
+                                            false/*allow_compression*/, this, logging_lsn_, logging_scn_))) {
       DUP_TABLE_LOG(WARN, "append block failed", K(ret), K(ls_id_));
     } else {
       if (OB_NOT_NULL(interface_stat_ptr_)) {
@@ -1312,15 +1284,24 @@ int ObTxRedoSyncRetryTask::iter_tx_retry_redo_sync()
 
   return ret;
 }
+
 int ObTxRedoSyncRetryTask::push_back_redo_sync_object(ObTransID tx_id, share::ObLSID ls_id)
 {
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
 
-  if (!redo_sync_retry_set_.created()) {
-    if (OB_FAIL(redo_sync_retry_set_.create(100))) {
-      TRANS_LOG(WARN, "alloc a redo sync set failed", K(ret), K(tx_id), K(ls_id));
+  if (ATOMIC_BCAS(&is_created_, false, true)) {
+    if (!redo_sync_retry_set_.created()) {
+      if (OB_FAIL(redo_sync_retry_set_.create(100))) {
+        TRANS_LOG(WARN, "alloc a redo sync set failed", K(ret), K(tx_id), K(ls_id));
+      }
     }
+    if (OB_FAIL(ret)) {
+      ATOMIC_STORE(&is_created_, false);
+    }
+  } else {
+    TRANS_LOG(INFO, "Try to create redo sync task twice. Skip it.", K(ret), K(is_created_),
+              K(tx_id), K(ls_id), K(in_thread_pool_), K(redo_sync_retry_set_.created()));
   }
 
   if (OB_SUCC(ret)) {
@@ -1371,11 +1352,11 @@ int ObDupTableLeaseRequestP::process()
   } else if (OB_ISNULL(ls_handle.get_ls())) {
     ret = OB_ERR_NULL_VALUE;
     DUP_TABLE_LOG(WARN, "ls pointer is nullptr", K(ret));
-  } else if (ls_handle.get_ls()->get_dup_table_ls_handler()->recive_lease_request(arg_)) {
-    DUP_TABLE_LOG(WARN, "recive_lease_request error", K(ret));
+  } else if (OB_FAIL(ls_handle.get_ls()->get_dup_table_ls_handler()->receive_lease_request(arg_))) {
+    DUP_TABLE_LOG(WARN, "receive_lease_request error", K(ret));
   }
 
-  DUP_TABLE_LOG(DEBUG, "recive lease request", K(ret), K(arg_));
+  DUP_TABLE_LOG(DEBUG, "receive lease request", K(ret), K(arg_));
   return ret;
 }
 
@@ -1394,11 +1375,11 @@ int ObDupTableTsSyncRequestP::process()
   } else if (OB_ISNULL(ls_handle.get_ls())) {
     ret = OB_ERR_NULL_VALUE;
     DUP_TABLE_LOG(WARN, "ls pointer is nullptr", K(ret));
-  } else if (ls_handle.get_ls()->get_dup_table_ls_handler()->handle_ts_sync_request(arg_)) {
+  } else if (OB_FAIL(ls_handle.get_ls()->get_dup_table_ls_handler()->handle_ts_sync_request(arg_))) {
     DUP_TABLE_LOG(WARN, "handle ts sync request error", K(ret));
   }
 
-  DUP_TABLE_LOG(DEBUG, "recive ts sync request", K(ret), K(arg_));
+  DUP_TABLE_LOG(DEBUG, "receive ts sync request", K(ret), K(arg_));
 
   return ret;
 }
@@ -1418,11 +1399,11 @@ int ObDupTableTsSyncResponseP::process()
   } else if (OB_ISNULL(ls_handle.get_ls())) {
     ret = OB_ERR_NULL_VALUE;
     DUP_TABLE_LOG(WARN, "ls pointer is nullptr", K(ret));
-  } else if (ls_handle.get_ls()->get_dup_table_ls_handler()->handle_ts_sync_response(arg_)) {
+  } else if (OB_FAIL(ls_handle.get_ls()->get_dup_table_ls_handler()->handle_ts_sync_response(arg_))) {
     DUP_TABLE_LOG(WARN, "handle ts sync request error", K(ret));
   }
 
-  DUP_TABLE_LOG(DEBUG, "recive ts sync response", K(ret), K(arg_));
+  DUP_TABLE_LOG(DEBUG, "receive ts sync response", K(ret), K(arg_));
 
   return ret;
 }
@@ -1460,7 +1441,7 @@ int ObDupTableBeforePrepareRequestP::process()
     ls_handle.get_ls()->revert_tx_ctx(part_ctx);
   }
 
-  DUP_TABLE_LOG(DEBUG, "recive before prepare request", K(ret), K(arg_));
+  DUP_TABLE_LOG(DEBUG, "receive before prepare request", K(ret), K(arg_));
   return ret;
 }
 

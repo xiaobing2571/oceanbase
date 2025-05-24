@@ -10,14 +10,10 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "common/storage/ob_sequence.h"
-#include "storage/memtable/mvcc/ob_mvcc_engine.h"
-#include "storage/memtable/mvcc/ob_mvcc_acc_ctx.h"
-#include "storage/memtable/ob_memtable.h"
+#include "ob_mvcc_engine.h"
 #include "storage/memtable/ob_row_conflict_handler.h"
-#include "storage/tx_table/ob_tx_table.h"
-#include "storage/tx/ob_trans_define.h"
 #include "storage/access/ob_index_sstable_estimator.h"
+#include "storage/memtable/mvcc/ob_multi_version_iterator.h"
 
 namespace oceanbase
 {
@@ -126,7 +122,7 @@ int ObMvccEngine::get(ObMvccAccessCtx &ctx,
       // rewrite ret
       ret = OB_SUCCESS;
     }
-  } else if (!query_flag.is_prewarm() && value->need_compact(for_read, for_replay)) {
+  } else if (!query_flag.is_prewarm() && value->need_compact(for_read, for_replay, memtable_->is_delete_insert_table())) {
     int tmp_ret = OB_SUCCESS;
     if (OB_SUCCESS != (tmp_ret = try_compact_row_when_mvcc_read_(ctx.get_snapshot_version(), *value))) {
       TRANS_LOG(WARN, "fail to try to compact row", K(tmp_ret));
@@ -254,12 +250,40 @@ int ObMvccEngine::check_row_locked(ObMvccAccessCtx &ctx,
   return ret;
 }
 
-int ObMvccEngine::create_kv(
-    const ObMemtableKey *key,
-    ObMemtableKey *stored_key,
-    ObMvccRow *&value,
-    RowHeaderGetter &getter,
-    bool &is_new_add)
+int ObMvccEngine::create_kvs(const ObMemtableSetArg &memtable_set_arg,
+                             ObMemtableKeyGenerator &memtable_key_generator,
+                             // whether is normal insert and we can
+                             // optimize to alloc first in the case
+                             const bool is_normal_insert,
+                             ObStoredKVs &kvs)
+{
+  int ret = OB_SUCCESS;
+  const blocksstable::ObDatumRow *new_rows = memtable_set_arg.new_row_;
+  const int64_t row_count = memtable_set_arg.row_count_;
+  ObMemtableKeyGenerator::ObMemtableKeyBuffer *memtable_key_buffer =
+      memtable_key_generator.get_key_buffer();
+
+  for (int64_t i = 0; OB_SUCC(ret) && i < row_count; i++) {
+    if (OB_FAIL(memtable_key_generator.generate_memtable_key(new_rows[i]))) {
+      TRANS_LOG(WARN, "generate memtable key fail", K(ret), K(memtable_set_arg));
+    } else if (OB_FAIL(create_kv(&memtable_key_generator.get_memtable_key(),
+                                 is_normal_insert,
+                                 &kvs.at(i).key_,
+                                 kvs.at(i).value_))) {
+      TRANS_LOG(WARN, "create kv fail", K(ret), K(memtable_set_arg));
+    } else if (nullptr != memtable_key_buffer &&
+               OB_FAIL(memtable_key_buffer->push_back(kvs[i].key_))) {
+      TRANS_LOG(WARN, "push back stored memtable key into buffer failed", K(ret));
+    }
+  }
+
+  return ret;
+}
+
+int ObMvccEngine::create_kv(const ObMemtableKey *key,
+                            const bool is_insert,
+                            ObMemtableKey *stored_key,
+                            ObMvccRow *&value)
 {
   int64_t loop_cnt = 0;
   int ret = OB_SUCCESS;
@@ -268,16 +292,21 @@ int ObMvccEngine::create_kv(
     ret = OB_NOT_INIT;
     TRANS_LOG(WARN, "mvcc_engine not init", K(this));
   } else {
-    is_new_add = false;
+
     while (OB_SUCCESS == ret && NULL == value) {
       ObStoreRowkey *tmp_key = nullptr;
-      if (OB_SUCCESS == (ret = query_engine_->get(key, value, stored_key))) {
+      // We optimize the create_kv operation by skipping the first hash table
+      // get for insert operation because it is unnecessary at most cases. Under
+      // the concurrent inserts, we rely on the conflict on the hash table set
+      // and the while loops for the next hash table get to maintain the origin
+      // create_kv semantic
+      if (!(0 == loop_cnt // is the first try in the loop
+            && is_insert) // is insert dml operation
+          && OB_SUCC(query_engine_->get(key, value, stored_key))) {
         if (NULL == value) {
           ret = OB_ERR_UNEXPECTED;
           TRANS_LOG(WARN, "get NULL value");
         }
-      } else if (OB_FAIL(getter.get())) {
-        TRANS_LOG(WARN, "get row header error");
       } else if (OB_FAIL(kv_builder_->dup_key(tmp_key,
                                               *engine_allocator_,
                                               key->get_rowkey()))) {
@@ -290,9 +319,7 @@ int ObMvccEngine::create_kv(
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else {
         value = new(value) ObMvccRow();
-        ObRowLatchGuard guard(value->latch_);
         if (OB_SUCCESS == (ret = query_engine_->set(stored_key, value))) {
-          is_new_add = true;
         } else if (OB_ENTRY_EXIST == ret) {
           ret = OB_SUCCESS;
           value = NULL;
@@ -312,29 +339,56 @@ int ObMvccEngine::create_kv(
   return ret;
 }
 
-int ObMvccEngine::mvcc_write(ObIMemtableCtx &ctx,
-                             const concurrent_control::ObWriteFlag write_flag,
-                             const transaction::ObTxSnapshot &snapshot,
+int ObMvccEngine::mvcc_write(storage::ObStoreCtx &ctx,
                              ObMvccRow &value,
                              const ObTxNodeArg &arg,
+                             const bool check_exist,
+                             void *buf, // preallocted buffer for ObMvccTransNode
                              ObMvccWriteResult &res)
 {
   int ret = OB_SUCCESS;
-  ObMvccTransNode *node = NULL;
+  ObMvccTransNode *node = (ObMvccTransNode *)buf;
+
+  if (OB_FAIL(init_tx_node_(arg, node))) {
+    TRANS_LOG(WARN, "build tx node failed", K(ret), K(ctx), K(arg));
+  } else if (OB_FAIL(value.mvcc_write(ctx,
+                                      *node,
+                                      check_exist,
+                                      res))) {
+    if (!is_mvcc_write_related_error_(ret)) {
+      TRANS_LOG(WARN, "mvcc write failed", K(ret), K(ctx), K(arg),
+                KPC(node), K(value));
+    }
+  } else {
+    TRANS_LOG(DEBUG, "mvcc write succeed", K(ret), K(ctx), K(arg),
+              KPC(node), K(value));
+  }
+
+  return ret;
+}
+
+int ObMvccEngine::mvcc_write(storage::ObStoreCtx &ctx,
+                             ObMvccRow &value,
+                             const ObTxNodeArg &arg,
+                             const bool check_exist,
+                             ObMvccWriteResult &res)
+{
+  int ret = OB_SUCCESS;
+  ObMvccTransNode *node = nullptr;
 
   if (OB_FAIL(build_tx_node_(arg, node))) {
     TRANS_LOG(WARN, "build tx node failed", K(ret), K(ctx), K(arg));
   } else if (OB_FAIL(value.mvcc_write(ctx,
-                                      write_flag,
-                                      snapshot,
                                       *node,
+                                      check_exist,
                                       res))) {
-    if (OB_TRY_LOCK_ROW_CONFLICT != ret &&
-        OB_TRANSACTION_SET_VIOLATION != ret) {
-      TRANS_LOG(WARN, "mvcc write failed", K(ret), K(ctx), K(arg));
+    if (!is_mvcc_write_related_error_(ret)) {
+      TRANS_LOG(WARN, "mvcc write failed", K(ret), K(ctx), K(arg),
+                KPC(node), K(value));
     }
   } else {
-    TRANS_LOG(DEBUG, "mvcc write succeed", K(ret), K(ctx), K(arg), K(*node));
+    TRANS_LOG(DEBUG, "mvcc write succeed", K(ret), K(ctx), K(arg),
+              KPC(node), K(value));
   }
 
   return ret;
@@ -345,7 +399,6 @@ int ObMvccEngine::mvcc_replay(const ObTxNodeArg &arg,
 {
   int ret = OB_SUCCESS;
   ObMvccTransNode *node = NULL;
-
   if (OB_FAIL(build_tx_node_(arg, node))) {
     TRANS_LOG(WARN, "build tx node failed", K(ret), K(arg));
   } else {
@@ -355,6 +408,7 @@ int ObMvccEngine::mvcc_replay(const ObTxNodeArg &arg,
   return ret;
 }
 
+// Alloc the memory and build the ObMvccTransNode base on the memory
 int ObMvccEngine::build_tx_node_(const ObTxNodeArg &arg,
                                  ObMvccTransNode *&node)
 {
@@ -369,11 +423,80 @@ int ObMvccEngine::build_tx_node_(const ObTxNodeArg &arg,
     node->version_ = arg.memstore_version_;
     node->scn_ = arg.scn_;
     node->seq_no_ = arg.seq_no_;
+    node->write_epoch_ = arg.write_epoch_;
     node->prev_ = NULL;
     node->next_ = NULL;
+
+    // After the success of ObMvccRow::mvcc_write_, the trans_node still
+    // cannot be guaranteed to be successful. This is because our subsequent
+    // SSTable check might fail, potentially causing data that is in an
+    // incomplete state to be seen. Therefore, we use the INCOMPLETE state
+    // to prevent such data from being erroneously visible.
+    if (node->scn_.is_max()) {  // leader write
+      node->set_incomplete();
+    }
   }
 
   return ret;
+}
+
+// Build the ObMvccTransNode with preallocted memory
+int ObMvccEngine::init_tx_node_(const ObTxNodeArg &arg,
+                                ObMvccTransNode *node)
+{
+  int ret = OB_SUCCESS;
+
+  new(node) ObMvccTransNode();
+  if (OB_FAIL(ObMemtableDataHeader::build(
+                reinterpret_cast<ObMemtableDataHeader *>(node->buf_),
+                arg.data_))) {
+    TRANS_LOG(WARN, "MemtableData dup fail", K(ret));
+  } else {
+    node->tx_id_ = arg.tx_id_;
+    node->trans_version_ = SCN::max_scn();
+    node->modify_count_ = arg.modify_count_;
+    node->acc_checksum_ = arg.acc_checksum_;
+    node->version_ = arg.memstore_version_;
+    node->scn_ = arg.scn_;
+    node->seq_no_ = arg.seq_no_;
+    node->write_epoch_ = arg.write_epoch_;
+    node->prev_ = NULL;
+    node->next_ = NULL;
+
+    // After the success of ObMvccRow::mvcc_write_, the trans_node still
+    // cannot be guaranteed to be successful. This is because our subsequent
+    // SSTable check might fail, potentially causing data that is in an
+    // incomplete state to be seen. Therefore, we use the INCOMPLETE state
+    // to prevent such data from being erroneously visible.
+    if (node->scn_.is_max()) {
+      node->set_incomplete();
+    }
+  }
+
+  return ret;
+}
+
+void ObMvccEngine::finish_kv(ObMvccWriteResult& res)
+{
+  // The trans_node after ObMvccRow::mvcc_write_ is incomplete, then we need use
+  // finish_kv as the final step of ObMemtable::set. Therefore, it is safe to
+  // make the data visible.
+  if (nullptr != res.tx_node_) {
+    res.tx_node_->set_complete();
+  }
+}
+
+void ObMvccEngine::finish_kvs(ObMvccWriteResults& results)
+{
+  // The trans_node after ObMvccRow::mvcc_write_ is incomplete, then we need use
+  // finish_kv as the final step of ObMemtable::multi_set. Therefore, it is safe
+  // to make the data visible.
+  for (int64_t i = 0; i < results.count(); ++i) {
+    ObMvccWriteResult &res = results[i];
+    if (nullptr != res.tx_node_) {
+      res.tx_node_->set_complete();
+    }
+  }
 }
 
 int ObMvccEngine::ensure_kv(const ObMemtableKey *stored_key,

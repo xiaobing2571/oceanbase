@@ -14,18 +14,7 @@
 
 #include "observer/mysql/ob_sync_plan_driver.h"
 #include "rpc/obmysql/packet/ompk_eof.h"
-#include "rpc/obmysql/packet/ompk_resheader.h"
-#include "rpc/obmysql/packet/ompk_field.h"
-#include "rpc/obmysql/packet/ompk_row.h"
-#include "rpc/obmysql/ob_mysql_field.h"
-#include "rpc/obmysql/ob_mysql_packet.h"
-#include "lib/profile/ob_perf_event.h"
-#include "obsm_row.h"
 #include "observer/mysql/obmp_query.h"
-#include "sql/engine/px/ob_px_admission.h"
-#include "sql/ob_spi.h"
-#include "share/object/ob_obj_cast.h"
-#include "observer/mysql/obmp_stmt_prexecute.h"
 
 namespace oceanbase
 {
@@ -135,6 +124,7 @@ int ObSyncPlanDriver::response_result(ObMySQLResultSet &result)
       const ObWarningBuffer *warnings_buf = common::ob_get_tsi_warning_buffer();
       uint16_t warning_count = 0;
       if (OB_ISNULL(warnings_buf)) {
+        // ignore ret
         LOG_WARN("can not get thread warnings buffer");
       } else {
         warning_count = static_cast<uint16_t>(warnings_buf->get_readable_warning_count());
@@ -212,6 +202,7 @@ int ObSyncPlanDriver::response_result(ObMySQLResultSet &result)
         ok_param.lii_ = result.get_last_insert_id_to_client();
         const ObWarningBuffer *warnings_buf = common::ob_get_tsi_warning_buffer();
         if (OB_ISNULL(warnings_buf)) {
+          // ignore ret
           LOG_WARN("can not get thread warnings buffer");
         } else {
           ok_param.warnings_count_ =
@@ -233,6 +224,7 @@ int ObSyncPlanDriver::response_result(ObMySQLResultSet &result)
           ok_param.affected_rows_ = curr_affected_row;
           ok_param.is_partition_hit_ = session_.partition_hit().get_bool();
           ok_param.has_more_result_ = !result.is_cursor_end();
+          ok_param.lii_ = result.get_last_insert_id_to_client();
           process_ok = true;
           if (OB_FAIL(sender_.send_ok_packet(session_, ok_param))) {
             LOG_WARN("send ok packet failed", K(ret), K(ok_param));
@@ -248,7 +240,7 @@ int ObSyncPlanDriver::response_result(ObMySQLResultSet &result)
     }
   }
   //if the error code is ob_timeout, we add more error info msg for dml query.
-  if (OB_TIMEOUT == ret) {
+  if (OB_TIMEOUT == ret && session_.is_user_session()) {
     LOG_USER_ERROR(OB_TIMEOUT, THIS_WORKER.get_timeout_ts() - session_.get_query_start_time());
   }
 
@@ -264,7 +256,7 @@ int ObSyncPlanDriver::response_result(ObMySQLResultSet &result)
     } else {
       int sret = OB_SUCCESS;
       bool is_partition_hit = session_.get_err_final_partition_hit(ret);
-      if (OB_SUCCESS != (sret = sender_.send_error_packet(ret, NULL, is_partition_hit))) {
+      if (OB_SUCCESS != (sret = sender_.send_error_packet(ret, NULL, is_partition_hit, (void *)ctx_.get_reroute_info()))) {
         LOG_WARN("send error packet fail", K(sret), K(ret));
       }
     }

@@ -193,20 +193,24 @@ public:
   ObInsertTableInfo() :
       ObDmlTableInfo(ObDmlTableType::INSERT_TABLE),
       is_replace_(false),
+      is_overwrite_(false),
       values_desc_(),
       values_vector_(),
       column_conv_exprs_(),
-      assignments_()
+      assignments_(),
+      column_in_values_vector_()
   {
   }
   ObInsertTableInfo(ObDmlTableType dml_type) :
       ObDmlTableInfo(dml_type),
       is_replace_(false),
+      is_overwrite_(false),
       values_desc_(),
       values_vector_(),
       column_conv_exprs_(),
       part_generated_col_dep_cols_(),
-      assignments_()
+      assignments_(),
+      column_in_values_vector_()
   {
   }
   virtual ~ObInsertTableInfo()
@@ -228,12 +232,15 @@ public:
                K_(check_constraint_exprs),
                K_(view_check_exprs),
                K_(is_replace),
+               K_(is_overwrite),
                K_(values_desc),
                K_(values_vector),
                K_(column_conv_exprs),
                K_(part_generated_col_dep_cols),
-               K_(assignments));
+               K_(assignments),
+               K_(column_in_values_vector));
   bool is_replace_;  // replace semantic for mysql
+  bool is_overwrite_;
   // 下面两个变量组合在一起描述了 INSERT 的 VALUES 结构
   // 以 INSERT INTO T1 (i, j, k) VALUES (1,2,3),(4,5,6) 为例：
   //  - values_desc_ 的大小为 3，里面保存了 i, j, k 三列的 column reference expr
@@ -248,6 +255,7 @@ public:
   // part_generated_col_dep_cols_ store c1.
   common::ObSEArray<ObColumnRefRawExpr*, 16, common::ModulePageAllocator, true> part_generated_col_dep_cols_;
   ObAssignments assignments_;
+  common::ObSEArray<ObRawExpr*, 16, common::ModulePageAllocator, true> column_in_values_vector_;
 };
 
 class ObMergeTableInfo: public ObInsertTableInfo
@@ -397,6 +405,7 @@ public:
         returning_exprs_(),
         returning_strs_(),
         returning_agg_items_(),
+        group_param_exprs_(),
         ignore_(false),
         has_global_index_(false),
         error_log_info_(),
@@ -406,6 +415,8 @@ public:
         pdml_disabled_(false)
   { }
   virtual ~ObDelUpdStmt() { }
+  common::ObIArray<ObRawExpr*> &get_group_param_exprs() { return group_param_exprs_; }
+  const common::ObIArray<ObRawExpr*> &get_group_param_exprs() const { return group_param_exprs_; }
   int deep_copy_stmt_struct(ObIAllocator &allocator,
                             ObRawExprCopier &expr_factory,
                             const ObDMLStmt &other) override;
@@ -472,11 +483,13 @@ public:
   int check_dml_source_from_join();
   bool is_pdml_disabled() const { return pdml_disabled_; }
   void set_pdml_disabled() { pdml_disabled_ = true; }
+  int get_modified_materialized_view_id(uint64_t &mview_id) const;
 protected:
   common::ObSEArray<ObRawExpr*, common::OB_PREALLOCATED_NUM, common::ModulePageAllocator, true> returning_exprs_;
   common::ObSEArray<ObRawExpr*, common::OB_PREALLOCATED_NUM, common::ModulePageAllocator, true> returning_into_exprs_;
   common::ObSEArray<ObString, common::OB_PREALLOCATED_NUM, common::ModulePageAllocator, true> returning_strs_;
   common::ObArray<ObAggFunRawExpr*, common::ModulePageAllocator, true> returning_agg_items_;
+  common::ObSEArray<ObRawExpr*, 16, common::ModulePageAllocator, true> group_param_exprs_;
   bool ignore_;
   bool has_global_index_;
   ObErrLogInfo error_log_info_;

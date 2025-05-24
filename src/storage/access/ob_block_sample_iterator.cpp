@@ -11,9 +11,7 @@
  */
 
 #include "ob_block_sample_iterator.h"
-#include "storage/tablet/ob_table_store_util.h"
 #include "storage/tablet/ob_tablet.h"
-#include "storage/blocksstable/ob_logic_macro_id.h"
 
 namespace oceanbase
 {
@@ -226,8 +224,9 @@ int ObBlockSampleSSTableEndkeyIterator::get_current_block_id(ObMicroBlockId &mic
   const ObIndexBlockRowHeader *idx_row_header = nullptr;
   if (OB_FAIL(tree_cursor_.get_idx_row_header(idx_row_header))) {
     STORAGE_LOG(WARN, "Fail to get index block row header", K(ret), K(tree_cursor_));
+  } else if (OB_FAIL(tree_cursor_.get_macro_block_id(micro_block_id.macro_id_))) {
+    STORAGE_LOG(WARN, "Fail to get macro block id", K(ret));
   } else {
-    micro_block_id.macro_id_ = idx_row_header->get_macro_id();
     micro_block_id.offset_ = idx_row_header->get_block_offset();
     micro_block_id.size_ = idx_row_header->get_block_size();
   }

@@ -26,6 +26,7 @@ MULTI_VERSION_EXTRA_ROWKEY_DEF(MAX_EXTRA_ROWKEY, 0, NULL, NULL)
 #include "share/ob_i_tablet_scan.h"
 #include "share/schema/ob_table_param.h"
 #include "storage/tx/ob_trans_define.h"
+#include "storage/ob_i_table.h"
 #include "storage/access/ob_table_read_info.h"
 #include "storage/blocksstable/ob_datum_rowkey.h"
 #include "storage/ob_table_store_stat_mgr.h"
@@ -48,11 +49,11 @@ struct ObEncryptMetaCache;
 
 namespace storage
 {
-class ObITable;
 class ObTableStoreIterator;
 class ObLS;
 class ObLSHandle;
 class ObTablet;
+class ObITable;
 struct ObStoreCtx;
 
 enum class ObStoreAccessType {
@@ -142,6 +143,8 @@ public:
     }
     return ret;
   }
+  OB_INLINE int cap() const
+  { return capacity_; }
   using common::ObFixedArrayImpl<T, common::ObIAllocator>::reset;
 protected:
   using common::ObFixedArrayImpl<T, common::ObIAllocator>::prepare_allocate;
@@ -212,23 +215,57 @@ private:
   int64_t row_version_;
 };
 
+enum class ObExistFlag : uint8_t
+{
+  EXIST        = 0,
+  UNKNOWN      = 1,
+  NOT_EXIST    = 2,
+};
+
 struct ObStoreRowLockState
 {
 public:
   ObStoreRowLockState()
     : is_locked_(false),
-      trans_version_(share::SCN::min_scn()),
-      lock_trans_id_(),
-      lock_data_sequence_(),
-      lock_dml_flag_(blocksstable::ObDmlFlag::DF_NOT_EXIST),
-      is_delayed_cleanout_(false),
-      mvcc_row_(nullptr),
-      trans_scn_(share::SCN::max_scn()) {}
+    trans_version_(share::SCN::min_scn()),
+    lock_trans_id_(),
+    lock_data_sequence_(),
+    lock_dml_flag_(blocksstable::ObDmlFlag::DF_NOT_EXIST),
+    is_delayed_cleanout_(false),
+    mvcc_row_(NULL),
+    trans_scn_(share::SCN::max_scn()) {}
+  inline bool row_exist_not_decided() const
+  {
+    return lock_dml_flag_ == blocksstable::ObDmlFlag::DF_NOT_EXIST;
+  }
+  inline bool row_exist_decided() const
+  {
+    return lock_dml_flag_ == blocksstable::ObDmlFlag::DF_LOCK ||
+      lock_dml_flag_ == blocksstable::ObDmlFlag::DF_UPDATE ||
+      lock_dml_flag_ == blocksstable::ObDmlFlag::DF_INSERT ||
+      lock_dml_flag_ == blocksstable::ObDmlFlag::DF_DELETE;
+  }
+  inline bool row_exist() const
+  {
+    return lock_dml_flag_ == blocksstable::ObDmlFlag::DF_LOCK ||
+      lock_dml_flag_ == blocksstable::ObDmlFlag::DF_UPDATE ||
+      lock_dml_flag_ == blocksstable::ObDmlFlag::DF_INSERT;
+  }
+  inline bool row_deleted() const
+  {
+    return lock_dml_flag_ == blocksstable::ObDmlFlag::DF_DELETE;
+  }
+  inline bool is_row_decided() const
+  {
+    return is_locked_ ||
+      (!trans_version_.is_min() &&
+       lock_dml_flag_ != blocksstable::ObDmlFlag::DF_NOT_EXIST);
+  }
   inline bool is_lock_decided() const
   {
     return is_locked_ || !trans_version_.is_min();
   }
-  inline bool is_locked(const transaction::ObTransID trans_id) const
+  inline bool is_locked_not_by(const transaction::ObTransID trans_id) const
   {
     return is_locked_ && lock_trans_id_ != trans_id;
   }
@@ -250,6 +287,15 @@ public:
   bool is_delayed_cleanout_;
   memtable::ObMvccRow *mvcc_row_;
   share::SCN trans_scn_; // sstable takes end_scn, memtable takes scn_ of ObMvccTransNode
+};
+
+struct ObSSTableRowState {
+  enum ObSSTableRowStateEnum {
+    UNKNOWN_STATE = 0,
+    NOT_EXIST,
+    IN_ROW_CACHE,
+    IN_BLOCK
+  };
 };
 
 struct ObStoreRow
@@ -325,10 +371,6 @@ public:
       const blocksstable::ObDatumRow &row,
       const ObITableReadInfo &read_info);
 };
-
-#define STORE_ITER_ROW_IN_GAP 1
-#define STORE_ITER_ROW_BIG_GAP_HINT 2
-#define STORE_ITER_ROW_PARTIAL 8
 
 template <typename AllocatorT>
 int malloc_store_row(
@@ -409,7 +451,7 @@ struct ObStoreCtx
   void reset();
   bool is_valid() const
   {
-    return ls_id_.is_valid() && mvcc_acc_ctx_.is_valid();
+    return ls_id_.is_valid() && OB_NOT_NULL(ls_) && mvcc_acc_ctx_.is_valid();
   }
   bool is_read() const { return mvcc_acc_ctx_.is_read(); }
   bool is_write() const { return mvcc_acc_ctx_.is_write(); }
@@ -424,7 +466,13 @@ struct ObStoreCtx
                     const int64_t timeout,
                     const int64_t lock_timeout_us,
                     const share::SCN &snapshot_version);
+  bool is_uncommitted_data_rollbacked() const;
   void force_print_trace_log();
+  int init_mds_filter(memtable::ObMvccMdsFilter &mds_filter)
+  { return mvcc_acc_ctx_.init_mds_filter(mds_filter); }
+  memtable::ObMvccMdsFilter &get_mds_filter() { return mvcc_acc_ctx_.mds_filter_; }
+  void clear_mds_filter() { mvcc_acc_ctx_.mds_filter_.reset(); }
+  int get_all_tables(ObIArray<ObITable *> &iter_tables);
   TO_STRING_KV(KP(this),
                K_(ls_id),
                KP_(ls),
@@ -435,9 +483,10 @@ struct ObStoreCtx
                K_(table_version),
                K_(mvcc_acc_ctx),
                K_(tablet_stat),
-               K_(is_read_store_ctx));
+               K_(is_read_store_ctx),
+               K_(update_full_column));
   share::ObLSID ls_id_;
-  storage::ObLS *ls_;                              // for performance opt
+  storage::ObLS *ls_;
   int16_t branch_;                                 // parallel write id
   common::ObTabletID tablet_id_;
   mutable ObTableStoreIterator *table_iter_;
@@ -446,6 +495,8 @@ struct ObStoreCtx
   memtable::ObMvccAccessCtx mvcc_acc_ctx_;         // all txn relative context
   storage::ObTabletStat tablet_stat_;              // used for collecting query statistics
   bool is_read_store_ctx_;
+  bool update_full_column_;
+  int64_t check_seq_;
 };
 
 

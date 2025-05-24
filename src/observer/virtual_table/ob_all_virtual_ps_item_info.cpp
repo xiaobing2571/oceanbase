@@ -13,12 +13,8 @@
 #include "observer/virtual_table/ob_all_virtual_ps_item_info.h"
 
 #include "sql/plan_cache/ob_ps_cache.h"
-#include "sql/plan_cache/ob_plan_cache.h"
-#include "sql/plan_cache/ob_ps_sql_utils.h"
 
 #include "observer/ob_server_utils.h"
-#include "observer/ob_server_struct.h"
-#include "share/inner_table/ob_inner_table_schema.h"
 
 using namespace oceanbase;
 using namespace sql;
@@ -254,7 +250,7 @@ int ObAllVirtualPsItemInfo::get_next_row_from_specified_tenant(uint64_t tenant_i
 
         // still need to deref_stmt_item even though ret is not OB_SUCCESS
         if (OB_NOT_NULL(stmt_item)) {
-          stmt_item->dec_ref_count_check_erase();
+          stmt_item->dec_ref_count();
           stmt_item = NULL;
         }
 

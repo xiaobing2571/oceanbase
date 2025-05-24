@@ -11,7 +11,6 @@
  */
 
 #include "rpc/obrpc/ob_poc_rpc_server.h"
-#include "lib/oblog/ob_log_module.h"
 #include "rpc/obrpc/ob_net_keepalive.h"
 
 #define rk_log_macro(level, ret, format, ...) _OB_LOG_RET(level, ret, "PNIO " format, ##__VA_ARGS__)
@@ -38,6 +37,22 @@ bool __attribute__((weak)) enable_pkt_nio(bool start_as_client) {
 }
 int64_t  __attribute__((weak)) get_max_rpc_packet_size() {
   return OB_MAX_RPC_PACKET_LENGTH;
+}
+void __attribute__((weak)) stream_rpc_register(const int64_t pkt_id, int64_t send_time_us)
+{
+  UNUSED(pkt_id);
+  UNUSED(send_time_us);
+  RPC_LOG_RET(WARN, OB_ERR_UNEXPECTED, "should not reach here");
+}
+void __attribute__((weak)) stream_rpc_unregister(const int64_t pkt_id)
+{
+  UNUSED(pkt_id);
+  RPC_LOG_RET(WARN, OB_ERR_UNEXPECTED, "should not reach here");
+}
+int __attribute__((weak)) stream_rpc_reverse_probe(const ObRpcReverseKeepaliveArg& reverse_keepalive_arg)
+{
+  UNUSED(reverse_keepalive_arg);
+  return OB_ERR_UNEXPECTED;
 }
 }; // end namespace obrpc
 }; // end namespace oceanbase
@@ -73,7 +88,7 @@ int ObPocServerHandleContext::create(int64_t resp_id, const char* buf, int64_t s
       }
       IGNORE_RETURN snprintf(rpc_timeguard_str, sizeof(rpc_timeguard_str), "sz=%ld,pcode=%x,id=%ld", sz, pcode, tenant_id);
       timeguard.click(rpc_timeguard_str);
-      ObRpcMemPool* pool = ObRpcMemPool::create(tenant_id, pcode_label, pool_size);
+      ObRpcMemPool* pool = ObRpcMemPool::create(tenant_id, pcode_label, pool_size, ObRpcMemPool::RPC_CACHE_SIZE);
       void *temp = NULL;
 
   #ifdef ERRSIM
@@ -107,6 +122,10 @@ int ObPocServerHandleContext::create(int64_t resp_id, const char* buf, int64_t s
           }
           int64_t receive_ts = ObTimeUtility::current_time();
           pkt->set_receive_ts(receive_ts);
+          int64_t pkt_id = pn_get_pkt_id(resp_id);
+          if (OB_LIKELY(pkt_id >= 0)) {
+            pkt->set_packet_id(pkt_id);
+          }
           pkt->set_content(packet_data, tmp_pkt.get_clen());
           req->set_server_handle_context(ctx);
           req->set_packet(pkt);
@@ -127,29 +146,59 @@ int ObPocServerHandleContext::create(int64_t resp_id, const char* buf, int64_t s
   return ret;
 }
 
+void* ObPocServerHandleContext::alloc(int64_t sz) {
+  resp_ptr_ = pn_resp_pre_alloc(resp_id_, sz);
+  return resp_ptr_;
+}
+
 void ObPocServerHandleContext::resp(ObRpcPacket* pkt)
 {
   int ret = OB_SUCCESS;
   int sys_err = 0;
   char reserve_buf[2048]; // reserve stack memory for response packet buf
-  char* buf = reserve_buf;
-  int64_t sz = 0;
+  char* buff = NULL;
+  int64_t resp_hdr_size = 0;
+  int64_t resp_buf_size = 0;
+  int64_t rpc_header_size = ObRpcPacket::get_header_size();
+  int pkt_hdr_size = sizeof(ObRpcPacket) + OB_NET_HEADER_LENGTH + rpc_header_size;
+  int64_t pos = 0;
+  char* pkt_ptr = reinterpret_cast<char*>(pkt);
   char rpc_timeguard_str[ObPocRpcServer::RPC_TIMEGUARD_STRING_SIZE] = {'\0'};
   ObTimeGuard timeguard("rpc_resp", 10 * 1000);
   if (NULL == pkt) {
     // do nothing
-  } else if (OB_FAIL(rpc_encode_ob_packet(pool_, pkt, buf, sz, sizeof(reserve_buf)))) {
-    RPC_LOG(WARN, "rpc_encode_ob_packet fail", KP(pkt), K(sz));
-    buf = NULL;
-    sz = 0;
+  } else if (OB_UNLIKELY(pkt_ptr != resp_ptr_)) {
+    // response error packet using temporary memory
+    int64_t sz = 0;
+    char* tmp_buf = reserve_buf;
+    if (OB_FAIL(rpc_encode_ob_packet(pool_, pkt, tmp_buf, sz, sizeof(reserve_buf)))) {
+      RPC_LOG(WARN, "rpc_encode_ob_packet fail", KP(pkt), K(sz));
+    } else {
+      buff = tmp_buf;
+    }
+    resp_hdr_size = 0;
+    resp_buf_size = sz;
+  } else if (OB_FAIL(pkt->encode_header(pkt_ptr + sizeof(ObRpcPacket) + OB_NET_HEADER_LENGTH, rpc_header_size, pos))) {
+    RPC_LOG(WARN, "encode pkt header fail", K(*pkt), K(rpc_header_size), K(pos));
   } else {
+    /*
+      *                   RPC response packet buffer format
+      *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      *  |  ObRpcPacket  |  easy header |  RPC header  | rcode | RPC response |
+      *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      */
+    // ObRpcPacket is not used in pkt-nio, pn_resp will use this buff to allocate pn_resp_t struct
+    buff = pkt_ptr;
+    resp_hdr_size = sizeof(ObRpcPacket) + OB_NET_HEADER_LENGTH;
+    resp_buf_size = pkt->get_encoded_size();
     IGNORE_RETURN snprintf(rpc_timeguard_str, sizeof(rpc_timeguard_str), "sz=%ld,pcode=%x,id=%ld",
-                          sz,
-                          pkt->get_pcode(),
-                          pkt->get_tenant_id());
+                      resp_buf_size,
+                      pkt->get_pcode(),
+                      pkt->get_tenant_id());
   }
   timeguard.click(rpc_timeguard_str);
-  if ((sys_err = pn_resp(resp_id_, buf, sz, resp_expired_abs_us_)) != 0) {
+  if ((sys_err = pn_resp(resp_id_, buff, resp_hdr_size, resp_buf_size, resp_expired_abs_us_)) != 0) {
+    ret = tranlate_to_ob_error(sys_err);
     RPC_LOG(WARN, "pn_resp fail", K(resp_id_), K(sys_err));
   }
 }
@@ -197,13 +246,7 @@ void ObPocServerHandleContext::set_peer_unsafe()
 {
   struct sockaddr_storage sock_addr;
   if (0 == pn_get_peer(resp_id_, &sock_addr)) {
-    if (AF_INET == sock_addr.ss_family) {
-      struct sockaddr_in *sin = reinterpret_cast<struct sockaddr_in *>(&sock_addr);
-      peer_.set_ipv4_addr(ntohl(sin->sin_addr.s_addr), ntohs(sin->sin_port));
-    } else if (AF_INET6 == sock_addr.ss_family) {
-      struct sockaddr_in6 *sin6 = reinterpret_cast<struct sockaddr_in6 *>(&sock_addr);
-      peer_.set_ipv6_addr(&sin6->sin6_addr.s6_addr, ntohs(sin6->sin6_port));
-    }
+    peer_.from_sockaddr(&sock_addr);
   }
 }
 
@@ -236,7 +279,7 @@ int serve_cb(int grp, const char* b, int64_t sz, uint64_t resp_id)
   if (OB_SUCCESS != tmp_ret) {
     if (OB_TMP_FAIL(ObPocServerHandleContext::resp_error(resp_id, tmp_ret, b, sz))) {
       int sys_err = 0;
-      if ((sys_err = pn_resp(resp_id, NULL, 0, OB_INVALID_TIMESTAMP)) != 0) {
+      if ((sys_err = pn_resp(resp_id, NULL, 0, 0, OB_INVALID_TIMESTAMP)) != 0) {
         RPC_LOG(WARN, "pn_resp fail", K(resp_id), K(sys_err));
       }
     }
@@ -268,6 +311,7 @@ int ObPocRpcServer::start(int port, int net_thread_count, frame::ObReqDeliver* d
       RPC_LOG(WARN, "pn_provision for RATELIMIT_PNIO_GROUP error", K(count), K(rl_net_thread_count));
     } else {
       has_start_ = true;
+      RPC_LOG(INFO, "start rpc server success", K(port), K(count));
     }
   }
   return ret;
@@ -290,6 +334,7 @@ int ObPocRpcServer::start_net_client(int net_thread_count)
     } else {
       has_start_ = true;
       start_as_client_ = true;
+      RPC_LOG(INFO, "start rpc net client success", K(net_thread_count));
     }
   }
   return ret;
@@ -300,6 +345,8 @@ void ObPocRpcServer::stop()
   for (uint64_t gid = 1; gid < END_GROUP; gid++) {
     pn_stop(gid);
   }
+  has_start_ = false;
+  start_as_client_ = false;
 }
 
 void ObPocRpcServer::wait()
@@ -307,6 +354,13 @@ void ObPocRpcServer::wait()
   for (uint64_t gid = 1; gid < END_GROUP; gid++) {
     pn_wait(gid);
   }
+}
+
+void ObPocRpcServer::destroy()
+{
+  stop();
+  wait();
+  RPC_LOG(INFO, "destory successfully");
 }
 
 int ObPocRpcServer::update_tcp_keepalive_params(int64_t user_timeout) {

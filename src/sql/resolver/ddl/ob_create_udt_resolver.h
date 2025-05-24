@@ -41,6 +41,7 @@ public:
   explicit ObCreateUDTResolver(ObResolverParams &params) : ObDDLResolver(params) {}
   virtual int resolve(const ParseNode &parse_tree);
 private:
+  int resolve_without_check_valid(const ParseNode &parse_tree);
   int create_udt_arg(obrpc::ObCreateUDTArg *&crt_udt_arg);
   int resolve_oid_clause(const ParseNode *oid_node,
                          share::schema::ObUDTTypeInfo *udt_info);
@@ -87,7 +88,30 @@ private:
                              uint64_t target_database_id,
                              const ObUDTTypeInfo *udt_info,
                              bool &has_mutual_dep);
+  static int splice_udt_ddl(ObSchemaGetterGuard &schema_guard,
+                            ObIAllocator &allocator,
+                            const uint64_t tenant_id,
+                            const uint64_t udt_id,
+                            const ObUDTTypeCode typecode,
+                            ObString &udt_ddl);
+  static int parse_ddl_by_plain_text(ObIAllocator &allocator,
+                                     const ObSQLSessionInfo &session_info,
+                                     const ObString &udt_ddl,
+                                     const ParseNode *&plain_parse_tree);
 public:
+  static int check_udt_validation(const ObSQLSessionInfo& session_info,
+                                  ObSchemaGetterGuard& schema_guard,
+                                  ObResolverParams &params,
+                                  const ObString& db_name,
+                                  const ObUDTTypeInfo& new_udt_info,
+                                  bool& valid);
+  static int check_udt_validation(const ObSQLSessionInfo& session_info,
+                                  ObSchemaGetterGuard& schema_guard,
+                                  ObResolverParams &params,
+                                  const ObString& db_name,
+                                  const ObString& new_udt_name,
+                                  ObUDTTypeCode type_code,
+                                  bool& valid);
   static int package_info_to_object_info(const share::schema::ObPackageInfo &pkg_info,
                                          share::schema::ObUDTObjectType &obj_info);
   static int object_info_to_package_info(const share::schema::ObUDTObjectType &obj_info,

@@ -12,13 +12,9 @@
 
 #include "ob_timestamp_service.h"
 #include "ob_standby_timestamp_service.h"
-#include "ob_trans_event.h"
-#include "observer/ob_server_struct.h"
 #include "observer/ob_srv_network_frame.h"
 #include "ob_timestamp_access.h"
-#include "storage/tx_storage/ob_ls_map.h"
 #include "storage/tx_storage/ob_ls_service.h"
-#include "share/scn.h"
 
 namespace oceanbase
 {
@@ -52,7 +48,6 @@ int ObTimestampService::mtl_init(ObTimestampService *&timestamp_service)
   return ret;
 }
 
-
 // The interface for getting gts timestamp, actually a wrapper of ObIDService::get_number.
 //
 // For most cases, the gts service uses the machine clock's time as gts timestamp, which means
@@ -69,7 +64,7 @@ int ObTimestampService::get_timestamp(int64_t &gts)
   int64_t unused_id;
   // 100ms
   const int64_t CHECK_INTERVAL = 100000000;
-  const int64_t current_time = ObTimeUtility::current_time_ns();
+  const int64_t current_time = ObClockGenerator::getClock() * 1000;
   int64_t last_request_ts = ATOMIC_LOAD(&last_request_ts_);
   int64_t time_delta = current_time - last_request_ts;
 
@@ -180,13 +175,27 @@ int ObTimestampService::handle_request(const ObGtsRequest &request, ObGtsRpcResu
   return ret;
 }
 
+#ifndef ERRSIM
+ERRSIM_POINT_DEF(EN_GTS_HANDLE_REQUEST)
+#endif
+
 int ObTimestampService::handle_local_request_(const ObGtsRequest &request, obrpc::ObGtsRpcResult &result)
 {
   int ret = OB_SUCCESS;
   int64_t gts = 0;
   const uint64_t tenant_id = request.get_tenant_id();
   const MonotonicTs srr = request.get_srr();
-  if (OB_FAIL(get_timestamp(gts))) {
+#ifndef ERRSIM
+  ret = EN_GTS_HANDLE_REQUEST;
+#endif
+  // the fisrt case for errsim
+  if (OB_SUCCESS != ret) {
+    TRANS_LOG(WARN, "errsim for gts handle local request", KR(ret));
+    int tmp_ret = OB_SUCCESS;
+    if (OB_SUCCESS != (tmp_ret = result.init(tenant_id, ret, srr, 0, 0))) {
+      TRANS_LOG(WARN, "gts result init failed", K(tmp_ret), K(request));
+    }
+  } else if (OB_FAIL(get_timestamp(gts))) {
     if (EXECUTE_COUNT_PER_SEC(10)) {
       TRANS_LOG(WARN, "get timestamp failed", KR(ret));
     }

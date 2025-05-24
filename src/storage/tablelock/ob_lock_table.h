@@ -17,6 +17,7 @@
 #include "lib/worker.h"
 #include "storage/ob_i_table.h"
 #include "storage/tablelock/ob_obj_lock.h"
+#include "storage/ob_i_memtable_mgr.h" // ObMemtableMgrHandle
 #include "logservice/ob_log_base_type.h"
 
 namespace oceanbase
@@ -60,8 +61,10 @@ namespace transaction
 namespace tablelock
 {
 struct ObLockParam;
+struct ObReplaceLockParam;
 class ObTableLockOp;
 class ObLockMemtable;
+class ObLockMemtableMgr;
 
 class ObLockTable : public logservice::ObIReplaySubHandler,
                     public logservice::ObIRoleChangeSubHandler,
@@ -69,9 +72,10 @@ class ObLockTable : public logservice::ObIReplaySubHandler,
 {
 public:
   ObLockTable()
-    : parent_(nullptr),
-      is_inited_(false)
-  {}
+    : is_inited_(false),
+      parent_(nullptr),
+      lock_mt_mgr_(nullptr),
+      lock_memtable_handle_() {}
   ~ObLockTable() {}
   int init(storage::ObLS *parent);
   int prepare_for_safe_destroy();
@@ -100,16 +104,24 @@ public:
       const ObTableLockOp &lock_op,
       ObTxIDSet &conflict_tx_set,
       const bool include_finish_tx = true);
-  // lock a object
+  // lock an object
   // @param[in] ctx, store ctx for trans.
   // @param[in] param, contain the lock id, lock type and so on.
   int lock(storage::ObStoreCtx &ctx,
            const ObLockParam &param);
-  // unlock a object
+  // unlock an object
   // @param[in] ctx, store ctx for trans.
-  // @param[in] unlock_op, contain the lock id, lock type and so on.
+  // @param[in] param, contain the lock id, lock type and so on.
   int unlock(storage::ObStoreCtx &ctx,
              const ObLockParam &param);
+  // replace the lock of an object,
+  // it is equivalent to unlocking and locking with a new lock_op.
+  // In addition, the owner of new lock_op can be different with
+  // previous owner.
+  // @param[in] ctx, store ctx for trans.
+  // @param[in] param, contain the lock id, lock type and so on of the previous lock, and new owner_id,
+  // lock_mode of new lock
+  int replace_lock(storage::ObStoreCtx &ctx, const ObReplaceLockParam &param);
   // get all the lock id in the lock map
   // @param[out] iter, the iterator returned.
   // int get_lock_id_iter(ObLockIDIterator &iter);
@@ -136,19 +148,25 @@ public:
   // and clear empty obj locks to recycle resources.
   // See the ObLockMemtable::check_and_clear_obj_lock for deatails.
   int check_and_clear_obj_lock(const bool force_compact);
+  int add_lock_into_queue(storage::ObStoreCtx &ctx, const ObLockParam &lock_param);
   // for replay
   int replay(const void *buffer,
              const int64_t nbytes,
              const palf::LSN &lsn,
-             const share::SCN &scn) override { return OB_SUCCESS; }
+             const share::SCN &scn) override;
   // for checkpoint
-  share::SCN get_rec_scn() override { return share::SCN::max_scn(); }
-  int flush(share::SCN &rec_scn) override { return OB_SUCCESS; }
+  share::SCN get_rec_scn() override;
+  int flush(share::SCN &rec_scn) override;
   // for role change
-  void switch_to_follower_forcedly() override{};
+  void switch_to_follower_forcedly() override;
   int switch_to_leader() override;
-  int switch_to_follower_gracefully() override { return OB_SUCCESS; }
+  int switch_to_follower_gracefully() override;
   int resume_leader() override { return OB_SUCCESS; }
+  // flush lock_memtable that flush had been failed
+  int traversal_flush();
+  int table_lock_split(const common::ObTabletID &src_tablet_id,
+                       const ObSArray<common::ObTabletID> &dst_tablet_ids,
+                       const transaction::ObTransID &trans_id);
 
   int enable_check_tablet_status(const bool need_check);
 
@@ -158,13 +176,17 @@ private:
   int recover_(const blocksstable::ObDatumRow &row);
   int get_table_schema_(const uint64_t tenant_id,
                         share::schema::ObTableSchema &schema);
+  int switch_to_follower_();
 
 private:
   static const int64_t LOCKTABLE_SCHEMA_VERSION = 0;
   static const int64_t LOCKTABLE_SCHEMA_ROEKEY_CNT = 1;
   static const int64_t LOCKTABLE_SCHEMA_COLUMN_CNT = 2;
-  storage::ObLS *parent_;
   bool is_inited_;
+  storage::ObLS *parent_;
+  ObLockMemtableMgr *lock_mt_mgr_;
+  storage::ObTableHandleV2 lock_memtable_handle_;
+  TCRWLock rw_lock_;
 };
 
 } // tablelock

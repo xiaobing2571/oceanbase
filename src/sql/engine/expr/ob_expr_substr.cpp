@@ -12,14 +12,8 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 
-#include "lib/oblog/ob_log.h"
-#include "share/object/ob_obj_cast.h"
-#include "share/vector/ob_vector_define.h"
 #include "sql/engine/expr/ob_expr_substr.h"
-#include "objit/common/ob_item_type.h"
-#include "sql/engine/expr/ob_expr_util.h"
 #include "sql/session/ob_sql_session_info.h"
-#include "storage/ob_storage_util.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 
 namespace oceanbase
@@ -179,7 +173,7 @@ int ObExprSubstr::calc_result_length_oracle(const ObExprResType *types_array,
         SQL_RESV_LOG(WARN, "fail to get mbmaxlen", K(ret), K(cs_type));
       } else {
         if (start_pos > 0 && substr_len > 0) {
-          if (start_pos + substr_len <= result_len + 1) {
+          if (start_pos <= INT64_MAX - substr_len && start_pos + substr_len <= result_len + 1) {
             res_len = substr_len;
           } else {
             res_len = result_len - start_pos + 1;
@@ -187,6 +181,7 @@ int ObExprSubstr::calc_result_length_oracle(const ObExprResType *types_array,
           if (result_type.is_varchar_or_char() && LS_BYTE == result_type.get_length_semantics()) {
             res_len *= mbmaxlen;
           }
+          res_len = MIN(res_len, INT32_MAX);
         }
       }
     }
@@ -254,19 +249,20 @@ int ObExprSubstr::calc_result_typeN(ObExprResType &type,
         type.set_varchar();
       }
     }
-    OZ(aggregate_charsets_for_string_result(type, types_array, 1, type_ctx.get_coll_type()));
+    OZ(aggregate_charsets_for_string_result(type, types_array, 1, type_ctx));
     if (OB_SUCC(ret)) {
       if (is_mysql_mode() && (types_array[0].is_text() || types_array[0].is_blob())) {
         // do nothing
       } else {
         types_array[0].set_calc_type(ObVarcharType);
+        types_array[0].set_calc_collation_level(type.get_collation_level());
+        types_array[0].set_calc_collation_type(type.get_collation_type());
       }
-      types_array[0].set_calc_collation_level(type.get_calc_collation_level());
-      types_array[0].set_calc_collation_type(type.get_collation_type());
     }
     if (OB_SUCC(ret)) {
       for (int i = 1; i < param_num; i++) {
         types_array[i].set_calc_type(ObIntType);
+        types_array[i].set_calc_collation_level(type.get_collation_level());
       }
     }
     if (OB_SUCC(ret) && !ob_is_text_tc(type.get_type())) {
@@ -468,7 +464,7 @@ int ObExprSubstr::substr(common::ObString &varchar,
       } else {
         if (do_ascii_optimize_check) { // ObCharsetType is CHARSET_UTF8MB4 or CHARSET_GBK
           res_len = min(length, varchar.length() - start);
-          is_ascii = storage::is_ascii_str(varchar.ptr(), start + res_len);
+          is_ascii = storage::is_ascii_str(varchar.ptr() + start, res_len);
         }
         if (is_ascii) {
           varchar.assign_ptr(varchar.ptr() + start, static_cast<int32_t>(res_len));
@@ -691,7 +687,7 @@ int ObExprSubstr::eval_substr(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_
         ObTextStringIter input_iter(input_meta.type_, input_meta.cs_type_, str_datum->get_string(), has_lob_header);
         ObTextStringDatumResult output_result(expr.datum_meta_.type_, &expr, &ctx, &expr_datum);
         int64_t total_byte_len = 0;
-        if (OB_FAIL(input_iter.init(0, NULL, &calc_alloc))) {
+        if (OB_FAIL(ObTextStringHelper::build_text_iter(input_iter, &ctx.exec_ctx_, NULL/*session*/, &calc_alloc))) {
           LOG_WARN("init input_iter failed ", K(ret), K(input_iter));
         } else if (OB_FAIL(input_iter.get_byte_len(total_byte_len))) {
           LOG_WARN("get input byte len failed", K(ret));
@@ -811,7 +807,7 @@ int ObExprSubstr::eval_substr_batch(const ObExpr &expr, ObEvalCtx &ctx,
             ObTextStringIter input_iter(input_meta.type_, input_meta.cs_type_, datum_array[j].get_string(), has_lob_header);
             ObTextStringDatumResult output_result(expr.datum_meta_.type_, &expr, &ctx, &results[j]);
             int64_t total_byte_len = 0;
-            if (OB_FAIL(input_iter.init(0, NULL, &calc_alloc))) {
+            if (OB_FAIL(ObTextStringHelper::build_text_iter(input_iter, &ctx.exec_ctx_, NULL/*session*/, &calc_alloc))) {
               LOG_WARN("init input_iter failed ", K(ret), K(input_iter));
             } else if (OB_FAIL(input_iter.get_byte_len(total_byte_len))) {
               LOG_WARN("get input byte len failed", K(ret), K(j));
@@ -888,7 +884,6 @@ int ObExprSubstr::vector_substr(VECTOR_EVAL_FUNC_ARG_DECL)
           eval_flags.set(idx);
         }
       }
-      eval_flags.set_all(bound.start(), bound.end());
     } else {
       // 2. calc substr while result is not all null
       int64_t pos = 0;
@@ -982,24 +977,24 @@ int ObExprSubstr::eval_substr_vector(VECTOR_EVAL_FUNC_ARG_DECL)
     VectorFormat arg_format = expr.args_[0]->get_format(ctx);
     VectorFormat res_format = expr.get_format(ctx);
     if (VEC_DISCRETE == arg_format && VEC_DISCRETE == res_format) {
-      ret = vector_substr<TextDiscVec, TextDiscVec>(VECTOR_EVAL_FUNC_ARG_LIST);
+      ret = vector_substr<StrDiscVec, StrDiscVec>(VECTOR_EVAL_FUNC_ARG_LIST);
     } else if (VEC_UNIFORM == arg_format && VEC_DISCRETE == res_format) {
-      ret = vector_substr<TextUniVec, TextDiscVec>(VECTOR_EVAL_FUNC_ARG_LIST);
+      ret = vector_substr<StrUniVec, StrDiscVec>(VECTOR_EVAL_FUNC_ARG_LIST);
     } else if (VEC_CONTINUOUS == arg_format && VEC_DISCRETE == res_format) {
-      ret = vector_substr<TextContVec, TextDiscVec>(VECTOR_EVAL_FUNC_ARG_LIST);
+      ret = vector_substr<StrContVec, StrDiscVec>(VECTOR_EVAL_FUNC_ARG_LIST);
     } else if (VEC_DISCRETE == arg_format && VEC_UNIFORM == res_format) {
-      ret = vector_substr<TextDiscVec, TextUniVec>(VECTOR_EVAL_FUNC_ARG_LIST);
+      ret = vector_substr<StrDiscVec, StrUniVec>(VECTOR_EVAL_FUNC_ARG_LIST);
     } else if (VEC_UNIFORM == arg_format && VEC_UNIFORM == res_format) {
-      ret = vector_substr<TextUniVec, TextUniVec>(VECTOR_EVAL_FUNC_ARG_LIST);
+      ret = vector_substr<StrUniVec, StrUniVec>(VECTOR_EVAL_FUNC_ARG_LIST);
     } else if (VEC_CONTINUOUS == arg_format && VEC_UNIFORM == res_format) {
-      ret = vector_substr<TextContVec, TextUniVec>(VECTOR_EVAL_FUNC_ARG_LIST);
+      ret = vector_substr<StrContVec, StrUniVec>(VECTOR_EVAL_FUNC_ARG_LIST);
     } else {
       ret = vector_substr<ObVectorBase, ObVectorBase>(VECTOR_EVAL_FUNC_ARG_LIST);
     }
   }
   if (OB_SUCC(ret)) {
-    SQL_LOG(DEBUG, "expr", K(ToStrVectorHeader(expr.get_vector_header(ctx), expr, &skip, bound)));
-    SQL_LOG(DEBUG, "expr.args_[0]", K(ToStrVectorHeader(expr.args_[0]->get_vector_header(ctx), *expr.args_[0], &skip, bound)));
+    SQL_LOG(DEBUG, "expr", K(ToStrVectorHeader(expr, ctx, &skip, bound)));
+    SQL_LOG(DEBUG, "expr.args_[0]", K(ToStrVectorHeader(*expr.args_[0], ctx, &skip, bound)));
   }
   return ret;
 }

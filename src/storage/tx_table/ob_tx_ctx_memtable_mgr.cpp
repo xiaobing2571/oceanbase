@@ -59,30 +59,28 @@ int ObTxCtxMemtableMgr::init(const common::ObTabletID &tablet_id,
                              ObTenantMetaMemMgr *t3m)
 {
   UNUSED(tablet_id);
-  UNUSED(freezer);
-
   int ret = OB_SUCCESS;
 
-  ls_id_ = ls_id;
-  freezer_ = freezer;
-  t3m_ = t3m;
-  table_type_ = ObITable::TableType::TX_CTX_MEMTABLE;
-  is_inited_ = true;
-  LOG_INFO("tx ctx memtable mgr init successfully", K(ls_id), K(tablet_id), K(this));
-
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("tx ctx memtable mgr init twice.", K(ret), K_(ls_id));
+  } else if (OB_UNLIKELY(!ls_id.is_valid()) ||
+             OB_ISNULL(freezer) ||
+             OB_ISNULL(t3m)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(ls_id), KP(freezer), KP(t3m));
+  } else {
+    ls_id_ = ls_id;
+    freezer_ = freezer;
+    t3m_ = t3m;
+    is_inited_ = true;
+    LOG_INFO("tx ctx memtable mgr init successfully", K(ls_id), K(tablet_id), K(this));
+  }
   return ret;
 }
 
-int ObTxCtxMemtableMgr::create_memtable(const SCN last_replay_scn,
-                                        const int64_t schema_version,
-                                        const SCN newest_clog_checkpoint_scn,
-                                        const bool for_replay)
+int ObTxCtxMemtableMgr::create_memtable(const CreateMemtableArg &arg)
 {
-  UNUSED(last_replay_scn);
-  UNUSED(schema_version);
-  UNUSED(newest_clog_checkpoint_scn);
-  UNUSED(for_replay);
-
   int ret = OB_SUCCESS;
   ObTableHandleV2 handle;
   ObITable::TableKey table_key;
@@ -111,7 +109,7 @@ int ObTxCtxMemtableMgr::create_memtable(const SCN last_replay_scn,
     if (NULL == tx_ctx_memtable) {
       ret = OB_INVALID_ARGUMENT;
       TRANS_LOG(WARN, "invalid tx_ctx_memtable", K(ret), KPC(table));
-    } else if (OB_FAIL(tx_ctx_memtable->init(table_key, ls_id_))) {
+    } else if (OB_FAIL(tx_ctx_memtable->init(table_key, ls_id_, freezer_))) {
       LOG_WARN("memtable init fail.", KR(ret));
     } else if (OB_FAIL(add_memtable_(handle))) {
       LOG_WARN("add memtable fail.", KR(ret));
@@ -132,7 +130,7 @@ int ObTxCtxMemtableMgr::create_memtable(const SCN last_replay_scn,
 const ObTxCtxMemtable *ObTxCtxMemtableMgr::get_tx_ctx_memtable_(const int64_t pos) const
 {
   int ret = OB_SUCCESS;
-  const memtable::ObIMemtable *imemtable = tables_[get_memtable_idx(pos)];
+  const ObIMemtable *imemtable = tables_[get_memtable_idx(pos)];
   const ObTxCtxMemtable *memtable = nullptr;
   if (OB_ISNULL(imemtable)) {
     ret = OB_NOT_INIT;
@@ -186,7 +184,7 @@ int ObTxCtxMemtableMgr::unregister_from_common_checkpoint_(const ObTxCtxMemtable
   return ret;
 }
 
-int ObTxCtxMemtableMgr::release_head_memtable_(memtable::ObIMemtable *imemtable,
+int ObTxCtxMemtableMgr::release_head_memtable_(ObIMemtable *imemtable,
                                                const bool force)
 {
   int ret = OB_SUCCESS;

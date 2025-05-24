@@ -65,11 +65,13 @@ private:
   int parse_reserved_snapshot_log_();
   int parse_medium_log_();
   int parse_dup_table_log_();
+  int parse_vector_index_log_();
 
   //log type belong to trans_service
   int parse_trans_redo_log_(transaction::ObTxLogBlock &tx_log_block,
                             transaction::TxID tx_id,
                             bool &has_dumped_tx_id);
+int prepare_log_buf_(logservice::ObLogBaseHeader &header);
 private:
   int alloc_mutator_string_buf_();
   int dump_tx_id_ts_(share::ObAdminLogDumperInterface *writer_ptr,
@@ -77,11 +79,13 @@ private:
                      bool &has_dumped_tx_id);
 
 private:
+
   const char *buf_;
-  const int64_t buf_len_;
+  int64_t buf_len_;
   int64_t pos_;
 
   int64_t scn_val_;
+  const palf::LogEntry &entry_;
   char block_name_[OB_MAX_FILE_NAME_LENGTH];
   palf::LSN lsn_;
   share::ObAdminMutatorStringArg str_arg_;

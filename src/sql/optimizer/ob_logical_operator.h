@@ -325,7 +325,6 @@ public:
 		multi_child_op_above_count_in_dfo_(0),
 		partition_count_(0),
     hash_part_(false),
-    slave_mapping_type_(SM_NONE),
     is_valid_for_gi_(false)
   {
   }
@@ -357,7 +356,6 @@ public:
   int push_current_dfo_dop(int64_t dop);
   // MANUAL_TABLE_DOP情况下，exchange operator在 alloc_gi_post才能够被调用
   int pop_current_dfo_dop();
-  inline bool is_in_slave_mapping() { return SlaveMappingType::SM_NONE != slave_mapping_type_; }
   TO_STRING_KV(K(alloc_gi_),
 							 K(tablet_size_),
 							 K(state_),
@@ -373,7 +371,6 @@ public:
   int64_t partition_count_;
   // 记录了当前GI直系TSC的是否是hash/key分区表
   bool hash_part_;
-  SlaveMappingType slave_mapping_type_;
   bool is_valid_for_gi_;
 };
 
@@ -436,20 +433,15 @@ public:
 
 struct ObExchangeInfo
 {
+  // TODO: remove this struct, use ObRawExpr* directly
   struct HashExpr
   {
     HashExpr() : expr_(NULL) {}
-    HashExpr(ObRawExpr *expr, const ObObjMeta &cmp_type) : expr_(expr), cmp_type_(cmp_type) {}
+    HashExpr(ObRawExpr *expr) : expr_(expr) {}
 
-    TO_STRING_KV(K_(expr), K_(cmp_type));
+    TO_STRING_KV(K_(expr));
 
     ObRawExpr *expr_;
-
-    // Compare type of %expr_ when compare with other values.
-    // Objects should convert to %cmp_type_ before calculate hash value.
-    //
-    // Only type_ and cs_type_ of %cmp_type_ are used right now.
-    ObObjMeta cmp_type_;
   };
   ObExchangeInfo()
   : is_remote_(false),
@@ -965,6 +957,12 @@ public:
     return OB_LIKELY(index >= 0 && index < child_.count()) ? child_.at(index) : NULL;
   }
 
+  inline const ObLogicalOperator *get_op_below_exchange() const
+  {
+    const ObLogicalOperator *op = log_op_def::LOG_EXCHANGE == get_type() ? get_child(0) : this;
+    return (OB_NOT_NULL(op) && log_op_def::LOG_EXCHANGE == op->get_type()) ? op->get_child(0) : op;
+  }
+
   inline ObIArray<ObLogicalOperator*> &get_child_list()
   {
     return child_;
@@ -1055,6 +1053,7 @@ public:
   inline uint64_t get_op_id() const { return op_id_; }
   inline void set_op_id(uint64_t op_id) { op_id_ = op_id; }
   inline bool is_partition_wise() const { return is_partition_wise_; }
+  int is_dfo_contains_partition_wise(bool &contain_partition_wise) const;
   inline void set_is_partition_wise(bool is_partition_wise)
   { is_partition_wise_ = is_partition_wise; }
   inline bool is_fully_partition_wise() const
@@ -1074,6 +1073,7 @@ public:
   {
     exchange_allocated_ = exchange_allocated;
   }
+
   virtual bool is_gi_above() const { return false; }
   inline void set_phy_plan_type(ObPhyPlanType phy_plan_type)
   {
@@ -1165,9 +1165,9 @@ public:
    * get cur_op's expected_ordering
    */
   inline void set_is_local_order(bool is_local_order) { is_local_order_ = is_local_order; }
-  inline bool get_is_local_order() { return is_local_order_; }
+  inline bool get_is_local_order() const { return is_local_order_; }
   inline void set_is_range_order(bool is_range_order) { is_range_order_ = is_range_order; }
-  inline bool get_is_range_order() { return is_range_order_; }
+  inline bool get_is_range_order() const { return is_range_order_; }
 
   inline void set_is_at_most_one_row(bool is_at_most_one_row) { is_at_most_one_row_ = is_at_most_one_row; }
   inline bool get_is_at_most_one_row() { return is_at_most_one_row_; }
@@ -1234,8 +1234,6 @@ public:
   int add_exprs_to_ctx(ObAllocExprContext &ctx,
                        const ObIArray<ObRawExpr*> &exprs);
   int build_and_put_pack_expr(ObIArray<ObRawExpr*> &output_exprs);
-  int build_and_put_into_outfile_expr(const ObSelectIntoItem *into_item,
-                                      ObIArray<ObRawExpr*> &output_exprs);
   int put_into_outfile_expr(ObRawExpr *into_expr);
   int add_exprs_to_ctx(ObAllocExprContext &ctx,
                        const ObIArray<ObRawExpr*> &exprs,
@@ -1248,12 +1246,11 @@ public:
 
   int extract_non_const_exprs(const ObIArray<ObRawExpr*> &input_exprs,
                               ObIArray<ObRawExpr*> &non_const_exprs);
-  int check_need_pushdown_expr(const bool producer_id,
+  int check_need_pushdown_expr(const uint64_t producer_id,
                                bool &need_pushdown);
   int check_can_pushdown_expr(const ObRawExpr *expr, bool &can_pushdown);
   int get_pushdown_producer_id(const ObRawExpr *expr, uint64_t &producer_id);
 
-  int force_pushdown_exprs(ObAllocExprContext &ctx);
   int get_pushdown_producer_id(uint64_t &producer_id);
 
   int extract_shared_exprs(const ObIArray<ObRawExpr*> &exprs,
@@ -1321,6 +1318,9 @@ public:
 
   int re_est_cost(EstimateCostInfo &param, double &card, double &cost);
   virtual int do_re_est_cost(EstimateCostInfo &param, double &card, double &op_cost, double &cost);
+
+  virtual int est_ambient_card();
+  int inner_est_ambient_card_by_child(int64_t child_idx);
 
   /**
    * @brief compute_property
@@ -1409,9 +1409,9 @@ public:
   int check_exchange_rescan(bool &need_rescan);
 
   /**
-   * Check if has exchange below.
+   * Check if has target op below.
    */
-  int check_has_exchange_below(bool &has_exchange) const;
+  int check_has_op_below(const log_op_def::ObLogOpType target_type, bool &has) const;
   /**
    * Allocate runtime filter operator.
    */
@@ -1540,7 +1540,10 @@ public:
   {
     inherit_sharding_index_ = inherit_sharding_index;
   }
+  inline bool need_re_est_child_cost() const { return need_re_est_child_cost_; }
 
+  inline DistAlgo get_dist_method()const { return dist_method_; }
+  inline void set_dist_method(const DistAlgo &algo) { dist_method_ = algo; }
   inline bool need_osg_merge() const { return need_osg_merge_; }
   inline void set_need_osg_merge(bool v)
   {
@@ -1630,6 +1633,8 @@ public:
   int get_part_column_exprs(const uint64_t table_id,
                             const uint64_t ref_table_id,
                             ObIArray<ObRawExpr *> &part_cols) const;
+  bool is_parallel_more_than_part_cnt(const int64_t ratio = 1) const;
+  int64_t get_part_cnt() const;
   inline void set_parallel(int64_t parallel) { parallel_ = parallel; }
   inline int64_t get_parallel() const { return parallel_; }
   inline void set_op_parallel_rule(OpParallelRule op_parallel_rule) { op_parallel_rule_ = op_parallel_rule; }
@@ -1652,7 +1657,6 @@ public:
                             ObIArray<ObRawExpr *> &filters_exprs);
 
   int find_shuffle_join_filter(bool &find) const;
-  int has_window_function_below(bool &has_win_func) const;
   int get_pushdown_op(log_op_def::ObLogOpType op_type, const ObLogicalOperator *&op) const;
 
   virtual int get_plan_item_info(PlanText &plan_text,
@@ -1718,6 +1722,19 @@ public:
   virtual int close_px_resource_analyze(CLOSE_PX_RESOURCE_ANALYZE_DECLARE_ARG);
   int find_max_px_resource_child(OPEN_PX_RESOURCE_ANALYZE_DECLARE_ARG, int64_t start_idx);
 
+  inline ObIArray<double> &get_ambient_card() { return ambient_card_; }
+
+  int pre_check_can_px_batch_rescan(bool &find_nested_rescan,
+                                    bool &find_rescan_px,
+                                    bool nested) const;
+  int check_contain_dist_das(const ObIArray<ObAddr> &exec_server_list,
+                             bool &contain_dist_das) const;
+
+  inline bool can_re_parallel() { return !is_distributed() && !is_match_all() && 1 < get_available_parallel() && !get_is_at_most_one_row(); }
+  int check_op_orderding_used_by_parent(bool &used);
+
+  inline void set_is_order_by_plan_top(const bool is_top) { is_order_by_plan_top_ = is_top; }
+  inline bool is_order_by_plan_top() const { return is_order_by_plan_top_; }
 public:
   ObSEArray<ObLogicalOperator *, 16, common::ModulePageAllocator, true> child_;
   ObSEArray<ObPCParamEqualInfo, 4, common::ModulePageAllocator, true> equal_param_constraints_;
@@ -1754,6 +1771,7 @@ protected:
   static int explain_print_partitions(const ObIArray<ObLogicalOperator::PartInfo> &part_infos,
                                       const bool two_level, char *buf,
                                       int64_t &buf_len, int64_t &pos);
+
 protected:
 
   void add_dist_flag(uint64_t &flags, DistAlgo method) const {
@@ -1771,6 +1789,19 @@ protected:
   void clear_dist_flag(uint64_t &flags) const {
     flags = 0;
   }
+
+  int find_table_scan(ObLogicalOperator* root_op,
+                    uint64_t table_id,
+                    ObLogicalOperator* &scan_op,
+                    bool& table_scan_has_exchange,
+                    bool &has_px_coord);
+
+  int check_sort_key_can_pushdown_to_tsc(
+      ObLogicalOperator *op,
+      common::ObSEArray<ObRawExpr *, 8, common::ModulePageAllocator, true> &effective_sk_exprs,
+      uint64_t table_id, ObLogicalOperator *&scan_op, bool &table_scan_has_exchange,
+      bool &has_px_coord, int64_t &effective_sk_cnt);
+
 protected:
 
   log_op_def::ObLogOpType type_;
@@ -1784,6 +1815,7 @@ protected:
   const EqualSets *output_equal_sets_;
   const ObFdItemSet *fd_item_set_;
   const ObRelIds *table_set_;
+  common::ObSEArray<double, 8, common::ModulePageAllocator, true> ambient_card_;
 
   uint64_t id_;                        // operator 0-based depth-first id
   uint64_t branch_id_;
@@ -1819,16 +1851,13 @@ private:
     ObLogicalOperator *op_sort,
     bool &need_remove,
     bool global_order);
-  int find_table_scan(ObLogicalOperator* root_op,
-                      uint64_t table_id,
-                      ObLogicalOperator* &scan_op,
-                      bool& table_scan_has_exchange,
-                      bool &has_px_coord);
   //private function, just used for allocating join filter node.
   int allocate_partition_join_filter(const ObIArray<JoinFilterInfo> &infos,
                                      int64_t &filter_id);
   int allocate_normal_join_filter(const ObIArray<JoinFilterInfo> &infos,
                                   int64_t &filter_id);
+  int calc_rf_max_wait_time(const ObLogicalOperator *node, uint64_t table_id,
+                            int64_t &max_wait_time_ms);
   int create_runtime_filter_info(
       ObLogicalOperator *op,
       ObLogicalOperator *join_filter_create_op,
@@ -1864,12 +1893,29 @@ private:
     ObLogicalOperator *scan_node,
     const JoinFilterInfo &info);
 
+  int check_sort_key_can_pushdown_to_tsc_detail(ObLogicalOperator *op,
+                                                ObRawExpr *candidate_sk_expr, uint64_t table_id,
+                                                ObLogicalOperator *&scan_op, bool &find_table_scan,
+                                                bool &table_scan_has_exchange, bool &has_px_coord);
+  int check_sort_key_can_pushdown_to_tsc_for_gby(ObLogicalOperator *op,
+                                                ObRawExpr *candidate_sk_expr, uint64_t table_id,
+                                                ObLogicalOperator *&scan_op, bool &find_table_scan,
+                                                bool &table_scan_has_exchange, bool &has_px_coord);
+  int check_sort_key_can_pushdown_to_tsc_for_winfunc(ObLogicalOperator *op,
+                                                 ObRawExpr *candidate_sk_expr, uint64_t table_id,
+                                                 ObLogicalOperator *&scan_op, bool &find_table_scan,
+                                                 bool &table_scan_has_exchange, bool &has_px_coord);
+  int check_sort_key_can_pushdown_to_tsc_for_join(ObLogicalOperator *op,
+                                                ObRawExpr *candidate_sk_expr, uint64_t table_id,
+                                                ObLogicalOperator *&scan_op, bool &find_table_scan,
+                                                bool &table_scan_has_exchange, bool &has_px_coord);
+
 
   /* manual set dop for each dfo */
   int refine_dop_by_hint();
   int check_has_temp_table_access(ObLogicalOperator *cur, bool &has_temp_table_access);
 
-  int find_px_for_batch_rescan(const log_op_def::ObLogOpType, int64_t op_id, bool &find);
+  int find_px_for_batch_rescan(ObLogicalOperator *batch_rescan_op, bool &find);
   int find_nested_dis_rescan(bool &find, bool nested);
   int add_op_exprs(ObRawExpr* expr);
   // alloc mat for sync in output
@@ -1878,6 +1924,7 @@ private:
   int need_alloc_material_for_push_down_wf(ObLogicalOperator &curr_op, bool &need_alloc);
   int check_need_parallel_valid(int64_t need_parallel) const;
   virtual int get_card_without_filter(double &card);
+  virtual int check_use_child_ordering(bool &used, int64_t &inherit_child_ordering_index);
 private:
   ObLogicalOperator *parent_;                           // parent operator
   bool is_plan_root_;                                // plan root operator
@@ -1937,6 +1984,9 @@ protected:
   bool need_osg_merge_;
   int64_t max_px_thread_branch_;
   int64_t max_px_group_branch_;
+  bool need_re_est_child_cost_;
+  DistAlgo dist_method_;
+  bool is_order_by_plan_top_;
 };
 
 template <typename Allocator>
@@ -1959,6 +2009,33 @@ int ObLogicalOperator::init_all_traverse_ctx(Allocator &alloc)
   }
   return ret;
 }
+
+// json table default value struct
+struct ObColumnDefault
+{
+public:
+  ObColumnDefault()
+    : column_id_(common::OB_NOT_EXIST_COLUMN_ID),
+      default_error_expr_(nullptr),
+      default_empty_expr_(nullptr)
+  {}
+  ObColumnDefault(int64_t column_id)
+    : column_id_(column_id),
+      default_error_expr_(nullptr),
+      default_empty_expr_(nullptr)
+  {}
+  void reset()
+  {
+    column_id_ = common::OB_NOT_EXIST_COLUMN_ID;
+    default_error_expr_ = nullptr;
+    default_empty_expr_ = nullptr;
+  }
+
+  TO_STRING_KV(K_(column_id), KPC_(default_error_expr), KPC_(default_empty_expr));
+  int64_t column_id_;
+  ObRawExpr* default_error_expr_;
+  ObRawExpr* default_empty_expr_;
+};
 
 } // end of namespace sql
 } // end of namespace oceanbase

@@ -14,19 +14,9 @@
 
 #include "ob_expr_ols_funcs.h"
 
-#include "sql/engine/expr/ob_expr_res_type.h"
-#include "sql/executor/ob_task_executor_ctx.h"
-#include "sql/engine/ob_exec_context.h"
 #include "sql/engine/cmd/ob_table_executor.h"
-#include "sql/parser/ob_parser.h"
 #include "sql/resolver/ddl/ob_alter_table_resolver.h"
 #include "sql/plan_cache/ob_sql_parameterization.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "share/schema/ob_schema_struct.h"
-#include "share/inner_table/ob_inner_table_schema_constants.h"
-#include "share/ob_common_rpc_proxy.h"
-#include "share/ob_label_security.h"
-#include "observer/ob_server_struct.h"
 #include "sql/ob_spi.h"
 
 using namespace oceanbase::common;
@@ -1786,9 +1776,9 @@ int ObExprOLSCharToLabel::eval_char_to_label(const ObExpr &expr, ObEvalCtx &ctx,
     LOG_WARN("schema guard is NULL", K(ret));
   } else if (OB_FAIL(expr.eval_param_value(ctx, param1, param2))) {
     LOG_WARN("failed to eval params", K(ret));
-  } else if (param1->to_obj(obj1, expr.args_[0]->obj_meta_)) {
+  } else if (OB_FAIL(param1->to_obj(obj1, expr.args_[0]->obj_meta_))) {
     LOG_WARN("failed to convert to obj", K(ret));
-  } else if (param2->to_obj(obj2, expr.args_[1]->obj_meta_)) {
+  } else if (OB_FAIL(param2->to_obj(obj2, expr.args_[1]->obj_meta_))) {
     LOG_WARN("failed to convert to obj", K(ret));
   } else {
     tenant_id = session->get_effective_tenant_id();

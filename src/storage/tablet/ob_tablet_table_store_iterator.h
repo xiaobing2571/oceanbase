@@ -34,8 +34,8 @@ class ObMemtableArray;
 
 class ObTableStoreIterator final
 {
-// TODO: currently, we will load all related tables into memory on initializetion of iterator,
-// maybe we should init with sstable address and prefetch sstable on iteratring for more smooth memory usage
+// TODO: currently, we will load all related tables into memory on initialization of iterator,
+// maybe we should init with sstable address and prefetch sstable on iterating for more smooth memory usage
 public:
   class TablePtr final
   {
@@ -49,7 +49,7 @@ public:
     int64_t hdl_idx_;
   };
 public:
-  static const int64_t DEFAULT_TABLE_HANDLE_CNT = 1;
+  static const int64_t DEFAULT_TABLE_HANDLE_CNT = 4;
   static const int64_t DEFAULT_TABLE_CNT = 16;
   typedef common::ObSEArray<ObStorageMetaHandle, DEFAULT_TABLE_HANDLE_CNT> SSTableHandleArray;
   typedef common::ObSEArray<TablePtr, DEFAULT_TABLE_CNT> TableArray;
@@ -67,6 +67,7 @@ public:
   void resume();
 
   int set_handle(const ObStorageMetaHandle &table_store_handle);
+  int alloc_split_extra_table_store_handle(ObStorageMetaHandle *&meta_handle);
 
   ObITable *get_last_memtable();
   int get_next(ObITable *&table);
@@ -85,7 +86,7 @@ public:
     return (NULL == memstore_retired_) ? false : ATOMIC_LOAD(memstore_retired_);
   }
   TO_STRING_KV(K_(table_ptr_array), K_(sstable_handle_array), K_(pos), K_(step), K_(memstore_retired),
-      K_(need_load_sstable), K_(table_store_handle), KPC_(transfer_src_table_store_handle));
+      K_(need_load_sstable), K_(table_store_handle), KPC_(transfer_src_table_store_handle), K_(split_extra_table_store_handles));
 private:
   int inner_move_idx_to_next();
   int get_table_ptr_with_meta_handle(
@@ -108,6 +109,7 @@ private:
   int64_t step_;
   bool * memstore_retired_;
   ObStorageMetaHandle *transfer_src_table_store_handle_;
+  ObSEArray<ObStorageMetaHandle, 1> split_extra_table_store_handles_;
   DISALLOW_COPY_AND_ASSIGN(ObTableStoreIterator);
 };
 

@@ -29,7 +29,7 @@ static pktc_sk_t* pktc_do_connect(pktc_t* cl, addr_t dest) {
 
 static pktc_sk_t* pktc_try_connect(pktc_t* cl, addr_t dest) {
   pktc_sk_t* sk = NULL;
-  link_t* sk_link = ihash_get(&cl->sk_map, *(uint64_t*)&dest);
+  link_t* sk_link = ihash_get(&cl->sk_map, &dest);
   if (sk_link) {
     sk = structof(sk_link, pktc_sk_t, hash);
   } else {
@@ -39,7 +39,8 @@ static pktc_sk_t* pktc_try_connect(pktc_t* cl, addr_t dest) {
   }
   return sk;
   el();
-  rk_warn("sk create fail: %s sk=%p", T2S(addr, dest), sk);
+  char dest_addr_buf[PNIO_NIO_ADDR_LEN] = {'\0'};
+  rk_warn("sk create fail: %s sk=%p", addr_str(dest, dest_addr_buf, sizeof(dest_addr_buf)), sk);
   if (sk) {
     pktc_sk_destroy(&cl->sf, sk);
   }
@@ -127,7 +128,7 @@ static int pktc_handle_req_queue(pktc_t* io) {
       if (PN_CMD_TERMINATE_PKT == cmd_req->cmd) {
         // make rpc callback executed in advance
         rk_info("hand cmd req, cmd=%ld, arg=%ld", cmd_req->cmd, cmd_req->arg);
-        pktc_resp_cb_on_terminate(io, (uint32_t)cmd_req->arg);
+        pktc_resp_cb_on_terminate(io, cmd_req->arg);
       }
       cfifo_free(cmd_req);
     } else {

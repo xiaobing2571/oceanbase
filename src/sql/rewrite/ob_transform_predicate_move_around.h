@@ -14,6 +14,7 @@
 #define OB_TRANSFORM_PREDICATE_MOVE_AROUND_H
 
 #include "sql/rewrite/ob_transform_rule.h"
+#include "sql/rewrite/ob_transform_utils.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/rewrite/ob_stmt_comparer.h"
 
@@ -38,6 +39,9 @@ struct ObTempTableColumnCheckContext : public ObStmtCompareContext {
   }
   int64_t first_temp_table_id_;
   int64_t second_temp_table_id_;
+
+private:
+  DISABLE_COPY_ASSIGN(ObTempTableColumnCheckContext);
 };
 
 class ObTransformPredicateMoveAround : public ObTransformRule
@@ -128,7 +132,8 @@ private:
 
   int compute_pullup_predicates(ObSelectStmt &view,
                                 const ObIArray<int64_t> &select_list,
-                                ObIArray<ObRawExpr *> &local_preds,
+                                ObIArray<ObRawExpr *> &original_preds,
+                                ObIArray<ObRawExpr *> &input_pullup_preds,
                                 ObIArray<ObRawExpr *> &pull_up_preds);
 
   int check_expr_pullup_validity(ObRawExpr *expr,
@@ -302,7 +307,9 @@ private:
 
   int inner_split_or_having_expr(ObSelectStmt &stmt,
                                 ObIArray<ObSEArray<ObRawExpr *, 16> > &sub_exprs,
-                                ObRawExpr *&new_expr);                                      
+                                ObRawExpr *&new_expr);
+
+  int extract_leaf_filters(ObRawExpr *expr, ObIArray<ObRawExpr *> &leaf_filters);
 
   int choose_pushdown_preds(ObIArray<ObRawExpr *> &preds,
                             ObIArray<ObRawExpr *> &invalid_preds,
@@ -313,15 +320,23 @@ private:
                                  ObIArray<ObRawExpr *> &preds);
 
   int transform_predicates(ObDMLStmt &stmt,
-                           ObIArray<ObRawExpr *> &input_preds,
+                           ObIArray<ObRawExpr *> &original_preds,
+                           ObIArray<ObRawExpr *> &other_preds,
                            ObIArray<ObRawExpr *> &target_exprs,
                            ObIArray<ObRawExpr *> &output_preds,
+                           bool &is_happened,
                            bool is_pullup = false);
-
+  int check_need_transform_predicates(ObIArray<ObRawExpr *> &exprs, bool &is_needed);
+  int accept_outjoin_predicates(ObDMLStmt &stmt,
+                                ObIArray<ObRawExpr *> &conds,
+                                ObSqlBitSet <> &filter_table_set,
+                                ObIArray<ObRawExpr *> &properties,
+                                ObIArray<ObRawExpr *> &new_conds);
   int accept_predicates(ObDMLStmt &stmt,
                         ObIArray<ObRawExpr *> &conds,
                         ObIArray<ObRawExpr *> &properties,
-                        ObIArray<ObRawExpr *> &new_conds);
+                        ObIArray<ObRawExpr *> &new_conds,
+                        const bool preserve_conds = false);
 
   int extract_generalized_column(ObRawExpr *expr,
                                  ObIArray<ObRawExpr *> &output);
@@ -381,6 +396,8 @@ private:
   int append_condition_array(ObIArray<ObRawExprCondition *> &conditions, int count, ObRawExprCondition *value);
 
   int gather_basic_qualify_filter(ObSelectStmt &stmt, ObIArray<ObRawExpr*> &preds);
+  int filter_lateral_correlated_preds(TableItem &table_item, ObIArray<ObRawExpr*> &preds);
+  void reset();
 
 private:
   typedef ObSEArray<ObRawExpr *, 4> PullupPreds;
@@ -390,6 +407,9 @@ private:
   ObSEArray<ObDMLStmt *, 8> transed_stmts_;
   ObSEArray<ObHint *, 4> applied_hints_;
   ObSEArray<ObSqlTempTableInfo *, 2> temp_table_infos_;
+  ObSEArray<ObRawExpr *, 4> null_constraints_;
+  ObSEArray<ObRawExpr *, 4> not_null_constraints_;
+  ObSEArray<ObPCParamEqualInfo, 4> equal_param_constraints_;
   bool real_happened_;
 };
 

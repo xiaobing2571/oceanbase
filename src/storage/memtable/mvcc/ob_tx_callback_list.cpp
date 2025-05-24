@@ -9,13 +9,8 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PubL v2 for more details.
  */
-#include "storage/memtable/mvcc/ob_tx_callback_list.h"
-#include "storage/memtable/mvcc/ob_mvcc_ctx.h"
-#include "share/config/ob_server_config.h"
-#include "storage/memtable/ob_memtable_key.h"
-#include "storage/tx/ob_trans_define.h"
+#include "ob_tx_callback_list.h"
 #include "storage/tx/ob_trans_part_ctx.h"
-#include "storage/tx/ob_tx_stat.h"
 
 namespace oceanbase
 {
@@ -27,6 +22,7 @@ ObTxCallbackList::ObTxCallbackList(ObTransCallbackMgr &callback_mgr, const int16
   : id_(id),
     head_(),
     log_cursor_(&head_),
+    log_epoch_(INT64_MAX),
     parallel_start_pos_(NULL),
     length_(0),
     appended_(0),
@@ -56,15 +52,19 @@ void ObTxCallbackList::reset()
 {
   if (length_ + removed_ != appended_) {
     TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "BUG:list state insanity", KPC(this));
+#ifdef ENABLE_DEBUG_LOG
     ob_abort();
+#endif
   }
   if (length_ + removed_ != logged_ + unlog_removed_) {
     TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "BUG:list state insanity", KPC(this));
+#ifdef ENABLE_DEBUG_LOG
     ob_abort();
+#endif
   }
   head_.set_prev(&head_);
   head_.set_next(&head_);
-  log_cursor_ = &head_;
+  set_log_cursor_(&head_);
   checksum_ = 0;
   tmp_checksum_ = 0;
   checksum_scn_ = SCN::min_scn();
@@ -112,29 +112,149 @@ int ObTxCallbackList::append_callback(ObITransCallback *callback,
         && append_pos->get_scn() > callback->get_scn()) {
       ret = OB_ERR_UNEXPECTED;
       TRANS_LOG(ERROR, "replay callback scn out of order", K(ret), KPC(callback), KPC(this));
+#ifdef ENABLE_DEBUG_LOG
       ob_abort();
+#endif
+    } else {
+      append_pos->append(callback);
+      // start parallel replay, remember the position
+      if (for_replay && parallel_replay && !serial_final && !parallel_start_pos_) {
+        ATOMIC_STORE(&parallel_start_pos_, get_tail());
+      }
+      ++appended_;
+      ATOMIC_INC(&length_);
+      int64_t data_size = callback->get_data_size();
+      data_size_ += data_size;
+      if (repos_lc) {
+        set_log_cursor_(get_tail());
+      }
+      if (for_replay) {
+        ++logged_;
+        logged_data_size_ += data_size;
+        ++synced_;
+      }
+
+      // NB: It is important to note that once the callback is successfully
+      // appended to the callback_list, it may have already been logged and
+      // freed, making subsequent access potentially unsafe. Therefore, the
+      // rule for append_callback is that the access is not allowed after a
+      // successful append, while the access is permitted after a failure
+      // append
     }
-    append_pos->append(callback);
-    // start parallel replay, remember the position
-    if (for_replay && parallel_replay && !serial_final && !parallel_start_pos_) {
-      ATOMIC_STORE(&parallel_start_pos_, get_tail());
-    }
-    ++appended_;
-    ATOMIC_INC(&length_);
-    data_size_ += callback->get_data_size();
-    if (repos_lc) {
-      log_cursor_ = get_tail();
-    }
-    if (for_replay) {
-      ++logged_;
-      ++synced_;
-    }
-    // Once callback is appended into callback lists, we can not handle the
-    // error after it. So it should never report the error later. What's more,
-    // after_append also should never return the error.
-    (void)callback->after_append_cb(for_replay);
   }
 
+  return ret;
+}
+
+// the semantic of the append_callback is atomic which means the cb is removed
+// and no side effect is taken effects if some unexpected failure has happened.
+int ObTxCallbackList::append_callback(ObITransCallback *head,
+                                      ObITransCallback *tail,
+                                      const int64_t length,
+                                      const bool for_replay,
+                                      const bool parallel_replay,
+                                      const bool serial_final)
+{
+  int ret = OB_SUCCESS;
+  // It is important that we should put the before_append_cb and after_append_cb
+  // into the latch guard otherwise the callback may already paxosed and released
+  // before callback it.
+  LockGuard gaurd(*this, LOCK_MODE::LOCK_APPEND);
+
+  if (OB_ISNULL(head) || OB_ISNULL(tail)) {
+    ret = OB_ERR_UNEXPECTED;
+    TRANS_LOG(ERROR, "before_append_cb failed", K(ret));
+  } else {
+    // Step1: prepare the callback append(unsubmitted_cnt for memtable and so on)
+    ObITransCallback *last_succeed_cb = nullptr;
+    int64_t data_size = 0;
+    for (ObITransCallback *cb = head;
+         OB_SUCC(ret) && nullptr != cb;
+         cb = cb->get_next()) {
+      if (OB_FAIL(cb->before_append_cb(for_replay))) {
+        TRANS_LOG(WARN, "before_append_cb failed", K(ret), KPC(cb));
+      } else {
+        data_size += cb->get_data_size();
+        last_succeed_cb = cb;
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+#ifdef ENABLE_DEBUG_LOG
+    } else if (OB_FAIL(memtable_set_injection_error())) {
+      TRANS_LOG(WARN, "memtable injection error", K(ret));
+#endif
+    } else {
+      // Tip1: remember whether to reposition the log cursor
+      const bool repos_lc = !for_replay && (log_cursor_ == &head_);
+
+      // Step2: ensure the append position
+      ObITransCallback *append_pos = NULL;
+      if (!for_replay || parallel_replay || serial_final || !parallel_start_pos_) {
+        append_pos = get_tail();
+      } else {
+        append_pos = parallel_start_pos_->get_prev();
+      }
+
+      // Tip2: for replay, do sanity check: scn is incremental
+      if (for_replay
+          && append_pos != &head_  // the head with scn max
+          && append_pos->get_scn() > head->get_scn()) {
+        ret = OB_ERR_UNEXPECTED;
+        TRANS_LOG(ERROR, "replay callback scn out of order", K(ret), KPC(head), KPC(this));
+#ifdef ENABLE_DEBUG_LOG
+        ob_abort();
+#endif
+      } else {
+
+#ifdef ENABLE_DEBUG_LOG
+        memtable_set_injection_sleep();
+#endif
+        // Step4: start to append
+        append_pos->append(head, tail);
+#ifdef ENABLE_DEBUG_LOG
+        memtable_set_injection_sleep();
+#endif
+
+        // Tip3: start parallel replay while not serial finial, remember the position
+        if (for_replay && parallel_replay && !serial_final && !parallel_start_pos_) {
+          ATOMIC_STORE(&parallel_start_pos_, get_tail());
+        }
+
+        // Step5: reposition the log_cursor if necessary
+        if (repos_lc) {
+          set_log_cursor_(head);
+        }
+
+        // Step6: maintain the callbacklist statistics
+        appended_ += length;
+        ATOMIC_FAA(&length_, length);
+        data_size_ += data_size;
+        if (for_replay) {
+          logged_ += length;
+          synced_ += length;
+          logged_data_size_ += data_size;
+        }
+
+        // NB: It is important to note that once the callback is successfully
+        // appended to the callback_list, it may have already been logged and
+        // freed, making subsequent access potentially unsafe. Therefore, the
+        // rule for append_callback is that the access is not allowed after a
+        // successful append, while the access is permitted after a failure
+        // append
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+      // In order to ensure the atomicity of the interface, we need clear the
+      // side-effects of previous callbacks that have called before_append
+      for (ObITransCallback *cb = head;
+           nullptr != cb && last_succeed_cb != cb->get_prev();
+           cb = cb->get_next()) {
+        (void)cb->after_append_fail_cb(for_replay);
+      }
+    }
+  }
   return ret;
 }
 
@@ -157,7 +277,7 @@ int64_t ObTxCallbackList::concat_callbacks(ObTxCallbackList &that)
     length_ += cnt;
     appended_ += cnt;
     if (log_cursor_ == &head_) {
-      log_cursor_ = that_head;
+      set_log_cursor_(that_head);
     }
     { // fake callback removement to pass sanity check when reset
       that.length_ = 0;
@@ -203,70 +323,82 @@ int ObTxCallbackList::callback_(ObITxCallbackFunctor &functor,
        OB_SUCC(ret) && !iter_end && iter != NULL && iter != end;
        iter = next) {
     functor.refresh();
-    if (iter->get_scn().is_min()) {
+    if (OB_UNLIKELY(iter->get_scn().is_min())) {
+      ret = OB_ERR_UNEXPECTED;
+      TRANS_LOG(ERROR, "callback with min_scn", K(ret), KPC(iter), KPC(this));
+#ifdef ENABLE_DEBUG_LOG
       usleep(5000);
       ob_abort();
-    }
-    if (functor.is_iter_end(iter)) {
+#endif
+    } else if (functor.is_iter_end(iter)) {
       iter_end = true;
     } else {
       next = (is_reverse ? iter->get_prev() : iter->get_next());
       if (OB_FAIL(functor(iter))) {
         // don't print log, print it in functor
       } else if (functor.need_remove_callback()) {
-        if (removed_ && (removed_ % 1000 == 0)) {
-          uint64_t checksum_now = batch_checksum_.calc();
-          TRANS_LOG(INFO, "[CallbackList] remove-callback", K(checksum_now), KPC(this));
-        }
         const share::SCN iter_scn = iter->get_scn();
-        // the del operation must serialize with append operation
-        // if it is operating on the list tail
-        bool deleted = false;
-        if (next == end) {
-          if (!lock_state.APPEND_LOCKED_) {
-            LockGuard guard(*this, LOCK_MODE::LOCK_APPEND);
-            ret = iter->del();
-            deleted = true;
-          } else {
-            ret = iter->del();
-            deleted = true;
-          }
-        }
-        if ((deleted && OB_FAIL(ret)) || (!deleted && OB_FAIL(iter->del()))) {
-          TRANS_LOG(ERROR, "remove callback failed", K(ret), KPC(iter), K(deleted));
+        // sanity check before remove:
+        // should not remove parallel replayed callback before serial replay finished
+        if (parallel_start_pos_
+            && !is_skip_checksum_()
+            && !callback_mgr_.is_serial_final()
+            && iter_scn >= parallel_start_pos_->get_scn()
+            && iter_scn <= sync_scn_) {
+          ret = OB_ERR_UNEXPECTED;
+          TRANS_LOG(ERROR, "remove parallel callback while serial part not all replayed", K(ret), KPC(iter), KPC(this));
+#ifdef ENABLE_DEBUG_LOG
+          usleep(5000);
+          ob_abort();
+#endif
         } else {
-          if (parallel_start_pos_
-              && !is_skip_checksum_()
-              && !callback_mgr_.is_serial_final()
-              && iter_scn >= parallel_start_pos_->get_scn()
-              && iter_scn <= sync_scn_) {
-            TRANS_LOG(ERROR, "should not remove this callback", KPC(iter));
-            usleep(5000);
-            ob_abort();
+          if (removed_ && (removed_ % 10000 == 0)) {
+            uint64_t checksum_now = batch_checksum_.calc();
+            TRANS_LOG(INFO, "[CallbackList] remove-callback", K(checksum_now), KPC(this));
           }
-          if (log_cursor_ == iter) {
-            log_cursor_ = next;
+          // the del operation must serialize with append operation
+          // if it is operating on the list tail
+          bool deleted = false;
+          if (next == end) {
+            if (!lock_state.APPEND_LOCKED_) {
+              LockGuard guard(*this, LOCK_MODE::LOCK_APPEND);
+              ret = iter->del();
+              deleted = true;
+            } else {
+              ret = iter->del();
+              deleted = true;
+            }
           }
-          if (parallel_start_pos_ == iter) {
-            parallel_start_pos_ = (next == &head_) ? NULL : next;
-          }
-          ++removed_;
-          if (iter->need_submit_log()) {
-            ++unlog_removed_;
-          }
-
-          ++remove_count;
-
-          if (iter->is_need_free()) {
-            callback_mgr_.get_ctx().callback_free(iter);
+          if ((deleted && OB_FAIL(ret)) || (!deleted && OB_FAIL(iter->del()))) {
+            TRANS_LOG(ERROR, "remove callback failed", K(ret), KPC(iter), K(deleted));
+          } else {
+            if (log_cursor_ == iter) {
+              set_log_cursor_(next);
+            }
+            if (parallel_start_pos_ == iter) {
+              parallel_start_pos_ = (is_reverse || next == &head_) ? NULL : next;
+            }
+            ++removed_;
+            if (iter->need_submit_log()) {
+              ++unlog_removed_;
+            }
+            ++remove_count;
+            if (iter->is_need_free()) {
+              if (iter->is_table_lock_callback()) {
+                callback_mgr_.get_ctx().free_table_lock_callback(iter);
+              } else if (MutatorType::MUTATOR_ROW_EXT_INFO == iter->get_mutator_type()) {
+                callback_mgr_.get_ctx().free_ext_info_callback(iter);
+              } else {
+                callback_mgr_.get_ctx().free_mvcc_row_callback(iter);
+              }
+            }
           }
         }
       }
-
-      if ((++traverse_count & 0xFFFFF) == 0) {
-        TRANS_LOG(WARN, "memtable fifo callback too long",
-                  K(traverse_count), K(remove_count), K(functor));
-      }
+    }
+    if ((++traverse_count & 0xFFFFF) == 0) {
+      TRANS_LOG(WARN, "memtable fifo callback too long",
+                K(traverse_count), K(remove_count), K(functor));
     }
   }
   functor.set_statistics(traverse_count, remove_count);
@@ -292,12 +424,20 @@ int ObTxCallbackList::remove_callbacks_for_fast_commit(const share::SCN stop_scn
   LockGuard guard(*this, LOCK_MODE::TRY_LOCK_ITERATE);
   if (guard.is_locked()) {
     int64_t remove_cnt = calc_need_remove_count_for_fast_commit_();
-    // use rm_logged_latch_ to protected multiple thread try to remove logged callbacks
-    bool skip_checksum = is_skip_checksum_();
-    const share::SCN right_bound = skip_checksum ? share::SCN::max_scn()
-      : (stop_scn.is_valid() ? stop_scn : sync_scn_);
+    share::SCN right_bound;
+    if (!stop_scn.is_valid()) {
+      // unspecified stop_scn, used callback_list's sync_scn_
+      right_bound = sync_scn_;
+    } else if (!sync_scn_.is_min()) {
+      // specified stop_scn, and callback_list's sync_scn_ is valid
+      // use mininum
+      right_bound = SCN::min(stop_scn, sync_scn_);
+    } else {
+      // callback_list's sync_scn is invalid, use stop_scn
+      right_bound = stop_scn;
+    }
     ObRemoveCallbacksForFastCommitFunctor functor(remove_cnt, right_bound);
-    if (!skip_checksum) {
+    if (!is_skip_checksum_()) {
       functor.set_checksumer(checksum_scn_, &batch_checksum_);
     }
     if (OB_FAIL(callback_(functor, get_guard(), log_cursor_, guard.state_))) {
@@ -321,9 +461,7 @@ int ObTxCallbackList::remove_callbacks_for_remove_memtable(
   // hence, acquire iter_latch is not required actually.
   int ret = OB_SUCCESS;
   LockGuard guard(*this, LOCK_MODE::LOCK_ITERATE);
-  const bool skip_checksum = is_skip_checksum_();
-  const share::SCN right_bound = skip_checksum ? share::SCN::max_scn()
-    : (stop_scn.is_max() ? sync_scn_ : stop_scn);
+  const share::SCN right_bound = stop_scn;
   struct Functor final : public ObRemoveSyncCallbacksWCondFunctor {
     Functor(const bool need_remove_data = true, const bool is_reverse = false)
       : ObRemoveSyncCallbacksWCondFunctor(need_remove_data, is_reverse) {}
@@ -356,7 +494,7 @@ int ObTxCallbackList::remove_callbacks_for_remove_memtable(
   functor.right_bound_ = right_bound;
   functor.memtable_set_ = memtable_set;
 
-  if (!skip_checksum) {
+  if (!is_skip_checksum_()) {
     functor.set_checksumer(checksum_scn_, &batch_checksum_);
   }
 
@@ -391,14 +529,20 @@ int ObTxCallbackList::remove_callbacks_for_rollback_to(const transaction::ObTxSE
   struct Functor final : public ObRemoveCallbacksWCondFunctor {
     Functor(const share::SCN right_bound, const bool need_remove_data = true)
       : ObRemoveCallbacksWCondFunctor(right_bound, need_remove_data) {}
-    bool cond_for_remove(ObITransCallback *callback) {
+    bool cond_for_remove(ObITransCallback *callback, int &ret) {
       transaction::ObTxSEQ dseq = callback->get_seq_no();
-      // sanity check
-      OB_ASSERT(to_seq_.support_branch() == dseq.support_branch());
-      return (to_seq_.get_branch() == 0                     // match all branches
-              || to_seq_.get_branch() == dseq.get_branch()) // match target branch
-        && dseq.get_seq() > to_seq_.get_seq()               // exclusive
-        && dseq.get_seq() < from_seq_.get_seq();            // inclusive
+      bool match = false;
+      if (to_seq_.get_branch() == 0                          // match all branches
+          || to_seq_.get_branch() == dseq.get_branch()) {    // match target branch
+        if (dseq.get_seq() >= from_seq_.get_seq()) {
+          ret = OB_ERR_UNEXPECTED;
+          TRANS_LOG(ERROR, "found callback with seq_no larger than rollback from point",
+                    K(ret), K(dseq), K_(from_seq), K_(to_seq), KPC(callback));
+        } else {
+          match = dseq.get_seq() > to_seq_.get_seq();          // exclusive
+        }
+      }
+      return match;
     }
     transaction::ObTxSEQ to_seq_;
     transaction::ObTxSEQ from_seq_;
@@ -486,9 +630,9 @@ int ObTxCallbackList::submit_log_succ(const ObCallbackScope &callbacks)
   if (next == &head_) {
     // next is un-stable, need serialize with append
     LockGuard guard(*this, LOCK_MODE::LOCK_APPEND);
-    ATOMIC_STORE(&log_cursor_, (*callbacks.end_)->get_next());
+    set_log_cursor_((*callbacks.end_)->get_next());
   } else {
-    ATOMIC_STORE(&log_cursor_, next);
+    set_log_cursor_(next);
   }
   ATOMIC_AAF(&logged_, (int64_t)callbacks.cnt_);
   ATOMIC_AAF(&logged_data_size_, callbacks.data_size_);
@@ -526,10 +670,10 @@ int ObTxCallbackList::sync_log_fail(const ObCallbackScope &callbacks,
   return ret;
 }
 
-int ObTxCallbackList::clean_unlog_callbacks(int64_t &removed_cnt)
+int ObTxCallbackList::clean_unlog_callbacks(int64_t &removed_cnt, common::ObFunction<void()> &before_remove)
 {
   int ret = OB_SUCCESS;
-  ObCleanUnlogCallbackFunctor functor;
+  ObCleanUnlogCallbackFunctor functor(before_remove);
 
   LockGuard guard(*this, LOCK_MODE::LOCK_ALL);
   if (log_cursor_ == &head_) {
@@ -610,11 +754,13 @@ int ObTxCallbackList::tx_commit()
   if (OB_FAIL(callback_(functor, guard.state_))) {
     TRANS_LOG(WARN, "trans commit failed", K(ret), K(functor));
   } else if (length_ != 0) {
+    ret = OB_ERR_UNEXPECTED;
+    TRANS_LOG(ERROR, "callback list has not been cleaned after commit callback", K(ret), K(functor));
+#ifdef ENABLE_DEBUG_LOG
     ob_abort();
-  } else {
-    callback_mgr_.add_tx_end_callback_remove_cnt(functor.get_remove_cnt());
+#endif
   }
-
+  callback_mgr_.add_tx_end_callback_remove_cnt(functor.get_remove_cnt());
   return ret;
 }
 
@@ -627,10 +773,13 @@ int ObTxCallbackList::tx_abort()
   if (OB_FAIL(callback_(functor, guard.state_))) {
     TRANS_LOG(WARN, "trans abort failed", K(ret), K(functor));
   } else if (length_ != 0) {
+    ret = OB_ERR_UNEXPECTED;
+    TRANS_LOG(ERROR, "callback list has not been cleaned after abort", K(ret), K(functor));
+#ifdef ENABLE_DEBUG_LOG
     ob_abort();
-  } else {
-    callback_mgr_.add_tx_end_callback_remove_cnt(functor.get_remove_cnt());
+#endif
   }
+  callback_mgr_.add_tx_end_callback_remove_cnt(functor.get_remove_cnt());
 
   return ret;
 }
@@ -645,6 +794,24 @@ int ObTxCallbackList::tx_elr_preparing()
   LockGuard guard(*this, LOCK_MODE::LOCK_ALL);
   if (OB_FAIL(callback_(functor, guard.state_))) {
     TRANS_LOG(WARN, "trans elr preparing failed", K(ret), K(functor));
+  }
+
+  return ret;
+}
+
+int ObTxCallbackList::tx_elr_revoke()
+{
+  int ret = OB_SUCCESS;
+  struct Functor final : public ObITxCallbackFunctor
+  {
+    int operator()(ObITransCallback *callback) {
+      callback->elr_trans_revoke();
+      return OB_SUCCESS;
+    }
+  } functor;
+  LockGuard guard(*this, LOCK_MODE::LOCK_ALL);
+  if (OB_FAIL(callback_(functor, guard.state_))) {
+    TRANS_LOG(WARN, "trans elr revoke failed", K(ret), K(functor));
   }
 
   return ret;
@@ -689,10 +856,21 @@ int ObTxCallbackList::replay_fail(const SCN scn, const bool serial_replay)
   functor.scn_ = scn;
 
   LockGuard guard(*this, LOCK_MODE::LOCK_ALL);
+  //
   // for replay fail of serial log, if parallel replay has happened,
   // must reverse traversal from parallel_start_pos_.prev_
-  ObITransCallback *start_pos = (serial_replay && parallel_start_pos_) ? parallel_start_pos_ : get_guard();
-  ObITransCallback *end_pos = get_guard();
+  //
+  // head_ --> ... -> parallel_start_pos_ -> ... -> head_
+  //
+  ObITransCallback *start_pos = NULL;
+  ObITransCallback *end_pos = NULL;
+  if (serial_replay) {
+    start_pos = parallel_start_pos_ ?: get_guard();
+    end_pos = get_guard();
+  } else {
+    start_pos = get_guard();
+    end_pos = parallel_start_pos_ ? parallel_start_pos_->get_prev() : get_guard();
+  }
   if (OB_FAIL(callback_(functor, start_pos, end_pos, guard.state_))) {
     TRANS_LOG(ERROR, "replay fail failed", K(ret), K(functor));
   } else {
@@ -730,7 +908,7 @@ void ObTxCallbackList::update_checksum(const uint64_t checksum, const SCN checks
   LockGuard guard(*this, LOCK_MODE::LOCK_ITERATE);
   if (checksum_scn.is_max()) {
     if (checksum == 0 && id_ > 0) {
-      // only check extends list, because version before 4.3 with 0 may happen
+      // only check extends list, because version before 4.2.4 with 0 may happen
       // and they will be replayed into first list (id_ equals to 0)
       TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "checksum should not be 0 if checksum_scn is max", KPC(this));
     }
@@ -825,7 +1003,13 @@ bool ObTxCallbackList::check_all_redo_flushed(const bool quite) const
 __attribute__((noinline))
 int64_t ObTxCallbackList::get_log_epoch() const
 {
-  return log_cursor_ == &head_ ? INT64_MAX : log_cursor_->get_epoch();
+  return ATOMIC_LOAD(&log_epoch_);
+}
+
+void ObTxCallbackList::set_log_cursor_(ObITransCallback* log_cursor)
+{
+  ATOMIC_STORE(&log_epoch_, (log_cursor == &head_) ? INT64_MAX : log_cursor->get_epoch());
+  ATOMIC_STORE(&log_cursor_, log_cursor);
 }
 
 void ObTxCallbackList::inc_update_sync_scn(const share::SCN scn)
@@ -847,15 +1031,23 @@ bool ObTxCallbackList::is_logging_blocked() const
 {
   bool blocked = false;
   if (log_latch_.try_lock()) {
-    if (log_cursor_ != &head_ && log_cursor_->is_logging_blocked()) {
-      blocked = true;
+    // acquire APPEND lock to prevent append callback and
+    // reset log_cursor_ when log_cursor_ is point to head_
+    // due to no callback need to logging
+    // _NOTE_: the caller thread has hold TxCtx's FLUSH_REDO
+    // lock which prevent operations of remove callbacks
+    LockGuard guard(*this, LOCK_MODE::TRY_LOCK_APPEND);
+    if (guard.is_locked()) {
+      if (log_cursor_ != &head_ && log_cursor_->is_logging_blocked()) {
+        blocked = true;
+      }
     }
     log_latch_.unlock();
   }
   return blocked;
 }
 
-ObTxCallbackList::LockGuard::LockGuard(ObTxCallbackList &list,
+ObTxCallbackList::LockGuard::LockGuard(const ObTxCallbackList &list,
                                        const ObTxCallbackList::LOCK_MODE mode,
                                        ObTimeGuard *tg)
   : host_(list)
@@ -867,10 +1059,13 @@ ObTxCallbackList::LockGuard::LockGuard(ObTxCallbackList &list,
     if (tg) {
       tg->click();
     }
-    lock_append_();
+    lock_append_(false);
     break;
   case LOCK_MODE::LOCK_APPEND:
-    lock_append_();
+    lock_append_(false);
+    break;
+  case LOCK_MODE::TRY_LOCK_APPEND:
+    lock_append_(true);
     break;
   case LOCK_MODE::LOCK_ITERATE:
     lock_iterate_(false);
@@ -896,17 +1091,23 @@ void ObTxCallbackList::LockGuard::lock_iterate_(const bool try_lock)
     }
     if (state_.ITERATE_LOCKED_) {
       if (!host_.is_append_only_()) {
-        lock_append_();
+        lock_append_(false);
       }
     }
   }
 }
 
-void ObTxCallbackList::LockGuard::lock_append_()
+void ObTxCallbackList::LockGuard::lock_append_(const bool try_lock)
 {
   if (!state_.APPEND_LOCKED_) {
-    host_.append_latch_.lock();
-    state_.APPEND_LOCKED_ = true;
+    if (try_lock) {
+      if (host_.append_latch_.try_lock()) {
+        state_.APPEND_LOCKED_ = true;
+      }
+    } else {
+      host_.append_latch_.lock();
+      state_.APPEND_LOCKED_ = true;
+    }
   }
 }
 

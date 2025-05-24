@@ -11,11 +11,8 @@
  */
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
-#include "share/schema/ob_column_schema.h"
-#include "lib/oblog/ob_log_module.h"
-#include "share/schema/ob_table_schema.h"
+#include "ob_column_schema.h"
 #include "share/schema/ob_schema_service.h"
-#include "share/ob_cluster_version.h"
 
 namespace oceanbase
 {
@@ -105,23 +102,15 @@ ObColumnSchemaV2::ObColumnSchemaV2(ObIAllocator *allocator)
   reset();
 }
 
-ObColumnSchemaV2::ObColumnSchemaV2(const ObColumnSchemaV2 &src_schema)
-    : ObSchema(),
-    local_session_vars_(get_allocator())
-
-{
-  reset();
-  *this = src_schema;
-}
-
 ObColumnSchemaV2::~ObColumnSchemaV2()
 {
 }
 
-ObColumnSchemaV2 &ObColumnSchemaV2::operator =(const ObColumnSchemaV2 &src_schema)
+int ObColumnSchemaV2::assign(const ObColumnSchemaV2 &src_schema)
 {
+  int ret = OB_SUCCESS;
   if (this != &src_schema) {
-    reset();
+    ObColumnSchemaV2::reset();
     error_ret_ = src_schema.error_ret_;
     tenant_id_ = src_schema.tenant_id_;
     table_id_ = src_schema.table_id_;
@@ -151,7 +140,6 @@ ObColumnSchemaV2 &ObColumnSchemaV2::operator =(const ObColumnSchemaV2 &src_schem
     skip_index_attr_ = src_schema.skip_index_attr_;
     lob_chunk_size_ = src_schema.lob_chunk_size_;
 
-    int ret = OB_SUCCESS;
     if (OB_FAIL(deep_copy_obj(src_schema.orig_default_value_, orig_default_value_))) {
       LOG_WARN("Fail to deepy copy orig_default_value, ", K(ret));
     } else if (OB_FAIL(deep_copy_obj(src_schema.cur_default_value_, cur_default_value_))) {
@@ -181,13 +169,7 @@ ObColumnSchemaV2 &ObColumnSchemaV2::operator =(const ObColumnSchemaV2 &src_schem
     }
     LOG_DEBUG("operator =", K(src_schema), K(*this));
   }
-  return *this;
-}
-
-int ObColumnSchemaV2::assign(const ObColumnSchemaV2 &other)
-{
-  *this = other;
-  return error_ret_;
+  return ret;
 }
 
 bool ObColumnSchemaV2::operator==(const ObColumnSchemaV2 &r) const
@@ -381,7 +363,7 @@ OB_DEF_DESERIALIZE(ObColumnSchemaV2)
 
   if (!OB_SUCC(ret)) {
     LOG_WARN("Fail to deserialize data, ", K(ret));
-  } else if (OB_FAIL(deserialize_string_array(buf, data_len, pos, extended_type_info_))) {
+  } else if (OB_FAIL(deserialize_string_array(buf, data_len, pos, extended_type_info_, get_allocator()))) {
     LOG_WARN("deserialize_string_array failed", K(ret));
   } else if (OB_FAIL(deep_copy_obj(orig_default_value, orig_default_value_))) {
     LOG_WARN("Fail to deep copy orig_default_value, ", K(ret), K_(orig_default_value));
@@ -560,9 +542,9 @@ int ObColumnSchemaV2::get_byte_length(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("collation type is invalid", K(ret));
   } else if (ob_is_text_tc(meta_type_.get_type()) || ob_is_json(meta_type_.get_type())
-             || ob_is_geometry(meta_type_.get_type())) {
+             || ob_is_geometry(meta_type_.get_type()) || ob_is_roaringbitmap(meta_type_.get_type())) {
     if (for_check_length) {
-      // when check row length, a lob will occupy at most 2KB
+      // when check row length, a lob will occupy at most 512B
       length = min(get_data_length(), OB_MAX_LOB_HANDLE_LENGTH);
     } else {
       length = get_data_length();
@@ -741,7 +723,7 @@ int ObColumnSchemaV2::deserialize_extended_type_info(const char *buf,
                                                       int64_t &pos)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(deserialize_string_array(buf, data_len, pos, extended_type_info_))) {
+  if (OB_FAIL(deserialize_string_array(buf, data_len, pos, extended_type_info_, get_allocator()))) {
     LOG_WARN("fail to deserialize extended type info", K(ret));
   }
   return ret;
@@ -820,6 +802,22 @@ int ObColumnSchemaV2::get_each_column_group_name(ObString &cg_name) const {
     if (cg_name.write(tmp_cg_name, write_len) != write_len) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("fail to write column group name to str", K(ret), K(cg_name), K(write_len));
+    }
+  }
+  return ret;
+}
+
+int ObColumnSchemaV2::is_same_collection_column(const ObColumnSchemaV2 &other, bool &is_same) const
+{
+  int ret = OB_SUCCESS;
+  if (get_extended_type_info().count() == other.get_extended_type_info().count()) {
+    if (get_extended_type_info().count() != 1) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to check type info incremental change", K(ret));
+    } else {
+      ObString src_sub_name = get_extended_type_info().at(0);
+      ObString dst_sub_name = other.get_extended_type_info().at(0);
+      is_same = (src_sub_name.case_compare(dst_sub_name) == 0);
     }
   }
   return ret;

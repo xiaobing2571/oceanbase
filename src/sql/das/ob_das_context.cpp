@@ -11,12 +11,8 @@
  */
 
 #define USING_LOG_PREFIX SQL_DAS
-#include "sql/das/ob_das_context.h"
-#include "sql/das/ob_das_location_router.h"
+#include "ob_das_context.h"
 #include "sql/das/ob_das_utils.h"
-#include "sql/engine/ob_physical_plan.h"
-#include "sql/executor/ob_task_executor_ctx.h"
-#include "sql/engine/ob_exec_context.h"
 #include "observer/ob_server.h"
 namespace oceanbase
 {
@@ -62,7 +58,7 @@ int ObDASCtx::init(const ObPhysicalPlan &plan, ObExecContext &ctx)
       }
     }
   }
-  LOG_TRACE("init das context finish", K(ret), K(normal_locations), K(das_locations), K(table_locs_));
+  LOG_DEBUG("init das context finish", K(ret), K(normal_locations), K(das_locations), K(table_locs_));
   return ret;
 }
 
@@ -76,6 +72,7 @@ int ObDASCtx::get_das_tablet_mapper(const uint64_t ref_table_id,
   tablet_mapper.related_info_.related_tids_ = related_table_ids;
 
   bool is_vt = is_virtual_table(ref_table_id);
+  bool is_external_object = is_external_object_id(ref_table_id);
   bool is_mapping_real_vt = is_oracle_mapping_real_virtual_table(ref_table_id);
   uint64_t real_table_id = ref_table_id;
   if (is_mapping_real_vt) {
@@ -86,22 +83,35 @@ int ObDASCtx::get_das_tablet_mapper(const uint64_t ref_table_id,
   if (tablet_mapper.is_non_partition_optimized()) {
     // table ids has calced for no partition entity table, continue
   } else if (!is_vt) {
-    //get ObTableSchema object corresponding to the table_id from ObSchemaGetterGuard
-    //record the ObTableSchema into tablet_mapper
-    //the tablet and partition info come from ObTableSchema in the real table
-    ObSchemaGetterGuard *schema_guard = nullptr;
-    if (OB_ISNULL(sql_ctx_) || OB_ISNULL(schema_guard = sql_ctx_->schema_guard_)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("schema guard is nullptr", K(ret), K(sql_ctx_), K(schema_guard));
-    } else if (OB_FAIL(schema_guard->get_table_schema(tenant_id,
-                                                      real_table_id,
-                                                      tablet_mapper.table_schema_))) {
-      LOG_WARN("get table schema failed", K(ret), K(tenant_id), K(real_table_id));
-    } else if (OB_ISNULL(tablet_mapper.table_schema_)) {
-      ret = OB_TABLE_NOT_EXIST;
-      LOG_WARN("table schema is not found", K(ret), K(real_table_id));
+    if (!is_external_object) {
+      //get ObTableSchema object corresponding to the table_id from ObSchemaGetterGuard
+      //record the ObTableSchema into tablet_mapper
+      //the tablet and partition info come from ObTableSchema in the real table
+      ObSchemaGetterGuard *schema_guard = nullptr;
+      if (OB_ISNULL(sql_ctx_) || OB_ISNULL(schema_guard = sql_ctx_->schema_guard_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("schema guard is nullptr", K(ret), K(sql_ctx_), K(schema_guard));
+      } else if (OB_ISNULL(tablet_mapper.table_schema_)
+          && OB_FAIL(schema_guard->get_table_schema(tenant_id, real_table_id, tablet_mapper.table_schema_))) {
+        LOG_WARN("get table schema failed", K(ret), K(tenant_id), K(real_table_id));
+      } else if (OB_ISNULL(tablet_mapper.table_schema_)) {
+        ret = OB_TABLE_NOT_EXIST;
+        LOG_WARN("table schema is not found", K(ret), K(real_table_id));
+      } else {
+        tablet_mapper.related_info_.guard_ = schema_guard;
+      }
     } else {
-      tablet_mapper.related_info_.guard_ = schema_guard;
+      ObSqlSchemaGuard *sql_schema_guard = &(sql_ctx_->cur_stmt_->get_query_ctx()->sql_schema_guard_);
+      if (OB_ISNULL(sql_schema_guard)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("schema guard is nullptr", K(ret), K(sql_ctx_), K(sql_schema_guard));
+      } else if (OB_ISNULL(tablet_mapper.table_schema_) &&
+          OB_FAIL(sql_schema_guard->get_mocked_table_schema(real_table_id, tablet_mapper.table_schema_))) {
+        LOG_WARN("get table schema failed", K(ret), K(tenant_id), K(real_table_id));
+      } else if (OB_ISNULL(tablet_mapper.table_schema_)) {
+        ret = OB_TABLE_NOT_EXIST;
+        LOG_WARN("table schema is not found", K(ret), K(real_table_id));
+      }
     }
   } else {
     //get all server lists corresponding to the table_id from the tablet location cache
@@ -121,6 +131,7 @@ ObDASTableLoc *ObDASCtx::get_table_loc_by_id(uint64_t table_loc_id, uint64_t ref
     if ((*tmp_node)->loc_meta_->table_loc_id_ == table_loc_id &&
         (*tmp_node)->loc_meta_->ref_table_id_ == ref_table_id) {
       table_loc = *tmp_node;
+      break;
     }
   }
   return table_loc;
@@ -149,7 +160,7 @@ int ObDASCtx::build_external_table_location(
   if (OB_ISNULL(local_location = get_table_loc_by_id(table_loc_id, ref_table_id))
       || OB_ISNULL(local_tablet_loc = local_location->get_first_tablet_loc())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected location", K(ret));
+    LOG_WARN("unexpected location", K(ret), K(local_location), K(local_tablet_loc));
   } else {
     ObDASTableLoc *table_loc = NULL;
     ObDASTableLocMeta *loc_meta = NULL;
@@ -231,21 +242,24 @@ int ObDASCtx::check_same_server(const ObDASTabletLoc *tablet_loc)
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("tablet location is null", KR(ret), KP(tablet_loc));
   } else if (same_server_) {
-    ObDASTabletLoc *first_tablet = NULL;
-    FOREACH_X(table_node, table_locs_, NULL == first_tablet) {
-      ObDASTableLoc *cur_table_loc = *table_node;
-      for (DASTabletLocListIter tablet_node = cur_table_loc->tablet_locs_begin();
-           NULL == first_tablet && tablet_node != cur_table_loc->tablet_locs_end();
-           ++tablet_node) {
-        first_tablet = *tablet_node;
+    if (!same_tablet_addr_.is_valid()) {
+      ObDASTabletLoc *first_tablet = NULL;
+      FOREACH_X(table_node, table_locs_, NULL == first_tablet)
+      {
+        ObDASTableLoc *cur_table_loc = *table_node;
+        for (DASTabletLocListIter tablet_node = cur_table_loc->tablet_locs_begin();
+        NULL == first_tablet && tablet_node != cur_table_loc->tablet_locs_end(); ++tablet_node) {
+          first_tablet = *tablet_node;
+        }
+      }
+      if (OB_ISNULL(first_tablet)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("first tablet location is null", KR(ret), KP(first_tablet));
+      } else {
+        same_tablet_addr_ = first_tablet->server_;
       }
     }
-    if (OB_ISNULL(first_tablet)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("first tablet location is null", KR(ret), KP(first_tablet));
-    } else if (tablet_loc->server_ != first_tablet->server_) {
-      same_server_ = false;
-    }
+    same_server_ = (tablet_loc->server_ == same_tablet_addr_);
   }
   return ret;
 }
@@ -425,7 +439,51 @@ int ObDASCtx::add_candi_table_loc(const ObDASTableLocMeta &loc_meta,
       LOG_WARN("extended tablet loc failed", K(ret));
     }
   }
-  LOG_TRACE("das table loc assign finish", K(candi_table_loc), K(loc_meta), K(table_loc->get_tablet_locs()));
+  LOG_DEBUG("das table loc assign finish", K(candi_table_loc), K(loc_meta), K(table_loc->get_tablet_locs()));
+  return ret;
+}
+
+int ObDASCtx::add_final_table_loc(const ObDASTableLocMeta &loc_meta,
+                                  const ObIArray<ObTabletID> &tablet_ids,
+                                  const ObIArray<ObObjectID> &partition_ids,
+                                  const ObIArray<ObObjectID> &first_level_part_ids)
+{
+  int ret = OB_SUCCESS;
+  ObDASTableLoc *table_loc = nullptr;
+  ObDASTableLocMeta *final_meta = nullptr;
+  LOG_DEBUG("das table loc assign begin", K(loc_meta));
+  if (OB_FAIL(ObDASUtils::build_table_loc_meta(allocator_, loc_meta, final_meta))) {
+    LOG_WARN("build table loc meta failed", K(ret));
+  } else if (OB_FAIL(extended_table_loc(*final_meta, table_loc))) {
+    LOG_WARN("extended table loc failed", K(ret), K(loc_meta));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < tablet_ids.count(); ++i) {
+    ObDASTabletLoc *tablet_loc = nullptr;
+    ObObjectID first_level_part_id =
+        first_level_part_ids.empty() ? OB_INVALID_ID : first_level_part_ids.at(i);
+    if (OB_FAIL(extended_tablet_loc(*table_loc,
+                                    tablet_ids.at(i),
+                                    tablet_loc,
+                                    partition_ids.at(i),
+                                    first_level_part_id))) {
+      LOG_WARN("extended tablet loc failed", K(ret));
+    }
+  }
+  LOG_DEBUG("das table loc assign finish", K(loc_meta), K(table_loc->get_tablet_locs()));
+
+  if (OB_FAIL(ret)) {
+    clear_all_location_info();
+  }
+  return ret;
+}
+
+int ObDASCtx::build_table_loc_meta(const ObDASTableLocMeta &src,
+                                    ObDASTableLocMeta *&dst)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ObDASUtils::build_table_loc_meta(allocator_, src, dst))) {
+    LOG_WARN("build table loc meta failed", K(ret));
+  }
   return ret;
 }
 
@@ -555,6 +613,27 @@ int ObDASCtx::build_related_tablet_map(const ObDASTableLocMeta &loc_meta)
     LOG_WARN("get das tablet mapper failed", K(ret));
   } else if (OB_FAIL(tablet_mapper.get_all_tablet_and_object_id(tablet_ids, partition_ids))) {
     LOG_WARN("build related tablet_id map failed", K(ret), K(loc_meta));
+  }
+  return ret;
+}
+
+int ObDASCtx::find_group_param_by_param_idx(int64_t param_idx,
+                                    bool &exist, uint64_t &array_idx)
+{
+  int ret = OB_SUCCESS;
+  exist = false;
+  array_idx = OB_INVALID_ID;
+  if(OB_ISNULL(group_params_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("group params set by above operator is null", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < group_params_->count() && !exist; ++i) {
+      const GroupRescanParam &group_param = group_params_->at(i);
+      if (param_idx == group_param.param_idx_) {
+        exist = true;
+        array_idx = i;
+      }
+    }
   }
   return ret;
 }

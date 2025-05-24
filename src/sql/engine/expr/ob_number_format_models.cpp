@@ -13,11 +13,8 @@
 #define USING_LOG_PREFIX  SQL_ENG
 
 #include "ob_number_format_models.h"
-#include "lib/charset/ob_charset.h"
 #include "sql/engine/ob_exec_context.h"
-#include "sql/engine/expr/ob_expr_util.h"
 #include "sql/engine/expr/ob_expr_func_round.h"
-#include "share/system_variable/ob_nls_system_variable.h"
 
 namespace oceanbase
 {
@@ -1896,6 +1893,16 @@ int ObNFMToChar::process_tm_format(const ObNFMObj &nfm_obj, const int64_t in_sca
         MEMCPY(buf, num_str_buf, num_str_len);
         pos += num_str_len;
       } else if (num_str_len > 64) {
+        if (lib::is_mysql_mode()) {
+          // remove '0' before '.'
+          if (num_str_len > 2 && 0 == MEMCMP(num_str_buf, "0.", 2)) {
+            MEMMOVE(num_str_buf, num_str_buf + 1, num_str_len - 1);
+            num_str_len -= 1;
+          } else if (num_str_len > 3 &&  0 == MEMCMP(num_str_buf, "-0.", 3)) {
+            MEMMOVE(num_str_buf + 1, num_str_buf + 2, num_str_len - 2);
+            num_str_len -= 1;
+          }
+        }
         if (OB_FAIL(num_str_to_sci(num_str, out_scale, buf, buf_len, pos, true))) {
           LOG_WARN("failed to convert num to sci str", K(ret));
         }
@@ -1947,6 +1954,16 @@ int ObNFMToChar::process_tme_format(const ObNFMObj &nfm_obj, const int64_t in_sc
       LOG_WARN("invalid obj type", K(ret), K(obj_type));
     }
     if (OB_SUCC(ret)) {
+      if (lib::is_mysql_mode()) {
+        // remove '0' before '.'
+        if (num_str_len > 2 && 0 == MEMCMP(num_str_buf, "0.", 2)) {
+          MEMMOVE(num_str_buf, num_str_buf + 1, num_str_len - 1);
+          num_str_len -= 1;
+        } else if (num_str_len > 3 &&  0 == MEMCMP(num_str_buf, "-0.", 3)) {
+          MEMMOVE(num_str_buf + 1, num_str_buf + 2, num_str_len - 2);
+          num_str_len -= 1;
+        }
+      }
       num_str.assign_ptr(num_str_buf, static_cast<int32_t>(num_str_len));
       LOG_DEBUG("process_tme_format", K(ret), K(num_str_buf), K(num_str_len));
       if (OB_FAIL(num_str_to_sci(num_str, out_scale, buf, buf_len, pos, true))) {
@@ -2459,7 +2476,7 @@ int ObNFMToNumber::process_hex_format(const common::ObString &in_str,
       number::ObNumber base_num;
       number::ObNumber power_num;
       number::ObNumber res;
-      if (base_num.from(base, allocator)) {
+      if (OB_FAIL(base_num.from(base, allocator))) {
         LOG_WARN("fail to cast uint64 to number", K(ret), K(base));
       } else if (OB_FAIL(base_num.power(exponent, power_num, allocator))) {
         LOG_WARN("power calc failed", K(ret));
@@ -2467,11 +2484,11 @@ int ObNFMToNumber::process_hex_format(const common::ObString &in_str,
         for (int32_t i = 0; OB_SUCC(ret) && i < hex_num_size; i++) {
           uint64_t val = nums.at(i);
           number::ObNumber num;
-          if (num.from(val, allocator)) {
+          if (OB_FAIL(num.from(val, allocator))) {
             LOG_WARN("fail to cast uint64 to number", K(ret), K(val));
           } else {
             for (int32_t j = i; OB_SUCC(ret) && j > 0; j--) {
-              if (num.mul_v2(power_num, num, allocator)) {
+              if (OB_FAIL(num.mul_v2(power_num, num, allocator))) {
                 LOG_WARN("fail to mul number", K(ret));
               }
             }

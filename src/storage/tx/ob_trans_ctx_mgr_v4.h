@@ -19,7 +19,9 @@
 #include "common/ob_simple_iterator.h"
 #include "storage/tx/ob_trans_ctx.h"
 #include "storage/tx/ob_tx_ls_log_writer.h"
+#include "storage/tx/ob_tx_ls_state_mgr.h"
 #include "storage/tx/ob_tx_retain_ctx_mgr.h"
+#include "storage/tx/ob_tx_log_cb_mgr.h"
 #include "storage/tablelock/ob_lock_table.h"
 #include "storage/tx/ob_keep_alive_ls_handler.h"
 
@@ -34,16 +36,17 @@ class ObTabletID;
 
 namespace storage
 {
+class ObIMemtable;
 class ObLSTxService;
 class ObTransSubmitLogFunctor;
 class ObTxCtxTable;
 struct ObTxCtxMoveArg;
 struct ObTransferMoveTxParam;
+struct ObTransferOutTxParam;
 }
 
 namespace memtable
 {
-class ObIMemtable;
 class ObMemtable;
 class ObIMemtableCtx;
 }
@@ -53,7 +56,7 @@ namespace transaction
 class ObLSTxCtxMgrStat;
 class ObTransCtx;
 class ObPartTransCtx;
-class ObITsMgr;
+class ObTsMgr;
 class ObITxLogParam;
 class ObITxLogAdapter;
 class ObLSTxLogAdapter;
@@ -99,6 +102,8 @@ struct ObTxCreateArg
                 const uint64_t cluster_id,
                 const uint64_t cluster_version,
                 const uint32_t session_id,
+                const uint32_t client_sid,
+                const uint32_t associated_session_id,
                 const common::ObAddr &scheduler,
                 const int64_t trans_expired_time,
                 ObTransService *trans_service,
@@ -113,6 +118,8 @@ struct ObTxCreateArg
         cluster_id_(cluster_id),
         cluster_version_(cluster_version),
         session_id_(session_id),
+        client_sid_(client_sid),
+        associated_session_id_(associated_session_id),
         scheduler_(scheduler),
         trans_expired_time_(trans_expired_time),
         trans_service_(trans_service),
@@ -126,10 +133,11 @@ struct ObTxCreateArg
         && trans_expired_time_ > 0
         && NULL != trans_service_;
   }
-  TO_STRING_KV(K_(for_replay), "ctx_source_", to_str(ctx_source_),
+  TO_STRING_KV(K_(for_replay), "ctx_source", to_str_ctx_source(ctx_source_),
                  K_(tenant_id), K_(tx_id),
                  K_(ls_id), K_(cluster_id), K_(cluster_version),
-                 K_(session_id), K_(scheduler), K_(trans_expired_time), KP_(trans_service),
+                 K_(session_id),K_(client_sid), K_(associated_session_id),
+                 K_(scheduler), K_(trans_expired_time), KP_(trans_service),
                  K_(epoch), K_(xid));
   bool for_replay_;
   PartCtxSource ctx_source_;
@@ -139,6 +147,8 @@ struct ObTxCreateArg
   uint64_t cluster_id_;
   uint64_t cluster_version_;
   uint32_t session_id_;
+  uint32_t client_sid_;
+  uint32_t associated_session_id_;
   const common::ObAddr &scheduler_;
   int64_t trans_expired_time_;
   ObTransService *trans_service_;
@@ -188,7 +198,7 @@ public:
            const share::ObLSID &ls_id,
            ObTxTable *tx_table,
            ObLockTable *lock_table,
-           ObITsMgr *ts_mgr,
+           ObTsMgr *ts_mgr,
            ObTransService *txs,
            ObITxLogParam *log_param,
            ObITxLogAdapter * log_adapter);
@@ -202,20 +212,18 @@ public:
   // Offline the in-memory state of the ObLSTxCtxMgr
   int offline();
 
-  int transfer_out_tx_op(int64_t except_tx_id,
-                         const SCN data_end_scn,
-                         const SCN op_scn,
-                         NotifyType op_type,
-                         bool is_replay,
-                         ObLSID dest_ls_id,
-                         int64_t transfer_epoch,
+  int filter_tx_need_transfer(ObIArray<ObTabletID> &tablet_list,
+                              const share::SCN data_end_scn,
+                              ObIArray<transaction::ObTransID> &move_tx_ids);
+
+  int transfer_out_tx_op(const ObTransferOutTxParam &param,
                          int64_t& active_tx_count,
                          int64_t &op_tx_count);
   int wait_tx_write_end(ObTimeoutCtx &timeout_ctx);
   int collect_tx_ctx(const share::ObLSID dest_ls_id,
                      const SCN log_scn,
                      const ObIArray<ObTabletID> &tablet_list,
-                     int64_t &tx_count,
+                     const ObIArray<ObTransID> *move_tx_ids,
                      int64_t &colllect_count,
                      ObIArray<ObTxCtxMoveArg> &res);
   int move_tx_op(const ObTransferMoveTxParam &move_tx_param,
@@ -368,8 +376,6 @@ public:
   int start_readonly_request();
   int end_readonly_request();
 
-  void dump_readonly_request(const int64_t max_req_number);
-
   // check this ObLSTxCtxMgr contains the specified ObLSID
   bool contain(const share::ObLSID &ls_id)
   {
@@ -515,6 +521,7 @@ public:
   // ObLSTxCtxMgr's status, drive ObLSTxCtxMgr to continue to execute the switch_to_leader routine
   // or resume_leader routine;
   int on_start_working_log_cb_succ(share::SCN start_working_scn);
+  int retry_apply_start_working_log();
 
   // START_WORKING log entry failed to written to the PALF;
   // Break the switch_to_leader routine or resume_leader routine; switch the ObLSTxCtxMgr's state to F_WORKING
@@ -545,13 +552,11 @@ public:
   // Get the trans_service corresponding to this ObLSTxCtxMgr;
   transaction::ObTransService *get_trans_service() { return txs_; }
 
+  ObTxLogCbPoolMgr &get_log_cb_pool_mgr() { return log_cb_pool_mgr_;}
   ObTxRetainCtxMgr &get_retain_ctx_mgr() { return ls_retain_ctx_mgr_; }
 
   // Get the tenant_id corresponding to this ObLSTxCtxMgr;
   int64_t get_tenant_id() { return tenant_id_; }
-
-  // Get the state of this ObLSTxCtxMgr
-  int64_t get_state() { return get_state_(); }
 
   // check is master
   bool is_master() const { return is_master_(); }
@@ -573,11 +578,14 @@ public:
 
   int do_standby_cleanup();
 
+  int errsim_switch_to_followr_gracefully();
+  int errsim_submit_start_working_log();
+  int errsim_apply_start_working_log();
+
   TO_STRING_KV(KP(this),
                K_(ls_id),
                K_(tenant_id),
-               "state",
-               State::state_str(state_),
+               K_(tx_ls_state_mgr),
                K_(total_tx_ctx_count),
                K_(active_tx_count),
                K_(ls_retain_ctx_mgr),
@@ -604,226 +612,51 @@ private:
   int get_tx_ctx_(const ObTransID &tx_id, const bool for_replay, ObPartTransCtx *&tx_ctx);
   int submit_start_working_log_();
   int try_wait_gts_and_inc_max_commit_ts_();
-  share::SCN get_aggre_rec_scn_();
+  share::SCN get_aggre_rec_scn_() const;
 public:
   static const int64_t MAX_HASH_ITEM_PRINT = 16;
   static const int64_t WAIT_SW_CB_TIMEOUT = 100 * 1000; // 100 ms
   static const int64_t WAIT_SW_CB_INTERVAL = 10 * 1000; // 10 ms
   static const int64_t WAIT_READONLY_REQUEST_TIME = 10 * 1000 * 1000;
-  static const int64_t READONLY_REQUEST_TRACE_ID_NUM = 8192;
-private:
-  class State
-  {
-  public:
-    static const int64_t INVALID = -1;
-    static const int64_t INIT = 0;
-    static const int64_t F_WORKING = 1;
-    static const int64_t T_PENDING = 2;
-    static const int64_t R_PENDING = 3;
-    static const int64_t L_WORKING = 4;
-    static const int64_t F_TX_BLOCKED = 5;
-    static const int64_t L_TX_BLOCKED = 6;
-    static const int64_t L_BLOCKED_NORMAL = 7;
-    static const int64_t T_TX_BLOCKED_PENDING = 8;
-    static const int64_t R_TX_BLOCKED_PENDING = 9;
-    static const int64_t F_ALL_BLOCKED = 10;
-    static const int64_t T_ALL_BLOCKED_PENDING = 11;
-    static const int64_t R_ALL_BLOCKED_PENDING = 12;
-    static const int64_t L_ALL_BLOCKED = 13;
-    static const int64_t STOPPED = 14;
-    static const int64_t END = 15;
-    static const int64_t MAX = 16;
-  public:
-    static bool is_valid(const int64_t state)
-    { return state > INVALID && state < MAX; }
-
-    #define TCM_STATE_CASE_TO_STR(state)        \
-      case state:                               \
-        str = #state;                           \
-        break;
-
-    static const char* state_str(uint64_t state)
-    {
-      const char* str = "INVALID";
-      switch (state) {
-        TCM_STATE_CASE_TO_STR(INIT);
-        TCM_STATE_CASE_TO_STR(F_WORKING);
-        TCM_STATE_CASE_TO_STR(T_PENDING);
-        TCM_STATE_CASE_TO_STR(R_PENDING);
-        TCM_STATE_CASE_TO_STR(L_WORKING);
-        TCM_STATE_CASE_TO_STR(F_TX_BLOCKED);
-        TCM_STATE_CASE_TO_STR(L_TX_BLOCKED);
-        TCM_STATE_CASE_TO_STR(L_BLOCKED_NORMAL);
-        TCM_STATE_CASE_TO_STR(T_TX_BLOCKED_PENDING);
-        TCM_STATE_CASE_TO_STR(R_TX_BLOCKED_PENDING);
-
-        TCM_STATE_CASE_TO_STR(F_ALL_BLOCKED);
-        TCM_STATE_CASE_TO_STR(T_ALL_BLOCKED_PENDING);
-        TCM_STATE_CASE_TO_STR(R_ALL_BLOCKED_PENDING);
-        TCM_STATE_CASE_TO_STR(L_ALL_BLOCKED);
-
-        TCM_STATE_CASE_TO_STR(STOPPED);
-        TCM_STATE_CASE_TO_STR(END);
-        default:
-          break;
-      }
-      return str;
-    }
-    #undef TCM_STATE_CASE_TO_STR
-  };
-
-  class Ops
-  {
-  public:
-    static const int64_t INVALID = -1;
-    static const int64_t START = 0;
-    static const int64_t LEADER_REVOKE = 1;
-    static const int64_t SWL_CB_SUCC = 2;// start working log callback success
-    static const int64_t SWL_CB_FAIL = 3;// start working log callback failed
-    static const int64_t LEADER_TAKEOVER = 4;
-    static const int64_t RESUME_LEADER = 5;
-    static const int64_t BLOCK_TX = 6;
-    static const int64_t BLOCK_NORMAL = 7;
-    static const int64_t BLOCK_ALL = 8;
-    static const int64_t STOP = 9;
-    static const int64_t ONLINE = 10;
-    static const int64_t UNBLOCK_NORMAL = 11;
-    static const int64_t MAX = 12;
-  public:
-    static bool is_valid(const int64_t op)
-    { return op > INVALID && op < MAX; }
-
-    #define TCM_OP_CASE_TO_STR(op)              \
-      case op:                                  \
-        str = #op;                              \
-        break;
-
-    static const char* op_str(uint64_t op)
-    {
-      const char* str = "INVALID";
-      switch (op) {
-        TCM_OP_CASE_TO_STR(START);
-        TCM_OP_CASE_TO_STR(LEADER_REVOKE);
-        TCM_OP_CASE_TO_STR(SWL_CB_SUCC);
-        TCM_OP_CASE_TO_STR(SWL_CB_FAIL);
-        TCM_OP_CASE_TO_STR(LEADER_TAKEOVER);
-        TCM_OP_CASE_TO_STR(RESUME_LEADER);
-        TCM_OP_CASE_TO_STR(BLOCK_TX);
-        TCM_OP_CASE_TO_STR(BLOCK_NORMAL);
-        TCM_OP_CASE_TO_STR(BLOCK_ALL);
-        TCM_OP_CASE_TO_STR(STOP);
-        TCM_OP_CASE_TO_STR(ONLINE);
-        TCM_OP_CASE_TO_STR(UNBLOCK_NORMAL);
-      default:
-        break;
-      }
-      return str;
-    }
-    #undef TCM_OP_CASE_TO_STR
-  };
-
-  class StateHelper
-  {
-  public:
-    explicit StateHelper(const share::ObLSID &ls_id, int64_t &state)
-        : ls_id_(ls_id), state_(state), last_state_(State::INVALID), is_switching_(false) {}
-    ~StateHelper() {}
-
-    int switch_state(const int64_t op);
-    void restore_state();
-    int64_t get_state() const { return state_; }
-  private:
-    const share::ObLSID &ls_id_;
-    int64_t &state_;
-    int64_t last_state_;
-    bool is_switching_;
-  };
 
 private:
   inline bool is_master_() const
-  { return is_master_(ATOMIC_LOAD(&state_)); }
-  inline bool is_master_(int64_t state) const
-  { return State::L_WORKING == state ||
-           State::L_TX_BLOCKED == state ||
-           State::L_BLOCKED_NORMAL == state ||
-           State::L_ALL_BLOCKED == state; }
+  { return tx_ls_state_mgr_.is_master(); }
 
   inline bool is_follower_() const
-  { return is_follower_(ATOMIC_LOAD(&state_)); }
-  inline bool is_follower_(int64_t state) const
-  { return State::F_WORKING == state ||
-           State::F_TX_BLOCKED == state ||
-           State::F_ALL_BLOCKED == state; }
+  { return tx_ls_state_mgr_.is_follower(); }
 
   inline bool is_tx_blocked_() const
-  { return is_tx_blocked_(ATOMIC_LOAD(&state_)); }
-  inline bool is_tx_blocked_(int64_t state) const
-  {
-    return State::F_TX_BLOCKED == state ||
-           State::L_TX_BLOCKED == state ||
-           State::T_TX_BLOCKED_PENDING == state ||
-           State::R_TX_BLOCKED_PENDING == state ||
-           State::F_ALL_BLOCKED == state ||
-           State::T_ALL_BLOCKED_PENDING == state ||
-           State::R_ALL_BLOCKED_PENDING == state ||
-           State::L_ALL_BLOCKED == state;
-  }
+  { return tx_ls_state_mgr_.is_block_start_tx(); }
 
   inline bool is_normal_blocked_() const
-  { return is_normal_blocked_(ATOMIC_LOAD(&state_)); }
-  inline bool is_normal_blocked_(int64_t state) const
-  { return State::L_BLOCKED_NORMAL == state; }
+  { return tx_ls_state_mgr_.is_block_start_normal_tx(); }
 
   inline bool is_all_blocked_() const
-  { return is_all_blocked_(ATOMIC_LOAD(&state_)); }
-  inline bool is_all_blocked_(const int64_t state) const
-  {
-    return State::F_ALL_BLOCKED == state ||
-           State::T_ALL_BLOCKED_PENDING == state ||
-           State::R_ALL_BLOCKED_PENDING == state ||
-           State::L_ALL_BLOCKED == state;
-  }
+  { return tx_ls_state_mgr_.is_block_WR(); }
 
   // check pending substate
   inline bool is_t_pending_() const
-  { return is_t_pending_(ATOMIC_LOAD(&state_)); }
-  inline bool is_t_pending_(int64_t state) const
-  {
-    return State::T_PENDING == state ||
-           State::T_TX_BLOCKED_PENDING == state ||
-           State::T_ALL_BLOCKED_PENDING == state;
-  }
+  { return tx_ls_state_mgr_.is_switch_leader_pending(); }
 
   inline bool is_r_pending_() const
-  { return is_r_pending_(ATOMIC_LOAD(&state_)); }
-  inline bool is_r_pending_(int64_t state) const
-  {
-    return State::R_PENDING == state ||
-           State::R_TX_BLOCKED_PENDING == state ||
-           State::R_ALL_BLOCKED_PENDING == state;
-  }
+  { return tx_ls_state_mgr_.is_resume_leader_pending(); }
+
+  inline bool is_f_pending_() const
+  { return tx_ls_state_mgr_.is_follower_swl_pending(); }
 
   inline bool is_pending_() const
-  { return is_pending_(ATOMIC_LOAD(&state_)); }
-  inline bool is_pending_(int64_t state) const
-  {
-    return is_t_pending_(state) || is_r_pending_(state);
-  }
+  { return tx_ls_state_mgr_.is_leader_takeover_pending(); }
 
   inline bool is_stopped_() const
-  { return is_stopped_(ATOMIC_LOAD(&state_)); }
-  inline bool is_stopped_(int64_t state) const
-  { return State::STOPPED == state; }
-
-  int64_t get_state_() const
-  { return ATOMIC_LOAD(&state_); }
+  { return tx_ls_state_mgr_.is_stopped(); }
 
 private:
   // Identifies this ObLSTxCtxMgr is inited or not;
   bool is_inited_;
 
   // See the ObLSTxCtxMgr's internal class State
-  int64_t state_;
+  ObTxLSStateMgr tx_ls_state_mgr_;
 
   // A thread-safe hashmap, used to find and traverse TxCtx in this ObLSTxCtxMgr
   ObLSTxCtxMap ls_tx_ctx_map_;
@@ -843,6 +676,8 @@ private:
   ObTxLSLogWriter ls_log_writer_;
   ObITxLogAdapter *tx_log_adapter_;
   ObLSTxLogAdapter log_adapter_def_;
+
+  ObTxLogCbPoolMgr log_cb_pool_mgr_;
 
   ObTxRetainCtxMgr ls_retain_ctx_mgr_;
 
@@ -871,7 +706,7 @@ private:
   ObTransService *txs_;
 
   // The time source
-  ObITsMgr *ts_mgr_;
+  ObTsMgr *ts_mgr_;
 
   // See the ObLSTxCtxMgr's member function update_max_replay_commit_version
   share::SCN max_replay_commit_version_;
@@ -888,7 +723,6 @@ private:
 
   // Online timestamp for ObLSTxCtxMgr
   int64_t online_ts_;
-  ObCurTraceId::TraceId readonly_request_trace_id_set_[READONLY_REQUEST_TRACE_ID_NUM];
 };
 
 // Used to iteratively access TxCtx in ObLSTxCtxMgr;
@@ -964,7 +798,7 @@ public:
   // @param [in] tenant_id: tenant id
   // @param [in] ts_mgr: used to get gts, see: update_max_replay_commit_version function;
   // @param [in] txs: transaction service which hold the ObTxCtxMgr;
-  int init(const int64_t tenant_id, ObITsMgr *ts_mgr, ObTransService *txs);
+  int init(const int64_t tenant_id, ObTsMgr *ts_mgr, ObTransService *txs);
 
   // Mark ObTxCtxMgr as running
   int start();
@@ -1152,7 +986,7 @@ private:
   ObLSTxCtxMgrMap ls_tx_ctx_mgr_map_;
 
   // The time source
-  ObITsMgr *ts_mgr_;
+  ObTsMgr *ts_mgr_;
 
   // Statistical variable that records the number of ObLSTxCtxMgr allocated;
   int64_t ls_alloc_cnt_;

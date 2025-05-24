@@ -141,7 +141,7 @@ private:
   public: \
   bool operator()(ObTransCtx *tx_ctx_base) { \
     bool bool_ret = false; \
-    ObPartTransCtx *tx_ctx = dynamic_cast<transaction::ObPartTransCtx*>(tx_ctx_base); \
+    ObPartTransCtx *tx_ctx = static_cast<transaction::ObPartTransCtx*>(tx_ctx_base); \
     ObTransID tx_id = tx_ctx->get_trans_id(); \
     share::ObLSID ls_id = tx_ctx->get_ls_id(); \
     func_stat_.begin_iter_single(); \
@@ -357,17 +357,53 @@ private:
   ObTxCommitCallback *&cb_list_;
 };
 
+class FilterTransferTxFunctor
+{
+public:
+  FilterTransferTxFunctor(ObIArray<ObTabletID> &tablet_list, const SCN data_end_scn, ObIArray<ObTransID> &move_tx_ids) :
+    tablet_list_(tablet_list), data_end_scn_(data_end_scn),
+    move_tx_ids_(move_tx_ids), count_(0), ret_(OB_SUCCESS)
+  {}
+  ~FilterTransferTxFunctor() { PRINT_FUNC_STAT; }
+  OPERATOR_V4(FilterTransferTxFunctor)
+  {
+    bool bool_ret = false;
+    int ret = OB_SUCCESS;
+    if (!tx_id.is_valid() || OB_ISNULL(tx_ctx)) {
+      ret_ = ret = OB_INVALID_ARGUMENT;
+      TRANS_LOG(WARN, "invalid argument", K(tx_id), "ctx", OB_P(tx_ctx));
+    } else {
+      ++count_;
+    }
+    if (OB_SUCC(ret)) {
+      bool need_transfer = false;
+      if (OB_FAIL(tx_ctx->check_need_transfer(data_end_scn_, tablet_list_, need_transfer))) {
+        TRANS_LOG(WARN, "check need transfer failed", KR(ret), K(*tx_ctx));
+        ret_ = ret;
+      } else if (need_transfer && OB_FAIL(move_tx_ids_.push_back(tx_id))) {
+        ret_ = ret;
+      } else {
+        bool_ret = true;
+      }
+    }
+    return bool_ret;
+  }
+  int get_ret() const { return ret_; }
+  int64_t get_count() const { return count_; }
+private:
+  ObIArray<ObTabletID> &tablet_list_;
+  const SCN data_end_scn_;
+  ObIArray<ObTransID> &move_tx_ids_;
+  int64_t count_;
+  int ret_;
+};
+
 class TransferOutTxOpFunctor
 {
 public:
-  TransferOutTxOpFunctor(const int64_t abs_expired_time, int64_t except_tx_id, const SCN data_end_scn,
-      const SCN op_scn, NotifyType op_type, bool is_replay, ObLSID dest_ls_id, int64_t transfer_epoch)
-     : abs_expired_time_(abs_expired_time), except_tx_id_(except_tx_id), data_end_scn_(data_end_scn),
-       op_scn_(op_scn), op_type_(op_type), is_replay_(is_replay), dest_ls_id_(dest_ls_id),
-       transfer_epoch_(transfer_epoch), count_(0), op_tx_count_(0), ret_(OB_SUCCESS)
+  TransferOutTxOpFunctor(const ObTransferOutTxParam &param)
+     : param_(param), count_(0), op_tx_count_(0), ret_(OB_SUCCESS)
   {
-
-    SET_EXPIRED_LIMIT(100 * 1000 /*100ms*/, 3 * 1000 * 1000 /*3s*/);
   }
   ~TransferOutTxOpFunctor() { PRINT_FUNC_STAT; }
   OPERATOR_V4(TransferOutTxOpFunctor)
@@ -379,21 +415,19 @@ public:
       TRANS_LOG(WARN, "invalid argument", K(tx_id), "ctx", OB_P(tx_ctx));
     } else {
       ++count_;
-      if ((count_ % BATCH_CHECK_COUNT) == 0) {
-        const int64_t now = ObTimeUtility::current_time();
-        if (now >= abs_expired_time_) {
-          ret_ = ret = OB_TIMEOUT;
-          TRANS_LOG(WARN, "transfer block tx timeout", K(count_));
-        }
-      }
     }
     if (OB_FAIL(ret)) {
-    } else if (tx_id.get_id() == except_tx_id_) {
+    } else if (tx_id.get_id() == param_.except_tx_id_) {
       bool_ret = true;
     } else {
       bool is_operated = false;
-      if (OB_FAIL(tx_ctx->do_transfer_out_tx_op(data_end_scn_, op_scn_, op_type_, is_replay_,
-              dest_ls_id_, transfer_epoch_, is_operated))) {
+      if (OB_FAIL(tx_ctx->do_transfer_out_tx_op(param_.data_end_scn_,
+                                                param_.op_scn_,
+                                                param_.op_type_,
+                                                param_.is_replay_,
+                                                param_.dest_ls_id_,
+                                                param_.transfer_epoch_,
+                                                is_operated))) {
         TRANS_LOG(WARN, "do_transfer_out_tx_op failed", KR(ret), K(*tx_ctx));
         ret_ = ret;
       } else {
@@ -409,15 +443,7 @@ public:
   int64_t get_count() const { return count_; }
   int64_t get_op_tx_count() const { return op_tx_count_; }
 private:
-  static const int64_t BATCH_CHECK_COUNT = 100;
-  int64_t abs_expired_time_;
-  int64_t except_tx_id_;
-  const SCN data_end_scn_;
-  const SCN op_scn_;
-  NotifyType op_type_;
-  bool is_replay_;
-  ObLSID dest_ls_id_;
-  int64_t transfer_epoch_;
+  const ObTransferOutTxParam &param_;
   int64_t count_;
   int64_t op_tx_count_;
   int ret_;
@@ -684,13 +710,15 @@ public:
         tmp_ret = OB_INVALID_ARGUMENT;
         TRANS_LOG_RET(WARN, tmp_ret, "invalid ls id", K(ls_id), KP(ls_tx_ctx_mgr));
       } else {
-        uint64_t mgr_state = ls_tx_ctx_mgr->get_state_();
+        uint64_t mgr_state;
+        bool is_master = false;
+        bool is_stopped = true;
+        ls_tx_ctx_mgr->tx_ls_state_mgr_.iter_ctx_mgr_stat_info(mgr_state, is_master, is_stopped);
         tmp_ret = ls_tx_ctx_mgr_stat.init(addr_,
                                           ls_tx_ctx_mgr->ls_id_,
-                                          ls_tx_ctx_mgr->is_master_(mgr_state),
-                                          ls_tx_ctx_mgr->is_stopped_(mgr_state),
+                                          is_master,
+                                          is_stopped,
                                           mgr_state,
-                                          ObLSTxCtxMgr::State::state_str(mgr_state),
                                           ls_tx_ctx_mgr->total_tx_ctx_count_,
                                           (int64_t)(&(*ls_tx_ctx_mgr)));
         if (OB_SUCCESS != tmp_ret) {
@@ -986,6 +1014,7 @@ public:
                                  tx_ctx->get_flushed_log_size(),
                                  tx_ctx->role_state_,
                                  tx_ctx->session_id_,
+                                 tx_ctx->client_sid_,
                                  tx_ctx->exec_info_.scheduler_,
                                  tx_ctx->is_exiting_,
                                  tx_ctx->exec_info_.xid_,
@@ -1154,6 +1183,7 @@ public:
                                         tx_ctx->get_ls_id(),
                                         memtable_key_info_arr.at(i),
                                         tx_ctx->get_session_id(),
+                                        tx_ctx->get_client_sid(),
                                         0,
                                         tx_id,
                                         tx_ctx->get_ctx_create_time(),
@@ -1482,6 +1512,7 @@ public:
       } else if (OB_TMP_FAIL(tx_scheduler_stat.init(tx_desc->tenant_id_,
                                                     tx_desc->addr_,
                                                     tx_desc->sess_id_,
+                                                    tx_desc->client_sid_,
                                                     tx_desc->tx_id_,
                                                     (int64_t)tx_desc->state_,
                                                     tx_desc->cluster_id_,
@@ -1500,7 +1531,7 @@ public:
                                                     tx_desc,
                                                     copy_savepoints,
                                                     tx_desc->abort_cause_,
-                                                    tx_desc->can_elr_))) {
+                                                    false))) {
         TRANS_LOG_RET(WARN, tmp_ret, "ObTxSchedulerStat init error", K(tmp_ret), KPC(tx_desc));
       } else if (OB_TMP_FAIL(tx_scheduler_stat_iter_.push(tx_scheduler_stat))) {
         TRANS_LOG_RET(WARN, tmp_ret, "ObTxSchedulerStatIterator push trans scheduler error", K(tmp_ret));

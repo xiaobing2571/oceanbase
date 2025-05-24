@@ -32,10 +32,17 @@ public:
   void reset();
 
   // append_callback will append your callback into the callback list
+  int append_callback(ObITransCallback *head,
+                      ObITransCallback *tail,
+                      const int64_t length,
+                      const bool for_replay,
+                      const bool parallel_replay = false,
+                      const bool serial_final = false);
   int append_callback(ObITransCallback *callback,
                       const bool for_replay,
                       const bool parallel_replay = false,
                       const bool serial_final = false);
+
 
   // concat_callbacks will append all callbacks in other into itself and reset
   // other. And it will return the concat number during concat_callbacks.
@@ -75,7 +82,7 @@ public:
 
   // clean_unlog_callbacks will remove all unlogged callbacks. Which is called
   // when switch to follower forcely.
-  int clean_unlog_callbacks(int64_t &removed_cnt);
+  int clean_unlog_callbacks(int64_t &removed_cnt, common::ObFunction<void()> &before_remove);
   int fill_log(ObITransCallback* log_cursor, ObTxFillRedoCtx &ctx, ObITxFillRedoFunctor &functor);
   int submit_log_succ(const ObCallbackScope &callbacks);
   int sync_log_succ(const share::SCN scn, int64_t sync_cnt);
@@ -104,6 +111,9 @@ public:
   // lock after proposing the commit log and even before the commit log
   // successfully synced for single ls txn.
   int tx_elr_preparing();
+
+  // tx_elr_revoke will clear elr flag on TransNode
+  int tx_elr_revoke();
 
   // tx_print_callback will simply print all calbacks.
   int tx_print_callback();
@@ -137,16 +147,17 @@ private:
     LOCK_ITERATE = 1,
     LOCK_APPEND = 2,
     LOCK_ALL = 3,
-    TRY_LOCK_ITERATE = 4
+    TRY_LOCK_ITERATE = 4,
+    TRY_LOCK_APPEND = 5,
   };
   struct LockGuard {
-    LockGuard(ObTxCallbackList &host, const LOCK_MODE m, ObTimeGuard *tg = NULL);
+    LockGuard(const ObTxCallbackList &host, const LOCK_MODE m, ObTimeGuard *tg = NULL);
     ~LockGuard();
     bool is_locked() const { return state_.is_locked(); }
     union LockState state_;
-    ObTxCallbackList &host_;
+    const ObTxCallbackList &host_;
   private:
-    void lock_append_();
+    void lock_append_(const bool try_lock);
     void lock_iterate_(const bool try_lock);
   };
   friend class LockGuard;
@@ -188,6 +199,10 @@ public:
   share::SCN get_checksum_scn() const { return checksum_scn_; }
   void get_checksum_and_scn(uint64_t &checksum, share::SCN &checksum_scn);
   void update_checksum(const uint64_t checksum, const share::SCN checksum_scn);
+  void inc_update_checksum_scn(const share::SCN checksum_scn)
+  {
+    checksum_scn_.inc_update(checksum_scn);
+  }
   void inc_update_sync_scn(const share::SCN scn);
   transaction::ObPartTransCtx *get_trans_ctx() const;
   bool pending_log_too_large(const int64_t limit) const
@@ -198,12 +213,21 @@ public:
   bool has_pending_log() const {
     return ATOMIC_LOAD(&data_size_) - ATOMIC_LOAD(&logged_data_size_) > 0;
   }
+  int64_t get_pending_log_size() const {
+    return data_size_ - logged_data_size_;
+  }
+  int64_t get_logged_data_size() const {
+    return logged_data_size_;
+  }
   DECLARE_TO_STRING;
+private:
+  void set_log_cursor_(ObITransCallback *log_cursor);
 private:
   const int16_t id_;
   // callback list sentinel
   ObITransCallback head_;
   ObITransCallback *log_cursor_;
+  int64_t log_epoch_;
   ObITransCallback *parallel_start_pos_;
   int64_t length_;
   // stats
@@ -241,11 +265,11 @@ private:
   uint64_t tmp_checksum_;
   ObTransCallbackMgr &callback_mgr_;
   // used to serialize append callback to list tail
-  common::ObByteLock append_latch_;
+  mutable common::ObByteLock append_latch_;
   // used to serialize fill and flush log of this list
   mutable common::ObByteLock log_latch_;
   // used to serialize operates on synced callbacks
-  common::ObByteLock iter_synced_latch_;
+  mutable common::ObByteLock iter_synced_latch_;
   DISALLOW_COPY_AND_ASSIGN(ObTxCallbackList);
 };
 

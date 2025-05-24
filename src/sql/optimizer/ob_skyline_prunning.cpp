@@ -13,8 +13,7 @@
 #define USING_LOG_PREFIX SQL_OPT
 
 #include "ob_skyline_prunning.h"
-#include "sql/resolver/expr/ob_raw_expr.h"
-
+#include "sql/optimizer/ob_optimizer_util.h"
 
 namespace oceanbase
 {
@@ -38,55 +37,10 @@ int ObIndexBackDim::compare(const ObSkylineDim &other, CompareStat &status) cons
     if (need_index_back_ == tmp.need_index_back_) {
       status = EQUAL;
     } else if (!need_index_back_ && tmp.need_index_back_) {
-      status = UNCOMPARABLE;
-      //在都抽不出query range和 没有 interesting order的情况下
-      //我们考虑两边的列的大小
-      //只有左边的restrict info是右边的super set的情况下
-      //并且 左边的列比右边的列少的情况下
-      //左边才算dominated右边
-      if (!has_interesting_order_ && !can_extract_range_
-          && !tmp.has_interesting_order_ && !tmp.can_extract_range_) {
-        //both not interesting order and not extract range
-        if (tmp.filter_column_cnt_ == 0) {
-          //右边抽不出条件，会走索引全表扫描+ 回表 剪掉
-          status = LEFT_DOMINATED;
-        } else if (index_column_cnt_ <= tmp.index_column_cnt_) {
-          status = LEFT_DOMINATED;
-        }
-      } else {
-        status = LEFT_DOMINATED;
-      }
+      status = LEFT_DOMINATED;
     } else if (need_index_back_ && !tmp.need_index_back_) {
-      status = UNCOMPARABLE;
-      if (!has_interesting_order_ && !can_extract_range_
-          && !tmp.has_interesting_order_ && !tmp.can_extract_range_) {
-        if (0 == filter_column_cnt_) {
-          //左边抽不出条件，会走索引全表扫描+回表， 剪掉
-          status = RIGHT_DOMINATED;
-        } else if (index_column_cnt_ >= tmp.index_column_cnt_) {
-          status = RIGHT_DOMINATED;
-        }
-      } else {
-        status = RIGHT_DOMINATED;
-      }
+      status = RIGHT_DOMINATED;
     }
-  }
-  return ret;
-}
-
-int ObIndexBackDim::add_filter_column_ids(const common::ObIArray<uint64_t> &filter_column_ids)
-{
-  int ret = OB_SUCCESS;
-  if (filter_column_ids.count() < 0 || filter_column_ids.count() > OB_USER_MAX_ROWKEY_COLUMN_NUMBER) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("too many columns", K(ret), K(filter_column_ids.count()));
-  } else {
-    MEMSET(filter_column_ids_, 0, sizeof(uint64_t) * OB_USER_MAX_ROWKEY_COLUMN_NUMBER);
-    for (int i = 0; OB_SUCC(ret) && i < filter_column_ids.count(); ++i) {
-      filter_column_ids_[i] = filter_column_ids.at(i);
-    }
-    filter_column_cnt_ = filter_column_ids.count();
-    std::sort(filter_column_ids_, filter_column_ids_ + filter_column_cnt_);//do sort, for quick compare
   }
   return ret;
 }
@@ -103,7 +57,7 @@ int ObInterestOrderDim::add_filter_column_ids(const common::ObIArray<uint64_t> &
       filter_column_ids_[i] = filter_column_ids.at(i);
     }
     filter_column_cnt_ = filter_column_ids.count();
-    std::sort(filter_column_ids_, filter_column_ids_ + filter_column_cnt_);//do sort, for quick compare
+    lib::ob_sort(filter_column_ids_, filter_column_ids_ + filter_column_cnt_);//do sort, for quick compare
   }
   return ret;
 }
@@ -390,11 +344,63 @@ int ObQueryRangeDim::add_rowkey_ids(const common::ObIArray<uint64_t> &rowkey_ids
       column_ids_[i] = rowkey_ids.at(i);
     }
     column_cnt_ = rowkey_ids.count();
-    std::sort(column_ids_, column_ids_ + column_cnt_);//do sort, for quick compare
+    lib::ob_sort(column_ids_, column_ids_ + column_cnt_);//do sort, for quick compare
   }
   return ret;
 }
 
+int ObUniqueRangeDim::compare(const ObSkylineDim &other, CompareStat &status) const
+{
+  int ret = OB_SUCCESS;
+  status = EQUAL;
+  if (other.get_dim_type() != get_dim_type()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("dimension type is different",
+             "dim_type", get_dim_type(), "other.dim_type", other.get_dim_type());
+  } else {
+    const ObUniqueRangeDim &tmp = static_cast<const ObUniqueRangeDim &>(other);
+    if (range_cnt_ > tmp.range_cnt_) {
+      status = RIGHT_DOMINATED;
+    } else if (range_cnt_ < tmp.range_cnt_) {
+      status = LEFT_DOMINATED;
+    } else {
+      status = EQUAL;
+    }
+  }
+  return ret;
+}
+
+int ObShardingInfoDim::compare(const ObSkylineDim &other, CompareStat &status) const
+{
+  int ret = OB_SUCCESS;
+  if (other.get_dim_type() != get_dim_type()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("dimension type is different",
+             "dim_type", get_dim_type(), "other.dim_type", other.get_dim_type());
+  } else {
+    status = ObSkylineDim::EQUAL;
+    const ObShardingInfoDim &tmp = static_cast<const ObShardingInfoDim &>(other);
+    DominateRelation strong_relation = DominateRelation::OBJ_UNCOMPARABLE;
+    EqualSets dummy;
+    if (is_single_get_ && tmp.is_single_get_) {
+      status = ObSkylineDim::EQUAL;
+    } else if (OB_FAIL(ObOptimizerUtil::compute_sharding_relationship(sharding_info_,
+                                              tmp.sharding_info_,
+                                              dummy,
+                                              strong_relation))) {
+      LOG_WARN("failed to compute sharding relationship", K(ret));
+    } else if (strong_relation == DominateRelation::OBJ_EQUAL) {
+      status = ObSkylineDim::EQUAL;
+    } else if (strong_relation == DominateRelation::OBJ_LEFT_DOMINATE) {
+      status = ObSkylineDim::LEFT_DOMINATED;
+    } else if (strong_relation == DominateRelation::OBJ_RIGHT_DOMINATE) {
+      status = ObSkylineDim::RIGHT_DOMINATED;
+    } else {
+      status = ObSkylineDim::UNCOMPARABLE;
+    }
+  }
+  return ret;
+}
 
 /*
  * 对三个维度进行比较
@@ -413,7 +419,9 @@ int ObIndexSkylineDim::compare(const ObIndexSkylineDim &other, ObSkylineDim::Com
     const ObSkylineDim *left_dim = skyline_dims_[i];
     const ObSkylineDim *right_dim = other.skyline_dims_[i];
     ObSkylineDim::CompareStat tmp_status = ObSkylineDim::UNCOMPARABLE;
-    if (OB_ISNULL(left_dim) || OB_ISNULL(right_dim)) {
+    if (OB_ISNULL(left_dim) && OB_ISNULL(right_dim)) {
+      //do nothing
+    } else if (OB_ISNULL(left_dim) || OB_ISNULL(right_dim)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("skyline dimension should not be null", K(ret), K(i), K(left_dim), K(right_dim));
     } else if (OB_FAIL(left_dim->compare(*right_dim, tmp_status))) {
@@ -439,7 +447,7 @@ int ObIndexSkylineDim::compare(const ObIndexSkylineDim &other, ObSkylineDim::Com
       }
       LOG_TRACE("skyline compare dim", K(i), K(tmp_status), K(compare_result), KPC(left_dim), KPC(right_dim));
       OPT_TRACE("compare dim", static_cast<int64_t>(i), "result:", static_cast<int64_t>(tmp_status));
-      OPT_TRACE("left dim:", *left_dim);
+      OPT_TRACE("left dim: ", *left_dim);
       OPT_TRACE("right dim:", *right_dim);
     }
   }
@@ -449,6 +457,15 @@ int ObIndexSkylineDim::compare(const ObIndexSkylineDim &other, ObSkylineDim::Com
         status = ObSkylineDim::EQUAL;
       } else {
         status = compare_result > 0 ? ObSkylineDim::LEFT_DOMINATED : ObSkylineDim::RIGHT_DOMINATED;
+      }
+    }
+    if (ObSkylineDim::EQUAL == status) {
+      if (is_get_ && !other.is_get_) {
+        status = ObSkylineDim::LEFT_DOMINATED;
+        OPT_TRACE("all dims are equal, while the left is table get");
+      } else if (!is_get_ && other.is_get_) {
+        status = ObSkylineDim::RIGHT_DOMINATED;
+        OPT_TRACE("all dims are equal, while the right is table get");
       }
     }
   }
@@ -475,10 +492,6 @@ int ObIndexSkylineDim::add_skyline_dim(const ObSkylineDim &dim)
 }
 
 int ObIndexSkylineDim::add_index_back_dim(const bool is_index_back,
-                                          const bool has_interest_order,
-                                          const bool can_extract_range,
-                                          const int64_t index_column_cnt,
-                                          const ObIArray<uint64_t> &filter_column_ids,
                                           ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
@@ -490,20 +503,10 @@ int ObIndexSkylineDim::add_index_back_dim(const bool is_index_back,
     LOG_WARN("failed to create dimension", K(ret));
   } else {
     dim->set_index_back(is_index_back);
-    dim->set_interesting_order(has_interest_order);
-    dim->set_extract_range(can_extract_range);
-    dim->set_index_column_cnt(index_column_cnt);
-    if (!has_interest_order && !can_extract_range && is_index_back) {
-      if (OB_FAIL(dim->add_filter_column_ids(filter_column_ids))) {
-        LOG_WARN("failed to add restrcit_ids", K(ret));
-      }
-    }
-    if (OB_SUCC(ret)) {
-      if (OB_FAIL(add_skyline_dim(*dim))) {
-        LOG_WARN("failed to add skyline dimension", K(ret));
-      } else {
-        LOG_TRACE("add index back dim success", K(ret), K(*dim));
-      }
+    if (OB_FAIL(add_skyline_dim(*dim))) {
+      LOG_WARN("failed to add skyline dimension", K(ret));
+    } else {
+      LOG_TRACE("add index back dim success", K(ret), K(*dim));
     }
   }
   return ret;
@@ -580,6 +583,49 @@ int ObIndexSkylineDim::add_query_range_dim(const ObIArray<uint64_t> &prefix_rang
   return ret;
 }
 
+int ObIndexSkylineDim::add_unique_range_dim(int64_t range_cnt, ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  ObUniqueRangeDim *dim = NULL;
+  if (OB_FAIL(ObSkylineDimFactory::get_instance().create_skyline_dim(allocator, dim))) {
+    LOG_WARN("failed to create key prefix dimension", K(ret));
+  } else if (OB_ISNULL(dim)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("failed to create dimension", K(ret));
+  } else {
+    dim->set_range_count(range_cnt);
+    if (OB_FAIL(add_skyline_dim(*dim))) {
+      LOG_WARN("failed to add_skylined_dim", K(ret));
+    } else {
+      LOG_TRACE("add query range dim success", K(ret), K(*dim));
+    }
+  }
+  return ret;
+}
+
+int ObIndexSkylineDim::add_sharding_info_dim(ObShardingInfo *sharding_info,
+                                             bool is_get,
+                                             ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  ObShardingInfoDim *dim = NULL;
+  if (OB_FAIL(ObSkylineDimFactory::get_instance().create_skyline_dim(allocator, dim))) {
+    LOG_WARN("failed to create key prefix dimension", K(ret));
+  } else if (OB_ISNULL(dim)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("failed to create dimension", K(ret));
+  } else {
+    dim->set_sharding_info(sharding_info);
+    dim->set_is_single_get(is_get);
+    if (OB_FAIL(add_skyline_dim(*dim))) {
+      LOG_WARN("failed to add_skylined_dim", K(ret));
+    } else {
+      LOG_TRACE("add partition num dim success", K(ret), K(*dim));
+    }
+  }
+  return ret;
+}
+
 int ObSkylineDimRecorder::add_index_dim(const ObIndexSkylineDim &dim, bool &has_add)
 {
   int ret = OB_SUCCESS;
@@ -600,7 +646,6 @@ int ObSkylineDimRecorder::add_index_dim(const ObIndexSkylineDim &dim, bool &has_
     OPT_TRACE("Index can not be pruning");
   } else {
     if (OB_FAIL(has_dominate_dim(dim, remove_idxs, need_add))) {
-      ret = OB_ERR_UNEXPECTED;
       LOG_WARN("check has dominate index failed", K(dim));
     } else if (need_add) {
       //remove from back, idx id is in ascending order

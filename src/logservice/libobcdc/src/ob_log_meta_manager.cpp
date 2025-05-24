@@ -20,15 +20,11 @@
 #include "observer/mysql/obsm_utils.h"            // ObSMUtils
 #include "rpc/obmysql/ob_mysql_global.h"          // obmysql
 #include "share/schema/ob_table_schema.h"         // ObTableSchema, ObSimpleTableSchemaV2
-#include "share/schema/ob_column_schema.h"        // ObColumnSchemaV2
-#include "logservice/data_dictionary/ob_data_dict_struct.h"
+#include "lib/udt/ob_array_utils.h"               // ObArrayUtil
 
 #include "ob_log_schema_getter.h"                 // ObLogSchemaGuard, DBSchemaInfo, TenantSchemaInfo
-#include "ob_log_utils.h"                         // print_mysql_type, ob_cdc_malloc
-#include "ob_obj2str_helper.h"                    // ObObj2strHelper
 #include "ob_log_adapt_string.h"                  // ObLogAdaptString
 #include "ob_log_config.h"                        // TCONF
-#include "ob_log_instance.h"                      // TCTX
 #include "ob_log_schema_cache_info.h"             // TableSchemaInfo
 #include "ob_log_timezone_info_getter.h"          // IObCDCTimeZoneInfoGetter
 
@@ -248,8 +244,10 @@ int ObLogMetaManager::get_table_meta(
           ret = OB_ERR_UNEXPECTED;
           LOG_ERROR("expect valid schema_getter", KR(ret));
         } else {
+          ObTimeGuard time_guard("get_table_meta", 2 * 1000 * 1000);
           RETRY_FUNC(stop_flag, *schema_getter, get_schema_guard_and_full_table_schema, tenant_id, table_id, global_schema_version, GET_SCHEMA_TIMEOUT,
-                  schema_mgr, table_schema);
+              schema_mgr, table_schema);
+          time_guard.click("get_full_table_schema");
 
           if (OB_FAIL(ret)) {
             // caller deal with error code OB_TENANT_HAS_BEEN_DROPPED
@@ -958,7 +956,6 @@ int ObLogMetaManager::build_column_metas_(
     const ObTimeZoneInfoWrap *tz_info_wrap = &(obcdc_tenant_tz_info->get_tz_wrap());
     int64_t version = table_schema->get_schema_version();
     uint64_t table_id = table_schema->get_table_id();
-    const bool is_heap_table = table_schema->is_heap_table();
     const int64_t column_cnt = column_ids.count();
     int16_t usr_column_cnt = 0;
 
@@ -1092,17 +1089,23 @@ int ObLogMetaManager::check_column_(
   const uint64_t column_id = column_schema.get_column_id();
   const uint64_t udt_set_id = column_schema.get_udt_set_id();
   const uint64_t sub_data_type = column_schema.get_sub_data_type();
-  const bool is_heap_table = table_schema.is_heap_table();
+  const bool is_table_with_hidden_pk_column = table_schema.is_table_with_hidden_pk_column();
+  const bool is_rowkey_column = column_schema.is_rowkey_column();
   const bool is_invisible_column = column_schema.is_invisible_column();
   const bool is_hidden_column = column_schema.is_hidden();
   const bool enable_output_hidden_primary_key = (0 != TCONF.enable_output_hidden_primary_key);
   const bool enable_output_invisible_column = (0 != TCONF.enable_output_invisible_column);
   // is column not user_column in OB.
   bool is_non_ob_user_column = (column_id < OB_APP_MIN_COLUMN_ID) || (column_id >= OB_MIN_SHADOW_COLUMN_ID);
-  is_heap_table_pk_increment_column = is_heap_table  && (OB_HIDDEN_PK_INCREMENT_COLUMN_ID == column_id);
+  is_heap_table_pk_increment_column = is_table_with_hidden_pk_column  && (OB_HIDDEN_PK_INCREMENT_COLUMN_ID == column_id);
 
-  if (is_non_ob_user_column) {
-    is_user_column = is_heap_table_pk_increment_column && enable_output_hidden_primary_key;
+  if (is_rowkey_column) {
+    // user specified rowkey column should output;
+    // invisible rowkey column should output;
+    // hidden_pk of heap_table will output if user config enable_output_hidden_primary_key=1
+    if (is_non_ob_user_column) {
+      is_user_column = is_heap_table_pk_increment_column && enable_output_hidden_primary_key;
+    }
   } else if (is_hidden_column) {
     is_user_column = false;
   } else if (column_schema.is_invisible_column() && !enable_output_invisible_column){
@@ -1112,12 +1115,13 @@ int ObLogMetaManager::check_column_(
   META_STAT_INFO("check_column_",
       "table_name", table_schema.get_table_name(),
       "table_id", table_schema.get_table_id(),
-      K(is_heap_table),
+      K(is_table_with_hidden_pk_column),
       K(column_id),
       K(udt_set_id),
       K(sub_data_type),
       "column_name", column_schema.get_column_name(),
       K(is_user_column),
+      K(is_rowkey_column),
       K(is_heap_table_pk_increment_column),
       K(enable_output_hidden_primary_key),
       "is_invisible_column", column_schema.is_invisible_column(),
@@ -1169,6 +1173,14 @@ int ObLogMetaManager::set_column_meta_(
         col_meta->setPrecision(column_schema.get_data_precision());
       } else if (column_schema.is_xmltype()) {
         mysql_type = obmysql::MYSQL_TYPE_ORA_XML;
+      } else if (ObRoaringBitmapType == col_type) {
+        mysql_type = obmysql::MYSQL_TYPE_ROARINGBITMAP;
+      } else if (ObCollectionSQLType == col_type) {
+        // get extended_type_info from column schema and determine it is array or vector
+        const ObIArray<ObString> &extended_type_info = column_schema.get_extended_type_info();
+        if (OB_FAIL(ObArrayUtil::get_mysql_type(extended_type_info, mysql_type))) {
+          LOG_ERROR("get_mysql_type fail", KR(ret));
+        }
       }
 
       col_meta->setScale(column_schema.get_data_scale());
@@ -1263,7 +1275,7 @@ int ObLogMetaManager::set_primary_keys_(ITableMeta *table_meta,
     LOG_ERROR("invalid argument", K(table_meta), K(table_schema));
     ret = OB_INVALID_ARGUMENT;
   } else {
-    if (! table_schema->is_heap_table()) {
+    if (table_schema->is_table_with_pk()) {
       const int64_t rowkey_column_num = table_schema->get_rowkey_column_num();
 
       for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_column_num; i++) {
@@ -1365,7 +1377,7 @@ int ObLogMetaManager::get_logic_primary_keys_for_heap_table_(
   const bool enable_output_hidden_primary_key = (1 == TCONF.enable_output_hidden_primary_key);
   pk_list.reset();
 
-  if (table_schema.is_heap_table() && enable_output_hidden_primary_key) {
+  if (table_schema.is_table_with_hidden_pk_column() && enable_output_hidden_primary_key) {
     ObArray<ObColDesc> col_ids;
     if (OB_FAIL(table_schema.get_column_ids(col_ids))) {
       LOG_ERROR("get all column info failed", KR(ret), K(table_schema));
@@ -1453,7 +1465,7 @@ int ObLogMetaManager::fill_primary_key_info_(
         "column_name", column_table_schema->get_column_name());
   } else if (valid_pk_num > 0 && OB_FAIL(pks.append(","))) {
     LOG_ERROR("append pks delimeter failed", KR(ret), K(valid_pk_num), K(pks));
-  } else if (pks.append(column_table_schema->get_column_name())) {
+  } else if (OB_FAIL(pks.append(column_table_schema->get_column_name()))) {
     LOG_ERROR("append column_name into pks failed", KR(ret), K(pks), KPC(column_table_schema));
   } else {
     if (OB_SUCC(ret)) {
@@ -1775,11 +1787,11 @@ int ObLogMetaManager::set_unique_keys_(ITableMeta *table_meta,
                   const auto *column_schema = table_schema->get_column_schema(column_id);
 
                   if (OB_ISNULL(column_schema)) {
+                    ret = OB_ERR_UNEXPECTED;
                     LOG_ERROR("get column schema fail", K(column_id), K(index), K(column_count),
                         "table_id", table_schema->get_table_id(),
                         "table_name", table_schema->get_table_name(),
                         "table_schame_version", table_schema->get_schema_version());
-                    ret = OB_ERR_UNEXPECTED;
                   } else {
                     if (is_first_uk_column) {
                       is_first_uk_column = false;

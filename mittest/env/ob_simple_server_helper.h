@@ -39,6 +39,7 @@ public:
   static int g_select_uint64(uint64_t tenant_id, const char *sql, uint64_t &val);
 
   static int select_int64(sqlclient::ObISQLConnection *conn, const char *sql, int64_t &val);
+  static int select_int64(ObMySQLTransaction &trans, uint64_t tenant_id, const char *sql, int64_t &val);
 
   static int select_varchar(sqlclient::ObISQLConnection *conn, const char *sql, ObString &val);
   static int g_select_varchar(uint64_t tenant_id, const char *sql, ObString &val);
@@ -70,6 +71,8 @@ public:
   static int get_ls_end_scn(uint64_t tenant_id, ObLSID ls_id, SCN &end_scn);
   static int wait_replay_advance(uint64_t tenant_id, ObLSID ls_id, SCN end_scn);
   static int wait_checkpoint_newest(uint64_t tenant_id, ObLSID ls_id);
+  static int freeze_tx_ctx(uint64_t tenant_id, ObLSID ls_id);
+  static int freeze_tx_data(uint64_t tenant_id, ObLSID ls_id);
   static int wait_tx(uint64_t tenant_id, ObLSID ls_id, ObTransID tx_id, ObTxState tx_state);
   static int wait_tx_exit(uint64_t tenant_id, ObLSID ls_id, ObTransID tx_id);
   static int wait_flush_finish(uint64_t tenant_id, ObLSID ls_id, ObTabletID tablet_id);
@@ -78,6 +81,8 @@ public:
   static int wait_weak_read_ts_advance(uint64_t tenant_id, ObLSID ls_id1, ObLSID ls_id2);
   static int enable_wrs(uint64_t tenant_id, ObLSID ls_id, bool enable);
   static int modify_wrs(uint64_t tenant_id, ObLSID ls_id, int64_t add_ns = 10 * 1000 * 1000 * 1000L);
+  static int get_tx_desc(uint64_t tenant_id, ObTransID tx_id, ObTxDesc *&tx_desc);
+  static int revert_tx_desc(uint64_t tenant_id, ObTxDesc *tx_desc);
 };
 
 class InjectTxFaultHelper : public transaction::ObLSTxLogAdapter
@@ -95,7 +100,8 @@ public:
                          const int64_t size,
                          const share::SCN &base_ts,
                          ObTxBaseLogCb *cb,
-                         const bool need_nonblock) override;
+                         const bool need_nonblock,
+                         const int64_t retry_timeout_us = 1000) override;
 private:
   transaction::ObLSTxCtxMgr *mgr_;
   hash::ObHashMap<ObTransID, ObTxLogType> tx_injects_;

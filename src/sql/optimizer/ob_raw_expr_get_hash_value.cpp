@@ -83,3 +83,15 @@ int ObRawExprGetHashValue::visit(ObSetOpRawExpr &expr)
   seed_ = expr.hash(seed_);
   return OB_SUCCESS;
 }
+
+int ObRawExprGetHashValue::visit(ObMatchFunRawExpr &expr)
+{
+  seed_ = expr.hash(seed_);
+  return OB_SUCCESS;
+}
+
+int ObRawExprGetHashValue::visit(ObUnpivotRawExpr &expr)
+{
+  seed_ = expr.hash(seed_);
+  return OB_SUCCESS;
+}

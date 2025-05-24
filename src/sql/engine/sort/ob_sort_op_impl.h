@@ -21,11 +21,14 @@
 #include "share/ob_rpc_struct.h"
 #include "sql/engine/basic/chunk_store/ob_compact_store.h"
 #include "sql/engine/basic/ob_chunk_datum_store.h"
+#include "sql/engine/sort/ob_pd_topn_sort_filter.h"
 
 namespace oceanbase
 {
 namespace sql
 {
+
+struct ObPushDownTopNFilterInfo;
 
 struct ObChunkStoreWrapper
 {
@@ -84,7 +87,7 @@ public:
     return is_compact_ ? compact_store_.get_mem_hold() : datum_store_.get_mem_hold();
   }
 
-  int reset()
+  int reset_iter()
   {
     int ret = OB_SUCCESS;
     if (is_compact_) {
@@ -110,14 +113,13 @@ public:
            const bool enable_dump = true,
            const uint32_t row_extra_size = 0,
            const bool enable_truncate = true,
-           const share::SortCompactLevel compact_level = share::SORT_DEFAULT_LEVEL,
            const ObCompressorType compress_type = NONE_COMPRESSOR,
            const ExprFixedArray *exprs = nullptr)
   {
     int ret = OB_SUCCESS;
     if (is_compact_) {
       ret = compact_store_.init(mem_limit, tenant_id, mem_ctx_id, label, enable_dump, row_extra_size,
-                          enable_truncate, compact_level, compress_type, exprs);
+                          enable_truncate, compress_type, exprs);
     } else {
       ret = datum_store_.init(mem_limit, tenant_id, mem_ctx_id, label, enable_dump, row_extra_size);
     }
@@ -247,6 +249,7 @@ public:
   static const int64_t INMEMORY_MERGE_SORT_WARN_WAYS = 10000;
 
   explicit ObSortOpImpl(ObMonitorNode &op_monitor_info);
+  ObSortOpImpl();
   virtual ~ObSortOpImpl();
 
   // if rewind id not needed, we will release the resource after iterate end.
@@ -262,15 +265,17 @@ public:
       const int64_t topn_cnt = INT64_MAX,
       const bool is_fetch_with_ties = false,
       const int64_t default_block_size = ObChunkDatumStore::BLOCK_SIZE,
-      const share::SortCompactLevel compact_level = share::SORT_DEFAULT_LEVEL,
       const common::ObCompressorType compressor_type = common::NONE_COMPRESSOR,
-      const ExprFixedArray *exprs = nullptr);
+      const ExprFixedArray *exprs = nullptr,
+      const int64_t est_rows = 0,
+      const bool use_compact_format = false,
+      const ObPushDownTopNFilterInfo *pd_topn_filter_info = nullptr);
 
   virtual int64_t get_prefix_pos() const { return 0;  }
   // keep initialized, can sort same rows (same cell type, cell count, projector) after reuse.
-  void reuse();
+  virtual void reuse();
   // reset to state before init
-  void reset();
+  virtual void reset();
   void destroy() { reset(); }
 
   // Add row and return the stored row.
@@ -340,9 +345,9 @@ public:
 
   int add_stored_row(const ObChunkDatumStore::StoredRow &input_row);
 
-  int sort();
+  virtual int sort();
 
-  int get_next_row(const common::ObIArray<ObExpr*> &exprs)
+  virtual int get_next_row(const common::ObIArray<ObExpr*> &exprs)
   {
     int ret = OB_SUCCESS;
     const ObChunkDatumStore::StoredRow *sr = NULL;
@@ -385,7 +390,7 @@ public:
 
   // get next batch rows, %max_cnt should equal or smaller than max batch size.
   // return OB_ITER_END for EOF
-  int get_next_batch(const common::ObIArray<ObExpr*> &exprs,
+  virtual int get_next_batch(const common::ObIArray<ObExpr*> &exprs,
                      const int64_t max_cnt, int64_t &read_rows);
 
   // rewind get_next_row() iterator to begin.
@@ -402,16 +407,16 @@ public:
   void set_operator_id(uint64_t op_id) { op_id_ = op_id; }
   void collect_memory_dump_info(ObMonitorNode &info)
   {
-    info.otherstat_1_id_ = op_monitor_info_.otherstat_1_id_;
-    info.otherstat_1_value_ = op_monitor_info_.otherstat_1_value_;
-    info.otherstat_2_id_ = op_monitor_info_.otherstat_2_id_;
-    info.otherstat_2_value_ = op_monitor_info_.otherstat_2_value_;
-    info.otherstat_3_id_ = op_monitor_info_.otherstat_3_id_;
-    info.otherstat_3_value_ = op_monitor_info_.otherstat_3_value_;
-    info.otherstat_4_id_ = op_monitor_info_.otherstat_4_id_;
-    info.otherstat_4_value_ = op_monitor_info_.otherstat_4_value_;
-    info.otherstat_6_id_ = op_monitor_info_.otherstat_6_id_;
-    info.otherstat_6_value_ = op_monitor_info_.otherstat_6_value_;
+    info.otherstat_1_id_ = op_monitor_info_->otherstat_1_id_;
+    info.otherstat_1_value_ = op_monitor_info_->otherstat_1_value_;
+    info.otherstat_2_id_ = op_monitor_info_->otherstat_2_id_;
+    info.otherstat_2_value_ = op_monitor_info_->otherstat_2_value_;
+    info.otherstat_3_id_ = op_monitor_info_->otherstat_3_id_;
+    info.otherstat_3_value_ = op_monitor_info_->otherstat_3_value_;
+    info.otherstat_4_id_ = op_monitor_info_->otherstat_4_id_;
+    info.otherstat_4_value_ = op_monitor_info_->otherstat_4_value_;
+    info.otherstat_6_id_ = op_monitor_info_->otherstat_6_id_;
+    info.otherstat_6_value_ = op_monitor_info_->otherstat_6_value_;
   }
   inline void set_io_event_observer(ObIOEventObserver *observer)
   {
@@ -757,7 +762,6 @@ protected:
                        const ObChunkDatumStore::StoredRow *&store_row);
   int adjust_topn_heap_with_ties(const common::ObIArray<ObExpr*> &exprs,
                                  const ObChunkDatumStore::StoredRow *&store_row);
-  //
   int copy_to_topn_row(const common::ObIArray<ObExpr*> &exprs,
                        ObIAllocator &alloc,
                        SortStoredRow *&top_row);
@@ -772,9 +776,9 @@ protected:
                        SortStoredRow *&new_row);
   int generate_last_ties_row(const ObChunkDatumStore::StoredRow *orign_row);
   int adjust_topn_read_rows(ObChunkDatumStore::StoredRow **stored_rows, int64_t &read_cnt);
-  bool use_compact_store() { return sort_compact_level_ != SORT_DEFAULT_LEVEL; }
   // for partition topn
-  int init_partition_topn();
+  int init_partition_topn(const int64_t est_rows);
+  int enlarge_partition_topn_buckets();
   void reuse_part_topn_heap();
   int locate_current_heap(const common::ObIArray<ObExpr*> &exprs);
   int locate_current_heap_in_bucket(PartHeapNode *first_node,
@@ -793,21 +797,33 @@ protected:
                           const int64_t batch_size,
                           const uint16_t selector[],
                           const int64_t size);
+  bool use_compact_store() { return use_compact_format_ || compress_type_ != NONE_COMPRESSOR; }
+  template<typename ArrayType>
+  int prepare_bucket_array(ArrayType *&buckets, uint64_t bucket_num);
   DISALLOW_COPY_AND_ASSIGN(ObSortOpImpl);
 
 protected:
+  using BucketArray = common::ObSegmentArray<PartHashNode *,
+                                             OB_MALLOC_MIDDLE_BLOCK_SIZE,
+                                             common::ModulePageAllocator>;
+  using BucketNodeArray = common::ObSegmentArray<PartHashNode,
+                                                 OB_MALLOC_MIDDLE_BLOCK_SIZE,
+                                                 common::ModulePageAllocator>;
   typedef common::ObBinaryHeap<ObChunkDatumStore::StoredRow **, Compare, 16> IMMSHeap;
   typedef common::ObBinaryHeap<ObSortOpChunk *, Compare, MAX_MERGE_WAYS> EMSHeap;
   //typedef common::ObBinaryHeap<ObChunkDatumStore::StoredRow *, Compare> TopnHeap;
   static const int64_t MAX_ROW_CNT = 268435456; // (2G / 8)
   static const int64_t STORE_ROW_HEADER_SIZE = sizeof(SortStoredRow);
   static const int64_t STORE_ROW_EXTRA_SIZE = sizeof(uint64_t);
+  static const int64_t MIN_BUCKET_COUNT = 1L << 14;  //16384;
+  static const int64_t MAX_BUCKET_COUNT = 1L << 19; //524288;
   bool inited_;
   bool local_merge_sort_;
   bool need_rewind_;
   bool got_first_row_;
   bool sorted_;
   bool enable_encode_sortkey_;
+  ModulePageAllocator page_allocator_;
   lib::MemoryContext mem_context_;
   MemEntifyFreeGuard mem_entify_guard_;
   int64_t tenant_id_;
@@ -831,7 +847,8 @@ protected:
   int64_t input_rows_;
   int64_t input_width_;
   ObSqlWorkAreaProfile profile_;
-  ObMonitorNode &op_monitor_info_;
+  ObMonitorNode self_monitor_info_;
+  ObMonitorNode *op_monitor_info_;
   ObSqlMemMgrProcessor sql_mem_processor_;
   ObPhyOperatorType op_type_;
   uint64_t op_id_;
@@ -839,9 +856,9 @@ protected:
   ObChunkDatumStore::StoredRow **stored_rows_;
   ObIOEventObserver *io_event_observer_;
   // for window function partition sort
-  PartHashNode **buckets_;
   uint64_t max_bucket_cnt_;
-  PartHashNode *part_hash_nodes_;
+  BucketArray *buckets_;
+  BucketNodeArray *part_hash_nodes_;
   uint64_t max_node_cnt_;
   int64_t part_cnt_;
   // for limit topn sort change to simple sort
@@ -858,12 +875,14 @@ protected:
   bool use_partition_topn_sort_;
   ObSEArray<TopnHeapNode*, 16> heap_nodes_;
   int64_t cur_heap_idx_;
+  int64_t part_group_cnt_;
   common::ObIArray<ObChunkDatumStore::StoredRow *> *rows_;
   ObTempBlockStore::BlockHolder compact_blk_holder_;
   ObChunkDatumStore::IteratedBlockHolder default_blk_holder_;
-  share::SortCompactLevel sort_compact_level_;
   const ExprFixedArray *sort_exprs_;
   common::ObCompressorType compress_type_;
+  bool use_compact_format_;
+  ObPushDownTopNFilter pd_topn_filter_;
 };
 
 class ObInMemoryTopnSortImpl;
@@ -871,7 +890,10 @@ class ObPrefixSortImpl : public ObSortOpImpl
 {
 public:
   explicit ObPrefixSortImpl(ObMonitorNode &op_monitor_info);
-
+  ~ObPrefixSortImpl()
+  {
+    reset();
+  }
   // init && start fetch %op rows
   int init(const int64_t tenant_id,
       const int64_t prefix_pos,
@@ -888,13 +910,13 @@ public:
       bool is_fetch_with_ties = false);
 
   int64_t get_prefix_pos() const { return prefix_pos_;  }
-  int get_next_row(const common::ObIArray<ObExpr*> &exprs);
+  virtual int get_next_row(const common::ObIArray<ObExpr*> &exprs);
 
-  int get_next_batch(const common::ObIArray<ObExpr*> &exprs,
+  virtual int get_next_batch(const common::ObIArray<ObExpr*> &exprs,
                      const int64_t max_cnt, int64_t &read_rows);
 
-  void reuse();
-  void reset();
+  virtual void reuse();
+  virtual void reset();
 private:
   // fetch rows in same prefix && do sort, set %next_prefix_row_ to NULL
   // when all child rows are fetched.
@@ -952,9 +974,8 @@ private:
 class ObUniqueSortImpl : public ObSortOpImpl
 {
 public:
-  explicit ObUniqueSortImpl(ObMonitorNode &op_monitor_info) : ObSortOpImpl(op_monitor_info), prev_row_(NULL), prev_buf_size_(0)
-  {
-  }
+  explicit ObUniqueSortImpl(ObMonitorNode &op_monitor_info) : ObSortOpImpl(op_monitor_info), prev_row_(NULL), prev_buf_size_(0) {}
+  ObUniqueSortImpl() : ObSortOpImpl(), prev_row_(NULL), prev_buf_size_(0) {}
 
   virtual ~ObUniqueSortImpl()
   {
@@ -983,16 +1004,16 @@ public:
         default_block_size);
   }
 
-  int get_next_row(const common::ObIArray<ObExpr*> &exprs);
+  virtual int get_next_row(const common::ObIArray<ObExpr*> &exprs);
   int get_next_stored_row(const ObChunkDatumStore::StoredRow *&sr);
 
-  int get_next_batch(const common::ObIArray<ObExpr*> &exprs,
+  virtual int get_next_batch(const common::ObIArray<ObExpr*> &exprs,
                      const int64_t max_cnt, int64_t &read_rows);
 
-  void reuse();
-  void reset();
+  virtual void reuse();
+  virtual void reset();
 
-  int sort()
+  virtual int sort()
   {
     free_prev_row();
     return ObSortOpImpl::sort();

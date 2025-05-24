@@ -11,14 +11,9 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
-#include "sql/engine/expr/ob_expr_frame_info.h"
-#include "sql/engine/expr/ob_expr.h"
-#include "sql/engine/ob_exec_context.h"
-#include "sql/engine/expr/ob_i_expr_extra_info.h"
-#include "sql/engine/expr/ob_expr_extra_info_factory.h"
-#include "sql/engine/expr/ob_expr_operator.h"
-#include "sql/engine/px/ob_px_util.h"
+#include "ob_expr_frame_info.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "sql/engine/px/ob_px_util.h"
 
 namespace oceanbase
 {
@@ -126,7 +121,7 @@ int ObExprFrameInfo::assign(const ObExprFrameInfo &other,
         }
 
         // copy inner function ptrs
-        if (other.rt_exprs_.at(i).inner_func_cnt_ > 0) {
+        if (OB_SUCC(ret) && other.rt_exprs_.at(i).inner_func_cnt_ > 0) {
           int64_t func_cnt = other.rt_exprs_.at(i).inner_func_cnt_;
           void *funcs_buf = NULL;
           if (OB_ISNULL(funcs_buf = allocator.alloc(sizeof(void *) * func_cnt))) {
@@ -156,7 +151,7 @@ int ObExprFrameInfo::assign(const ObExprFrameInfo &other,
       }
 
       // allocate parents memory for all rt exprs
-      if (rt_exprs_.at(i).parent_cnt_ > 0) {
+      if (OB_SUCC(ret) && rt_exprs_.at(i).parent_cnt_ > 0) {
         ObExpr **parent_buf = NULL;
         int64_t buf_size = rt_exprs_.at(i).parent_cnt_ * sizeof(ObExpr *);
         if (OB_ISNULL(parent_buf = (ObExpr **)allocator.alloc(buf_size))) {
@@ -679,7 +674,7 @@ int ObTempExpr::eval(ObExecContext &exec_ctx, const ObNewRow &row, ObObj &result
     if (!exec_ctx.use_temp_expr_ctx_cache()) {
       temp_expr_ctx->~ObTempExprCtx();
     }
-    LOG_TRACE("temp expr result", K(result), K(row), K(rt_exprs_));
+    LOG_DEBUG("temp expr result", K(result), K(row), K(rt_exprs_));
   }
 
   return ret;
@@ -712,7 +707,10 @@ int ObTempExpr::deep_copy(ObIAllocator &allocator, ObTempExpr *&dst) const
 {
   int ret = OB_SUCCESS;
   char *buf = static_cast<char *>(allocator.alloc(sizeof(ObTempExpr)));
-  CK(OB_NOT_NULL(buf));
+  if (OB_ISNULL(buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("fail to alloc mem in temp expr deep copy", K(ret));
+  }
   OX(dst = new(buf)ObTempExpr(allocator));
   OZ(dst->assign(*this, allocator));
   OX(dst->expr_idx_ = expr_idx_);

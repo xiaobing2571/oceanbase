@@ -11,8 +11,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
-#include "common/ob_smart_call.h"
-#include "sql/resolver/expr/ob_raw_expr_copier.h"
+#include "ob_raw_expr_copier.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 using namespace oceanbase;
 using namespace oceanbase::sql;
@@ -134,6 +133,13 @@ int ObRawExprCopier::find_in_copy_context(const ObRawExpr *old_expr, ObRawExpr *
   return ret;
 }
 
+void ObRawExprCopier::reuse()
+{
+  new_exprs_.reuse();
+  copied_exprs_.reuse();
+  uncopy_expr_nodes_.reuse();
+}
+
 int ObRawExprCopier::copy_expr_node(const ObRawExpr *expr,
                                     ObRawExpr *&new_expr)
 {
@@ -202,13 +208,23 @@ int ObRawExprCopier::add_expr(const ObRawExpr *from,
       LOG_WARN("failed to create expr set", K(ret));
     }
   }
-  if (OB_SUCC(ret)) {
-    if (OB_FAIL(copied_exprs_.set_refactored(reinterpret_cast<uint64_t>(from),
-                                             reinterpret_cast<uint64_t>(to)))) {
+  if (OB_FAIL(ret)) {
+  } else if (OB_SUCCESS != (ret = copied_exprs_.set_refactored(reinterpret_cast<uint64_t>(from),
+                                                               reinterpret_cast<uint64_t>(to)))) {
+    if (OB_UNLIKELY(ret != OB_HASH_EXIST)) {
       LOG_WARN("faield to add copied expr into map", K(ret));
-    } else if (OB_FAIL(new_exprs_.set_refactored(reinterpret_cast<uint64_t>(to)))) {
-      LOG_WARN("failed to add copied expr into set", K(ret));
+    } else {
+      ret = OB_SUCCESS;
+      uint64_t val = 0;
+      if (OB_FAIL(copied_exprs_.get_refactored(reinterpret_cast<uint64_t>(from), val))) {
+        LOG_WARN("get expr from hash map failed", K(ret));
+      } else if (OB_UNLIKELY(val != reinterpret_cast<uint64_t>(to))) {
+        ret = OB_HASH_EXIST;
+        LOG_WARN("from expr exists", K(ret), KPC(from), KPC(to), K(val));
+      }
     }
+  } else if (OB_FAIL(new_exprs_.set_refactored(reinterpret_cast<uint64_t>(to)))) {
+    LOG_WARN("failed to add copied expr into set", K(ret));
   }
   return ret;
 }
@@ -325,7 +341,11 @@ int ObRawExprCopier::add_skipped_expr(const ObRawExpr *target, bool include_chil
 {
   int ret = OB_SUCCESS;
   if (include_child) {
-    ret = add_expr(target, target);
+    if (is_existed(target)) {
+      // do nothing
+    } else {
+      ret = add_expr(target, target);
+    }
   } else {
     ret = uncopy_expr_nodes_.push_back(target);
   }

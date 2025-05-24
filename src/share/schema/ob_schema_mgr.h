@@ -40,6 +40,7 @@
 #include "share/schema/ob_context_mgr.h"
 #include "share/schema/ob_mock_fk_parent_table_mgr.h"
 #include "share/schema/ob_rls_mgr.h"
+#include "share/schema/ob_catalog_mgr.h"
 
 namespace oceanbase
 {
@@ -591,7 +592,8 @@ public:
                        const common::ObString &table_name,
                        const bool is_index,
                        const ObSimpleTableSchemaV2 *&table_schema,
-                       bool is_hidden = false) const;
+                       const bool with_hidden_flag = false,
+                       const bool is_built_in_index = false) const;
   int get_table_schema(
       const uint64_t tenant_id,
       const uint64_t database_id,
@@ -606,7 +608,8 @@ public:
       const uint64_t tenant_id,
       const uint64_t database_id,
       const common::ObString &table_name,
-      const ObSimpleTableSchemaV2 *&table_schema) const;
+      const ObSimpleTableSchemaV2 *&table_schema,
+      const bool is_built_in = false) const;
   int get_idx_schema_by_origin_idx_name(const uint64_t tenant_id,
                                       const uint64_t database_id,
                                       const common::ObString &index_name,
@@ -905,6 +908,18 @@ private:
 
   int reserved_mem_for_tables_(
       const common::ObIArray<share::schema::ObSimpleTableSchemaV2*> &table_schemas);
+  IndexNameMap &get_index_name_map_(const bool is_built_in)
+  {
+    return is_built_in ? built_in_index_name_map_ : normal_index_name_map_;
+  }
+  const IndexNameMap &get_index_name_map_(const bool is_built_in) const
+  {
+    return is_built_in ? built_in_index_name_map_ : normal_index_name_map_;
+  }
+  // catalog
+  int add_catalogs(const common::ObIArray<ObCatalogSchema> &catalog_schemas);
+  int add_catalog(const ObCatalogSchema &catalog_schema);
+  int del_catalog(const ObTenantCatalogId &id);
 private:
   common::ObArenaAllocator local_allocator_;
   common::ObIAllocator &allocator_;
@@ -923,7 +938,7 @@ private:
   TableInfos lob_piece_infos_;
   TableIdMap table_id_map_;
   TableNameMap table_name_map_;
-  IndexNameMap index_name_map_;
+  IndexNameMap normal_index_name_map_;
   AuxVPNameMap aux_vp_name_map_;
   ObOutlineMgr outline_mgr_;
   ObRoutineMgr routine_mgr_;
@@ -946,7 +961,14 @@ private:
   DropTenantInfos drop_tenant_infos_;
   ObKeystoreMgr keystore_mgr_;
   ObTablespaceMgr tablespace_mgr_;
+  // Map of tables with HIDDEN flag (is_user_hidden_table())
   TableNameMap hidden_table_name_map_;
+  // Map of index tables with following attributes:
+  // 1. with no HIDDEN flag：is_user_hidden_table() == false
+  // 2. system built-in index tables when creating index
+  // 3. they are not visible to users, and their names are not in normal index name space. Their names
+  //    are not conflicted with normal index names
+  IndexNameMap built_in_index_name_map_;
   ObDbLinkMgr dblink_mgr_;
   ObDirectoryMgr directory_mgr_;
   ObContextMgr context_mgr_;
@@ -954,6 +976,7 @@ private:
   ObRlsPolicyMgr rls_policy_mgr_;
   ObRlsGroupMgr rls_group_mgr_;
   ObRlsContextMgr rls_context_mgr_;
+  ObCatalogMgr catalog_mgr_;
   int64_t timestamp_in_slot_; // when schema mgr put in slot, we will set the timestamp
   int64_t allocator_idx_;
   TableInfos mlog_infos_;

@@ -36,6 +36,23 @@ enum class LogIOTaskType
   PURGE_THROTTLING_TYPE = 6,
 };
 
+OB_INLINE const char *log_io_task_type_str(const LogIOTaskType type)
+{
+#define IO_TASK_TYPE_NAME(io_type)  case LogIOTaskType::io_type: { str = #io_type; } break
+  const char *str = nullptr;
+  switch (type) {
+    IO_TASK_TYPE_NAME(FLUSH_LOG_TYPE);
+    IO_TASK_TYPE_NAME(FLUSH_META_TYPE);
+    IO_TASK_TYPE_NAME(TRUNCATE_PREFIX_TYPE);
+    IO_TASK_TYPE_NAME(TRUNCATE_LOG_TYPE);
+    IO_TASK_TYPE_NAME(FLASHBACK_LOG_TYPE);
+    IO_TASK_TYPE_NAME(PURGE_THROTTLING_TYPE);
+    default: str = "UNKNOWN_TYPE";
+  }
+  return str;
+#undef IO_TASK_TYPE_NAME
+}
+
 class IPalfHandleImplGuard;
 class LogIOTask;
 
@@ -200,11 +217,12 @@ public:
   int64_t get_count() const { return io_task_array_.count(); }
   int64_t get_accum_in_queue_time() const { return accum_in_queue_time_; }
 
-  TO_STRING_KV(K_(palf_id), "count", io_task_array_.count(), K_(lsn_array));
+  TO_STRING_KV(K_(palf_id), "count", io_task_array_.count(), K_(lsn_array), K_(accum_size));
 private:
   int push_flush_cb_to_thread_pool_(int tg_id, IPalfEnvImpl *palf_env_impl);
   int do_task_(int tg_id, IPalfEnvImpl *palf_env_impl);
   void clear_memory_(IPalfEnvImpl *palf_env_impl);
+  static int64_t SINGLE_TASK_MAX_SIZE;
 private:
   BatchIOTaskArray io_task_array_;
   LogWriteBufArray log_write_buf_array_;
@@ -212,6 +230,7 @@ private:
   LSNArray lsn_array_;
   int64_t palf_id_;
   int64_t accum_in_queue_time_;
+  int64_t accum_size_;
   bool is_inited_;
 };
 

@@ -49,6 +49,10 @@ public:
                           ObTableSchema &alter_table_schema,
                           share::schema::ObSchemaOperationType operation_type,
                           const common::ObString *ddl_stmt_str = NULL);
+  int only_update_table_options(common::ObISQLClient &sql_client,
+                                ObTableSchema &new_table_schema,
+                                share::schema::ObSchemaOperationType operation_type,
+                                const common::ObString *ddl_stmt_str = NULL);
   int update_table_schema_version(common::ObISQLClient &sql_client,
                                   const ObTableSchema &table_schema,
                                   share::schema::ObSchemaOperationType operation_type,
@@ -61,7 +65,7 @@ public:
                              const bool update_object_status_ignore_version,
                              const common::ObString *ddl_stmt_str = nullptr);
   int update_partition_option(common::ObISQLClient &sql_client,
-                              ObTableSchema &table,
+                              const ObTableSchema &table,
                               const common::ObString *ddl_stmt_str = NULL);
   int update_partition_option(common::ObISQLClient &sql_client,
                               ObTableSchema &table,
@@ -72,6 +76,8 @@ public:
   int update_all_part_for_subpart(ObISQLClient &sql_client,
                                   const ObTableSchema &table,
                                   const ObIArray<ObPartition*> &update_part_array);
+  int update_splitting_partition_option(common::ObISQLClient &sql_client,
+                                        const ObTableSchema &table);
 
   virtual int drop_table(const ObTableSchema &table_schema,
                          const int64_t new_schema_version,
@@ -79,6 +85,7 @@ public:
                          const common::ObString *ddl_stmt_str,
                          const bool is_truncate_table,
                          const bool is_drop_db,
+                         const bool is_force_drop_lonely_lob_aux_table,
                          share::schema::ObSchemaGetterGuard *schema_guard,
                          share::schema::DropTableIdHashSet *drop_table_set);
 
@@ -110,12 +117,14 @@ public:
                            const ObTableSchema &origin_table_schema,
                            const ObTableSchema &new_table_schema,
                            const ObColumnSchemaV2 &column_schema,
-                           const bool record_ddl_operation);
+                           const bool record_ddl_operation,
+                           const bool need_del_stats);
   //alter table drop column
   int delete_single_column(const int64_t new_schema_version,
                            common::ObISQLClient &sql_client,
                            const ObTableSchema &table_schema,
-                           const ObColumnSchemaV2 &column_schema);
+                           const ObColumnSchemaV2 &column_schema,
+                           const bool record_ddl_operation);
   //alter table drop constraint
   int delete_single_constraint(const int64_t new_schema_version,
                                common::ObISQLClient &sql_client,
@@ -133,9 +142,17 @@ public:
                                   const int64_t new_schema_version,
                                   common::ObISQLClient &sql_client,
                                   const common::ObString *ddl_stmt_str);
+  int update_index_type(const ObTableSchema &data_table_schema,
+                        const uint64_t index_table_id,
+                        const ObIndexType index_type,
+                        const int64_t new_schema_version,
+                        const common::ObString *ddl_stmt_str,
+                        common::ObISQLClient &sql_client);
 
   virtual int update_mview_status(const ObTableSchema &mview_table_schema,
                                  common::ObISQLClient &sql_client);
+  virtual int update_mview_reference_table_status(const ObTableSchema &table_schema,
+                                                  common::ObISQLClient &sql_client);
   // TODO: merge these two API
   int sync_aux_schema_version_for_history(common::ObISQLClient &sql_client,
                                           const ObTableSchema &index_schema1,
@@ -145,26 +162,40 @@ public:
                              const ObTableSchema &ori_table,
                              ObTableSchema &inc_table,
                              const int64_t schema_version,
-                             bool is_truncate_table,
-                             bool is_subpart);
+                             bool ignore_log_operation,
+                             bool is_subpart,
+                             const bool is_subpart_idx_specified = false);
   int add_inc_part_info(common::ObISQLClient &sql_client,
                         const ObTableSchema &ori_table,
                         const ObTableSchema &inc_table,
                         const int64_t schema_version,
-                        bool is_truncate_table);
+                        bool ignore_log_operation);
+  int add_split_inc_part_info(common::ObISQLClient &sql_client,
+                              const ObTableSchema &ori_table,
+                              const ObTableSchema &inc_table,
+                              const int64_t schema_version);
   int add_inc_subpart_info(common::ObISQLClient &sql_client,
-                        const ObTableSchema &ori_table,
-                        const ObTableSchema &inc_table,
-                        const int64_t schema_version);
+                           const ObTableSchema &ori_table,
+                           const ObTableSchema &inc_table,
+                           const int64_t schema_version,
+                           const bool is_subpart_idx_specified = false);
+  int update_part_info(common::ObISQLClient &sql_client,
+                             const ObTableSchema &ori_table,
+                             const ObTableSchema &upd_table,
+                             const int64_t schema_version);
   int rename_inc_part_info(common::ObISQLClient &sql_client,
                            const ObTableSchema &ori_table,
                            const ObTableSchema &inc_table,
-                           const int64_t schema_version);
+                           const int64_t schema_version,
+                           const bool update_part_idx);
   int rename_inc_subpart_info(common::ObISQLClient &sql_client,
                            const ObTableSchema &ori_table,
                            const ObTableSchema &inc_table,
                            const int64_t schema_version);
-
+  int alter_inc_part_policy(ObISQLClient &sql_client, const ObTableSchema &table_schema,
+      const ObTableSchema &inc_table_schema, const int64_t new_schema_version);
+  int alter_inc_subpart_policy(ObISQLClient &sql_client, const ObTableSchema &table_schema,
+      const ObTableSchema &inc_table_schema, const int64_t new_schema_version);
   int drop_inc_part_info(
       common::ObISQLClient &sql_client,
       const ObTableSchema &ori_table,
@@ -207,6 +238,23 @@ public:
       ObTableSchema &inc_table,
       ObTableSchema &del_table,
       const int64_t schema_version);
+
+  int exchange_part_info(
+      common::ObISQLClient &sql_client,
+      const ObTableSchema &ori_table,
+      ObTableSchema &inc_table,
+      ObTableSchema &del_table,
+      const int64_t drop_schema_version,
+      const int64_t add_schema_version);
+
+  int exchange_subpart_info(
+      common::ObISQLClient &sql_client,
+      const ObTableSchema &ori_table,
+      ObTableSchema &inc_table,
+      ObTableSchema &del_table,
+      const int64_t drop_schema_version,
+      const int64_t add_schema_version,
+      const bool is_subpart_idx_specified);
 
   int sync_schema_version_for_history(
       common::ObISQLClient &sql_client,
@@ -255,6 +303,8 @@ public:
       const ObConstraint &cst);
 
 private:
+  int inner_update_table_options_(ObISQLClient &sql_client,
+                                  const ObTableSchema &new_table_schema);
 
   int add_table(common::ObISQLClient &sql_client, const ObTableSchema &table,
                 const bool update_object_status_ignore_version,
@@ -270,6 +320,10 @@ private:
                                   const uint64_t tenant_id,
                                   const uint64_t table_id,
                                   ObSqlString *extra_condition = NULL);
+  int delete_column_stat(ObISQLClient &sql_client,
+                         const uint64_t tenant_id,
+                         const uint64_t table_id,
+                         const uint64_t column_id);
   int delete_from_all_histogram_stat(common::ObISQLClient &sql_client,
                                      const uint64_t tenant_id,
                                      const uint64_t table_id,
@@ -300,7 +354,8 @@ private:
   int delete_constraint(common::ObISQLClient &sql_client,
                         const ObTableSchema &table_schema,
                         const int64_t new_schema_version);
-  int add_sequence(const uint64_t tenant_id,
+  int add_sequence(common::ObISQLClient &sql_client,
+                   const uint64_t tenant_id,
                    const uint64_t table_id,
                    const uint64_t column_id,
                    const uint64_t auto_increment,
@@ -379,6 +434,9 @@ private:
   int delete_from_all_optstat_user_prefs(ObISQLClient &sql_client,
                                          const uint64_t tenant_id,
                                          const uint64_t table_id);
+  int update_partition_option_(ObISQLClient &sql_client,
+                               const ObTableSchema &table,
+                               ObDMLSqlSplicer &dml);
 
 public:
   int insert_column_ids_into_column_group(ObISQLClient &sql_client,
@@ -399,6 +457,11 @@ public:
                                  const ObTableSchema &new_table_schema,
                                  const ObColumnGroupSchema &ori_cg_schema,
                                  const ObColumnGroupSchema &new_cg_schema);
+  int update_origin_column_group_with_new_schema(ObISQLClient &sql_client,
+                                                 const int64_t delete_schema_version,
+                                                 const int64_t insert_schema_version,
+                                                 const ObTableSchema &orig_table_schema,
+                                                 const ObTableSchema &new_table_schema);
 private:
   int log_operation_wrapper(
       ObSchemaOperation &opt,

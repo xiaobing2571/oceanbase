@@ -11,9 +11,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
-#include "sql/engine/dml/ob_fk_checker.h"
-#include "sql/engine/ob_exec_context.h"
-#include "sql/engine/expr/ob_expr.h"
+#include "ob_fk_checker.h"
 #include "sql/engine/dml/ob_dml_service.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 
@@ -58,7 +56,7 @@ int ObForeignKeyChecker::do_fk_check_batch(bool &all_has_result)
 
   int64_t get_row_count = 0;
   if (0 == batch_distinct_fk_cnt_) {
-    LOG_INFO("distinct foreign key count is 0 in a batch");
+    LOG_TRACE("distinct foreign key count is 0 in a batch");
     all_has_result = true;
   } else if (OB_FAIL(das_ref_.execute_all_task())) {
     LOG_WARN("execute all scan das task failed", K(ret));
@@ -164,7 +162,7 @@ int ObForeignKeyChecker::build_fk_check_das_task(const ObIArray<ObForeignKeyColu
     // Match simple is the ony one match method of OB, if foreign key columns has null, it will pass foreign key check;
     // Note: we need to support match partial and match full method for a more strict foreign key check in MySQL mode
     need_check = false;
-    LOG_INFO("foreign key columns has null, pass foreign key check");
+    LOG_TRACE("foreign key columns has null, pass foreign key check");
   } else if (OB_FAIL(build_table_range(columns, row, lookup_range, need_check))) {
     LOG_WARN("build data table range failed", K(ret), KPC(tablet_loc));
   } else if (!need_check) {
@@ -216,7 +214,7 @@ int ObForeignKeyChecker::calc_lookup_tablet_loc(ObDASTabletLoc *&tablet_loc)
   } else if (OB_FAIL(DAS_CTX(das_ref_.get_exec_ctx()).extended_tablet_loc(*table_loc_, tablet_id, tablet_loc))) {
     LOG_WARN("extended tablet loc failed", K(ret));
   }
-  LOG_INFO("tablet_id and partition id is", K(tablet_id), K(partition_id));
+  LOG_TRACE("tablet_id and partition id is", K(tablet_id), K(partition_id));
   return ret;
 }
 
@@ -363,6 +361,11 @@ int ObForeignKeyChecker::check_fk_column_type(const ObObjMeta &col_obj_meta,
   if (col_obj_meta.get_type() != dst_obj_meta.get_type()) {
     if (lib::is_oracle_mode() && ob_is_number_tc(col_obj_meta.get_type()) && ob_is_number_tc(dst_obj_meta.get_type())) {
       // oracle mode, numberfloat and number type are same
+    } else if (lib::is_mysql_mode() && ((ob_is_float_tc(col_obj_meta.get_type()) && ob_is_float_tc(dst_obj_meta.get_type()))
+                || (ob_is_double_tc(col_obj_meta.get_type()) && ob_is_double_tc(dst_obj_meta.get_type())))) {
+      // signed/unsigned float, double format are the same in the mysql mode.
+      // do extra cast to ensure the value is in the range.
+      need_extra_cast = true;
     } else if ((ob_is_number_tc(col_obj_meta.get_type()) && ob_is_decimal_int_tc(dst_obj_meta.get_type())) ||
         (ob_is_number_tc(dst_obj_meta.get_type()) && ob_is_decimal_int_tc(col_obj_meta.get_type()))) {
       need_extra_cast = true;
@@ -408,9 +411,9 @@ int ObForeignKeyChecker::build_primary_table_range(const ObIArray<ObForeignKeyCo
     const ObObjDatumMapType &obj_datum_map = column_expr->obj_datum_map_;
     int64_t rowkey_index = checker_ctdef_.rowkey_ids_.at(i);
     bool need_extra_cast = false;
+    ObObjMeta to_obj_meta = col_obj_meta;
     const ObPrecision dst_prec = dst_obj_meta.is_decimal_int() ?
         dst_obj_meta.get_stored_precision() : PRECISION_UNKNOWN_YET;
-    ObObjMeta to_obj_meta = col_obj_meta;
     if (rowkey_index < 0 || rowkey_index >= rowkey_cnt) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("Invalid woekey index to build scan range", K(ret), K(rowkey_index));
@@ -435,6 +438,11 @@ int ObForeignKeyChecker::build_primary_table_range(const ObIArray<ObForeignKeyCo
       ObObj ori_obj = tmp_obj;
       if(OB_FAIL(ObObjCaster::to_type(dst_obj_meta.get_type(), cast_ctx, ori_obj, tmp_obj))) {
         LOG_WARN("fail to cast type", K(ret), K(col_obj_meta), K(dst_obj_meta));
+        if (ret == OB_DATA_OUT_OF_RANGE) {
+          // To compatible with MySQL.
+          // Also, if the value is not in the range, then it means that there's no referenced row.
+          ret = OB_ERR_NO_REFERENCED_ROW;
+        }
       }
     }
     if (OB_FAIL(ret)) {
@@ -524,6 +532,11 @@ int ObForeignKeyChecker::build_index_table_range(const ObIArray<ObForeignKeyColu
         ObObj ori_obj = tmp_obj;
         if(OB_FAIL(ObObjCaster::to_type(dst_obj_meta.get_type(), cast_ctx, ori_obj, tmp_obj))) {
           LOG_WARN("fail to cast type", K(ret), K(col_obj_meta), K(dst_obj_meta));
+          if (ret == OB_DATA_OUT_OF_RANGE) {
+            // To compatible with MySQL.
+            // Also, if the value is not in the range, then it means that there's no referenced row.
+            ret = OB_ERR_NO_REFERENCED_ROW;
+          }
         }
       }
       if (OB_FAIL(ret)) {
@@ -625,6 +638,11 @@ int ObForeignKeyChecker::build_index_table_range_need_shadow_column(const ObIArr
         ObObj ori_obj = tmp_obj;
         if(OB_FAIL(ObObjCaster::to_type(dst_obj_meta.get_type(), cast_ctx, ori_obj, tmp_obj))) {
           LOG_WARN("fail to cast type", K(ret), K(col_obj_meta), K(dst_obj_meta));
+          if (ret == OB_DATA_OUT_OF_RANGE) {
+            // To compatible with MySQL.
+            // Also, if the value is not in the range, then it means that there's no referenced row.
+            ret = OB_ERR_NO_REFERENCED_ROW;
+          }
         }
       }
       if (OB_FAIL(ret)) {
@@ -675,7 +693,7 @@ int ObForeignKeyChecker::check_need_shadow_columns(const ObIArray<ObForeignKeyCo
     }
     need_shadow_columns = is_rowkey_all_null;
   }
-  LOG_INFO("need shadow columns", K(need_shadow_columns));
+  LOG_TRACE("need shadow columns", K(need_shadow_columns));
   return ret;
 }
 

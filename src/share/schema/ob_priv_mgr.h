@@ -18,6 +18,7 @@
 #include "lib/container/ob_vector.h"
 #include "lib/allocator/page_arena.h"
 #include "share/schema/ob_schema_struct.h"
+#include "share/schema/ob_catalog_schema_struct.h"
 
 namespace oceanbase
 {
@@ -46,6 +47,52 @@ struct ObGetTablePrivKeyV3<ObTablePrivSortKey, ObTablePriv *>
       key;
   }
 };
+
+template<class T, class V>
+struct ObGetRoutinePrivKeyV3
+{
+  void operator()(const T & t, const V &v) const
+  {
+    UNUSED(t);
+    UNUSED(v);
+  }
+};
+
+
+template<>
+struct ObGetRoutinePrivKeyV3<ObRoutinePrivSortKey, ObRoutinePriv *>
+{
+  ObRoutinePrivSortKey operator()(const ObRoutinePriv *routine_priv) const
+  {
+    ObRoutinePrivSortKey key;
+    return NULL != routine_priv ?
+      routine_priv->get_sort_key() :
+      key;
+  }
+};
+
+template<class T, class V>
+struct ObGetColumnPrivKeyV3
+{
+  void operator()(const T & t, const V &v) const
+  {
+    UNUSED(t);
+    UNUSED(v);
+  }
+};
+
+template<>
+struct ObGetColumnPrivKeyV3<ObColumnPrivSortKey, ObColumnPriv *>
+{
+  ObColumnPrivSortKey operator()(const ObColumnPriv *column_priv) const
+  {
+    ObColumnPrivSortKey key;
+    return NULL != column_priv ?
+      column_priv->get_sort_key() :
+      key;
+  }
+};
+
 template<class T, class V>
 struct ObGetObjPrivKey
 {
@@ -70,18 +117,31 @@ class ObPrivMgr
 {
   typedef common::ObSortedVector<ObDBPriv *> DBPrivInfos;
   typedef common::ObSortedVector<ObTablePriv *> TablePrivInfos;
+  typedef common::ObSortedVector<ObRoutinePriv *> RoutinePrivInfos;
+  typedef common::ObSortedVector<ObColumnPriv *> ColumnPrivInfos;
   typedef common::ObSortedVector<ObObjPriv *>ObjPrivInfos;
   typedef common::ObSortedVector<ObSysPriv *>SysPrivInfos;
+  typedef common::ObSortedVector<ObCatalogPriv *> CatalogPrivInfos;
   typedef common::hash::ObPointerHashMap<ObTablePrivSortKey, ObTablePriv *, ObGetTablePrivKeyV3, 128> TablePrivMap;
+  typedef common::hash::ObPointerHashMap<ObRoutinePrivSortKey, ObRoutinePriv *, ObGetRoutinePrivKeyV3, 128> RoutinePrivMap;
+  typedef common::hash::ObPointerHashMap<ObColumnPrivSortKey, ObColumnPriv *, ObGetColumnPrivKeyV3, 128> ColumnPrivMap;
   typedef common::hash::ObPointerHashMap<ObObjPrivSortKey, ObObjPriv *, ObGetObjPrivKey, 128> ObjPrivMap;
+  typedef common::hash::ObPointerHashMap<ObCatalogPrivSortKey, ObCatalogPriv *, ObGetCatalogPrivKey, 128> CatalogPrivMap;
   typedef DBPrivInfos::iterator DBPrivIter;
   typedef DBPrivInfos::const_iterator ConstDBPrivIter;
   typedef TablePrivInfos::iterator TablePrivIter;
   typedef TablePrivInfos::const_iterator ConstTablePrivIter;
+  typedef RoutinePrivInfos::iterator RoutinePrivIter;
+  typedef RoutinePrivInfos::const_iterator ConstRoutinePrivIter;
+
+  typedef ColumnPrivInfos::iterator ColumnPrivIter;
+  typedef ColumnPrivInfos::const_iterator ConstColumnPrivIter;
   typedef SysPrivInfos::iterator SysPrivIter;
   typedef SysPrivInfos::const_iterator ConstSysPrivIter;
   typedef ObjPrivInfos::iterator ObjPrivIter;
   typedef ObjPrivInfos::const_iterator ConstObjPrivIter;
+  typedef CatalogPrivInfos::iterator CatalogPrivIter;
+  typedef CatalogPrivInfos::const_iterator ConstCatalogPrivIter;
 public:
   ObPrivMgr();
   explicit ObPrivMgr(common::ObIAllocator &allocator);
@@ -110,14 +170,56 @@ public:
   int add_table_priv(const ObTablePriv &table_priv);
   int del_table_priv(const ObTablePrivSortKey &table_priv_key);
 
+  int add_column_privs(const common::ObIArray<ObColumnPriv> &column_privs);
+  int add_column_priv(const ObColumnPriv &column_priv);
+  int del_column_privs(const common::ObIArray<ObColumnPrivIdKey> &column_priv_keys);
+  int del_column_priv(const ObColumnPrivIdKey &column_priv_key);
+
   int get_table_priv(const ObTablePrivSortKey &table_priv_key,
                      const ObTablePriv *&table_priv) const;
   int get_table_priv_set(const ObTablePrivSortKey &table_priv_key,
+                         ObPrivSet &priv_set) const;
+
+  int add_routine_privs(const common::ObIArray<ObRoutinePriv> &routine_privs);
+  int del_routine_privs(const common::ObIArray<ObRoutinePrivSortKey> &routine_priv_keys);
+  int add_routine_priv(const ObRoutinePriv &routine_priv);
+  int del_routine_priv(const ObRoutinePrivSortKey &routine_priv_key);
+  int get_routine_priv(const ObRoutinePrivSortKey &routine_priv_key,
+                      const ObRoutinePriv *&routine_priv) const;
+
+  int get_routine_priv_set(const ObRoutinePrivSortKey &routine_priv_key,
+                          ObPrivSet &priv_set) const;
+  int get_column_priv_in_table(const uint64_t tenant_id,
+                                 const uint64_t user_id,
+                                 const ObString &db,
+                                 const ObString &table,
+                                 ObIArray<const ObColumnPriv *> &column_privs) const;
+
+  int get_column_priv_by_id(const uint64_t tenant_id,
+                            const uint64_t priv_id,
+                            const ObColumnPriv *&column_priv) const;
+  int get_column_priv_id(const uint64_t tenant_id,
+                        const uint64_t user_id,
+                        const ObString &db,
+                        const ObString &table,
+                        const ObString &column,
+                        uint64_t &column_priv_id) const;
+  int get_column_priv_in_db(const uint64_t tenant_id,
+                                 const uint64_t user_id,
+                                 const ObString &db,
+                                 ObIArray<const ObColumnPriv *> &column_privs) const;
+  int get_column_priv(const ObColumnPrivSortKey &column_priv_key,
+                      const ObColumnPriv *&column_priv) const;
+  int get_column_priv_set(const ObColumnPrivSortKey &column_priv_key,
                          ObPrivSet &priv_set) const;
   int table_grant_in_db(const uint64_t tenant_id,
                         const uint64_t user_id,
                         const common::ObString &db,
                         bool &is_grant) const;
+  int routine_grant_in_db(const uint64_t tenant_id,
+                          const uint64_t user_id,
+                          const ObString &db,
+                          bool &is_grant) const;
   //obj priv
   int add_obj_privs(const common::ObIArray<ObObjPriv> &obj_privs);
   int del_obj_privs(const common::ObIArray<ObObjPrivSortKey> &obj_priv_keys);
@@ -149,7 +251,20 @@ public:
   int get_sys_priv(const ObSysPrivKey &sys_priv_key,
                    const ObSysPriv *&sys_priv) const;
   int get_sys_priv_array(const ObSysPrivKey &sys_priv_key,
-                         const ObPackedPrivArray &packed_priv_array) const;                      
+                         const ObPackedPrivArray &packed_priv_array) const;
+
+  // catalog priv
+  int add_catalog_privs(const common::ObIArray<ObCatalogPriv> &catalog_privs);
+  int del_catalog_privs(const common::ObIArray<ObCatalogPrivSortKey> &catalog_priv_keys);
+  int add_catalog_priv(const ObCatalogPriv &catalog_priv);
+  int del_catalog_priv(const ObCatalogPrivSortKey &catalog_priv_key);
+  int get_catalog_priv(const ObCatalogPrivSortKey &catalog_priv_key,
+                       const ObCatalogPriv *&catalog_priv) const;
+  int get_catalog_priv_set(const ObCatalogPrivSortKey &catalog_priv_key,
+                           ObPrivSet &priv_set) const;
+  int get_catalog_privs_in_user(const uint64_t tenant_id,
+                                const uint64_t user_id,
+                                common::ObIArray<const ObCatalogPriv *> &catalog_privs) const;
   // other
   int get_db_privs_in_tenant(const uint64_t tenant_id,
                              common::ObIArray<const ObDBPriv *> &db_privs) const;
@@ -161,6 +276,15 @@ public:
   int get_table_privs_in_user(const uint64_t tenant_id,
                               const uint64_t user_id,
                               common::ObIArray<const ObTablePriv *> &table_privs) const;
+  int get_routine_privs_in_user(const uint64_t tenant_id,
+                                const uint64_t user_id,
+                                ObIArray<const ObRoutinePriv *> &routine_privs) const;
+
+
+
+  int get_column_privs_in_user(const uint64_t tenant_id,
+                                const uint64_t user_id,
+                                ObIArray<const ObColumnPriv *> &column_privs) const;
   int get_obj_privs_in_tenant(const uint64_t tenant_id,
                               common::ObIArray<const ObObjPriv *> &obj_privs) const;
   int get_obj_privs_in_grantee(const uint64_t tenant_id,
@@ -190,15 +314,24 @@ private:
                        DBPrivIter &target_db_priv_iter) const;
   int get_sys_priv_iter(const ObSysPrivKey &sys_key,
                         SysPrivIter &target_sys_priv_iter) const;
+  int rebuild_routine_priv_hashmap();
+  int rebuild_column_priv_hashmap_and_vec();
 private:
   common::ObArenaAllocator local_allocator_;
   common::ObIAllocator &allocator_;
   DBPrivInfos db_privs_;
   TablePrivInfos table_privs_;
   TablePrivMap table_priv_map_;
+  RoutinePrivInfos routine_privs_;
+  RoutinePrivMap routine_priv_map_;
+
+  ColumnPrivInfos column_privs_sort_by_name_;
+  ColumnPrivInfos column_privs_sort_by_id_;
   ObjPrivInfos obj_privs_;
   ObjPrivMap obj_priv_map_;
   SysPrivInfos sys_privs_;
+  CatalogPrivInfos catalog_privs_;
+  CatalogPrivMap catalog_priv_map_;
   static const char *priv_names_[];
 };
 

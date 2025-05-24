@@ -14,9 +14,6 @@
 
 #include "ob_integer_base_diff_decoder.h"
 #include "ob_encoding_query_util.h"
-#include "storage/blocksstable/ob_block_sstable_struct.h"
-#include "ob_bit_stream.h"
-#include "ob_integer_array.h"
 
 namespace oceanbase
 {
@@ -130,7 +127,7 @@ int ObIntegerBaseDiffDecoder::update_pointer(const char *old_block, const char *
 
 int ObIntegerBaseDiffDecoder::batch_get_bitpacked_values(
     const ObColumnDecoderCtx &ctx,
-    const int64_t *row_ids,
+    const int32_t *row_ids,
     const int64_t row_cap,
     const int64_t datum_len,
     const int64_t data_offset,
@@ -163,7 +160,7 @@ int ObIntegerBaseDiffDecoder::batch_get_bitpacked_values(
 int ObIntegerBaseDiffDecoder::batch_decode(
     const ObColumnDecoderCtx &ctx,
     const ObIRowIndex* row_index,
-    const int64_t *row_ids,
+    const int32_t *row_ids,
     const char **cell_datas,
     const int64_t row_cap,
     common::ObDatum *datums) const
@@ -249,6 +246,7 @@ int ObIntegerBaseDiffDecoder::decode_vector(
         break;
       }
       case VEC_TC_DATE:
+      case VEC_TC_MYSQL_DATE:
       case VEC_TC_DEC_INT32: {
         // int32_t
         FILL_VECTOR_FUNC(ObFixedLengthFormat<int32_t>, decoder_ctx.has_extend_value());
@@ -256,6 +254,7 @@ int ObIntegerBaseDiffDecoder::decode_vector(
       }
       case VEC_TC_INTEGER:
       case VEC_TC_DATETIME:
+      case VEC_TC_MYSQL_DATETIME:
       case VEC_TC_TIME:
       case VEC_TC_UNKNOWN:
       case VEC_TC_INTERVAL_YM:
@@ -401,13 +400,17 @@ int ObIntegerBaseDiffDecoder::pushdown_operator(
                   filter,
                   pd_filter_info,
                   result_bitmap))) {
-        LOG_WARN("Failed on EQ / NE operator", K(ret), K(col_ctx));
+        if (OB_UNLIKELY(OB_NOT_SUPPORTED != ret)) {
+          LOG_WARN("Failed on EQ / NE operator", K(ret), K(col_ctx));
+        }
       }
       break;
     }
     case sql::WHITE_OP_BT: {
       if (OB_FAIL(bt_operator(parent, col_ctx, col_data, filter, pd_filter_info, result_bitmap))) {
-        LOG_WARN("Failed on BT operator", K(ret), K(col_ctx));
+        if (OB_UNLIKELY(OB_NOT_SUPPORTED != ret)) {
+          LOG_WARN("Failed on BT operator", K(ret), K(col_ctx));
+        }
       }
       break;
     }
@@ -517,9 +520,9 @@ int ObIntegerBaseDiffDecoder::comparison_operator(
     const sql::ObWhiteFilterOperatorType op_type = filter.get_op_type();
     ObGetFilterCmpRetFunc get_cmp_ret = get_filter_cmp_ret_func(op_type);
     int cmp_res = 0;
-    if (OB_FAIL(cmp_func(ref_datum, base_datum, cmp_res))) {
+    if (FAILEDx(cmp_func(base_datum, ref_datum, cmp_res))) {
       LOG_WARN("Failed to compare datum", K(ret), K(ref_datum), K(base_datum));
-    } else if (FALSE_IT(filter_obj_smaller_than_base = cmp_res < 0)){
+    } else if (FALSE_IT(filter_obj_smaller_than_base = cmp_res > 0)){
     } else if (filter_obj_smaller_than_base) {
       // Do not need to decode the data
       if (op_type == sql::WHITE_OP_GE || op_type == sql::WHITE_OP_GT || op_type == sql::WHITE_OP_NE) {
@@ -630,8 +633,7 @@ int ObIntegerBaseDiffDecoder::bt_operator(
         || ObIntSC == get_store_class_map()[col_ctx.obj_meta_.get_type_class()]) {
     if (OB_FAIL(traverse_all_data(parent, col_ctx, col_data,
                 filter, pd_filter_info, result_bitmap,
-                [](const ObObjMeta &obj_meta,
-                   const ObDatum &cur_datum,
+                [](const ObDatum &cur_datum,
                    const sql::ObWhiteFilterExecutor &filter,
                    bool &result) -> int {
                   int ret = OB_SUCCESS;
@@ -672,16 +674,12 @@ int ObIntegerBaseDiffDecoder::in_operator(
         K(ret), K(col_ctx), K(pd_filter_info), K(result_bitmap.size()), K(filter));
   } else if (OB_FAIL(traverse_all_data(parent, col_ctx, col_data,
                       filter, pd_filter_info, result_bitmap,
-                      [](const ObObjMeta &obj_meta,
-                         const ObDatum &cur_datum,
+                      [](const ObDatum &cur_datum,
                          const sql::ObWhiteFilterExecutor &filter,
                          bool &result) -> int {
                         int ret = OB_SUCCESS;
-                        ObObj cur_obj;
-                        if (OB_FAIL(cur_datum.to_obj(cur_obj, obj_meta))) {
-                          LOG_WARN("convert datum to obj failed", K(ret), K(cur_datum), K(obj_meta));
-                        } else if (OB_FAIL(filter.exist_in_obj_set(cur_obj, result))) {
-                          LOG_WARN("Failed to check object in hashset", K(ret), K(cur_obj));
+                        if (OB_FAIL(filter.exist_in_set(cur_datum, result))) {
+                          LOG_WARN("Failed to check datum in hashset", K(ret), K(cur_datum));
                         }
                         return ret;
                       }))) {
@@ -698,7 +696,6 @@ int ObIntegerBaseDiffDecoder::traverse_all_data(
     const sql::PushdownFilterInfo &pd_filter_info,
     ObBitmap &result_bitmap,
     int (*lambda)(
-        const ObObjMeta &obj_meta,
         const ObDatum &cur_datum,
         const sql::ObWhiteFilterExecutor &filter,
         bool &result)) const
@@ -748,7 +745,7 @@ int ObIntegerBaseDiffDecoder::traverse_all_data(
         cur_datum.ptr_ = reinterpret_cast<char *> (&cur_int);
         // use lambda here to filter and set result bitmap
         bool result = false;
-        if (OB_FAIL(lambda(col_ctx.obj_meta_, cur_datum, filter, result))) {
+        if (FAILEDx(lambda(cur_datum, filter, result))) {
           LOG_WARN("Failed on trying to filter the row", K(ret), K(row_id), K(cur_int));
         } else if (result) {
           if (OB_FAIL(result_bitmap.set(offset))) {
@@ -765,7 +762,7 @@ int ObIntegerBaseDiffDecoder::traverse_all_data(
 int ObIntegerBaseDiffDecoder::get_null_count(
     const ObColumnDecoderCtx &ctx,
     const ObIRowIndex *row_index,
-    const int64_t *row_ids,
+    const int32_t *row_ids,
     const int64_t row_cap,
     int64_t &null_count) const
 {

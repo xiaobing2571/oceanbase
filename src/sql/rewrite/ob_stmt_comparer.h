@@ -34,8 +34,11 @@ enum QueryRelation
   QUERY_EQUAL,
   QUERY_UNCOMPARABLE
 };
- struct ObStmtMapInfo {
+
+struct ObStmtMapInfo {
   common::ObSEArray<common::ObSEArray<int64_t, 4>, 4> view_select_item_map_;
+  common::ObSEArray<ObExprConstraint, 4> expr_cons_map_;
+  common::ObSEArray<ObPCConstParamInfo, 4> const_param_map_;
   common::ObSEArray<ObPCParamEqualInfo, 4> equal_param_map_;
   common::ObSEArray<int64_t, 4> table_map_;
   common::ObSEArray<int64_t, 4> from_map_;
@@ -54,7 +57,8 @@ enum QueryRelation
   bool is_select_item_equal_;
   bool is_distinct_equal_;
   bool is_qualify_filter_equal_;
-  
+  bool left_can_be_replaced_; // used for mv rewrite
+
   //如果from item是generated table，需要记录ref query的select item map关系
   //如果是set stmt，每个set query对应的映射关系也记录在view_select_item_map_
   ObStmtMapInfo()
@@ -67,7 +71,8 @@ enum QueryRelation
     is_order_equal_(false),
     is_select_item_equal_(false),
     is_distinct_equal_(false),
-    is_qualify_filter_equal_(false)
+    is_qualify_filter_equal_(false),
+    left_can_be_replaced_(true)
     {}
 
   void reset();
@@ -83,7 +88,8 @@ enum QueryRelation
                K_(equal_param_map),
                K_(view_select_item_map),
                K_(is_order_equal),
-               K_(is_distinct_equal));
+               K_(is_distinct_equal),
+               K_(left_can_be_replaced));
 };
 
 struct StmtCompareHelper {
@@ -108,6 +114,9 @@ struct StmtCompareHelper {
   ObSEArray<ObSelectStmt*, 8> similar_stmts_;
   QbNameList hint_force_stmt_set_;
   ObSelectStmt *stmt_;
+
+private:
+  DISABLE_COPY_ASSIGN(StmtCompareHelper);
 };
 
 // NOTE (link.zt) remember to de-construct the struct
@@ -119,7 +128,9 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
     inner_(NULL),
     outer_(NULL),
     map_info_(),
-    equal_param_info_()
+    equal_param_info_(),
+    is_in_same_stmt_(true),
+    ora_numeric_cmp_for_grouping_items_(false)
   {
     init_override_params();
   }
@@ -129,19 +140,24 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
     inner_(NULL),
     outer_(NULL),
     map_info_(),
-    equal_param_info_()
+    equal_param_info_(),
+    is_in_same_stmt_(true),
+    ora_numeric_cmp_for_grouping_items_(false)
   {
     init_override_params();
   }
   // for common expression extraction
   ObStmtCompareContext(const ObIArray<ObHiddenColumnItem> *calculable_items,
-                       bool need_check_deterministic = false) :
+                       bool need_check_deterministic = false,
+                       bool is_in_same_stmt = true) :
     ObExprEqualCheckContext(need_check_deterministic),
     calculable_items_(calculable_items),
     inner_(NULL),
     outer_(NULL),
     map_info_(),
-    equal_param_info_()
+    equal_param_info_(),
+    is_in_same_stmt_(is_in_same_stmt),
+    ora_numeric_cmp_for_grouping_items_(false)
   {
     init_override_params();
   }
@@ -149,13 +165,16 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
                        const ObDMLStmt *outer,
                        const ObStmtMapInfo &map_info,
                        const ObIArray<ObHiddenColumnItem> *calculable_items,
-                       bool need_check_deterministic = false) :
+                       bool need_check_deterministic = false,
+                       bool is_in_same_stmt = true) :
     ObExprEqualCheckContext(need_check_deterministic),
     calculable_items_(calculable_items),
     inner_(inner),
     outer_(outer),
     map_info_(map_info),
-    equal_param_info_()
+    equal_param_info_(),
+    is_in_same_stmt_(is_in_same_stmt),
+    ora_numeric_cmp_for_grouping_items_(false)
   {
     init_override_params();
   }
@@ -174,10 +193,10 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
   void init(const ObIArray<ObHiddenColumnItem> *calculable_items);
 
   // for win_magic rewrite
-  void init(const ObDMLStmt *inner,
-            const ObDMLStmt *outer,
-            const ObStmtMapInfo &map_info,
-            const ObIArray<ObHiddenColumnItem> *calculable_items);
+  int init(const ObDMLStmt *inner,
+           const ObDMLStmt *outer,
+           const ObStmtMapInfo &map_info,
+           const ObIArray<ObHiddenColumnItem> *calculable_items);
   
   int get_table_map_idx(uint64_t l_table_id, uint64_t r_table_id);
 
@@ -202,6 +221,13 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
   const ObDMLStmt *outer_;
   ObStmtMapInfo map_info_;
   common::ObSEArray<ObPCParamEqualInfo, 4> equal_param_info_;
+  common::ObSEArray<ObExprConstraint, 4> expr_cons_info_;
+  common::ObSEArray<ObPCConstParamInfo, 4> const_param_info_;
+  bool is_in_same_stmt_; // only if the two stmts are in the same parent stmt, can we compare table id and column id directly
+  bool ora_numeric_cmp_for_grouping_items_;
+
+private:
+  DISABLE_COPY_ASSIGN(ObStmtCompareContext);
 };
 
 class ObStmtComparer
@@ -226,7 +252,9 @@ public:
                                     const ObDMLStmt *second,
                                     ObStmtMapInfo &map_info,
                                     QueryRelation &relation,
-                                    bool is_strict_select_list = false);
+                                    bool is_strict_select_list = false,
+                                    bool need_check_select_items = true,
+                                    bool is_in_same_stmt = true);
 
   static int compute_conditions_map(const ObDMLStmt *first,
                                     const ObDMLStmt *second,
@@ -234,8 +262,10 @@ public:
                                     const ObIArray<ObRawExpr*> &second_exprs,
                                     ObStmtMapInfo &map_info,
                                     ObIArray<int64_t> &condition_map,
-                                    int64_t &match_count,
-                                    bool is_same_by_order = false);
+                                    QueryRelation &relation,
+                                    bool is_in_same_cond = true,
+                                    bool is_same_by_order = false,
+                                    bool need_check_second_range = false);
 
   static int compute_orderby_map(const ObDMLStmt *first,
                                  const ObDMLStmt *second,
@@ -246,13 +276,15 @@ public:
 
   static int compute_from_items_map(const ObDMLStmt *first,
                                     const ObDMLStmt *second,
+                                    bool is_in_same_stmt,
                                     ObStmtMapInfo &map_info,
-                                    int64_t &match_count);
+                                    QueryRelation &relation);
 
   static int is_same_from(const ObDMLStmt *first,
                           const FromItem &first_from,
                           const ObDMLStmt *second,
                           const FromItem &second_from,
+                          bool is_in_same_stmt,
                           ObStmtMapInfo &map_info,
                           bool &is_same);
 
@@ -263,6 +295,7 @@ public:
 
   static int compute_semi_infos_map(const ObDMLStmt *first,
                                     const ObDMLStmt *second,
+                                    bool is_in_same_stmt,
                                     ObStmtMapInfo &map_info,
                                     int64_t &match_count);
 
@@ -270,6 +303,7 @@ public:
                               const SemiInfo *first_semi_info,
                               const ObDMLStmt *second,
                               const SemiInfo *second_semi_info,
+                              bool is_in_same_stmt,
                               ObStmtMapInfo &map_info,
                               bool &is_same);
 
@@ -281,18 +315,37 @@ public:
                                 ObIArray<int64_t> &table_map,
                                 int64_t &match_count);
 
+  static int compute_unmatched_item(const ObIArray<int64_t> &item_map,
+                                    int first_size,
+                                    int second_size,
+                                    ObIArray<int64_t> &first_unmatched_items,
+                                    ObIArray<int64_t> &second_unmatched_items);
+
+  static int compute_new_expr(const ObIArray<ObRawExpr*> &target_exprs,
+                              const ObDMLStmt *target_stmt,
+                              const ObIArray<ObRawExpr*> &source_exprs,
+                              const ObDMLStmt *source_stmt,
+                              ObStmtMapInfo &map_info,
+                              ObRawExprCopier &expr_copier,
+                              ObIArray<ObRawExpr*> &compute_exprs,
+                              bool &is_all_computable);
+
+  static int inner_compute_expr(const ObRawExpr *target_expr,
+                                const ObIArray<ObRawExpr*> &source_exprs,
+                                ObStmtCompareContext &context,
+                                ObRawExprCopier &expr_copier,
+                                bool &is_match);
+
   /**
-   * @brief compare_basic_table_item 
+   * @brief compare_basic_table_item
    * 如果两张表partition hint分区包含的关系，
    * 如果两张表不同，则不可比较
    * 如果两张表相同且没有partition hint，则相等
    * 如果两张表都是generated_table只比较引用的子查询是否相同
    */
-  static int compare_basic_table_item (const ObDMLStmt *first,
-                                      const TableItem *first_table,
-                                      const ObDMLStmt *second,
-                                      const TableItem *second_table,
-                                      QueryRelation &relation);
+  static int compare_basic_table_item (const TableItem *first_table,
+                                       const TableItem *second_table,
+                                       QueryRelation &relation);
 
   /**
    * @brief compare_joined_table_item
@@ -303,6 +356,7 @@ public:
                                         const TableItem *first_table,
                                         const ObDMLStmt *second,
                                         const TableItem *second_table,
+                                        bool is_in_same_stmt,
                                         ObStmtMapInfo &map_info,
                                         QueryRelation &relation);
 
@@ -314,13 +368,15 @@ public:
                                 const TableItem *first_table,
                                 const ObDMLStmt *second,
                                 const TableItem *second_table,
+                                bool is_in_same_stmt,
                                 ObStmtMapInfo &map_info,
                                 QueryRelation &relation);
 
   static int compare_set_stmt(const ObSelectStmt *first,
                               const ObSelectStmt *second,
                               ObStmtMapInfo &map_info,
-                              QueryRelation &relation);
+                              QueryRelation &relation,
+                              bool is_in_same_stmt = true);
 
   static int compare_values_table_item(const ObDMLStmt *first,
                                        const TableItem *first_table,
@@ -328,6 +384,19 @@ public:
                                        const TableItem *second_table,
                                        ObStmtMapInfo &map_info,
                                        QueryRelation &relation);
+  static int get_map_table(const ObStmtMapInfo& map_info,
+                           const ObSelectStmt *outer_stmt,
+                           const ObSelectStmt *inner_stmt,
+                           const uint64_t &outer_table_id,
+                           uint64_t &inner_table_id);
+  static int get_map_column(const ObStmtMapInfo& map_info,
+                            const ObSelectStmt *outer_stmt,
+                            const ObSelectStmt *inner_stmt,
+                            const uint64_t &outer_table_id,
+                            const uint64_t &outer_column_id,
+                            const bool in_same_stmt,
+                            uint64_t &inner_table_id,
+                            uint64_t &inner_column_id);
 
 };
 

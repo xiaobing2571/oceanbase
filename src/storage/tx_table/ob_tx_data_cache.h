@@ -107,7 +107,7 @@ public:
   TO_STRING_KV(K_(is_inited), KP_(tx_data), KPC_(tx_data), KP_(mtl_alloc_buf), KP(&reserved_buf_));
 
 public:  // derived from ObIKVCacheValue
-  virtual int64_t size() const { return (IS_INIT && OB_NOT_NULL(tx_data_)) ? sizeof(*this) + tx_data_->size() : 0; }
+  virtual int64_t size() const { return (IS_INIT && OB_NOT_NULL(tx_data_)) ? sizeof(*this) + tx_data_->size_need_cache() : 0; }
 
   virtual int deep_copy(char *buf, const int64_t buf_len, ObIKVCacheValue *&value) const;
 
@@ -128,13 +128,6 @@ struct ObTxDataValueHandle {
   common::ObKVCacheHandle handle_;
 
   ObTxDataValueHandle() : value_(nullptr), handle_() {}
-  ObTxDataValueHandle(const ObTxDataValueHandle &rhs) { *this = rhs; }
-  ObTxDataValueHandle &operator=(const ObTxDataValueHandle &rhs)
-  {
-    value_ = rhs.value_;
-    handle_ = rhs.handle_;
-    return *this;
-  }
   ~ObTxDataValueHandle() {}
 
   OB_INLINE bool is_valid() const { return OB_NOT_NULL(value_) && value_->is_valid() && handle_.is_valid(); }

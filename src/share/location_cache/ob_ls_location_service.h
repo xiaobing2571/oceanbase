@@ -193,6 +193,15 @@ public:
   int schedule_dump_cache_timer_task();
   // Dump all ls locations in cache.
   int dump_cache();
+  /*
+    Check if the ls_id cache needs renewal:
+    renew if cache time < expire_renew_time or ls_id info is missing.
+  */
+  int check_ls_needing_renew(
+      const uint64_t tenant_id,
+      const ObLSID &ls_id,
+      const int64_t expire_renew_time,
+      bool &need_renew);
   static bool is_valid_key(
       const int64_t cluster_id,
       const uint64_t tenant_id,
@@ -216,10 +225,11 @@ private:
       const uint64_t tenant_id,
       const ObLSID &ls_id,
       ObLSLocation &location);
-  int erase_location_(
+  int erase_location_safely_(
       const int64_t cluster_id,
       const uint64_t tenant_id,
       const ObLSID &ls_id);
+  int try_clear_dropped_tenant_caches_();
   int build_tenant_ls_info_hash_(ObTenantLsInfoHashMap &hash);
   int construct_rpc_dests_(common::ObIArray<common::ObAddr> &addrs);
   int detect_ls_leaders_(
@@ -235,6 +245,7 @@ private:
   static const int64_t RENEW_LS_LOCATION_INTERVAL_US = 5 * 1000 * 1000L; // 5s
   static const int64_t RENEW_LS_LOCATION_BY_RPC_INTERVAL_US = 1000 * 1000L; // 1s
   static const int64_t DUMP_CACHE_INTERVAL_US = 10 * 1000 * 1000L; // 10s
+  static const int64_t CLEAR_CACHE_INTERVAL = 60 * 1000 * 1000L; // 1m
 
   bool inited_;
   bool stopped_;

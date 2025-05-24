@@ -14,10 +14,13 @@
 #define _OCEABASE_COMMON_OB_COMMON_UTILITY_H_
 #include <sys/time.h>
 #include "lib/ob_define.h"
+#include "lib/time/ob_tsc_timestamp.h"
 namespace oceanbase
 {
 namespace common
 {
+int64_t get_tenant_stack_size(const uint64_t tenant_id);
+
 extern const char *print_server_role(const common::ObServerRole server_role);
 
 //@brief recursive function call should use this function to check if recursion is too deep
@@ -57,11 +60,7 @@ private:
 
 inline int64_t get_cur_ts()
 {
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  const int64_t us =
-            static_cast<int64_t>(tv.tv_sec) * static_cast<int64_t>(1000000) + static_cast<int64_t>(tv.tv_usec);
-  return us;
+  return OB_TSC_TIMESTAMP.fast_current_time();
 }
 
 class ObBasicTimeGuard
@@ -79,12 +78,17 @@ public:
     const char* mod_;
   };
   explicit ObBasicTimeGuard(const char *owner, const char *start, const char *end)
-    : last_time_guard_(tl_time_guard), owner_(owner), start_(start), end_(end)
+    : enable_(tl_enable_time_guard), owner_(owner), start_(start), end_(end)
   {
-    if (NULL != tl_time_guard) {
-      tl_time_guard->click(start_);
+    if (OB_LIKELY(enable_)) {
+      last_time_guard_ = tl_time_guard;
+      if (NULL != tl_time_guard) {
+        tl_time_guard->click(start_);
+      }
+      tl_time_guard = this;
+    } else {
+      last_time_guard_ = NULL;
     }
-    tl_time_guard = this;
     start_ts_ = get_cur_ts();
     last_ts_ = start_ts_;
     click_count_ = 0;
@@ -92,9 +96,11 @@ public:
   }
   ~ObBasicTimeGuard()
   {
-    tl_time_guard = last_time_guard_;
-    if (NULL != tl_time_guard) {
-      tl_time_guard->click(end_);
+    if (OB_LIKELY(enable_)) {
+      tl_time_guard = last_time_guard_;
+      if (NULL != tl_time_guard) {
+        tl_time_guard->click(end_);
+      }
     }
   }
   static ObBasicTimeGuard *get_tl_time_guard()
@@ -103,7 +109,7 @@ public:
   }
   static void time_guard_click(const char *mod)
   {
-    if (NULL != tl_time_guard) {
+    if (OB_LIKELY(tl_enable_time_guard) && NULL != tl_time_guard) {
       tl_time_guard->click(mod);
     }
   }
@@ -142,10 +148,13 @@ private:
       click_infos_[index].mod_ = mod;
     }
   }
+public:
+  static __thread bool tl_enable_time_guard;
 protected:
   static const int64_t MAX_CLICK_COUNT = 16;
   static __thread ObBasicTimeGuard *tl_time_guard;
 private:
+  const bool enable_;
   ObBasicTimeGuard *last_time_guard_;
   int64_t start_ts_;
   int64_t last_ts_;

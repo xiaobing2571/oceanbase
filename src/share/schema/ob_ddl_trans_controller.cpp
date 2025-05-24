@@ -9,10 +9,8 @@
 // See the Mulan PubL v2 for more details.
 
 #define USING_LOG_PREFIX RS
-#include "share/schema/ob_ddl_trans_controller.h"
-#include "share/schema/ob_multi_version_schema_service.h"
+#include "ob_ddl_trans_controller.h"
 #include "rootserver/ob_root_service.h"
-#include "share/ob_srv_rpc_proxy.h"
 
 
 namespace oceanbase
@@ -36,8 +34,6 @@ int ObDDLTransController::init(share::schema::ObMultiVersionSchemaService *schem
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("schema_service is null", KR(ret));
     } else if (OB_FAIL(tenants_.create(10))) {
-      LOG_WARN("hashset create fail", KR(ret));
-    } else if (OB_FAIL(tenant_for_ddl_trans_new_lock_.create(10))) {
       LOG_WARN("hashset create fail", KR(ret));
     } else if (OB_FAIL(ObThreadPool::start())) {
       LOG_WARN("thread start fail", KR(ret));
@@ -70,7 +66,6 @@ void ObDDLTransController::destroy()
     ObThreadPool::destroy();
     tasks_.destroy();
     tenants_.destroy();
-    tenant_for_ddl_trans_new_lock_.destroy();
     schema_service_ = NULL;
   }
 }
@@ -82,6 +77,7 @@ ObDDLTransController::~ObDDLTransController()
 
 void ObDDLTransController::run1()
 {
+  ObDIActionGuard ag("DDLService", "DDLTransCtr", "detect task");
   lib::set_thread_name("DDLTransCtr");
   while (!has_set_stop()) {
     int ret = OB_SUCCESS;
@@ -99,7 +95,12 @@ void ObDDLTransController::run1()
     }
     if (OB_SUCC(ret) && tenant_ids.count() > 0) {
       LOG_INFO("refresh_schema tenants", K(tenant_ids));
-      if (OB_ISNULL(GCTX.root_service_)) {
+      ObUnitTableOperator ut_operator;
+      if (OB_ISNULL(GCTX.root_service_) || OB_ISNULL(GCTX.sql_proxy_)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid argument", KR(ret), KP(GCTX.root_service_), KP(GCTX.sql_proxy_));
+      } else if (OB_FAIL(ut_operator.init(*GCTX.sql_proxy_))) {
+        LOG_WARN("fail to init unit table operator", KR(ret), KP(GCTX.sql_proxy_));
       } else {
         // ignore ret continue
         for (int64_t i = 0; i < tenant_ids.count(); i++) {
@@ -109,9 +110,13 @@ void ObDDLTransController::run1()
           int64_t schema_version = OB_INVALID_VERSION;
           int64_t start_time = ObTimeUtility::current_time();
           ObCurTraceId::init(GCONF.self_addr_);
+          ObDIActionGuard(ObDIActionGuard::NS_ACTION, "control tenant[T_%ld]", tenant_id);
 
-          if (OB_FAIL(GCTX.root_service_->get_ddl_service().get_unit_manager().get_tenant_unit_servers(tenant_id, zone, server_list))) {
-            LOG_WARN("get alive server failed", KR(ret));
+          if (OB_ISNULL(GCTX.root_service_)) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid argument", KR(ret), KP(GCTX.root_service_));
+          } else if (OB_FAIL(ut_operator.get_alive_servers_by_tenant(tenant_id, server_list))) {
+            LOG_WARN("get alive server failed", KR(ret), K(tenant_id));
           } else if (OB_FAIL(GCTX.root_service_->get_ddl_service().publish_schema_and_get_schema_version(tenant_id, server_list, &schema_version))) {
             LOG_WARN("fail to publish_schema", KR(ret), K(tenant_id));
           } else if (OB_FAIL(broadcast_consensus_version(tenant_id, schema_version, server_list))) {
@@ -124,6 +129,7 @@ void ObDDLTransController::run1()
       }
     }
     if (tenant_ids.empty()) {
+      common::ObBKGDSessInActiveGuard inactive_guard;
       wait_cond_.timedwait(100 * 1000);
     }
   }
@@ -179,6 +185,28 @@ int ObDDLTransController::broadcast_consensus_version(const int64_t tenant_id,
     }
   }
   LOG_INFO("broadcast consensus version finished", KR(ret), K(schema_version), K(arg), K(server_list));
+  return ret;
+}
+
+int ObDDLTransController::reserve_schema_version(const uint64_t tenant_id,
+    const uint64_t schema_version_count)
+{
+  int ret = OB_SUCCESS;
+  SpinWLockGuard guard(lock_);
+  int64_t end_schema_version = OB_INVALID_VERSION;
+  if (!inited_) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ObDDLTransController", KR(ret));
+  } else if (OB_ISNULL(schema_service_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ObDDLTransController", KR(ret));
+  } else if (tenant_id == OB_INVALID_TENANT_ID || schema_version_count == 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("register_task_and_assign_schema_version", KR(ret), K(tenant_id), K(schema_version_count));
+  } else if (OB_FAIL(schema_service_->gen_batch_new_schema_versions(
+              tenant_id, schema_version_count, end_schema_version))) {
+    LOG_WARN("fail to gen batch new schema versions", KR(ret), K(schema_version_count));
+  }
   return ret;
 }
 
@@ -363,43 +391,6 @@ int ObDDLTransController::remove_task(const uint64_t tenant_id, const int64_t ta
   return ret;
 }
 
-int ObDDLTransController::check_enable_ddl_trans_new_lock(
-    const uint64_t tenant_id, bool &res)
-{
-  int ret = OB_SUCCESS;
-  if (!inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("ObDDLTransController", KR(ret));
-  } else {
-    SpinRLockGuard guard(lock_for_tenant_set_);
-    ret = tenant_for_ddl_trans_new_lock_.exist_refactored(tenant_id);
-    if (OB_HASH_EXIST == ret) {
-      res = true;
-      ret = OB_SUCCESS;
-    } else if (OB_HASH_NOT_EXIST == ret) {
-      res = false;
-      ret = OB_SUCCESS;
-    } else {
-      LOG_WARN("check tenant in hashset fail", KR(ret), K(tenant_id));
-    }
-  }
-  return ret;
-}
-
-int ObDDLTransController::set_enable_ddl_trans_new_lock(const uint64_t tenant_id)
-{
-  int ret = OB_SUCCESS;
-  if (!inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("ObDDLTransController", KR(ret));
-  } else {
-    SpinWLockGuard guard(lock_for_tenant_set_);
-    if (OB_FAIL(tenant_for_ddl_trans_new_lock_.set_refactored(tenant_id, 1, 0, 1))) {
-      LOG_WARN("fail set enable_ddl_trans_new_lock", KR(ret), K(tenant_id));
-    }
-  }
-  return ret;
-}
 
 } // end schema
 } // end share

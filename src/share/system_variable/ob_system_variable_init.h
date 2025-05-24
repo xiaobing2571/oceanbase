@@ -36,6 +36,7 @@ struct ObSysVarFlag
   const static int64_t WITH_CREATE = (1LL << 10);
   const static int64_t WITH_UPGRADE = (1LL << 11);
   const static int64_t MYSQL_ONLY = (1LL << 12);
+  const static int64_t INFLUENCE_PL = (1LL << 13);
 };
 struct ObSysVarFromJson{
   ObSysVarClassType id_;
@@ -80,6 +81,7 @@ public:
   static const common::ObObj &get_default_value(int64_t i);
   static const common::ObObj &get_base_value(int64_t i);
   static int64_t get_amount();
+  static ObCollationType get_default_sysvar_collation();
   static int set_value(const char *name, const char * new_value);
   static int set_value(const common::ObString &name, const common::ObString &new_value);
   static int set_base_value(const char *name, const char * new_value);

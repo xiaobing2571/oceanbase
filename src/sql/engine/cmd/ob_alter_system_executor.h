@@ -25,6 +25,7 @@ namespace sql
 class ObExecContext;
 class ObAdminServerStmt;
 class ObAdminZoneStmt;
+class ObAdminStorageStmt;
 class ObBootstrapStmt;
 
 #define DEF_SIMPLE_EXECUTOR(name)                          \
@@ -38,6 +39,8 @@ class ObBootstrapStmt;
     DISALLOW_COPY_AND_ASSIGN(name##Executor);              \
   }
 
+DEF_SIMPLE_EXECUTOR(ObAdminStorage);
+
 DEF_SIMPLE_EXECUTOR(ObFreeze);
 
 DEF_SIMPLE_EXECUTOR(ObFlushCache);
@@ -47,6 +50,8 @@ DEF_SIMPLE_EXECUTOR(ObFlushKVCache);
 DEF_SIMPLE_EXECUTOR(ObFlushIlogCache);
 
 DEF_SIMPLE_EXECUTOR(ObFlushDagWarnings);
+
+DEF_SIMPLE_EXECUTOR(ObFlushSSMicroCache);
 
 DEF_SIMPLE_EXECUTOR(ObSwitchReplicaRole);
 
@@ -72,6 +77,8 @@ DEF_SIMPLE_EXECUTOR(ObRefreshIOCalibraiton);
 
 DEF_SIMPLE_EXECUTOR(ObSetConfig);
 
+DEF_SIMPLE_EXECUTOR(ObChangeExternalStorageDest);
+
 DEF_SIMPLE_EXECUTOR(ObClearLocationCache);
 
 DEF_SIMPLE_EXECUTOR(ObReloadUnit);
@@ -83,6 +90,8 @@ DEF_SIMPLE_EXECUTOR(ObReloadZone);
 DEF_SIMPLE_EXECUTOR(ObClearMergeError);
 
 DEF_SIMPLE_EXECUTOR(ObMigrateUnit);
+
+DEF_SIMPLE_EXECUTOR(ObAlterLSReplica);
 
 DEF_SIMPLE_EXECUTOR(ObAddArbitrationService);
 
@@ -102,8 +111,6 @@ DEF_SIMPLE_EXECUTOR(ObStopUpgradeJob);
 
 DEF_SIMPLE_EXECUTOR(ObSetTP);
 
-DEF_SIMPLE_EXECUTOR(ObRefreshTimeZoneInfo);
-
 DEF_SIMPLE_EXECUTOR(ObEnableSqlThrottle);
 
 DEF_SIMPLE_EXECUTOR(ObDisableSqlThrottle);
@@ -122,6 +129,7 @@ DEF_SIMPLE_EXECUTOR(ObBackupManage);
 DEF_SIMPLE_EXECUTOR(ObBackupClean);
 DEF_SIMPLE_EXECUTOR(ObDeletePolicy);
 DEF_SIMPLE_EXECUTOR(ObBackupKey);
+DEF_SIMPLE_EXECUTOR(ObBackupClusterParam);
 DEF_SIMPLE_EXECUTOR(ObBackupBackupset);
 DEF_SIMPLE_EXECUTOR(ObBackupArchiveLog);
 DEF_SIMPLE_EXECUTOR(ObBackupBackupPiece);
@@ -140,6 +148,9 @@ DEF_SIMPLE_EXECUTOR(ObResetConfig);
 
 DEF_SIMPLE_EXECUTOR(ObCancelClone);
 
+DEF_SIMPLE_EXECUTOR(ObTransferPartition);
+DEF_SIMPLE_EXECUTOR(ObServiceName);
+DEF_SIMPLE_EXECUTOR(ObRebuildTablet);
 class ObCancelTaskExecutor
 {
 public:
@@ -195,6 +206,7 @@ private:
   int construct_wait_leader_switch_sql_(
       const obrpc::ObServerList &svr_list,
       ObSqlString &sql);
+  int check_server_empty_(obrpc::ObSrvRpcProxy &rpc_proxy, const obrpc::ObServerList &servers);
   DISALLOW_COPY_AND_ASSIGN(ObAdminServerExecutor);
 };
 
@@ -227,6 +239,8 @@ private:
       obrpc::ObServerList &svr_list);
   DISALLOW_COPY_AND_ASSIGN(ObAdminZoneExecutor);
 };
+
+DEF_SIMPLE_EXECUTOR(ObModuleData);
 
 #undef DEF_SIMPLE_EXECUTOR
 

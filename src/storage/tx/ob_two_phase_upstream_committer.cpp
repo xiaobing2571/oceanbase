@@ -380,6 +380,9 @@ int ObTxCycleTwoPhaseCommitter::decide_downstream_msg_type_(bool &need_submit,
     if (is_sub2pc()) {
       need_submit = true;
       msg_type = ObTwoPhaseCommitMsgType::OB_MSG_TX_PREPARE_REDO_REQ;
+    } else if(is_dup_tx()) {
+      need_submit = true;
+      msg_type = ObTwoPhaseCommitMsgType::OB_MSG_TX_PREPARE_REQ;
     } else {
       need_submit = false;
       if (REACH_TIME_INTERVAL(1 * 1000 * 1000)) {
@@ -525,7 +528,7 @@ int ObTxCycleTwoPhaseCommitter::handle_2pc_prepare_response_impl_(const int64_t 
     }
     case Ob2PCRole::LEAF: {
       ret = OB_ERR_UNEXPECTED;
-      TRANS_LOG(WARN, "The leaf should not recive prepare response", K(ret), K(participant),
+      TRANS_LOG(WARN, "The leaf should not receive prepare response", K(ret), K(participant),
                 KPC(this));
       break;
     }
@@ -687,7 +690,7 @@ int ObTxCycleTwoPhaseCommitter::handle_2pc_ack_response_impl_(const int64_t part
     }
     case Ob2PCRole::LEAF: {
       ret = OB_ERR_UNEXPECTED;
-      TRANS_LOG(WARN, "The leaf should not recive ack response", K(ret), K(participant), KPC(this));
+      TRANS_LOG(WARN, "The leaf should not receive ack response", K(ret), K(participant), KPC(this));
       break;
     }
     default: {
@@ -742,7 +745,7 @@ int ObTxCycleTwoPhaseCommitter::handle_2pc_abort_response_impl_(const int64_t pa
     }
     case Ob2PCRole::LEAF: {
       ret = OB_ERR_UNEXPECTED;
-      TRANS_LOG(WARN, "The leaf should not recive abort response", K(ret), K(participant),
+      TRANS_LOG(WARN, "The leaf should not receive abort response", K(ret), K(participant),
                 KPC(this));
       break;
     }
@@ -853,7 +856,7 @@ int ObTxCycleTwoPhaseCommitter::handle_2pc_pre_commit_response_impl_(const int64
     }
     case Ob2PCRole::LEAF: {
       ret = OB_ERR_UNEXPECTED;
-      TRANS_LOG(WARN, "The leaf should not recive pre_commit response", K(ret), K(participant),
+      TRANS_LOG(WARN, "The leaf should not receive pre_commit response", K(ret), K(participant),
                 KPC(this));
       break;
     }
@@ -974,7 +977,7 @@ int ObTxCycleTwoPhaseCommitter::collect_downstream_(const int64_t participant)
   case Ob2PCRole::ROOT:
   case Ob2PCRole::INTERNAL: {
     if (participant == get_self_id()) {
-      TRANS_LOG(WARN, "recive self 2pc msg", K(participant), KPC(this));
+      TRANS_LOG(WARN, "receive self 2pc msg", K(participant), KPC(this));
     } else {
       ret = collected_.add_member(participant);
     }

@@ -74,10 +74,13 @@ public:
 
   explicit ObAddr(const easy_addr_t& addr);
 
-  explicit ObAddr(const sockaddr &addr);
+  void from_sockaddr(struct sockaddr_storage *sock_addr);
+  struct sockaddr_storage *to_sockaddr(struct sockaddr_storage *sock_addr) const;
 
   void reset()
   {
+    reset_v4_extraneous();  // reset addr except v4_
+    ip_.v4_ = 0;            // reset v4_
     port_ = 0;
     //memset(&ip_, 0, sizeof (ip_));
   }
@@ -85,11 +88,32 @@ public:
   bool using_ipv4() const { return IPV4 == version_; }
   bool using_ipv6() const { return IPV6 == version_; }
   bool using_unix() const { return UNIX == version_; }
-  int64_t to_string(char *buffer, const int64_t size) const;
-  bool ip_to_string(char *buffer, const int32_t size) const;
-  int ip_port_to_string(char *buffer, const int32_t size) const;
-  int addr_to_buffer(char *buffer, const int32_t size, int32_t &ret_len) const;
   int to_yson(char *buf, const int64_t buf_len, int64_t &pos) const;
+  int format_ipv6_addr(char *buffer, const int64_t size) const;
+
+  template<size_t N>
+  int64_t to_string(char (&buffer)[N], const int64_t size) const;
+  template <typename T, typename DUMP_T=
+            typename std::enable_if<std::is_convertible<T, char*>::value>::type>
+  int64_t to_string(T buffer, const int64_t size) const;
+
+  template<size_t N>
+  int ip_to_string(char (&buffer)[N], const int32_t size) const;
+  template <typename T, typename DUMP_T=
+            typename std::enable_if<std::is_convertible<T, char*>::value>::type>
+  bool ip_to_string(T buffer, const int32_t size) const;
+
+  template<size_t N>
+  int ip_port_to_string(char (&buffer)[N], const int32_t size) const;
+  template <typename T, typename DUMP_T=
+            typename std::enable_if<std::is_convertible<T, char*>::value>::type>
+  int ip_port_to_string(T buffer, const int32_t size) const;
+
+  template<size_t N>
+  int addr_to_buffer(char (&buffer)[N], const int32_t size, int32_t &ret_len) const;
+  template <typename T, typename DUMP_T=
+            typename std::enable_if<std::is_convertible<T, char*>::value>::type>
+  int addr_to_buffer(T buffer, const int32_t size, int32_t &ret_len) const;
 
   bool set_ip_addr(const char *ip, const int32_t port);
   bool set_ip_addr(const ObString &ip, const int32_t port);
@@ -129,12 +153,24 @@ private:
   friend class oceanbase::obrpc::ObBatchP;
   int64_t get_ipv4_server_id() const;
   void set_ipv4_server_id(const int64_t ipv4_server_id);
+  int compare_refactored(const ObAddr &rv) const;
 
 private:
+  void reset_v4_extraneous()
+  {
+    uint32_t *p = &ip_.v4_;
+    *++p = 0;
+    *++p = 0;
+    *++p = 0;
+  }
   int convert_ipv4_addr(const char *ip);
   int convert_ipv6_addr(const char *ip);
   bool set_ipv4_addr(const char *ip, const int32_t port);
   bool set_ipv6_addr(const char *ip, const int32_t port);
+  int64_t inner_to_string(char *buffer, const int64_t size) const;
+  bool inner_ip_to_string(char *buffer, const int32_t size) const;
+  int inner_ip_port_to_string(char *buffer, const int32_t size) const;
+  int inner_addr_to_buffer(char *buffer, const int32_t size, int32_t &ret_len) const;
 
 private:
   VER version_;
@@ -212,9 +248,31 @@ inline bool ObAddr::operator !=(const ObAddr &rv) const
 
 inline bool ObAddr::operator ==(const ObAddr &rv) const
 {
-  return version_ == rv.version_ && port_ == rv.port_ && (0 == memcmp(&ip_, &rv.ip_, sizeof(ip_)));
+  return 0 == compare_refactored(rv);
 }
 
+inline int ObAddr::compare_refactored(const ObAddr &rv) const
+{
+  int64_t ipcmp = 0;
+  if (this == &rv) {
+    ipcmp = 0;
+  } else if (version_ != rv.version_) {
+    ipcmp = version_ - rv.version_;
+  } else if (IPV4 == version_) {
+    ipcmp = static_cast<int64_t>(ip_.v4_) - static_cast<int64_t>(rv.ip_.v4_);
+  } else if (IPV6 == version_) {
+    int pos = 0;
+    for (; 0 == ipcmp && pos < IPV6_LEN; pos++) {
+      ipcmp = ip_.v6_[pos] - rv.ip_.v6_[pos];
+    }
+  }
+  if (0 == ipcmp) {
+    ipcmp = port_ - rv.port_;
+  }
+  return 0 == ipcmp ? 0 : (ipcmp > 0 ? 1 : -1);
+}
+
+// forward compatible
 inline int ObAddr::compare(const ObAddr &rv) const
 {
   int compare_ret = 0;
@@ -230,6 +288,62 @@ inline int ObAddr::compare(const ObAddr &rv) const
   }
 
   return compare_ret;
+}
+
+template<size_t N>
+int64_t ObAddr::to_string(char (&buffer)[N], const int64_t size) const
+{
+  STATIC_ASSERT(N >= MAX_IP_PORT_LENGTH,
+                "buffer size is not enough for an ip string");
+  return inner_to_string(buffer, size);
+}
+
+template<size_t N>
+int ObAddr::ip_to_string(char (&buffer)[N], const int32_t size) const
+{
+  STATIC_ASSERT(N >= MAX_IP_ADDR_LENGTH,
+                "buffer size is not enough for an ip string");
+  return inner_ip_to_string(buffer, size);
+}
+
+template<size_t N>
+int ObAddr::addr_to_buffer(char (&buffer)[N], const int32_t size, int32_t &ret_len) const
+{
+  STATIC_ASSERT(N >= MAX_IP_PORT_LENGTH,
+                "buffer size is not enough for an ip string");
+  return inner_addr_to_buffer(buffer, size, ret_len);
+}
+
+template<size_t N>
+int ObAddr::ip_port_to_string(char (&buffer)[N], const int32_t size) const
+{
+  STATIC_ASSERT(N >= MAX_IP_PORT_LENGTH,
+                "buffer size is not enough for an ip string");
+  return inner_ip_port_to_string(buffer, size);
+}
+
+template <typename T, typename DUMP_T>
+int64_t ObAddr::to_string(T buffer, const int64_t size) const
+{
+  return inner_to_string(buffer, size);
+}
+
+template <typename T, typename DUMP_T>
+bool ObAddr::ip_to_string(T buffer, const int32_t size) const
+{
+  return inner_ip_to_string(buffer, size);
+}
+
+template <typename T, typename DUMP_T>
+int ObAddr::ip_port_to_string(T buffer, const int32_t size) const
+{
+  return inner_ip_port_to_string(buffer, size);
+}
+
+template <typename T, typename DUMP_T>
+int ObAddr::addr_to_buffer(T buffer, const int32_t size, int32_t &ret_len) const
+{
+  return inner_addr_to_buffer(buffer, size, ret_len);
 }
 
 //for ofs proxy service,server addr and seq present a life cycle for one server

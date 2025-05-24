@@ -13,14 +13,8 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "share/scheduler/ob_dag_warning_history_mgr.h"
-#include "storage/slog_ckpt/ob_server_checkpoint_slog_handler.h"
-#include "storage/tx_storage/ob_ls_map.h"
-#include "storage/tx_storage/ob_ls_service.h"
-#include "storage/tenant_snapshot/ob_tenant_snapshot_defs.h"
 #include "storage/tenant_snapshot/ob_tenant_snapshot_task.h"
 #include "storage/tenant_snapshot/ob_tenant_snapshot_service.h"
-#include "storage/tenant_snapshot/ob_tenant_snapshot_mgr.h"
-#include "storage/tenant_snapshot/ob_tenant_snapshot_meta_table.h"
 namespace oceanbase
 {
 namespace storage
@@ -129,6 +123,7 @@ int ObTenantSnapshotCreateDag::fill_dag_key(char *buf, const int64_t buf_len) co
 {
   int ret = OB_SUCCESS;
 
+  int64_t pos = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObTenantSnapshotCreateDag has not been inited", KR(ret), KPC(this));
@@ -138,8 +133,8 @@ int ObTenantSnapshotCreateDag::fill_dag_key(char *buf, const int64_t buf_len) co
   } else if (!tenant_snapshot_id_.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tenant_snapshot_id_ is invalid", KR(ret), KPC(this));
-  } else if (OB_FAIL(databuff_printf(buf, buf_len, "tenant_snapshot_id=%s",
-                                     to_cstring(tenant_snapshot_id_)))) {
+  } else if (OB_FAIL(databuff_print_multi_objs(buf, buf_len, pos, "tenant_snapshot_id=",
+                                     tenant_snapshot_id_))) {
     LOG_WARN("fail to fill dag_key", KR(ret), KPC(this));
   }
   return ret;
@@ -322,6 +317,7 @@ int ObTenantSnapshotGCDag::fill_info_param(compaction::ObIBasicInfoParam *&out_p
 int ObTenantSnapshotGCDag::fill_dag_key(char *buf, const int64_t buf_len) const
 {
   int ret = OB_SUCCESS;
+  int64_t pos = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObTenantSnapshotGCDag has not been inited", KR(ret), KPC(this));
@@ -331,8 +327,8 @@ int ObTenantSnapshotGCDag::fill_dag_key(char *buf, const int64_t buf_len) const
   } else if (OB_UNLIKELY(!tenant_snapshot_id_.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tenant_snapshot_id_ is invalid", KR(ret), KPC(this));
-  } else if (OB_FAIL(databuff_printf(buf, buf_len, "tenant_snapshot_id=%s",
-                                     to_cstring(tenant_snapshot_id_)))) {
+  } else if (OB_FAIL(databuff_print_multi_objs(buf, buf_len, pos, "tenant_snapshot_id=",
+                                     tenant_snapshot_id_))) {
     LOG_WARN("failed to fill dag_key", KR(ret), KPC(this));
   }
   return ret;
@@ -402,11 +398,11 @@ int ObTenantSnapshotGCTask::process()
           LOG_WARN("fail to delete tenant snapshot in tenant_snapshot_mgr_",
               KR(ret), KPC(tenant_snapshot_mgr_), KPC(tenant_snapshot));
         }
-      } // if only gc ls snapshot, then no need to delete tenant_snapshot in tenant_snapshot_mgr_
-      tenant_snapshot->finish_gc_tenant_snapshot_dag();
-      tenant_snapshot_mgr_->revert_tenant_snapshot(tenant_snapshot);
-      LOG_INFO("execute gc tenant snapshot task success");
+      }
     }
+    // once task finished, we clean has_unfinished_gc_dag_ flag
+    tenant_snapshot->finish_gc_tenant_snapshot_dag();
+    tenant_snapshot_mgr_->revert_tenant_snapshot(tenant_snapshot);
   }
 
   LOG_INFO("ObTenantSnapshotGCTask finished",

@@ -11,19 +11,16 @@
  */
 
 #include "ob_id_service.h"
-#include "ob_trans_service.h"
 #include "ob_timestamp_service.h"
 #include "ob_trans_id_service.h"
-#include "ob_tx_ls_log_writer.h"
-#include "storage/ls/ob_ls_tx_service.h"
-#include "storage/slog/ob_storage_logger.h"
-#include "storage/slog/ob_storage_log.h"
-#include "storage/slog/ob_storage_log_replayer.h"
 #include "storage/tx_storage/ob_ls_service.h"
-#include "logservice/ob_log_base_header.h"
-#include "share/scn.h"
-#include "storage/tx_storage/ob_ls_handle.h"
 #include "sql/das/ob_das_id_service.h"
+
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "storage/incremental/ob_shared_meta_service.h"
+#endif
+
+#define USING_LOG_PREFIX TRANS
 
 namespace oceanbase
 {
@@ -77,11 +74,14 @@ int ObIDService::check_and_fill_ls()
     ObLSService *ls_svr =  MTL(ObLSService *);
     ObLSHandle handle;
     ObLS *ls = nullptr;
-
+    ObLSID ls_id = IDS_LS;
+    if (GCTX.is_shared_storage_mode() && is_meta_tenant(MTL_ID())) {
+      ls_id = SSLOG_LS;
+    }
     if (OB_ISNULL(ls_svr)) {
       ret = OB_ERR_UNEXPECTED;
       TRANS_LOG(WARN, "log stream service is NULL", K(ret));
-    } else if (OB_FAIL(ls_svr->get_ls(IDS_LS, handle, ObLSGetMod::TRANS_MOD))) {
+    } else if (OB_FAIL(ls_svr->get_ls(ls_id, handle, ObLSGetMod::TRANS_MOD))) {
       TRANS_LOG(WARN, "get id service log stream failed");
     } else if (OB_ISNULL(ls = handle.get_ls())) {
       ret = OB_ERR_UNEXPECTED;
@@ -113,6 +113,7 @@ int ObIDService::submit_log_(const int64_t last_id, const int64_t limited_id)
       TRANS_LOG(WARN, "invalid argument", K(ret), K_(service_type), K_(latest_log_ts), K_(self));
     } else if (ObTimeUtility::current_time() - submit_log_ts_ > SUBMIT_LOG_ALARM_INTERVAL) {
       if (log_interval_.reach()) {
+        // ignore ret
         TRANS_LOG(WARN, "submit log callback use too mush time", K_(submit_log_ts), K_(cb), K_(service_type), K_(latest_log_ts), K_(self));
       }
     }
@@ -143,7 +144,8 @@ int ObIDService::submit_log_(const int64_t last_id, const int64_t limited_id)
       TRANS_LOG(WARN, "serialize ls log error", KR(ret), K(cb_));
     } else {
       cb_.set_srv_type(service_type_);
-      if (OB_FAIL(ls_->get_log_handler()->append(cb_.get_log_buf(), cb_.get_log_pos(), base_scn, false, &cb_, lsn, log_ts))) {
+      if (OB_FAIL(ls_->get_log_handler()->append(cb_.get_log_buf(), cb_.get_log_pos(), base_scn,
+                                                 false, false/*allow_compression*/, &cb_, lsn, log_ts))) {
         cb_.reset();
         if (REACH_TIME_INTERVAL(100 * 1000)) {
           TRANS_LOG(WARN, "submit ls log failed", KR(ret), K(service_type_));
@@ -245,10 +247,28 @@ int ObIDService::update_ls_id_meta(const bool write_slog)
   if (OB_FAIL(check_and_fill_ls())) {
     TRANS_LOG(WARN, "ls set fail", K(ret));
   } else if (write_slog) {
-    ret = ls_->update_id_meta(service_type_,
-                              ATOMIC_LOAD(&limited_id_),
-                              latest_log_ts_.atomic_load(),
-                              true /* write slog */);
+#ifdef OB_BUILD_SHARED_STORAGE
+    if (GCTX.is_shared_storage_mode()) {
+      SYNC_UPLOAD_INC_META_WITH_RET(SSIncMetaUploadType::ID_SERVICE_UPLOAD_TYPE,
+                                    ret,
+                                    ls_id_meta,
+                                    (*(MTL(ObSSMetaService *))),
+                                    ls_->get_ls_id(),
+                                    service_type_,
+                                    ATOMIC_LOAD(&limited_id_),
+                                    latest_log_ts_.atomic_load());
+      if (OB_FAIL(ret)) {
+        TRANS_LOG(WARN, "update ls id meta failed", K(ret), K(service_type_));
+      }
+    }
+#endif
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ls_->update_id_meta(service_type_,
+                                           ATOMIC_LOAD(&limited_id_),
+                                           latest_log_ts_.atomic_load(),
+                                           true /* write slog */))) {
+      TRANS_LOG(WARN, "update id meta failed", K(ret), KPC(ls_));
+    }
   } else {
     ret = ls_->update_id_meta(service_type_,
                               ATOMIC_LOAD(&limited_id_),
@@ -385,7 +405,9 @@ int ObIDService::get_number(const int64_t range, const int64_t base_id, int64_t 
       submit_log_with_lock_(pre_allocated_id, pre_allocated_id);
     }
   }
-  if (REACH_TIME_INTERVAL(100000)) {
+  // thread local, 4 seconds
+  // TODO, tenant level
+  if (TC_REACH_TIME_INTERVAL(4000000)) {
     TRANS_LOG(INFO, "get number", K(ret), K(service_type_), K(range), K(base_id), K(start_id), K(end_id));
   }
 	return ret;
@@ -682,18 +704,30 @@ OB_DEF_DESERIALIZE(ObAllIDMeta)
   return ret;
 }
 
-void ObAllIDMeta::update_all_id_meta(const ObAllIDMeta &all_id_meta)
+void ObAllIDMeta::update_all_id_meta(const ObAllIDMeta &all_id_meta,
+                                     bool &updated)
 {
+  updated = false;
   ObSpinLockGuard lock_guard(lock_);
-  for(int i=0; i<ObIDService::MAX_SERVICE_TYPE; i++) {
+  for(int i = 0; i < ObIDService::MAX_SERVICE_TYPE; i++) {
+    int64_t old_limited_id = id_meta_[i].limited_id_;
+    SCN old_log_ts = id_meta_[i].latest_log_ts_;
+
     (void)inc_update(&id_meta_[i].limited_id_, all_id_meta.id_meta_[i].limited_id_);
     id_meta_[i].latest_log_ts_.inc_update(all_id_meta.id_meta_[i].latest_log_ts_);
+
+    if (updated) {
+    } else if (id_meta_[i].limited_id_ > old_limited_id
+               || id_meta_[i].latest_log_ts_ > old_log_ts) {
+      updated = true;
+    }
   }
 }
 
 int ObAllIDMeta::update_id_meta(const int64_t service_type,
                                 const int64_t limited_id,
-                                const SCN &latest_log_ts)
+                                const SCN &latest_log_ts,
+                                bool &updated)
 {
   int ret = OB_SUCCESS;
   ObSpinLockGuard lock_guard(lock_);
@@ -702,8 +736,17 @@ int ObAllIDMeta::update_id_meta(const int64_t service_type,
     ret = OB_INVALID_ARGUMENT;
     TRANS_LOG(WARN, "invalid argument", K(ret), K(service_type));
   } else {
+    int64_t old_limited_id = id_meta_[service_type].limited_id_;
+    SCN old_log_ts = id_meta_[service_type].latest_log_ts_;
+
     (void)inc_update(&id_meta_[service_type].limited_id_, limited_id);
     id_meta_[service_type].latest_log_ts_.inc_update(latest_log_ts);
+
+    if (limited_id > old_limited_id || latest_log_ts > old_log_ts) {
+      updated = true;
+    } else {
+      updated = false;
+    }
   }
   return ret;
 }

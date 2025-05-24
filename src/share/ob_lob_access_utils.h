@@ -29,6 +29,8 @@ class ObBasicSessionInfo;
 namespace storage
 {
   class ObLobQueryIter;
+  class ObLobDiffHeader;
+  class ObLobAccessCtx;
 } // namespace storage
 namespace common
 {
@@ -40,6 +42,16 @@ OB_INLINE bool ob_enable_lob_locator_v2()
   const uint64_t ob_cluster_ver = GET_MIN_CLUSTER_VERSION();
   bool bret = ob_cluster_ver > CLUSTER_VERSION_4_0_0_0;
   return bret;
+}
+
+OB_INLINE void ob_use_old_lob_tx_info_if_need(ObMemLobExternFlags &flags)
+{
+  uint64_t cluster_version = GET_MIN_CLUSTER_VERSION();
+  // [, 4,2.4) or [4.3.0, 4.3.4)
+  if (flags.has_read_snapshot_ == 1 && (cluster_version < MOCK_CLUSTER_VERSION_4_2_4_0 || (cluster_version >= CLUSTER_VERSION_4_3_0_0 && cluster_version < CLUSTER_VERSION_4_3_4_0))) {
+    flags.has_read_snapshot_ = 0;
+    flags.has_tx_info_ = 1;
+  }
 }
 
 OB_INLINE bool ob_enable_datum_cast_debug_log()
@@ -67,7 +79,7 @@ struct ObLobTextIterCtx
     total_access_len_(0), total_byte_len_(0), content_byte_len_(0), content_len_(0),
     reserved_byte_len_(0), reserved_len_(0), accessed_byte_len_(0), accessed_len_(0),
     last_accessed_byte_len_(0), last_accessed_len_(0), iter_count_(0), is_cloned_temporary_(false),
-    is_backward_(false), locator_(locator), lob_query_iter_(NULL)
+    is_backward_(false), locator_(locator), lob_query_iter_(NULL), lob_access_ctx_(nullptr)
   {}
 
   TO_STRING_KV(KP_(alloc), KP_(session), KP_(buff), K_(buff_byte_len), K_(start_offset), K_(total_access_len),
@@ -112,6 +124,7 @@ struct ObLobTextIterCtx
 
   ObLobLocatorV2 locator_;
   storage::ObLobQueryIter *lob_query_iter_;
+  storage::ObLobAccessCtx *lob_access_ctx_;
 };
 
 // wrapper class to handle string/text type input
@@ -129,6 +142,7 @@ public:
     if (is_lob_storage(type)) {
       validate_has_lob_header(has_lob_header_);
     }
+    cs_type_ = ob_is_json(type) ? CS_TYPE_BINARY : cs_type_;
   }
 
   ObTextStringIter(const ObObj &obj) :
@@ -139,6 +153,7 @@ public:
     if (is_lob_storage(obj.get_type())) {
       validate_has_lob_header(has_lob_header_);
     }
+    cs_type_ = ob_is_json(obj.get_type()) ? CS_TYPE_BINARY : cs_type_;
   }
   ~ObTextStringIter();
 
@@ -148,7 +163,8 @@ public:
   int init(uint32_t buffer_len,
            const sql::ObBasicSessionInfo *session = NULL,
            ObIAllocator *res_allocator = NULL,
-           ObIAllocator *tmp_allocator = NULL);
+           ObIAllocator *tmp_allocator = NULL,
+           storage::ObLobAccessCtx *lob_access_ctx = NULL);
 
   ObTextStringIterState get_next_block(ObString &str);
 
@@ -193,15 +209,16 @@ public:
 
 private:
   int get_outrow_lob_full_data(ObIAllocator *allocator = nullptr);
+  int get_delta_lob_full_data(ObLobLocatorV2& lob_locator, ObIAllocator *allocator, ObString &data);
   int get_first_block(ObString &str);
   int get_next_block_inner(ObString &str);
   int get_outrow_prefix_data(uint32_t prefix_char_len);
   int reserve_data();
   int reserve_byte_data();
-  OB_INLINE bool is_valid_for_config()
+  OB_INLINE bool is_valid_for_config(ObTextStringIterState valid_state = TEXTSTRING_ITER_INIT)
   {
     return (is_init_ && is_outrow_ && has_lob_header_
-            && state_ == TEXTSTRING_ITER_INIT && OB_NOT_NULL(ctx_));
+            && state_ == valid_state && OB_NOT_NULL(ctx_));
   }
 private:
   ObObjType type_;
@@ -244,7 +261,8 @@ public:
   // Notice:
   // 1. all lobs created by this class should be temp lobs
   // 2. if has_lob_header_ is false, the text result should be 4.0 compatible
-  int init(const int64_t res_len, ObIAllocator *allocator = NULL);
+  virtual int init(const int64_t res_len, ObIAllocator *allocator = NULL);
+  int init(const int64_t res_len, ObString &res_buffer);
 
   // copy existent loc to result
   int copy(const ObLobLocatorV2 *loc);
@@ -278,9 +296,13 @@ public:
                                            const ObObjMeta &in_obj_meta,
                                            const ObObjMeta &out_obj_meta,
                                            ObIAllocator &allocator);
+  static int calc_inrow_templob_len(uint32 inrow_data_len, int64_t &templob_len);
+  static int64_t calc_inrow_templob_locator_len();
+  static int fill_inrow_templob_header(const int64_t inrow_data_len, char *buf, int64_t buf_len);
+  int calc_buffer_len(const int64_t res_len);
+  OB_INLINE int64_t get_buff_len() { return buff_len_; }
 
 protected:
-  int calc_buffer_len(const int64_t res_len);
   int fill_temp_lob_header(const int64_t res_len);
 
 protected:
@@ -325,6 +347,28 @@ OB_INLINE bool ob_is_empty_lob(const ObObj &obj)
   }
   return bret;
 }
+
+class ObDeltaLob {
+public:
+   static int has_diff(const ObLobLocatorV2 &locator, int64_t &res);
+   static int has_diff(const ObLobLocatorV2 &locator, bool &res);
+
+public:
+  int64_t get_serialize_size() const;
+  int64_t get_header_serialize_size() const;
+  virtual int64_t get_partial_data_serialize_size() const = 0;
+  virtual int64_t get_lob_diff_serialize_size() const = 0;
+  virtual uint32_t get_lob_diff_cnt() const = 0;
+
+  int serialize(char* buf, const int64_t buf_len, int64_t& pos) const;
+  int serialize_header(char* buf, const int64_t buf_len, int64_t& pos, storage::ObLobDiffHeader *&diff_header) const;
+  virtual int serialize_partial_data(char* buf, const int64_t buf_len, int64_t& pos) const = 0;
+  virtual int serialize_lob_diffs(char* buf, const int64_t buf_len, storage::ObLobDiffHeader *diff_header) const = 0;
+
+  int deserialize(const ObLobLocatorV2 &delta_lob);
+  virtual int deserialize_partial_data(storage::ObLobDiffHeader *diff_header) = 0;
+  virtual int deserialize_lob_diffs(char* buf, const int64_t buf_len, storage::ObLobDiffHeader *diff_header) = 0;
+};
 
 } // end namespace common
 } // end namespace oceanbase

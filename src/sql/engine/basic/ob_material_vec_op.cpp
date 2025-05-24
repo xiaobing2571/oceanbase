@@ -13,10 +13,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "sql/engine/basic/ob_material_vec_op.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/px/ob_px_util.h"
-#include "sql/engine/ob_physical_plan.h"
-#include "sql/engine/ob_exec_context.h"
 
 namespace oceanbase
 {
@@ -53,7 +50,8 @@ int ObMaterialVecOp::inner_open()
                                    mem_attr,
                                    0 /*mem_limit*/,
                                    true /*enable_dump*/,
-                                   true /*reuse_vector_array*/))) {
+                                   true /*reuse_vector_array*/,
+                                   MY_SPEC.compress_type_))) {
       LOG_WARN("init row store failed");
     } else {
       const int64_t size = OB_INVALID_ID == row_count ? 0 : row_count * MY_SPEC.width_;

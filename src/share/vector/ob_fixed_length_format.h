@@ -77,6 +77,8 @@ public:
                        const uint64_t row_idx, const int64_t col_idx, const int64_t remain_size,
                        const bool is_fixed_length_data, int64_t &row_size) const override final;
   OB_INLINE int32_t type_size() const { return sizeof(ValueType); }
+  DEF_VEC_READ_INTERFACES(ObFixedLengthFormat<ValueType>);
+  DEF_VEC_WRITE_INTERFACES(ObFixedLengthFormat<ValueType>);
 };
 
 template<typename ValueType>
@@ -114,17 +116,39 @@ OB_INLINE int ObFixedLengthFormat<ValueType>::from_rows(const sql::RowMeta &row_
   int ret = OB_SUCCESS;
   if (row_meta.is_reordered_fixed_expr(col_idx)) {
     const int64_t offset = row_meta.fixed_offsets(col_idx);
-    for (int64_t i = 0; i < size; i++) {
-      if (stored_rows[i]->is_null(col_idx)) {
-        set_null(i);
-      } else {
-        const char *payload = stored_rows[i]->payload() + offset;
-        set_payload_shallow(i, payload, sizeof(ValueType));
+    if (!has_null()) {
+      for (int64_t i = 0; i < size; i++) {
+        if (nullptr == stored_rows[i]) {
+          continue;
+        }
+        if (stored_rows[i]->is_null(col_idx)) {
+          set_null(i);
+        } else {
+          const char *payload = stored_rows[i]->payload() + offset;
+          if (!std::is_same<ValueType, char[0]>::value) {
+            (reinterpret_cast<ValueType *>(data_))[i] = *(reinterpret_cast<const ValueType *>(payload));
+          }
+        }
+      }
+    } else {
+      for (int64_t i = 0; i < size; i++) {
+        if (nullptr == stored_rows[i]) {
+          continue;
+        }
+        if (stored_rows[i]->is_null(col_idx)) {
+          set_null(i);
+        } else {
+          const char *payload = stored_rows[i]->payload() + offset;
+          set_payload_shallow(i, payload, sizeof(ValueType));
+        }
       }
     }
   } else {
     const int64_t var_idx = row_meta.var_idx(col_idx);
     for (int64_t i = 0; i < size; i++) {
+      if (nullptr == stored_rows[i]) {
+        continue;
+      }
       if (stored_rows[i]->is_null(col_idx)) {
         set_null(i);
       } else {
@@ -147,18 +171,41 @@ OB_INLINE int ObFixedLengthFormat<ValueType>::from_rows(const sql::RowMeta &row_
   int ret = OB_SUCCESS;
   if (row_meta.is_reordered_fixed_expr(col_idx)) {
     const int64_t offset = row_meta.fixed_offsets(col_idx);
-    for (int64_t i = 0; i < size; i++) {
-      int64_t row_idx = selector[i];
-      if (stored_rows[i]->is_null(col_idx)) {
-        set_null(row_idx);
-      } else {
-        const char *payload = stored_rows[i]->payload() + offset;
-        set_payload_shallow(row_idx, payload, sizeof(ValueType));
+    if (!has_null()) {
+      for (int64_t i = 0; i < size; i++) {
+        if (nullptr == stored_rows[i]) {
+          continue;
+        }
+        int64_t row_idx = selector[i];
+        if (stored_rows[i]->is_null(col_idx)) {
+          set_null(row_idx);
+        } else {
+          const char *payload = stored_rows[i]->payload() + offset;
+          if (!std::is_same<ValueType, char[0]>::value) {
+            (reinterpret_cast<ValueType *>(data_))[row_idx] = *(reinterpret_cast<const ValueType *>(payload));
+          }
+        }
+      }
+    } else {
+      for (int64_t i = 0; i < size; i++) {
+        if (nullptr == stored_rows[i]) {
+          continue;
+        }
+        int64_t row_idx = selector[i];
+        if (stored_rows[i]->is_null(col_idx)) {
+          set_null(row_idx);
+        } else {
+          const char *payload = stored_rows[i]->payload() + offset;
+          set_payload_shallow(row_idx, payload, sizeof(ValueType));
+        }
       }
     }
   } else {
     const int64_t var_idx = row_meta.var_idx(col_idx);
     for (int64_t i = 0; i < size; i++) {
+      if (nullptr == stored_rows[i]) {
+        continue;
+      }
       int64_t row_idx = selector[i];
       if (stored_rows[i]->is_null(col_idx)) {
         set_null(row_idx);

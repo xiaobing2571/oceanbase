@@ -24,13 +24,17 @@
 
 namespace oceanbase
 {
+namespace memtable {
+class ObMemtableBlockReader;
+}
 namespace storage
 {
 struct ObTableIterParam;
 struct ObTableAccessContext;
+struct ObRowSampleFilter;
 class ObBlockRowStore;
-class ObTableStoreStat;
-class ObCGAggCells;
+class ObTableScanStoreStat;
+class ObAggGroupBase;
 }
 namespace blocksstable
 {
@@ -46,6 +50,8 @@ public:
       storage::ObTableAccessContext &context,
       const blocksstable::ObSSTable *sstable);
   OB_INLINE bool is_valid() const { return is_inited_ && nullptr != range_; }
+  OB_INLINE int64_t get_data_length() const
+  { return nullptr == reader_ ? 0 : reader_->original_data_length(); }
   virtual int switch_context(
       const storage::ObTableIterParam &param,
       storage::ObTableAccessContext &context,
@@ -62,9 +68,7 @@ public:
       const ObCSRange &range);
   virtual int get_next_row(const ObDatumRow *&row);
   virtual int get_next_rows();
-  virtual int apply_blockscan(
-      storage::ObBlockRowStore *block_row_store,
-      storage::ObTableStoreStat &table_store_stat);
+  virtual int apply_filter(const bool can_blockscan);
   virtual int set_ignore_shadow_row() { return OB_NOT_SUPPORTED;}
   int end_of_block() const;
   OB_INLINE int get_access_cnt() const { return reverse_scan_ ? (current_ - last_ + 1) : (last_ - current_ + 1);}
@@ -84,17 +88,14 @@ public:
   virtual int get_next_rows(
       const common::ObIArray<int32_t> &cols_projector,
       const common::ObIArray<const share::schema::ObColumnParam *> &col_params,
-      const int64_t *row_ids,
+      const int32_t *row_ids,
       const char **cell_datas,
       const int64_t row_cap,
       common::ObIArray<ObSqlDatumInfo> &datums,
       const int64_t datum_offset,
-      uint32_t *len_array);
-  int get_aggregate_result(
-      const int32_t col_idx,
-      const int64_t *row_ids,
-      const int64_t row_cap,
-      ObCGAggCells &cg_agg_cells);
+      uint32_t *len_array,
+      const bool is_padding_mode,
+      const bool init_vector_header = true);
   int advance_to_border(
       const ObDatumRowkey &rowkey,
       int64_t &start_offset,
@@ -108,12 +109,13 @@ public:
   int read_distinct(
       const int32_t group_by_col,
       const char **cell_datas,
-      storage::ObGroupByCell &group_by_cell) const;
+      const bool is_padding_mode,
+      storage::ObGroupByCellBase &group_by_cell) const;
   int read_reference(
       const int32_t group_by_col,
-      const int64_t *row_ids,
+      const int32_t *row_ids,
       const int64_t row_cap,
-      storage::ObGroupByCell &group_by_cell) const;
+      storage::ObGroupByCellBase &group_by_cell) const;
   OB_INLINE void reserve_reader_memory(bool reserve)
   {
     if (nullptr != reader_) {
@@ -124,31 +126,47 @@ public:
   int get_rows_for_old_format(
       const common::ObIArray<int32_t> &col_offsets,
       const common::ObIArray<const share::schema::ObColumnParam *> &col_params,
-      const int64_t *row_ids,
+      const int32_t *row_ids,
       const int64_t row_cap,
       const int64_t vector_offset,
       const char **cell_datas,
       sql::ObExprPtrIArray &exprs,
       common::ObIArray<ObSqlDatumInfo> &datum_infos,
-      blocksstable::ObDatumRow *default_row);
+      const common::ObIArray<blocksstable::ObStorageDatum> *default_datums,
+      const bool is_padding_mode);
   int get_rows_for_rich_format(
       const common::ObIArray<int32_t> &col_offsets,
       const common::ObIArray<const share::schema::ObColumnParam *> &col_params,
-      const int64_t *row_ids,
+      const int32_t *row_ids,
       const int64_t row_cap,
       const int64_t vector_offset,
       const char **cell_datas,
       uint32_t *len_array,
       sql::ObExprPtrIArray &exprs,
-      blocksstable::ObDatumRow *default_row);
+      const common::ObIArray<blocksstable::ObStorageDatum> *default_datums,
+      const bool is_padding_mode,
+      const bool need_init_vector = true);
   int64_t get_current_pos() const
   { return current_; }
+  OB_INLINE int64_t get_last_pos() const
+  { return last_; }
   ObIMicroBlockReader *get_reader() const
   { return reader_; }
-  VIRTUAL_TO_STRING_KV(K_(can_ignore_multi_version));
+  int get_next_border_rows(const ObDatumRowkey &rowkey);
+  OB_INLINE bool can_blockscan() const
+  { return can_blockscan_ && can_ignore_multi_version_; }
+  OB_INLINE bool is_filter_applied() const
+  { return is_filter_applied_; }
+  void reset_blockscan()
+  { can_blockscan_ = false; is_filter_applied_ = false; }
+  int check_and_revert_non_border_rowkey(
+      const ObDatumRowkey &border_rowkey,
+      const ObDatumRow &deleted_row,
+      ObCSRowId &co_current);
+  VIRTUAL_TO_STRING_KV(K_(is_left_border), K_(is_right_border), K_(can_ignore_multi_version), K_(use_private_bitmap),
+                       K_(can_blockscan), K_(is_filter_applied), K_(current), K_(start), K_(last), K_(step));
 protected:
   virtual int inner_get_next_row(const ObDatumRow *&row);
-  int inner_get_row_header(const ObRowHeader *&row_header);
   int set_reader(const ObRowStoreType store_type);
   int set_base_scan_param(const bool is_left_bound_block,
                           const bool is_right_bound_block);
@@ -165,8 +183,11 @@ protected:
       common::ObIAllocator *allocator = nullptr);
   OB_INLINE bool is_row_empty(const ObDatumRow &row) const
   { return row.row_flag_.is_not_exist(); }
-private:
+  int get_filter_result(ObFilterResult &res);
+  bool is_di_bitmap_valid() const;
+  int init_bitmap(ObCGBitmap *&bitmap, bool is_all_true);
   int inner_get_next_row_blockscan(const ObDatumRow *&row);
+private:
   int apply_black_filter_batch(
       sql::ObPushdownFilterExecutor *parent,
       sql::ObBlackFilterExecutor &filter,
@@ -174,10 +195,13 @@ private:
       common::ObBitmap &result_bitmap);
 protected:
   bool is_inited_;
-  bool use_fuse_row_cache_;
   bool reverse_scan_;
   bool is_left_border_;
   bool is_right_border_;
+  bool can_ignore_multi_version_;
+  bool can_blockscan_;
+  bool is_filter_applied_;
+  bool use_private_bitmap_;
   int64_t current_;         // current cursor
   int64_t start_;           // start of scan, inclusive.
   int64_t last_;            // end of scan, inclusive.
@@ -192,11 +216,32 @@ protected:
   ObIMicroBlockDecoder *decoder_;
   ObMicroBlockDecoder *pax_decoder_;
   ObMicroBlockCSDecoder *cs_decoder_;
+  memtable::ObMemtableBlockReader *memtable_reader_;
   const storage::ObTableIterParam *param_;
   storage::ObTableAccessContext *context_;
   ObIAllocator &allocator_;
-  bool can_ignore_multi_version_;
   storage::ObBlockRowStore *block_row_store_;
+  ObCGBitmap *di_bitmap_;
+  ObCGBitmap *filter_bitmap_;
+};
+
+// tablet split ddl task scan bared row without multi-merge.
+class ObMicroBlockRowDirectScanner final : public ObIMicroBlockRowScanner
+{
+public:
+  ObMicroBlockRowDirectScanner(common::ObIAllocator &allocator)
+    : ObIMicroBlockRowScanner(allocator)
+  {}
+  virtual ~ObMicroBlockRowDirectScanner() {}
+  virtual int init(
+      const storage::ObTableIterParam &param,
+      storage::ObTableAccessContext &context,
+      const blocksstable::ObSSTable *sstable) override final;
+  virtual int open(
+      const MacroBlockId &macro_id,
+      const ObMicroBlockData &block_data,
+      const bool is_left_border,
+      const bool is_right_border) override final;
 };
 
 // major sstable micro block scanner for query and merge
@@ -269,18 +314,17 @@ class ObMultiVersionMicroBlockRowScanner : public ObIMicroBlockRowScanner
 public:
   ObMultiVersionMicroBlockRowScanner(common::ObIAllocator &allocator)
       : ObIMicroBlockRowScanner(allocator),
-        cell_allocator_(common::ObModIds::OB_SSTABLE_READER, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
-        reserved_pos_(ObIMicroBlockReaderInfo::INVALID_ROW_INDEX),
         finish_scanning_cur_rowkey_(true),
         is_last_multi_version_row_(true),
+        read_row_direct_flag_(false),
+        cell_allocator_(common::ObModIds::OB_SSTABLE_READER, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
+        reserved_pos_(ObIMicroBlockReaderInfo::INVALID_ROW_INDEX),
         trans_version_col_idx_(-1),
         sql_sequence_col_idx_(-1),
-        cell_cnt_(0),
-        read_row_direct_flag_(false),
-        ignore_shadow_row_(false)
+        cell_cnt_(0)
   {}
   virtual ~ObMultiVersionMicroBlockRowScanner() {}
-  void reuse() override;
+  virtual void reuse() override;
   virtual int switch_context(
       const storage::ObTableIterParam &param,
       storage::ObTableAccessContext &context,
@@ -288,27 +332,42 @@ public:
   virtual int init(
       const storage::ObTableIterParam &param,
       storage::ObTableAccessContext &context,
-      const blocksstable::ObSSTable *sstable) override final;
+      const blocksstable::ObSSTable *sstable) override;
   virtual int open(
       const MacroBlockId &macro_id,
       const ObMicroBlockData &block_data,
       const bool is_left_border,
-      const bool is_right_border) override final;
-  virtual int set_ignore_shadow_row() override final { ignore_shadow_row_ = true; return OB_SUCCESS; }
-  INHERIT_TO_STRING_KV("ObMultiVersionMicroBlockRowScanner", ObIMicroBlockRowScanner, K_(read_row_direct_flag), K_(ignore_shadow_row), K_(version_range));
+      const bool is_right_border) override;
+  INHERIT_TO_STRING_KV("ObMultiVersionMicroBlockRowScanner",
+                       ObIMicroBlockRowScanner, K_(read_row_direct_flag),
+                       K_(version_range), K_(is_last_multi_version_row),
+                       K_(finish_scanning_cur_rowkey));
+
 protected:
   virtual int inner_get_next_row(const ObDatumRow *&row) override;
-  virtual void inner_reset();
-private:
-  OB_INLINE int inner_get_next_row_impl(const ObDatumRow *&ret_row);
+  int check_trans_version(
+      bool &final_result,
+      bool &version_fit,
+      bool &have_uncommited_row,
+      int64_t &trans_version,
+      int64_t &sql_sequence,
+      const int64_t index,
+      const ObRowHeader *&row_header);
+  int check_foreign_key(
+      const int64_t trans_version,
+      const int64_t sql_sequence,
+      const ObRowHeader *row_header);
   void reuse_cur_micro_row();
+private:
   void reuse_prev_micro_row();
+  void inner_reset();
   int locate_cursor_to_read(bool &found_first_row);
+  int inner_get_next_row_impl(const ObDatumRow *&ret_row);
   int inner_inner_get_next_row(
       const ObDatumRow *&ret_row,
       bool &version_fit,
       bool &final_result,
-      bool &have_uncommited_row);
+      bool &have_uncommitted_row);
   int inner_get_next_row_directly(
       const ObDatumRow *&ret_row,
       bool &version_fit,
@@ -323,11 +382,7 @@ private:
   // and it will be destroyed when the life cycle of the rowkey_helper is end.
   // So we have to send it into the function to avoid this situation.
   int get_store_rowkey(ObStoreRowkey &store_rowkey, ObDatumRowkeyHelper &rowkey_helper);
-private:
-  ObDatumRow prev_micro_row_;
-  storage::ObNopPos nop_pos_;
-  common::ObArenaAllocator cell_allocator_;
-  int64_t reserved_pos_;
+protected:
   // Use shallow_copy to directly quote the original data of the microblock when compacting,
   // only at the moment (when the dump row format is flat) there is no risk
   // TRUE:it means that the compacted result of the current rowkey has been obtained
@@ -335,14 +390,70 @@ private:
   bool finish_scanning_cur_rowkey_;
   // TRUE: meet Last Flag of current rowkey
   bool is_last_multi_version_row_;
+  bool read_row_direct_flag_;
+  ObDatumRow prev_micro_row_;
   ObDatumRow tmp_row_;
+private:
+  storage::ObNopPos nop_pos_;
+  common::ObArenaAllocator cell_allocator_;
+  int64_t reserved_pos_;
   int64_t trans_version_col_idx_;
   int64_t sql_sequence_col_idx_;
   int64_t cell_cnt_;
-  transaction::ObTransID trans_id_;
   common::ObVersionRange version_range_;
-  bool read_row_direct_flag_;
-  bool ignore_shadow_row_;
+};
+
+// multi version sstable micro block scanner for mow tables
+class ObMultiVersionDIMicroBlockRowScanner final : public ObMultiVersionMicroBlockRowScanner
+{
+public:
+  ObMultiVersionDIMicroBlockRowScanner(common::ObIAllocator &allocator)
+      : ObMultiVersionMicroBlockRowScanner(allocator),
+        is_prev_micro_row_valid_(false),
+        found_first_di_row_(false)
+  {}
+  virtual ~ObMultiVersionDIMicroBlockRowScanner() {}
+  virtual void reuse() override final;
+  virtual int open(
+      const MacroBlockId &macro_id,
+      const ObMicroBlockData &block_data,
+      const bool is_left_border,
+      const bool is_right_border) override final;
+  INHERIT_TO_STRING_KV("ObMultiVersionDIMicroBlockRowScanner", ObMultiVersionMicroBlockRowScanner,
+      K_(is_prev_micro_row_valid), K_(found_first_di_row));
+protected:
+  virtual int inner_get_next_row(const ObDatumRow *&row) override final;
+private:
+  int inner_get_next_di_row(const ObDatumRow *&row);
+  int inner_get_next_compact_di_row(const ObDatumRow *&ret_row);
+  int inner_get_next_header_info(
+    int64_t &index,
+    bool &version_fit,
+    bool &final_result,
+    ObDmlRowFlag &row_flag);
+  int locate_next_rowkey(int64_t &index);
+  int preprocess_di_rows();
+  int compact_rows_of_same_rowkey(
+      const int64_t insert_idx,
+      const int64_t delete_idx,
+      const ObDatumRow *&ret_row);
+  int check_meet_next_rowkey(
+      const int64_t start,
+      const int64_t end,
+      bool &meet_next_rowkey) const;
+  int try_cache_unfinished_row(
+      const int64_t insert_idx,
+      const int64_t delete_idx);
+  int get_trans_version(
+      int64_t &trans_version,
+      const int64_t index);
+  int set_row_trans_col(
+      const int64_t trans_version,
+      ObDatumRow &row);
+
+private:
+  bool is_prev_micro_row_valid_;
+  bool found_first_di_row_;
 };
 
 // multi version sstable micro block scanner for minor merge
@@ -353,22 +464,9 @@ public:
       : ObIMicroBlockRowScanner(allocator),
       trans_version_col_idx_(ObIMicroBlockReaderInfo::INVALID_ROW_INDEX),
       sql_sequence_col_idx_(ObIMicroBlockReaderInfo::INVALID_ROW_INDEX),
-      row_allocator_("MergeRowQueue", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
-      row_queue_(),
-      is_last_multi_version_row_(false),
-      is_row_queue_ready_(false),
-      scan_state_(SCAN_START),
       committed_trans_version_(INT64_MAX),
-      last_trans_state_(INT64_MAX),
-      read_trans_id_(),
-      last_trans_id_(),
-      first_rowkey_flag_(true),
-      have_output_row_flag_(false)
-  {
-    for (int i = 0; i < COMPACT_MAX_ROW; ++i) {
-      nop_pos_[i] = NULL;
-    }
-  }
+      last_trans_state_(INT64_MAX)
+  {}
   virtual ~ObMultiVersionMicroBlockMinorMergeRowScanner()
   {}
 
@@ -382,87 +480,38 @@ public:
       const bool is_left_border,
       const bool is_right_border) override final;
   void reuse() override;
-  virtual int apply_blockscan(
-      storage::ObBlockRowStore *block_row_store,
-      storage::ObTableStoreStat &table_store_stat) override final
+  virtual int apply_filter(const bool can_blockscan) override final
   {
-    UNUSEDx(block_row_store, table_store_stat);
+    UNUSED(can_blockscan);
     return OB_NOT_SUPPORTED;
   }
   virtual int get_next_rows() override
   { return OB_NOT_SUPPORTED; }
   int get_first_row_mvcc_info(bool &is_first_row, bool &is_shadow_row) const;
-  TO_STRING_KV(K_(macro_id), K_(is_last_multi_version_row), K_(is_row_queue_ready),
-               K_(row_queue), K_(start), K_(current), K_(last),
-               K_(scan_state), K_(committed_trans_version));
+  TO_STRING_KV(K_(macro_id), K_(start), K_(current), K_(last));
 protected:
   virtual int inner_get_next_row(const ObDatumRow *&row) override;
 private:
-  enum ScanState{
-    SCAN_START = 0,
-    GET_RUNNING_TRANS_ROW = 1,
-    PREPARE_COMMITTED_ROW_QUEUE = 2,
-    FILTER_ABORT_TRANS_ROW = 3,
-    COMPACT_COMMIT_TRANS_ROW = 4,
-    GET_ROW_FROM_ROW_QUEUE = 5,
-    LOCATE_LAST_COMMITTED_ROW = 6,
-  };
+  int get_trans_state(
+    const transaction::ObTransID &read_trans_id,
+    int64_t &state,
+    bool &can_read);
+  int64_t get_trans_state_from_cache(
+    const transaction::ObTransID &read_trans_id,
+    const transaction::ObTxSEQ &sql_seq,
+    bool &can_read);
+  int get_trans_state_from_tx_table(
+    const transaction::ObTransID &read_trans_id,
+    const transaction::ObTxSEQ &sql_seq,
+    int64_t &state,
+    bool &can_read);
+  int check_row_trans_state(bool &skip_curr_row);
 private:
-  int init_row_queue(const int64_t row_col_cnt);
-  int locate_last_committed_row();
-  void clear_row_queue_status();
-  int compact_first_row();
-  int compact_last_row();
-  int compact_row(
-      const ObDatumRow &former,
-      const int64_t row_compact_info_index,
-      ObDatumRow &result);
-  int find_uncommitted_row();
-  int filter_abort_trans_row(const ObDatumRow *&row);
-  int get_running_trans_row(const ObDatumRow *&row);
-  int compact_commit_trans_row(const ObDatumRow *&row);
-  int judge_trans_state(
-      const int64_t state,
-      const int64_t commit_trans_version);
-  void clear_scan_status();
-  int prepare_committed_row_queue(const ObDatumRow *&row);
-  int get_row_from_row_queue(const ObDatumRow *&row);
-  int check_curr_row_can_read(const transaction::ObTransID &trans_id, const transaction::ObTxSEQ &sql_seq, bool &can_read);
-  int compact_trans_row_into_row_queue();
-  int set_trans_version_for_uncommitted_row(ObDatumRow &row);
-  int get_trans_state(const transaction::ObTransID &trans_id,
-                       int64_t &state,
-                       int64_t &commit_trans_version);
-  int read_committed_row(bool &add_row_queue_flag, const ObDatumRow *&row);
-  int read_uncommitted_row(bool &can_read, const ObDatumRow *&row);
-  int add_row_into_row_queue(const ObDatumRow *&row);
-  int meet_uncommitted_last_row(const bool can_read, const ObDatumRow *&row);
-  int filter_unneeded_row(
-      bool &add_row_queue_flag,
-      bool &is_tombstone_row_flag);
-  int compact_shadow_row_to_last();
-
-private:
-  enum RowCompactInfoIndex{
-    COMPACT_FIRST_ROW = 0,
-    COMPACT_LAST_ROW = 1,
-    COMPACT_MAX_ROW,
-  };
   // multi version
   int64_t trans_version_col_idx_;
   int64_t sql_sequence_col_idx_;
-  common::ObArenaAllocator row_allocator_;
-  ObRowQueue row_queue_;
-  storage::ObNopPos *nop_pos_[COMPACT_MAX_ROW];
-  bool is_last_multi_version_row_;
-  bool is_row_queue_ready_;
-  ScanState scan_state_;
   int64_t committed_trans_version_;
   int64_t last_trans_state_;
-  transaction::ObTransID read_trans_id_;
-  transaction::ObTransID last_trans_id_;
-  bool first_rowkey_flag_;
-  bool have_output_row_flag_;
 };
 
 }

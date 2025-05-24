@@ -10,9 +10,8 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "storage/tx_table/ob_tx_data_hash_map.h"
+#include "ob_tx_data_hash_map.h"
 #include "storage/tx/ob_tx_data_define.h"
-#include "lib/utility/ob_macro_utils.h"
 
 namespace oceanbase {
 namespace storage {
@@ -57,7 +56,6 @@ int ObTxDataHashMap::init()
 int ObTxDataHashMap::insert(const transaction::ObTransID &key, ObTxData *value)
 {
   int ret = OB_SUCCESS;
-
   if (!key.is_valid() || OB_ISNULL(value)) {
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "invalid argument", K(key), KP(value));

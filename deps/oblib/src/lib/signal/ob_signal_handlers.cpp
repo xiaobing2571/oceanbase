@@ -12,17 +12,11 @@
 
 #define USING_LOG_PREFIX COMMON
 #define _GNU_SOURCE 1
-#include "lib/signal/ob_signal_handlers.h"
-#include <sys/prctl.h>
+#include "ob_signal_handlers.h"
 #include <dirent.h>
-#include <unistd.h>
-#include <fstream>
 #include <sys/wait.h>
-#include "lib/profile/ob_trace_id.h"
 #include "lib/utility/utility.h"
 #include "lib/signal/ob_libunwind.h"
-#include "lib/signal/ob_signal_struct.h"
-#include "lib/signal/ob_signal_utils.h"
 #include "lib/signal/ob_signal_worker.h"
 #include "lib/utility/ob_hang_fatal_error.h"
 #include "common/ob_common_utility.h"
@@ -47,7 +41,7 @@ ObSigFaststack &ObSigFaststack::get_instance()
   return sig_faststack;
 }
 
-static const int SIG_SET[] = {SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGURG};
+static const int SIG_SET[] = {SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGURG, SIGILL};
 static constexpr char MINICORE_SHELL_PATH[] = "tools/minicore.sh";
 static constexpr char FASTSTACK_SHELL_PATH[] = "tools/callstack.sh";
 static constexpr char MINICORE_SCRIPT[] = "if [ -e bin/minicore.py ]; then\n"
@@ -55,11 +49,17 @@ static constexpr char MINICORE_SCRIPT[] = "if [ -e bin/minicore.py ]; then\n"
 "fi\n"
 "[ $(ls -1 core.*.mini 2>/dev/null | wc -l) -gt 5 ] && ls -1 core.*.mini -t | tail -n 1 | xargs rm -f";
 
-static constexpr char FASTSTACK_SCRIPT[] = "if [ -x \"$(command -v obstack)\" ]; then\n"
-"  obstack `cat $(pwd)/run/observer.pid` > stack.`cat $(pwd)/run/observer.pid`.`date +%Y%m%d%H%M%S`\n"
+static constexpr char FASTSTACK_SCRIPT[] =
+"path_to_obstack=\"bin/obstack\"\n"
+"if [ ! -x \"$path_to_obstack\" ]; then\n"
+"  path_to_obstack=$(command -v obstack)\n"
+"fi\n"
+"if [ -x \"$path_to_obstack\" ]; then\n"
+"  $path_to_obstack `cat $(pwd)/run/observer.pid` > stack.`cat $(pwd)/run/observer.pid`.`date +%Y%m%d%H%M%S`\n"
 "fi\n"
 "[ $(ls -1 stack.* 2>/dev/null | wc -l) -gt 100 ] && ls -1 stack.* -t | tail -n 1 | xargs rm -f";
-
+const char *const FASTSTACK_SCRIPT_ARGV[] = {"/bin/sh", "-c", FASTSTACK_SCRIPT, NULL};
+const char *const FASTSTACK_SHELL_ARGV[] = {"/bin/sh", FASTSTACK_SHELL_PATH, NULL};
 static inline void handler(int sig, siginfo_t *s, void *p)
 {
   if (get_signal_handler() != nullptr) {
@@ -94,7 +94,7 @@ signal_handler_t &get_signal_handler()
 bool g_redirect_handler = false;
 static __thread int g_coredump_num = 0;
 
-#define COMMON_FMT "timestamp=%ld, tid=%ld, tname=%s, trace_id="TRACE_ID_FORMAT_V2", extra_info=(%s), lbt=%s"
+#define COMMON_FMT "timestamp=%ld, tid=%ld, tname=%s, trace_id=%s, lbt=%s"
 
 void coredump_cb(int, int, void*, void*);
 void ob_signal_handler(int sig, siginfo_t *si, void *context)
@@ -183,29 +183,35 @@ void coredump_cb(volatile int sig, volatile int sig_code, void* volatile sig_add
     char tname[16];
     prctl(PR_GET_NAME, tname);
     // backtrace
-    char bt[512];
+    char bt[512] = {'\0'};
     int64_t len = 0;
-#ifdef __x86_64__
-    safe_backtrace(bt, sizeof(bt) - 1, &len);
-#endif
-    bt[len++] = '\0';
     // extra
     const ObFatalErrExtraInfoGuard *extra_info = nullptr; // TODO: May deadlock, ObFatalErrExtraInfoGuard::get_thd_local_val_ptr();
-    uint64_t uval[4] = {0};
     auto *trace_id = ObCurTraceId::get_trace_id();
+    char trace_id_buf[128] = {'\0'};
     if (trace_id != nullptr) {
-      trace_id->get_uval(uval);
+      int64_t pos = trace_id->to_string(trace_id_buf, sizeof(trace_id_buf));
+      if (pos < sizeof(trace_id_buf)) {
+        trace_id_buf[pos]= '\0';
+      }
     }
     char print_buf[1024];
     const ucontext_t *con = (ucontext_t *)context;
 #if defined(__x86_64__)
     int64_t ip = con->uc_mcontext.gregs[REG_RIP];
     int64_t bp = con->uc_mcontext.gregs[REG_RBP]; // stack base
+    safe_backtrace(bt, sizeof(bt) - 1, &len);
+#elif defined(__aarch64__)
+    int64_t ip = con->uc_mcontext.regs[30];
+    int64_t bp = con->uc_mcontext.regs[29];
+    void* addrs[64];
+    int n_addr = light_backtrace(addrs, ARRAYSIZEOF(addrs), bp);
+    len += safe_parray(bt, sizeof(bt) - 1, (int64_t*)addrs, n_addr);
 #else
-    // TODO: ARM
     int64_t ip = -1;
     int64_t bp = -1;
 #endif
+    bt[len++] = '\0';
     char rlimit_core[32] = "unlimited";
     if (UINT64_MAX != g_rlimit_core) {
       lnprintf(rlimit_core, sizeof(rlimit_core), "%lu", g_rlimit_core);
@@ -220,21 +226,25 @@ void coredump_cb(volatile int sig, volatile int sig_code, void* volatile sig_add
     ssize_t print_len = lnprintf(print_buf, sizeof(print_buf),
                                  "%s IP=%lx, RBP=%lx, sig=%d, sig_code=%d, sig_addr=%p, RLIMIT_CORE=%s, "COMMON_FMT", ",
                                   crash_info, ip, bp, sig, sig_code, sig_addr, rlimit_core,
-                                  ts, GETTID(), tname, TRACE_ID_FORMAT_PARAM(uval),
-                                  (NULL == extra_info) ? NULL : to_cstring(*extra_info), bt);
-    const auto &si_guard = ObSqlInfoGuard::get_cur_guard();
-    char sql[] = "SQL=";
+                                  ts, GETTID(), tname, trace_id_buf, bt);
+    ObSqlInfo sql_info = ObSqlInfoGuard::get_tl_sql_info();
+    char sql_id[] = "SQL_ID=";
+    char sql_string[] = ", SQL_STRING=";
     char end[] = "\n";
-    struct iovec iov[4];
+    struct iovec iov[6];
     memset(iov, 0, sizeof(iov));
     iov[0].iov_base = print_buf;
     iov[0].iov_len = print_len;
-    iov[1].iov_base = sql;
-    iov[1].iov_len = strlen(sql);
-    iov[2].iov_base = NULL != si_guard ? si_guard->sql_.ptr() : NULL;
-    iov[2].iov_len = NULL != si_guard ? si_guard->sql_.length() : 0;
-    iov[3].iov_base = end;
-    iov[3].iov_len = strlen(end);
+    iov[1].iov_base = sql_id;
+    iov[1].iov_len = strlen(sql_id);
+    iov[2].iov_base = sql_info.sql_id_.ptr();
+    iov[2].iov_len = sql_info.sql_id_.length();
+    iov[3].iov_base = sql_string;
+    iov[3].iov_len = strlen(sql_string);
+    iov[4].iov_base = sql_info.sql_string_.ptr();
+    iov[4].iov_len = sql_info.sql_string_.length();
+    iov[5].iov_base = end;
+    iov[5].iov_len = strlen(end);
     writev(STDERR_FILENO, iov, sizeof(iov) / sizeof(iov[0]));
     if (OB_SUCC(ret)) {
       int status = 0;
@@ -281,19 +291,42 @@ int faststack()
   int64_t now = ObTimeUtility::fast_current_time();
   int64_t last = ATOMIC_LOAD(&last_ts);
   int ret = OB_SUCCESS;
+  pid_t pid;
   if (now - last < ObSigFaststack::get_instance().get_min_interval()) {
     ret = OB_EAGAIN;
   } else if (!ATOMIC_BCAS(&last_ts, last, now)) {
     ret = OB_EAGAIN;
   } else if (-1 == access(FASTSTACK_SHELL_PATH, R_OK)) {
-    if (0 == syscall(__NR_clone, CLONE_VFORK | CLONE_PARENT, nullptr, nullptr, nullptr, nullptr)) {
-      IGNORE_RETURN execlp("sh", "sh", "-c", FASTSTACK_SCRIPT, nullptr);
-      _exit(EXIT_FAILURE);
+    if ((pid = vfork()) < 0) {
+      LOG_WARN("fork first child failed");
+    } else if (pid == 0) { /* first child */
+      if ((pid = vfork()) < 0) {
+        LOG_WARN("fork second child failed");
+      } else if (pid > 0) {
+        _exit(EXIT_SUCCESS); /* parent from second fork == first child */
+      } else {
+        IGNORE_RETURN syscall(SYS_execve, "/bin/sh", FASTSTACK_SCRIPT_ARGV, nullptr);
+        _exit(EXIT_FAILURE);
+      }
+    }
+    if (waitpid(pid, NULL, 0) != pid) {
+      LOG_WARN("wait child process:FASTSTACK_SCRIPT failed");
     }
   } else if (-1 != access(FASTSTACK_SHELL_PATH, X_OK)) {
-    if (0 == syscall(__NR_clone, CLONE_VFORK | CLONE_PARENT, nullptr, nullptr, nullptr, nullptr)) {
-      IGNORE_RETURN execlp("sh", "sh", FASTSTACK_SHELL_PATH, nullptr);
-      _exit(EXIT_FAILURE);
+    if ((pid = vfork()) < 0) {
+      LOG_WARN("fork first child failed");
+    } else if (pid == 0) { /* first child */
+      if ((pid = vfork()) < 0) {
+        LOG_WARN("fork second child failed");
+      } else if (pid > 0) {
+        _exit(EXIT_SUCCESS); /* parent from second vfork == first child */
+      } else {
+        IGNORE_RETURN syscall(SYS_execve, "/bin/sh", FASTSTACK_SHELL_ARGV, nullptr);
+        _exit(EXIT_FAILURE);
+      }
+    }
+    if (waitpid(pid, NULL, 0) != pid) {
+      LOG_WARN("wait child process:FASTSTACK_SHELL failed");
     }
   }
   LOG_WARN("faststack", K(now), K(ret));

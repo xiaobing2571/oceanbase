@@ -17,6 +17,7 @@
 #include "sql/resolver/dml/ob_dml_resolver.h"
 #include "sql/printer/ob_raw_expr_printer.h"
 #include "share/schema/ob_schema_struct.h"
+#include "share/catalog/ob_catalog_utils.h"
 
 namespace oceanbase
 {
@@ -34,6 +35,7 @@ namespace sql
 
 #define PRINT_TABLE_NAME_NORMAL(table_item)                                 \
   do {                                                                		  \
+    ObString catalog_name = table_item->catalog_name_;                      \
     ObString database_name = table_item->synonym_name_.empty() ?         \
                             ( table_item->is_link_table() ?                 \
                               table_item->link_database_name_ :             \
@@ -41,6 +43,10 @@ namespace sql
                              table_item->synonym_db_name_;                  \
     ObString table_name = table_item->synonym_name_.empty() ? table_item->table_name_ : table_item->synonym_name_ ; \
     if (table_item->cte_type_ == TableItem::NOT_CTE) {								      \
+      if (!catalog_name.empty() && table_item->type_ == TableItem::BASE_TABLE && need_print_catalog_name(catalog_name)) { \
+        PRINT_IDENT_WITH_QUOT(catalog_name);                               \
+        DATA_PRINTF(".");                                                   \
+      }                                                                     \
       if (!database_name.empty()) {                                         \
         PRINT_IDENT_WITH_QUOT(database_name);                               \
         DATA_PRINTF(".");                                                   \
@@ -92,7 +98,8 @@ public:
   ObDMLStmtPrinter(char *buf, int64_t buf_len, int64_t *pos, const ObDMLStmt *stmt,
                    ObSchemaGetterGuard *schema_guard,
                    common::ObObjPrintParams print_params,
-                   const ParamStore *param_store = NULL);
+                   const ParamStore *param_store = NULL,
+                   const ObSQLSessionInfo *session = NULL);
   virtual ~ObDMLStmtPrinter();
   void enable_print_temp_table_as_cte() { print_cte_ = true; }
   void disable_print_temp_table_as_cte() { print_cte_ = false; }
@@ -104,14 +111,20 @@ public:
   int print_semi_info_to_subquery();
   int print_where();
   int print_order_by();
+  int print_approx();
   int print_limit();
   int print_fetch();
   int print_returning();
   int print_json_table(const TableItem *table_item);
+  int print_xml_table(const TableItem *table_item);
+  int print_values_table(const TableItem &table_item, bool no_print_alias);
+  int print_values_table_to_union_all(const TableItem &table_item, bool no_print_alias);
   int print_table(const TableItem *table_item,
                   bool no_print_alias = false);
+  int print_table_with_transpose(const TableItem *table_item);
   int print_table_with_subquery(const TableItem *table_item);
   int print_base_table(const TableItem *table_item);
+  int prepare_dblink_hint(ObQueryHint &query_hint_dblink);
   int print_hint();
   void set_is_root(bool is_root) { is_root_ = is_root; }
   void set_is_first_stmt_for_hint(bool is_first_stmt) { is_first_stmt_for_hint_ = is_first_stmt; }
@@ -137,6 +150,11 @@ public:
   int print_search_and_cycle(const ObSelectStmt *sub_select_stmt);
   bool is_root_stmt() const { return is_root_; }
   int print_with();
+  void set_is_print_view_definition(bool is_print_view_definition) {
+    print_params_.print_view_definition_ = is_print_view_definition;
+  }
+  bool is_print_view_definition() { return print_params_.print_view_definition_; }
+  bool need_print_catalog_name(const ObString& catalog_name);
 private:
   // added for json table
   int print_json_table_nested_column(const TableItem *table_item, const ObDmlJtColDef& col_def);
@@ -145,6 +163,8 @@ private:
   int print_binary_charset_collation(int64_t value, ObDataType data_type);
   int get_json_table_column_if_exists(int32_t id, ObDmlJtColDef* root, ObDmlJtColDef*& col);
   int build_json_table_nested_tree(const TableItem* table_item, ObIAllocator* allocator, ObDmlJtColDef*& root);
+  // add xml table namespace
+  int print_xml_namespace(const TableItem *table_item);
   // disallow copy
   DISALLOW_COPY_AND_ASSIGN(ObDMLStmtPrinter);
 
@@ -161,6 +181,7 @@ protected:
   ObObjPrintParams print_params_;
   ObRawExprPrinter expr_printer_;
   const ParamStore *param_store_;
+  const ObSQLSessionInfo *session_;
 };
 
 }

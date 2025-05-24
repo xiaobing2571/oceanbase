@@ -13,12 +13,7 @@
 #define USING_LOG_PREFIX RPC_FRAME
 
 #include "rpc/frame/ob_sql_processor.h"
-
-#include "lib/time/ob_time_utility.h"
-#include "rpc/ob_request.h"
-#include "lib/oblog/ob_trace_log.h"
-#include "lib/rc/context.h"
-#include "rpc/obmysql/ob_mysql_request_utils.h"
+#include "lib/other/recursion.h"
 using namespace oceanbase::common;
 using namespace oceanbase::rpc::frame;
 
@@ -27,6 +22,7 @@ int ObSqlProcessor::run()
   int ret = OB_SUCCESS;
   bool deseri_succ = true;
 
+  RECURSION_CHECKER_GUARD;
   run_timestamp_ = ObTimeUtility::current_time();
   if (OB_FAIL(setup_packet_sender())) {
     deseri_succ = false;
@@ -43,12 +39,16 @@ int ObSqlProcessor::run()
     } else {
     }
   }
-
-  if (OB_FAIL(response(ret))) {
-    LOG_WARN("response rpc result fail", K(ret));
+  int tmp_ret = OB_SUCCESS;
+  int tmp_ret_2 = OB_SUCCESS;
+  if (OB_TMP_FAIL(response(ret))) {
+    ret = (OB_SUCCESS != ret) ? ret : tmp_ret;
+    LOG_WARN("response rpc result fail", K(ret), K(tmp_ret));
   }
-  if (deseri_succ && OB_FAIL(after_process(ret))) {
-    LOG_WARN("after process fail", K(ret));
+
+  if (deseri_succ && OB_UNLIKELY(OB_SUCCESS != (tmp_ret_2 = after_process(ret)))) {
+    ret = (OB_SUCCESS != ret) ? ret : tmp_ret_2;
+    LOG_WARN("after process fail", K(ret), K(tmp_ret_2));
   }
 
   cleanup();
@@ -60,4 +60,3 @@ ObAddr ObSqlProcessor::get_peer() const
 {
   return SQL_REQ_OP.get_peer(req_);
 }
-

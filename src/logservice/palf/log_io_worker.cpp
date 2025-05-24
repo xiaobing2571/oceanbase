@@ -12,16 +12,7 @@
 #define USING_LOG_PREFIX PALF
 
 #include "log_io_worker.h"
-#include <time.h>                             // timespce
-#include <sys/prctl.h>                        // prctl
-#include "lib/ob_errno.h"                     // OB_SUCCESS
-#include "lib/stat/ob_session_stat.h"         // Session
-#include "lib/thread/ob_thread_name.h"        // set_thread_name
-#include "share/rc/ob_tenant_base.h"          // mtl_free
-#include "share/ob_throttling_utils.h"        //ObThrottlingUtils
-#include "log_io_task.h"                      // LogIOTask
 #include "palf_env_impl.h"                    // PalfEnvImpl
-#include "log_throttle.h"                     // LogWritingThrottle
 
 namespace oceanbase
 {
@@ -174,6 +165,7 @@ int LogIOWorker::notify_need_writing_throttling(const bool &need_throttling)
 
 void LogIOWorker::run1()
 {
+  ObDIActionGuard ag("LogService", "LogIOWorker", nullptr);
   lib::set_thread_name("IOWorker");
   (void) run_loop_();
 }
@@ -212,6 +204,7 @@ int LogIOWorker::handle_io_task_with_throttling_(LogIOTask *io_task)
 
 int LogIOWorker::handle_io_task_(LogIOTask *io_task)
 {
+  ObDIActionGuard ag(log_io_task_type_str(io_task->get_io_task_type()));
   int ret = OB_SUCCESS;
 	int64_t start_ts = ObTimeUtility::current_time();
   wait_cost_stat_.stat(start_ts - io_task->get_init_task_ts());
@@ -284,6 +277,7 @@ bool LogIOWorker::need_reduce_(LogIOTask *io_task)
 
 int LogIOWorker::reduce_io_task_(void *task)
 {
+  ObDIActionGuard ag("aggregate io task");
   OB_ASSERT(true == batch_io_task_mgr_.empty());
   int ret = OB_SUCCESS;
   LogIOTask *io_task = NULL;
@@ -310,7 +304,7 @@ int LogIOWorker::reduce_io_task_(void *task)
       // 2. there is full in each BatchLogIOFlushLogTask in 'batch_io_task_mgr_'.
       if (OB_SUCCESS != (tmp_ret = batch_io_task_mgr_.insert(flush_log_task))) {
         last_io_task_has_been_reduced = false;
-        PALF_LOG(WARN, "batch_io_task_mgr_ insert failed", K(tmp_ret));
+        PALF_LOG(TRACE, "batch_io_task_mgr_ insert failed", K(tmp_ret));
       } else if (OB_SUCCESS == (tmp_ret = queue_.pop(task))) {
       // When 'queue_' is empty, stop aggreating.
         update_throttling_options_();
@@ -341,7 +335,7 @@ int LogIOWorker::update_throttling_options_()
 }
 
 LogIOWorker::BatchLogIOFlushLogTaskMgr::BatchLogIOFlushLogTaskMgr()
-  : handle_count_(0), has_batched_size_(0), usable_count_(0), batch_width_(0),
+  : handle_count_(0), usable_count_(0), batch_width_(0),
     wait_cost_stat_(NULL)
 {}
 
@@ -395,7 +389,7 @@ int LogIOWorker::BatchLogIOFlushLogTaskMgr::init(int64_t batch_width,
 
 void LogIOWorker::BatchLogIOFlushLogTaskMgr::destroy()
 {
-  handle_count_ = has_batched_size_ = batch_width_ = usable_count_ = 0;
+  handle_count_ = batch_width_ = usable_count_ = 0;
   for (int i = 0; i < batch_io_task_array_.count(); i++) {
     BatchLogIOFlushLogTask *&io_task = batch_io_task_array_[i];
     if (NULL != io_task) {
@@ -416,8 +410,7 @@ int LogIOWorker::BatchLogIOFlushLogTaskMgr::insert(LogIOFlushLogTask *io_task)
   if (OB_FAIL(find_usable_batch_io_task_(palf_id, batch_io_task))) {
     PALF_LOG(WARN, "find_usable_batch_io_task_ failed", K(ret), K(palf_id));
   } else if (OB_FAIL(batch_io_task->push_back(io_task))) {
-    PALF_LOG(ERROR, "batch_io_task must have enouch space to hold io_task, unexpected error!!!",
-             K(ret), KP(batch_io_task));
+    PALF_LOG(TRACE, "push_back failed", K(ret), K(palf_id), KPC(io_task));
   } else {
   }
   return ret;
@@ -446,13 +439,12 @@ int LogIOWorker::BatchLogIOFlushLogTaskMgr::handle(const int64_t tg_id, IPalfEnv
         wait_cost_stat_->stat(io_task->get_count(), io_task->get_accum_in_queue_time());
       }
       io_task->reset_accum_in_queue_time();
-      PALF_LOG(TRACE, "BatchLogIOFlushLogTaskMgr::handle success", K(ret), K(has_batched_size_),
+      PALF_LOG(TRACE, "BatchLogIOFlushLogTaskMgr::handle success", K(ret), K(handle_count_),
           KP(io_task));
     }
     if (OB_NOT_NULL(io_task)) {
-      // 'handle_count_' and 'has_batched_size_' are used for statistics
-      handle_count_ += io_task->get_count() <= 1 ? 0 : 1;
-      has_batched_size_ += io_task->get_count() == 1 ? 0 : io_task->get_count();
+      // 'handle_count_' used for statistics
+      handle_count_ += io_task->get_count();
       io_task->reuse();
       usable_count_++;
     }

@@ -34,6 +34,7 @@ class ObISQLClient;
 namespace obrpc
 {
 class ObSrvRpcProxy;
+class ObAdminStorageArg;
 }
 
 namespace share
@@ -44,6 +45,7 @@ namespace schema
 class ObMultiVersionSchemaService;
 class ObTableSchema;
 class ObTenantSchema;
+class ObSimpleTableSchemaV2;
 }
 }
 
@@ -103,6 +105,12 @@ private:
   virtual int check_is_all_server_empty(bool &is_empty);
   virtual int check_all_server_bootstrap_mode_match(bool &match);
   virtual int notify_sys_tenant_root_key();
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+  virtual int check_and_notify_logservice_access_point();
+#endif
+#ifdef OB_BUILD_SHARED_STORAGE
+  virtual int check_and_notify_shared_storage_info();
+#endif
   virtual int notify_sys_tenant_server_unit_resource();
   virtual int create_ls();
   virtual int wait_elect_ls(common::ObAddr &master_rs);
@@ -125,15 +133,16 @@ public:
   public:
     TableIdCompare() : ret_(common::OB_SUCCESS) {}
     ~TableIdCompare() {}
-    bool operator() (const share::schema::ObTableSchema* left,
-                     const share::schema::ObTableSchema* right);
+    bool operator() (const share::schema::ObSimpleTableSchemaV2* left,
+                     const share::schema::ObSimpleTableSchemaV2* right);
     int get_ret() const { return ret_; }
-  private:
+private:
     int ret_;
   };
   explicit ObBootstrap(obrpc::ObSrvRpcProxy &rpc_proxy,
                        share::ObLSTableOperator &lst_operator,
                        ObDDLService &ddl_service,
+                       ObTenantDDLService &tenant_ddl_service,
                        ObUnitManager &unit_mgr,
                        common::ObServerConfig &config,
                        const obrpc::ObBootstrapArg &arg,
@@ -145,12 +154,12 @@ public:
       ObDDLService &ddl_service,
       common::ObIArray<share::schema::ObTableSchema> &table_schemas);
   int construct_all_schema(
-      common::ObIArray<share::schema::ObTableSchema> &table_schemas);
+      common::ObSArray<share::schema::ObTableSchema> &table_schemas,
+      ObIAllocator &allocator);
   int sort_schema(const common::ObIArray<share::schema::ObTableSchema> &table_schemas,
                   common::ObIArray<share::schema::ObTableSchema> &sort_table_schemas);
 private:
   static const int64_t HEAT_BEAT_INTERVAL_US = 2 * 1000 * 1000; //2s
-  static const int64_t WAIT_RS_IN_SERVICE_TIMEOUT_US = 40 * 1000 * 1000; //40s
   static const int64_t BATCH_INSERT_SCHEMA_CNT = 128;
   virtual int generate_table_schema_array_for_create_partition(
       const share::schema::ObTableSchema &tschema,
@@ -163,20 +172,22 @@ private:
   virtual int construct_schema(
       const share::schema_create_func func,
       share::schema::ObTableSchema &tschema);
-  virtual int broadcast_sys_schema(
-      const common::ObSArray<share::schema::ObTableSchema> &table_schemas);
+  virtual int broadcast_sys_schema();
   static int batch_create_schema(
       ObDDLService &ddl_service,
       common::ObIArray<share::schema::ObTableSchema> &table_schemas,
       const int64_t begin, const int64_t end);
   virtual int check_is_already_bootstrap(bool &is_bootstrap);
   virtual int init_global_stat();
-  virtual int init_sequence_id();
   virtual int init_system_data();
   virtual int init_all_zone_table();
   virtual int init_multiple_zone_deployment_table(common::ObISQLClient &sql_client);
   virtual int add_servers_in_rs_list(rootserver::ObServerZoneOpService &server_zone_op_service);
-  virtual int wait_all_rs_in_service();
+#ifdef OB_BUILD_SHARED_STORAGE
+  virtual int write_shared_storage_args();
+  virtual int write_shared_storage_args_for_zone(const ObZone &zone, const ObRegion &region,
+      const obrpc::ObAdminStorageArg &storage_args);
+#endif
   template<typename SCHEMA>
     int set_replica_options(SCHEMA &schema);
   int build_zone_region_list(
@@ -201,6 +212,7 @@ private:
 private:
   share::ObLSTableOperator &lst_operator_;
   ObDDLService &ddl_service_;
+  ObTenantDDLService &tenant_ddl_service_;
   ObUnitManager &unit_mgr_;
   const obrpc::ObBootstrapArg &arg_;
   obrpc::ObCommonRpcProxy &common_proxy_;

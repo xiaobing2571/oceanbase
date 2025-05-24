@@ -15,6 +15,7 @@
 #include "share/ob_rpc_struct.h"
 #include "sql/resolver/ob_stmt.h"
 #include "sql/resolver/ob_cmd.h"
+#include "sql/resolver/dml/ob_hint.h"
 #include "share/ob_rpc_struct.h"
 namespace oceanbase
 {
@@ -25,10 +26,12 @@ class ObDDLStmt : public ObStmt, public ObICmd
   const static int OB_DEFAULT_ARRAY_SIZE = 16;
 public:
   ObDDLStmt(common::ObIAllocator *name_pool, stmt::StmtType type)
-    : ObStmt(name_pool, type), parallelism_(1L), compact_level_(share::SORT_COMPACT_LEVEL)
+      : ObStmt(name_pool, type), parallelism_(1L), has_parallel_hint_(false),
+        has_append_hint_(false)
   {
   }
-  explicit ObDDLStmt(stmt::StmtType type): ObStmt(type)
+  explicit ObDDLStmt(stmt::StmtType type)
+      : ObStmt(type), parallelism_(1L), has_parallel_hint_(false), has_append_hint_(false)
   {
   }
   virtual ~ObDDLStmt() {}
@@ -46,15 +49,19 @@ public:
   virtual int get_first_stmt(common::ObString &first_stmt);
   void set_parallelism(const int64_t parallelism) { parallelism_ = parallelism; }
   int64_t &get_parallelism() { return parallelism_; }
-  void set_compact_level(int64_t compact_level) {
-    compact_level_ = static_cast<share::SortCompactLevel>(compact_level);
-  };
-  share::SortCompactLevel get_compact_level() { return compact_level_; }
+  void set_has_parallel_hint(bool has_parallel_hint) { has_parallel_hint_ = has_parallel_hint; }
+  bool get_has_parallel_hint() const { return has_parallel_hint_; }
+  void set_has_append_hint(bool has_append_hint) { has_append_hint_ = has_append_hint; }
+  bool get_has_append_hint() const { return has_append_hint_; }
+  void set_direct_load_hint(const ObDirectLoadHint &hint) { direct_load_hint_.merge(hint); }
+  const ObDirectLoadHint &get_direct_load_hint() const { return direct_load_hint_; }
 protected:
   ObArenaAllocator allocator_;
 private:
   int64_t parallelism_;
-  share::SortCompactLevel compact_level_;
+  bool has_parallel_hint_;
+  bool has_append_hint_;
+  ObDirectLoadHint direct_load_hint_;
 
   DISALLOW_COPY_AND_ASSIGN(ObDDLStmt);
 };

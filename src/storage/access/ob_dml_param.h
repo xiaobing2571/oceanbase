@@ -46,7 +46,8 @@ struct ObStorageDatum;
 }
 namespace storage
 {
-
+class ObStoreCtxGuard;
+struct ObMdsReadInfoCollector;
 //
 // Project storage output row to expression array, the core project logic is:
 //
@@ -135,7 +136,13 @@ public:
         allocator_(&CURRENT_CONTEXT->get_arena_allocator()),
         need_scn_(false),
         need_switch_param_(false),
-        is_thread_scope_(true)
+        is_mds_query_(false),
+        is_thread_scope_(true),
+        tx_seq_base_(-1),
+        read_version_range_(),
+        need_update_tablet_param_(false),
+        in_row_cache_threshold_(common::DEFAULT_MAX_MULTI_GET_CACHE_AWARE_ROW_NUM),
+        mds_collector_(nullptr)
   {}
   virtual ~ObTableScanParam() {}
 public:
@@ -149,14 +156,30 @@ public:
   common::SampleInfo sample_info_;
   bool need_scn_;
   bool need_switch_param_;
+  bool is_mds_query_;
   OB_INLINE virtual bool is_valid() const {
-    return  snapshot_.valid_ && ObVTableScanParam::is_valid();
+    return  snapshot_.valid_ && ObVTableScanParam::is_valid() && (!is_mds_query_ || nullptr != mds_collector_);
   }
   OB_INLINE bool use_index_skip_scan() const {
     return (1 == ss_key_ranges_.count()) && (!ss_key_ranges_.at(0).is_whole_range());
   }
+  OB_INLINE bool is_mview_query() const {
+    return nullptr != op_filters_ && scan_flag_.is_mr_mview_query();
+  }
+  void destroy() override
+  {
+    if (OB_UNLIKELY(ss_key_ranges_.get_capacity() > OB_DEFAULT_RANGE_COUNT)) {
+      ss_key_ranges_.destroy();
+    }
+    ObVTableScanParam::destroy();
+  }
   bool is_thread_scope_;
   ObRangeArray ss_key_ranges_;  // used for index skip scan, use as postfix range for ObVTableScanParam::key_ranges_
+  int64_t tx_seq_base_;  // used by lob when main table is read_latest
+  ObVersionRange read_version_range_;
+  bool need_update_tablet_param_; // whether need to update tablet-level param, such as split filter param
+  int64_t in_row_cache_threshold_;
+  ObMdsReadInfoCollector *mds_collector_; // used for collect mds info when query mds sstable
 
   DECLARE_VIRTUAL_TO_STRING;
 private:
@@ -177,6 +200,7 @@ struct ObDMLBaseParam
         prelock_(false),
         is_batch_stmt_(false),
         dml_allocator_(nullptr),
+        store_ctx_guard_(nullptr),
         encrypt_meta_(NULL),
         encrypt_meta_legacy_(),
         spec_seq_no_(),
@@ -184,7 +208,10 @@ struct ObDMLBaseParam
         branch_id_(0),
         direct_insert_task_id_(0),
         write_flag_(),
-        check_schema_version_(true)
+        check_schema_version_(true),
+        ddl_task_id_(0),
+        lob_allocator_(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
+        data_row_for_lob_(nullptr)
   {
   }
 
@@ -203,7 +230,7 @@ struct ObDMLBaseParam
   bool prelock_;
   bool is_batch_stmt_;
   mutable common::ObIAllocator *dml_allocator_;
-
+  mutable ObStoreCtxGuard *store_ctx_guard_;
   // table_id_, local_index_id_ and its encrypt_meta
   const common::ObIArray<transaction::ObEncryptMetaCache> *encrypt_meta_;
   common::ObSEArray<transaction::ObEncryptMetaCache, 1> encrypt_meta_legacy_;
@@ -218,8 +245,10 @@ struct ObDMLBaseParam
   // write flag for inner write processing
   concurrent_control::ObWriteFlag write_flag_;
   bool check_schema_version_;
-  bool is_valid() const { return (timeout_ > 0 && schema_version_ >= 0); }
-  bool is_direct_insert() const { return (direct_insert_task_id_ > 0); }
+  int64_t ddl_task_id_;
+  mutable ObArenaAllocator lob_allocator_;
+  const blocksstable::ObDatumRow *data_row_for_lob_; // for tablet split
+  bool is_valid() const { return (timeout_ > 0 && schema_version_ >= 0) && nullptr != store_ctx_guard_; }
   DECLARE_TO_STRING;
 };
 

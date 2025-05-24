@@ -20,7 +20,6 @@
 
 namespace oceanbase
 {
-using jit::expr::ObColumnIndexProvider;
 namespace sql
 {
 class ObExprRegexp;
@@ -48,7 +47,8 @@ class ObExprCollectionConstruct;
 class ObExprObjectConstruct;
 class ObExprCalcPartitionId;
 class ObExprOpSubQueryInPl;
-
+class ObExprUdtConstruct;
+class ObExprUDTAttributeAccess;
 typedef common::ObSEArray<ObIterExprOperator*, 2> PhyIterExprDesc;
 
 class ObExprGeneratorImpl: public ObExprGenerator, public ObRawExprVisitor
@@ -57,13 +57,13 @@ public:
   ObExprGeneratorImpl(int16_t cur_regexp_op_count,
                       int16_t cur_like_op_count,
                       uint32_t *next_expr_id,
-                      ObColumnIndexProvider &column_idx_provider);
+                      RowDesc &column_idx_provider);
 
   ObExprGeneratorImpl(ObExprOperatorFactory &factory,
                       int16_t cur_regexp_op_count,
                       int16_t cur_like_op_count,
                       uint32_t *next_expr_id,
-                      ObColumnIndexProvider &column_idx_provider);
+                      RowDesc &column_idx_provider);
   virtual ~ObExprGeneratorImpl();
   virtual int generate(ObRawExpr &raw_expr, ObSqlExpression &out_expr);
 
@@ -96,6 +96,8 @@ private:
   virtual int visit(ObWinFunRawExpr &expr);
   virtual int visit(ObPseudoColumnRawExpr &expr);
   virtual int visit(ObPlQueryRefRawExpr &expr);
+  virtual int visit(ObMatchFunRawExpr &expr);
+  virtual int visit(ObUnpivotRawExpr &expr);
   virtual bool skip_child(ObRawExpr &expr);
 private:
   // types and constants
@@ -132,6 +134,8 @@ private:
   inline int visit_pl_object_construct_expr(ObRawExpr &expr, ObExprObjectConstruct *pl_object_construct);
   inline int visit_pl_get_cursor_attr_expr(
     ObRawExpr &expr, ObExprPLGetCursorAttr *pl_get_cursor_attr);
+  inline int visit_sql_udt_construct_expr(ObRawExpr &expr, ObExprUdtConstruct *udt_construct);
+  inline int visit_sql_udt_attr_access_expr(ObRawExpr &expr, ObExprUDTAttributeAccess *udt_attr_access);
 
   // %item_pos is the position of %raw_expr (infix expr item) in infix_expr_.exprs_ array.
   int add_child_infix_expr(ObRawExpr &raw_expr, const int64_t item_pos,
@@ -147,7 +151,7 @@ private:
   ObSqlExpression *sql_expr_;  // generated postfix expression
   int16_t cur_regexp_op_count_;
   int16_t cur_like_op_count_;
-  ObColumnIndexProvider &column_idx_provider_;
+  RowDesc &column_idx_provider_;
   common::ObArenaAllocator inner_alloc_;
   ObExprOperatorFactory inner_factory_;
   ObExprOperatorFactory &factory_;

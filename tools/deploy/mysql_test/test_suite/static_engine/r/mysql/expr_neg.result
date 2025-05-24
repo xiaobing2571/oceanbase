@@ -148,6 +148,9 @@ create table t (t1 tinyint,
 insert into t values (1, -1, 1, -1, 1, 1, 1, 1, 1, 1, -0.2, 0.3, 0.4, 0.5, -0.6, 0.7,
                      '1993-03-20', '1993-03-20', '1993-03-20', '10:10:10', '1993', '0.8', '0.9', '1.0', '1.1',
                      '1.2', 1, 'b', 'b');
+Warnings:
+Warning	1265	Data truncated for column 't15' at row 1
+Warning	1265	Data truncated for column '"test"."t"."t16"' at row 1
 insert into t(t1) values (null);
 
 
@@ -625,7 +628,7 @@ Query Plan
 ===============================================
 |ID|OPERATOR       |NAME|EST.ROWS|EST.TIME(us)|
 -----------------------------------------------
-|0 |TABLE FULL SCAN|t   |2       |3           |
+|0 |TABLE FULL SCAN|t   |2       |16          |
 ===============================================
 Outputs & filters:
 -------------------------------------
@@ -645,11 +648,11 @@ Query Plan
 ===============================================
 |ID|OPERATOR       |NAME|EST.ROWS|EST.TIME(us)|
 -----------------------------------------------
-|0 |TABLE FULL SCAN|t   |2       |3           |
+|0 |TABLE FULL SCAN|t   |2       |16          |
 ===============================================
 Outputs & filters:
 -------------------------------------
-  0 - output([neg(cast(t.t25, DOUBLE(-1, -1)))]), filter(nil)
+  0 - output([neg(cast(t.t25, DOUBLE(-1, -1)))]), filter(nil), rowset=16
       access([t.t25]), partitions(p0)
       is_index_back=false, is_global_index=false, 
       range_key([t.__pk_increment]), range(MIN ; MAX)always true
@@ -665,11 +668,11 @@ Query Plan
 ===============================================
 |ID|OPERATOR       |NAME|EST.ROWS|EST.TIME(us)|
 -----------------------------------------------
-|0 |TABLE FULL SCAN|t   |2       |3           |
+|0 |TABLE FULL SCAN|t   |2       |16          |
 ===============================================
 Outputs & filters:
 -------------------------------------
-  0 - output([neg(cast(t.t26, DOUBLE(-1, -1)))]), filter(nil)
+  0 - output([neg(cast(t.t26, DOUBLE(-1, -1)))]), filter(nil), rowset=16
       access([t.t26]), partitions(p0)
       is_index_back=false, is_global_index=false, 
       range_key([t.__pk_increment]), range(MIN ; MAX)always true

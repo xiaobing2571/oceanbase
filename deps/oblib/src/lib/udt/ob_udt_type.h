@@ -48,9 +48,7 @@ public:
   bool is_same(ObSqlUDTAttrMeta &other) {
     bool is_same = (order_ == other.order_);
     if (is_same) {
-      if ((type_info_.is_user_defined_sql_type()
-      // || type_info_.is_collection_sql_type()
-      )) {
+      if ((type_info_.is_user_defined_sql_type() || type_info_.is_collection_sql_type())) {
         is_same = (type_info_.get_type() == other.type_info_.get_type()
                    && type_info_.get_scale() == other.type_info_.get_scale());
       } else {
@@ -67,6 +65,10 @@ typedef struct ObSqlUDTMeta
 {
   OB_UNIS_VERSION(1);
 public:
+  ObSqlUDTMeta(common::ObIAllocator *alloc = NULL)
+  {
+    reset();
+  }
   void set_name(ObString &name)
   {
     udt_name_ = name.ptr();
@@ -116,6 +118,7 @@ public:
 
   int deep_copy(ObIAllocator &allocator, ObSqlUDTMeta *&dst) const;
 
+  inline uint64_t get_signature() const { return udt_id_; }
   TO_STRING_KV(K_(attribute_cnt),
                K_(fixed_attr_cnt),
                K_(fixed_offset),
@@ -191,6 +194,7 @@ public:
   static uint32_t get_offset_array_len(uint32_t count);
   static int set_null_bitmap_pos(char *bitmap_start, uint32_t bitmap_len, uint32_t pos);
   static int get_null_bitmap_pos(const char *bitmap_start, uint32_t bitmap_len, uint32_t pos, bool &is_set);
+  static inline void increase_varray_null_count(char *null_count) { (*reinterpret_cast<int32_t *>(null_count))++; }
 
   TO_STRING_KV(KP_(allocator), K_(udt_meta), K_(udt_data));
 
@@ -199,7 +203,7 @@ private:
 
   inline int32_t get_attr_offset(uint32_t index, uint32_t null_bitmap_offset, bool is_varray_element = false) {
 
-    int32_t count_offset = is_varray_element ? sizeof(uint32) : 0;
+    int32_t count_offset = is_varray_element ? sizeof(uint32) + sizeof(uint32) : 0;
     return reinterpret_cast<int32_t *>(udt_data_.ptr() + null_bitmap_offset + count_offset)[index];
   }
 

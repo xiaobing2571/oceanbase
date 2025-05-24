@@ -78,10 +78,28 @@ public:
 
 #define PS_STATIC_DEFENSE_CHECK(checker, len)              \
   if (OB_FAIL(ret)) {                                      \
-  } else if (nullptr != checker                            \
-    && OB_FAIL(checker->detection(len))) {                 \
+  } else if (nullptr != (checker)                          \
+    && OB_FAIL((checker)->detection(len))) {               \
     LOG_WARN("memory access out of bounds", K(ret));       \
   } else
+
+struct ObPsSessionInfoParamsCleaner
+{
+public:
+  ObPsSessionInfoParamsCleaner(): ret_(OB_SUCCESS) {}
+  void operator() (common::hash::HashMapPair<uint64_t, ObPsSessionInfo *> &entry);
+  int ret_;
+};
+
+struct ObPsSessionInfoParamsAssignment
+{
+public:
+  ObPsSessionInfoParamsAssignment(sql::ParamTypeArray &param_types):
+    ret_(OB_SUCCESS), param_types_(param_types) {}
+  void operator() (common::hash::HashMapPair<uint64_t, ObPsSessionInfo *> &entry);
+  int ret_;
+  sql::ParamTypeArray &param_types_;
+};
 
 class ObMPStmtExecute : public ObMPBase
 {
@@ -96,6 +114,7 @@ public:
   // see parse_param_value()
   static int parse_basic_param_value(ObIAllocator &allocator,
                                     const uint32_t type,
+                                    sql::ObSQLSessionInfo *session,
                                     const ObCharsetType charset,
                                     const ObCharsetType ncharset,
                                     const ObCollationType cs_type,
@@ -197,7 +216,9 @@ protected:
   inline void set_param(ParamStore *params) { params_ = params; }
   sql::ObSqlCtx &get_ctx() { return ctx_; }
   ObQueryRetryCtrl &get_retry_ctrl() { return retry_ctrl_; }
-  void record_stat(const sql::stmt::StmtType type, const int64_t end_time) const;
+  void record_stat(const sql::stmt::StmtType type, const int64_t end_time,
+                   const sql::ObSQLSessionInfo& session, const int64_t ret,
+                   const ObMySQLResultSet &result) const;
   int request_params(sql::ObSQLSessionInfo *session,
                      const char* &pos,
                      uint32_t ps_stmt_checksum,
@@ -246,11 +267,12 @@ private:
   int init_arraybinding_field(int64_t column_field_cnt, const ColumnsFieldIArray *column_fields);
 
   int init_row_for_arraybinding(ObIAllocator &alloc, int64_t array_binding_row_num);
-  int check_param_type_for_arraybinding(
-    sql::ObSQLSessionInfo *session_info, sql::ParamTypeInfoArray &param_type_infos);
+  int check_precondition_for_arraybinding(const ObSQLSessionInfo &session_info);
+  int check_param_type_for_arraybinding(sql::ParamTypeInfoArray &param_type_infos);
   int check_param_value_for_arraybinding(ObObjParam &param);
   int construct_execute_param_for_arraybinding(int64_t pos);
-  void reset_complex_param_memory(ParamStore *params, sql::ObSQLSessionInfo &session_info);
+  int param_assign_after_convert_int2number(ObObj& dst, const ObObj& src);
+  void reset_complex_param_memory(ParamStore *params, sql::ObSQLSessionInfo *session_info = nullptr);
   int save_exception_for_arraybinding(
     int64_t pos, int error_code, ObIArray<ObSavedException> &exception_array);
   //int after_do_process_for_arraybinding(ObMySQLResultSet &result);
@@ -331,6 +353,7 @@ private:
   bool is_contain_complex_element(const sql::ParamTypeArray &param_types) const;
 
   virtual int before_process();
+  virtual int after_process(int error_code);
   int response_query_header(sql::ObSQLSessionInfo &session, pl::ObDbmsCursorInfo &cursor);
   //重载response，在response中不去调用flush_buffer(true)；flush_buffer(true)在需要回包时显示调用
 

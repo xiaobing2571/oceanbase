@@ -17,6 +17,7 @@
 #include "lib/worker.h"
 #include "lib/container/ob_iarray.h"
 #include "storage/tx/ob_trans_define.h"
+#include "storage/tablet/ob_tablet_create_delete_mds_user_data.h"
 #include "storage/ob_storage_schema.h"
 
 namespace oceanbase
@@ -55,6 +56,14 @@ class ObLSHandle;
 class ObTabletHandle;
 class ObLSTabletService;
 
+enum class ObTabletCreateThrottlingLevel : uint8_t
+{
+    STRICT = 0, // throttling by config like 1G2W, used in leader creation
+    SOFT = 1,   // adaptive, could break config to 1G3W, used in HA scene
+    FREE = 2,   // most free, 1G4W is the max creation speed without influcing stability
+    MAX
+};
+
 class ObTabletCreateMdsHelper
 {
 public:
@@ -78,7 +87,7 @@ public:
       const obrpc::ObBatchCreateTabletArg &arg,
       const share::SCN &scn,
       mds::BufferCtx &ctx);
-  static int check_create_new_tablets(const int64_t inc_tablet_cnt, const bool is_soft_limit = false);
+  static int check_create_new_tablets(const int64_t inc_tablet_cnt, const ObTabletCreateThrottlingLevel level);
 private:
   static int check_create_new_tablets(const obrpc::ObBatchCreateTabletArg &arg, const bool is_replay = false);
   static int check_create_arg(
@@ -149,18 +158,26 @@ private:
   static int get_ls(
       const share::ObLSID &ls_id,
       ObLSHandle &ls_handle);
-  static int set_tablet_normal_status(
+  static int set_tablet_status(
       ObLSTabletService *ls_tablet_service,
       ObTabletHandle &tablet_handle,
       const bool for_replay,
       const share::SCN &scn,
       mds::BufferCtx &ctx,
-      const bool for_old_mds);
+      const bool for_old_mds,
+      const storage::ObTabletMdsUserDataType &create_type,
+      const int64_t create_commit_version);
   static void handle_ret_for_replay(int &ret);
   static int convert_schemas(obrpc::ObBatchCreateTabletArg &arg);
-  static bool check_need_create_empty_major_sstable(
-      const ObCreateTabletSchema &create_tablet_schema,
-      const obrpc::ObCreateTabletExtraInfo &create_tablet_extra_info);
+  static int check_and_get_create_tablet_schema_info(
+      const ObSArray<ObCreateTabletSchema*> &create_tablet_schemas,
+      const ObSArray<obrpc::ObCreateTabletExtraInfo> &create_tablet_extra_infos,
+      const obrpc::ObCreateTabletInfo &info,
+      const int64_t index,
+      const ObCreateTabletSchema *&create_tablet_schema,
+      bool &need_create_empty_major_sstable,
+      bool &micro_index_clustered,
+      ObTabletID &split_src_tablet_id);
 };
 } // namespace storage
 } // namespace oceanbase

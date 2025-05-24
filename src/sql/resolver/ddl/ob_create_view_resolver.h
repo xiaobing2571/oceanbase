@@ -45,29 +45,48 @@ class ObCreateViewResolver : public ObCreateTableResolverBase
   static const int64_t PARTITION_NODE = 9;
   static const int64_t TABLE_OPTION_NODE = 10;
   static const int64_t HINT_NODE = 11;
-  static const int64_t ROOT_NUM_CHILD = 12;
+  static const int64_t COLUMN_GROUP_NODE = 12;
+  static const int64_t ROOT_NUM_CHILD = 13;
 
 public:
   explicit ObCreateViewResolver(ObResolverParams &params);
   virtual ~ObCreateViewResolver();
 
   virtual int resolve(const ParseNode &parse_tree);
+  static int resolve_select_node_for_force_view(bool &add_undefined_columns,
+                                                ParseNode *select_stmt_node,
+                                                ObIArray<SelectItem> &select_items);
+  static int add_undefined_column_infos(const uint64_t tenant_id,
+                                        ObIArray<SelectItem> &select_items,
+                                        ObTableSchema &table_schema,
+                                        const common::ObIArray<ObString> &column_list);
+  static int try_add_undefined_column_infos(const uint64_t tenant_id,
+                                            bool has_resolved_field_list,
+                                            ParseNode *select_stmt_node,
+                                            ObSelectStmt &select_stmt,
+                                            ObTableSchema &table_schema,
+                                            const common::ObIArray<ObString> &column_list);
   static int add_column_infos(const uint64_t tenant_id,
                               ObSelectStmt &select_stmt,
                               ObTableSchema &table_schema,
                               common::ObIAllocator &alloc,
                               sql::ObSQLSessionInfo &session_info,
-                              const common::ObIArray<ObString> &column_list);
+                              const common::ObIArray<ObString> &column_list,
+                              const common::ObIArray<ObString> &comment_list,
+                              bool is_from_create_mview = false);
   static int fill_column_meta_infos(const ObRawExpr &expr,
                                     const ObCharsetType charset_type,
                                     const uint64_t table_id,
-                                    ObColumnSchemaV2 &column);
+                                    sql::ObSQLSessionInfo &session_info,
+                                    ObColumnSchemaV2 &column,
+                                    bool is_from_create_mview = false);
   static int resolve_column_default_value(const sql::ObSelectStmt *select_stmt,
                                         const sql::SelectItem &select_item,
                                         schema::ObColumnSchemaV2 &column_schema,
                                         common::ObIAllocator &alloc,
                                         sql::ObSQLSessionInfo &session_info);
   static int resolve_columns_nullable_value(const sql::ObSelectStmt *select_stmt,
+                                            const ObTableSchema &table_schema,
                                             const sql::SelectItem &select_item,
                                             ObColumnSchemaV2 &column_schema,
                                             ObIAllocator &alloc,
@@ -77,7 +96,13 @@ private:
   int check_privilege(ObCreateTableStmt *stmt,
                       ObSelectStmt *select_stmt);
   int resolve_column_list(ParseNode *view_columns_node,
-                          common::ObIArray<common::ObString> &column_list);
+                          common::ObIArray<common::ObString> &column_list,
+                          ParseNode *&mv_primary_key_node);
+  int resolve_mv_options(const ObSelectStmt *stmt,
+                         ParseNode *options_node,
+                         ObMVRefreshInfo &refresh_info,
+                         ObTableSchema &table_schema,
+                         ObTableSchema &container_table_schema);
   int resolve_mv_refresh_info(ParseNode *refresh_info_node,
                               ObMVRefreshInfo &refresh_info);
 
@@ -87,7 +112,9 @@ private:
   int check_view_columns(ObSelectStmt &select_stmt,
                          ParseNode *view_columns_node,
                          share::schema::ObErrorInfo &error_info,
-                         const bool is_force_view);
+                         const bool is_force_view,
+                         bool &can_expand_star,
+                         bool &add_undefined_columns);
   int check_privilege_needed(ObCreateTableStmt &stmt,
                              ObSelectStmt &select_stmt,
                              const bool is_force_view);
@@ -101,9 +128,12 @@ private:
    * use stmt_print instead of ObSelectStmtPrinter. When do_print return OB_SIZE_OVERFLOW
    * and the buf_len is less than OB_MAX_PACKET_LENGTH, stmt_print will expand buf and try again.
    */
-  int stmt_print(const ObSelectStmt *stmt,
-                 common::ObIArray<common::ObString> *column_list,
-                 common::ObString &expanded_view);
+  int print_rebuilt_view_stmt(const ObSelectStmt *stmt,
+                              common::ObIArray<common::ObString> *column_list,
+                              common::ObString &expanded_view);
+  int print_star_expanded_view_stmt(common::ObString &expanded_view,
+                                    const int64_t view_definition_start_pos,
+                                    const int64_t view_definition_end_pos);
   int collect_dependency_infos(ObQueryCtx *query_ctx,
                                obrpc::ObCreateTableArg &create_arg);
   int get_sel_priv_tables_in_subquery(const ObSelectStmt *child_stmt,
@@ -112,7 +142,18 @@ private:
                            hash::ObHashMap<int64_t, const TableItem *> &select_tables,
                            hash::ObHashMap<int64_t, const TableItem *> &any_tables);
   int add_hidden_tablet_seq_col(ObTableSchema &table_schema);
-
+  int resolve_materialized_view_container_table(ParseNode *partition_node,
+                                                ParseNode *mv_primary_key_node,
+                                                ObTableSchema &container_table_schema,
+                                                ObSEArray<ObConstraint,4>& csts);
+  int resolve_primary_key_node(ParseNode &pk_node, ObTableSchema &table_schema);
+  int check_on_query_computation_supported(const ObSelectStmt *stmt);
+  int load_mview_dep_session_vars(ObSQLSessionInfo &session_info,
+                                  ObSelectStmt *stmt,
+                                  ObLocalSessionVar &dep_vars);
+  int get_dep_session_vars_from_stmt(ObSQLSessionInfo &session_info,
+                                     ObSelectStmt *stmt,
+                                     ObLocalSessionVar &dep_vars);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObCreateViewResolver);
 };

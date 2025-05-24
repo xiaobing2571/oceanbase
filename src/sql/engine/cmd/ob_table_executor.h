@@ -100,27 +100,6 @@ public:
   ObAlterTableExecutor();
   virtual ~ObAlterTableExecutor();
   int execute(ObExecContext &ctx, ObAlterTableStmt &stmt);
-
-  static int update_external_file_list(
-      const uint64_t tenant_id,
-      const uint64_t table_id,
-      const common::ObString &location,
-      const common::ObString &access_info,
-      const common::ObString &pattern,
-      const ObExprRegexpSessionVariables &regexp_vars);
-  static int collect_local_files_on_servers(
-      const uint64_t tenant_id,
-      const common::ObString &location,
-      const common::ObString &pattern,
-      const ObExprRegexpSessionVariables &regexp_vars,
-      common::ObIArray<common::ObAddr> &all_servers,
-      common::ObIArray<common::ObString> &file_urls,
-      common::ObIArray<int64_t> &file_sizes,
-      common::ObIAllocator &allocator);
-  static int flush_external_file_cache(
-      const uint64_t tenant_id,
-      const uint64_t table_id,
-      const common::ObIArray<common::ObAddr> &all_servers);
 private:
   static const int64_t TIME_INTERVAL_PER_PART_US = 50 * 1000; // 50ms
   static const int64_t MAX_WAIT_CHECK_SCHEMA_VERSION_INTERVAL_US = 120LL * 1000000LL; // 120s
@@ -143,6 +122,12 @@ private:
       ObSQLSessionInfo *my_session,
       const bool is_sync_ddl_user);
 
+  int alter_table_exchange_partition_rpc(
+      obrpc::ObExchangePartitionArg &exchange_partition_arg,
+      obrpc::ObAlterTableRes &res,
+      obrpc::ObCommonRpcProxy *common_rpc_proxy,
+      ObSQLSessionInfo *my_session);
+
   int need_check_constraint_validity(obrpc::ObAlterTableArg &alter_table_arg, bool &need_check);
 
   int set_alter_col_nullable_ddl_stmt_str(
@@ -160,12 +145,12 @@ private:
       ObSQLSessionInfo &session_info,
       common::ObIAllocator &allocator,
       const bool is_sub_part,
-      ObExprResType &dst_res_type);
+      ObRawExprResType &dst_res_type);
   template<class T>
   int calc_range_part_high_bound(
       const ObPartitionFuncType part_func_type,
       const ObString &col_name,
-      const ObExprResType &dst_res_type,
+      const ObRawExprResType &dst_res_type,
       T &part,
       ObExecContext &ctx);
   int calc_range_values_exprs(
@@ -181,7 +166,7 @@ private:
   int calc_list_part_rows(
     const ObPartitionFuncType part_func_type,
     const ObString &col_name,
-    const ObExprResType &dst_res_type,
+    const ObRawExprResType &dst_res_type,
     const T &orig_part,
     T &new_part,
     ObExecContext &ctx,
@@ -202,10 +187,29 @@ private:
 
   int refresh_schema_for_table(const uint64_t tenant_id);
   int execute_alter_external_table(ObExecContext &ctx, ObAlterTableStmt &stmt);
-  static int sort_external_files(ObIArray<ObString> &file_urls,
-                                 ObIArray<int64_t> &file_sizes);
+  static int get_external_file_list(
+    const ObString &location,
+    common::ObIArray<common::ObString> &file_urls,
+    common::ObIArray<int64_t> &file_sizes,
+    const common::ObString &access_info,
+    common::ObIAllocator &allocator,
+    common::ObStorageType &storage_type);
+  int populate_based_schema_obj_info_(obrpc::ObAlterTableArg &alter_table_arg);
+
 private:
   //DISALLOW_COPY_AND_ASSIGN(ObAlterTableExecutor);
+};
+
+class ObCommentExecutor
+{
+public:
+  ObCommentExecutor();
+  virtual ~ObCommentExecutor();
+  int execute(ObExecContext &ctx, ObAlterTableStmt &stmt);
+private:
+  // because of the lack of the assign in alter table schema and alter column schema, this function is implemented for
+  // assigning args needed for parallel comment.
+  int assign_alter_to_comment_(const obrpc::ObAlterTableArg &alter_table_arg, obrpc::ObSetCommentArg &set_comment_arg);
 };
 
 class ObDropTableStmt;

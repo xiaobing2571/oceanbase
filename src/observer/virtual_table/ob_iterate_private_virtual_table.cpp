@@ -12,10 +12,6 @@
 
 #define USING_LOG_PREFIX SERVER
 
-#include "lib/container/ob_array_iterator.h"
-#include "share/ob_i_tablet_scan.h"
-#include "share/schema/ob_schema_struct.h"
-#include "observer/ob_server_struct.h"
 #include "observer/ob_inner_sql_result.h"
 #include "observer/virtual_table/ob_iterate_private_virtual_table.h"
 
@@ -121,9 +117,9 @@ int ObIteratePrivateVirtualTable::do_open()
     }
     if (OB_SUCC(ret)) {
       if (scan_flag_.is_reverse_scan()) {
-        std::sort(tenants_.begin(), tenants_.end(), std::greater<uint64_t>());
+        lib::ob_sort(tenants_.begin(), tenants_.end(), std::greater<uint64_t>());
       } else {
-        std::sort(tenants_.begin(), tenants_.end());
+        lib::ob_sort(tenants_.begin(), tenants_.end());
       }
       LOG_TRACE("tenant id array", K(tenants_));
     }

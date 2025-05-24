@@ -52,6 +52,16 @@ public:
   //OB_SV_SERVER_UUID:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
   const static int64_t SERVER_UUID_MAX_LEN = 37;
   static char server_uuid_[SERVER_UUID_MAX_LEN];
+
+  // OB_SV_PID_FILE
+  static char server_pid_file_str_[MAX_PATH_SIZE];
+
+  // OB_SV_SOCKET
+  static char server_socket_file_str_[MAX_PATH_SIZE];
+
+  // OB_SV_PORT
+  const static int64_t SERVER_PORT_INT_STR_MAX_LEN = 64;
+  static char server_port_int_str_[SERVER_PORT_INT_STR_MAX_LEN];
 public:
   ObSpecialSysVarValues();
 };
@@ -242,6 +252,7 @@ public:
   inline bool is_global_scope() const { return 0 != (flags_ & ObSysVarFlag::GLOBAL_SCOPE); }
   inline bool is_session_scope() const { return 0 != (flags_ & ObSysVarFlag::SESSION_SCOPE); }
   inline bool is_influence_plan() const { return 0 != (flags_ & ObSysVarFlag::INFLUENCE_PLAN); }
+  inline bool is_influence_pl() const { return 0 != (flags_ & ObSysVarFlag::INFLUENCE_PL); }
   inline bool is_oracle_only() const { return 0 != (flags_ & ObSysVarFlag::ORACLE_ONLY); }
   inline bool is_enum_type() const { return is_enum_type_; }
   inline bool is_mysql_only() const { return 0 != (flags_ & ObSysVarFlag::MYSQL_ONLY); }
@@ -485,6 +496,31 @@ private:
                                    common::ObObj &out_val);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObCharsetSysVar);
+};
+
+class ObVersionSysVar : public ObBasicSysVar
+{
+public:
+  ObVersionSysVar(OnCheckAndConvertFunc on_check_and_convert = NULL,
+                  OnUpdateFunc on_update = NULL,
+                  ToObjFunc to_select_obj = NULL,
+                  ToStrFunc to_show_str = NULL,
+                  GetMetaTypeFunc get_meta_type = NULL)
+      : ObBasicSysVar(on_check_and_convert,
+                      on_update,
+                      to_select_obj,
+                      to_show_str,
+                      get_meta_type)
+  {
+  }
+  virtual ~ObVersionSysVar() {}
+private:
+  virtual int do_check_and_convert(sql::ObExecContext &ctx,
+                                   const ObSetVar &set_var,
+                                   const common::ObObj &in_val,
+                                   common::ObObj &out_val);
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObVersionSysVar);
 };
 
 /////////////////////////////
@@ -813,6 +849,11 @@ public:
                                                   const ObBasicSysVar &sys_var,
                                                   const common::ObObj &in_val,
                                                   common::ObObj &out_val);
+  static int check_default_value_for_utf8mb4(sql::ObExecContext &ctx,
+                                            const ObSetVar &set_var,
+                                            const ObBasicSysVar &sys_var,
+                                            const ObObj &in_val,
+                                            ObObj &out_val);
   static int check_and_convert_tx_isolation(sql::ObExecContext &ctx,
                                             const ObSetVar &set_var,
                                             const ObBasicSysVar &sys_var,
@@ -910,6 +951,26 @@ public:
                                         const ObBasicSysVar &sys_var,
                                         const common::ObObj &in_val,
                                         common::ObObj &out_val);
+  static int check_and_convert_compat_version(sql::ObExecContext &ctx,
+                                              const ObSetVar &set_var,
+                                              const ObBasicSysVar &sys_var,
+                                              const common::ObObj &in_val,
+                                              common::ObObj &out_val);
+  static int check_and_convert_security_version(sql::ObExecContext &ctx,
+                                                const ObSetVar &set_var,
+                                                const ObBasicSysVar &sys_var,
+                                                const common::ObObj &in_val,
+                                                common::ObObj &out_val);
+  static int check_and_convert_version(sql::ObExecContext &ctx,
+                                       const ObBasicSysVar &sys_var,
+                                       const common::ObObj &in_val,
+                                       const uint64_t tenant_id,
+                                       uint64_t &version);
+  static int check_and_convert_block_encryption_mode(sql::ObExecContext &ctx,
+                                                     const ObSetVar &set_var,
+                                                     const ObBasicSysVar &sys_var,
+                                                     const common::ObObj &in_val,
+                                                     common::ObObj &out_val);
 private:
   static int check_session_readonly(sql::ObExecContext &ctx,
                                     const ObSetVar &set_var,
@@ -964,6 +1025,8 @@ public:
                               const ObBasicSysVar &sys_var, common::ObObj &result_obj);
   static int to_obj_sql_mode(common::ObIAllocator &allocator, const sql::ObBasicSessionInfo &session,
                              const ObBasicSysVar &sys_var, common::ObObj &result_obj);
+  static int to_obj_version(common::ObIAllocator &allocator, const sql::ObBasicSessionInfo &session,
+                            const ObBasicSysVar &sys_var, common::ObObj &result_obj);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSysVarToObjFuncs);
 };
@@ -980,6 +1043,8 @@ public:
                               const ObBasicSysVar &sys_var, common::ObString &result_str);
   static int to_str_sql_mode(common::ObIAllocator &allocator, const sql::ObBasicSessionInfo &session,
                              const ObBasicSysVar &sys_var, common::ObString &result_str);
+  static int to_str_version(common::ObIAllocator &allocator, const sql::ObBasicSessionInfo &session,
+                            const ObBasicSysVar &sys_var, common::ObString &result_str);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSysVarToStrFuncs);
 };
@@ -1072,6 +1137,7 @@ public:
   static int init_sys_var();
 
 private:
+  static int init_config_sys_vars(); //require observer deploy to determine value
   static int change_initial_value();
 private:
   DISALLOW_COPY_AND_ASSIGN(ObPreProcessSysVars);

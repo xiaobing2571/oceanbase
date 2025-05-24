@@ -202,6 +202,17 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigCompressFuncChecker);
 };
 
+class ObConfigPerfCompressFuncChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigPerfCompressFuncChecker() {}
+  virtual ~ObConfigPerfCompressFuncChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigPerfCompressFuncChecker);
+};
+
 class ObConfigResourceLimitSpecChecker
   : public ObConfigChecker
 {
@@ -211,6 +222,17 @@ public:
   bool check(const ObConfigItem &t) const;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigResourceLimitSpecChecker);
+};
+
+class ObConfigTempStoreFormatChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigTempStoreFormatChecker() {}
+  virtual ~ObConfigTempStoreFormatChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigTempStoreFormatChecker);
 };
 
 class ObConfigPxBFGroupSizeChecker
@@ -246,6 +268,84 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigCompressOptionChecker);
 };
 
+class ObConfigMaxSyslogFileCountChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigMaxSyslogFileCountChecker() {}
+  virtual ~ObConfigMaxSyslogFileCountChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigMaxSyslogFileCountChecker);
+};
+
+class ObConfigSyslogCompressFuncChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigSyslogCompressFuncChecker() {}
+  virtual ~ObConfigSyslogCompressFuncChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigSyslogCompressFuncChecker);
+};
+
+class ObConfigSyslogFileUncompressedCountChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigSyslogFileUncompressedCountChecker() {}
+  virtual ~ObConfigSyslogFileUncompressedCountChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigSyslogFileUncompressedCountChecker);
+};
+
+// Used to check the format of STS credential
+class ObConfigSTScredentialChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigSTScredentialChecker() {}
+  virtual ~ObConfigSTScredentialChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigSTScredentialChecker);
+};
+
+class ObConfigStorageCachePolicyChecker : public ObConfigChecker
+{
+public:
+  ObConfigStorageCachePolicyChecker() {}
+  virtual ~ObConfigStorageCachePolicyChecker() {}
+  bool check(const ObConfigItem &t) const;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigStorageCachePolicyChecker);
+};
+
+class ObConfigEnableManualSCPChecker : public ObConfigChecker
+{
+public:
+  ObConfigEnableManualSCPChecker() {}
+  virtual ~ObConfigEnableManualSCPChecker() {}
+  bool check(const ObConfigItem &t) const;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigEnableManualSCPChecker);
+};
+
+class ObConfigSuspendStorageCacheTaskChecker : public ObConfigChecker
+{
+public:
+  ObConfigSuspendStorageCacheTaskChecker() {}
+  virtual ~ObConfigSuspendStorageCacheTaskChecker() {}
+  bool check(const ObConfigItem &t) const;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigSuspendStorageCacheTaskChecker);
+};
+
 class ObConfigUseLargePagesChecker
   : public ObConfigChecker
 {
@@ -269,6 +369,18 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigLogLevelChecker);
 };
 
+class ObConfigAlertLogLevelChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigAlertLogLevelChecker() {}
+  virtual ~ObConfigAlertLogLevelChecker() {};
+  bool check(const ObConfigItem &t) const;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigAlertLogLevelChecker);
+};
+
 class ObConfigAuditTrailChecker
   : public ObConfigChecker
 {
@@ -278,6 +390,61 @@ public:
   bool check(const ObConfigItem &t) const;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigAuditTrailChecker);
+};
+
+class ObConfigAuditLogCompressionChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigAuditLogCompressionChecker() {}
+  virtual ~ObConfigAuditLogCompressionChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigAuditLogCompressionChecker);
+};
+
+class ObConfigAuditLogPathChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigAuditLogPathChecker() {}
+  virtual ~ObConfigAuditLogPathChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigAuditLogPathChecker);
+};
+
+class ObConfigAuditLogFormatChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigAuditLogFormatChecker() {}
+  virtual ~ObConfigAuditLogFormatChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigAuditLogFormatChecker);
+};
+
+class ObConfigAuditLogQuerySQLChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigAuditLogQuerySQLChecker() {}
+  virtual ~ObConfigAuditLogQuerySQLChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigAuditLogQuerySQLChecker);
+};
+
+class ObConfigAuditLogStrategyChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigAuditLogStrategyChecker() {}
+  virtual ~ObConfigAuditLogStrategyChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigAuditLogStrategyChecker);
 };
 
 class ObConfigWorkAreaPolicyChecker
@@ -338,6 +505,15 @@ class ObConfigTenantMemoryChecker
 public:
   ObConfigTenantMemoryChecker() {}
   virtual ~ObConfigTenantMemoryChecker() {};
+  bool check(const ObConfigItem &t) const;
+};
+
+class ObConfigTenantDataDiskChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigTenantDataDiskChecker() {}
+  virtual ~ObConfigTenantDataDiskChecker() {};
   bool check(const ObConfigItem &t) const;
 };
 
@@ -505,6 +681,27 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObTTLDutyDurationChecker);
 };
 
+class ObVecIndexOptDutyTimeChecker : public ObConfigChecker {
+public:
+  ObVecIndexOptDutyTimeChecker()
+  {}
+  virtual ~ObVecIndexOptDutyTimeChecker(){};
+  bool check(const ObConfigItem& t) const;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObVecIndexOptDutyTimeChecker);
+};
+
+class ObMySQLVersionLengthChecker : public ObConfigChecker {
+public:
+  ObMySQLVersionLengthChecker()
+  {}
+  virtual ~ObMySQLVersionLengthChecker(){};
+  bool check(const ObConfigItem& t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObMySQLVersionLengthChecker);
+};
+
 class ObConfigPublishSchemaModeChecker
   : public ObConfigChecker
 {
@@ -588,18 +785,8 @@ class ObConfigCapacityParser
 public:
   ObConfigCapacityParser() {}
   virtual ~ObConfigCapacityParser() {}
-  static int64_t get(const char *str, bool &valid, bool check_unit = true);
+  static int64_t get(const char *str, bool &valid, bool check_unit = true, bool use_byte = false);
 private:
-  enum CAP_UNIT
-  {
-    // shift bits between unit of byte and that
-    CAP_B = 0,
-    CAP_KB = 10,
-    CAP_MB = 20,
-    CAP_GB = 30,
-    CAP_TB = 40,
-    CAP_PB = 50,
-  };
   DISALLOW_COPY_AND_ASSIGN(ObConfigCapacityParser);
 };
 
@@ -680,12 +867,46 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigSQLTlsVersionChecker);
 };
 
+class ObConfigSQLSpillCompressionCodecChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigSQLSpillCompressionCodecChecker() {}
+  virtual ~ObConfigSQLSpillCompressionCodecChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigSQLSpillCompressionCodecChecker);
+};
+
+class ObSqlPlanManagementModeChecker
+  : public ObConfigChecker
+{
+public:
+  ObSqlPlanManagementModeChecker() {}
+  virtual ~ObSqlPlanManagementModeChecker() {}
+  bool check(const ObConfigItem &t) const;
+  static int64_t get_spm_mode_by_string(const common::ObString &string);
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObSqlPlanManagementModeChecker);
+};
+
+class ObDefaultLoadModeChecker
+  : public ObConfigChecker
+{
+public:
+  ObDefaultLoadModeChecker() {}
+  virtual ~ObDefaultLoadModeChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObDefaultLoadModeChecker);
+};
+
 class ObModeConfigParserUitl
 {
 public:
-  // parse config item like: "xxx=yyy"
-  static int parse_item_to_kv(char *item, ObString &key, ObString &value);
-  static int get_kv_list(char *str, ObIArray<std::pair<ObString, ObString>> &kv_list);
+  // parse config item like: "xxx=yyy", "xxx:yyy"
+  static int parse_item_to_kv(char *item, ObString &key, ObString &value, const char* delim = "=");
+  static int get_kv_list(char *str, ObIArray<std::pair<ObString, ObString>> &kv_list, const char* delim = "=");
   // format str for split config item
   static int format_mode_str(const char *src, int64_t src_len, char *dst, int64_t dst_len);
 };
@@ -707,9 +928,9 @@ public:
   virtual ~ObKvFeatureModeParser() {}
   virtual bool parse(const char *str, uint8_t *arr, int64_t len) override;
 public:
-  static const int8_t MODE_DEFAULT = 0b00;
-  static const int8_t MODE_ON = 0b01;
-  static const int8_t MODE_OFF = 0b10;
+  static const int16_t MODE_DEFAULT = 0b00;
+  static const int16_t MODE_ON = 0b01;
+  static const int16_t MODE_OFF = 0b10;
   DISALLOW_COPY_AND_ASSIGN(ObKvFeatureModeParser);
 };
 
@@ -731,6 +952,22 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigTableStoreFormatChecker);
 };
 
+class ObConfigDDLNoLoggingChecker: public ObConfigChecker {
+  public:
+    static bool check(const uint64_t tenant_id, const obrpc::ObAdminSetConfigItem &t);
+  private:
+    DISALLOW_COPY_AND_ASSIGN(ObConfigDDLNoLoggingChecker);
+};
+
+class ObConfigArchiveLagTargetChecker {
+public:
+  ObConfigArchiveLagTargetChecker(){}
+  virtual ~ObConfigArchiveLagTargetChecker(){}
+  static bool check(const uint64_t tenant_id, const obrpc::ObAdminSetConfigItem &t);
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigArchiveLagTargetChecker);
+};
+
 class ObConfigMigrationChooseSourceChecker
   : public ObConfigChecker
 {
@@ -742,8 +979,183 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigMigrationChooseSourceChecker);
 };
 
+
+class ObParallelDDLControlParser : public ObConfigParser
+{
+public:
+  ObParallelDDLControlParser() {}
+  virtual ~ObParallelDDLControlParser() {}
+  virtual bool parse(const char *str, uint8_t *arr, int64_t len) override;
+public:
+  static const uint8_t MODE_DEFAULT = 0b00;
+  static const uint8_t MODE_OFF = 0b01;
+  static const uint8_t MODE_ON = 0b10;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObParallelDDLControlParser);
+};
+
+class ObConfigKvGroupCommitRWModeChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigKvGroupCommitRWModeChecker() {}
+  virtual ~ObConfigKvGroupCommitRWModeChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigKvGroupCommitRWModeChecker);
+};
+
+class ObConfigRegexpEngineChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigRegexpEngineChecker(){}
+  virtual ~ObConfigRegexpEngineChecker(){}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigRegexpEngineChecker);
+};
+
+class ObConfigS3URLEncodeTypeChecker : public ObConfigChecker
+{
+public:
+  ObConfigS3URLEncodeTypeChecker() {}
+  virtual ~ObConfigS3URLEncodeTypeChecker() {}
+  virtual bool check(const ObConfigItem &t) const override;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigS3URLEncodeTypeChecker);
+};
+
+class ObConfigReplicaParallelMigrationChecker : public ObConfigChecker
+{
+public:
+  ObConfigReplicaParallelMigrationChecker() {}
+  virtual ~ObConfigReplicaParallelMigrationChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigReplicaParallelMigrationChecker);
+};
+
+class ObConfigDegradationPolicyChecker : public ObConfigChecker
+{
+public:
+  ObConfigDegradationPolicyChecker() {}
+  virtual ~ObConfigDegradationPolicyChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigDegradationPolicyChecker);
+};
+
 typedef __ObConfigContainer<ObConfigStringKey,
                             ObConfigItem, OB_MAX_CONFIG_NUMBER> ObConfigContainer;
+
+class ObConfigVectorMemoryChecker
+{
+public:
+  static bool check(const uint64_t tenant_id, const obrpc::ObAdminSetConfigItem &t);
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigVectorMemoryChecker);
+};
+
+class ObConfigDefaultTableOrganizationChecker : public ObConfigChecker
+{
+public:
+  ObConfigDefaultTableOrganizationChecker() {}
+  virtual ~ObConfigDefaultTableOrganizationChecker() {}
+  static bool check(const obrpc::ObAdminSetConfigItem &t);
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigDefaultTableOrganizationChecker);
+};
+
+class ObConfigEnableHashRollupChecker: public ObConfigChecker
+{
+public:
+  ObConfigEnableHashRollupChecker()
+  {}
+  virtual ~ObConfigEnableHashRollupChecker()
+  {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigEnableHashRollupChecker);
+};
+
+class ObConfigPxNodePolicyChecker: public ObConfigChecker
+{
+public:
+  ObConfigPxNodePolicyChecker()
+  {}
+  virtual ~ObConfigPxNodePolicyChecker()
+  {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigPxNodePolicyChecker);
+};
+
+class ObConfigPluginsLoadChecker : public ObConfigChecker
+{
+public:
+  ObConfigPluginsLoadChecker() = default;
+  virtual ~ObConfigPluginsLoadChecker() = default;
+  bool check(const ObConfigItem& t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigPluginsLoadChecker);
+};
+
+class ObConfigNonStdCmpLevelChecker: public ObConfigChecker
+{
+public:
+  ObConfigNonStdCmpLevelChecker()
+  {}
+  virtual ~ObConfigNonStdCmpLevelChecker()
+  {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigNonStdCmpLevelChecker);
+};
+
+class ObConfigJavaParamsChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigJavaParamsChecker() {}
+  virtual ~ObConfigJavaParamsChecker() {}
+  bool check(const ObConfigItem& t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigJavaParamsChecker);
+};
+
+class ObConfigEnableAutoSplitChecker : public ObConfigChecker
+{
+public:
+  ObConfigEnableAutoSplitChecker() {}
+  virtual ~ObConfigEnableAutoSplitChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigEnableAutoSplitChecker);
+};
+
+class ObConfigAutoSplitTabletSizeChecker : public ObConfigChecker
+{
+public:
+  ObConfigAutoSplitTabletSizeChecker() {}
+  virtual ~ObConfigAutoSplitTabletSizeChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigAutoSplitTabletSizeChecker);
+};
+
+class ObConfigGlobalIndexAutoSplitPolicyChecker : public ObConfigChecker
+{
+public:
+  ObConfigGlobalIndexAutoSplitPolicyChecker() {}
+  virtual ~ObConfigGlobalIndexAutoSplitPolicyChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigGlobalIndexAutoSplitPolicyChecker);
+};
+
+
 } // namespace common
 } // namespace oceanbase
 

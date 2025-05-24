@@ -1,3 +1,6 @@
+// owner: cxf262476
+// owner group: transaction
+
 /**
  * Copyright (c) 2021 OceanBase
  * OceanBase CE is licensed under Mulan PubL v2.
@@ -10,21 +13,12 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include <gtest/gtest.h>
-#include <sys/stat.h>
-#include <sys/vfs.h>
-#include <sys/types.h>
-#include <gmock/gmock.h>
 #define USING_LOG_PREFIX STORAGETEST
 
 #define protected public
 #define private public
-#include "share/allocator/ob_tenant_mutil_allocator_mgr.h"
-#include "storage/tx_storage/ob_ls_service.h"
-#include "storage/slog/ob_storage_logger_manager.h"
-#include "storage/slog/ob_storage_logger.h"
+#include "src/storage/slog/ob_storage_log_item.h"
 #include "mtlenv/mock_tenant_module_env.h"
-#include "storage/init_basic_struct.h"
 #include "storage/test_tablet_helper.h"
 
 namespace oceanbase
@@ -62,7 +56,7 @@ using namespace oceanbase::obsys;
 void TestLSService::SetUpTestCase()
 {
   EXPECT_EQ(OB_SUCCESS, MockTenantModuleEnv::get_instance().init());
-  ObServerCheckpointSlogHandler::get_instance().is_started_ = true;
+  SERVER_STORAGE_META_SERVICE.is_started_ = true;
 }
 
 void TestLSService::TearDownTestCase()
@@ -328,6 +322,7 @@ TEST_F(TestLSService, create_and_clean)
       LOG_WARN("create failed but not break by test", K(ret), K(id_105));
     } else {
       // create success and finish the break test
+      ls_svr->break_point = 0;
       ASSERT_EQ(OB_SUCCESS, ls_svr->check_ls_exist(id_105, exist));
       ASSERT_TRUE(exist);
       ASSERT_EQ(OB_SUCCESS, ls_svr->remove_ls(id_105));
@@ -346,6 +341,56 @@ TEST_F(TestLSService, create_and_clean)
     }
   }
   ASSERT_FALSE(waiting);
+}
+
+TEST_F(TestLSService, test_remove_ls)
+{
+  int ret = OB_SUCCESS;
+  uint64_t tenant_id = MTL_ID();
+  ObCreateLSArg arg;
+  ObLSService* ls_svr = MTL(ObLSService*);
+  bool exist = false;
+  bool waiting = false;
+  bool need_break = false;
+  ObLSID id_105(105);
+  int64_t MAX_CREATE_STEP = 100;
+  int cnt = 0;
+
+  LOG_INFO("TestLSService::test_remove_ls");
+  ASSERT_EQ(OB_SUCCESS, gen_create_ls_arg(tenant_id, id_105, arg));
+  for (int64_t i = 1; i < MAX_CREATE_STEP; i++) {
+    ls_svr->break_point = 0;
+    ASSERT_EQ(OB_SUCCESS, ls_svr->create_ls(arg));
+    // create success and remove ls break test
+    LOG_INFO("remove ls break point", K(i));
+    ls_svr->break_point = i;
+    ASSERT_EQ(OB_SUCCESS, ls_svr->check_ls_exist(id_105, exist));
+    ASSERT_TRUE(exist);
+    cnt = 0;
+    while (OB_FAIL(ls_svr->remove_ls(id_105)) && OB_BREAK_BY_TEST == ret) {
+      ls_svr->break_point = 0;
+      cnt++;
+      LOG_WARN("remove_ls failed, retry", K(ret), K(cnt));
+    }
+    // remove ls does not failed, the test should break
+    if (cnt == 0) {
+      need_break = true;
+    }
+    // wait safe destroy
+    cnt = 0;
+    while (cnt++ < 20) {
+      ASSERT_EQ(OB_SUCCESS, ls_svr->check_ls_waiting_safe_destroy(id_105, waiting));
+      if (waiting) {
+        ::sleep(1);
+      } else {
+        break;
+      }
+    }
+    ASSERT_FALSE(waiting);
+    if (need_break) {
+      break;
+    }
+  }
 }
 
 TEST_F(TestLSService, check_ls_iter_cnt)
@@ -422,6 +467,7 @@ TEST_F(TestLSService, check_ls_iter_cnt)
   end_time = ObTimeUtil::current_time();
   ASSERT_TRUE(end_time - start_time <= 60 * 1000 * 1000);
 }
+
 
 } // namespace storage
 } // namespace oceanbase

@@ -18,8 +18,8 @@ class SqlItem:
     self.action_sql = action_sql
     self.rollback_sql = rollback_sql
 
-current_cluster_version = "4.3.0.1"
-current_data_version = "4.3.0.1"
+current_cluster_version = "4.4.0.0"
+current_data_version = "4.4.0.0"
 g_succ_sql_list = []
 g_commit_sql_list = []
 
@@ -113,10 +113,10 @@ def get_min_cluster_version(cur):
   results = cur.fetchall()
   if len(results) != 1:
     logging.exception('min_observer_version is not sync')
-    raise e
+    raise MyError('min_observer_version is not sync')
   elif len(results[0]) != 1:
     logging.exception('column cnt not match')
-    raise e
+    raise MyError('column cnt not match')
   else:
     min_cluster_version = get_version(results[0][0])
   return min_cluster_version
@@ -147,10 +147,12 @@ def set_default_timeout_by_tenant(cur, timeout, timeout_per_tenant, min_timeout)
 
   return timeout
 
-def set_tenant_parameter(cur, parameter, value, timeout = 0):
+def set_tenant_parameter(cur, parameter, value, timeout = 0, only_sys_tenant = False):
 
   tenants_list = []
-  if get_min_cluster_version(cur) < get_version("4.2.1.0"):
+  if only_sys_tenant:
+    tenants_list = ['sys']
+  elif get_min_cluster_version(cur) < get_version("4.2.1.0"):
     tenants_list = ['all']
   else:
     tenants_list = ['sys', 'all_user', 'all_meta']
@@ -166,7 +168,7 @@ def set_tenant_parameter(cur, parameter, value, timeout = 0):
 
   set_session_timeout(cur, 10)
 
-  wait_parameter_sync(cur, True, parameter, value, timeout)
+  wait_parameter_sync(cur, True, parameter, value, timeout, only_sys_tenant)
 
 def get_ori_enable_ddl(cur, timeout):
   ori_value_str = fetch_ori_enable_ddl(cur)
@@ -187,17 +189,17 @@ def fetch_ori_enable_ddl(cur):
     ori_value = 'True'
   elif len(result) != 1 or len(result[0]) != 1:
     logging.exception('result cnt not match')
-    raise e
+    raise MyError('result cnt not match')
   elif result[0][0].lower() in ["1", "true", "on", "yes", 't']:
     ori_value = 'True'
   elif result[0][0].lower() in ["0", "false", "off", "no", 'f']:
     ori_value = 'False'
   else:
     logging.exception("""result value is invalid, result:{0}""".format(result[0][0]))
-    raise e
+    raise MyError("""result value is invalid, result:{0}""".format(result[0][0]))
   return ori_value
 
-# print version like "x.x.x.x"
+# print(version like "x.x.x.x")
 def print_version(version):
   version = int(version)
   major = (version >> 32) & 0xffffffff
@@ -212,7 +214,7 @@ def get_version(version_str):
 
   if len(versions) != 4:
     logging.exception("""version:{0} is invalid""".format(version_str))
-    raise e
+    raise MyError("""version:{0} is invalid""".format(version_str))
 
   major = int(versions[0])
   minor = int(versions[1])
@@ -221,7 +223,7 @@ def get_version(version_str):
 
   if major > 0xffffffff or minor > 0xffff or major_patch > 0xff or minor_patch > 0xff:
     logging.exception("""version:{0} is invalid""".format(version_str))
-    raise e
+    raise MyError("""version:{0} is invalid""".format(version_str))
 
   version = (major << 32) | (minor << 16) | (major_patch << 8) | (minor_patch)
   return version
@@ -250,10 +252,11 @@ def check_parameter(cur, is_tenant_config, key, value):
     bret = False
   return bret
 
-def wait_parameter_sync(cur, is_tenant_config, key, value, timeout):
+def wait_parameter_sync(cur, is_tenant_config, key, value, timeout, only_sys_tenant = False):
   table_name = "GV$OB_PARAMETERS" if not is_tenant_config else "__all_virtual_tenant_parameter_info"
+  extra_sql = " and tenant_id = 1" if is_tenant_config and only_sys_tenant else ""
   sql = """select count(*) as cnt from oceanbase.{0}
-           where name = '{1}' and value != '{2}'""".format(table_name, key, value)
+           where name = '{1}' and value != '{2}'{3}""".format(table_name, key, value, extra_sql)
 
   wait_timeout = 0
   query_timeout = 0
@@ -274,7 +277,7 @@ def wait_parameter_sync(cur, is_tenant_config, key, value, timeout):
     result = cur.fetchall()
     if len(result) != 1 or len(result[0]) != 1:
       logging.exception('result cnt not match')
-      raise e
+      raise MyError('result cnt not match')
     elif result[0][0] == 0:
       logging.info("""{0} is sync, value is {1}""".format(key, value))
       break
@@ -284,7 +287,7 @@ def wait_parameter_sync(cur, is_tenant_config, key, value, timeout):
     times -= 1
     if times == -1:
       logging.exception("""check {0}:{1} sync timeout""".format(key, value))
-      raise e
+      raise MyError("""check {0}:{1} sync timeout""".format(key, value))
     time.sleep(5)
 
   set_session_timeout(cur, 10)
@@ -403,12 +406,12 @@ class Cursor:
       if True == print_when_succ:
         logging.info('succeed to execute sql: %s, rowcount = %d', sql, rowcount)
       return rowcount
-    except mysql.connector.Error, e:
+    except mysql.connector.Error as e:
       logging.exception('mysql connector error, fail to execute sql: %s', sql)
-      raise e
-    except Exception, e:
+      raise
+    except Exception as e:
       logging.exception('normal error, fail to execute sql: %s', sql)
-      raise e
+      raise
   def exec_query(self, sql, print_when_succ = True):
     try:
       self.__cursor.execute(sql)
@@ -417,12 +420,12 @@ class Cursor:
       if True == print_when_succ:
         logging.info('succeed to execute query: %s, rowcount = %d', sql, rowcount)
       return (self.__cursor.description, results)
-    except mysql.connector.Error, e:
+    except mysql.connector.Error as e:
       logging.exception('mysql connector error, fail to execute sql: %s', sql)
-      raise e
-    except Exception, e:
+      raise
+    except Exception as e:
       logging.exception('normal error, fail to execute sql: %s', sql)
-      raise e
+      raise
 
 class DDLCursor:
   _cursor = None
@@ -433,9 +436,9 @@ class DDLCursor:
       # 这里检查是不是ddl，不是ddl就抛错
       check_is_ddl_sql(sql)
       return self._cursor.exec_sql(sql, print_when_succ)
-    except Exception, e:
+    except Exception as e:
       logging.exception('fail to execute ddl: %s', sql)
-      raise e
+      raise
 
 class QueryCursor:
   _cursor = None
@@ -446,9 +449,9 @@ class QueryCursor:
       # 这里检查是不是query，不是query就抛错
       check_is_query_sql(sql)
       return self._cursor.exec_query(sql, print_when_succ)
-    except Exception, e:
+    except Exception as e:
       logging.exception('fail to execute dml query: %s', sql)
-      raise e
+      raise
 
 class DMLCursor(QueryCursor):
   def exec_update(self, sql, print_when_succ = True):
@@ -456,9 +459,9 @@ class DMLCursor(QueryCursor):
       # 这里检查是不是update，不是update就抛错
       check_is_update_sql(sql)
       return self._cursor.exec_sql(sql, print_when_succ)
-    except Exception, e:
+    except Exception as e:
       logging.exception('fail to execute dml update: %s', sql)
-      raise e
+      raise
 
 class BaseDDLAction():
   __ddl_cursor = None
@@ -568,7 +571,7 @@ def fetch_tenant_ids(query_cur):
     for r in results:
       tenant_id_list.append(r[0])
     return tenant_id_list
-  except Exception, e:
+  except Exception as e:
     logging.exception('fail to fetch distinct tenant ids')
-    raise e
+    raise
 

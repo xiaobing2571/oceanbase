@@ -78,7 +78,7 @@ typedef struct _YYLookaheadToken
 } YYLookaheadToken;
 
 extern ParseNode *obpl_mysql_read_sql_construct(ObParseCtx *parse_ctx, const char *prefix, YYLookaheadToken *la_token, int end_token_cnt, ...);
-extern void obpl_mysql_yyerror(YYLTYPE *yylloc, ObParseCtx *parse_ctx, char *s, ...);
+extern void obpl_mysql_yyerror(YYLTYPE *yylloc, ObParseCtx *parse_ctx, char *s);
 extern void obpl_mysql_parse_fatal_error(int32_t errcode, yyscan_t yyscanner, yyconst char *msg, ...);
 
 int obpl_mysql_check_specific_node(const ParseNode *node, const ObItemType type, int *is_contain) {
@@ -128,6 +128,7 @@ int obpl_mysql_wrap_node_into_subquery(ObParseCtx *_parse_ctx, ParseNode *node) 
       parse_result.is_not_utf8_connection_ = _parse_ctx->is_not_utf8_connection_;
       parse_result.connection_collation_ = _parse_ctx->connection_collation_;
       parse_result.sql_mode_ = _parse_ctx->scanner_ctx_.sql_mode_;
+      parse_result.semicolon_start_col_ = INT32_MAX;
       if (0 == parse_sql_stmt(&parse_result)) {
         *node = *parse_result.result_tree_->children_[0];
         node->str_value_ = subquery;
@@ -194,63 +195,68 @@ void obpl_mysql_wrap_get_user_var_into_subquery(ObParseCtx *parse_ctx, ParseNode
 
 /*these tokens can't be used for obj names*/
 %token END_P
-/* reserved key words */
-%token  ALTER BEFORE BY CALL CASE CONDITION CONTINUE CREATE CURRENT_USER CURSOR DECLARE
-        DEFAULT DELETE DETERMINISTIC DROP EACH ELSE ELSEIF EXISTS EXIT FETCH FOR FROM IF IN
-        INDEX INOUT INSERT INTO IS ITERATE LEAVE LIMIT LONG LOOP MODIFIES  NOT ON OR OUT
-        PROCEDURE READS REPEAT REPLACE RESIGNAL RETURN SELECT SIGNAL SQL SQLEXCEPTION
-        SQLSTATE SQLWARNING TABLE THEN TRIGGER UPDATE USING WHEN WHILE
-/* reserved key words only used in ob, in mysql these keywords are non reserved*/
-%token  COMMIT ROLLBACK DO UNTIL 
-
 %token SQL_KEYWORD SQL_TOKEN PARAM_ASSIGN_OPERATOR
 %token PARSER_SYNTAX_ERROR /*used internal*/
 %token <node> IDENT STRING INTNUM DECIMAL_VAL HEX_STRING_VALUE DATE_VALUE SYSTEM_VARIABLE USER_VARIABLE NULLX
 %token <node> USER_NAME
-//*data type keyword*/
-%token TINYINT SMALLINT MEDIUMINT INTEGER BIGINT FLOAT DOUBLE PRECISION NUMBER NUMERIC BIT
-        DATETIME TIMESTAMP TIME DATE YEAR CHARACTER TEXT VARCHAR NCHAR NVARCHAR BINARY VARBINARY UNSIGNED
-        SIGNED ZEROFILL COLLATE SET CHARSET BOOL BOOLEAN BLOB ENUM TINYTEXT MEDIUMTEXT LONGTEXT TINYBLOB
-        MEDIUMBLOB LONGBLOB VARYING
+/* reserved key words */
+%token
+//-----------------------------reserved keyword begin-----------------------------------------------
+        ALTER BEFORE BY CALL CASE CONDITION CONTINUE CREATE CURRENT_USER CURSOR DECLARE
+        DEFAULT DELETE DETERMINISTIC DROP EACH ELSE ELSEIF EXISTS EXIT FETCH FOR FROM IF IN
+        INDEX INOUT INSERT INTO IS ITERATE LEAVE LIMIT LONG LOOP MODIFIES  NOT ON OR OUT
+        PROCEDURE READS RENAME REPEAT REPLACE RESIGNAL RETURN SELECT SIGNAL SQL SQLEXCEPTION
+        SQLSTATE SQLWARNING TABLE THEN TRIGGER UPDATE USING WHEN WHILE
+        TINYINT SMALLINT MEDIUMINT INTEGER BIGINT FLOAT DOUBLE PRECISION DEC DECIMAL NUMERIC
+        CHARACTER VARCHAR BINARY VARBINARY UNSIGNED
+        ZEROFILL COLLATE SET BLOB TINYTEXT MEDIUMTEXT LONGTEXT TINYBLOB
+        MEDIUMBLOB LONGBLOB VARYING LOAD
+/* reserved key words only used in ob, in mysql these keywords are non reserved*/
+        CHARSET COMMIT ROLLBACK DO UNTIL
+//-----------------------------reserved keyword end-------------------------------------------------
 
 /* non reserved key words */
 %token <non_reserved_keyword>
-      AFTER AUTHID BEGIN_KEY BINARY_INTEGER BODY C CATALOG_NAME CLASS_ORIGIN CLOSE COLUMN_NAME COMMENT
+//-----------------------------non_reserved keyword begin-------------------------------------------
+      AFTER AT AUTHID BEGIN_KEY BINARY_INTEGER BODY C CATALOG_NAME CLASS_ORIGIN CLOSE COLUMN_NAME COMMENT COMPLETION
       CONSTRAINT_CATALOG CONSTRAINT_NAME CONSTRAINT_ORIGIN CONSTRAINT_SCHEMA CONTAINS COUNT CURSOR_NAME
-      DATA DEFINER END_KEY EXTEND FOLLOWS FOUND FUNCTION HANDLER INTERFACE INVOKER JSON LANGUAGE
-      MESSAGE_TEXT MYSQL_ERRNO NATIONAL NEXT NO OF OPEN PACKAGE PRAGMA PRECEDES RECORD RETURNS ROW ROWTYPE
-      SCHEMA_NAME SECURITY SUBCLASS_ORIGIN TABLE_NAME TYPE VALUE
-
+      DATA DAY DEFINER DISABLE ENABLE ENDS END_KEY EVENT EVERY EXTEND FOLLOWS FOUND FUNCTION HANDLER HOUR INTERFACE INTERVAL INVOKER JSON LANGUAGE
+      MESSAGE_TEXT MINUTE MONTH MYSQL_ERRNO NATIONAL NEXT NO OF OPEN PACKAGE PRAGMA PRECEDES PRESERVE RECORD RETURNS ROW ROWTYPE
+      SCHEDULE SCHEMA_NAME SECOND SECURITY SUBCLASS_ORIGIN TABLE_NAME TO USER TYPE VALUE DATETIME TIMESTAMP TIME DATE YEAR
+      TEXT NCHAR NVARCHAR BOOL BOOLEAN ENUM BIT FIXED SIGNED STARTS ROLE SUBMIT CANCEL JOB XA RECOVER COMPILE REUSE SETTINGS
+      GEOMETRY POINT LINESTRING POLYGON MULTIPOINT MULTILINESTRING MULTIPOLYGON GEOMETRYCOLLECTION GEOMCOLLECTION
+      ROARINGBITMAP SERIAL
+//-----------------------------non_reserved keyword end---------------------------------------------
 %right END_KEY
 %left ELSE IF ELSEIF
 
 %nonassoc LOWER_PARENS
-%nonassoc FUNCTION
+%nonassoc FUNCTION ZEROFILL SIGNED UNSIGNED
 %nonassoc PARENS
 %left '(' ')'
 %nonassoc AUTHID INTERFACE
 %nonassoc DECLARATION
 
-%type <node> sql_keyword
+%type <node> sql_keyword xa_keyword
 %type <non_reserved_keyword> unreserved_keyword
 %type <node> stmt_block stmt_list stmt outer_stmt sp_proc_outer_statement sp_proc_inner_statement sp_proc_independent_statement
 %type <node> create_procedure_stmt sp_proc_stmt expr expr_list procedure_body default_expr
 %type <node> create_function_stmt function_body
 %type <node> drop_procedure_stmt drop_function_stmt
-%type <node> alter_procedure_stmt alter_function_stmt opt_sp_alter_chistics
+%type <node> alter_procedure_stmt alter_function_stmt opt_sp_alter_chistics sp_compile_clause
 %type <node> sp_unlabeled_block
 %type <node> sp_block_content opt_sp_decls sp_proc_stmts sp_decl sp_decls
 %type <node> sp_labeled_block label_ident opt_sp_label
 %type <node> sp_decl_idents sp_data_type opt_sp_decl_default opt_param_default
 %type <node> sp_proc_stmt_if sp_if sp_proc_stmt_case sp_when_list sp_when sp_elseifs 
 %type <node> sp_proc_stmt_return
-%type <node> sql_stmt ident simple_ident
+%type <node> sql_stmt_prefix sql_stmt ident simple_ident
 %type <node> into_clause
 %type <node> sp_name sp_call_name opt_sp_param_list opt_sp_fparam_list sp_param_list sp_fparam_list
 %type <node> sp_param sp_fparam sp_alter_chistics
 %type <node> opt_sp_definer sp_create_chistics sp_create_chistic sp_chistic opt_parentheses user opt_host_name
 %type <node> param_type sp_cparams opt_sp_cparam_list cexpr sp_cparam opt_sp_cparam_with_assign
-%type <ival> opt_sp_inout opt_if_exists
+%type <ival> opt_sp_inout opt_if_exists opt_if_not_exists opt_reuse_settings
 %type <node> call_sp_stmt do_sp_stmt
 %type <node> sp_cond sp_hcond_list sp_hcond
 %type <node> sp_unlabeled_control sp_labeled_control
@@ -270,17 +276,22 @@ void obpl_mysql_wrap_get_user_var_into_subquery(ObParseCtx *parse_ctx, ParseNode
 %type <node> opt_tail_package_name
 %type <ival> opt_replace
 %type <node> create_trigger_stmt drop_trigger_stmt plsql_trigger_source
-%type <node> trigger_definition trigger_event trigger_body pl_obj_access_ref opt_trigger_order
+%type <node> trigger_definition trigger_event trigger_body pl_obj_access_ref
 %type <ival> trigger_time
+%type <node> submit_job_stmt cancel_job_stmt
+%type <node> create_event_stmt event_schedule event_time_expr opt_event_time_range event_start_time event_end_time event_on_completion opt_event_on_completion opt_event_status opt_event_comment event_body_stmts event_body
+%type <node> alter_event_stmt opt_event_alter_on_schedule_completion opt_event_rename opt_event_body
+%type <node> drop_event_stmt
 /*SQL data type*/
 %type <node> scalar_data_type opt_charset collation opt_collation charset_name collation_name
 %type <node> number_literal literal charset_key opt_float_precision opt_number_precision opt_binary
 %type <node> string_list text_string
 %type <ival> string_length_i opt_string_length_i opt_int_length_i opt_string_length_i_v2
-%type <ival> opt_bit_length_i opt_datetime_fsp_i opt_unsigned_i opt_zerofill_i opt_year_i
+%type <ival> opt_bit_length_i opt_datetime_fsp_i opt_year_i
 %type <ival> int_type_i float_type_i datetime_type_i date_year_type_i text_type_i blob_type_i
 %type <ival> nchar_type_i nvarchar_type_i
-%type <node> variable
+%type <node> variable number_type date_unit
+%type <node> geometry_collection
 %%
 /*****************************************************************************
  *
@@ -355,6 +366,11 @@ outer_stmt:
   | create_package_stmt { $$ = $1; }
   | create_package_body_stmt { $$ = $1; }
   | drop_package_stmt { $$ = $1; }
+  | submit_job_stmt { $$ = $1; }
+  | cancel_job_stmt { $$ = $1; }
+  | create_event_stmt { $$ = $1; }
+  | alter_event_stmt { $$ = $1; }
+  | drop_event_stmt { $$ = $1; }
   | sql_stmt { $$ = $1; }
   | call_sp_stmt { $$ = $1; }
   | do_sp_stmt { $$ = $1; }
@@ -380,16 +396,29 @@ outer_stmt:
  *
  *****************************************************************************/
 sql_keyword:
-    '(' sql_keyword { $$ = NULL; }
-  | SQL_KEYWORD { $$ = NULL; }
+    SQL_KEYWORD { $$ = NULL; }
   | TABLE { $$ = NULL; }
+  | USER { $$ = NULL; }
+;
+
+sql_stmt_prefix:
+    '(' sql_stmt_prefix { $$ = NULL; }
+  | SQL_KEYWORD { $$ = NULL; }
   | INSERT { $$ = NULL; }
   | DELETE { $$ = NULL; }
   | UPDATE { $$ = NULL; }
+  | LOAD { $$ = NULL; }
+;
+
+xa_keyword:
+  BEGIN_KEY { $$ = NULL; }
+  | SQL_KEYWORD { $$ = NULL; }
+  | END_KEY { $$ = NULL; }
+  | RECOVER { $$ = NULL; }
 ;
 
 sql_stmt:
-    sql_keyword /*sql stmt tail*/
+    sql_stmt_prefix /*sql stmt tail*/
     {
       //read sql query string直到读到token';'或者END_P
       ParseNode *sql_stmt = NULL;
@@ -403,7 +432,28 @@ sql_stmt:
       do_parse_sql_stmt(sql_stmt, parse_ctx, @1.first_column, @1.last_column, 2, ';', END_P);
       malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SQL_STMT, 1, sql_stmt);
     }
+  | XA xa_keyword /*sql stmt tail*/
+    {
+      //read sql query string直到读到token';'或者END_P
+      ParseNode *sql_stmt = NULL;
+      do_parse_sql_stmt(sql_stmt, parse_ctx, @1.first_column, @1.last_column, 2, ';', END_P);
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SQL_STMT, 1, sql_stmt);
+    }
   | CREATE sql_keyword /*sql stmt tail*/
+    {
+      //read sql query string直到读到token';'或者END_P
+      ParseNode *sql_stmt = NULL;
+      do_parse_sql_stmt(sql_stmt, parse_ctx, @1.first_column, @1.last_column, 2, ';', END_P);
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SQL_STMT, 1, sql_stmt);
+    }
+  | CREATE ROLE /*sql stmt tail*/
+    {
+      //read sql query string直到读到token';'或者END_P
+      ParseNode *sql_stmt = NULL;
+      do_parse_sql_stmt(sql_stmt, parse_ctx, @1.first_column, @1.last_column, 2, ';', END_P);
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SQL_STMT, 1, sql_stmt);
+    }
+  | DROP ROLE /*sql stmt tail*/
     {
       //read sql query string直到读到token';'或者END_P
       ParseNode *sql_stmt = NULL;
@@ -431,6 +481,13 @@ sql_stmt:
       do_parse_sql_stmt(sql_stmt, parse_ctx, @1.first_column, @1.last_column, 2, ';', END_P);
       malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SQL_STMT, 1, sql_stmt);
     }
+  | RENAME sql_keyword /*sql stmt tail*/
+    {
+      //read sql query string直到读到token';'或者END_P
+      ParseNode *sql_stmt = NULL;
+      do_parse_sql_stmt(sql_stmt, parse_ctx, @1.first_column, @1.last_column, 2, ';', END_P);
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SQL_STMT, 1, sql_stmt);
+    }
   | SET /*sql stmt tail*/
     {
       //read sql query string直到读到token';'或者END_P
@@ -438,14 +495,23 @@ sql_stmt:
       do_parse_sql_stmt(sql_stmt, parse_ctx, @1.first_column, @1.last_column, 2, ';', END_P);
       if (T_SET_PASSWORD == sql_stmt->type_ ||
           T_SET_NAMES == sql_stmt->type_ ||
-          T_SET_CHARSET == sql_stmt->type_) {
+          T_SET_CHARSET == sql_stmt->type_ ||
+          T_SET_ROLE == sql_stmt->type_ ||
+          T_ALTER_USER_DEFAULT_ROLE == sql_stmt->type_) {
         malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SQL_STMT, 1, sql_stmt);
       } else {
         $$ = sql_stmt;
       }
       if(T_VARIABLE_SET == $$->type_) {
+        int64_t child_cnt = $$->num_child_;
         for(int64_t i = 0; i < $$->num_child_; ++i) {
-          if(OB_UNLIKELY(NULL == $$->children_[i] || NULL == $$->children_[i]->children_[1])) {
+          if (T_SET_NAMES == $$->children_[i]->type_ || T_SET_CHARSET == $$->children_[i]->type_) {
+            malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SQL_STMT, 1, sql_stmt);
+            if (child_cnt > 1) {
+              obpl_mysql_yyerror(&@1, parse_ctx, "Syntax Error\n");
+              YYERROR;
+            }
+          } else if(OB_UNLIKELY(NULL == $$->children_[i] || NULL == $$->children_[i]->children_[1])) {
             YY_UNEXPECTED_ERROR("value node in SET statement is NULL");
           } else {
             obpl_mysql_wrap_get_user_var_into_subquery(parse_ctx, $$->children_[i]->children_[1]);
@@ -559,7 +625,15 @@ call_sp_stmt:
       }
       $$ = $2;
     }
-  | CALL PROCEDURE sp_name '(' opt_sp_param_list ')' sp_create_chistics procedure_body
+  | CALL PROCEDURE opt_if_not_exists sp_name '(' opt_sp_param_list ')' sp_create_chistics procedure_body
+    {
+      if (!parse_ctx->is_inner_parse_) {
+        obpl_mysql_yyerror(&@2, parse_ctx, "Syntax Error\n");
+        YYERROR; //生成一个语法错误
+      }
+      $$ = $9;
+    }
+  | CALL PROCEDURE opt_if_not_exists sp_name '(' opt_sp_param_list ')' procedure_body
     {
       if (!parse_ctx->is_inner_parse_) {
         obpl_mysql_yyerror(&@2, parse_ctx, "Syntax Error\n");
@@ -567,29 +641,21 @@ call_sp_stmt:
       }
       $$ = $8;
     }
-  | CALL PROCEDURE sp_name '(' opt_sp_param_list ')' procedure_body
+  | CALL FUNCTION opt_if_not_exists sp_name '(' opt_sp_fparam_list ')' RETURNS sp_data_type sp_create_chistics function_body
     {
       if (!parse_ctx->is_inner_parse_) {
         obpl_mysql_yyerror(&@2, parse_ctx, "Syntax Error\n");
         YYERROR; //生成一个语法错误
       }
-      $$ = $7;
+      $$ = $11;
     }
-  | CALL FUNCTION sp_name '(' opt_sp_fparam_list ')' RETURNS sp_data_type sp_create_chistics function_body
+  | CALL FUNCTION opt_if_not_exists sp_name '(' opt_sp_fparam_list ')' RETURNS sp_data_type function_body
     {
       if (!parse_ctx->is_inner_parse_) {
         obpl_mysql_yyerror(&@2, parse_ctx, "Syntax Error\n");
         YYERROR; //生成一个语法错误
       }
       $$ = $10;
-    }
-  | CALL FUNCTION sp_name '(' opt_sp_fparam_list ')' RETURNS sp_data_type function_body
-    {
-      if (!parse_ctx->is_inner_parse_) {
-        obpl_mysql_yyerror(&@2, parse_ctx, "Syntax Error\n");
-        YYERROR; //生成一个语法错误
-      }
-      $$ = $9;
     }
 ;
 
@@ -696,16 +762,19 @@ ident:
 
 unreserved_keyword:
     AFTER
+  | AT
   | AUTHID
   | BEGIN_KEY %prec LOWER_PARENS
   | BINARY_INTEGER
   | BODY %prec LOWER_PARENS
   | C
   | CATALOG_NAME
+  | CANCEL
   | CLASS_ORIGIN
   | CLOSE
   | COLUMN_NAME
   | COMMENT
+  | COMPLETION
   | CONSTRAINT_CATALOG
   | CONSTRAINT_NAME
   | CONSTRAINT_ORIGIN
@@ -715,6 +784,11 @@ unreserved_keyword:
   | CURSOR_NAME
   | DATA
   | DEFINER
+  | DISABLE
+  | ENABLE
+  | ENDS
+  | EVENT
+  | EVERY
   | END_KEY %prec LOWER_PARENS
   | EXTEND
   | FOUND
@@ -722,6 +796,7 @@ unreserved_keyword:
   | HANDLER
   | INTERFACE 
   | INVOKER
+  | JOB
   | JSON
   | LANGUAGE
   | MESSAGE_TEXT
@@ -730,18 +805,64 @@ unreserved_keyword:
   | NO
   | OF
   | OPEN
+  | USER
   | PACKAGE
   | PRAGMA
   | RECORD
   | RETURNS
   | ROW
   | ROWTYPE
+  | ROLE
+  | SCHEDULE
   | SCHEMA_NAME
   | SECURITY
+  | STARTS
   | SUBCLASS_ORIGIN
+  | SUBMIT
   | TABLE_NAME
+  | TO
   | TYPE
   | VALUE
+  | FOLLOWS
+  | PRECEDES
+  | PRESERVE
+  | NATIONAL
+  | DATETIME
+  | TIMESTAMP
+  | TIME
+  | DATE
+  | YEAR
+  | TEXT
+  | NCHAR
+  | NVARCHAR
+  | BOOL
+  | BOOLEAN
+  | ENUM
+  | BIT
+  | FIXED
+  | SIGNED
+  | XA
+  | RECOVER
+  | GEOMETRY
+  | POINT
+  | LINESTRING
+  | POLYGON
+  | MULTIPOINT
+  | MULTILINESTRING
+  | MULTIPOLYGON
+  | GEOMETRYCOLLECTION
+  | GEOMCOLLECTION
+  | ROARINGBITMAP
+  | COMPILE
+  | REUSE
+  | SETTINGS
+  | MONTH
+  | DAY
+  | HOUR
+  | MINUTE
+  | SECOND
+  | INTERVAL
+  | SERIAL
 ;
 
 /*****************************************************************************
@@ -1029,23 +1150,38 @@ create_trigger_stmt:
 ;
 
 plsql_trigger_source:
-    TRIGGER sp_name trigger_definition
+    TRIGGER opt_if_not_exists sp_name trigger_definition
     {
-      check_ptr($3);
+      check_ptr($4);
       const char *stmt_str = parse_ctx->stmt_str_ + @1.first_column;
-      int32_t str_len = @3.last_column - @1.first_column + 1;
-      $3->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
-      check_ptr($3->str_value_);
-      $3->str_len_ = str_len;
-      $3->pl_str_off_ = @1.first_column;
-      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_TG_SOURCE, 2, $2, $3);
+      int32_t str_len = @4.last_column - @1.first_column + 1;
+      $4->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
+      check_ptr($4->str_value_);
+      $4->str_len_ = str_len;
+      $4->pl_str_off_ = @1.first_column;
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_TG_SOURCE, 2, $3, $4);
+      $$->value_ = $2;
     }
 ;
 
 trigger_definition:
-    trigger_time trigger_event ON sp_name FOR EACH ROW opt_trigger_order trigger_body
+    trigger_time trigger_event ON sp_name FOR EACH ROW trigger_body
     {
-      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_TG_SIMPLE_DML, 4, $2, $4, $8, $9);
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_TG_SIMPLE_DML, 4, $2, $4, NULL, $8);
+      $$->int16_values_[0] = $1;
+    }
+    | trigger_time trigger_event ON sp_name FOR EACH ROW FOLLOWS sp_name trigger_body
+    {
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_TG_ORDER, 1, $9);
+      $$->value_ = 1; // FOLLOWS
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_TG_SIMPLE_DML, 4, $2, $4, $$, $10);
+      $$->int16_values_[0] = $1;
+    }
+    | trigger_time trigger_event ON sp_name FOR EACH ROW PRECEDES sp_name trigger_body
+    {
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_TG_ORDER, 1, $9);
+      $$->value_ = 2; // PRECEDES
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_TG_SIMPLE_DML, 4, $2, $4, $$, $10);
       $$->int16_values_[0] = $1;
     }
 
@@ -1059,19 +1195,6 @@ trigger_event:
   | DELETE { malloc_terminal_node($$, parse_ctx->mem_pool_, T_DELETE); }
   | UPDATE { malloc_terminal_node($$, parse_ctx->mem_pool_, T_UPDATE); }
 ;
-
-opt_trigger_order:
-    /*EMPTY*/ { $$ = NULL; }
-  | FOLLOWS sp_name
-   {
-      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_TG_ORDER, 1, $2);
-      $$->value_ = 1; // FOLLOWS
-   }
-  | PRECEDES sp_name
-    {
-      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_TG_ORDER, 1, $2);
-      $$->value_ = 2; // PRECEDES
-    }
 
 trigger_body:
   sp_proc_stmt
@@ -1112,73 +1235,11 @@ drop_trigger_stmt:
  *
  *****************************************************************************/
 create_procedure_stmt:
-    CREATE opt_sp_definer PROCEDURE sp_name '(' opt_sp_param_list ')' sp_create_chistics procedure_body
-    {
-      check_ptr($9);
-      ParseNode *sp_clause_node = NULL;
-      merge_nodes(sp_clause_node, parse_ctx->mem_pool_, T_SP_CLAUSE_LIST, $8);
-      const char *stmt_str = parse_ctx->stmt_str_ + @3.first_column;
-      int32_t str_len = @9.last_column - @3.first_column + 1;
-      $9->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
-      check_ptr($9->str_value_);
-      $9->str_len_ = str_len;
-      $9->raw_text_ = $9->str_value_ + @9.first_column - @3.first_column;
-      $9->text_len_ = str_len - (@9.first_column - @3.first_column);
-      if (NULL != $6) {
-        const char *param_str = parse_ctx->stmt_str_ + @5.first_column + 1;
-        int32_t param_len = @7.last_column - @5.last_column - 1;
-        $6->str_value_ = parse_strndup(param_str, param_len, parse_ctx->mem_pool_);
-        check_ptr($6->str_value_);
-        $6->str_len_ = param_len;
-      }
-      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SP_CREATE, 5, $2, $4, $6, sp_clause_node, $9);
-    }
-  | CREATE opt_sp_definer PROCEDURE sp_name '(' opt_sp_param_list ')' procedure_body
-    {
-      check_ptr($8);
-      const char *stmt_str = parse_ctx->stmt_str_ + @3.first_column;
-      int32_t str_len = @8.last_column - @3.first_column + 1;
-      $8->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
-      check_ptr($8->str_value_);
-      $8->str_len_ = str_len;
-      $8->raw_text_ = $8->str_value_ + @8.first_column - @3.first_column;
-      $8->text_len_ = str_len - (@8.first_column - @3.first_column);
-      if (NULL != $6) {
-        const char *param_str = parse_ctx->stmt_str_ + @5.first_column + 1;
-        int32_t param_len = @7.last_column - @5.last_column - 1;
-        $6->str_value_ = parse_strndup(param_str, param_len, parse_ctx->mem_pool_);
-        check_ptr($6->str_value_);
-        $6->str_len_ = param_len;
-      }
-      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SP_CREATE, 5, $2, $4, $6, NULL, $8);
-    }
-;
-
-create_function_stmt:
-    CREATE opt_sp_definer FUNCTION sp_name '(' opt_sp_fparam_list ')' RETURNS sp_data_type sp_create_chistics function_body
-    {
-      check_ptr($11);
-      ParseNode *sp_clause_node = NULL;
-      merge_nodes(sp_clause_node, parse_ctx->mem_pool_, T_SP_CLAUSE_LIST, $10);
-      const char *stmt_str = parse_ctx->stmt_str_ + @3.first_column;
-      int32_t str_len = @11.last_column - @3.first_column + 1;
-      $11->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
-      check_ptr($11->str_value_);
-      $11->str_len_ = str_len;
-      $11->raw_text_ = $11->str_value_ + @11.first_column - @3.first_column;
-      $11->text_len_ = str_len - (@11.first_column - @3.first_column);
-      if (NULL != $6) {
-        const char *param_str = parse_ctx->stmt_str_ + @5.first_column + 1;
-        int32_t param_len = @7.last_column - @5.last_column - 1;
-        $6->str_value_ = parse_strndup(param_str, param_len, parse_ctx->mem_pool_);
-        check_ptr($6->str_value_);
-        $6->str_len_ = param_len;
-      }
-      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SF_CREATE, 6, $2, $4, $6, $9, sp_clause_node, $11);
-    }
-  | CREATE opt_sp_definer FUNCTION sp_name '(' opt_sp_fparam_list ')' RETURNS sp_data_type function_body
+    CREATE opt_sp_definer PROCEDURE opt_if_not_exists sp_name '(' opt_sp_param_list ')' sp_create_chistics procedure_body
     {
       check_ptr($10);
+      ParseNode *sp_clause_node = NULL;
+      merge_nodes(sp_clause_node, parse_ctx->mem_pool_, T_SP_CLAUSE_LIST, $9);
       const char *stmt_str = parse_ctx->stmt_str_ + @3.first_column;
       int32_t str_len = @10.last_column - @3.first_column + 1;
       $10->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
@@ -1186,14 +1247,80 @@ create_function_stmt:
       $10->str_len_ = str_len;
       $10->raw_text_ = $10->str_value_ + @10.first_column - @3.first_column;
       $10->text_len_ = str_len - (@10.first_column - @3.first_column);
-      if (NULL != $6) {
-        const char *param_str = parse_ctx->stmt_str_ + @5.first_column + 1;
-        int32_t param_len = @7.last_column - @5.last_column - 1;
-        $6->str_value_ = parse_strndup(param_str, param_len, parse_ctx->mem_pool_);
-        check_ptr($6->str_value_);
-        $6->str_len_ = param_len;
+      if (NULL != $7) {
+        const char *param_str = parse_ctx->stmt_str_ + @6.first_column + 1;
+        int32_t param_len = @8.last_column - @6.last_column - 1;
+        $7->str_value_ = parse_strndup(param_str, param_len, parse_ctx->mem_pool_);
+        check_ptr($7->str_value_);
+        $7->str_len_ = param_len;
       }
-      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SF_CREATE, 6, $2, $4, $6, $9, NULL, $10);
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SP_CREATE, 5, $2, $5, $7, sp_clause_node, $10);
+      $$->value_ = $4;
+    }
+  | CREATE opt_sp_definer PROCEDURE opt_if_not_exists sp_name '(' opt_sp_param_list ')' procedure_body
+    {
+      check_ptr($9);
+      const char *stmt_str = parse_ctx->stmt_str_ + @3.first_column;
+      int32_t str_len = @9.last_column - @3.first_column + 1;
+      $9->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
+      check_ptr($9->str_value_);
+      $9->str_len_ = str_len;
+      $9->raw_text_ = $9->str_value_ + @9.first_column - @3.first_column;
+      $9->text_len_ = str_len - (@9.first_column - @3.first_column);
+      if (NULL != $7) {
+        const char *param_str = parse_ctx->stmt_str_ + @6.first_column + 1;
+        int32_t param_len = @8.last_column - @6.last_column - 1;
+        $7->str_value_ = parse_strndup(param_str, param_len, parse_ctx->mem_pool_);
+        check_ptr($7->str_value_);
+        $7->str_len_ = param_len;
+      }
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SP_CREATE, 5, $2, $5, $7, NULL, $9);
+      $$->value_ = $4;
+    }
+;
+
+create_function_stmt:
+    CREATE opt_sp_definer FUNCTION opt_if_not_exists sp_name '(' opt_sp_fparam_list ')' RETURNS sp_data_type sp_create_chistics function_body
+    {
+      check_ptr($12);
+      ParseNode *sp_clause_node = NULL;
+      merge_nodes(sp_clause_node, parse_ctx->mem_pool_, T_SP_CLAUSE_LIST, $11);
+      const char *stmt_str = parse_ctx->stmt_str_ + @3.first_column;
+      int32_t str_len = @12.last_column - @3.first_column + 1;
+      $12->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
+      check_ptr($12->str_value_);
+      $12->str_len_ = str_len;
+      $12->raw_text_ = $12->str_value_ + @12.first_column - @3.first_column;
+      $12->text_len_ = str_len - (@12.first_column - @3.first_column);
+      if (NULL != $7) {
+        const char *param_str = parse_ctx->stmt_str_ + @6.first_column + 1;
+        int32_t param_len = @8.last_column - @6.last_column - 1;
+        $7->str_value_ = parse_strndup(param_str, param_len, parse_ctx->mem_pool_);
+        check_ptr($7->str_value_);
+        $7->str_len_ = param_len;
+      }
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SF_CREATE, 6, $2, $5, $7, $10, sp_clause_node, $12);
+      $$->value_ = $4;
+    }
+  | CREATE opt_sp_definer FUNCTION opt_if_not_exists sp_name '(' opt_sp_fparam_list ')' RETURNS sp_data_type function_body
+    {
+      check_ptr($11);
+      const char *stmt_str = parse_ctx->stmt_str_ + @3.first_column;
+      int32_t str_len = @11.last_column - @3.first_column + 1;
+      $11->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
+      check_ptr($11->str_value_);
+      $11->str_len_ = str_len;
+      $11->raw_text_ = $11->str_value_ + @11.first_column - @3.first_column;
+      $11->text_len_ = str_len - (@11.first_column - @3.first_column);
+      if (NULL != $7) {
+        const char *param_str = parse_ctx->stmt_str_ + @6.first_column + 1;
+        int32_t param_len = @8.last_column - @6.last_column - 1;
+        $7->str_value_ = parse_strndup(param_str, param_len, parse_ctx->mem_pool_);
+        check_ptr($7->str_value_);
+        $7->str_len_ = param_len;
+      }
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SF_CREATE, 6, $2, $5, $7, $10, NULL, $11);
+      $$->value_ = $4;
     }
 ;
 
@@ -1402,12 +1529,26 @@ alter_function_stmt:
     }
 ;
 
+sp_compile_clause:
+    COMPILE opt_reuse_settings
+    {
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SP_COMPILE_CLAUSE, 1, NULL);
+      $$->int32_values_[1] = $2;
+    }
+;
+
+opt_reuse_settings:
+      /*EMPTY*/        { $$ = 0; }
+    | REUSE SETTINGS   { $$ = 1; }
+;
+
 opt_sp_alter_chistics:
     /* empty */ { $$ = NULL; }
   | sp_alter_chistics
     {
       merge_nodes($$, parse_ctx->mem_pool_, T_SP_CLAUSE_LIST, $1);
     }
+  | sp_compile_clause { $$ = $1; }
 ;
 
 sp_alter_chistics:
@@ -1775,6 +1916,18 @@ into_clause:
     {
       ParseNode *vars_list = NULL;
       merge_nodes(vars_list, parse_ctx->mem_pool_, T_SP_INTO_LIST, $2);
+      if (vars_list == NULL) {
+        obpl_mysql_parse_fatal_error(OB_PARSER_ERR_PARSE_SQL, YYLEX_PARAM, "Syntax Error");
+      } else {
+        // The MySQL PL `FETCH INTO @user_var` syntax is not supported. Check if there is a
+        // T_SELECT in the `var_list`, which is transformed from `@user_var` in the `expr` rule.
+        for (int i = 0; i < vars_list->num_child_; ++i) {
+          ParseNode *child = vars_list->children_[i];
+          if (NULL != child && T_SELECT == child->type_) {
+            obpl_mysql_parse_fatal_error(OB_PARSER_ERR_PARSE_SQL, YYLEX_PARAM, "Syntax Error");
+          }
+        }
+      }
       malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_INTO_VARIABLES, 1, vars_list);
     }
 ;
@@ -1797,8 +1950,11 @@ sp_data_type:
 
 opt_sp_decl_default:
     /*Empty*/ { $$ = NULL; }
-  | DEFAULT expr
+  | DEFAULT default_expr
     {
+      if (NULL == $2) {
+        YYERROR;
+      }
       malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SP_DECL_DEFAULT, 1, $2);
     }
 ;
@@ -1916,36 +2072,434 @@ opt_if_exists:
   | IF EXISTS { $$ = 1; }
 ;
 
+opt_if_not_exists:
+    /*Empty*/ { $$ = 0; }
+  | IF NOT EXISTS { $$ = 1; }
+;
+
+geometry_collection:
+GEOMETRYCOLLECTION { $$ = NULL; }
+| GEOMCOLLECTION { $$ = NULL; }
+;
+
+/*****************************************************************************
+ *
+ *	EVENT grammar
+ *
+ *****************************************************************************/
+create_event_stmt:
+CREATE opt_sp_definer EVENT opt_if_not_exists sp_name ON SCHEDULE event_schedule opt_event_on_completion opt_event_status opt_event_comment DO event_body
+{
+  ParseNode *if_not_exists = NULL;
+  if ($4 == 1) {
+    malloc_terminal_node(if_not_exists, parse_ctx->mem_pool_, T_IF_NOT_EXISTS);
+  }
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_EVENT_JOB_CREATE, 8, $2, if_not_exists, $5, $8, $9, $10, $11, $13);
+}
+;
+
+event_schedule:
+AT event_time_expr
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_EVENT_JOB_WITH_ON, 1, $2);
+  $$->value_ = 1;
+}
+| EVERY INTNUM date_unit opt_event_time_range
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_EVENT_JOB_WITH_ON, 3, $2, $3, $4);
+  $$->value_ = 2;
+}
+;
+
+event_time_expr:
+{
+  do_parse_sql_expr_rule($$, parse_ctx, 9, ',', ';', ON, ENABLE, DISABLE, COMMENT, DO, ENDS, RENAME);
+}
+
+opt_event_time_range:
+{
+  $$ = NULL;
+}
+| event_start_time
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_IDENT, 2, $1, NULL);
+}
+| event_end_time
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_IDENT, 2, NULL, $1);
+}
+| event_start_time event_end_time
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_IDENT, 2, $1, $2);
+}
+;
+
+event_start_time:
+STARTS event_time_expr
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_IDENT, 1, $2);
+}
+;
+
+event_end_time:
+ENDS event_time_expr
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_IDENT, 1, $2);
+}
+;
+
+opt_event_on_completion:
+/*Empty*/
+{
+  $$ = NULL;
+}
+| event_on_completion
+{
+  $$ = $1;
+}
+
+event_on_completion:
+ON COMPLETION NOT PRESERVE
+{
+  malloc_terminal_node($$, parse_ctx->mem_pool_, T_IDENT);
+  $$->value_ = 0;
+}
+| ON COMPLETION PRESERVE
+{
+  malloc_terminal_node($$, parse_ctx->mem_pool_, T_IDENT);
+  $$->value_ = 1;
+}
+;
+
+opt_event_status:
+/*Empty*/
+{
+  $$ = NULL;
+}
+| ENABLE
+{
+  malloc_terminal_node($$, parse_ctx->mem_pool_, T_IDENT);
+  $$->value_ = 1;
+}
+| DISABLE
+{
+  malloc_terminal_node($$, parse_ctx->mem_pool_, T_IDENT);
+  $$->value_ = 0;
+}
+/*
+| DISABLE ON SLAVE
+{
+  malloc_terminal_node($$, parse_ctx->mem_pool_, T_IDENT);
+  $$->value_ = 0;
+}
+*/
+;
+
+opt_event_comment:
+/*Empty*/
+{
+  $$ = NULL;
+}
+| COMMENT STRING
+{
+  $$ = $2;
+}
+;
+
+event_body_stmts:
+sql_stmt ';'
+{
+  $$ = $1;
+  check_ptr($$);
+  const char *stmt_str = parse_ctx->stmt_str_ + @1.first_column;
+  int32_t str_len = @1.last_column - @1.first_column + 1;
+  $$->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
+  check_ptr($$->str_value_);
+  $$->str_len_ = str_len;
+}
+| event_body_stmts sql_stmt ';'
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_LINK_NODE, 2, $1, $2);
+  check_ptr($2);
+  const char *stmt_str = parse_ctx->stmt_str_ + @2.first_column;
+  int32_t str_len = @2.last_column - @2.first_column + 1;
+  $2->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
+  check_ptr($2->str_value_);
+  $2->str_len_ = str_len;
+}
+
+event_body:
+sql_stmt
+{
+  check_ptr($1);
+  const char *stmt_str = parse_ctx->stmt_str_ + @1.first_column;
+  int32_t str_len = @1.last_column - @1.first_column + 1;
+  $1->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
+  check_ptr($1->str_value_);
+  $1->str_len_ = str_len;
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_STMT_LIST, 1, $1);
+}
+| call_sp_stmt
+{
+  check_ptr($1);
+  const char *stmt_str = parse_ctx->stmt_str_ + @1.first_column;
+  int32_t str_len = @1.last_column - @1.first_column + 1;
+  $1->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
+  check_ptr($1->str_value_);
+  $1->str_len_ = str_len;
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_STMT_LIST, 1, $1);
+}
+| BEGIN_KEY event_body_stmts END_KEY
+{
+  ParseNode *event_job_stmts = NULL;
+  merge_nodes(event_job_stmts, parse_ctx->mem_pool_, T_STMT_LIST, $2);
+  $$ = event_job_stmts;
+}
+;
+
+alter_event_stmt:
+ALTER opt_sp_definer EVENT sp_name opt_event_alter_on_schedule_completion opt_event_rename opt_event_status opt_event_comment opt_event_body
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_EVENT_JOB_ALTER, 7, $2, $4, $5, $6, $7, $8, $9);
+}
+;
+
+opt_event_alter_on_schedule_completion:
+{
+  $$ = NULL;
+}
+| ON SCHEDULE event_schedule
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_IDENT, 2, $3, NULL);
+}
+| event_on_completion
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_IDENT, 2, NULL, $1);
+}
+| ON SCHEDULE event_schedule event_on_completion
+{
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_IDENT, 2, $3, $4);
+}
+;
+
+opt_event_rename:
+{
+  $$ = NULL;
+}
+| RENAME TO sp_name
+{
+  $$ = $3;
+}
+;
+
+opt_event_body:
+{
+  $$ = NULL;
+}
+| DO event_body
+{
+  $$ = $2;
+}
+;
+
+drop_event_stmt:
+DROP EVENT opt_if_exists sp_name
+{
+  ParseNode *if_exists = NULL;
+  if ($3 == 1) {
+    malloc_terminal_node(if_exists, parse_ctx->mem_pool_, T_IF_EXISTS);
+  }
+  malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_EVENT_JOB_DROP, 2, if_exists, $4);
+}
+;
+
+
 scalar_data_type:
-    int_type_i opt_int_length_i opt_unsigned_i opt_zerofill_i
+    int_type_i opt_int_length_i %prec LOWER_PARENS
     {
-      malloc_terminal_node($$, parse_ctx->mem_pool_, ($3 || $4) ? $1 + (T_UTINYINT - T_TINYINT) : $1);
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1);
       $$->int16_values_[0] = $2;
-      $$->int16_values_[2] = $4;   /* 2 is the same index as float or number. */
+      $$->int16_values_[2] = 0;   /* 2 is the same index as float or number. */
     }
-  | float_type_i opt_float_precision opt_unsigned_i opt_zerofill_i
+  | int_type_i opt_int_length_i ZEROFILL
+    {
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1 + (T_UTINYINT - T_TINYINT));
+      $$->int16_values_[0] = $2;
+      $$->int16_values_[2] = 1;   /* 2 is the same index as float or number. */
+    }
+  | int_type_i opt_int_length_i SIGNED
+    {
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1);
+      $$->int16_values_[0] = $2;
+      $$->int16_values_[2] = 0;   /* 2 is the same index as float or number. */
+    }
+  | int_type_i opt_int_length_i SIGNED ZEROFILL
+    {
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1 + (T_UTINYINT - T_TINYINT));
+      $$->int16_values_[0] = $2;
+      $$->int16_values_[2] = 1;   /* 2 is the same index as float or number. */
+    }
+  | int_type_i opt_int_length_i UNSIGNED
+    {
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1 + (T_UTINYINT - T_TINYINT));
+      $$->int16_values_[0] = $2;
+      $$->int16_values_[2] = 0;   /* 2 is the same index as float or number. */
+    }
+  | int_type_i opt_int_length_i UNSIGNED ZEROFILL
+    {
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1 + (T_UTINYINT - T_TINYINT));
+      $$->int16_values_[0] = $2;
+      $$->int16_values_[2] = 1;   /* 2 is the same index as float or number. */
+    }
+  | float_type_i opt_float_precision %prec LOWER_PARENS
     {
       if (T_FLOAT != $1 && NULL != $2 && -1 == $2->int16_values_[1]) {
         obpl_mysql_yyerror(&@2, parse_ctx, "double type not support double(M) syntax\n");
         YYERROR;
       }
-      malloc_terminal_node($$, parse_ctx->mem_pool_, ($3 || $4) ? $1 + (T_UFLOAT - T_FLOAT) : $1);
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1);
       if (NULL != $2) {
         $$->int16_values_[0] = $2->int16_values_[0];
         $$->int16_values_[1] = $2->int16_values_[1];
       }
       /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
-      $$->int16_values_[2] = $4;
+      $$->int16_values_[2] = 0;
     }
-  | NUMBER opt_number_precision opt_unsigned_i opt_zerofill_i
+  | float_type_i opt_float_precision ZEROFILL
     {
-      malloc_terminal_node($$, parse_ctx->mem_pool_, ($3 || $4) ? T_UNUMBER : T_NUMBER);
+      if (T_FLOAT != $1 && NULL != $2 && -1 == $2->int16_values_[1]) {
+        obpl_mysql_yyerror(&@2, parse_ctx, "double type not support double(M) syntax\n");
+        YYERROR;
+      }
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1 + (T_UFLOAT - T_FLOAT));
       if (NULL != $2) {
         $$->int16_values_[0] = $2->int16_values_[0];
         $$->int16_values_[1] = $2->int16_values_[1];
       }
       /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
-      $$->int16_values_[2] = $4;
+      $$->int16_values_[2] = 1;
+    }
+  | float_type_i opt_float_precision SIGNED
+    {
+      if (T_FLOAT != $1 && NULL != $2 && -1 == $2->int16_values_[1]) {
+        obpl_mysql_yyerror(&@2, parse_ctx, "double type not support double(M) syntax\n");
+        YYERROR;
+      }
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1);
+      if (NULL != $2) {
+        $$->int16_values_[0] = $2->int16_values_[0];
+        $$->int16_values_[1] = $2->int16_values_[1];
+      }
+      /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
+      $$->int16_values_[2] = 0;
+    }
+  | float_type_i opt_float_precision SIGNED ZEROFILL
+    {
+      if (T_FLOAT != $1 && NULL != $2 && -1 == $2->int16_values_[1]) {
+        obpl_mysql_yyerror(&@2, parse_ctx, "double type not support double(M) syntax\n");
+        YYERROR;
+      }
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1 + (T_UFLOAT - T_FLOAT));
+      if (NULL != $2) {
+        $$->int16_values_[0] = $2->int16_values_[0];
+        $$->int16_values_[1] = $2->int16_values_[1];
+      }
+      /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
+      $$->int16_values_[2] = 1;
+    }
+  | float_type_i opt_float_precision UNSIGNED
+    {
+      if (T_FLOAT != $1 && NULL != $2 && -1 == $2->int16_values_[1]) {
+        obpl_mysql_yyerror(&@2, parse_ctx, "double type not support double(M) syntax\n");
+        YYERROR;
+      }
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1 + (T_UFLOAT - T_FLOAT));
+      if (NULL != $2) {
+        $$->int16_values_[0] = $2->int16_values_[0];
+        $$->int16_values_[1] = $2->int16_values_[1];
+      }
+      /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
+      $$->int16_values_[2] = 0;
+    }
+  | float_type_i opt_float_precision UNSIGNED ZEROFILL
+    {
+      if (T_FLOAT != $1 && NULL != $2 && -1 == $2->int16_values_[1]) {
+        obpl_mysql_yyerror(&@2, parse_ctx, "double type not support double(M) syntax\n");
+        YYERROR;
+      }
+      malloc_terminal_node($$, parse_ctx->mem_pool_, $1 + (T_UFLOAT - T_FLOAT));
+      if (NULL != $2) {
+        $$->int16_values_[0] = $2->int16_values_[0];
+        $$->int16_values_[1] = $2->int16_values_[1];
+      }
+      /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
+      $$->int16_values_[2] = 1;
+    }
+  | number_type opt_number_precision %prec LOWER_PARENS
+    {
+      (void)($1);
+      malloc_terminal_node($$, parse_ctx->mem_pool_, T_NUMBER);
+      if (NULL != $2) {
+        $$->int16_values_[0] = $2->int16_values_[0];
+        $$->int16_values_[1] = $2->int16_values_[1];
+      }
+      /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
+      $$->int16_values_[2] = 0;
+    }
+  | number_type opt_number_precision ZEROFILL
+    {
+      (void)($1);
+      malloc_terminal_node($$, parse_ctx->mem_pool_, T_UNUMBER);
+      if (NULL != $2) {
+        $$->int16_values_[0] = $2->int16_values_[0];
+        $$->int16_values_[1] = $2->int16_values_[1];
+      }
+      /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
+      $$->int16_values_[2] = 1;
+    }
+  | number_type opt_number_precision SIGNED
+    {
+      (void)($1);
+      malloc_terminal_node($$, parse_ctx->mem_pool_, T_NUMBER);
+      if (NULL != $2) {
+        $$->int16_values_[0] = $2->int16_values_[0];
+        $$->int16_values_[1] = $2->int16_values_[1];
+      }
+      /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
+      $$->int16_values_[2] = 0;
+    }
+  | number_type opt_number_precision SIGNED ZEROFILL
+    {
+      (void)($1);
+      malloc_terminal_node($$, parse_ctx->mem_pool_, T_UNUMBER);
+      if (NULL != $2) {
+        $$->int16_values_[0] = $2->int16_values_[0];
+        $$->int16_values_[1] = $2->int16_values_[1];
+      }
+      /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
+      $$->int16_values_[2] = 1;
+    }
+  | number_type opt_number_precision UNSIGNED
+    {
+      (void)($1);
+      malloc_terminal_node($$, parse_ctx->mem_pool_, T_UNUMBER);
+      if (NULL != $2) {
+        $$->int16_values_[0] = $2->int16_values_[0];
+        $$->int16_values_[1] = $2->int16_values_[1];
+      }
+      /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
+      $$->int16_values_[2] = 0;
+    }
+  | number_type opt_number_precision UNSIGNED ZEROFILL
+    {
+      (void)($1);
+      malloc_terminal_node($$, parse_ctx->mem_pool_, T_UNUMBER);
+      if (NULL != $2) {
+        $$->int16_values_[0] = $2->int16_values_[0];
+        $$->int16_values_[1] = $2->int16_values_[1];
+      }
+      /* malloc_terminal_node() has set memory to 0 filled, so there is no else. */
+      $$->int16_values_[2] = 1;
     }
   | datetime_type_i opt_datetime_fsp_i
     {
@@ -2086,27 +2640,75 @@ scalar_data_type:
     $$->int32_values_[0] = 0;//not used so far
     $$->int32_values_[1] = 0; /* is char */
   }
-  | pl_obj_access_ref
+  | JSON
 	{
-    if ($1 != NULL && $1->type_ == T_SP_OBJ_ACCESS_REF && 
-        $1->num_child_ == 2 && 
-        $1->children_[0] != NULL &&
-        $1->children_[0]->type_ == T_SP_ACCESS_NAME &&
-        $1->children_[0]->num_child_ == 3 &&
-        $1->children_[0]->children_[0] == NULL && 
-        $1->children_[0]->children_[1] == NULL &&
-        nodename_equal($1->children_[0]->children_[2], "JSON", 4)) {
-      malloc_terminal_node($$, parse_ctx->mem_pool_, T_JSON);
-      $$->int32_values_[0] = 0; 
-    } else {
-      obpl_mysql_yyerror(&@1, parse_ctx, "Syntax Error\n");
-      YYERROR;
-    }
+    malloc_terminal_node($$, parse_ctx->mem_pool_, T_JSON);
+    $$->int32_values_[0] = 0;
   }
+  | GEOMETRY
+  {
+    malloc_terminal_node($$, parse_ctx->mem_pool_, T_GEOMETRY);
+    $$->int32_values_[0] = 0; /* length */
+    $$->int32_values_[1] = 0; /* geometry, geometry uses collation type value convey sub geometry type. */
+  }
+  | POINT
+  {
+    malloc_terminal_node($$, parse_ctx->mem_pool_, T_GEOMETRY);
+    $$->int32_values_[0] = 0; /* length */
+    $$->int32_values_[1] = 1; /* point, geometry uses collation type value convey sub geometry type. */
+  }
+  | LINESTRING
+  {
+    malloc_terminal_node($$, parse_ctx->mem_pool_, T_GEOMETRY);
+    $$->int32_values_[0] = 0; /* length */
+    $$->int32_values_[1] = 2; /* linestring, geometry uses collation type value convey sub geometry type. */
+  }
+  | POLYGON
+  {
+    malloc_terminal_node($$, parse_ctx->mem_pool_, T_GEOMETRY);
+    $$->int32_values_[0] = 0; /* length */
+    $$->int32_values_[1] = 3; /* polygon, geometry uses collation type value convey sub geometry type. */
+  }
+  | MULTIPOINT
+  {
+    malloc_terminal_node($$, parse_ctx->mem_pool_, T_GEOMETRY);
+    $$->int32_values_[0] = 0; /* length */
+    $$->int32_values_[1] = 4; /* mutipoint, geometry uses collation type value convey sub geometry type. */
+  }
+  | MULTILINESTRING
+  {
+    malloc_terminal_node($$, parse_ctx->mem_pool_, T_GEOMETRY);
+    $$->int32_values_[0] = 0; /* length */
+    $$->int32_values_[1] = 5; /* multilinestring, geometry uses collation type value convey sub geometry type. */
+  }
+  | MULTIPOLYGON
+  {
+    malloc_terminal_node($$, parse_ctx->mem_pool_, T_GEOMETRY);
+    $$->int32_values_[0] = 0; /* length */
+    $$->int32_values_[1] = 6; /* multipolygon, geometry uses collation type value convey sub geometry type. */
+  }
+  | geometry_collection
+  {
+    UNUSED($1);
+    malloc_terminal_node($$, parse_ctx->mem_pool_, T_GEOMETRY);
+    $$->int32_values_[0] = 0; /* length */
+    $$->int32_values_[1] = 7; /* geometrycollection, geometry uses collation type value convey sub geometry type. */
+  }
+  | ROARINGBITMAP
+  {
+    malloc_terminal_node($$, parse_ctx->mem_pool_, T_ROARINGBITMAP);
+    $$->int32_values_[0] = 0; /* length */
+  }
+  | SERIAL
+    {
+      malloc_terminal_node($$, parse_ctx->mem_pool_, T_UINT64);
+      $$->int16_values_[0] = -1;  // precision, default value -1
+      $$->int16_values_[2] = 0;   // zerofill always false for serial type
+    }
   | pl_obj_access_ref '%' ROWTYPE
   {
     if (parse_ctx->is_for_trigger_ && parse_ctx->is_inner_parse_) {
-      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SP_ROWTYPE, 1, $1);
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_SP_ROWTYPE, 2, $1, NULL);
     } else {
       obpl_mysql_yyerror(&@3, parse_ctx, "Syntax Error\n");
       YYERROR;
@@ -2139,6 +2741,12 @@ datetime_type_i:
   | TIMESTAMP   { $$ = T_TIMESTAMP; }
   | TIME        { $$ = T_TIME; }
 ;
+
+number_type:
+DEC { $$ = NULL; }
+| DECIMAL { $$ = NULL; }
+| NUMERIC { $$ = NULL; }
+| FIXED { $$ = NULL; }
 
 date_year_type_i:
     DATE        { $$ = T_DATE; }
@@ -2355,17 +2963,6 @@ opt_string_length_i:
     }
 ;
 
-opt_unsigned_i:
-    UNSIGNED    { $$ = 1; }
-  | SIGNED      { $$ = 0; }
-  | /*EMPTY*/   { $$ = 0; }
-;
-
-opt_zerofill_i:
-    ZEROFILL    { $$ = 1; }
-  | /*EMPTY*/   { $$ = 0; }
-;
-
 opt_binary:
     BINARY
     {
@@ -2530,6 +3127,99 @@ scond_info_item_name:
   | MYSQL_ERRNO { $$ = DIAG_MYSQL_ERRNO; }
 ;
 
+/*****************************************************************************
+ *
+ *	OLAP ASYNC JOB grammar
+ *
+ *****************************************************************************/
+submit_job_stmt:
+    SUBMIT JOB sql_stmt
+    {
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_OLAP_ASYNC_JOB_SUBMIT, 1, $3);
+      const char *stmt_str = parse_ctx->stmt_str_ + @3.first_column;
+      int32_t str_len = @3.last_column - @3.first_column + 1;
+      $$->str_value_ = parse_strndup(stmt_str, str_len, parse_ctx->mem_pool_);
+      check_ptr($$->str_value_);
+      $$->str_len_ = str_len;
+    }
+;
+
+cancel_job_stmt:
+    CANCEL JOB STRING
+    {
+      malloc_non_terminal_node($$, parse_ctx->mem_pool_, T_OLAP_ASYNC_JOB_CANCEL, 1, $3);
+    }
+;
+
+date_unit:
+YEAR
+{
+  malloc_terminal_node($$, parse_ctx->mem_pool_, T_INT);
+  $$->value_ = DATE_UNIT_YEAR;
+  $$->is_hidden_const_ = 1;
+  $$->is_date_unit_ = 1;
+  const char *time_str = parse_ctx->stmt_str_ + @1.first_column;
+  int32_t str_len = @1.last_column - @1.first_column + 1;
+  $$->str_value_ = parse_strndup(time_str, str_len, parse_ctx->mem_pool_);
+  $$->str_len_ = str_len;
+}
+| MONTH
+{
+  malloc_terminal_node($$, parse_ctx->mem_pool_, T_INT);
+  $$->value_ = DATE_UNIT_MONTH;
+  $$->is_hidden_const_ = 1;
+  $$->is_date_unit_ = 1;
+  const char *time_str = parse_ctx->stmt_str_ + @1.first_column;
+  int32_t str_len = @1.last_column - @1.first_column + 1;
+  $$->str_value_ = parse_strndup(time_str, str_len, parse_ctx->mem_pool_);
+  $$->str_len_ = str_len;
+}
+| DAY
+{
+  malloc_terminal_node($$, parse_ctx->mem_pool_, T_INT);
+  $$->value_ = DATE_UNIT_DAY;
+  $$->is_hidden_const_ = 1;
+  $$->is_date_unit_ = 1;
+  const char *time_str = parse_ctx->stmt_str_ + @1.first_column;
+  int32_t str_len = @1.last_column - @1.first_column + 1;
+  $$->str_value_ = parse_strndup(time_str, str_len, parse_ctx->mem_pool_);
+  $$->str_len_ = str_len;
+}
+| HOUR
+{
+ malloc_terminal_node($$, parse_ctx->mem_pool_, T_INT);
+  $$->value_ = DATE_UNIT_HOUR;
+  $$->is_hidden_const_ = 1;
+  $$->is_date_unit_ = 1;
+  const char *time_str = parse_ctx->stmt_str_ + @1.first_column;
+  int32_t str_len = @1.last_column - @1.first_column + 1;
+  $$->str_value_ = parse_strndup(time_str, str_len, parse_ctx->mem_pool_);
+  $$->str_len_ = str_len;
+}
+| MINUTE
+{
+  malloc_terminal_node($$, parse_ctx->mem_pool_, T_INT);
+  $$->value_ = DATE_UNIT_MINUTE;
+  $$->is_hidden_const_ = 1;
+  $$->is_date_unit_ = 1;
+  const char *time_str = parse_ctx->stmt_str_ + @1.first_column;
+  int32_t str_len = @1.last_column - @1.first_column + 1;
+  $$->str_value_ = parse_strndup(time_str, str_len, parse_ctx->mem_pool_);
+  $$->str_len_ = str_len;
+}
+| SECOND
+{
+  malloc_terminal_node($$, parse_ctx->mem_pool_, T_INT);
+  $$->value_ = DATE_UNIT_SECOND;
+  $$->is_hidden_const_ = 1;
+  $$->is_date_unit_ = 1;
+  const char *time_str = parse_ctx->stmt_str_ + @1.first_column;
+  int32_t str_len = @1.last_column - @1.first_column + 1;
+  $$->str_value_ = parse_strndup(time_str, str_len, parse_ctx->mem_pool_);
+  $$->str_len_ = str_len;
+}
+;
+
 %%
 /**
  * parser function
@@ -2611,6 +3301,7 @@ ParseNode *obpl_mysql_read_sql_construct(ObParseCtx *parse_ctx, const char *pref
     parse_result.is_not_utf8_connection_ = parse_ctx->is_not_utf8_connection_;
     parse_result.connection_collation_ = parse_ctx->connection_collation_;
     parse_result.sql_mode_ = parse_ctx->scanner_ctx_.sql_mode_;
+    parse_result.semicolon_start_col_ = INT32_MAX;
   }
   if (sql_str_len <= 0) {
     //do nothing
@@ -2634,12 +3325,11 @@ ParseNode *obpl_mysql_read_sql_construct(ObParseCtx *parse_ctx, const char *pref
   return sql_node;
 }
 
-void obpl_mysql_yyerror(YYLTYPE *yylloc, ObParseCtx *parse_ctx, char *s, ...)
+void obpl_mysql_yyerror(YYLTYPE *yylloc, ObParseCtx *parse_ctx, char *s)
 {
   if (OB_LIKELY(NULL != parse_ctx)) {
-    va_list ap;
-    va_start(ap, s);
-    vsnprintf(parse_ctx->global_errmsg_, MAX_ERROR_MSG, s, ap);
+    strncpy(parse_ctx->global_errmsg_, s, MAX_ERROR_MSG);
+    parse_ctx->global_errmsg_[MAX_ERROR_MSG - 1] = '\0';
     // vfprintf(stderr, s, ap);
     if (OB_LIKELY(NULL != yylloc)) {
       ObParseErrorInfo *error_info = (ObParseErrorInfo*)parse_malloc(sizeof(ObParseErrorInfo), parse_ctx->mem_pool_);
@@ -2654,7 +3344,6 @@ void obpl_mysql_yyerror(YYLTYPE *yylloc, ObParseCtx *parse_ctx, char *s, ...)
         parse_ctx->cur_error_info_ = error_info;
       }
     }
-    va_end(ap);
   }
 }
 

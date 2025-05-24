@@ -10,12 +10,8 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "storage/tx/ob_tx_ls_log_writer.h"
-#include "storage/tx/ob_timestamp_service.h"
-#include "storage/tx/ob_trans_id_service.h"
-#include "logservice/ob_log_base_header.h"
+#include "ob_tx_ls_log_writer.h"
 #include "storage/tx/ob_trans_ctx_mgr.h"
-#include "lib/stat/ob_latch_define.h"
 
 namespace oceanbase
 {
@@ -138,7 +134,7 @@ int ObTxLSLogCb::on_failure()
   if (OB_ISNULL(base_wr_)) {
     ret = OB_INVALID_ARGUMENT;
     TRANS_LOG(WARN, "[TxLsLogWriter] invalid arguments", KP(base_wr_));
-  } else if (base_wr_->on_failure(this)) {
+  } else if (OB_FAIL(base_wr_->on_failure(this))) {
     TRANS_LOG(WARN, "[TxLsLogWriter] on_failure failed", KR(ret), K(log_ts_), K(type_));
   }
   return ret;

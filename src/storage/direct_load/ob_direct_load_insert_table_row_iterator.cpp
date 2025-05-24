@@ -13,6 +13,11 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/direct_load/ob_direct_load_insert_table_row_iterator.h"
+#include "sql/engine/cmd/ob_load_data_utils.h"
+#include "storage/direct_load/ob_direct_load_datum_row.h"
+#include "storage/direct_load/ob_direct_load_dml_row_handler.h"
+#include "storage/direct_load/ob_direct_load_insert_table_ctx.h"
+#include "storage/direct_load/ob_direct_load_row_iterator.h"
 
 namespace oceanbase
 {
@@ -20,118 +25,162 @@ namespace storage
 {
 using namespace common;
 using namespace blocksstable;
-
-/**
- * ObDirectLoadInsertTableRowIteratorParam
- */
-
-ObDirectLoadInsertTableRowIteratorParam::ObDirectLoadInsertTableRowIteratorParam()
-  : lob_column_cnt_(0),
-    datum_utils_(nullptr),
-    col_descs_(nullptr),
-    cmp_funcs_(nullptr),
-    column_stat_array_(nullptr),
-    lob_builder_(nullptr),
-    is_heap_table_(false),
-    online_opt_stat_gather_(false),
-    px_mode_(false)
-{
-}
-
-ObDirectLoadInsertTableRowIteratorParam::~ObDirectLoadInsertTableRowIteratorParam()
-{
-}
-
-/**
- * ObDirectLoadInsertTableRowIterator
- */
+using namespace table;
+using namespace sql;
 
 ObDirectLoadInsertTableRowIterator::ObDirectLoadInsertTableRowIterator()
-: lob_allocator_(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID())
+  : insert_tablet_ctx_(nullptr),
+    row_iters_(nullptr),
+    dml_row_handler_(nullptr),
+    job_stat_(nullptr),
+    rowkey_column_count_(0),
+    column_count_(0),
+    pos_(0),
+    row_count_(0),
+    is_inited_(false)
 {
 }
 
-ObDirectLoadInsertTableRowIterator::~ObDirectLoadInsertTableRowIterator()
-{
-}
+ObDirectLoadInsertTableRowIterator::~ObDirectLoadInsertTableRowIterator() {}
 
-int ObDirectLoadInsertTableRowIterator::inner_init(
-  const ObDirectLoadInsertTableRowIteratorParam &param)
+int ObDirectLoadInsertTableRowIterator::init(
+  ObDirectLoadInsertTabletContext *insert_tablet_ctx,
+  const ObIArray<ObDirectLoadIStoreRowIterator *> &row_iters,
+  ObDirectLoadDMLRowHandler *dml_row_handler,
+  ObLoadDataStat *job_stat)
 {
   int ret = OB_SUCCESS;
-  param_ = param;
-  return ret;
-}
-
-int ObDirectLoadInsertTableRowIterator::get_next_row(const blocksstable::ObDatumRow *&result_row)
-{
-  int ret = OB_SUCCESS;
-  ObDatumRow *datum_row = nullptr;
-  if (OB_FAIL(inner_get_next_row(datum_row))) {
-    if (OB_UNLIKELY(OB_ITER_END != ret)) {
-      LOG_WARN("fail to do inner get next row", KR(ret));
-    }
-  }
-  if (OB_SUCC(ret)) {
-    if (param_.online_opt_stat_gather_ && OB_FAIL(collect_obj(*datum_row))) {
-      LOG_WARN("fail to collect obj", KR(ret));
-    }
-  }
-  if (OB_SUCC(ret) && param_.lob_column_cnt_ > 0) {
-    lob_allocator_.reuse();
-    if (OB_FAIL(handle_lob(*datum_row))) {
-      LOG_WARN("fail to handle lob", KR(ret));
-    }
-  }
-  if (OB_SUCC(ret)) {
-    result_row = datum_row;
-  }
-  return ret;
-}
-
-int ObDirectLoadInsertTableRowIterator::collect_obj(const blocksstable::ObDatumRow &datum_row)
-{
-  int ret = OB_SUCCESS;
-  const int64_t extra_rowkey_cnt = ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt();
-  if (param_.is_heap_table_) {
-    for (int64_t i = 0; OB_SUCC(ret) && i < param_.table_data_desc_.column_count_; i++) {
-      const ObStorageDatum &datum = datum_row.storage_datums_[i + extra_rowkey_cnt + 1];
-      const common::ObCmpFunc &cmp_func = param_.cmp_funcs_->at(i + 1).get_cmp_func();
-      const ObColDesc &col_desc = param_.col_descs_->at(i + 1);
-      ObOptOSGColumnStat *col_stat = param_.column_stat_array_->at(i);
-      bool is_valid = ObColumnStatParam::is_valid_opt_col_type(col_desc.col_type_.get_type());
-      if (col_stat != nullptr && is_valid) {
-        if (OB_FAIL(
-              col_stat->update_column_stat_info(&datum, col_desc.col_type_, cmp_func.cmp_func_))) {
-          LOG_WARN("Failed to merge obj", K(ret), KP(col_stat));
-        }
-      }
-    }
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("ObDirectLoadInsertTableRowIterator init twice", KR(ret), KP(this));
+  } else if (OB_UNLIKELY(nullptr == insert_tablet_ctx || nullptr == job_stat)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid args", KR(ret), KPC(insert_tablet_ctx), KP(job_stat));
   } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < param_.table_data_desc_.rowkey_column_num_; i++) {
-      const ObStorageDatum &datum = datum_row.storage_datums_[i];
-      const common::ObCmpFunc &cmp_func = param_.cmp_funcs_->at(i).get_cmp_func();
-      const ObColDesc &col_desc = param_.col_descs_->at(i);
-      ObOptOSGColumnStat *col_stat = param_.column_stat_array_->at(i);
-      bool is_valid = ObColumnStatParam::is_valid_opt_col_type(col_desc.col_type_.get_type());
-      if (col_stat != nullptr && is_valid) {
-        if (OB_FAIL(
-              col_stat->update_column_stat_info(&datum, col_desc.col_type_, cmp_func.cmp_func_))) {
-          LOG_WARN("Failed to merge obj", K(ret), KP(col_stat));
-        }
+    // check row iters
+    for (int64_t i = 0; OB_SUCC(ret) && i < row_iters.count(); ++i) {
+      ObDirectLoadIStoreRowIterator *row_iter = row_iters.at(i);
+      if (OB_ISNULL(row_iter)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected row iter is null", KR(ret), K(i), K(row_iters));
+      } else if (OB_UNLIKELY(!row_iter->is_valid() || row_iter->get_row_flag().get_column_count(
+                                                        row_iter->get_column_count()) !=
+                                                        insert_tablet_ctx->get_column_count())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected row iter", KR(ret), KPC(row_iter));
       }
     }
-    for (int64_t i = param_.table_data_desc_.rowkey_column_num_;
-         OB_SUCC(ret) && i < param_.table_data_desc_.column_count_; i++) {
-      const ObStorageDatum &datum = datum_row.storage_datums_[i + extra_rowkey_cnt];
-      const common::ObCmpFunc &cmp_func = param_.cmp_funcs_->at(i).get_cmp_func();
-      const ObColDesc &col_desc = param_.col_descs_->at(i);
-      ObOptOSGColumnStat *col_stat = param_.column_stat_array_->at(i);
-      bool is_valid = ObColumnStatParam::is_valid_opt_col_type(col_desc.col_type_.get_type());
-      if (col_stat != nullptr && is_valid) {
-        if (OB_FAIL(
-              col_stat->update_column_stat_info(&datum, col_desc.col_type_, cmp_func.cmp_func_))) {
-          LOG_WARN("Failed to merge obj", K(ret), KP(col_stat));
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(row_handler_.init(insert_tablet_ctx))) {
+      LOG_WARN("fail to init row handler", KR(ret));
+    } else if (OB_FAIL(insert_tablet_ctx->init_datum_row(insert_datum_row_))) {
+      LOG_WARN("fail to init datum row", KR(ret));
+    } else if (OB_FAIL(insert_tablet_ctx->init_datum_row(delete_datum_row_, true /*is_delete*/))) {
+      LOG_WARN("fail to init datum row", KR(ret));
+    } else {
+      insert_tablet_ctx_ = insert_tablet_ctx;
+      dml_row_handler_ = dml_row_handler;
+      row_iters_ = &row_iters;
+      job_stat_ = job_stat;
+      rowkey_column_count_ = insert_tablet_ctx->get_rowkey_column_count();
+      column_count_ = insert_tablet_ctx->get_column_count();
+      is_inited_ = true;
+    }
+  }
+  return ret;
+}
+
+int ObDirectLoadInsertTableRowIterator::get_next_row(const ObDatumRow *&result_row)
+{
+  int ret = OB_SUCCESS;
+  ret = get_next_row(false, result_row);
+  if (OB_UNLIKELY(ret != OB_ITER_END && ret != OB_SUCCESS)) {
+    LOG_WARN("fail to get next row", KR(ret));
+  }
+  return ret;
+}
+
+int ObDirectLoadInsertTableRowIterator::get_next_row(const bool skip_lob,
+                                                     const ObDatumRow *&result_row)
+{
+  int ret = OB_SUCCESS;
+  result_row = nullptr;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ObDirectLoadInsertTableRowIterator not init", KR(ret), KP(this));
+  } else {
+    ObDatumRow *datum_row = nullptr;
+    if (OB_FAIL(inner_get_next_row(datum_row))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("fail to get next row", KR(ret));
+      }
+    } else if (OB_FAIL(row_handler_.handle_row(*datum_row, skip_lob))) {
+      LOG_WARN("fail to handle row", KR(ret));
+    } else {
+      result_row = datum_row;
+      ++row_count_;
+      ATOMIC_AAF(&job_stat_->store_.merge_stage_write_rows_, 1);
+    }
+  }
+  return ret;
+}
+
+int ObDirectLoadInsertTableRowIterator::inner_get_next_row(ObDatumRow *&result_row)
+{
+  int ret = OB_SUCCESS;
+  result_row = nullptr;
+  const ObDirectLoadDatumRow *datum_row = nullptr;
+  while (OB_SUCC(ret) && nullptr == result_row) {
+    if (pos_ >= row_iters_->count()) {
+      ret = OB_ITER_END;
+    } else {
+      ObDirectLoadIStoreRowIterator *row_iter = row_iters_->at(pos_);
+      if (OB_FAIL(row_iter->get_next_row(datum_row))) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          LOG_WARN("fail to get next row", KR(ret));
+        } else {
+          ret = OB_SUCCESS;
+          ++pos_; // switch next row iter
+        }
+      } else if (OB_ISNULL(datum_row)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected datum row is null", KR(ret));
+      } else {
+        ObDatumRow *datum_row2 =
+          datum_row->is_delete_ ? &delete_datum_row_ : &insert_datum_row_;
+        // rowkey cols
+        if (row_iter->get_row_flag().uncontain_hidden_pk_) {
+          uint64_t pk_seq = OB_INVALID_ID;
+          if (OB_FAIL(row_iter->get_hide_pk_interval()->next_value(pk_seq))) {
+            LOG_WARN("fail to get next pk seq", KR(ret));
+          } else {
+            datum_row2->storage_datums_[0].set_int(pk_seq);
+          }
+        } else {
+          for (int64_t i = 0; i < rowkey_column_count_; ++i) {
+            datum_row2->storage_datums_[i] = datum_row->storage_datums_[i];
+          }
+        }
+        // normal cols
+        if (OB_SUCC(ret) && !datum_row->is_delete_) {
+          for (int64_t
+                 i = row_iter->get_row_flag().uncontain_hidden_pk_ ? 0 : rowkey_column_count_,
+                 j = rowkey_column_count_ + ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt();
+               i < datum_row->count_; ++i, ++j) {
+            datum_row2->storage_datums_[j] = datum_row->storage_datums_[i];
+          }
+        }
+        if (OB_SUCC(ret) && nullptr != dml_row_handler_) {
+          // 只有堆表insert阶段会走到这里
+          if (OB_UNLIKELY(datum_row->is_delete_)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected delete row", KR(ret), KPC(datum_row));
+          } else if (OB_FAIL(dml_row_handler_->handle_insert_row(insert_tablet_ctx_->get_tablet_id(), *datum_row2))) {
+            LOG_WARN("fail to handle insert row", KR(ret), KPC(datum_row2));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          result_row = datum_row2;
         }
       }
     }
@@ -139,11 +188,16 @@ int ObDirectLoadInsertTableRowIterator::collect_obj(const blocksstable::ObDatumR
   return ret;
 }
 
-int ObDirectLoadInsertTableRowIterator::handle_lob(blocksstable::ObDatumRow &datum_row)
+int ObDirectLoadInsertTableRowIterator::close()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(param_.lob_builder_->append_lob(lob_allocator_, datum_row))) {
-    LOG_WARN("fail to append lob", KR(ret), K(param_.tablet_id_), K(datum_row));
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ObDirectLoadInsertTableRowIterator not init", KR(ret), KP(this));
+  } else if (OB_FAIL(row_handler_.close())) {
+    LOG_WARN("fail to close row handler", KR(ret));
+  } else {
+    insert_tablet_ctx_->inc_row_count(row_count_);
   }
   return ret;
 }

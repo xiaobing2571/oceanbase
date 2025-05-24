@@ -21,6 +21,7 @@
 #include "share/ob_rpc_struct.h"
 #include "rootserver/ob_rs_job_table_operator.h"
 #include "rootserver/ob_root_inspection.h"
+#include "share/ob_global_stat_proxy.h"
 
 namespace oceanbase
 {
@@ -44,6 +45,34 @@ private:
   obrpc::ObUpgradeJobArg arg_;
 };
 
+class ObUpgradeProcessorExecutor {
+public:
+  int init(const uint64_t &tenant_id, common::ObMySQLProxy *sql_proxy);
+  virtual int get_data_version(uint64_t &data_version) = 0;
+  virtual int update_data_version(const uint64_t &data_version) = 0;
+  virtual int run_upgrade_processor(share::ObBaseUpgradeProcessor &processor) = 0;
+  uint64_t get_tenant_id() { return tenant_id_; }
+protected:
+  int check_inner_stat_();
+protected:
+  uint64_t tenant_id_;
+  common::ObMySQLProxy *sql_proxy_;
+};
+
+class ObUpgradeCurrentDataVersionProcessorExecutor : public ObUpgradeProcessorExecutor{
+public:
+  virtual int get_data_version(uint64_t &data_version) override;
+  virtual int update_data_version(const uint64_t &data_version) override;
+  virtual int run_upgrade_processor(share::ObBaseUpgradeProcessor &processor) override;
+};
+
+class ObUpgradeBeginDataVersionProcessorExecutor : public ObUpgradeProcessorExecutor{
+public:
+  virtual int get_data_version(uint64_t &data_version) override;
+  virtual int update_data_version(const uint64_t &data_version) override;
+  virtual int run_upgrade_processor(share::ObBaseUpgradeProcessor &processor) override;
+};
+
 class ObUpgradeExecutor : public share::ObCheckStopProvider
 {
 public:
@@ -52,6 +81,7 @@ public:
   int init(share::schema::ObMultiVersionSchemaService &schema_service,
            rootserver::ObRootInspection &root_inspection,
            common::ObMySQLProxy &sql_proxy,
+           common::ObOracleSqlProxy &oracle_sql_proxy,
            obrpc::ObSrvRpcProxy &rpc_proxy,
            obrpc::ObCommonRpcProxy &common_proxy);
 
@@ -66,6 +96,14 @@ private:
   int check_inner_stat_() const;
   int set_execute_mark_();
 
+  int check_data_version_after_upgrade_begin_(const uint64_t tenant_id);
+  int check_data_version_after_upgrade_post_action_(const uint64_t tenant_id);
+  int check_data_version_after_upgrade_end_(const uint64_t tenant_id);
+
+  int check_target_data_version_(const uint64_t tenant_id, share::ObGlobalStatProxy &proxy);
+  int check_current_data_version_(const uint64_t tenant_id, share::ObGlobalStatProxy &proxy);
+  int check_compatible_(const uint64_t tenant_id);
+
   int run_upgrade_post_job_(const common::ObIArray<uint64_t> &tenant_ids,
                             const int64_t version);
 
@@ -78,6 +116,7 @@ private:
   int run_upgrade_all_post_action_(const common::ObIArray<uint64_t> &tenant_ids);
   int run_upgrade_inspection_job_(const common::ObIArray<uint64_t> &tenant_ids);
   int run_upgrade_end_action_(const common::ObIArray<uint64_t> &tenant_ids);
+  int run_upgrade_finish_action_(const common::ObIArray<uint64_t> &tenant_ids);
 
   int run_upgrade_all_(const common::ObIArray<uint64_t> &tenant_ids);
   /*-----upgrade all cmd----*/
@@ -94,6 +133,7 @@ private:
 #endif
   int run_upgrade_all_post_action_(const uint64_t tenant_id);
   int run_upgrade_end_action_(const uint64_t tenant_id);
+  int run_upgrade_finish_action_(const uint64_t tenant_id);
 
   int check_schema_sync_(const uint64_t tenant_id);
   int check_schema_sync_(
@@ -112,12 +152,17 @@ private:
       const uint64_t current_data_version,
       const int64_t buf_len,
       char *buf);
+  int run_upgrade_all_processors_(ObUpgradeProcessorExecutor &executor);
+  int run_upgrade_processor_(ObUpgradeProcessorExecutor &executor,
+      share::ObBaseUpgradeProcessor *processor,
+      uint64_t &version);
 private:
   bool inited_;
   bool stopped_;
   bool execute_;
   common::SpinRWLock rwlock_;
   common::ObMySQLProxy *sql_proxy_;
+  common::ObOracleSqlProxy *oralce_sql_proxy_;
   obrpc::ObSrvRpcProxy *rpc_proxy_;
   obrpc::ObCommonRpcProxy *common_rpc_proxy_;
   share::schema::ObMultiVersionSchemaService *schema_service_;

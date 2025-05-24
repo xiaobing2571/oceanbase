@@ -20,6 +20,8 @@
 #include "share/scn.h"
 #include "logservice/palf/palf_callback.h"
 #include "logservice/palf/palf_iterator.h"
+#include "logservice/ipalf/ipalf_handle.h"
+#include "logservice/ipalf/ipalf_iterator.h"
 #include "logservice/palf/palf_handle.h"
 #include "lib/lock/ob_spin_lock.h"
 #include "lib/lock/ob_spin_rwlock.h"
@@ -29,12 +31,15 @@
 #include "share/ob_define.h"
 #include "share/ob_errno.h"
 #include "share/ob_ls_id.h"
+#include "logservice/ob_log_handler.h"
 
 namespace oceanbase
 {
-namespace palf
+namespace ipalf
 {
-class PalfEnv;
+class IPalfEnv;
+class IPalfHandle;
+class IPalfLogIterator;
 }
 namespace logservice
 {
@@ -125,19 +130,25 @@ public:
                   const palf::LSN &lsn,
                   const share::SCN &scn,
                   const int64_t log_size,
-                  const bool is_raw_write)
-    : ls_id_(ls_id),
+                  const int64_t base_header_len,
+                  void *decompression_buf,
+                  int64_t decompressed_log_size)
+      : ls_id_(ls_id),
       log_type_(header.get_log_type()),
       lsn_(lsn),
       scn_(scn),
       is_pre_barrier_(header.need_pre_replay_barrier()),
       is_post_barrier_(header.need_post_replay_barrier()),
-      log_size_(log_size),
+      read_log_size_(log_size),
       replay_hint_(std::abs(header.get_replay_hint())),
-      is_raw_write_(is_raw_write),
       init_task_ts_(OB_INVALID_TIMESTAMP),
       first_handle_ts_(OB_INVALID_TIMESTAMP),
-      print_error_ts_(OB_INVALID_TIMESTAMP)
+      print_error_ts_(OB_INVALID_TIMESTAMP),
+      read_log_buf_(NULL),
+      decompression_buf_(decompression_buf),
+      has_decompressed_(false),
+      decompressed_log_size_(decompressed_log_size),
+      base_header_len_(base_header_len)
   {}
   virtual ~ObLogReplayTask()
   {
@@ -146,6 +157,8 @@ public:
   int init(void *log_buf);
   void reset();
   bool is_valid();
+  void *get_replay_payload() const;
+  int64_t get_replay_payload_size() const;
   void shallow_copy(const ObLogReplayTask &other);
 public:
   share::ObLSID ls_id_;
@@ -154,16 +167,18 @@ public:
   share::SCN scn_;
   bool is_pre_barrier_;
   bool is_post_barrier_;
-  int64_t log_size_;
+  int64_t read_log_size_;//
   int64_t replay_hint_;
-  //for standby replay control, need record for cached log replay task;
-  bool is_raw_write_;
   int64_t init_task_ts_;
   int64_t first_handle_ts_;
   int64_t print_error_ts_;
   int64_t replay_cost_; //此任务回放成功时的当次处理时间
   int64_t retry_cost_; //此任务重试的总耗时时间
-  void *log_buf_;
+  void *read_log_buf_;
+  void *decompression_buf_;//buf used to decompress log; if not NULL, means log should be decompessed
+  bool has_decompressed_;
+  int64_t decompressed_log_size_;
+  int64_t base_header_len_;
 
   int64_t to_string(char* buf, const int64_t buf_len) const;
 };
@@ -278,7 +293,7 @@ public:
   }
   int init(const palf::LSN &base_lsn,
            const share::SCN &base_scn,
-           palf::PalfHandle *palf_handle,
+           const share::ObLSID &id,
            ObReplayStatus *replay_status);
   void reset() override;
   void destroy() override;
@@ -295,11 +310,11 @@ public:
   int get_base_lsn(palf::LSN &lsn) const;
   int get_base_scn(share::SCN &scn) const;
   int need_skip(const share::SCN &scn, bool &need_skip);
-  int get_log(const char *&buffer, int64_t &nbytes, share::SCN &scn, palf::LSN &offset, bool &is_raw_write);
+  int get_log(const char *&buffer, int64_t &nbytes, share::SCN &scn, palf::LSN &lsn, palf::LSN &end_lsn);
   int next_log(const share::SCN &replayable_point,
                bool &iterate_end_by_replayable_point);
   // 以当前的终点作为新起点重置迭代器
-  int reset_iterator(palf::PalfHandle &palf_handle,
+  int reset_iterator(const share::ObLSID &id,
                      const palf::LSN &begin_lsn);
 
   INHERIT_TO_STRING_KV("ObReplayServiceSubmitTask", ObReplayServiceTask,
@@ -325,7 +340,7 @@ private:
   //initial log scn when enable replay, logs which scn small than this value should skip replay
   share::SCN base_scn_;
   //for unittest, should be a member not pointer
-  palf::PalfBufferIterator iterator_;
+  ipalf::IPalfLogIterator iterator_;
 };
 
 class ObReplayServiceReplayTask : public ObReplayServiceTask
@@ -444,7 +459,7 @@ public:
   ObReplayStatus();
   ~ObReplayStatus();
   int init(const share::ObLSID &id,
-           palf::PalfEnv *palf_env,
+           ipalf::IPalfEnv *palf_env,
            ObLogReplayService *rp_sv);
   void destroy();
 public:
@@ -515,7 +530,10 @@ public:
                                   int64_t &first_handle_ts,
                                   int64_t &replay_cost,
                                   int64_t &retry_cost);
-  int get_replay_process(int64_t &replayed_log_size, int64_t &unreplayed_log_size);
+  int get_replay_process(int64_t &submitted_log_size,
+                         int64_t &unsubmitted_log_size,
+                         int64_t &replayed_log_size,
+                         int64_t &unreplayed_log_size);
   //提交日志检查barrier状态
   int check_submit_barrier();
   //回放日志检查barrier状态
@@ -621,8 +639,8 @@ private:
   ObReplayServiceReplayTask task_queues_[common::REPLAY_TASK_QUEUE_SIZE];
   ObReplayServiceSubmitTask submit_log_task_;
 
-  palf::PalfEnv *palf_env_;
-  palf::PalfHandle palf_handle_;
+  ipalf::IPalfEnv *palf_env_;
+  ipalf::IPalfHandle *palf_handle_;
   ObReplayFsCb fs_cb_;
   mutable int64_t get_log_info_debug_time_;
   mutable int64_t try_wrlock_debug_time_;

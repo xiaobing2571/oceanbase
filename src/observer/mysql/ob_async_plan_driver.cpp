@@ -14,17 +14,7 @@
 
 #include "ob_async_plan_driver.h"
 
-#include "rpc/obmysql/packet/ompk_eof.h"
-#include "rpc/obmysql/packet/ompk_resheader.h"
-#include "rpc/obmysql/packet/ompk_field.h"
-#include "rpc/obmysql/packet/ompk_row.h"
-#include "rpc/obmysql/ob_mysql_field.h"
-#include "rpc/obmysql/ob_mysql_packet.h"
-#include "lib/profile/ob_perf_event.h"
-#include "obsm_row.h"
 #include "observer/mysql/obmp_query.h"
-#include "observer/mysql/ob_mysql_end_trans_cb.h"
-#include "observer/mysql/obmp_stmt_prexecute.h"
 
 namespace oceanbase
 {
@@ -144,7 +134,7 @@ int ObAsyncPlanDriver::response_result(ObMySQLResultSet &result)
             K(ret), K(async_resp_used), K(retry_ctrl_.need_retry()));
 
   //if the error code is ob_timeout, we add more error info msg for dml query.
-  if (OB_TIMEOUT == ret) {
+  if (OB_TIMEOUT == ret && session_.is_user_session()) {
     LOG_USER_ERROR(OB_TIMEOUT, THIS_WORKER.get_timeout_ts() - session_.get_query_start_time());
   }
 

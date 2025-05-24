@@ -12,15 +12,10 @@
 
 #define USING_LOG_PREFIX LIB
 
-#include "lib/net/ob_addr.h"
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
+#include "ob_addr.h"
 #include "lib/utility/utility.h"
 #include "lib/net/ob_net_util.h"
-#include "include/easy_define.h"
 
 namespace oceanbase
 {
@@ -45,48 +40,31 @@ ObAddr::ObAddr(const easy_addr_t& addr)
   port_ = addr.port;
 }
 
-ObAddr::ObAddr(const sockaddr &addr)
+void ObAddr::from_sockaddr(struct sockaddr_storage *sock_addr)
 {
-  if (AF_INET == addr.sa_family) {
-    version_ = IPV4;
-    const sockaddr_in &addr_in = *static_cast<const sockaddr_in *>(static_cast<const void *>(&addr));
-    ip_.v4_ = ntohl(addr_in.sin_addr.s_addr);
-    port_ = ntohs(addr_in.sin_port);
-  } else if (AF_INET6 == addr.sa_family) {
-    version_ = IPV6;
-    const sockaddr_in6 &addr_in6 = *static_cast<const sockaddr_in6 *>(static_cast<const void *>(&addr));
-    MEMCPY(ip_.v6_, &addr_in6.sin6_addr, sizeof(ip_.v6_));
-    port_ = ntohs(addr_in6.sin6_port);
-  } else if (AF_UNIX == addr.sa_family) {
-    version_ = UNIX;
-    const sockaddr_un &addr_un = *static_cast<const sockaddr_un *>(static_cast<const void *>(&addr));
-    MEMCPY(ip_.unix_path_, addr_un.sun_path, sizeof(ip_.unix_path_));
-    port_ = 0;
-  } else {
-    port_ = 0;
+  reset();
+  bool is_ipv6 = false;
+  oceanbase::obsys::ObNetUtil::sockaddr_to_addr(sock_addr, is_ipv6, &ip_, port_);
+  version_ = !is_ipv6 ? IPV4 : IPV6;
+}
+
+struct sockaddr_storage *ObAddr::to_sockaddr(struct sockaddr_storage *sock_addr) const
+{
+  sockaddr_storage *sret = NULL;
+  if (IPV4 == version_ || IPV6 == version_) {
+    sret = oceanbase::obsys::ObNetUtil::make_unix_sockaddr(IPV6 == version_, &ip_, port_, sock_addr);
   }
+  return sret;
 }
 
 int ObAddr::convert_ipv4_addr(const char *ip)
 {
   int ret = OB_SUCCESS;
-  in_addr in;
-  if (OB_ISNULL(ip)) {
-    // null ptr
+  bool is_ipv6 = false;
+  if (!oceanbase::obsys::ObNetUtil::straddr_to_addr(ip, is_ipv6, &ip_)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if('\0' == *ip) {
-    // empty ip
-    ip_.v4_ = 0;
   } else {
-    MEMSET(&in, 0, sizeof (in));
-    int rt = inet_pton(AF_INET, ip, &in);
-    if (rt != 1) { // wrong ip or error
-      in.s_addr = 0;
-      ret = OB_ERR_UNEXPECTED;
-    } else {
-      ret = OB_SUCCESS;
-    }
-    ip_.v4_ = ntohl(in.s_addr);
+    reset_v4_extraneous();
   }
   return ret;
 }
@@ -94,18 +72,9 @@ int ObAddr::convert_ipv4_addr(const char *ip)
 int ObAddr::convert_ipv6_addr(const char *ip)
 {
   int ret = OB_SUCCESS;
-  in6_addr in6;
-
-  if (!OB_ISNULL(ip)) {
-    MEMSET(&in6, 0, sizeof (in6));
-    ret = inet_pton(AF_INET6, ip, &in6);
-    if (ret != 1) { // wrong ip or error
-      ret = OB_ERR_UNEXPECTED;
-      memset(&in6, 0, sizeof (in6));
-    } else {
-      ret = OB_SUCCESS;
-    }
-    MEMCPY(ip_.v6_, in6.s6_addr, sizeof(ip_.v6_));
+  bool is_ipv6 = false;
+  if (!oceanbase::obsys::ObNetUtil::straddr_to_addr(ip, is_ipv6, &ip_)) {
+    ret = OB_INVALID_ARGUMENT;
   }
   return ret;
 }
@@ -113,7 +82,7 @@ int ObAddr::convert_ipv6_addr(const char *ip)
 int ObAddr::parse_from_string(const ObString &str)
 {
   int ret = OB_SUCCESS;
-  char buf[MAX_IP_ADDR_LENGTH] = "";
+  char buf[MAX_IP_PORT_LENGTH] = "";
   int port = 0;
 
   if (str.ptr() != NULL) {
@@ -136,19 +105,12 @@ int ObAddr::parse_from_string(const ObString &str)
   }
 
   if (OB_SUCC(ret)) {
-    if ('[' != buf[0]) {  // IPV4 format
-      if (false == set_ipv4_addr(buf, port))
-      {
-        ret = OB_INVALID_ARGUMENT;
-      }
-    } else {              // IPV6 format
-      const char *ipv6 = buf + 1;
-      if (']' == buf[strlen(buf) - 1]) {
-        buf[strlen(buf) - 1] = '\0';
-        IGNORE_RETURN set_ipv6_addr(ipv6, port);
-      } else {
-        ret = OB_INVALID_ARGUMENT;
-      }
+    char *p = buf;
+    if ('[' == buf[0]) p = buf + 1;
+    if (']' == buf[strlen(buf) - 1]) buf[strlen(buf) - 1] = '\0';
+    if (NULL == strchr(p, ':') ?
+        !set_ipv4_addr(p, port) : !set_ipv6_addr(p, port)) {
+      ret = OB_INVALID_ARGUMENT;
     }
   }
   return ret;
@@ -199,11 +161,31 @@ bool ObAddr::set_unix_addr(const char *unix_path)
   return ret;
 }
 
-int64_t ObAddr::to_string(char *buffer, const int64_t size) const
+int ObAddr::format_ipv6_addr(char *buffer, const int64_t size) const
+{
+  int ret = OB_SUCCESS;
+  if (nullptr == buffer) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    if (NULL == inet_ntop(AF_INET6, ip_.v6_, buffer, size)) {
+      ret = OB_ERR_SYS;
+      LOG_ERROR("failed to format ipv6 addr", K(size), KERRMSG);
+    }
+  }
+  return ret;
+}
+
+int64_t ObAddr::inner_to_string(char *buffer, const int64_t size) const
 {
   int64_t pos = 0;
   if (nullptr != buffer && size > 0) {
     //databuff_printf(buffer, size, pos, "version=%d ", version_);
+#ifdef ENABLE_DEBUG_LOG
+    if (size < MAX_IP_PORT_LENGTH && (version_ == IPV4 || version_ == IPV6)) {
+      LOG_ERROR_RET(OB_BUF_NOT_ENOUGH, "buffer size is not enough for an ip string",
+                    K(size));
+    }
+#endif
     if (version_ == IPV4) {
       if (port_ > 0) {
         databuff_printf(buffer, size, pos, "\"%d.%d.%d.%d:%d\"",
@@ -215,27 +197,13 @@ int64_t ObAddr::to_string(char *buffer, const int64_t size) const
         databuff_printf(buffer, size, pos, "\"%d.%d.%d.%d:%d\"", 0,0,0,0,0);
       }
     } else if (version_ == IPV6) {
-      if (port_ > 0) {
-        databuff_printf(buffer, size, pos, "\"[%x:%x:%x:%x:%x:%x:%x:%x]:%d\"",
-                 (((uint16_t) (ip_.v6_[0])) << 8) | ((uint16_t)(ip_.v6_[1])),
-                 (((uint16_t) (ip_.v6_[2])) << 8) | ((uint16_t)(ip_.v6_[3])),
-                 (((uint16_t) (ip_.v6_[4])) << 8) | ((uint16_t)(ip_.v6_[5])),
-                 (((uint16_t) (ip_.v6_[6])) << 8) | ((uint16_t)(ip_.v6_[7])),
-                 (((uint16_t) (ip_.v6_[8])) << 8) | ((uint16_t)(ip_.v6_[9])),
-                 (((uint16_t) (ip_.v6_[10])) << 8) | ((uint16_t)(ip_.v6_[11])),
-                 (((uint16_t) (ip_.v6_[12])) << 8) | ((uint16_t)(ip_.v6_[13])),
-                 (((uint16_t) (ip_.v6_[14])) << 8) | ((uint16_t)(ip_.v6_[15])),
-                 port_);
-      } else {
-        databuff_printf(buffer, size, pos, "\"%x:%x:%x:%x:%x:%x:%x:%x\"",
-                 (((uint16_t) (ip_.v6_[0])) << 8) | ((uint16_t)(ip_.v6_[1])),
-                 (((uint16_t) (ip_.v6_[2])) << 8) | ((uint16_t)(ip_.v6_[3])),
-                 (((uint16_t) (ip_.v6_[4])) << 8) | ((uint16_t)(ip_.v6_[5])),
-                 (((uint16_t) (ip_.v6_[6])) << 8) | ((uint16_t)(ip_.v6_[7])),
-                 (((uint16_t) (ip_.v6_[8])) << 8) | ((uint16_t)(ip_.v6_[9])),
-                 (((uint16_t) (ip_.v6_[10])) << 8) | ((uint16_t)(ip_.v6_[11])),
-                 (((uint16_t) (ip_.v6_[12])) << 8) | ((uint16_t)(ip_.v6_[13])),
-                 (((uint16_t) (ip_.v6_[14])) << 8) | ((uint16_t)(ip_.v6_[15])));
+      char ipv6[INET6_ADDRSTRLEN] = { '\0' };
+      if (OB_SUCCESS == format_ipv6_addr(ipv6, sizeof(ipv6))) {
+        if (port_ > 0) {
+          databuff_printf(buffer, size, pos, "\"[%s]:%d\"", ipv6, port_);
+        } else {
+          databuff_printf(buffer, size, pos, "\"%s\"", ipv6);
+        }
       }
     } else if (version_ == UNIX) {
       databuff_printf(buffer, size, pos, "\"unix:%s\"", ip_.unix_path_);
@@ -244,10 +212,15 @@ int64_t ObAddr::to_string(char *buffer, const int64_t size) const
   return pos;
 }
 
-bool ObAddr::ip_to_string(char *buffer, const int32_t size) const
+bool ObAddr::inner_ip_to_string(char *buffer, const int32_t size) const
 {
   bool res = false;
   if (nullptr != buffer && size > 0) {
+#ifdef ENABLE_DEBUG_LOG
+    if (size < MAX_IP_ADDR_LENGTH && (version_ == IPV4 || version_ == IPV6)) {
+      LOG_ERROR_RET(OB_BUF_NOT_ENOUGH, "buffer size is not enough for an ip string", K(size));
+    }
+#endif
     if (version_ == IPV4) {
       snprintf(buffer, size, "%d.%d.%d.%d",
                (ip_.v4_ >> 24) & 0XFF,
@@ -255,15 +228,10 @@ bool ObAddr::ip_to_string(char *buffer, const int32_t size) const
                (ip_.v4_ >> 8) & 0xFF,
                (ip_.v4_) & 0xFF);
     } else if (version_ == IPV6) {
-      snprintf(buffer, size, "%x:%x:%x:%x:%x:%x:%x:%x",
-                (((uint16_t) (ip_.v6_[0])) << 8) | ((uint16_t)(ip_.v6_[1])),
-                (((uint16_t) (ip_.v6_[2])) << 8) | ((uint16_t)(ip_.v6_[3])),
-                (((uint16_t) (ip_.v6_[4])) << 8) | ((uint16_t)(ip_.v6_[5])),
-                (((uint16_t) (ip_.v6_[6])) << 8) | ((uint16_t)(ip_.v6_[7])),
-                (((uint16_t) (ip_.v6_[8])) << 8) | ((uint16_t)(ip_.v6_[9])),
-                (((uint16_t) (ip_.v6_[10])) << 8) | ((uint16_t)(ip_.v6_[11])),
-                (((uint16_t) (ip_.v6_[12])) << 8) | ((uint16_t)(ip_.v6_[13])),
-                (((uint16_t) (ip_.v6_[14])) << 8) | ((uint16_t)(ip_.v6_[15])));
+      char ipv6[INET6_ADDRSTRLEN] = { '\0' };
+      if (OB_SUCCESS == format_ipv6_addr(ipv6, sizeof(ipv6))) {
+        snprintf(buffer, size, "%s", ipv6);
+      }
     } else if (version_ == UNIX) {
       snprintf(buffer, size, "unix:%s", ip_.unix_path_);
     }
@@ -272,23 +240,23 @@ bool ObAddr::ip_to_string(char *buffer, const int32_t size) const
   return res;
 }
 
-int ObAddr::ip_port_to_string(char *buffer, const int32_t size) const
+int ObAddr::inner_ip_port_to_string(char *buffer, const int32_t size) const
 {
   int ret = OB_SUCCESS;
   int ret_len = 0;
+#ifdef ENABLE_DEBUG_LOG
+  if (size < MAX_IP_PORT_LENGTH) {
+    LOG_ERROR_RET(OB_BUF_NOT_ENOUGH, "buffer size is not enough for an ip string",
+                  K(size));
+  }
+#endif
   if (NULL == buffer || size <= 0) {
     ret = OB_INVALID_ARGUMENT;
   } else if (version_ == IPV6) {
-    ret_len = snprintf(buffer, size, "[%x:%x:%x:%x:%x:%x:%x:%x]:%d",
-        (((uint16_t) (ip_.v6_[0])) << 8) | ((uint16_t)(ip_.v6_[1])),
-        (((uint16_t) (ip_.v6_[2])) << 8) | ((uint16_t)(ip_.v6_[3])),
-        (((uint16_t) (ip_.v6_[4])) << 8) | ((uint16_t)(ip_.v6_[5])),
-        (((uint16_t) (ip_.v6_[6])) << 8) | ((uint16_t)(ip_.v6_[7])),
-        (((uint16_t) (ip_.v6_[8])) << 8) | ((uint16_t)(ip_.v6_[9])),
-        (((uint16_t) (ip_.v6_[10])) << 8) | ((uint16_t)(ip_.v6_[11])),
-        (((uint16_t) (ip_.v6_[12])) << 8) | ((uint16_t)(ip_.v6_[13])),
-        (((uint16_t) (ip_.v6_[14])) << 8) | ((uint16_t)(ip_.v6_[15])),
-        port_);
+    char ipv6[INET6_ADDRSTRLEN] = { '\0' };
+    if (OB_SUCC(format_ipv6_addr(ipv6, sizeof(ipv6)))) {
+      ret_len = snprintf(buffer, size, "[%s]:%d", ipv6, port_);
+    }
   } else {
     ret_len = snprintf(buffer, size, "%d.%d.%d.%d:%d",
                        (ip_.v4_ >> 24) & 0XFF,
@@ -307,22 +275,22 @@ int ObAddr::ip_port_to_string(char *buffer, const int32_t size) const
   return ret;
 }
 
-int ObAddr::addr_to_buffer(char *buffer, const int32_t size, int32_t &ret_len) const
+int ObAddr::inner_addr_to_buffer(char *buffer, const int32_t size, int32_t &ret_len) const
 {
   int ret = OB_SUCCESS;
+#ifdef ENABLE_DEBUG_LOG
+  if (size < MAX_IP_PORT_LENGTH) {
+    LOG_ERROR_RET(OB_BUF_NOT_ENOUGH, "buffer size is not enough for an ip string",
+                  K(size));
+  }
+#endif
   if (NULL == buffer || size <= 0) {
     ret = OB_INVALID_ARGUMENT;
   } else if (version_ == IPV6) {
-    ret_len = snprintf(buffer, size, "[%x:%x:%x:%x:%x:%x:%x:%x]:%d",
-        (((uint16_t) (ip_.v6_[0])) << 8) | ((uint16_t)(ip_.v6_[1])),
-        (((uint16_t) (ip_.v6_[2])) << 8) | ((uint16_t)(ip_.v6_[3])),
-        (((uint16_t) (ip_.v6_[4])) << 8) | ((uint16_t)(ip_.v6_[5])),
-        (((uint16_t) (ip_.v6_[6])) << 8) | ((uint16_t)(ip_.v6_[7])),
-        (((uint16_t) (ip_.v6_[8])) << 8) | ((uint16_t)(ip_.v6_[9])),
-        (((uint16_t) (ip_.v6_[10])) << 8) | ((uint16_t)(ip_.v6_[11])),
-        (((uint16_t) (ip_.v6_[12])) << 8) | ((uint16_t)(ip_.v6_[13])),
-        (((uint16_t) (ip_.v6_[14])) << 8) | ((uint16_t)(ip_.v6_[15])),
-        port_);
+    char ipv6[INET6_ADDRSTRLEN] = { '\0' };
+    if (OB_SUCC(format_ipv6_addr(ipv6, sizeof(ipv6)))) {
+      ret_len = snprintf(buffer, size, "[%s]:%d", ipv6, port_);
+    }
   } else if (version_ == IPV4){
     ret_len = snprintf(buffer, size, "%d.%d.%d.%d:%d",
                            (ip_.v4_ >> 24) & 0XFF,
@@ -332,7 +300,8 @@ int ObAddr::addr_to_buffer(char *buffer, const int32_t size, int32_t &ret_len) c
                            port_);
 
   }
-  if (ret_len < 0) {
+  if (OB_FAIL(ret)) {
+  } else if (ret_len < 0) {
     ret = OB_ERR_SYS;
   } else if (ret_len >= size) {
     ret = OB_SIZE_OVERFLOW;
@@ -348,7 +317,7 @@ int ObAddr::to_yson(char *buf, const int64_t buf_len, int64_t &pos) const
                                                     OB_ID(ip), ip_.v4_,
                                                     OB_ID(port), port_);
   } else if (IPV6 == version_) {
-    char ip[MAX_IP_ADDR_LENGTH + 1] = { '\0' };
+    char ip[MAX_IP_PORT_LENGTH + 1] = { '\0' };
     if (!ip_to_string(ip, sizeof(ip))) {
       ret = OB_ERR_UNEXPECTED;
     } else {
@@ -407,8 +376,8 @@ bool ObAddr::set_ipv4_addr(const char *ip, const int32_t port)
 bool ObAddr::set_ip_addr(const ObString &ip, const int32_t port)
 {
   bool ret = true;
-  char ip_buf[MAX_IP_ADDR_LENGTH] = "";
-  if (ip.length() >= MAX_IP_ADDR_LENGTH) {
+  char ip_buf[MAX_IP_PORT_LENGTH] = "";
+  if (ip.length() >= MAX_IP_PORT_LENGTH) {
     ret = false;
   } else {
     // ObString may be not terminated by '\0'
@@ -435,6 +404,7 @@ void ObAddr::set_ipv4_server_id(const int64_t ipv4_server_id)
 {
   version_ = IPV4;
   ip_.v4_ = static_cast<int32_t>(0x00000000ffffffff & (ipv4_server_id >> 32));
+  reset_v4_extraneous();
   port_ = static_cast<int32_t>(0x00000000ffffffff & ipv4_server_id);
 }
 
@@ -474,34 +444,12 @@ ObAddr &ObAddr::as_subnet(const ObAddr &mask)
 
 bool ObAddr::operator <(const ObAddr &rv) const
 {
-  int64_t ipcmp = 0;
-  if (version_ != rv.version_) {
-    LOG_ERROR_RET(common::OB_NOT_SUPPORTED, "comparision between different IP versions hasn't supported!");
-  } else if (IPV4 == version_) {
-    ipcmp = static_cast<int64_t>(ip_.v4_) - static_cast<int64_t>(rv.ip_.v4_);
-  } else if (IPV6 == version_) {
-    int pos = 0;
-    for (; ipcmp == 0 && pos < IPV6_LEN; pos++) {
-      ipcmp = ip_.v6_[pos] - rv.ip_.v6_[pos];
-    }
-  }
-  return (ipcmp < 0) || (0 == ipcmp && port_ < rv.port_);
+  return compare_refactored(rv) < 0;
 }
 
 bool ObAddr::operator >(const ObAddr &rv) const
 {
-  int64_t ipcmp = 0;
-  if (version_ != rv.version_) {
-    LOG_ERROR_RET(common::OB_NOT_SUPPORTED, "comparision between different IP versions hasn't supported!");
-  } else if (IPV4 == version_) {
-    ipcmp = static_cast<int64_t>(ip_.v4_) - static_cast<int64_t>(rv.ip_.v4_);
-  } else if (IPV6 == version_) {
-    int pos = 0;
-    for (; ipcmp == 0 && pos < IPV6_LEN; pos++) {
-      ipcmp = ip_.v6_[pos] - rv.ip_.v6_[pos];
-    }
-  }
-  return (ipcmp > 0) || (0 == ipcmp && port_ > rv.port_);
+  return compare_refactored(rv) > 0;
 }
 
 bool ObAddr::is_equal_except_port(const ObAddr &rv) const

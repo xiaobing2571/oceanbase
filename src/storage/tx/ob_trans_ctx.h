@@ -35,6 +35,7 @@
 #include "share/rc/ob_context.h"
 #include "share/ob_light_hashmap.h"
 #include "ob_tx_elr_handler.h"
+#include "storage/tx/ob_tx_on_demand_print.h"
 
 namespace oceanbase
 {
@@ -59,23 +60,10 @@ namespace transaction
 {
 class ObITransCtxMgr;
 class ObTransService;
-class ObITsMgr;
+class ObTsMgr;
 class KillTransArg;
 class ObLSTxCtxMgr;
 }
-
-#define TO_STRING_KV_(args...) DEFINE_TO_STRING_(J_KV(args))
-
-#define DEFINE_TO_STRING_(body) DECLARE_TO_STRING_  \
-  {                                                 \
-    int64_t pos = 0;                                \
-    J_OBJ_START();                                  \
-    body;                                           \
-    J_OBJ_END();                                    \
-    return pos;                                     \
-  }
-
-#define DECLARE_TO_STRING_ int64_t to_string_(char* buf, const int64_t buf_len) const
 
 namespace transaction
 {
@@ -103,6 +91,8 @@ public:
       trans_service_(NULL), tlog_(NULL),
       cluster_version_(0), ls_tx_ctx_mgr_(NULL),
       session_id_(UINT32_MAX),
+      client_sid_(UINT32_MAX),
+      associated_session_id_(UINT32_MAX),
       stc_(0), part_trans_action_(ObPartTransAction::UNKNOWN),
       callback_scheduler_on_clear_(false),
       pending_callback_param_(common::OB_SUCCESS), p_mt_ctx_(NULL),
@@ -149,6 +139,8 @@ public:
   bool contain(const ObTransID trans_id) { return trans_id_ == trans_id; }
   int set_session_id(const uint32_t session_id) { session_id_ = session_id; return common::OB_SUCCESS; }
   uint32_t get_session_id() const { return session_id_; }
+  uint32_t get_client_sid() const { return client_sid_; }
+  uint32_t get_associated_session_id() const { return associated_session_id_; }
   void before_unlock(CtxLockArg &arg);
   void after_unlock(CtxLockArg &arg);
 public:
@@ -188,7 +180,7 @@ protected:
   void set_stc_(const MonotonicTs stc);
   void set_stc_by_now_();
   MonotonicTs get_stc_();
-  ObITsMgr *get_ts_mgr_();
+  ObTsMgr *get_ts_mgr_();
   bool has_callback_scheduler_();
   int defer_callback_scheduler_(const int ret, const share::SCN &commit_version);
   int prepare_commit_cb_for_role_change_(const int cb_ret, ObTxCommitCallback *&cb_list);
@@ -256,6 +248,8 @@ protected:
   uint64_t cluster_version_;
   ObLSTxCtxMgr *ls_tx_ctx_mgr_;
   uint32_t session_id_;
+  uint32_t client_sid_;
+  uint32_t associated_session_id_;// associated session id in distributed scenario
   // set stc only by set_stc_xxx, and
   // get stc only by get_stc_()
   MonotonicTs stc_;

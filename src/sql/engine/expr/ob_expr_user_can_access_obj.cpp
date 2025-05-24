@@ -12,17 +12,9 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 
-#include "lib/oblog/ob_log.h"
 #include "sql/engine/expr/ob_expr_user_can_access_obj.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "objit/common/ob_item_type.h"
-#include "common/data_buffer.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/privilege_check/ob_ora_priv_check.h"
-#include "share/schema/ob_synonym_mgr.h"
-#include "share/ob_get_compat_mode.h"
-#include "lib/worker.h"
 
 namespace oceanbase
 {
@@ -105,6 +97,9 @@ int ObExprUserCanAccessObj::build_raw_obj_priv(
       OZ (raw_obj_priv_array.push_back(OBJ_PRIV_ID_READ));
       OZ (raw_obj_priv_array.push_back(OBJ_PRIV_ID_WRITE));
       break;
+    case static_cast<uint64_t>(share::schema::ObObjectType::CATALOG):
+      OZ (raw_obj_priv_array.push_back(OBJ_PRIV_ID_USE_CATALOG));
+      break;
     default:
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid argument", K(obj_type));
@@ -117,7 +112,8 @@ int ObExprUserCanAccessObj::build_real_obj_type_for_sym(
     uint64_t tenant_id,
     share::schema::ObSchemaGetterGuard *schema_guard,
     uint64_t &obj_type,
-    uint64_t &obj_id)
+    uint64_t &obj_id,
+    uint64_t &owner_id)
 {
   int ret = OB_SUCCESS;
   const share::schema::ObSimpleSynonymSchema *synonym_info = NULL;
@@ -131,6 +127,7 @@ int ObExprUserCanAccessObj::build_real_obj_type_for_sym(
       } else {
         const share::schema::ObSimpleTableSchemaV2 *simple_table_schema = NULL;
         uint64_t db_id = synonym_info->get_object_database_id();
+        owner_id = db_id;
         const ObString &obj_name = synonym_info->get_object_name_str();
         OZ (schema_guard->get_simple_table_schema(tenant_id,
                                                   db_id,
@@ -246,7 +243,7 @@ int ObExprUserCanAccessObj::check_user_access_obj(
   if (OB_SUCC(ret)) {
     if (obj_type == static_cast<uint64_t>(share::schema::ObObjectType::SYNONYM)) {
       OZ (build_real_obj_type_for_sym(session->get_effective_tenant_id(),
-                                      schema_guard, obj_type, obj_id),
+                                      schema_guard, obj_type, obj_id, owner_id),
                                       obj_type, obj_id);
       /* 忽略synonym对于的object不存在的错误 */
       if (ret == OB_TABLE_NOT_EXIST) {
@@ -303,52 +300,62 @@ int ObExprUserCanAccessObj::eval_user_can_access_obj(const ObExpr &expr,
   if (OB_FAIL(expr.eval_param_value(ctx))) {
     LOG_WARN("eval arg failed", K(ret));
   } else {
-    ObDatum &obj_type = expr.locate_param_datum(ctx, 0);
-    ObDatum &obj_id = expr.locate_param_datum(ctx, 1);
-    uint64_t database_id = expr.locate_param_datum(ctx, 2).get_uint64();
+    ObDatum *obj_type = NULL;
+    ObDatum *obj_id = NULL;
+    ObDatum *obj_database = NULL;
+    if (OB_FAIL(expr.args_[0]->eval(ctx, obj_type))
+        || OB_FAIL(expr.args_[1]->eval(ctx, obj_id))
+        || OB_FAIL(expr.args_[2]->eval(ctx, obj_database))) {
+      LOG_WARN("eval arg failed", K(ret));
+    } else if (OB_UNLIKELY(obj_type->is_null() || obj_id->is_null() || obj_database->is_null())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("expr param is null", K(ret));
+    } else {
+      uint64_t database_id = obj_database->get_uint64();
 
-    const ObSimpleDatabaseSchema *db_schema = NULL;
-    uint64_t owner_id = OB_INVALID_ID;
-    ObSQLSessionInfo *session = ctx.exec_ctx_.get_my_session();
-    share::schema::ObSchemaGetterGuard *schema_guard =
-        ctx.exec_ctx_.get_virtual_table_ctx().schema_guard_;
+      const ObSimpleDatabaseSchema *db_schema = NULL;
+      uint64_t owner_id = OB_INVALID_ID;
+      ObSQLSessionInfo *session = ctx.exec_ctx_.get_my_session();
+      share::schema::ObSchemaGetterGuard *schema_guard =
+          ctx.exec_ctx_.get_virtual_table_ctx().schema_guard_;
 
-    OX (res_datum.set_int(0));
-    CK(OB_NOT_NULL(session));
-    CK(OB_NOT_NULL(schema_guard));
-    if (OB_SUCC(ret)) {
-      const uint64_t tenant_id = session->get_effective_tenant_id();
-      // In 4.0, database_id and owner_id are different, so we first transfer database_id to user_id.
-      lib::Worker::CompatMode compat_mode = lib::Worker::CompatMode::MYSQL;
-      if (FAILEDx(schema_guard->get_database_schema(
-          tenant_id, database_id, db_schema))) {
-        LOG_WARN("fail to get database", KR(ret), K(tenant_id), K(database_id));
-      } else if (OB_ISNULL(db_schema)) {
-        // target owner not exist
-        LOG_TRACE("database not exist", KR(ret), K(tenant_id), K(database_id));
-      } else if (OB_FAIL(share::ObCompatModeGetter::get_tenant_mode(tenant_id, compat_mode))) {
-        LOG_WARN("fail to get tenant mode", KR(ret), K(tenant_id));
-      } else {
-        // treat some mysql db as `sys` user in oracle to check priv
-        ObString user_name = (lib::Worker::CompatMode::ORACLE == compat_mode
-                              && (is_oceanbase_sys_database_id(database_id)
-                                  || is_recyclebin_database_id(database_id)
-                                  || is_public_database_id(database_id))) ?
-                             ObString(OB_ORA_SYS_USER_NAME) : db_schema->get_database_name();
-        ObString host_name(OB_DEFAULT_HOST_NAME);
-        if (OB_FAIL(schema_guard->get_user_id(tenant_id, user_name, host_name, owner_id))) {
-          LOG_WARN("fail to get user_id", KR(ret), K(tenant_id), K(user_name));
-        } else if (OB_INVALID_ID == owner_id) {
-          LOG_TRACE("user not exist", KR(ret), K(tenant_id), K(user_name));
+      OX (res_datum.set_int(0));
+      CK(OB_NOT_NULL(session));
+      CK(OB_NOT_NULL(schema_guard));
+      if (OB_SUCC(ret)) {
+        const uint64_t tenant_id = session->get_effective_tenant_id();
+        // In 4.0, database_id and owner_id are different, so we first transfer database_id to user_id.
+        lib::Worker::CompatMode compat_mode = lib::Worker::CompatMode::MYSQL;
+        if (FAILEDx(schema_guard->get_database_schema(
+            tenant_id, database_id, db_schema))) {
+          LOG_WARN("fail to get database", KR(ret), K(tenant_id), K(database_id));
+        } else if (OB_ISNULL(db_schema)) {
+          // target owner not exist
+          LOG_TRACE("database not exist", KR(ret), K(tenant_id), K(database_id));
+        } else if (OB_FAIL(share::ObCompatModeGetter::get_tenant_mode(tenant_id, compat_mode))) {
+          LOG_WARN("fail to get tenant mode", KR(ret), K(tenant_id));
         } else {
-          bool can_access;
-          OZ (check_user_access_obj(schema_guard,
-                                    session,
-                                    obj_type.get_uint64(),
-                                    obj_id.get_uint64(),
-                                    owner_id,
-                                    can_access));
-          OX (res_datum.set_int(static_cast<int64_t>(can_access)));
+          // treat some mysql db as `sys` user in oracle to check priv
+          ObString user_name = (lib::Worker::CompatMode::ORACLE == compat_mode
+                                && (is_oceanbase_sys_database_id(database_id)
+                                    || is_recyclebin_database_id(database_id)
+                                    || is_public_database_id(database_id))) ?
+                              ObString(OB_ORA_SYS_USER_NAME) : db_schema->get_database_name();
+          ObString host_name(OB_DEFAULT_HOST_NAME);
+          if (OB_FAIL(schema_guard->get_user_id(tenant_id, user_name, host_name, owner_id))) {
+            LOG_WARN("fail to get user_id", KR(ret), K(tenant_id), K(user_name));
+          } else if (OB_INVALID_ID == owner_id) {
+            LOG_TRACE("user not exist", KR(ret), K(tenant_id), K(user_name));
+          } else {
+            bool can_access;
+            OZ (check_user_access_obj(schema_guard,
+                                      session,
+                                      obj_type->get_uint64(),
+                                      obj_id->get_uint64(),
+                                      owner_id,
+                                      can_access));
+            OX (res_datum.set_int(static_cast<int64_t>(can_access)));
+          }
         }
       }
     }

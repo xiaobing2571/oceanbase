@@ -21,6 +21,7 @@ void ObPrefixSortVecImpl<Compare, Store_Row, has_addon>::reset()
   full_sk_collations_ = nullptr;
   base_sk_collations_.reset();
   brs_holder_.reset();
+  brs_holder_.destroy();
   next_prefix_row_ = nullptr;
   prev_row_ = nullptr;
   child_ = nullptr;
@@ -31,10 +32,20 @@ void ObPrefixSortVecImpl<Compare, Store_Row, has_addon>::reset()
   prefix_pos_ = 0;
   im_sk_store_.reset();
   im_addon_store_.reset();
-  im_sk_rows_ = nullptr;
-  im_addon_rows_ = nullptr;
   immediate_pos_ = 0;
   brs_ = nullptr;
+  if (nullptr != mem_context_ && nullptr != selector_) {
+    mem_context_->get_malloc_allocator().free(selector_);
+    selector_ = nullptr;
+  }
+  if (nullptr != mem_context_ && nullptr != im_sk_rows_) {
+    mem_context_->get_malloc_allocator().free(im_sk_rows_);
+    im_sk_rows_ = nullptr;
+  }
+  if (nullptr != mem_context_ && nullptr != im_addon_rows_) {
+    mem_context_->get_malloc_allocator().free(im_addon_rows_);
+    im_addon_rows_ = nullptr;
+  }
   ObSortVecOpImpl<Compare, Store_Row, has_addon>::reset();
 }
 
@@ -72,18 +83,20 @@ int ObPrefixSortVecImpl<Compare, Store_Row, has_addon>::init(ObSortVecOpContext 
       SQL_ENG_LOG(WARN, "sort impl init failed", K(ret));
     } else if (OB_FAIL(init_temp_row_store(
                  *sk_exprs_, INT64_MAX, batch_size, false, false /*enable dump*/,
-                 Store_Row::get_extra_size(true /*is_sort_key*/), im_sk_store_))) {
+                 Store_Row::get_extra_size(true /*is_sort_key*/), NONE_COMPRESSOR, im_sk_store_))) {
       SQL_ENG_LOG(WARN, "failed to init temp row store", K(ret));
-    } else if (OB_FAIL(init_temp_row_store(
-                 *addon_exprs_, INT64_MAX, batch_size, false, false /*enable dump*/,
-                 Store_Row::get_extra_size(false /*is_sort_key*/), im_addon_store_))) {
+    } else if (ctx.has_addon_
+               && OB_FAIL(init_temp_row_store(*addon_exprs_, INT64_MAX, batch_size, false,
+                                              false /*enable dump*/,
+                                              Store_Row::get_extra_size(false /*is_sort_key*/),
+                                              NONE_COMPRESSOR, im_addon_store_))) {
       SQL_ENG_LOG(WARN, "failed to init temp row store", K(ret));
     } else {
       selector_ =
-        (typeof(selector_))ctx.exec_ctx_->get_allocator().alloc(batch_size * sizeof(*selector_));
-      im_sk_rows_ = (typeof(im_sk_rows_))ctx.exec_ctx_->get_allocator().alloc(
+        (typeof(selector_))mem_context_->get_malloc_allocator().alloc(batch_size * sizeof(*selector_));
+      im_sk_rows_ = (typeof(im_sk_rows_))mem_context_->get_malloc_allocator().alloc(
         batch_size * sizeof(*im_sk_rows_));
-      im_addon_rows_ = (typeof(im_addon_rows_))ctx.exec_ctx_->get_allocator().alloc(
+      im_addon_rows_ = (typeof(im_addon_rows_))mem_context_->get_malloc_allocator().alloc(
         batch_size * sizeof(*im_addon_rows_));
       if (nullptr == selector_ || nullptr == im_sk_rows_ || nullptr == im_addon_rows_) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -189,7 +202,7 @@ int ObPrefixSortVecImpl<Compare, Store_Row, has_addon>::add_immediate_prefix(
                                    enable_encode_sortkey_ && !(part_cnt_ > 0)))) {
     SQL_ENG_LOG(WARN, "init compare failed", K(ret));
   } else {
-    std::sort(im_sk_rows_ + pos, im_sk_rows_ + pos + selector_size_,
+    lib::ob_sort(im_sk_rows_ + pos, im_sk_rows_ + pos + selector_size_,
               CopyableComparer(comp_));
     if (OB_SUCCESS != comp_.ret_) {
       ret = comp_.ret_;
@@ -281,7 +294,7 @@ int ObPrefixSortVecImpl<Compare, Store_Row, has_addon>::fetch_rows_batch()
     selector_size_ = 0;
   }
   immediate_pos_ = 0;
-  if (im_sk_store_.get_row_cnt() > 0 || im_addon_store_.get_row_cnt() > 0) {
+  if (im_sk_store_.get_row_cnt() > 0) {
     im_sk_store_.reset();
     im_addon_store_.reset();
   }

@@ -12,8 +12,6 @@
 
 #include "lib/allocator/ob_concurrent_fifo_allocator.h"
 #include "lib/ob_running_mode.h"
-#include "lib/utility/utility.h"
-#include "lib/cpu/ob_cpu_topology.h"
 
 namespace oceanbase
 {
@@ -84,6 +82,11 @@ void ObConcurrentFIFOAllocator::set_total_limit(int64_t total_limit)
 void ObConcurrentFIFOAllocator::destroy()
 {
   inner_allocator_.destroy();
+}
+
+void ObConcurrentFIFOAllocator::purge()
+{
+  inner_allocator_.purge();
 }
 
 void ObConcurrentFIFOAllocator::set_label(const lib::ObLabel &label)

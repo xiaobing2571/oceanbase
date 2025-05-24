@@ -8,14 +8,7 @@
 // MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 // See the Mulan PubL v2 for more details.
 
-// #include "lib/utility/ob_print_utils.h"
-#include "observer/ob_server_struct.h"
-#include "share/rc/ob_tenant_base.h"
-#include "storage/tx/ob_dup_table_base.h"
-#include "storage/tx/ob_dup_table_lease.h"
-#include "storage/tx/ob_dup_table_ts_sync.h"
-#include "storage/tx/ob_dup_table_util.h"
-#include "storage/tx/ob_location_adapter.h"
+#include "ob_dup_table_lease.h"
 #include "storage/tx/ob_trans_service.h"
 
 namespace oceanbase
@@ -71,7 +64,7 @@ void ObDupTableLSLeaseMgr::reset()
   lease_diag_info_log_buf_ = nullptr;
 }
 
-int ObDupTableLSLeaseMgr::recive_lease_request(const ObDupTableLeaseRequest &lease_req)
+int ObDupTableLSLeaseMgr::receive_lease_request(const ObDupTableLeaseRequest &lease_req)
 {
   int ret = OB_SUCCESS;
   SpinWLockGuard guard(lease_lock_);
@@ -89,7 +82,7 @@ int ObDupTableLSLeaseMgr::recive_lease_request(const ObDupTableLeaseRequest &lea
       DUP_TABLE_LOG(INFO, "first lease request from the new dup_table follower", K(ret), K(lease_req));
     }
   } else if (tmp_lease_info.cache_lease_req_.is_ready()) {
-    DUP_TABLE_LOG(INFO, "leader lease info is logging which can not recive new lease request",
+    DUP_TABLE_LOG(INFO, "leader lease info is logging which can not receive new lease request",
                   K(lease_req.get_src()));
   } else if (tmp_lease_info.cache_lease_req_.request_ts_ < lease_req.get_request_ts()) {
     // renew request ts before submit lease log
@@ -587,7 +580,7 @@ bool ObDupTableLSLeaseMgr::check_follower_lease_serving(const bool is_election_l
 {
   SpinRLockGuard guard(lease_lock_);
   bool follower_lease_serving = false;
-  if (is_election_leader) {
+  if (is_election_leader && is_master()) {
     follower_lease_serving = true;
     DUP_TABLE_LOG(INFO, "no need to check follower serving on a leader", K(is_election_leader),
                   K(max_replayed_scn));
@@ -595,8 +588,8 @@ bool ObDupTableLSLeaseMgr::check_follower_lease_serving(const bool is_election_l
     follower_lease_serving = false;
     DUP_TABLE_LOG(INFO, "dup table lease has been expired", K(follower_lease_serving),
                   K(is_election_leader), K(max_replayed_scn), K(follower_lease_info_));
-  } else if (follower_lease_info_.lease_acquire_scn_.is_valid()
-             || follower_lease_info_.lease_acquire_scn_ <= max_replayed_scn) {
+  } else if (follower_lease_info_.lease_acquire_scn_.is_valid_and_not_min()
+             && follower_lease_info_.lease_acquire_scn_ <= max_replayed_scn) {
     follower_lease_serving = true;
   }
   return follower_lease_serving;
@@ -640,6 +633,7 @@ void ObDupTableLSLeaseMgr::print_lease_diag_info_log(const bool is_master)
                      DupTableDiagStd::DUP_DIAG_COMMON_PREFIX, tenant_id, ls_id.id(),
                      common::ObTime2Str::ob_timestamp_str(cur_time), lease_diag_info_log_buf_);
     } else {
+      ObCStringHelper helper;
       _DUP_TABLE_LOG(
           INFO,
           "[%sFollower Lease Info] tenant: %lu, ls: %lu , current_time = %s\n"
@@ -649,13 +643,13 @@ void ObDupTableLSLeaseMgr::print_lease_diag_info_log(const bool is_master)
           DupTableDiagStd::DUP_DIAG_COMMON_PREFIX, tenant_id, ls_id.id(),
           common::ObTime2Str::ob_timestamp_str(cur_time), DupTableDiagStd::DUP_DIAG_INDENT_SPACE,
           DupTableDiagStd::DUP_DIAG_COMMON_PREFIX,
-          to_cstring(cur_time >= follower_lease_info_.lease_expired_ts_),
+          helper.convert(cur_time >= follower_lease_info_.lease_expired_ts_),
           follower_lease_info_.durable_lease_.request_ts_,
           common::ObTime2Str::ob_timestamp_str(follower_lease_info_.durable_lease_.request_ts_),
           common::ObTime2Str::ob_timestamp_str(follower_lease_info_.lease_expired_ts_),
           follower_lease_info_.durable_lease_.lease_interval_us_,
-          to_cstring(follower_lease_info_.last_lease_scn_),
-          to_cstring(follower_lease_info_.lease_acquire_scn_));
+          helper.convert(follower_lease_info_.last_lease_scn_),
+          helper.convert(follower_lease_info_.lease_acquire_scn_));
     }
   }
 }
@@ -851,14 +845,16 @@ int ObDupTableLSLeaseMgr::DiagInfoGenerator::operator()(
 {
   int ret = OB_SUCCESS;
 
-  const char *addr_str = to_cstring(hash_pair.first);
-
   ret = ::oceanbase::common::databuff_printf(
       info_buf_, info_buf_len_, info_buf_pos_,
-      "%s[%sConfirmed Lease] owner=%s, is_expired=%s, request_ts=%lu, request_ts(date)=%s, "
-      "lease_expired_time=%s, lease_interval_us=%lu\n",
-      DupTableDiagStd::DUP_DIAG_INDENT_SPACE, DupTableDiagStd::DUP_DIAG_COMMON_PREFIX, addr_str,
-      to_cstring(cur_time_ >= hash_pair.second.lease_expired_ts_),
+      "%s[%sConfirmed Lease] owner=",
+      DupTableDiagStd::DUP_DIAG_INDENT_SPACE, DupTableDiagStd::DUP_DIAG_COMMON_PREFIX);
+  OB_SUCCESS != ret ? : ret = ::oceanbase::common::databuff_printf(
+      info_buf_, info_buf_len_, info_buf_pos_, hash_pair.first);
+  OB_SUCCESS != ret ? : ret = ::oceanbase::common::databuff_printf(
+      info_buf_, info_buf_len_, info_buf_pos_, ", is_expired=%s, request_ts=%lu, "
+      "request_ts(date)=%s, lease_expired_time=%s, lease_interval_us=%lu\n",
+      cur_time_ >= hash_pair.second.lease_expired_ts_ ? "True" : "False",
       hash_pair.second.confirmed_lease_info_.request_ts_,
       common::ObTime2Str::ob_timestamp_str(hash_pair.second.confirmed_lease_info_.request_ts_),
       common::ObTime2Str::ob_timestamp_str(hash_pair.second.lease_expired_ts_),
@@ -866,20 +862,22 @@ int ObDupTableLSLeaseMgr::DiagInfoGenerator::operator()(
 
   if (OB_SUCC(ret) && need_cache_) {
     if (hash_pair.second.cache_lease_req_.is_invalid()) {
-
       ret = ::oceanbase::common::databuff_printf(
-          info_buf_, info_buf_len_, info_buf_pos_,
-          "%s[%sCached Lease] owner=%s, No Lease Request Cache\n",
-          DupTableDiagStd::DUP_DIAG_INDENT_SPACE, DupTableDiagStd::DUP_DIAG_COMMON_PREFIX,
-          addr_str);
+          info_buf_, info_buf_len_, info_buf_pos_, "%s[%sCached Lease] owner=",
+          DupTableDiagStd::DUP_DIAG_INDENT_SPACE, DupTableDiagStd::DUP_DIAG_COMMON_PREFIX);
+      OB_SUCCESS != ret ? : ret = ::oceanbase::common::databuff_printf(
+          info_buf_, info_buf_len_, info_buf_pos_, hash_pair.first);
+      OB_SUCCESS != ret ? : ret = ::oceanbase::common::databuff_printf(
+          info_buf_, info_buf_len_, info_buf_pos_, ", No Lease Request Cache\n");
     } else {
-
       ret = ::oceanbase::common::databuff_printf(
-          info_buf_, info_buf_len_, info_buf_pos_,
-          "%s[%sCached Lease] owner=%s, request_ts=%lu, request_ts(date)=%s, "
-          "handle_request_time=%lu, handle_request_time(date)=%s, request_lease_interval_us "
-          "=%lu\n",
-          DupTableDiagStd::DUP_DIAG_INDENT_SPACE, DupTableDiagStd::DUP_DIAG_COMMON_PREFIX, addr_str,
+          info_buf_, info_buf_len_, info_buf_pos_, "%s[%sCached Lease] owner=",
+          DupTableDiagStd::DUP_DIAG_INDENT_SPACE, DupTableDiagStd::DUP_DIAG_COMMON_PREFIX);
+      OB_SUCCESS != ret ? : ret = ::oceanbase::common::databuff_printf(
+          info_buf_, info_buf_len_, info_buf_pos_, hash_pair.first);
+      OB_SUCCESS != ret ? : ret = ::oceanbase::common::databuff_printf(
+          info_buf_, info_buf_len_, info_buf_pos_, ", request_ts=%lu, request_ts(date)=%s, "
+          "handle_request_time=%lu, handle_request_time(date)=%s, request_lease_interval_us =%lu\n",
           hash_pair.second.cache_lease_req_.request_ts_,
           common::ObTime2Str::ob_timestamp_str(hash_pair.second.cache_lease_req_.request_ts_),
           hash_pair.second.cache_lease_req_.lease_acquire_ts_,

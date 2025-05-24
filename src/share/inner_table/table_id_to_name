@@ -273,10 +273,8 @@
 # 424: __all_transfer_task_history
 # 425: __all_balance_job
 # 426: __all_balance_job_history
-# 426: __all_balance_job  # BASE_TABLE_NAME
 # 427: __all_balance_task
 # 428: __all_balance_task_history
-# 428: __all_balance_task  # BASE_TABLE_NAME
 # 429: __all_arbitration_service
 # 430: __all_ls_arb_replica_task
 # 431: __all_data_dictionary_in_log
@@ -303,6 +301,8 @@
 # 450: __all_external_table_file
 # 451: __all_task_opt_stat_gather_history
 # 452: __all_table_opt_stat_gather_history
+# 453: __all_zone_storage
+# 454: __all_zone_storage_operation
 # 455: __wr_active_session_history
 # 456: __wr_snapshot
 # 457: __wr_statname
@@ -329,13 +329,68 @@
 # 478: __all_import_table_job_history
 # 479: __all_import_table_task
 # 480: __all_import_table_task_history
+# 482: __all_tablet_reorganize_history
+# 483: __all_storage_ha_error_diagnose_history
+# 484: __all_storage_ha_perf_diagnose_history
 # 485: __all_clone_job
 # 486: __all_clone_job_history
+# 487: __wr_system_event
+# 488: __wr_event_name
+# 490: __all_routine_privilege
+# 491: __all_routine_privilege_history
+# 491: __all_routine_privilege  # BASE_TABLE_NAME
+# 492: __wr_sqlstat
+# 493: __all_ncomp_dll
 # 494: __all_aux_stat
 # 495: __all_index_usage_info
+# 496: __all_detect_lock_info
+# 497: __all_client_to_server_session_info
+# 498: __all_transfer_partition_task
+# 499: __all_transfer_partition_task_history
+# 499: __all_transfer_partition_task  # BASE_TABLE_NAME
 # 500: __all_tenant_snapshot_job
+# 501: __wr_sqltext
 # 502: __all_trusted_root_certificate
+# 503: __all_audit_log_filter
+# 504: __all_audit_log_user
+# 505: __all_column_privilege
+# 506: __all_column_privilege_history
+# 506: __all_column_privilege  # BASE_TABLE_NAME
 # 507: __all_tenant_snapshot_ls_replica_history
+# 508: __all_ls_replica_task_history
+# 511: __all_tablet_checksum_error_info
+# 512: __all_user_proxy_info
+# 513: __all_user_proxy_info_history
+# 513: __all_user_proxy_info  # BASE_TABLE_NAME
+# 514: __all_user_proxy_role_info
+# 515: __all_user_proxy_role_info_history
+# 515: __all_user_proxy_role_info  # BASE_TABLE_NAME
+# 516: __all_service
+# 517: __all_storage_io_usage
+# 518: __all_mview_dep
+# 519: __all_scheduler_job_run_detail_v2
+# 520: __all_spm_evo_result
+# 521: __all_detect_lock_info_v2
+# 522: __all_pkg_type
+# 523: __all_pkg_type_attr
+# 524: __all_pkg_coll_type
+# 525: __wr_sql_plan
+# 526: __wr_res_mgr_sysstat
+# 527: __all_kv_redis_table
+# 528: __all_ncomp_dll_v2
+# 530: __wr_sql_plan_aux_key2snapshot
+# 531: __ft_dict_ik_utf8
+# 532: __ft_stopword_ik_utf8
+# 533: __ft_quantifier_ik_utf8
+# 537: __all_catalog
+# 538: __all_catalog_history
+# 538: __all_catalog  # BASE_TABLE_NAME
+# 539: __all_catalog_privilege
+# 540: __all_catalog_privilege_history
+# 540: __all_catalog_privilege  # BASE_TABLE_NAME
+# 544: __all_pl_recompile_objinfo
+# 545: __all_vector_index_task
+# 546: __all_vector_index_task_history
 # 10001: __tenant_virtual_all_table
 # 10002: __tenant_virtual_table_column
 # 10003: __tenant_virtual_table_index
@@ -429,13 +484,17 @@
 # 11117: __all_virtual_tablet_stat
 # 11118: __all_virtual_ddl_sim_point
 # 11119: __all_virtual_ddl_sim_point_stat
+# 11120: __all_virtual_res_mgr_sysstat
+# 11124: __all_virtual_ss_tablet_meta
+# 11125: __all_virtual_ss_ls_meta
+# 11126: __all_virtual_ss_sstable_mgr
+# 11127: __all_virtual_ss_ls_tablet_reorganization_info
 # 12001: SESSION_VARIABLES
 # 12006: GLOBAL_STATUS
 # 12008: SESSION_STATUS
 # 12009: user
 # 12010: db
 # 12013: __all_virtual_lock_wait_stat
-# 12030: proc
 # 12031: __tenant_virtual_collation
 # 12032: __tenant_virtual_charset
 # 12033: __all_virtual_tenant_memstore_allocator_info
@@ -906,13 +965,11 @@
 # 12344: __all_virtual_balance_job
 # 12344: __all_balance_job  # BASE_TABLE_NAME
 # 12345: __all_virtual_balance_job_history
-# 12345: __all_balance_job  # BASE_TABLE_NAME
-# 12345: __all_balance_job_history  # BASE_TABLE_NAME1
+# 12345: __all_balance_job_history  # BASE_TABLE_NAME
 # 12346: __all_virtual_balance_task
 # 12346: __all_balance_task  # BASE_TABLE_NAME
 # 12347: __all_virtual_balance_task_history
-# 12347: __all_balance_task  # BASE_TABLE_NAME
-# 12347: __all_balance_task_history  # BASE_TABLE_NAME1
+# 12347: __all_balance_task_history  # BASE_TABLE_NAME
 # 12348: __all_virtual_rls_policy
 # 12348: __all_rls_policy  # BASE_TABLE_NAME
 # 12349: __all_virtual_rls_policy_history
@@ -965,6 +1022,7 @@
 # 12383: __all_virtual_opt_stat_gather_monitor
 # 12384: __all_virtual_thread
 # 12385: __all_virtual_arbitration_member_info
+# 12386: __all_virtual_server_storage
 # 12387: __all_virtual_arbitration_service_status
 # 12388: __all_virtual_wr_active_session_history
 # 12388: __wr_active_session_history  # BASE_TABLE_NAME
@@ -1036,6 +1094,7 @@
 # 12426: __all_import_table_task  # BASE_TABLE_NAME
 # 12427: __all_virtual_import_table_task_history
 # 12427: __all_import_table_task_history  # BASE_TABLE_NAME
+# 12429: __all_virtual_data_activity_metrics
 # 12430: __all_virtual_column_group_mapping
 # 12430: __all_column_group_mapping  # BASE_TABLE_NAME
 # 12431: __all_virtual_column_group_history
@@ -1044,19 +1103,150 @@
 # 12432: __all_virtual_column_group_mapping_history
 # 12432: __all_column_group_mapping  # BASE_TABLE_NAME
 # 12432: __all_column_group_mapping_history  # BASE_TABLE_NAME1
+# 12433: __all_virtual_storage_ha_error_diagnose
+# 12434: __all_virtual_storage_ha_perf_diagnose
 # 12435: __all_virtual_clone_job
 # 12435: __all_clone_job  # BASE_TABLE_NAME
 # 12436: __all_virtual_clone_job_history
 # 12436: __all_clone_job_history  # BASE_TABLE_NAME
+# 12437: __all_virtual_checkpoint_diagnose_memtable_info
+# 12438: __all_virtual_checkpoint_diagnose_checkpoint_unit_info
+# 12439: __all_virtual_checkpoint_diagnose_info
+# 12440: __all_virtual_wr_system_event
+# 12440: __wr_system_event  # BASE_TABLE_NAME
+# 12441: __all_virtual_wr_event_name
+# 12441: __wr_event_name  # BASE_TABLE_NAME
+# 12442: __all_virtual_tenant_scheduler_running_job
+# 12443: __all_virtual_routine_privilege
+# 12443: __all_routine_privilege  # BASE_TABLE_NAME
+# 12444: __all_virtual_routine_privilege_history
+# 12444: __all_routine_privilege  # BASE_TABLE_NAME
+# 12444: __all_routine_privilege_history  # BASE_TABLE_NAME1
+# 12445: __all_virtual_sqlstat
+# 12446: __all_virtual_wr_sqlstat
+# 12446: __wr_sqlstat  # BASE_TABLE_NAME
 # 12447: __all_virtual_aux_stat
 # 12447: __all_aux_stat  # BASE_TABLE_NAME
+# 12448: __all_virtual_detect_lock_info
+# 12448: __all_detect_lock_info  # BASE_TABLE_NAME
+# 12449: __all_virtual_client_to_server_session_info
+# 12449: __all_client_to_server_session_info  # BASE_TABLE_NAME
+# 12450: __all_virtual_sys_variable_default_value
+# 12451: __all_virtual_transfer_partition_task
+# 12451: __all_transfer_partition_task  # BASE_TABLE_NAME
+# 12452: __all_virtual_transfer_partition_task_history
+# 12452: __all_transfer_partition_task  # BASE_TABLE_NAME
+# 12452: __all_transfer_partition_task_history  # BASE_TABLE_NAME1
 # 12453: __all_virtual_tenant_snapshot_job
 # 12453: __all_tenant_snapshot_job  # BASE_TABLE_NAME
+# 12454: __all_virtual_wr_sqltext
+# 12454: __wr_sqltext  # BASE_TABLE_NAME
+# 12456: __all_virtual_dbms_lock_allocated
+# 12456: __all_dbms_lock_allocated  # BASE_TABLE_NAME
+# 12457: __all_virtual_shared_storage_compaction_info
 # 12458: __all_virtual_ls_snapshot
 # 12459: __all_virtual_index_usage_info
 # 12459: __all_index_usage_info  # BASE_TABLE_NAME
+# 12460: __all_virtual_audit_log_filter
+# 12460: __all_audit_log_filter  # BASE_TABLE_NAME
+# 12461: __all_virtual_audit_log_user
+# 12461: __all_audit_log_user  # BASE_TABLE_NAME
+# 12462: __all_virtual_column_privilege
+# 12462: __all_column_privilege  # BASE_TABLE_NAME
+# 12463: __all_virtual_column_privilege_history
+# 12463: __all_column_privilege  # BASE_TABLE_NAME
+# 12463: __all_column_privilege_history  # BASE_TABLE_NAME1
 # 12464: __all_virtual_tenant_snapshot_ls_replica_history
 # 12464: __all_tenant_snapshot_ls_replica_history  # BASE_TABLE_NAME
+# 12465: __all_virtual_shared_storage_quota
+# 12466: ENABLED_ROLES
+# 12467: __all_virtual_ls_replica_task_history
+# 12467: __all_ls_replica_task_history  # BASE_TABLE_NAME
+# 12468: __all_virtual_session_ps_info
+# 12469: __all_virtual_tracepoint_info
+# 12472: __all_virtual_tablet_checksum_error_info
+# 12472: __all_tablet_checksum_error_info  # BASE_TABLE_NAME
+# 12473: __all_virtual_compatibility_control
+# 12474: __all_virtual_user_proxy_info
+# 12474: __all_user_proxy_info  # BASE_TABLE_NAME
+# 12475: __all_virtual_user_proxy_info_history
+# 12475: __all_user_proxy_info  # BASE_TABLE_NAME
+# 12475: __all_user_proxy_info_history  # BASE_TABLE_NAME1
+# 12476: __all_virtual_user_proxy_role_info
+# 12476: __all_user_proxy_role_info  # BASE_TABLE_NAME
+# 12477: __all_virtual_user_proxy_role_info_history
+# 12477: __all_user_proxy_role_info  # BASE_TABLE_NAME
+# 12477: __all_user_proxy_role_info_history  # BASE_TABLE_NAME1
+# 12478: __all_virtual_tablet_reorganize_history
+# 12478: __all_tablet_reorganize_history  # BASE_TABLE_NAME
+# 12479: __all_virtual_res_mgr_directive
+# 12479: __all_res_mgr_directive  # BASE_TABLE_NAME
+# 12480: __all_virtual_service
+# 12480: __all_service  # BASE_TABLE_NAME
+# 12481: __all_virtual_tenant_resource_limit
+# 12482: __all_virtual_tenant_resource_limit_detail
+# 12483: __all_virtual_group_io_stat
+# 12485: __all_virtual_storage_io_usage
+# 12485: __all_storage_io_usage  # BASE_TABLE_NAME
+# 12486: __all_virtual_zone_storage_mysql_sys_agent
+# 12486: __all_zone_storage  # BASE_TABLE_NAME
+# 12487: __all_virtual_nic_info
+# 12488: __all_virtual_scheduler_job_run_detail_v2
+# 12488: __all_scheduler_job_run_detail_v2  # BASE_TABLE_NAME
+# 12490: __all_virtual_spatial_reference_systems
+# 12490: __all_spatial_reference_systems  # BASE_TABLE_NAME
+# 12491: __all_virtual_log_transport_dest_stat
+# 12492: __all_virtual_ss_local_cache_info
+# 12493: __all_virtual_kv_group_commit_status
+# 12495: __all_virtual_spm_evo_result
+# 12495: __all_spm_evo_result  # BASE_TABLE_NAME
+# 12496: __all_virtual_vector_index_info
+# 12497: __all_virtual_pkg_type
+# 12497: __all_pkg_type  # BASE_TABLE_NAME
+# 12498: __all_virtual_pkg_type_attr
+# 12498: __all_pkg_type_attr  # BASE_TABLE_NAME
+# 12499: __all_virtual_pkg_coll_type
+# 12499: __all_pkg_coll_type  # BASE_TABLE_NAME
+# 12500: __all_virtual_kv_client_info
+# 12501: __all_virtual_wr_sql_plan
+# 12501: __wr_sql_plan  # BASE_TABLE_NAME
+# 12502: __all_virtual_wr_res_mgr_sysstat
+# 12502: __wr_res_mgr_sysstat  # BASE_TABLE_NAME
+# 12503: __all_virtual_kv_redis_table
+# 12503: __all_kv_redis_table  # BASE_TABLE_NAME
+# 12504: __all_virtual_function_io_stat
+# 12505: __all_virtual_temp_file
+# 12506: __all_virtual_ncomp_dll_v2
+# 12506: __all_ncomp_dll_v2  # BASE_TABLE_NAME
+# 12511: __all_virtual_wr_sql_plan_aux_key2snapshot
+# 12511: __wr_sql_plan_aux_key2snapshot  # BASE_TABLE_NAME
+# 12513: __all_virtual_cs_replica_tablet_stats
+# 12514: __all_virtual_ddl_diagnose_info
+# 12515: __all_virtual_plugin_info
+# 12516: __all_virtual_catalog
+# 12516: __all_catalog  # BASE_TABLE_NAME
+# 12517: __all_virtual_catalog_history
+# 12517: __all_catalog  # BASE_TABLE_NAME
+# 12517: __all_catalog_history  # BASE_TABLE_NAME1
+# 12518: __all_virtual_catalog_privilege
+# 12518: __all_catalog_privilege  # BASE_TABLE_NAME
+# 12519: __all_virtual_catalog_privilege_history
+# 12519: __all_catalog_privilege  # BASE_TABLE_NAME
+# 12519: __all_catalog_privilege_history  # BASE_TABLE_NAME1
+# 12520: __all_virtual_sswriter_group_stat
+# 12521: __all_virtual_sswriter_lease_mgr
+# 12523: __all_virtual_pl_recompile_objinfo
+# 12523: __all_pl_recompile_objinfo  # BASE_TABLE_NAME
+# 12524: __all_virtual_vector_index_task
+# 12524: __all_vector_index_task  # BASE_TABLE_NAME
+# 12525: __all_virtual_vector_index_task_history
+# 12525: __all_vector_index_task_history  # BASE_TABLE_NAME
+# 12526: __tenant_virtual_show_create_catalog
+# 12527: __tenant_virtual_show_catalog_databases
+# 12529: __all_virtual_storage_cache_task
+# 12530: __all_virtual_tablet_local_cache
+# 12535: __all_virtual_mview_running_job
+# 12536: __all_virtual_dynamic_partition_table
 # 15009: ALL_VIRTUAL_SQL_AUDIT
 # 15009: __all_virtual_sql_audit  # BASE_TABLE_NAME
 # 15010: ALL_VIRTUAL_PLAN_STAT
@@ -1553,13 +1743,11 @@
 # 15377: ALL_VIRTUAL_BALANCE_JOB_REAL_AGENT
 # 15377: __all_balance_job  # BASE_TABLE_NAME
 # 15378: ALL_VIRTUAL_BALANCE_JOB_HISTORY_REAL_AGENT
-# 15378: __all_balance_job  # BASE_TABLE_NAME
-# 15378: __all_balance_job_history  # BASE_TABLE_NAME1
+# 15378: __all_balance_job_history  # BASE_TABLE_NAME
 # 15379: ALL_VIRTUAL_BALANCE_TASK_REAL_AGENT
 # 15379: __all_balance_task  # BASE_TABLE_NAME
 # 15380: ALL_VIRTUAL_BALANCE_TASK_HISTORY_REAL_AGENT
-# 15380: __all_balance_task  # BASE_TABLE_NAME
-# 15380: __all_balance_task_history  # BASE_TABLE_NAME1
+# 15380: __all_balance_task_history  # BASE_TABLE_NAME
 # 15381: ALL_VIRTUAL_TRANSFER_TASK_REAL_AGENT
 # 15381: __all_transfer_task  # BASE_TABLE_NAME
 # 15382: ALL_VIRTUAL_TRANSFER_TASK_HISTORY_REAL_AGENT
@@ -1605,6 +1793,8 @@
 # 15403: __all_virtual_flt_config  # BASE_TABLE_NAME
 # 15404: ALL_VIRTUAL_TENANT_SCHEDULER_JOB_RUN_DETAIL_REAL_AGENT
 # 15404: __all_tenant_scheduler_job_run_detail  # BASE_TABLE_NAME
+# 15405: ALL_VIRTUAL_SESSION_INFO
+# 15405: __all_virtual_session_info  # BASE_TABLE_NAME
 # 15406: ALL_VIRTUAL_TENANT_SCHEDULER_JOB_CLASS_REAL_AGENT
 # 15406: __all_tenant_scheduler_job_class  # BASE_TABLE_NAME
 # 15407: ALL_VIRTUAL_RECOVER_TABLE_JOB
@@ -1629,12 +1819,140 @@
 # 15414: __all_virtual_ls_info  # BASE_TABLE_NAME
 # 15418: ALL_VIRTUAL_CGROUP_CONFIG
 # 15418: __all_virtual_cgroup_config  # BASE_TABLE_NAME
+# 15421: ALL_VIRTUAL_WR_SYSTEM_EVENT
+# 15421: __wr_system_event  # BASE_TABLE_NAME
+# 15421: __all_virtual_wr_system_event  # BASE_TABLE_NAME1
+# 15422: ALL_VIRTUAL_WR_EVENT_NAME
+# 15422: __wr_event_name  # BASE_TABLE_NAME
+# 15422: __all_virtual_wr_event_name  # BASE_TABLE_NAME1
+# 15424: ALL_VIRTUAL_SQLSTAT
+# 15424: __all_virtual_sqlstat  # BASE_TABLE_NAME
+# 15425: ALL_VIRTUAL_WR_SQLSTAT
+# 15425: __wr_sqlstat  # BASE_TABLE_NAME
+# 15425: __all_virtual_wr_sqlstat  # BASE_TABLE_NAME1
+# 15426: TENANT_VIRTUAL_STATNAME
+# 15426: __tenant_virtual_statname  # BASE_TABLE_NAME
 # 15427: ALL_VIRTUAL_AUX_STAT_REAL_AGENT
 # 15427: __all_aux_stat  # BASE_TABLE_NAME
+# 15428: ALL_VIRTUAL_SYS_VARIABLE_REAL_AGENT
+# 15428: __all_sys_variable  # BASE_TABLE_NAME
+# 15429: ALL_VIRTUAL_SYS_VARIABLE_DEFAULT_VALUE
+# 15429: __all_virtual_sys_variable_default_value  # BASE_TABLE_NAME
+# 15430: ALL_VIRTUAL_TRANSFER_PARTITION_TASK_REAL_AGENT
+# 15430: __all_transfer_partition_task  # BASE_TABLE_NAME
+# 15431: ALL_VIRTUAL_TRANSFER_PARTITION_TASK_HISTORY_REAL_AGENT
+# 15431: __all_transfer_partition_task  # BASE_TABLE_NAME
+# 15431: __all_transfer_partition_task_history  # BASE_TABLE_NAME1
+# 15432: ALL_VIRTUAL_WR_SQLTEXT
+# 15432: __wr_sqltext  # BASE_TABLE_NAME
+# 15432: __all_virtual_wr_sqltext  # BASE_TABLE_NAME1
 # 15439: ALL_VIRTUAL_LS_SNAPSHOT
 # 15439: __all_virtual_ls_snapshot  # BASE_TABLE_NAME
 # 15440: ALL_VIRTUAL_INDEX_USAGE_INFO_REAL_AGENT
 # 15440: __all_index_usage_info  # BASE_TABLE_NAME
+# 15441: ALL_VIRTUAL_SHARED_STORAGE_QUOTA
+# 15441: __all_virtual_shared_storage_quota  # BASE_TABLE_NAME
+# 15443: ALL_VIRTUAL_LS_REPLICA_TASK_HISTORY
+# 15443: __all_ls_replica_task_history  # BASE_TABLE_NAME
+# 15443: __all_virtual_ls_replica_task_history  # BASE_TABLE_NAME1
+# 15444: ALL_VIRTUAL_SESSION_PS_INFO
+# 15444: __all_virtual_session_ps_info  # BASE_TABLE_NAME
+# 15445: ALL_VIRTUAL_TRACEPOINT_INFO
+# 15445: __all_virtual_tracepoint_info  # BASE_TABLE_NAME
+# 15446: ALL_VIRTUAL_USER_PROXY_INFO_REAL_AGENT
+# 15446: __all_user_proxy_info  # BASE_TABLE_NAME
+# 15447: ALL_VIRTUAL_USER_PROXY_ROLE_INFO_REAL_AGENT
+# 15447: __all_user_proxy_role_info  # BASE_TABLE_NAME
+# 15449: ALL_VIRTUAL_SERVICE
+# 15449: __all_service  # BASE_TABLE_NAME
+# 15449: __all_virtual_service  # BASE_TABLE_NAME1
+# 15450: ALL_VIRTUAL_TENANT_RESOURCE_LIMIT
+# 15450: __all_virtual_tenant_resource_limit  # BASE_TABLE_NAME
+# 15451: ALL_VIRTUAL_TENANT_RESOURCE_LIMIT_DETAIL
+# 15451: __all_virtual_tenant_resource_limit_detail  # BASE_TABLE_NAME
+# 15452: ALL_VIRTUAL_GROUP_IO_STAT
+# 15452: __all_virtual_group_io_stat  # BASE_TABLE_NAME
+# 15454: ALL_VIRTUAL_STORAGE_IO_USAGE
+# 15454: __all_storage_io_usage  # BASE_TABLE_NAME
+# 15454: __all_virtual_storage_io_usage  # BASE_TABLE_NAME1
+# 15455: ALL_VIRTUAL_ZONE_STORAGE_SYS_AGENT
+# 15455: __all_zone_storage  # BASE_TABLE_NAME
+# 15456: ALL_VIRTUAL_NIC_INFO
+# 15456: __all_virtual_nic_info  # BASE_TABLE_NAME
+# 15457: ALL_VIRTUAL_QUERY_RESPONSE_TIME
+# 15457: __all_virtual_query_response_time  # BASE_TABLE_NAME
+# 15458: ALL_VIRTUAL_SCHEDULER_JOB_RUN_DETAIL_V2_REAL_AGENT
+# 15458: __all_scheduler_job_run_detail_v2  # BASE_TABLE_NAME
+# 15459: ALL_VIRTUAL_SPATIAL_REFERENCE_SYSTEMS_REAL_AGENT
+# 15459: __all_spatial_reference_systems  # BASE_TABLE_NAME
+# 15461: ALL_VIRTUAL_LOG_TRANSPORT_DEST_STAT
+# 15461: __all_virtual_log_transport_dest_stat  # BASE_TABLE_NAME
+# 15462: ALL_VIRTUAL_SS_LOCAL_CACHE_INFO
+# 15462: __all_virtual_ss_local_cache_info  # BASE_TABLE_NAME
+# 15466: ALL_VIRTUAL_SPM_EVO_RESULT
+# 15466: __all_spm_evo_result  # BASE_TABLE_NAME
+# 15466: __all_virtual_spm_evo_result  # BASE_TABLE_NAME1
+# 15467: ALL_VIRTUAL_VECTOR_INDEX_INFO
+# 15467: __all_virtual_vector_index_info  # BASE_TABLE_NAME
+# 15468: ALL_VIRTUAL_PKG_TYPE_SYS_AGENT
+# 15468: __all_pkg_type  # BASE_TABLE_NAME
+# 15469: ALL_VIRTUAL_PKG_TYPE_ATTR_SYS_AGENT
+# 15469: __all_pkg_type_attr  # BASE_TABLE_NAME
+# 15470: ALL_VIRTUAL_PKG_COLL_TYPE_SYS_AGENT
+# 15470: __all_pkg_coll_type  # BASE_TABLE_NAME
+# 15471: ALL_VIRTUAL_PKG_TYPE_REAL_AGENT
+# 15471: __all_pkg_type  # BASE_TABLE_NAME
+# 15472: ALL_VIRTUAL_PKG_TYPE_ATTR_REAL_AGENT
+# 15472: __all_pkg_type_attr  # BASE_TABLE_NAME
+# 15473: ALL_VIRTUAL_PKG_COLL_TYPE_REAL_AGENT
+# 15473: __all_pkg_coll_type  # BASE_TABLE_NAME
+# 15481: ALL_VIRTUAL_WR_SQL_PLAN
+# 15481: __wr_sql_plan  # BASE_TABLE_NAME
+# 15481: __all_virtual_wr_sql_plan  # BASE_TABLE_NAME1
+# 15482: ALL_VIRTUAL_RES_MGR_SYSSTAT
+# 15482: __all_virtual_res_mgr_sysstat  # BASE_TABLE_NAME
+# 15483: ALL_VIRTUAL_WR_RES_MGR_SYSSTAT
+# 15483: __wr_res_mgr_sysstat  # BASE_TABLE_NAME
+# 15483: __all_virtual_wr_res_mgr_sysstat  # BASE_TABLE_NAME1
+# 15484: ALL_VIRTUAL_FUNCTION_IO_STAT
+# 15484: __all_virtual_function_io_stat  # BASE_TABLE_NAME
+# 15485: ALL_VIRTUAL_TEMP_FILE
+# 15485: __all_virtual_temp_file  # BASE_TABLE_NAME
+# 15486: ALL_VIRTUAL_NCOMP_DLL_V2_REAL_AGENT
+# 15486: __all_ncomp_dll_v2  # BASE_TABLE_NAME
+# 15489: ALL_VIRTUAL_TABLET_POINTER_STATUS
+# 15489: __all_virtual_tablet_pointer_status  # BASE_TABLE_NAME
+# 15492: ALL_VIRTUAL_WR_SQL_PLAN_AUX_KEY2SNAPSHOT
+# 15492: __wr_sql_plan_aux_key2snapshot  # BASE_TABLE_NAME
+# 15492: __all_virtual_wr_sql_plan_aux_key2snapshot  # BASE_TABLE_NAME1
+# 15493: ALL_VIRTUAL_CS_REPLICA_TABLET_STATS
+# 15493: __all_virtual_cs_replica_tablet_stats  # BASE_TABLE_NAME
+# 15494: ALL_VIRTUAL_CATALOG_REAL_AGENT
+# 15494: __all_catalog  # BASE_TABLE_NAME
+# 15495: ALL_VIRTUAL_CATALOG_PRIVILEGE_REAL_AGENT
+# 15495: __all_catalog_privilege  # BASE_TABLE_NAME
+# 15498: ALL_VIRTUAL_SSWRITER_GROUP_STAT
+# 15498: __all_virtual_sswriter_group_stat  # BASE_TABLE_NAME
+# 15499: ALL_VIRTUAL_SSWRITER_LEASE_MGR
+# 15499: __all_virtual_sswriter_lease_mgr  # BASE_TABLE_NAME
+# 15503: ALL_VIRTUAL_PL_RECOMPILE_OBJINFO_REAL_AGENT
+# 15503: __all_pl_recompile_objinfo  # BASE_TABLE_NAME
+# 15504: TENANT_VIRTUAL_SHOW_CREATE_CATALOG
+# 15504: __tenant_virtual_show_create_catalog  # BASE_TABLE_NAME
+# 15507: ALL_VIRTUAL_MVIEW_RUNNING_JOB
+# 15507: __all_virtual_mview_running_job  # BASE_TABLE_NAME
+# 15508: ALL_VIRTUAL_MVIEW_DEP_REAL_AGENT
+# 15508: __all_mview_dep  # BASE_TABLE_NAME
+# 15509: ALL_VIRTUAL_DYNAMIC_PARTITION_TABLE
+# 15509: __all_virtual_dynamic_partition_table  # BASE_TABLE_NAME
+# 15517: ALL_VIRTUAL_SS_TABLET_META
+# 15517: __all_virtual_ss_tablet_meta  # BASE_TABLE_NAME
+# 15518: ALL_VIRTUAL_SS_LS_META
+# 15518: __all_virtual_ss_ls_meta  # BASE_TABLE_NAME
+# 15519: ALL_VIRTUAL_SS_SSTABLE_MGR
+# 15519: __all_virtual_ss_sstable_mgr  # BASE_TABLE_NAME
+# 15520: ALL_VIRTUAL_SS_LS_TABLET_REORGANIZATION_INFO
+# 15520: __all_virtual_ss_ls_tablet_reorganization_info  # BASE_TABLE_NAME
 # 20001: GV$OB_PLAN_CACHE_STAT
 # 20002: GV$OB_PLAN_CACHE_PLAN_STAT
 # 20003: SCHEMATA
@@ -1649,6 +1967,14 @@
 # 20012: KEY_COLUMN_USAGE
 # 20014: ENGINES
 # 20015: ROUTINES
+# 20016: PROFILING
+# 20017: OPTIMIZER_TRACE
+# 20018: PLUGINS
+# 20019: INNODB_SYS_COLUMNS
+# 20020: INNODB_FT_BEING_DELETED
+# 20021: INNODB_FT_CONFIG
+# 20022: INNODB_FT_DELETED
+# 20023: INNODB_FT_INDEX_CACHE
 # 21000: GV$SESSION_EVENT
 # 21001: GV$SESSION_WAIT
 # 21002: GV$SESSION_WAIT_HISTORY
@@ -1942,6 +2268,9 @@
 # 21381: V$OB_THREAD
 # 21382: GV$OB_ARBITRATION_MEMBER_INFO
 # 21383: V$OB_ARBITRATION_MEMBER_INFO
+# 21384: DBA_OB_ZONE_STORAGE
+# 21385: GV$OB_SERVER_STORAGE
+# 21386: V$OB_SERVER_STORAGE
 # 21387: GV$OB_ARBITRATION_SERVICE_STATUS
 # 21388: V$OB_ARBITRATION_SERVICE_STATUS
 # 21389: DBA_WR_ACTIVE_SESSION_HISTORY
@@ -1988,6 +2317,10 @@
 # 21447: DBA_OB_TENANT_EVENT_HISTORY
 # 21448: CDB_OB_TENANT_EVENT_HISTORY
 # 21449: GV$OB_FLT_TRACE_CONFIG
+# 21459: GV$OB_SESSION
+# 21460: V$OB_SESSION
+# 21461: GV$OB_PL_CACHE_OBJECT
+# 21462: V$OB_PL_CACHE_OBJECT
 # 21463: CDB_OB_RECOVER_TABLE_JOBS
 # 21464: DBA_OB_RECOVER_TABLE_JOBS
 # 21465: CDB_OB_RECOVER_TABLE_JOB_HISTORY
@@ -2004,15 +2337,49 @@
 # 21478: V$OB_TENANT_RUNTIME_INFO
 # 21479: GV$OB_CGROUP_CONFIG
 # 21480: V$OB_CGROUP_CONFIG
+# 21481: DBA_WR_SYSTEM_EVENT
+# 21482: CDB_WR_SYSTEM_EVENT
+# 21483: DBA_WR_EVENT_NAME
+# 21484: CDB_WR_EVENT_NAME
+# 21485: DBA_OB_FORMAT_OUTLINES
+# 21486: procs_priv
+# 21487: GV$OB_SQLSTAT
+# 21488: V$OB_SQLSTAT
+# 21489: DBA_WR_SQLSTAT
+# 21490: CDB_WR_SQLSTAT
+# 21491: GV$OB_SESS_TIME_MODEL
+# 21492: V$OB_SESS_TIME_MODEL
+# 21493: GV$OB_SYS_TIME_MODEL
+# 21494: V$OB_SYS_TIME_MODEL
+# 21495: DBA_WR_SYS_TIME_MODEL
+# 21496: CDB_WR_SYS_TIME_MODEL
 # 21497: DBA_OB_AUX_STATISTICS
 # 21498: CDB_OB_AUX_STATISTICS
 # 21499: DBA_INDEX_USAGE
+# 21500: DBA_OB_SYS_VARIABLES
+# 21501: DBA_OB_TRANSFER_PARTITION_TASKS
+# 21502: CDB_OB_TRANSFER_PARTITION_TASKS
+# 21503: DBA_OB_TRANSFER_PARTITION_TASK_HISTORY
+# 21504: CDB_OB_TRANSFER_PARTITION_TASK_HISTORY
+# 21505: DBA_WR_SQLTEXT
+# 21506: CDB_WR_SQLTEXT
+# 21507: GV$OB_ACTIVE_SESSION_HISTORY
+# 21508: V$OB_ACTIVE_SESSION_HISTORY
 # 21509: DBA_OB_TRUSTED_ROOT_CERTIFICATE
 # 21510: DBA_OB_CLONE_PROGRESS
+# 21511: role_edges
+# 21512: default_roles
 # 21513: CDB_INDEX_USAGE
+# 21514: audit_log_filter
+# 21515: audit_log_user
+# 21516: columns_priv
 # 21517: GV$OB_LS_SNAPSHOTS
 # 21518: V$OB_LS_SNAPSHOTS
 # 21519: DBA_OB_CLONE_HISTORY
+# 21520: GV$OB_SHARED_STORAGE_QUOTA
+# 21521: V$OB_SHARED_STORAGE_QUOTA
+# 21523: DBA_OB_LS_REPLICA_TASK_HISTORY
+# 21524: CDB_OB_LS_REPLICA_TASK_HISTORY
 # 21525: CDB_MVIEW_LOGS
 # 21526: DBA_MVIEW_LOGS
 # 21527: CDB_MVIEWS
@@ -2029,6 +2396,105 @@
 # 21538: DBA_MVREF_CHANGE_STATS
 # 21539: CDB_MVREF_STMT_STATS
 # 21540: DBA_MVREF_STMT_STATS
+# 21541: GV$OB_SESSION_PS_INFO
+# 21542: V$OB_SESSION_PS_INFO
+# 21543: GV$OB_TRACEPOINT_INFO
+# 21544: V$OB_TRACEPOINT_INFO
+# 21545: V$OB_COMPATIBILITY_CONTROL
+# 21546: DBA_OB_RSRC_DIRECTIVES
+# 21547: CDB_OB_RSRC_DIRECTIVES
+# 21548: DBA_OB_SERVICES
+# 21549: CDB_OB_SERVICES
+# 21550: GV$OB_TENANT_RESOURCE_LIMIT
+# 21551: V$OB_TENANT_RESOURCE_LIMIT
+# 21552: GV$OB_TENANT_RESOURCE_LIMIT_DETAIL
+# 21553: V$OB_TENANT_RESOURCE_LIMIT_DETAIL
+# 21554: INNODB_LOCK_WAITS
+# 21555: INNODB_LOCKS
+# 21556: INNODB_TRX
+# 21557: NDB_TRANSID_MYSQL_CONNECTION_MAP
+# 21558: V$OB_GROUP_IO_STAT
+# 21559: GV$OB_GROUP_IO_STAT
+# 21560: DBA_OB_STORAGE_IO_USAGE
+# 21561: CDB_OB_STORAGE_IO_USAGE
+# 21562: TABLESPACES
+# 21563: INNODB_BUFFER_PAGE
+# 21564: INNODB_BUFFER_PAGE_LRU
+# 21565: INNODB_BUFFER_POOL_STATS
+# 21566: INNODB_CMP
+# 21567: INNODB_CMP_PER_INDEX
+# 21568: INNODB_CMP_PER_INDEX_RESET
+# 21569: INNODB_CMP_RESET
+# 21570: INNODB_CMPMEM
+# 21571: INNODB_CMPMEM_RESET
+# 21572: INNODB_SYS_DATAFILES
+# 21573: INNODB_SYS_INDEXES
+# 21574: INNODB_SYS_TABLES
+# 21575: INNODB_SYS_TABLESPACES
+# 21576: INNODB_SYS_TABLESTATS
+# 21577: INNODB_SYS_VIRTUAL
+# 21578: INNODB_TEMP_TABLE_INFO
+# 21579: INNODB_METRICS
+# 21580: EVENTS
+# 21581: V$OB_NIC_INFO
+# 21582: ROLE_TABLE_GRANTS
+# 21583: ROLE_COLUMN_GRANTS
+# 21584: ROLE_ROUTINE_GRANTS
+# 21585: func
+# 21586: GV$OB_NIC_INFO
+# 21587: GV$OB_QUERY_RESPONSE_TIME_HISTOGRAM
+# 21588: V$OB_QUERY_RESPONSE_TIME_HISTOGRAM
+# 21589: DBA_SCHEDULER_JOB_RUN_DETAILS
+# 21590: CDB_SCHEDULER_JOB_RUN_DETAILS
+# 21592: CDB_OB_SERVER_SPACE_USAGE
+# 21594: CDB_OB_SPACE_USAGE
+# 21595: DBA_OB_TABLE_SPACE_USAGE
+# 21596: CDB_OB_TABLE_SPACE_USAGE
+# 21597: GV$OB_LOG_TRANSPORT_DEST_STAT
+# 21598: V$OB_LOG_TRANSPORT_DEST_STAT
+# 21599: GV$OB_SS_LOCAL_CACHE
+# 21600: V$OB_SS_LOCAL_CACHE
+# 21601: GV$OB_KV_GROUP_COMMIT_STATUS
+# 21602: V$OB_KV_GROUP_COMMIT_STATUS
+# 21603: INNODB_SYS_FIELDS
+# 21604: INNODB_SYS_FOREIGN
+# 21605: INNODB_SYS_FOREIGN_COLS
+# 21607: GV$OB_KV_CLIENT_INFO
+# 21608: V$OB_KV_CLIENT_INFO
+# 21610: GV$OB_RES_MGR_SYSSTAT
+# 21611: V$OB_RES_MGR_SYSSTAT
+# 21612: DBA_WR_SQL_PLAN
+# 21613: CDB_WR_SQL_PLAN
+# 21614: DBA_WR_RES_MGR_SYSSTAT
+# 21615: CDB_WR_RES_MGR_SYSSTAT
+# 21616: DBA_OB_SPM_EVO_RESULT
+# 21617: CDB_OB_SPM_EVO_RESULT
+# 21618: DBA_OB_KV_REDIS_TABLE
+# 21619: CDB_OB_KV_REDIS_TABLE
+# 21620: GV$OB_FUNCTION_IO_STAT
+# 21621: V$OB_FUNCTION_IO_STAT
+# 21622: DBA_OB_TEMP_FILES
+# 21623: CDB_OB_TEMP_FILES
+# 21628: proc
+# 21633: DBA_OB_CS_REPLICA_STATS
+# 21634: CDB_OB_CS_REPLICA_STATS
+# 21635: GV$OB_PLUGINS
+# 21636: V$OB_PLUGINS
+# 21640: DBA_OB_VECTOR_INDEX_TASKS
+# 21641: CDB_OB_VECTOR_INDEX_TASKS
+# 21642: DBA_OB_VECTOR_INDEX_TASK_HISTORY
+# 21643: CDB_OB_VECTOR_INDEX_TASK_HISTORY
+# 21644: GV$OB_STORAGE_CACHE_TASKS
+# 21645: V$OB_STORAGE_CACHE_TASKS
+# 21646: GV$OB_TABLET_LOCAL_CACHE
+# 21647: V$OB_TABLET_LOCAL_CACHE
+# 21652: DBA_MVIEW_RUNNING_JOBS
+# 21653: CDB_MVIEW_RUNNING_JOBS
+# 21654: DBA_MVIEW_DEPS
+# 21655: DBA_OB_DYNAMIC_PARTITION_TABLES
+# 21656: CDB_OB_DYNAMIC_PARTITION_TABLES
+# 21657: V$OB_DYNAMIC_PARTITION_TABLES
+# 21660: V$OB_SS_SSTABLES
 # 25001: DBA_SYNONYMS
 # 25002: DBA_OBJECTS
 # 25003: ALL_OBJECTS
@@ -2283,7 +2749,16 @@
 # 25265: DBA_OB_IMPORT_TABLE_JOB_HISTORY
 # 25266: DBA_OB_IMPORT_TABLE_TASKS
 # 25267: DBA_OB_IMPORT_TABLE_TASK_HISTORY
+# 25269: DBA_WR_SYSTEM_EVENT
+# 25270: DBA_WR_EVENT_NAME
+# 25272: DBA_OB_FORMAT_OUTLINES
+# 25273: DBA_WR_SQLSTAT
+# 25274: DBA_WR_SYS_TIME_MODEL
+# 25275: DBA_OB_TRANSFER_PARTITION_TASKS
+# 25276: DBA_OB_TRANSFER_PARTITION_TASK_HISTORY
+# 25277: DBA_WR_SQLTEXT
 # 25278: USER_USERS
+# 25279: DBA_OB_LS_REPLICA_TASK_HISTORY
 # 25283: DBA_MVIEW_LOGS
 # 25284: ALL_MVIEW_LOGS
 # 25285: USER_MVIEW_LOGS
@@ -2302,6 +2777,13 @@
 # 25298: USER_MVREF_CHANGE_STATS
 # 25299: DBA_MVREF_STMT_STATS
 # 25300: USER_MVREF_STMT_STATS
+# 25301: PROXY_USERS
+# 25302: DBA_OB_SERVICES
+# 25303: DBA_OB_STORAGE_IO_USAGE
+# 25305: USER_SCHEDULER_JOBS
+# 25308: DBA_MVIEW_RUNNING_JOBS
+# 25309: DBA_MVIEW_DEPS
+# 25310: DBA_OB_DYNAMIC_PARTITION_TABLES
 # 28002: GV$OB_SQL_AUDIT
 # 28003: V$OB_SQL_AUDIT
 # 28004: GV$INSTANCE
@@ -2469,12 +2951,69 @@
 # 28193: V$OB_TIMESTAMP_SERVICE
 # 28194: V$OB_LS_LOG_RESTORE_STATUS
 # 28195: GV$OB_FLT_TRACE_CONFIG
+# 28196: GV$OB_SESSION
+# 28197: V$OB_SESSION
+# 28198: GV$OB_PL_CACHE_OBJECT
+# 28199: V$OB_PL_CACHE_OBJECT
 # 28200: GV$OB_CGROUP_CONFIG
 # 28201: V$OB_CGROUP_CONFIG
+# 28203: GV$OB_SQLSTAT
+# 28204: V$OB_SQLSTAT
+# 28205: GV$OB_SESS_TIME_MODEL
+# 28206: V$OB_SESS_TIME_MODEL
+# 28207: GV$OB_SYS_TIME_MODEL
+# 28208: V$OB_SYS_TIME_MODEL
+# 28209: V$STATNAME
 # 28210: DBA_OB_AUX_STATISTICS
+# 28211: DBA_OB_SYS_VARIABLES
+# 28212: GV$OB_ACTIVE_SESSION_HISTORY
+# 28213: V$OB_ACTIVE_SESSION_HISTORY
 # 28214: DBA_INDEX_USAGE
 # 28215: GV$OB_LS_SNAPSHOTS
 # 28216: V$OB_LS_SNAPSHOTS
+# 28217: GV$OB_SHARED_STORAGE_QUOTA
+# 28218: V$OB_SHARED_STORAGE_QUOTA
+# 28219: GV$OB_SESSION_PS_INFO
+# 28220: V$OB_SESSION_PS_INFO
+# 28221: GV$OB_TRACEPOINT_INFO
+# 28222: V$OB_TRACEPOINT_INFO
+# 28223: DBA_OB_RSRC_DIRECTIVES
+# 28224: GV$OB_TENANT_RESOURCE_LIMIT
+# 28225: V$OB_TENANT_RESOURCE_LIMIT
+# 28226: GV$OB_TENANT_RESOURCE_LIMIT_DETAIL
+# 28227: V$OB_TENANT_RESOURCE_LIMIT_DETAIL
+# 28228: V$OB_GROUP_IO_STAT
+# 28229: GV$OB_GROUP_IO_STAT
+# 28230: GV$OB_NIC_INFO
+# 28231: V$OB_NIC_INFO
+# 28232: GV$OB_QUERY_RESPONSE_TIME_HISTOGRAM
+# 28233: V$OB_QUERY_RESPONSE_TIME_HISTOGRAM
+# 28234: DBA_OB_SPATIAL_COLUMNS
+# 28237: DBA_OB_TABLE_SPACE_USAGE
+# 28238: GV$OB_LOG_TRANSPORT_DEST_STAT
+# 28239: V$OB_LOG_TRANSPORT_DEST_STAT
+# 28240: GV$OB_SS_LOCAL_CACHE
+# 28241: V$OB_SS_LOCAL_CACHE
+# 28244: ALL_PLSQL_TYPES
+# 28245: DBA_PLSQL_TYPES
+# 28246: USER_PLSQL_TYPES
+# 28247: ALL_PLSQL_COLL_TYPES
+# 28248: DBA_PLSQL_COLL_TYPES
+# 28249: USER_PLSQL_COLL_TYPES
+# 28250: ALL_PLSQL_TYPE_ATTRS
+# 28251: DBA_PLSQL_TYPE_ATTRS
+# 28252: USER_PLSQL_TYPE_ATTRS
+# 28257: GV$OB_RES_MGR_SYSSTAT
+# 28258: V$OB_RES_MGR_SYSSTAT
+# 28259: DBA_WR_SQL_PLAN
+# 28260: DBA_WR_RES_MGR_SYSSTAT
+# 28261: DBA_OB_SPM_EVO_RESULT
+# 28262: GV$OB_FUNCTION_IO_STAT
+# 28263: V$OB_FUNCTION_IO_STAT
+# 28264: DBA_OB_TEMP_FILES
+# 28271: DBA_OB_CS_REPLICA_STATS
+# 28274: V$OB_DYNAMIC_PARTITION_TABLES
+# 28278: V$OB_SS_SSTABLES
 # 14999: __idx_11003_all_virtual_plan_cache_stat_i1
 # 14999: all_virtual_plan_cache_stat_i1  # INDEX_NAME
 # 14999: __all_virtual_plan_cache_stat  # DATA_BASE_TABLE_NAME
@@ -2505,6 +3044,9 @@
 # 14990: __idx_12302_all_virtual_ash_i1
 # 14990: all_virtual_ash_i1  # INDEX_NAME
 # 14990: __all_virtual_ash  # DATA_BASE_TABLE_NAME
+# 14989: __idx_12514_all_virtual_ddl_diagnose_info_i1
+# 14989: all_virtual_ddl_diagnose_info_i1  # INDEX_NAME
+# 14989: __all_virtual_ddl_diagnose_info  # DATA_BASE_TABLE_NAME
 # 19999: __idx_15009_all_virtual_sql_audit_i1
 # 19999: all_virtual_sql_audit_i1  # INDEX_NAME
 # 19999: __all_virtual_sql_audit  # DATA_BASE_TABLE_NAME
@@ -2842,6 +3384,9 @@
 # 101091: __idx_471_idx_dbms_lock_allocated_expiration
 # 101091: idx_dbms_lock_allocated_expiration  # INDEX_NAME
 # 101091: __all_dbms_lock_allocated  # DATA_BASE_TABLE_NAME
+# 101092: __idx_482_idx_tablet_his_table_id_src
+# 101092: idx_tablet_his_table_id_src  # INDEX_NAME
+# 101092: __all_tablet_reorganize_history  # DATA_BASE_TABLE_NAME
 # 101093: __idx_410_idx_kv_ttl_task_table_id
 # 101093: idx_kv_ttl_task_table_id  # INDEX_NAME
 # 101093: __all_kv_ttl_task  # DATA_BASE_TABLE_NAME
@@ -2857,6 +3402,59 @@
 # 101097: __idx_468_idx_mview_refresh_stats_mview_end_time
 # 101097: idx_mview_refresh_stats_mview_end_time  # INDEX_NAME
 # 101097: __all_mview_refresh_stats  # DATA_BASE_TABLE_NAME
+# 101098: __idx_498_idx_transfer_partition_key
+# 101098: idx_transfer_partition_key  # INDEX_NAME
+# 101098: __all_transfer_partition_task  # DATA_BASE_TABLE_NAME
+# 101099: __idx_497_idx_client_to_server_session_info_client_session_id
+# 101099: idx_client_to_server_session_info_client_session_id  # INDEX_NAME
+# 101099: __all_client_to_server_session_info  # DATA_BASE_TABLE_NAME
+# 101100: __idx_505_idx_column_privilege_name
+# 101100: idx_column_privilege_name  # INDEX_NAME
+# 101100: __all_column_privilege  # DATA_BASE_TABLE_NAME
+# 101101: __idx_512_idx_user_proxy_info_proxy_user_id
+# 101101: idx_user_proxy_info_proxy_user_id  # INDEX_NAME
+# 101101: __all_user_proxy_info  # DATA_BASE_TABLE_NAME
+# 101102: __idx_513_idx_user_proxy_info_proxy_user_id_history
+# 101102: idx_user_proxy_info_proxy_user_id_history  # INDEX_NAME
+# 101102: __all_user_proxy_info  # DATA_BASE_TABLE_NAME
+# 101102: __all_user_proxy_info_history  # DATA_BASE_TABLE_NAME1
+# 101103: __idx_515_idx_user_proxy_role_info_proxy_user_id_history
+# 101103: idx_user_proxy_role_info_proxy_user_id_history  # INDEX_NAME
+# 101103: __all_user_proxy_role_info  # DATA_BASE_TABLE_NAME
+# 101103: __all_user_proxy_role_info_history  # DATA_BASE_TABLE_NAME1
+# 101105: __idx_519_idx_scheduler_job_run_detail_v2_time
+# 101105: idx_scheduler_job_run_detail_v2_time  # INDEX_NAME
+# 101105: __all_scheduler_job_run_detail_v2  # DATA_BASE_TABLE_NAME
+# 101106: __idx_519_idx_scheduler_job_run_detail_v2_job_class_time
+# 101106: idx_scheduler_job_run_detail_v2_job_class_time  # INDEX_NAME
+# 101106: __all_scheduler_job_run_detail_v2  # DATA_BASE_TABLE_NAME
+# 101107: __idx_522_idx_pkg_db_type_name
+# 101107: idx_pkg_db_type_name  # INDEX_NAME
+# 101107: __all_pkg_type  # DATA_BASE_TABLE_NAME
+# 101108: __idx_522_idx_pkg_type_name
+# 101108: idx_pkg_type_name  # INDEX_NAME
+# 101108: __all_pkg_type  # DATA_BASE_TABLE_NAME
+# 101109: __idx_523_idx_pkg_type_attr_name
+# 101109: idx_pkg_type_attr_name  # INDEX_NAME
+# 101109: __all_pkg_type_attr  # DATA_BASE_TABLE_NAME
+# 101110: __idx_523_idx_pkg_type_attr_id
+# 101110: idx_pkg_type_attr_id  # INDEX_NAME
+# 101110: __all_pkg_type_attr  # DATA_BASE_TABLE_NAME
+# 101111: __idx_524_idx_pkg_coll_name_type
+# 101111: idx_pkg_coll_name_type  # INDEX_NAME
+# 101111: __all_pkg_coll_type  # DATA_BASE_TABLE_NAME
+# 101112: __idx_524_idx_pkg_coll_name_id
+# 101112: idx_pkg_coll_name_id  # INDEX_NAME
+# 101112: __all_pkg_coll_type  # DATA_BASE_TABLE_NAME
+# 101113: __idx_537_idx_catalog_name
+# 101113: idx_catalog_name  # INDEX_NAME
+# 101113: __all_catalog  # DATA_BASE_TABLE_NAME
+# 101114: __idx_539_idx_catalog_priv_catalog_name
+# 101114: idx_catalog_priv_catalog_name  # INDEX_NAME
+# 101114: __all_catalog_privilege  # DATA_BASE_TABLE_NAME
+# 101104: __idx_482_idx_tablet_his_table_id_dest
+# 101104: idx_tablet_his_table_id_dest  # INDEX_NAME
+# 101104: __all_tablet_reorganize_history  # DATA_BASE_TABLE_NAME
 # 15306: __idx_15120_idx_data_table_id_real_agent
 # 15306: idx_data_table_id_real_agent  # INDEX_NAME
 # 15306: __all_table  # DATA_BASE_TABLE_NAME
@@ -3145,3 +3743,47 @@
 # 15416: idx_dbms_lock_allocated_expiration_real_agent  # INDEX_NAME
 # 15416: __all_dbms_lock_allocated  # DATA_BASE_TABLE_NAME
 # 15416: ALL_VIRTUAL_DBMS_LOCK_ALLOCATED_REAL_AGENT  # DATA_BASE_TABLE_NAME1
+# 15448: __idx_15446_idx_user_proxy_info_proxy_user_id_real_agent
+# 15448: idx_user_proxy_info_proxy_user_id_real_agent  # INDEX_NAME
+# 15448: __all_user_proxy_info  # DATA_BASE_TABLE_NAME
+# 15448: ALL_VIRTUAL_USER_PROXY_INFO_REAL_AGENT  # DATA_BASE_TABLE_NAME1
+# 15460: __idx_15458_idx_scheduler_job_run_detail_v2_time_real_agent
+# 15460: idx_scheduler_job_run_detail_v2_time_real_agent  # INDEX_NAME
+# 15460: __all_scheduler_job_run_detail_v2  # DATA_BASE_TABLE_NAME
+# 15460: ALL_VIRTUAL_SCHEDULER_JOB_RUN_DETAIL_V2_REAL_AGENT  # DATA_BASE_TABLE_NAME1
+# 15463: __idx_15458_idx_scheduler_job_run_detail_v2_job_class_time_real_agent
+# 15463: idx_scheduler_job_run_detail_v2_job_class_time_real_agent  # INDEX_NAME
+# 15463: __all_scheduler_job_run_detail_v2  # DATA_BASE_TABLE_NAME
+# 15463: ALL_VIRTUAL_SCHEDULER_JOB_RUN_DETAIL_V2_REAL_AGENT  # DATA_BASE_TABLE_NAME1
+# 15474: __idx_15471_idx_pkg_db_type_name_real_agent
+# 15474: idx_pkg_db_type_name_real_agent  # INDEX_NAME
+# 15474: __all_pkg_type  # DATA_BASE_TABLE_NAME
+# 15474: ALL_VIRTUAL_PKG_TYPE_REAL_AGENT  # DATA_BASE_TABLE_NAME1
+# 15475: __idx_15471_idx_pkg_type_name_real_agent
+# 15475: idx_pkg_type_name_real_agent  # INDEX_NAME
+# 15475: __all_pkg_type  # DATA_BASE_TABLE_NAME
+# 15475: ALL_VIRTUAL_PKG_TYPE_REAL_AGENT  # DATA_BASE_TABLE_NAME1
+# 15476: __idx_15472_idx_pkg_type_attr_name_real_agent
+# 15476: idx_pkg_type_attr_name_real_agent  # INDEX_NAME
+# 15476: __all_pkg_type_attr  # DATA_BASE_TABLE_NAME
+# 15476: ALL_VIRTUAL_PKG_TYPE_ATTR_REAL_AGENT  # DATA_BASE_TABLE_NAME1
+# 15477: __idx_15472_idx_pkg_type_attr_id_real_agent
+# 15477: idx_pkg_type_attr_id_real_agent  # INDEX_NAME
+# 15477: __all_pkg_type_attr  # DATA_BASE_TABLE_NAME
+# 15477: ALL_VIRTUAL_PKG_TYPE_ATTR_REAL_AGENT  # DATA_BASE_TABLE_NAME1
+# 15478: __idx_15473_idx_pkg_coll_name_type_real_agent
+# 15478: idx_pkg_coll_name_type_real_agent  # INDEX_NAME
+# 15478: __all_pkg_coll_type  # DATA_BASE_TABLE_NAME
+# 15478: ALL_VIRTUAL_PKG_COLL_TYPE_REAL_AGENT  # DATA_BASE_TABLE_NAME1
+# 15479: __idx_15473_idx_pkg_coll_name_id_real_agent
+# 15479: idx_pkg_coll_name_id_real_agent  # INDEX_NAME
+# 15479: __all_pkg_coll_type  # DATA_BASE_TABLE_NAME
+# 15479: ALL_VIRTUAL_PKG_COLL_TYPE_REAL_AGENT  # DATA_BASE_TABLE_NAME1
+# 15500: __idx_15494_idx_catalog_name_real_agent
+# 15500: idx_catalog_name_real_agent  # INDEX_NAME
+# 15500: __all_catalog  # DATA_BASE_TABLE_NAME
+# 15500: ALL_VIRTUAL_CATALOG_REAL_AGENT  # DATA_BASE_TABLE_NAME1
+# 15501: __idx_15495_idx_catalog_priv_catalog_name_real_agent
+# 15501: idx_catalog_priv_catalog_name_real_agent  # INDEX_NAME
+# 15501: __all_catalog_privilege  # DATA_BASE_TABLE_NAME
+# 15501: ALL_VIRTUAL_CATALOG_PRIVILEGE_REAL_AGENT  # DATA_BASE_TABLE_NAME1

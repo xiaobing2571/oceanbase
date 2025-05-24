@@ -162,7 +162,8 @@ private:
   // @param[in]: start_scn
   // @param[in]: tablet_list
   // @param[out]: transfer_out_info
-  int build_tx_finish_transfer_in_info_(const share::ObLSID &src_ls_id, const share::ObLSID &dest_ls_id,
+  int build_tx_finish_transfer_in_info_(const share::ObTransferTaskID &task_id, const share::ObLSID &src_ls_id,
+      const share::ObLSID &dest_ls_id,
       const share::SCN &start_scn, const common::ObArray<share::ObTransferTabletInfo> &tablet_list,
       ObTXFinishTransferInInfo &transfer_out_info);
 
@@ -172,7 +173,8 @@ private:
   // @param[in]: finish_scn
   // @param[in]: tablet_list
   // @param[out]: transfer_out_info
-  int build_tx_finish_transfer_out_info_(const share::ObLSID &src_ls_id, const share::ObLSID &dest_ls_id,
+  int build_tx_finish_transfer_out_info_(const share::ObTransferTaskID &task_id, const share::ObLSID &src_ls_id,
+      const share::ObLSID &dest_ls_id,
       const share::SCN &finish_scn, const common::ObArray<share::ObTransferTabletInfo> &tablet_list,
       ObTXFinishTransferOutInfo &transfer_out_info);
 
@@ -201,7 +203,6 @@ private:
   int report_result_(const share::ObTransferTaskID &task_id, const int64_t result, obrpc::ObSrvRpcProxy *rs_rpc_proxy);
 
 private:
-
   // check self is leader
   // @param[in]: ls_id
   // @param[out]: is_leader
@@ -268,6 +269,17 @@ private:
       const ObSqlString &extra_info,
       const share::ObTransferStatus &status) const;
 
+  void process_perf_diagnose_info_(
+      const ObStorageHACostItemName name,
+      const int64_t start_ts,
+      const int64_t tablet_count,
+      const int64_t round, const bool is_report) const;
+
+  void process_perf_diagnose_info_(
+      const ObStorageHACostItemName name,
+      const int64_t round,
+      const bool is_report) const;
+
 private:
   static const int64_t DEFAULT_WAIT_INTERVAL_US = 10_ms;
   static const int64_t TASK_EXECUTE_LONG_WARNING_THRESHOLD = 60_min;
@@ -281,6 +293,9 @@ private:
   mutable lib::ObMutex mutex_;
   common::ObThreadCond cond_;
   common::ObMySQLProxy *sql_proxy_;
+  int64_t round_;
+  share::ObStorageHACostItemName diagnose_result_msg_;
+  uint64_t data_version_;
   DISALLOW_COPY_AND_ASSIGN(ObTxFinishTransfer);
 };
 

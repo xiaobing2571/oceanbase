@@ -17,15 +17,20 @@
 #include "share/table/ob_table_load_array.h"
 #include "share/table/ob_table_load_define.h"
 #include "share/table/ob_table_load_row_array.h"
-#include "share/table/ob_table_load_sql_statistics.h"
 
 namespace oceanbase
 {
+namespace table
+{
+class ObTableLoadSqlStatistics;
+class ObTableLoadDmlStat;
+} // namespace table
 namespace observer
 {
 class ObTableLoadTableCtx;
 class ObTableLoadStoreCtx;
 class ObTableLoadStoreTrans;
+class ObTableLoadStoreTransPXWriter;
 
 class ObTableLoadStore
 {
@@ -35,22 +40,23 @@ public:
     ObTableLoadTableCtx *ctx,
     const table::ObTableLoadArray<table::ObTableLoadLSIdAndPartitionId> &partition_id_array,
     const table::ObTableLoadArray<table::ObTableLoadLSIdAndPartitionId> &target_partition_id_array);
-  static void abort_ctx(ObTableLoadTableCtx *ctx, bool &is_stopped);
+  static void abort_ctx(ObTableLoadTableCtx *ctx, int error_code, bool &is_stopped);
   int init();
 private:
   static int abort_active_trans(ObTableLoadTableCtx *ctx);
-
 // table load ctrl interface
 public:
   int pre_begin();
   int confirm_begin();
+public:
   int pre_merge(const table::ObTableLoadArray<table::ObTableLoadTransId> &committed_trans_id_array);
   int start_merge();
-  int commit(table::ObTableLoadResultInfo &result_info);
+  int commit(table::ObTableLoadResultInfo &result_info,
+             table::ObTableLoadSqlStatistics &sql_statistics,
+             table::ObTableLoadDmlStat &dml_stats,
+             transaction::ObTxExecResult &trans_result);
   int get_status(table::ObTableLoadStatusType &status, int &error_code);
   int heart_beat();
-private:
-  int commit_sql_statistics(const table::ObTableLoadSqlStatistics &sql_statistics);
 private:
   class MergeTaskProcessor;
   class MergeTaskCallback;
@@ -85,10 +91,7 @@ private:
 public:
   int px_start_trans(const table::ObTableLoadTransId &trans_id);
   int px_finish_trans(const table::ObTableLoadTransId &trans_id);
-  int px_check_for_write(const ObTabletID &tablet_id);
-  int px_write(const table::ObTableLoadTransId &trans_id,
-               const ObTabletID &tablet_id,
-               const common::ObIArray<common::ObNewRow> &row_array);
+  int px_get_trans_writer(const table::ObTableLoadTransId &trans_id, ObTableLoadStoreTransPXWriter &writer);
   static int px_abandon_trans(ObTableLoadTableCtx *ctx, const table::ObTableLoadTransId &trans_id);
 private:
   int px_flush(ObTableLoadStoreTrans *trans);

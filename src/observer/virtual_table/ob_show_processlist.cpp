@@ -10,14 +10,9 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "lib/string/ob_string.h"
-#include "share/config/ob_server_config.h"
 #include "observer/virtual_table/ob_show_processlist.h"
 #include "observer/ob_server.h"
-//#include "sql/engine/expr/ob_expr_promotion_util.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "sql/privilege_check/ob_ora_priv_check.h"
-#include "lib/utility/ob_print_utils.h"
 
 using namespace oceanbase::common;
 namespace oceanbase
@@ -57,7 +52,8 @@ int ObShowProcesslist::inner_get_next_row(ObNewRow *&row)
                                      session_,
                                      &cur_row_,
                                      output_column_ids_,
-                                     schema_guard_))) {
+                                     schema_guard_,
+                                     table_schema_))) {
         SERVER_LOG(WARN, "init fill_scanner fail", K(ret));
       } else if (OB_FAIL(session_mgr_->for_each_session(fill_scanner_))) {
         SERVER_LOG(WARN, "fill scanner fail", K(ret));
@@ -136,13 +132,22 @@ bool ObShowProcesslist::FillScanner::operator()(sql::ObSQLSessionMgr::Key key, O
     char ip_buf[common::OB_IP_STR_BUFF];
     char peer_buf[common::OB_IP_PORT_STR_BUFF];
     char sql_id[common::OB_MAX_SQL_ID_LENGTH + 1];
+    // for compatibility，the time type of the new version is converted from int to double
+    bool type_is_double = true;
+    const ObColumnSchemaV2 *tmp_column_schema = NULL;
+    if (OB_ISNULL(table_schema_) ||
+        OB_ISNULL(tmp_column_schema = table_schema_->get_column_schema("TIME"))) {
+      ret = OB_ERR_UNEXPECTED;
+      SERVER_LOG(WARN, "table or column schema is null", KR(ret), KP(table_schema_), KP(tmp_column_schema));
+    } else {
+      type_is_double = tmp_column_schema->get_meta_type().is_double();
+    }
     //If you are in system tenant, you can see all thread.
     //Otherwise, you can show only the threads at the same Tenant with you.
     //If you have the PROCESS privilege, you can show all threads at your Tenant.
     //Otherwise, you can show only your own threads.
-    // if session is marked killed, no display to user.
-    if (sess_info->is_shadow() || sess_info->is_mark_killed()) {
-      //this session info is logical free, shouldn't be added to scanner
+    if (sess_info->is_shadow()) {
+      // do not show shadow session
     } else if ((OB_SYS_TENANT_ID == my_session_->get_priv_tenant_id())
         || (sess_info->get_priv_tenant_id() == my_session_->get_priv_tenant_id()
             && (has_process_privilege()
@@ -151,12 +156,13 @@ bool ObShowProcesslist::FillScanner::operator()(sql::ObSQLSessionMgr::Key key, O
       const int64_t col_count = output_column_ids_.count();
       ObCharsetType default_charset = ObCharset::get_default_charset();
       ObCollationType default_collation = ObCharset::get_default_collation(default_charset);
+      int64_t current_time = ::oceanbase::common::ObTimeUtility::current_time();
       for (int64_t i = 0; OB_SUCC(ret) && i < col_count; ++i) {
         uint64_t col_id = output_column_ids_.at(i);
         switch(col_id) {
           case ID: {
             cur_row_->cells_[cell_idx].set_uint64(static_cast<uint64_t>(
-                                  sess_info->get_compatibility_sessid()));
+                                  sess_info->get_sid()));
             break;
           }
           case USER: {
@@ -216,8 +222,15 @@ bool ObShowProcesslist::FillScanner::operator()(sql::ObSQLSessionMgr::Key key, O
             break;
           }
           case TIME: {
-            int64_t time_sec = (::oceanbase::common::ObTimeUtility::current_time() - sess_info->get_cur_state_start_time()) / 1000000;
-            cur_row_->cells_[cell_idx].set_int(time_sec);
+            if (type_is_double) {
+              double time_sec = (static_cast<double> (current_time - sess_info->get_cur_state_start_time())) / 1000000;
+              cur_row_->cells_[cell_idx].set_double(time_sec);
+              cur_row_->cells_[cell_idx].set_scale(6);
+            } else {
+              int64_t time_sec = (current_time - sess_info->get_cur_state_start_time()) / 1000000;
+              cur_row_->cells_[cell_idx].set_int(time_sec);
+            }
+
             break;
           }
           case STATE: {
@@ -335,13 +348,26 @@ bool ObShowProcesslist::FillScanner::operator()(sql::ObSQLSessionMgr::Key key, O
             break;
           }
           case TOTAL_TIME: {
-            if (ObSQLSessionState::QUERY_ACTIVE == sess_info->get_session_state()) {
-              // time_sec = current time - sql packet received from easy time
-              int64_t time_sec = (::oceanbase::common::ObTimeUtility::current_time() - sess_info->get_query_start_time()) / 1000000;
-              cur_row_->cells_[cell_idx].set_int(time_sec);
+            if (type_is_double) {
+              // indicates that the request is in progress
+              if (!sess_info->get_is_request_end()) {
+                // time_sec = current time - sql packet received from easy time
+                double time_sec = (static_cast<double> (current_time - sess_info->get_query_start_time())) / 1000000;
+                cur_row_->cells_[cell_idx].set_double(time_sec);
+              } else {
+                double time_sec = (static_cast<double> (current_time - sess_info->get_cur_state_start_time())) / 1000000;
+                cur_row_->cells_[cell_idx].set_double(time_sec);
+              }
+              cur_row_->cells_[cell_idx].set_scale(6);
             } else {
-              int64_t time_sec = (::oceanbase::common::ObTimeUtility::current_time() - sess_info->get_cur_state_start_time()) / 1000000;
-              cur_row_->cells_[cell_idx].set_int(time_sec);
+              if (ObSQLSessionState::QUERY_ACTIVE == sess_info->get_session_state()) {
+                // time_sec = current time - sql packet received from easy time
+                int64_t time_sec = (current_time - sess_info->get_query_start_time()) / 1000000;
+                cur_row_->cells_[cell_idx].set_int(time_sec);
+              } else {
+                int64_t time_sec = (current_time - sess_info->get_cur_state_start_time()) / 1000000;
+                cur_row_->cells_[cell_idx].set_int(time_sec);
+              }
             }
             break;
           }
@@ -449,10 +475,46 @@ bool ObShowProcesslist::FillScanner::operator()(sql::ObSQLSessionMgr::Key key, O
             break;
           }
           case PROXY_USER_NAME: {
-            cur_row_->cells_[cell_idx].set_null();
+            cur_row_->cells_[cell_idx].set_varchar(sess_info->get_proxy_user_name());
+            cur_row_->cells_[cell_idx].set_collation_type(ObCharset::get_default_collation(
+                                         ObCharset::get_default_charset()));
             break;
           }
           case SERVICE_NAME: {
+            if (!sess_info->get_service_name().is_empty()) {
+              cur_row_->cells_[cell_idx].set_varchar(sess_info->get_service_name().ptr());
+              cur_row_->cells_[cell_idx].set_collation_type(default_collation);
+            } else {
+              cur_row_->cells_[cell_idx].set_null();
+            }
+            break;
+          }
+          case TOTAL_CPU_TIME: {
+            if (ObSQLSessionState::QUERY_ACTIVE == sess_info->get_session_state()) {
+              // time_sec = current time - sql packet received from easy time
+              double time_sec = (static_cast<double> (sess_info->get_retry_active_time() + current_time - sess_info->get_cur_state_start_time())) / 1000000;
+              cur_row_->cells_[cell_idx].set_double(time_sec);
+            } else {
+              double time_sec = (static_cast<double> (sess_info->get_retry_active_time())) / 1000000;
+              cur_row_->cells_[cell_idx].set_double(time_sec);
+            }
+            cur_row_->cells_[cell_idx].set_scale(6);
+            break;
+          }
+          case TOP_INFO: {
+            if ((obmysql::COM_QUERY == sess_info->get_mysql_cmd() ||
+                obmysql::COM_STMT_EXECUTE == sess_info->get_mysql_cmd() ||
+                obmysql::COM_STMT_PREPARE == sess_info->get_mysql_cmd() ||
+                obmysql::COM_STMT_PREXECUTE == sess_info->get_mysql_cmd()) &&
+                !sess_info->get_top_query_string().empty()) {
+              cur_row_->cells_[cell_idx].set_varchar(sess_info->get_top_query_string());
+              cur_row_->cells_[cell_idx].set_collation_type(default_collation);
+            } else {
+              cur_row_->cells_[cell_idx].set_null();
+            }
+            break;
+          }
+          case MEMORY_USAGE: {
             cur_row_->cells_[cell_idx].set_null();
             break;
           }
@@ -490,16 +552,19 @@ int ObShowProcesslist::FillScanner::init(ObIAllocator *allocator,
                                          sql::ObSQLSessionInfo *session_info,
                                          common::ObNewRow *cur_row,
                                          const ObIArray<uint64_t> &column_ids,
-                                         share::schema::ObSchemaGetterGuard* schema_guard)
+                                         share::schema::ObSchemaGetterGuard* schema_guard,
+                                         const share::schema::ObTableSchema *table_schema)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(NULL == allocator
                   || NULL == scanner
                   || NULL == cur_row
-                  || NULL == session_info)) {
+                  || NULL == session_info
+                  || NULL == table_schema)) {
     ret = OB_NOT_INIT;
     SERVER_LOG(WARN,
-               "some parameter is NULL", K(ret), K(allocator), K(scanner), K(cur_row), K(session_info));
+               "some parameter is NULL", K(ret), K(allocator), K(scanner),
+              K(cur_row), K(session_info), K(table_schema));
   } else if (OB_FAIL(output_column_ids_.assign(column_ids))) {
     SQL_ENG_LOG(WARN, "fail to assign output column ids", K(ret), K(column_ids));
   } else {
@@ -508,7 +573,7 @@ int ObShowProcesslist::FillScanner::init(ObIAllocator *allocator,
     cur_row_ = cur_row;
     my_session_ = session_info;
     schema_guard_ = schema_guard;
-
+    table_schema_ = table_schema;
   }
   return ret;
 }

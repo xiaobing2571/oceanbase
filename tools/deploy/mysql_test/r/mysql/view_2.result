@@ -354,7 +354,8 @@ ERROR 42S02: 'view.v2' contains view recursion
 select * from v3;
 ERROR 42S02: 'view.v2' contains view recursion
 SET optimizer_switch = (SELECT variable_value FROM INFORMATION_SCHEMA.GLOBAL_VARIABLES WHERE VARIABLE_NAME = 'optimizer_switch');
-ERROR 0A000: subqueries or stored function calls here not supported
+Warnings:
+Warning	1235	This system variable now is mock not supported
 drop table if exists t1,t2;
 drop view if exists v1;
 create table t1(c1 int,c2 int);
@@ -393,7 +394,7 @@ insert into t1 values(1, 1);
 create view v as select * from t1 where not exists(select * from t1 where c1>0);
 show create view v;
 View	Create View	character_set_client	collation_connection
-v	CREATE VIEW `v` AS select `view`.`t1`.`c1` AS `c1`,`view`.`t1`.`c2` AS `c2` from `view`.`t1` where not exists((select `t1`.`c1`,`t1`.`c2` from `view`.`t1` `t1` where (`t1`.`c1` > 0)))	utf8mb4	utf8mb4_general_ci
+v	CREATE VIEW `v` AS select `view`.`t1`.`c1` AS `c1`,`view`.`t1`.`c2` AS `c2` from `view`.`t1` where not exists((select `view`.`t1`.`c1`,`view`.`t1`.`c2` from `view`.`t1` where (`view`.`t1`.`c1` > 0)))	utf8mb4	utf8mb4_general_ci
 select * from v;
 c1	c2
 create view xy as select 123 from dual where not exists (select 1 from dual) limit 1;
@@ -416,7 +417,7 @@ create table t1 (k int, v int);
 create view v as (select k, v from t1) union (select 1, 1 from t1);
 show create view v;
 View	Create View	character_set_client	collation_connection
-v	CREATE VIEW `v` AS (select `view`.`t1`.`k` AS `k`,`view`.`t1`.`v` AS `v` from `view`.`t1`) union (select 1 AS `1`,1 AS `1` from `view`.`t1` `t1`)	utf8mb4	utf8mb4_general_ci
+v	CREATE VIEW `v` AS (select `view`.`t1`.`k` AS `k`,`view`.`t1`.`v` AS `v` from `view`.`t1`) union (select 1 AS `1`,1 AS `1` from `view`.`t1`)	utf8mb4	utf8mb4_general_ci
 drop table if exists t1;
 drop table if exists t2;
 CREATE TABLE `t11` ( `a` int(11) NOT NULL, `b` int(11) DEFAULT NULL, `c` int(11) DEFAULT NULL, PRIMARY KEY (`a`) );
@@ -461,8 +462,8 @@ Outline Data:
       BEGIN_OUTLINE_DATA
       LEADING(@"SEL$21AFC505" ("view"."t11"@"SEL$2" "view"."t21"@"SEL$2"))
       USE_MERGE(@"SEL$21AFC505" "view"."t21"@"SEL$2")
-      FULL(@"SEL$21AFC505" "view"."t11"@"SEL$2")
-      FULL(@"SEL$21AFC505" "view"."t21"@"SEL$2")
+      INDEX(@"SEL$21AFC505" "view"."t11"@"SEL$2" "primary")
+      INDEX(@"SEL$21AFC505" "view"."t21"@"SEL$2" "primary")
       MERGE(@"SEL$2" > "SEL$1")
       OUTER_TO_INNER(@"SEL$CFEA49FE")
       PRED_DEDUCE(@"SEL$A7A036C9")
@@ -481,7 +482,7 @@ Optimization Info:
       table_dop:1
       dop_method:Table DOP
       avaiable_index_name:[t11]
-      stats version:0
+      stats info:[version=1970-01-01 08:00:00.000000, is_locked=0, is_expired=0]
       dynamic sampling level:1
       estimation method:[DYNAMIC SAMPLING FULL]
   t21:
@@ -493,11 +494,13 @@ Optimization Info:
       table_dop:1
       dop_method:Table DOP
       avaiable_index_name:[t21]
-      stats version:0
+      stats info:[version=1970-01-01 08:00:00.000000, is_locked=0, is_expired=0]
       dynamic sampling level:1
       estimation method:[DYNAMIC SAMPLING FULL]
   Plan Type:
       LOCAL
+  Parameters:
+      :0 => 10
   Note:
       Degree of Parallelisim is 1 because of table property
   Expr Constraints:

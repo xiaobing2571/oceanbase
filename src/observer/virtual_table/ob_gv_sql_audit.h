@@ -17,6 +17,7 @@
 #include "share/ob_virtual_table_scanner_iterator.h"
 #include "common/ob_range.h"
 #include "observer/mysql/ob_ra_queue.h"
+#include "observer/mysql/ob_dl_queue.h"
 
 namespace oceanbase
 {
@@ -176,7 +177,13 @@ private:
     TOTAL_MEMSTORE_READ_ROW_COUNT,
     TOTAL_SSSTORE_READ_ROW_COUNT,
     PROXY_USER_NAME,
-    FORMAT_SQL_ID
+    FORMAT_SQL_ID,
+    USER_CLIENT_PORT,
+    TRANS_STATUS,
+    PLSQL_COMPILE_TIME,
+    CCL_RULE_ID,
+    CCL_MATCH_TIME,
+    INSERT_DUPLICATE_ROW_COUNT,
   };
 
   const static int64_t PRI_KEY_IP_IDX        = 0;
@@ -195,7 +202,7 @@ private:
   int64_t start_id_;
   int64_t end_id_;
   int64_t cur_id_;
-  common::ObRaQueue::Ref ref_;
+  common::ObDlQueue::DlRef ref_;
   common::ObAddr *addr_;
   common::ObString ipstr_;
   int32_t port_;
@@ -203,6 +210,7 @@ private:
   char client_ip_[common::MAX_IP_ADDR_LENGTH + 2];
   char user_client_ip_[common::MAX_IP_ADDR_LENGTH + 2];
   char trace_id_[128];
+  char pl_trace_id_[128];
 
   //max wait event columns
   bool is_first_get_;

@@ -13,17 +13,13 @@
 #define USING_LOG_PREFIX STORAGE
 
 #define ASSERT_OK(x) ASSERT_EQ(OB_SUCCESS, (x))
-#include <gtest/gtest.h>
 
 #define private public
-#include "storage/meta_mem/ob_tenant_meta_mem_mgr.h"
+#define protected public
 #include "storage/blocksstable/ob_row_generate.h"
 #include "storage/blocksstable/ob_data_file_prepare.h"
-#include "src/sql/engine/basic/ob_chunk_datum_store.h"
 #include "unittest/storage/blocksstable/ob_data_file_prepare.h"
-#include "src/sql/engine/basic/chunk_store/ob_compact_store.h"
-#include "src/sql/engine/basic/ob_temp_block_store.h"
-
+#include "mtlenv/mock_tenant_module_env.h"
 #undef private
 
 namespace oceanbase
@@ -161,6 +157,35 @@ public:
     TestDataFilePrepare(&getter, "TestTmpFile", 2 * 1024 * 1024, 2048) {};
   void SetUp();
   void TearDown();
+  static void SetUpTestCase()
+  {
+    ASSERT_EQ(OB_SUCCESS, ObTimerService::get_instance().start());
+  }
+  static void TearDownTestCase()
+  {
+    ObTimerService::get_instance().stop();
+    ObTimerService::get_instance().wait();
+    ObTimerService::get_instance().destroy();
+  }
+
+  int init_tenant_mgr()
+  {
+    int ret = OB_SUCCESS;
+    ObAddr self;
+    obrpc::ObSrvRpcProxy rpc_proxy;
+    obrpc::ObCommonRpcProxy rs_rpc_proxy;
+    share::ObRsMgr rs_mgr;
+    self.set_ip_addr("127.0.0.1", 8086);
+    rpc::frame::ObReqTransport req_transport(NULL, NULL);
+    const int64_t ulmt = 128LL << 30;
+    const int64_t llmt = 128LL << 30;
+    ret = getter.add_tenant(OB_SYS_TENANT_ID, ulmt, llmt);
+    EXPECT_EQ(OB_SUCCESS, ret);
+    ret = getter.add_tenant(OB_SERVER_TENANT_ID, ulmt, llmt);
+    EXPECT_EQ(OB_SUCCESS, ret);
+    lib::set_memory_limit(128LL << 32);
+    return ret;
+  }
 
 protected:
   ObStoredRowGenerate row_generate_;
@@ -184,8 +209,12 @@ void TestCompactChunk::SetUp()
   }
   // set observer memory limit
   CHUNK_MGR.set_limit(8L * 1024L * 1024L * 1024L);
-  ret = ObTmpFileManager::get_instance().init();
-  ASSERT_EQ(OB_SUCCESS, ret);
+
+  EXPECT_EQ(OB_SUCCESS, init_tenant_mgr());
+  ASSERT_EQ(OB_SUCCESS, common::ObClockGenerator::init());
+  ASSERT_EQ(OB_SUCCESS, tmp_file::ObTmpBlockCache::get_instance().init("tmp_block_cache", 1));
+  ASSERT_EQ(OB_SUCCESS, tmp_file::ObTmpPageCache::get_instance().init("sn_tmp_page_cache", 1));
+
   static ObTenantBase tenant_ctx(OB_SYS_TENANT_ID);
   ObTenantEnv::set_tenant(&tenant_ctx);
   ObTenantIOManager *io_service = nullptr;
@@ -193,92 +222,37 @@ void TestCompactChunk::SetUp()
   EXPECT_EQ(OB_SUCCESS, ObTenantIOManager::mtl_init(io_service));
   EXPECT_EQ(OB_SUCCESS, io_service->start());
   tenant_ctx.set(io_service);
+
+  ObTimerService *timer_service = nullptr;
+  EXPECT_EQ(OB_SUCCESS, ObTimerService::mtl_new(timer_service));
+  EXPECT_EQ(OB_SUCCESS, ObTimerService::mtl_start(timer_service));
+  tenant_ctx.set(timer_service);
+
+  tmp_file::ObTenantTmpFileManager *tf_mgr = nullptr;
+  EXPECT_EQ(OB_SUCCESS, mtl_new_default(tf_mgr));
+  EXPECT_EQ(OB_SUCCESS, tmp_file::ObTenantTmpFileManager::mtl_init(tf_mgr));
+  tf_mgr->get_sn_file_manager().page_cache_controller_.write_buffer_pool_.default_wbp_memory_limit_ = 40*1024*1024;
+  EXPECT_EQ(OB_SUCCESS, tf_mgr->start());
+  tenant_ctx.set(tf_mgr);
+  SERVER_STORAGE_META_SERVICE.is_started_ = true;
   ObTenantEnv::set_tenant(&tenant_ctx);
 }
 
 void TestCompactChunk::TearDown()
 {
-  ObTmpFileManager::get_instance().destroy();
   ObKVGlobalCache::get_instance().destroy();
-  ObTmpFileStore::get_instance().destroy();
   allocator_.reuse();
   row_generate_.allocator_.reuse();
   TestDataFilePrepare::TearDown();
-}
 
-TEST_F(TestCompactChunk, test_read_writer)
-{
-  int ret = OB_SUCCESS;
-  ObCompactStore cs_chunk;
-  cs_chunk.init(1, 1,
-        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, true, share::SORT_DEFAULT_LEVEL);
-
-  StoredRow **sr;
-  ret = row_generate_.get_stored_row(sr);
-  ASSERT_EQ(ret, OB_SUCCESS);
-
-  char *buf = reinterpret_cast<char*>(sr);
-  int64_t pos = 0;
-  for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-    StoredRow *tmp_sr = (StoredRow *)(buf + pos);
-    ret = cs_chunk.add_row(*tmp_sr);
-    ASSERT_EQ(ret, OB_SUCCESS);
-    pos += tmp_sr->row_size_;
-  }
-
-  ret = cs_chunk.finish_add_row();
-  ASSERT_EQ(ret, OB_SUCCESS);
-  for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-    int64_t result = 0;
-    const StoredRow *cur_sr = nullptr;
-    ret = cs_chunk.get_next_row(cur_sr);
-    if (ret == OB_ITER_END) {
-      ret = OB_SUCCESS;
-    }
-    ASSERT_EQ(ret, OB_SUCCESS);
-    for (int64_t k = 0; k < cur_sr->cnt_; k++) {
-      ObDatum cur_cell = cur_sr->cells()[k];
-      result += *(int64_t *)(cur_cell.ptr_);
-    }
-    OB_ASSERT(result == 64);
-  }
-}
-
-TEST_F(TestCompactChunk, test_batch)
-{
-  int ret = OB_SUCCESS;
-  ObCompactStore cs_chunk;
-  cs_chunk.init(1, 1,
-        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, true, share::SORT_DEFAULT_LEVEL);
-
-  StoredRow **sr;
-  ret = row_generate_.get_stored_row(sr);
-  ASSERT_EQ(ret, OB_SUCCESS);
-
-  char *buf = reinterpret_cast<char*>(sr);
-  int64_t pos = 0;
-  for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-    StoredRow *tmp_sr = (StoredRow *)(buf + pos);
-    ret = cs_chunk.add_row(*tmp_sr);
-    ASSERT_EQ(ret, OB_SUCCESS);
-    pos += tmp_sr->row_size_;
-  }
-  ret = cs_chunk.finish_add_row();
-  ASSERT_EQ(ret, OB_SUCCESS);
-  for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-    int64_t result = 0;
-    const StoredRow *cur_sr = nullptr;
-    ret = cs_chunk.get_next_row(cur_sr);
-    if (ret == OB_ITER_END) {
-      ret = OB_SUCCESS;
-    }
-    ASSERT_EQ(ret, OB_SUCCESS);
-    for (int64_t k = 0; k < cur_sr->cnt_; k++) {
-      ObDatum cur_cell = cur_sr->cells()[k];
-      result += *(int64_t *)(cur_cell.ptr_);
-    }
-    OB_ASSERT(result == 64);
-  }
+  tmp_file::ObTmpBlockCache::get_instance().destroy();
+  tmp_file::ObTmpPageCache::get_instance().destroy();
+  common::ObClockGenerator::destroy();
+  ObTimerService *timer_service = MTL(ObTimerService *);
+  ASSERT_NE(nullptr, timer_service);
+  timer_service->stop();
+  timer_service->wait();
+  timer_service->destroy();
 }
 
 TEST_F(TestCompactChunk, test_read_writer_compact)
@@ -287,7 +261,7 @@ TEST_F(TestCompactChunk, test_read_writer_compact)
   ObCompactStore cs_chunk;
 
   cs_chunk.init(1, 1,
-        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, true, share::SORT_COMPACT_LEVEL);
+        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, true);
   ChunkRowMeta row_meta(allocator_);
   row_meta.col_cnt_ = COLUMN_CNT;
   row_meta.fixed_cnt_ = COLUMN_CNT;
@@ -343,7 +317,7 @@ TEST_F(TestCompactChunk, test_read_writer_compact_vardata)
   ObCompactStore cs_chunk;
 
   cs_chunk.init(1, 1,
-        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, true, share::SORT_COMPACT_LEVEL);
+        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, true);
   ChunkRowMeta row_meta(allocator_);
   row_meta.col_cnt_ = COLUMN_CNT;
   row_meta.fixed_cnt_ = 0;
@@ -391,272 +365,12 @@ TEST_F(TestCompactChunk, test_read_writer_compact_vardata)
   }
 }
 
-TEST_F(TestCompactChunk, test_read_writer_compression)
-{
-  int ret = OB_SUCCESS;
-  ObCompactStore cs_chunk;
-
-  cs_chunk.init(1, 1,
-      ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, true, share::SORT_COMPRESSION_LEVEL, ZSTD_COMPRESSOR);
-  StoredRow **sr;
-  ret = row_generate_.get_stored_row(sr);
-  ASSERT_EQ(ret, OB_SUCCESS);
-
-  char *buf = reinterpret_cast<char*>(sr);
-  int64_t pos = 0;
-  for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-    StoredRow *tmp_sr = (StoredRow *)(buf + pos);
-    ret = cs_chunk.add_row(*tmp_sr);
-    ASSERT_EQ(ret, OB_SUCCESS);
-    pos += tmp_sr->row_size_;
-  }
-  ret = cs_chunk.finish_add_row();
-  ASSERT_EQ(ret, OB_SUCCESS);
-  for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-    int64_t result = 0;
-    const StoredRow *cur_sr = nullptr;
-    ret = cs_chunk.get_next_row(cur_sr);
-    if (ret == OB_ITER_END) {
-      ret = OB_SUCCESS;
-    }
-    ASSERT_EQ(ret, OB_SUCCESS);
-    for (int64_t k = 0; k < cur_sr->cnt_; k++) {
-      ObDatum cur_cell = cur_sr->cells()[k];
-      result += *(int64_t *)(cur_cell.ptr_);
-    }
-    OB_ASSERT(result == 64);
-  }
-}
-
-TEST_F(TestCompactChunk, test_irregular)
-{
-  int ret = OB_SUCCESS;
-  ObCompactStore cs_chunk;
-  cs_chunk.init(1, 1,
-        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, false/*disable trunc*/, share::SORT_DEFAULT_LEVEL);
-  StoredRow **sr;
-  ret = row_generate_.get_stored_row_irregular(sr);
-  ASSERT_EQ(ret, OB_SUCCESS);
-
-  char *buf = reinterpret_cast<char*>(sr);
-  int64_t pos = 0;
-  for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-    StoredRow *tmp_sr = (StoredRow *)(buf + pos);
-    ret = cs_chunk.add_row(*tmp_sr);
-    ASSERT_EQ(ret, OB_SUCCESS);
-    pos += tmp_sr->row_size_;
-  }
-
-  ret = cs_chunk.finish_add_row();
-  ASSERT_EQ(ret, OB_SUCCESS);
-  for (int j = 0; OB_SUCC(ret) && j < 1; j++ ) {
-    int64_t total_res = 0;
-    //cs_chunk.rescan();
-    for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-      int64_t result = 0;
-      const StoredRow *cur_sr = nullptr;
-      ret = cs_chunk.get_next_row(cur_sr);
-      if (ret == OB_ITER_END) {
-        ret = OB_SUCCESS;
-      }
-      ASSERT_EQ(ret, OB_SUCCESS);
-      for (int64_t k = 0; k < cur_sr->cnt_; k++) {
-        ObDatum cur_cell = cur_sr->cells()[k];
-        result += *(int64_t *)(cur_cell.ptr_);
-        total_res += *(int64_t *)(cur_cell.ptr_);
-      }
-      OB_ASSERT(result == ((1024 * i * COLUMN_CNT) + ((COLUMN_CNT - 1) * COLUMN_CNT / 2)));
-    }
-    OB_ASSERT(total_res == ((1024 * (BATCH_SIZE-1) * BATCH_SIZE * COLUMN_CNT / 2) + BATCH_SIZE * ((COLUMN_CNT - 1) * COLUMN_CNT / 2)));
-  }
-}
-
-TEST_F(TestCompactChunk, test_rescan_irregular_1)
-{
-  int ret = OB_SUCCESS;
-  ObCompactStore cs_chunk;
-  cs_chunk.init(1, 1,
-        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, false/*disable trunc*/, share::SORT_DEFAULT_LEVEL);
-  StoredRow **sr;
-  ret = row_generate_.get_stored_row_irregular(sr);
-  ASSERT_EQ(ret, OB_SUCCESS);
-
-  char *buf = reinterpret_cast<char*>(sr);
-  int64_t pos = 0;
-  for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-    StoredRow *tmp_sr = (StoredRow *)(buf + pos);
-    ret = cs_chunk.add_row(*tmp_sr);
-    ASSERT_EQ(ret, OB_SUCCESS);
-    pos += tmp_sr->row_size_;
-  }
-
-  ret = cs_chunk.finish_add_row();
-  ASSERT_EQ(ret, OB_SUCCESS);
-  for (int j = 0; OB_SUCC(ret) && j < 1; j++ ) {
-    int64_t total_res = 0;
-    cs_chunk.rescan();
-    for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-      int64_t result = 0;
-      const StoredRow *cur_sr = nullptr;
-      ret = cs_chunk.get_next_row(cur_sr);
-      if (ret == OB_ITER_END) {
-        ret = OB_SUCCESS;
-      }
-      ASSERT_EQ(ret, OB_SUCCESS);
-      for (int64_t k = 0; k < cur_sr->cnt_; k++) {
-        ObDatum cur_cell = cur_sr->cells()[k];
-        result += *(int64_t *)(cur_cell.ptr_);
-        total_res += *(int64_t *)(cur_cell.ptr_);
-      }
-      OB_ASSERT(result == ((1024 * i * COLUMN_CNT) + ((COLUMN_CNT - 1) * COLUMN_CNT / 2)));
-    }
-    OB_ASSERT(total_res == ((1024 * (BATCH_SIZE-1) * BATCH_SIZE * COLUMN_CNT / 2) + BATCH_SIZE * ((COLUMN_CNT - 1) * COLUMN_CNT / 2)));
-  }
-}
-
-
-TEST_F(TestCompactChunk, test_rescan)
-{
-  int ret = OB_SUCCESS;
-  ObCompactStore cs_chunk;
-  cs_chunk.init(1, 1,
-        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, false/*disable trunc*/, share::SORT_DEFAULT_LEVEL);
-  StoredRow **sr;
-  ret = row_generate_.get_stored_row(sr);
-  ASSERT_EQ(ret, OB_SUCCESS);
-
-  char *buf = reinterpret_cast<char*>(sr);
-  int64_t pos = 0;
-  for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-    StoredRow *tmp_sr = (StoredRow *)(buf + pos);
-    ret = cs_chunk.add_row(*tmp_sr);
-    ASSERT_EQ(ret, OB_SUCCESS);
-    pos += tmp_sr->row_size_;
-  }
-
-  ret = cs_chunk.finish_add_row();
-  ASSERT_EQ(ret, OB_SUCCESS);
-  for (int j = 0; OB_SUCC(ret) && j < 10; j++ ) {
-    cs_chunk.rescan();
-    for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-      int64_t result = 0;
-      const StoredRow *cur_sr = nullptr;
-      ret = cs_chunk.get_next_row(cur_sr);
-      if (ret == OB_ITER_END) {
-        ret = OB_SUCCESS;
-      }
-      ASSERT_EQ(ret, OB_SUCCESS);
-      for (int64_t k = 0; k < cur_sr->cnt_; k++) {
-        ObDatum cur_cell = cur_sr->cells()[k];
-        result += *(int64_t *)(cur_cell.ptr_);
-      }
-      OB_ASSERT(result == 64);
-    }
-  }
-}
-
-TEST_F(TestCompactChunk, test_rescan_irregular)
-{
-  int ret = OB_SUCCESS;
-  ObCompactStore cs_chunk;
-  cs_chunk.init(1, 1,
-        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, false/*disable trunc*/, share::SORT_DEFAULT_LEVEL);
-  StoredRow **sr;
-  ret = row_generate_.get_stored_row_irregular(sr);
-  ASSERT_EQ(ret, OB_SUCCESS);
-
-  char *buf = reinterpret_cast<char*>(sr);
-  int64_t pos = 0;
-  for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-    StoredRow *tmp_sr = (StoredRow *)(buf + pos);
-    ret = cs_chunk.add_row(*tmp_sr);
-    ASSERT_EQ(ret, OB_SUCCESS);
-    pos += tmp_sr->row_size_;
-  }
-
-  ret = cs_chunk.finish_add_row();
-  ASSERT_EQ(ret, OB_SUCCESS);
-  for (int j = 0; OB_SUCC(ret) && j < 2; j++ ) {
-    int64_t total_res = 0;
-    cs_chunk.rescan();
-    for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-      int64_t result = 0;
-      const StoredRow *cur_sr = nullptr;
-      ret = cs_chunk.get_next_row(cur_sr);
-      if (ret == OB_ITER_END) {
-        ret = OB_SUCCESS;
-      }
-      ASSERT_EQ(ret, OB_SUCCESS);
-      for (int64_t k = 0; k < cur_sr->cnt_; k++) {
-        ObDatum cur_cell = cur_sr->cells()[k];
-        result += *(int64_t *)(cur_cell.ptr_);
-        total_res += *(int64_t *)(cur_cell.ptr_);
-      }
-      OB_ASSERT(result == ((1024 * i * COLUMN_CNT) + ((COLUMN_CNT - 1) * COLUMN_CNT / 2)));
-    }
-    OB_ASSERT(total_res == ((1024 * (BATCH_SIZE-1) * BATCH_SIZE * COLUMN_CNT / 2) + BATCH_SIZE * ((COLUMN_CNT - 1) * COLUMN_CNT / 2)));
-  }
-}
-
-TEST_F(TestCompactChunk, test_rescan_get_last_row)
-{
-  int ret = OB_SUCCESS;
-  ObCompactStore cs_chunk;
-  cs_chunk.init(1, 1,
-        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, false/*disable trunc*/, share::SORT_DEFAULT_LEVEL);
-  StoredRow **sr;
-  ret = row_generate_.get_stored_row_irregular(sr);
-  ASSERT_EQ(ret, OB_SUCCESS);
-
-  char *buf = reinterpret_cast<char*>(sr);
-  int64_t pos = 0;
-  for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-    StoredRow *tmp_sr = (StoredRow *)(buf + pos);
-    ret = cs_chunk.add_row(*tmp_sr);
-    ASSERT_EQ(ret, OB_SUCCESS);
-    pos += tmp_sr->row_size_;
-    // get last row
-    const StoredRow *cur_sr = nullptr;
-    ret = cs_chunk.get_last_stored_row(cur_sr);
-    ASSERT_EQ(ret, OB_SUCCESS);
-    int64_t res = 0;
-    for (int64_t k = 0; k < cur_sr->cnt_; k++) {
-      ObDatum cur_cell = cur_sr->cells()[k];
-      res += *(int64_t *)(cur_cell.ptr_);
-    }
-    OB_ASSERT(res == ((1024 * i * COLUMN_CNT) + ((COLUMN_CNT - 1) * COLUMN_CNT / 2)));
-  }
-
-  ret = cs_chunk.finish_add_row();
-  ASSERT_EQ(ret, OB_SUCCESS);
-  for (int j = 0; OB_SUCC(ret) && j < 2; j++ ) {
-    int64_t total_res = 0;
-    cs_chunk.rescan();
-    for (int64_t i = 0; OB_SUCC(ret) && i < BATCH_SIZE; i++) {
-      int64_t result = 0;
-      const StoredRow *cur_sr = nullptr;
-      ret = cs_chunk.get_next_row(cur_sr);
-      if (ret == OB_ITER_END) {
-        ret = OB_SUCCESS;
-      }
-      ASSERT_EQ(ret, OB_SUCCESS);
-      for (int64_t k = 0; k < cur_sr->cnt_; k++) {
-        ObDatum cur_cell = cur_sr->cells()[k];
-        result += *(int64_t *)(cur_cell.ptr_);
-        total_res += *(int64_t *)(cur_cell.ptr_);
-      }
-      OB_ASSERT(result == ((1024 * i * COLUMN_CNT) + ((COLUMN_CNT - 1) * COLUMN_CNT / 2)));
-    }
-    OB_ASSERT(total_res == ((1024 * (BATCH_SIZE-1) * BATCH_SIZE * COLUMN_CNT / 2) + BATCH_SIZE * ((COLUMN_CNT - 1) * COLUMN_CNT / 2)));
-  }
-}
-
 TEST_F(TestCompactChunk, test_rescan_get_last_row_compact)
 {
   int ret = OB_SUCCESS;
   ObCompactStore cs_chunk;
   cs_chunk.init(1, 1,
-        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, false/*disable trunc*/, share::SORT_COMPACT_LEVEL);
+        ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true, 0, false/*disable trunc*/);
   ChunkRowMeta row_meta(allocator_);
   row_meta.col_cnt_ = COLUMN_CNT;
   row_meta.fixed_cnt_ = 0;

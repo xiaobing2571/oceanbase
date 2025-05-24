@@ -14,6 +14,7 @@
 
 #include "ob_icolumn_decoder.h"
 #include "ob_encoding_bitset.h"
+#include "storage/access/ob_aggregate_base.h"
 
 namespace oceanbase
 {
@@ -111,7 +112,7 @@ int ObIColumnDecoder::get_is_null_bitmap_from_var_column(
 
 int ObIColumnDecoder::set_null_datums_from_fixed_column(
     const ObColumnDecoderCtx &ctx,
-    const int64_t *row_ids,
+    const int32_t *row_ids,
     const int64_t row_cap,
     const unsigned char *col_data,
     common::ObDatum *datums) const
@@ -135,7 +136,7 @@ int ObIColumnDecoder::set_null_datums_from_fixed_column(
 int ObIColumnDecoder::set_null_datums_from_var_column(
     const ObColumnDecoderCtx &ctx,
     const ObIRowIndex* row_index,
-    const int64_t *row_ids,
+    const int32_t *row_ids,
     const int64_t row_cap,
     common::ObDatum *datums) const
 {
@@ -164,7 +165,7 @@ int ObIColumnDecoder::set_null_datums_from_var_column(
 
 int ObIColumnDecoder::set_null_vector_from_fixed_column(
     const ObColumnDecoderCtx &ctx,
-    const int64_t *row_ids,
+    const int32_t *row_ids,
     const int64_t row_cap,
     const int64_t vec_offset,
     const unsigned char *col_data,
@@ -220,7 +221,7 @@ int ObIColumnDecoder::batch_locate_var_len_row(
 int ObIColumnDecoder::get_null_count(
     const ObColumnDecoderCtx &ctx,
     const ObIRowIndex *row_index,
-    const int64_t *row_ids,
+    const int32_t *row_ids,
     const int64_t row_cap,
     int64_t &null_count) const
 {
@@ -250,7 +251,7 @@ int ObIColumnDecoder::get_null_count(
 
 int ObIColumnDecoder::get_null_count_from_fixed_column(
     const ObColumnDecoderCtx &ctx,
-    const int64_t *row_ids,
+    const int32_t *row_ids,
     const int64_t row_cap,
     const unsigned char *col_data,
     int64_t &null_count) const
@@ -273,7 +274,7 @@ int ObIColumnDecoder::get_null_count_from_fixed_column(
 int ObIColumnDecoder::get_null_count_from_var_column(
     const ObColumnDecoderCtx &ctx,
     const ObIRowIndex* row_index,
-    const int64_t *row_ids,
+    const int32_t *row_ids,
     const int64_t row_cap,
     int64_t &null_count) const
 {
@@ -302,7 +303,7 @@ int ObIColumnDecoder::get_null_count_from_var_column(
 int ObIColumnDecoder::get_null_count_from_extend_value(
     const ObColumnDecoderCtx &ctx,
     const ObIRowIndex* row_index,
-    const int64_t *row_ids,
+    const int32_t *row_ids,
     const int64_t row_cap,
     const char *meta_data_,
     int64_t &null_count) const
@@ -351,13 +352,15 @@ int ObSpanColumnDecoder::decode_exception_vector(
     LOAD_VEC_BY_TYPE(uint8_t, D_INTEGER);
     break;
   }
-  case VEC_TC_DATE: {
+  case VEC_TC_DATE:
+  case VEC_TC_MYSQL_DATE: {
     // int32_t
     LOAD_VEC_BY_TYPE(int32_t, D_INTEGER);
     break;
   }
   case VEC_TC_INTEGER:
   case VEC_TC_DATETIME:
+  case VEC_TC_MYSQL_DATETIME:
   case VEC_TC_TIME:
   case VEC_TC_UNKNOWN:
   case VEC_TC_INTERVAL_YM: {
@@ -486,7 +489,7 @@ int ObSpanColumnDecoder::decode_refed_range(
 {
   int ret = OB_SUCCESS;
   const int64_t row_cap = ref_end_idx - ref_start_idx + 1;
-  const int64_t *row_id_arr = raw_vector_ctx.row_ids_ + ref_start_idx;
+  const int32_t *row_id_arr = raw_vector_ctx.row_ids_ + ref_start_idx;
   const char **ptr_arr = raw_vector_ctx.ptr_arr_ + ref_start_idx;
   uint32_t *len_arr = raw_vector_ctx.len_arr_ + ref_start_idx;
   const int64_t vec_offset = raw_vector_ctx.vec_offset_ + ref_start_idx;

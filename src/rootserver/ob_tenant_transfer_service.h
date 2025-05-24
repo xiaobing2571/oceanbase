@@ -28,6 +28,7 @@ class ObTimeoutCtx;
 namespace share
 {
 class ObLSID;
+class ObLSAttr;
 namespace schema
 {
 class ObSimpleTableSchemaV2;
@@ -63,7 +64,7 @@ public:
    * @param [in] dest_ls:         destination log stream
    * @param [in] part_list:       partition list for transfer
    * @param [in] balance_task_id: parenet balance task id
-   * @param [out] task_id:        unique transfer task id
+   * @param [out] task:        transfer task
    * @return
    * - OB_SUCCESS:                generate task successfully
    * - other:                     generate task failed
@@ -74,7 +75,7 @@ public:
       const share::ObLSID &dest_ls,
       const share::ObTransferPartList &part_list,
       const share::ObBalanceTaskID balance_task_id,
-      share::ObTransferTaskID &task_id);
+      share::ObTransferTask &transfer_task);
   /*
    * try cancel and clear transfer task (only task in INIT status can be canceled)
    *
@@ -91,7 +92,8 @@ public:
    * if task is already cleared, return OB_SUCCESS and related info recorded in history
    *
    * @param[in] task_id:               transfer task id
-   * @param[out] all_part_list:        all partitions of the transfer task
+   * @param[out] task:                 transfer task
+   * @param[out] all_part_list:        all partitons of the transfer task
    * @param[out] finished_part_list:   successfully transferred partitions + needless transferred (not exist or not in src LS) partitions
    * @return
    * - OB_SUCCESS:         clear task successfully
@@ -101,6 +103,7 @@ public:
    */
   int try_clear_transfer_task(
       const share::ObTransferTaskID task_id,
+      share::ObTransferTask &transfer_task,
       share::ObTransferPartList &all_part_list,
       share::ObTransferPartList &finished_part_list);
 
@@ -119,17 +122,19 @@ public:
 private:
   int process_task_(const share::ObTransferTask::TaskStatus &task_stat);
   int process_init_task_(const share::ObTransferTaskID task_id);
-  int check_ls_member_list_(
+  int check_ls_member_list_and_learner_list_(
       common::ObISQLClient &sql_proxy,
       const share::ObLSID &src_ls,
       const share::ObLSID &dest_ls,
       share::ObTransferTaskComment &result_comment);
-  int get_member_lists_by_inner_sql_(
+  int get_member_list_and_learner_list_by_inner_sql_(
       common::ObISQLClient &sql_proxy,
       const share::ObLSID &src_ls,
       const share::ObLSID &dest_ls,
       share::ObLSReplica::MemberList &src_ls_member_list,
-      share::ObLSReplica::MemberList &dest_ls_member_list);
+      share::ObLSReplica::MemberList &dest_ls_member_list,
+      common::GlobalLearnerList &src_ls_learner_list,
+      common::GlobalLearnerList &dest_ls_learner_list);
   int lock_table_and_part_(
       ObMySQLTransaction &trans,
       const share::ObLSID &src_ls,
@@ -144,7 +149,6 @@ private:
       const share::ObTransferPartList &part_list,
       const transaction::tablelock::ObTableLockOwnerID &lock_owner_id);
   int get_related_table_schemas_(
-      common::ObISQLClient &sql_proxy,
       share::schema::ObSimpleTableSchemaV2 &table_schema,
       ObArenaAllocator &allocator,
       ObArray<share::schema::ObSimpleTableSchemaV2 *> &related_table_schemas);
@@ -193,7 +197,7 @@ private:
       const share::ObTransferPartInfo &part_info,
       const common::ObTabletID &tablet_id);
   int generate_related_tablet_ids_(
-      share::schema::ObSimpleTableSchemaV2 &table_schema,
+      const ObIArray<share::schema::ObSimpleTableSchemaV2 *> &related_table_schemas,
       const int64_t part_idx,
       const int64_t subpart_idx,
       common::ObIArray<common::ObTabletID> &tablet_ids);
@@ -228,13 +232,32 @@ private:
       const share::ObTransferTaskID &task_id,
       const share::ObTransferTaskComment &result_comment);
   int64_t get_tablet_count_threshold_() const;
-  int construct_ls_member_list_(
+  int check_if_need_wait_due_to_last_failure_(
+      common::ObISQLClient &sql_proxy,
+      const share::ObTransferTask &task,
+      bool &need_wait);
+#ifdef OB_BUILD_SHARED_STORAGE
+  int lock_and_check_tenant_merge_status_(ObMySQLTransaction &trans, bool &need_wait);
+#endif
+  int check_tablet_count_by_threshold_(
+      const ObIArray<common::ObTabletID> &tablet_ids,
+      const int64_t new_tablet_cnt,
+      bool &exceed_threshold);
+  bool is_dup_ls_(const share::ObLSID &ls_id, const ObIArray<share::ObLSAttr> &dup_ls_attrs);
+  int construct_ls_member_list_and_learner_list_(
       common::sqlclient::ObMySQLResult &res,
-      share::ObLSReplica::MemberList &ls_member_list);
+      share::ObLSReplica::MemberList &ls_member_list,
+      common::GlobalLearnerList &ls_learner_list);
+  int64_t calc_transfer_retry_interval_(
+      const share::ObTransferTaskID &current_failed_task_id,
+      int64_t &retry_count,
+      share::ObTransferTaskID &last_failed_task_id);
+  int64_t get_transfer_config_retry_interval_();
 private:
   static const int64_t IDLE_TIME_US = 10 * 1000 * 1000L; // 10s
   static const int64_t BUSY_IDLE_TIME_US = 100 * 1000L; // 100ms
   static const int64_t PART_COUNT_IN_A_TRANSFER = 100;
+  static const int64_t MAX_EXPONENTIAL_BACKOFF_COUNTS = 10;
 
   bool is_inited_;
   uint64_t tenant_id_;

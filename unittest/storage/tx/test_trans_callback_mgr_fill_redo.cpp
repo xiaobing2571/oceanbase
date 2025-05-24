@@ -11,13 +11,8 @@
  */
 
 #include <gmock/gmock.h>
-#include <gtest/gtest.h>
-#include <thread>
 #define private public
 #define protected public
-#include "storage/tx/ob_trans_define.h"
-#include "storage/tx/ob_trans_service.h"
-#include "storage/tx/ob_trans_part_ctx.h"
 #include "storage/tx/ob_tx_redo_submitter.h"
 #define USING_LOG_PREFIX TRANS
 
@@ -98,7 +93,7 @@ public:
   ObTestRedoFill():
     mem_ctx_(),
     cb_allocator_(),
-    callback_mgr_(mem_ctx_, cb_allocator_) {}
+    callback_mgr_(mem_ctx_, cb_allocator_, mem_ctx_.mem_ctx_obj_pool_) {}
   virtual void SetUp() override
   {
     oceanbase::ObClusterVersion::get_instance().update_data_version(DATA_CURRENT_VERSION);
@@ -156,7 +151,6 @@ public:
 TEST_F(ObTestRedoFill, serial_single_list_fill_all_BLOCK_FROZEN)
 {
   set_parallel_logging(true);
-  callback_mgr_.need_merge_ = false;
   // single list
   callback_mgr_.callback_lists_ = NULL;
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(1));
@@ -182,7 +176,6 @@ TEST_F(ObTestRedoFill, serial_single_list_fill_all_BLOCK_FROZEN)
 TEST_F(ObTestRedoFill, serial_multi_list_fill_all_ALL_FILLED)
 {
   set_parallel_logging(false);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -278,7 +271,6 @@ TEST_F(ObTestRedoFill, serial_multi_list_fill_all_ALL_FILLED)
 TEST_F(ObTestRedoFill, serial_multi_list_fill_all_BLOCK_FROZEN)
 {
   set_parallel_logging(false);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -327,7 +319,6 @@ TEST_F(ObTestRedoFill, serial_multi_list_fill_all_BLOCK_FROZEN)
 TEST_F(ObTestRedoFill, serial_single_list_fill_all_BUF_NOT_ENOUGH)
 {
   set_parallel_logging(false);
-  callback_mgr_.need_merge_ = false;
   // single list
   callback_mgr_.callback_lists_ = NULL;
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(1));
@@ -354,7 +345,6 @@ TEST_F(ObTestRedoFill, serial_single_list_fill_all_BUF_NOT_ENOUGH)
 TEST_F(ObTestRedoFill, serial_single_list_fill_all_list_BIG_ROW)
 {
   set_parallel_logging(false);
-  callback_mgr_.need_merge_ = false;
   // single list
   callback_mgr_.callback_lists_ = NULL;
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(1));
@@ -381,7 +371,6 @@ TEST_F(ObTestRedoFill, serial_single_list_fill_all_list_BIG_ROW)
 TEST_F(ObTestRedoFill, serial_multi_list_fill_all_list_BIG_ROW)
 {
   set_parallel_logging(false);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -410,7 +399,6 @@ TEST_F(ObTestRedoFill, serial_multi_list_fill_all_list_BIG_ROW)
 TEST_F(ObTestRedoFill, serial_multi_list_fill_all_OTHER_ERROR_WHEN_FILL_OTHERS)
 {
   set_parallel_logging(false);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -458,7 +446,6 @@ TEST_F(ObTestRedoFill, serial_multi_list_fill_all_OTHER_ERROR_WHEN_FILL_OTHERS)
 TEST_F(ObTestRedoFill, serial_logging_fill_from_all_list_ALL_OTHERS_BLOCK_FROZEN_EMPTY)
 {
   set_parallel_logging(false);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -500,7 +487,6 @@ TEST_F(ObTestRedoFill, serial_logging_fill_from_all_list_ALL_OTHERS_BLOCK_FROZEN
 TEST_F(ObTestRedoFill, serial_logging_fill_from_all_list_FIRST_ITER_END_OTHERS_BLOCK_FROZEN_EMPTY)
 {
   set_parallel_logging(false);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -545,7 +531,6 @@ TEST_F(ObTestRedoFill, serial_logging_fill_from_all_list_FIRST_ITER_END_OTHERS_B
 TEST_F(ObTestRedoFill, parallel_multi_list_fill_all_BLOCK_FROZEN)
 {
   set_parallel_logging(true);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -574,7 +559,6 @@ TEST_F(ObTestRedoFill, parallel_multi_list_fill_all_BLOCK_FROZEN)
 TEST_F(ObTestRedoFill, parallel_multi_list_fill_all_BLOCK_FROZEN_EMPTY)
 {
   set_parallel_logging(true);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -603,7 +587,6 @@ TEST_F(ObTestRedoFill, parallel_multi_list_fill_all_BLOCK_FROZEN_EMPTY)
 TEST_F(ObTestRedoFill, parallel_multi_list_fill_all_BLOCK_FROZEN_FILL_FROM_OTHERS)
 {
   set_parallel_logging(true);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -639,7 +622,6 @@ TEST_F(ObTestRedoFill, parallel_multi_list_fill_all_BLOCK_FROZEN_FILL_FROM_OTHER
 TEST_F(ObTestRedoFill, parallel_multi_list_fill_all_BLOCK_BY_OTHERS)
 {
   set_parallel_logging(true);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -669,7 +651,6 @@ TEST_F(ObTestRedoFill, parallel_multi_list_fill_all_BLOCK_BY_OTHERS)
 TEST_F(ObTestRedoFill, parallel_logging_fill_from_all_list_ALL_FILLED_OTHERS_REMAIN)
 {
   set_parallel_logging(true);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -698,7 +679,6 @@ TEST_F(ObTestRedoFill, parallel_logging_fill_from_all_list_ALL_FILLED_OTHERS_REM
 TEST_F(ObTestRedoFill, parallel_logging_fill_from_one_list_OTHERS_IS_EMPTY)
 {
   set_parallel_logging(true);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));
@@ -729,7 +709,6 @@ TEST_F(ObTestRedoFill, parallel_logging_fill_from_one_list_OTHERS_IS_EMPTY)
 TEST_F(ObTestRedoFill, serial_logging_fill_from_one_list_OTHERS_IS_EMPTY)
 {
   set_parallel_logging(false);
-  callback_mgr_.need_merge_ = false;
   // 4 list
   extend_callback_lists_(3);
   EXPECT_CALL(mdo_, get_logging_list_count()).Times(AtLeast(1)).WillRepeatedly(Return(4));

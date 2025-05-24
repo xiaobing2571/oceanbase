@@ -116,6 +116,16 @@ int ObRawExprAddToContext::visit(ObPseudoColumnRawExpr &expr)
   return add_expr(expr);
 }
 
+int ObRawExprAddToContext::visit(ObMatchFunRawExpr &expr)
+{
+  return add_expr(expr);
+}
+
+int ObRawExprAddToContext::visit(ObUnpivotRawExpr &expr)
+{
+  return add_expr(expr);
+}
+
 /**
  *  TODO(jiuman): the complexity of the algorithm used in add_expr is quite high. *  We may need to revisit it later if it turns out to be an optimization we have
  *  to do.

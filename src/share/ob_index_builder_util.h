@@ -46,6 +46,7 @@ class ObColumnSchemaV2;
 class ObIndexBuilderUtil
 {
 public:
+  static bool is_do_create_dense_vec_index(const ObIndexType index_type);
   static int adjust_expr_index_args(
       obrpc::ObCreateIndexArg &arg,
       share::schema::ObTableSchema &data_schema,
@@ -53,7 +54,7 @@ public:
       common::ObIArray<share::schema::ObColumnSchemaV2*> &gen_columns);
   static int generate_ordinary_generated_column(
       sql::ObRawExpr &expr,
-      const ObSQLMode sql_mode,
+      const sql::ObSQLSessionInfo &session,
       share::schema::ObTableSchema &data_schema,
       share::schema::ObColumnSchemaV2 *&gen_col,
       share::schema::ObSchemaGetterGuard *schema_guard,
@@ -79,37 +80,11 @@ public:
       ObColumnSchemaV2 &shadow_column_schema);
 private:
   static const int SPATIAL_MBR_COLUMN_MAX_LENGTH = 32;
-  typedef common::ObArray<std::pair<int64_t, common::ObString> > OrderFTColumns;
-  class FulltextColumnOrder
-  {
-  public:
-    FulltextColumnOrder() {}
-    ~FulltextColumnOrder() {}
-
-    bool operator()(const std::pair<int64_t, common::ObString> &left,
-                    const std::pair<int64_t, common::ObString> &right) const
-    {
-      return left.first < right.first;
-    }
-  };
-  static int generate_fulltext_column(
-      OrderFTColumns &ft_cols,
-      share::schema::ObTableSchema &data_schema,
-      uint64_t specified_virtual_cid,
-      share::schema::ObColumnSchemaV2 *&ft_col);
   static int generate_prefix_column(
       const obrpc::ObColumnSortItem &sort_item,
       const ObSQLMode sql_mode,
       share::schema::ObTableSchema &data_schema,
       share::schema::ObColumnSchemaV2 *&prefix_col);
-  static int adjust_fulltext_args(
-      obrpc::ObCreateIndexArg &arg,
-      share::schema::ObTableSchema &data_schema,
-      common::ObIAllocator &allocator,
-      share::schema::ObColumnSchemaV2 *&ft_col);
-  static int adjust_fulltext_columns(
-      obrpc::ObCreateIndexArg &arg,
-      OrderFTColumns &ft_columns);
   static int adjust_ordinary_index_column_args(
       obrpc::ObCreateIndexArg &arg,
       share::schema::ObTableSchema &data_schema,

@@ -11,31 +11,19 @@
  */
 
 #include "ob_garbage_collector.h"
-#include "palf_handle_guard.h"
-#include "ob_log_handler.h"
 #include "ob_log_service.h"
 #include "ob_switch_leader_adapter.h"
-#include "common_util/ob_log_time_utils.h"
 #include "archiveservice/ob_archive_service.h"
-#include "share/scn.h"
 #include "rpc/obrpc/ob_rpc_net_handler.h"
-#include "storage/high_availability/ob_storage_ha_struct.h"
-#include "storage/ls/ob_ls.h"
-#include "storage/slog/ob_storage_logger.h"
-#include "storage/tx/ob_trans_define.h"
 #include "storage/tx/ob_ts_mgr.h"
-#include "storage/tx_storage/ob_ls_service.h"
-#include "share/location_cache/ob_location_service.h"
-#include "share/ob_srv_rpc_proxy.h"
-#include "share/rc/ob_tenant_base.h"
 #include "share/ls/ob_ls_life_manager.h"
-#include "share/ob_debug_sync.h"
-#include "storage/tx_storage/ob_ls_handle.h"
-#include "rootserver/ob_ls_recovery_reportor.h"      // ObLSRecoveryReportor
 #include "rootserver/ob_tenant_info_loader.h" // ObTenantInfoLoader
-#include "share/ob_occam_time_guard.h"
-#include "storage/slog_ckpt/ob_server_checkpoint_slog_handler.h"
+#include "storage/meta_store/ob_server_storage_meta_service.h"
 #include "storage/concurrency_control/ob_data_validation_service.h"
+#include "lib/wait_event/ob_wait_event.h"
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "storage/incremental/ob_shared_meta_service.h"
+#endif
 
 namespace oceanbase
 {
@@ -292,7 +280,7 @@ ObGCLSLog::ObGCLSLog()
 
 //GC类型日志回放要求同类型内按序, 考虑到回放的性能, 使用前向barrier
 ObGCLSLog::ObGCLSLog(const int16_t log_type)
-    : header_(ObLogBaseType::GC_LS_LOG_BASE_TYPE, ObReplayBarrierType::PRE_BARRIER),
+    : header_(ObLogBaseType::GC_LS_LOG_BASE_TYPE, ObReplayBarrierType::STRICT_BARRIER),
       version_(GC_LOG_VERSION),
       log_type_(log_type)
 {
@@ -357,6 +345,20 @@ DEFINE_GET_SERIALIZE_SIZE(ObGCLSLog)
   return size;
 }
 
+int ObGCHandler::ObGCLSLogCb::on_success()
+{
+  int tmp_ret = OB_SUCCESS;
+  if (OB_ISNULL(handler_)) {
+    tmp_ret = OB_ERR_UNEXPECTED;
+    CLOG_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "handler_ is nullptr, unexpected!!!", KP(handler_), K_(state), K(tmp_ret));
+  } else if (OB_SUCCESS != (tmp_ret = handler_->handle_on_success_cb(*this))) {
+    CLOG_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "failed to handle_on_success_cb", K(this), K(tmp_ret));
+  } else {
+    ATOMIC_STORE(&state_, CbState::STATE_SUCCESS);
+  }
+  return OB_SUCCESS;
+}
+
 //---------------ObGCHandler---------------//
 ObGCHandler::ObGCHandler() : is_inited_(false),
                              rwlock_(common::ObLatchIds::GC_HANDLER_LOCK),
@@ -365,8 +367,10 @@ ObGCHandler::ObGCHandler() : is_inited_(false),
                              gc_start_ts_(OB_INVALID_TIMESTAMP),
                              block_tx_ts_(OB_INVALID_TIMESTAMP),
                              block_log_debug_time_(OB_INVALID_TIMESTAMP),
-                             log_sync_stopped_(false)
+                             log_sync_stopped_(false),
+                             last_print_dba_log_ts_(OB_INVALID_TIMESTAMP)
 {
+  rec_scn_.set_max();
 }
 
 ObGCHandler::~ObGCHandler()
@@ -377,13 +381,29 @@ ObGCHandler::~ObGCHandler()
 void ObGCHandler::reset()
 {
   WLockGuard wlock_guard(rwlock_);
+  last_print_dba_log_ts_ = OB_INVALID_TIMESTAMP;
   gc_seq_invalid_member_ = -1;
   ls_ = NULL;
   gc_start_ts_ = OB_INVALID_TIMESTAMP;
   block_tx_ts_ = OB_INVALID_TIMESTAMP;
   block_log_debug_time_ = OB_INVALID_TIMESTAMP;
   log_sync_stopped_ = false;
+  rec_scn_.set_max();
   is_inited_ = false;
+}
+
+int ObGCHandler::handle_on_success_cb(const ObGCHandler::ObGCLSLogCb &cb)
+{
+  int ret = OB_SUCCESS;
+  ObSpinLockGuard guard(rec_scn_lock_);
+  const SCN scn = cb.scn_;
+  if (OB_UNLIKELY(!scn.is_valid() || scn.is_max())) {
+    ret = OB_INVALID_ARGUMENT;
+    CLOG_LOG(ERROR, "invalid scn", K(scn));
+  } else {
+    rec_scn_.atomic_set(scn);
+  }
+  return ret;
 }
 
 int ObGCHandler::init(ObLS *ls)
@@ -623,8 +643,12 @@ int ObGCHandler::replay(const void *buffer,
     }
 
     if (OB_SUCC(ret)) {
-      (void)update_ls_gc_state_after_submit_log_(log_type, scn);
-      CLOG_LOG(INFO, "replay gc log", K(log_type), K(scn));
+      ret = update_ls_gc_state_after_submit_log_(log_type, scn);
+      if (OB_SUCC(ret)) {
+        CLOG_LOG(INFO, "replay gc log", K(log_type), K(scn));
+      } else if (REACH_TIME_INTERVAL(2 * 1000 * 1000L)) {
+        CLOG_LOG(WARN, "replay gc log failed", K(log_type), K(scn));
+      }
     }
   }
   return ret;
@@ -632,7 +656,7 @@ int ObGCHandler::replay(const void *buffer,
 
 SCN ObGCHandler::get_rec_scn()
 {
-  return SCN::max_scn();
+  return rec_scn_.atomic_load();
 }
 
 int ObGCHandler::flush(SCN &scn)
@@ -952,7 +976,7 @@ int ObGCHandler::submit_log_(const ObGCLSLOGType log_type, bool &is_success)
   char *buffer = nullptr;
   int64_t pos = 0;
   int64_t buffer_size = gc_log.get_serialize_size();
-  ObGCLSLogCb cb;
+  ObGCLSLogCb cb(this);
   const bool need_nonblock = false;
   is_success = false;
   SCN ref_scn;
@@ -969,37 +993,62 @@ int ObGCHandler::submit_log_(const ObGCLSLOGType log_type, bool &is_success)
     CLOG_LOG(WARN, "failed to serialize log header", K(ret), K(buffer_size), K(pos));
   } else if (OB_FAIL(get_gts_(GET_GTS_TIMEOUT_US, ref_scn))) {
     CLOG_LOG(WARN, "failed to get gts", K(ret), K(ref_scn));
-  } else if (OB_FAIL(ls_->append(buffer,
-                                 buffer_size,
-                                 ref_scn,
-                                 need_nonblock,
-                                 &cb,
-                                 lsn,
-                                 scn))) {
-    CLOG_LOG(WARN, "failed to submit log", K(ret), K(buffer_size), K(pos));
   } else {
-    // 此处需要考虑能否做成异步
-    int64_t retry_cnt = 0;
-    const int64_t WAIT_TIME = 100; // us
-    bool is_finished = false;
-    while (!is_finished) {
-      if (cb.is_succeed()) {
-        (void)update_ls_gc_state_after_submit_log_(log_type, scn);
-        is_finished = true;
-        is_success = true;
-        CLOG_LOG(INFO, "write GC ls log success", K(ret), K(log_type));
-      } else if (cb.is_failed()) {
-        is_finished = true;
-        CLOG_LOG(WARN, "write GC ls log failed", K(ret), K(log_type));
+    int64_t start_ts = ObTimeUtility::current_time();
+    {
+      const bool allow_compression = false;
+      ObSpinLockGuard guard(rec_scn_lock_);
+      if (OB_FAIL(ls_->append(buffer, buffer_size, ref_scn, need_nonblock,
+                              allow_compression, &cb, lsn, scn))) {
+        CLOG_LOG(WARN, "failed to submit log", K(buffer_size), K(pos));
       } else {
-        ob_usleep(WAIT_TIME);
-        retry_cnt++;
-        if (retry_cnt % 1000 == 0) {
-          CLOG_LOG_RET(WARN, OB_ERR_TOO_MUCH_TIME, "GC ls log wait cb too much time", K(retry_cnt), K(log_type));
+        cb.scn_ = scn;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      const ObLSID ls_id = ls_->get_ls_id();
+      // 此处需要考虑能否做成异步
+      bool is_finished = false;
+      int64_t WAIT_TIME = 10 * 1000L; // 10ms
+      constexpr int64_t MIN = 60 * 1000 * 1000;
+      while (!is_finished) {
+        bool wait_for_update_ls_gc_state = false;
+        if (cb.is_succeed()) {
+          if (OB_SUCC(update_ls_gc_state_after_submit_log_(log_type, scn))) {
+            is_finished = true;
+            is_success = true;
+            CLOG_LOG(INFO, "write GC ls log success", K(ls_id), K(log_type));
+          } else {
+            wait_for_update_ls_gc_state = true;
+            if (OB_ERR_UNEXPECTED == ret) {
+              WAIT_TIME = 10 * 1000 * 1000L;
+            } else {
+              WAIT_TIME = 1 * 1000 * 1000L;
+            }
+          }
+        } else if (cb.is_failed()) {
+          is_finished = true;
+          CLOG_LOG(WARN, "write GC ls log failed", K(ls_id), K(log_type));
+        } else {
+          //keep WAIT_TIME 10ms
+        }
+
+        if (!is_finished) {
+          ob_usleep<ObWaitEventIds::GARBAGE_COLLECTOR_SLEEP>(WAIT_TIME);
+          if (REACH_TIME_INTERVAL(2 * 1000 * 1000L)) {
+            CLOG_LOG_RET(WARN, OB_ERR_TOO_MUCH_TIME, "GC ls log wait cb too much time",
+                         K(wait_for_update_ls_gc_state), K(log_type), K(ls_id), K(scn));
+          }
+          int64_t cost_ts = ObTimeUtility::current_time() - start_ts;
+          if (cost_ts >= 10 * MIN && palf_reach_time_interval(10 * MIN, last_print_dba_log_ts_)) {
+            LOG_DBA_ERROR(OB_ERR_TOO_MUCH_TIME, "msg", "wait log sync cost too much time, can not drop replica!!!",
+                          K(start_ts), K(cost_ts));
+          }
         }
       }
     }
   }
+
   if (nullptr != buffer) {
     mtl_free(buffer);
     buffer = nullptr;
@@ -1007,24 +1056,30 @@ int ObGCHandler::submit_log_(const ObGCLSLOGType log_type, bool &is_success)
   return ret;
 }
 
-void ObGCHandler::update_ls_gc_state_after_submit_log_(const ObGCLSLOGType log_type,
-                                                       const SCN &scn)
+int ObGCHandler::update_ls_gc_state_after_submit_log_(const ObGCLSLOGType log_type,
+                                                      const SCN &scn)
 {
+  int ret = OB_SUCCESS;
   switch(log_type) {
   case ObGCLSLOGType::BLOCK_TABLET_TRANSFER_IN:
-    (void)block_ls_transfer_in_(scn);
+    ret = block_ls_transfer_in_(scn);
     break;
   case ObGCLSLOGType::OFFLINE_LS:
-    (void)offline_ls_(scn);
+    ret = offline_ls_(scn);
     break;
   default:
     //do nothing
+    ret = OB_ERR_UNEXPECTED;
     CLOG_LOG(INFO, "invalid log_type", K(log_type));
     break;
   }
+  if (OB_SUCC(ret)) {
+    rec_scn_.atomic_set(SCN::max_scn());
+  }
+  return ret;
 }
-
-void ObGCHandler::block_ls_transfer_in_(const SCN &block_scn)
+ERRSIM_POINT_DEF(EN_GC_BLOCK_WRITE_SLOG);
+int ObGCHandler::block_ls_transfer_in_(const SCN &block_scn)
 {
   int ret = OB_SUCCESS;
   LSGCState gc_state = INVALID_LS_GC_STATE;
@@ -1033,20 +1088,36 @@ void ObGCHandler::block_ls_transfer_in_(const SCN &block_scn)
   if (OB_FAIL(ls_->get_gc_state(gc_state))) {
     CLOG_LOG(WARN, "get_gc_state failed", K(ls_id), K(gc_state));
   } else if (!is_valid_ls_gc_state(gc_state)) {
+    ret = OB_ERR_UNEXPECTED;
     CLOG_LOG(WARN, "ls check gc state invalid", K(ls_id), K(gc_state));
   } else if (is_ls_blocked_finished_(gc_state)) {
     CLOG_LOG(INFO, "ls already blocked, ignore", K(ls_id), K(gc_state), K(block_scn));
   } else if (OB_FAIL(ls_->block_all())) {
     CLOG_LOG(WARN, "block_all failed", K(ls_id), K(ret));
-  } else if (FALSE_IT(block_tx_ts_ = ObClockGenerator::getClock())) {
-  } else if (OB_FAIL(ls_->set_gc_state(LSGCState::LS_BLOCKED))) {
-    CLOG_LOG(WARN, "set_gc_state block failed", K(ls_id), K(ret));
   } else {
-    CLOG_LOG(INFO, "block_ls_transfer_in_ success", K(ls_id), K(block_scn));
+    (void)set_block_tx_if_necessary_();
+#ifdef ERRSIM
+    if (OB_SUCC(ret))
+    {
+      ret = EN_GC_BLOCK_WRITE_SLOG ? : OB_SUCCESS;
+      if (OB_FAIL(ret)) {
+        TRANS_LOG(INFO, "fake EN_GC_CHECK_RD_TX", K(ret));
+      }
+    }
+#endif
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ls_->set_gc_state(LSGCState::LS_BLOCKED))) {
+      int ret_code = ret;
+      ret = overwrite_set_gc_state_retcode_(ret_code, LSGCState::LS_BLOCKED, ls_id);
+    } else {
+      CLOG_LOG(INFO, "block_ls_transfer_in_ success", K(ls_id), K(block_scn));
+    }
   }
+  return ret;
 }
 
-void ObGCHandler::offline_ls_(const SCN &offline_scn)
+ERRSIM_POINT_DEF(EN_GC_OFFLINE_WRITE_SLOG);
+int ObGCHandler::offline_ls_(const SCN &offline_scn)
 {
   DEBUG_SYNC(LS_GC_BEFORE_OFFLINE);
   int ret = OB_SUCCESS;
@@ -1056,6 +1127,7 @@ void ObGCHandler::offline_ls_(const SCN &offline_scn)
   if (OB_FAIL(ls_->get_gc_state(gc_state))) {
     CLOG_LOG(WARN, "get_gc_state failed", K(ls_id), K(gc_state));
   } else if (!is_valid_ls_gc_state(gc_state)) {
+    ret = OB_ERR_UNEXPECTED;
     CLOG_LOG(WARN, "ls check gc state invalid", K(ls_id), K(gc_state));
   } else if (is_ls_offline_finished_(gc_state)) {
     SCN pre_offline_scn;
@@ -1064,10 +1136,68 @@ void ObGCHandler::offline_ls_(const SCN &offline_scn)
     } else {
       CLOG_LOG(INFO, "ls already offline, ignore", K(ls_id), K(offline_scn), K(gc_state), K(pre_offline_scn));
     }
-  } else if (OB_FAIL(ls_->set_gc_state(LSGCState::LS_OFFLINE, offline_scn))) {
-    CLOG_LOG(WARN, "set_gc_state failed", K(ls_->get_ls_id()), K(offline_scn));
   } else {
-    CLOG_LOG(INFO, "offline_ls success",  K(ls_->get_ls_id()), K(offline_scn)); }
+#ifdef ERRSIM
+    if (OB_SUCC(ret))
+    {
+      ret = EN_GC_OFFLINE_WRITE_SLOG ? : OB_SUCCESS;
+      if (OB_FAIL(ret)) {
+        TRANS_LOG(INFO, "fake EN_GC_CHECK_RD_TX", K(ret));
+      }
+    }
+#endif
+
+    if (OB_FAIL(ret)) {
+#ifdef OB_BUILD_SHARED_STORAGE
+      // update ss_ls_meta first and then change the local meta.
+    } else if (GCTX.is_shared_storage_mode()
+               && OB_FAIL(update_ss_ls_meta_(ls_id, LSGCState::LS_OFFLINE, offline_scn))) {
+      CLOG_LOG(WARN, "update ss ls meta failed", K(ret), K(offline_scn));
+#endif
+    } else if (OB_FAIL(ls_->set_gc_state(LSGCState::LS_OFFLINE, offline_scn))) {
+      int ret_code = ret;
+      ret = overwrite_set_gc_state_retcode_(ret_code, LSGCState::LS_OFFLINE, ls_id);
+    } else {
+      CLOG_LOG(INFO, "offline_ls success", K(ls_->get_ls_id()), K(offline_scn));
+    }
+  }
+  return ret;
+}
+
+#ifdef OB_BUILD_SHARED_STORAGE
+int ObGCHandler::update_ss_ls_meta_(const ObLSID &ls_id,
+                                    const logservice::LSGCState &gc_state,
+                                    const share::SCN &offline_scn)
+{
+  int ret = OB_SUCCESS;
+  SYNC_UPLOAD_INC_META_WITH_RET(SSIncMetaUploadType::GC_HANDLER_UPLOAD_TYPE,
+                                ret,
+                                ls_gc_state,
+                                (*MTL(ObSSMetaService *)),
+                                ls_id,
+                                gc_state,
+                                offline_scn);
+  if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "update ls gc state failed", K(ret), K(ls_id), K(offline_scn));
+  }
+  return ret;
+}
+#endif
+
+int ObGCHandler::overwrite_set_gc_state_retcode_(const int ret_code,
+                                                 const LSGCState gc_state,
+                                                 const ObLSID &ls_id)
+{
+  int ret = ret_code;
+  if (OB_ERR_UNEXPECTED == ret_code) {
+    CLOG_LOG(ERROR, "set_gc_state failed", K(ls_id), K(gc_state), K(ret_code));
+  } else {
+    ret = OB_EAGAIN;
+    if (REACH_TIME_INTERVAL(1 * 1000 * 1000)) {
+      CLOG_LOG(WARN, "set_gc_state failed", K(ls_id), K(gc_state), K(ret_code));
+    }
+  }
+  return ret;
 }
 
 int ObGCHandler::get_palf_role_(common::ObRole &role)
@@ -1128,7 +1258,7 @@ void ObGCHandler::handle_gc_ls_dropping_(const ObGarbageCollector::LSStatus &ls_
         CLOG_LOG(WARN, "BLOCK_TABLET_TRANSFER_IN log has not callback on_success", K(ls_id), K(gc_state));
       }
     }
-    CLOG_LOG(INFO, "ls handle_gc_ls_dropping_ finished", K(ls_id), K(role), K(gc_state));
+    CLOG_LOG(INFO, "ls handle_gc_ls_dropping_ finished", K(ls_id), K(role), K(gc_state), K(is_success));
   }
 }
 
@@ -1186,13 +1316,15 @@ int ObGCHandler::diagnose(GCDiagnoseInfo &diagnose_info) const
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     CLOG_LOG(WARN, "GC handler not init");
-  } else {
-    RLockGuard wlock_guard(rwlock_);
+  } else if (true == rwlock_.try_rdlock()){
     if (OB_FAIL(ls_->get_gc_state(diagnose_info.gc_state_))) {
       CLOG_LOG(WARN, "get_gc_state failed", K(ls_->get_ls_id()));
     } else {
       diagnose_info.gc_start_ts_ = gc_start_ts_;
     }
+    rwlock_.unlock();
+  } else {
+    CLOG_LOG(WARN, "try_lock failed", KP(ls_));
   }
   return ret;
 }
@@ -1343,7 +1475,7 @@ void ObGarbageCollector::run1()
 
   const int64_t gc_interval = GC_INTERVAL;
   while (!has_set_stop()) {
-    if (ObServerCheckpointSlogHandler::get_instance().is_started()) {
+    if (SERVER_STORAGE_META_SERVICE.is_started()) {
       if (!stop_create_new_gc_task_) {
         CLOG_LOG(INFO, "Garbage Collector is running", K(seq_), K(gc_interval));
         ObGCCandidateArray gc_candidates;
@@ -1362,7 +1494,7 @@ void ObGarbageCollector::run1()
     // safe destroy handler keep running even if ObServerCheckpointSlogHandler is not started,
     // because ls still need to be safe destroy when observer fail to start.
     (void) safe_destroy_handler_.handle();
-    ob_usleep(gc_interval);
+    ob_usleep(gc_interval, true/*is_idle_sleep*/);
   }
 }
 
@@ -1557,7 +1689,8 @@ void ObGarbageCollector::gc_check_ls_status_(ObGCCandidateArray &gc_candidates)
           CLOG_LOG(WARN, "get next log stream failed", K(ret));
         }
       } else if (OB_ISNULL(ls)) {
-        CLOG_LOG(ERROR, "log stream is NULL", KP(ls));
+        ret = OB_ERR_UNEXPECTED;
+        CLOG_LOG(ERROR, "log stream is NULL", K(ret), KP(ls));
       } else if (OB_UNLIKELY(!ls->is_create_committed())) {
         CLOG_LOG(INFO, "ls is not committed, just ignore", K(ls));
       } else if (OB_SUCCESS != (tmp_ret = gc_check_ls_status_(*ls, gc_candidates))) {
@@ -1585,6 +1718,29 @@ int ObGarbageCollector::check_if_tenant_has_been_dropped_(const uint64_t tenant_
   return ret;
 }
 
+int ObGarbageCollector::check_if_tenant_is_creating_(const uint64_t tenant_id, bool &is_creating)
+{
+  int ret = OB_SUCCESS;
+  schema::ObMultiVersionSchemaService *schema_service = GCTX.schema_service_;
+  schema::ObSchemaGetterGuard guard;
+  const schema::ObTenantSchema *tenant_schema = NULL;
+  is_creating = false;
+  if (OB_ISNULL(schema_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    CLOG_LOG(WARN, "schema_service is null", KR(ret));
+  } else if (OB_FAIL(schema_service->get_tenant_schema_guard(OB_SYS_TENANT_ID, guard))) {
+    CLOG_LOG(WARN, "fail to get schema guard", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(guard.get_tenant_info(tenant_id, tenant_schema))) {
+    CLOG_LOG(WARN, "fail to get tenant schema", KR(ret), K(tenant_id));
+  } else if (OB_ISNULL(tenant_schema)) {
+    ret = OB_TENANT_NOT_EXIST;
+    CLOG_LOG(WARN, "tenant not exist", KR(ret), K(tenant_id));
+  } else {
+    is_creating = tenant_schema->is_creating();
+  }
+  return ret;
+}
+
 int ObGarbageCollector::gc_check_ls_status_(storage::ObLS &ls,
                                             ObGCCandidateArray &gc_candidates)
 {
@@ -1603,6 +1759,7 @@ int ObGarbageCollector::gc_check_ls_status_(storage::ObLS &ls,
   if (OB_FAIL(get_ls_status_from_table(ls_id, ls_status))) {
     int tmp_ret = OB_SUCCESS;
     bool is_tenant_dropped = false;
+    bool is_creating = false;
     if (OB_SUCCESS != (tmp_ret = check_if_tenant_has_been_dropped_(tenant_id, is_tenant_dropped))) {
       CLOG_LOG(WARN, "check_if_tenant_has_been_dropped_ failed", K(tmp_ret), K(tenant_id), K(ls_id));
     } else if (is_tenant_dropped) {
@@ -1610,7 +1767,21 @@ int ObGarbageCollector::gc_check_ls_status_(storage::ObLS &ls,
       candidate.gc_reason_ = GCReason::LS_STATUS_ENTRY_NOT_EXIST;
       ret = OB_SUCCESS;
     } else if (OB_ENTRY_NOT_EXIST == ret) {
-      if (OB_SUCCESS != (tmp_ret = ls.get_migration_status(migration_status))) {
+      if (is_user_tenant(tenant_id)) {
+        if (OB_TMP_FAIL(check_if_tenant_is_creating_(gen_meta_tenant_id(tenant_id), is_creating))
+            || is_creating) {
+          // tenant is creating, current observer may not refresh schema which will cause failure to get tenant schema
+          // when creating tenant, ls status may not exist, so treat it as normal
+          // after meta tenant is created, user ls should exists in __all_ls_status
+          if (REACH_TIME_INTERVAL(10_s)) {
+            CLOG_LOG(WARN, "failed to get ls status, tenant may be creating", KR(ret), KR(tmp_ret),
+                K(is_creating), K(ls_id));
+          }
+          ret = OB_SUCCESS;
+        }
+      }
+      if (OB_SUCC(ret)) {
+      } else if (OB_SUCCESS != (tmp_ret = ls.get_migration_status(migration_status))) {
         CLOG_LOG(WARN, "get_migration_status failed", K(tmp_ret), K(ls_id));
       } else if (OB_SUCCESS != (tmp_ret = ObMigrationStatusHelper::check_ls_allow_gc(
             ls.get_ls_id(), migration_status, allow_gc))) {
@@ -1683,6 +1854,7 @@ void ObGarbageCollector::execute_gc_(ObGCCandidateArray &gc_candidates)
       } else if (NOT_IN_LEADER_MEMBER_LIST == gc_reason) {
         ObLogHandler *log_handler = NULL;
         if (OB_ISNULL(log_handler = ls->get_log_handler())) {
+          tmp_ret = OB_ERR_UNEXPECTED;
           CLOG_LOG(ERROR, "log_handler is NULL", K(tmp_ret), K(id));
         } else if (!log_handler->is_sync_enabled() || !log_handler->is_replay_enabled()) {
           gc_handler->set_log_sync_stopped();

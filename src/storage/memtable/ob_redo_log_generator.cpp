@@ -11,14 +11,7 @@
  */
 
 #include "ob_redo_log_generator.h"
-#include "lib/utility/ob_tracepoint.h"
-#include "ob_memtable_key.h"
-#include "ob_memtable.h"
-#include "ob_memtable_data.h"
-#include "ob_memtable_context.h"
-#include "mvcc/ob_tx_callback_functor.h"
 #include "storage/tx/ob_trans_part_ctx.h"
-#include "storage/tablelock/ob_table_lock_callback.h"
 
 namespace oceanbase
 {
@@ -96,24 +89,30 @@ public:
       ctx_.next_epoch_ = iter->get_epoch();
     } else if (iter->get_epoch() < ctx_.epoch_from_) {
       ret = OB_ERR_UNEXPECTED;
+      TRANS_LOG(ERROR, "found callback with epoch less than `from`", K(ret), KPC(iter), K(ctx_));
+#ifdef ENABLE_DEBUG_LOG
       ob_abort();
+#endif
     } else if (FALSE_IT(ctx_.cur_epoch_ = iter->get_epoch())) {
     } else if (!iter->need_submit_log()) {
       // this should not happend
       // because log_cursor is _strictly_ point to the right next to logging position
+      ret = OB_ERR_UNEXPECTED;
+      TRANS_LOG(ERROR, "found callback has been logged, maybe log_cursor value is insane", K(ret), KPC(iter), K(ctx_));
+#ifdef ENABLE_DEBUG_LOG
       ob_abort();
+#endif
     } else if (iter->is_logging_blocked()) {
       ret = OB_BLOCK_FROZEN;
       ctx_.last_log_blocked_memtable_ = static_cast<memtable::ObMemtable *>(iter->get_memtable());
-    } else if (OB_UNLIKELY(iter->get_freeze_clock() >= ctx_.freeze_clock_)) {
-      // when flush redo for frozen memtable, if memtable is active, should stop
-      ret = OB_BLOCK_FROZEN;
     } else {
       bool fake_fill = false;
       if (MutatorType::MUTATOR_ROW == iter->get_mutator_type()) {
         ret = fill_row_redo_(iter, fake_fill);
       } else if (MutatorType::MUTATOR_TABLE_LOCK == iter->get_mutator_type()) {
         ret = fill_table_lock_redo_(iter, fake_fill);
+      } else if (MutatorType::MUTATOR_ROW_EXT_INFO == iter->get_mutator_type()) {
+        ret = fill_ext_info_redo_(iter, fake_fill);
       } else {
         ret = OB_ERR_UNEXPECTED;
         TRANS_LOG(ERROR, "mutator row type not expected.", K(ret));
@@ -195,6 +194,27 @@ private:
     TRANS_LOG(DEBUG, "fill table lock redo.", K(ret), K(*titer), K(redo.lock_id_), K(redo.lock_mode_));
     return ret;
   }
+
+  int fill_ext_info_redo_(ObITransCallback *callback, bool &fake_fill)
+  {
+    int ret = OB_SUCCESS;
+    RedoDataNode redo;
+    ObExtInfoCallback *ext_iter = (ObExtInfoCallback *)callback;
+    if (OB_FAIL(ext_iter->get_redo(redo))) {
+      if (OB_ITER_END != ret) {
+        TRANS_LOG(WARN, "get_redo fail", K(ret));
+      } else {
+        ret = OB_SUCCESS;
+      }
+    } else if (OB_FAIL(mmw_.append_ext_info_log_kv(mem_ctx_->get_max_table_version(),
+                                                  redo, false/*is_big_row*/))) {
+      if (OB_BUF_NOT_ENOUGH != ret) {
+        TRANS_LOG(WARN, "mutator writer append_kv fail", K(ret));
+      }
+    }
+    return ret;
+  }
+
 private:
   ObMemtableCtx *mem_ctx_;
   transaction::ObTxEncryptMeta *clog_encrypt_meta_;

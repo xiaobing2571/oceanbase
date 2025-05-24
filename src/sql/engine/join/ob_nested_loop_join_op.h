@@ -123,6 +123,10 @@ public:
   ObBatchRescanCtl &get_batch_rescan_ctl() { return batch_rescan_ctl_; }
   int fill_cur_row_rescan_param();
   int calc_other_conds(bool &is_match);
+
+  int get_next_batch_from_right(const ObBatchRows *right_brs);
+  int get_next_row_from_right();
+
   int do_drain_exch_multi_lvel_bnlj();
 private:
   // state operation and transfer function type.
@@ -154,7 +158,7 @@ private:
   // for vectorized
   int rescan_params_batch_one(int64_t batch_idx);
   int get_left_batch();
-  int group_get_left_batch(const ObBatchRows *&left_brs);
+  int group_get_left_batch(const ObBatchRows *&group_left_brs);
   int inner_get_next_batch(const int64_t max_row_cnt);
   // for vectorized end
 
@@ -168,7 +172,7 @@ private:
   void skip_l_idx();
   // for refactor vectorized end
 
-  bool continue_fetching() { return !(left_brs_->end_ || is_full());}
+  bool continue_fetching() { return !(is_left_end_ || is_full());}
   virtual int do_drain_exch() override;
   virtual int inner_drain_exch() { return OB_SUCCESS; }
 public:
@@ -194,6 +198,7 @@ public:
   ObChunkDatumStore right_store_;
   ObChunkDatumStore::Iterator right_store_iter_;
   const ObBatchRows *left_brs_;
+  ObBatchRows group_left_brs_; //describes the probe data originating from the left child in group rescan scenario.
   ObBitVector *left_matched_;
   bool need_switch_iter_;
   bool iter_end_;

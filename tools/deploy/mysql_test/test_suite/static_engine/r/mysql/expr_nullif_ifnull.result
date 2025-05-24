@@ -3,6 +3,7 @@ explain_protocol: 0
 
 set @@ob_enable_plan_cache = 0;
 drop table if exists t1;
+alter system set default_table_store_format = "row";
 create table t1 (c1 int, c2 int unsigned,
     c3 tinyint, c4 tinyint unsigned,
     c5 smallint, c6 smallint unsigned,
@@ -26,6 +27,9 @@ insert into t1 values(1, 2,
     7.5, 8.5,
     '2019-12-01 12:00:00', '2019-12-03 06:00:00',
     '9.5', '10.5', null);
+Warnings:
+Warning	1265	Data truncated for column 'c17' at row 1
+Warning	1265	Data truncated for column '"oceanbase"."t1"."c18"' at row 1
 insert into t1 values(-1, 2,
     -1, 2,
     -1, 2,
@@ -37,6 +41,9 @@ insert into t1 values(-1, 2,
     -7.5, 8.5,
     '2019-12-01 12:00:00', '2019-12-03 06:00:00',
     '-9.5', '10.5', null);
+Warnings:
+Warning	1265	Data truncated for column 'c17' at row 1
+Warning	1265	Data truncated for column '"oceanbase"."t1"."c18"' at row 1
 
 select nullif(null, null), nullif(1, null), nullif(null, 1);
 +--------------------+-----------------+-----------------+

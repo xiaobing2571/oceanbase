@@ -1,3 +1,6 @@
+// owner: zjf225077
+// owner group: log
+
 /**
  * Copyright (c) 2021 OceanBase
  * OceanBase CE is licensed under Mulan PubL v2.
@@ -10,12 +13,7 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include <cstdio>
-#include <gtest/gtest.h>
-#include <signal.h>
 #define private public
-#include "lib/allocator/ob_qsync.h"
-#include "logservice/ob_ls_adapter.h"
 #include "env/ob_simple_log_cluster_env.h"
 #undef private
 
@@ -88,6 +86,8 @@ public:
     return OB_SUCCESS;
   }
 
+  const char *get_cb_name() const override { return "MockAppendCb"; }
+
   void init(const int64_t log_id,
             MockLSAdapter *ls_adapter)
   {
@@ -102,6 +102,7 @@ int64_t ObSimpleLogClusterTestBase::member_cnt_ = 3;
 int64_t ObSimpleLogClusterTestBase::node_cnt_ = 3;
 std::string ObSimpleLogClusterTestBase::test_name_ = TEST_NAME;
 bool ObSimpleLogClusterTestBase::need_add_arb_server_  = false;
+bool ObSimpleLogClusterTestBase::need_shared_storage_ = false;
 
 TEST_F(TestObSimpleLogApplyFunc, apply)
 {
@@ -350,6 +351,8 @@ TEST_F(TestObSimpleLogApplyFunc, get_max_decided_scn)
     end_lsn = leader.palf_handle_impl_->get_end_lsn();
     if (end_lsn <= max_lsn) {
       CLOG_LOG(INFO, "wait end_lsn", K(end_lsn), K(max_lsn));
+      ret = submit_log(new_leader, 1, id, 100);
+      wait_until_has_committed(new_leader, new_leader.palf_handle_impl_->get_max_lsn());
       sleep (1);
     }
   } while (end_lsn <= max_lsn);

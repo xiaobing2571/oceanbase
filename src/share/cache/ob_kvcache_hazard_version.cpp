@@ -228,11 +228,11 @@ int ObKVCacheHazardStation::acquire(int64_t &slot_id)
     int64_t retry_count = 0;
     int64_t curr = get_itid() % slot_num_;
     const int64_t end = curr;
-    while (!hazard_slots_[curr].acquire(version_)) {
+    while (OB_SUCC(ret) && !hazard_slots_[curr].acquire(version_)) {
       curr = (curr + 1) % slot_num_;
       if (curr == end) {
         if (++retry_count >= MAX_ACQUIRE_RETRY_COUNT) {
-          ret = OB_ERR_UNEXPECTED;
+          ret = OB_ENTRY_NOT_EXIST;
           COMMON_LOG(WARN, "There is no free slot for current thread", K(ret), K(retry_count));
         } else {
           sched_yield();
@@ -324,7 +324,7 @@ int ObKVCacheHazardStation::print_current_status() const
           }
         }
         if (OB_SUCC(ret)) {
-          _OB_LOG(INFO, "[KVCACHE-HAZARD] hazard version status info: current_version: %8ld | min_version=%8ld | total_nodes_count: %8ld |\n%s",
+          _OB_LOG(INFO, "[KVCACHE-HAZARD-VERSION] hazard version status info: current_version: %8ld | min_version=%8ld | total_nodes_count: %8ld |\n%s",
               version_, get_min_version(), total_nodes_num, buf);
         }
       }

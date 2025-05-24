@@ -10,13 +10,8 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "observer/omt/ob_tenant.h"
-#include "observer/omt/ob_multi_tenant.h"
 #include "observer/virtual_table/ob_all_virtual_dtl_interm_result_monitor.h"
 #include "observer/ob_server_utils.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "lib/hash/ob_hashmap.h"
-#include "sql/session/ob_sql_session_info.h"
 #include "sql/dtl/ob_dtl_interm_result_manager.h"
 
 namespace oceanbase
@@ -63,8 +58,8 @@ int ObDTLIntermResultMonitorInfoGetter::operator() (common::hash::HashMapPair<Ob
     const char *owner = NULL;
     ObObj *cells = cur_row_.cells_;
     if (info.is_store_valid()) {
-      if (info.use_rich_format_) {
-        GET_CHUNK_STORE_INFO(info.col_store_);
+      if (info.is_rich_format()) {
+        GET_CHUNK_STORE_INFO(info.block_store_);
       } else {
         GET_CHUNK_STORE_INFO(info.datum_store_);
       }
@@ -124,7 +119,7 @@ int ObDTLIntermResultMonitorInfoGetter::operator() (common::hash::HashMapPair<Ob
           break;
         }
         case ObAllDtlIntermResultMonitor::INSPECT_COLUMN::EXPIRE_TIME: {
-          int64_t expire_time = key.time_us_;
+          int64_t expire_time = key.timeout_ts_;
           cells[cell_idx].set_timestamp(expire_time);
           break;
         }
@@ -254,7 +249,7 @@ int ObAllDtlIntermResultMonitor::fill_scanner()
           }
         }
       }
-    } else if(is_user_tenant(cur_tenant_id)) {
+    } else {
       ObDTLIntermResultMonitorInfoGetter monitor_getter(scanner_, *allocator_, output_column_ids_,
                                   cur_row_, *addr_, ipstr, cur_tenant_id);
       MTL_SWITCH(cur_tenant_id) {
@@ -262,9 +257,6 @@ int ObAllDtlIntermResultMonitor::fill_scanner()
           SERVER_LOG(WARN, "generate monitor info array failed", K(ret));
         }
       }
-    } else {
-      ret = OB_ERR_UNEXPECTED;
-      SERVER_LOG(WARN, "Non-system non-user tenants try generate_monitor_info_rows", K(ret));
     }
     if(OB_SUCC(ret)) {
       scanner_it_ = scanner_.begin();

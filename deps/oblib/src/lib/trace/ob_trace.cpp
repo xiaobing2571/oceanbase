@@ -12,14 +12,8 @@
 
 #include "ob_trace.h"
 
-#include <cstdlib>
-#include <ctime>
 #include <random>
 
-#include "lib/oblog/ob_log_level.h"
-#include "lib/time/ob_time_utility.h"
-#include "lib/time/ob_tsc_timestamp.h"
-#include "common/ob_clock_generator.h"
 
 namespace oceanbase
 {
@@ -66,15 +60,16 @@ void flush_trace()
         int ret = OB_SUCCESS;
         ObTagCtxBase* tag = span->tags_;
         bool first = true;
+        char tagstr[] = "\"tags\":[";
         INIT_SPAN(span);
         while (OB_SUCC(ret) && OB_NOT_NULL(tag)) {
-          if (pos + 10 >= MAX_TRACE_LOG_SIZE) {
+          if (pos + sizeof(tagstr) + 1 >= MAX_TRACE_LOG_SIZE) {
             ret = OB_BUF_NOT_ENOUGH;
           } else {
             buf[pos++] = ',';
             if (first) {
-              strcpy(buf + pos, "\"tags\":[");
-              pos += 8;
+              strncpy(buf + pos, tagstr, MAX_TRACE_LOG_SIZE - pos);
+              pos += sizeof(tagstr) - 1;
               first = false;
             }
             ret = tag->tostring(buf, MAX_TRACE_LOG_SIZE, pos);
@@ -260,7 +255,11 @@ int to_string_and_strip(const char* str, const int64_t length, char* buf, const 
       }
     }
   }
-  if (OB_FAIL(ret) || pos + 2 >= buf_len) {
+  if (OB_FAIL(ret) || pos + 3 >= buf_len) {
+    // When the length of the tag exceeds buf_len, need ensure that the json format is legal when truncating.
+    // Pos in buf_len - 2 will fill ']' later.
+    buf[buf_len - 4] = '\"';
+    buf[buf_len - 3] = '}';
     buf[buf_len - 1] = 0;
   } else {
     buf[pos++] = '\"';
@@ -507,6 +506,7 @@ int ObTrace::serialize(char* buf, const int64_t buf_len, int64_t& pos) const
 int ObTrace::deserialize(const char* buf, const int64_t buf_len, int64_t& pos)
 {
   int ret = OB_SUCCESS;
+  reset();
   if (OB_FAIL(trace_id_.deserialize(buf, buf_len, pos))) {
     // LOG_WARN("deserialize failed", K(ret), K(buf), K(buf_len), K(pos));
   } else if (OB_FAIL(root_span_id_.deserialize(buf, buf_len, pos))) {

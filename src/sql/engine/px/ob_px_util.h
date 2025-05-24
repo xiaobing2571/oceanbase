@@ -31,6 +31,7 @@ namespace sql
 {
 const int64_t PX_RESCAN_BATCH_ROW_COUNT = 8192;
 class ObIExtraStatusCheck;
+class ObPxNodePool;
 enum ObBcastOptimization {
   BC_TO_WORKER,
   BC_TO_SERVER,
@@ -48,9 +49,44 @@ struct ObExprExtraSerializeInfo
 {
   OB_UNIS_VERSION(1);
 public:
-  ObExprExtraSerializeInfo() : current_time_(nullptr), last_trace_id_(nullptr) { }
+  ObExprExtraSerializeInfo() :
+    current_time_(nullptr),
+    last_trace_id_(nullptr),
+    mview_ids_(nullptr),
+    last_refresh_scns_(nullptr)
+    { }
   common::ObObj *current_time_;
   common::ObCurTraceId::TraceId *last_trace_id_;
+  common::ObFixedArray<uint64_t, common::ObIAllocator> *mview_ids_;
+  common::ObFixedArray<uint64_t, common::ObIAllocator> *last_refresh_scns_;
+};
+
+class ObBaseOrderMap
+{
+public:
+  struct ClearMapFunc
+  {
+    int operator()(const hash::HashMapPair<int64_t, std::pair<ObIArray<int64_t> *, bool>> &entry) {
+      entry.second.first->destroy();
+      return OB_SUCCESS;
+    }
+  };
+  ObBaseOrderMap() {
+  }
+  ~ObBaseOrderMap();
+  int init(int64_t count);
+  inline hash::ObHashMap<int64_t, std::pair<ObIArray<int64_t> *, bool>, hash::NoPthreadDefendMode> &get_map()
+  {
+    return map_;
+  }
+  int add_base_partition_order(int64_t pwj_group_id, const TabletIdArray &tablet_id_array,
+                               const DASTabletLocIArray &dst_locations, bool asc);
+  int reorder_partition_as_base_order(int64_t pwj_group_id,
+                                      const TabletIdArray &tablet_id_array,
+                                      DASTabletLocIArray &dst_locations);
+private:
+  ObArenaAllocator allocator_;
+  hash::ObHashMap<int64_t, std::pair<ObIArray<int64_t> *, bool>, hash::NoPthreadDefendMode> map_;
 };
 
 class ObPxSqcUtil
@@ -108,6 +144,10 @@ public:
 
 
 typedef common::hash::ObHashMap<uint64_t, int64_t, common::hash::NoPthreadDefendMode> ObTabletIdxMap;
+typedef common::hash::ObHashSet<ObAddr, common::hash::NoPthreadDefendMode> ObAddrSet;
+typedef common::hash::ObHashSet<ObZone, common::hash::NoPthreadDefendMode> ObZoneSet;
+
+
 
 class ObPXServerAddrUtil
 {
@@ -133,12 +173,12 @@ public:
   static int alloc_by_data_distribution_inner(
       const ObIArray<ObTableLocation> *table_locations,
       ObExecContext &ctx, ObDfo &dfo);
-
   static int alloc_by_child_distribution(const ObDfo &child,
                                          ObDfo &parent);
   static int alloc_by_random_distribution(ObExecContext &exec_ctx,
                                           const ObDfo &child,
-                                          ObDfo &parent);
+                                          ObDfo &parent,
+                                          ObPxNodePool &px_node_pool);
   static int alloc_by_temp_child_distribution(ObExecContext &ctx,
                                               ObDfo &child);
   static int alloc_by_temp_child_distribution_inner(ObExecContext &ctx,
@@ -147,8 +187,10 @@ public:
                                          ObDfo &root);
   static int alloc_by_reference_child_distribution(const ObIArray<ObTableLocation> *table_locations,
                                                    ObExecContext &exec_ctx,
-                                                   ObDfo &child,
                                                    ObDfo &parent);
+  static int add_pdml_merge_gindex_locations(const ObTableModifySpec &dml_op,
+                                             ObExecContext &ctx,
+                                             ObDfo &dfo);
   static int split_parallel_into_task(const int64_t parallelism,
                                       const common::ObIArray<int64_t> &sqc_partition_count,
                                       common::ObIArray<int64_t> &results);
@@ -161,10 +203,44 @@ public:
       ObExecContext &ctx,
       uint64_t table_id,
       uint64_t ref_table_id,
-      const ObQueryRange &pre_query_range,
+      const ObQueryRangeProvider &pre_query_range,
       ObDfo &dfo,
       ObDASTableLoc *&table_loc);
 
+  static int init_px_node_exec_info(ObExecContext &exec_ctx);
+  // Because the begin and end interfaces need to be used,
+  // ObIArray cannot be used here.
+  static int get_data_servers(ObExecContext &exec_ctx,
+                              sql::ObTMArray<ObAddr> &addrs,
+                              bool &is_empty,
+                              int64_t &data_node_cnt);
+  static int get_data_servers(ObExecContext &exec_ctx,
+                              ObAddrSet &addr_set,
+                              bool &is_empty);
+  static int inner_get_zone_servers(const ObAddrSet &data_addr_set,
+                                    ObIArray<ObAddr> &addrs);
+  static int get_zone_servers(ObExecContext &exec_ctx,
+                              sql::ObTMArray<ObAddr> &addrs,
+                              bool &is_empty,
+                              int64_t &data_node_cnt);
+  static int get_cluster_servers(ObExecContext &exec_ctx,
+                                sql::ObTMArray<ObAddr> &addrs,
+                                bool &is_empty,
+                                int64_t &data_node_cnt);
+  static int get_specified_servers(ObExecContext &exec_ctx,
+                                  sql::ObTMArray<ObAddr> &addrs,
+                                  bool &is_empty,
+                                  int64_t &data_node_cnt);
+  static int get_tenant_server_set(const int64_t &tenant_id,
+                                  ObAddrSet &tenant_server_set);
+  static int get_tenant_servers(const int64_t &tenant_id,
+                              ObIArray<ObAddr> &tenant_servers);
+  static int shuffle_px_node_pool(sql::ObTMArray<ObAddr> &addrs,
+                                    int64_t data_node_cnt);
+  static int get_zone_server_cnt(const ObIArray<ObAddr> &server_list,
+                                  int64_t &server_cnt);
+  static int get_cluster_server_cnt(const ObIArray<ObAddr> &server_list,
+                                    int64_t &server_cnt);
 private:
   static int find_dml_ops_inner(common::ObIArray<const ObTableModifySpec *> &insert_ops,
                              const ObOpSpec &op);
@@ -175,11 +251,11 @@ private:
       int64_t tenant_id,
       uint64_t ref_table_id,
       ObTabletIdxMap &idx_map);
-  static int reorder_all_partitions(int64_t location_key,
-      int64_t ref_table_id,
-      const DASTabletLocList &src_locations,
-      DASTabletLocIArray &tsc_locations,
-      bool asc, ObExecContext &exec_ctx, ObIArray<int64_t> &base_order);
+  static int reorder_all_partitions(
+      int64_t location_key, int64_t ref_table_id, const DASTabletLocList &src_locations,
+      DASTabletLocIArray &tsc_locations, bool asc, ObExecContext &exec_ctx,
+      ObBaseOrderMap &base_order_map, int64_t op_id,
+      ObIArray<std::pair<int64_t, bool>> &locations_order);
   static int build_dynamic_partition_table_location(common::ObIArray<const ObTableScanSpec*> &scan_ops,
       const ObIArray<ObTableLocation> *table_locations, ObDfo &dfo);
 
@@ -208,12 +284,11 @@ private:
    * Add the partition information (table_loc) involved in the
    * current phy_op to the corresponding SQC access location
    */
-  static int set_sqcs_accessed_location(ObExecContext &ctx,
-                                        int64_t base_table_location_key,
-                                        ObDfo &dfo,
-                                        ObIArray<int64_t> &base_order,
-                                        const ObDASTableLoc *table_loc,
-                                        const ObOpSpec *phy_op);
+  static int set_sqcs_accessed_location(
+      ObExecContext &ctx, int64_t base_table_location_key, ObDfo &dfo,
+      ObBaseOrderMap &base_order_map,
+      const ObDASTableLoc *table_loc, const ObOpSpec *phy_op,
+      ObIArray<std::pair<int64_t, bool>> &locations_order);
   /**
    * Get the access sequence of the partition of the current phy_op,
    * the access sequence of the phy_op partition is determined by
@@ -246,9 +321,10 @@ private:
                                         common::ObIArray<common::ObAddr> &dst_addrs);
   static int sort_and_collect_local_file_distribution(common::ObIArray<share::ObExternalFileInfo> &files,
                                                       common::ObIArray<common::ObAddr> &dst_addrs);
-  static int assign_external_files_to_sqc(const common::ObIArray<share::ObExternalFileInfo> &files,
+  static int assign_external_files_to_sqc(ObDfo &dfo,
                                           bool is_file_on_disk,
-                                          common::ObIArray<ObPxSqcMeta *> &sqcs);
+                                          common::ObIArray<ObPxSqcMeta *> &sqcs,
+                                          int64_t parallel);
 private:
   static int generate_dh_map_info(ObDfo &dfo);
   DISALLOW_COPY_AND_ASSIGN(ObPXServerAddrUtil);
@@ -436,8 +512,10 @@ public:
     TO_STRING_KV(K_(tablet_id), K_(tablet_idx), K_(hash_value), K_(worker_id), K_(partition_info));
   };
 public:
-  ObPxAffinityByRandom(bool order_partitions) :
-  worker_cnt_(0), tablet_hash_values_(), order_partitions_(order_partitions) {}
+  ObPxAffinityByRandom(bool order_partitions, bool partition_random_affinitize)
+      : worker_cnt_(0), tablet_hash_values_(), order_partitions_(order_partitions),
+        partition_random_affinitize_(partition_random_affinitize)
+  {}
   virtual ~ObPxAffinityByRandom() = default;
   int reserve(int64_t size) { return tablet_hash_values_.reserve(size); }
   int add_partition(int64_t tablet_id,
@@ -452,6 +530,7 @@ private:
   int64_t worker_cnt_;
   ObSEArray<TabletHashValue, 8> tablet_hash_values_;
   bool order_partitions_;
+  bool partition_random_affinitize_;// whether do partition random in gi task split
 };
 
 class ObSlaveMapUtil
@@ -518,8 +597,36 @@ public:
               const int64_t sqc_id,
               const int64_t task_id,
               dtl::ObDtlChTotalInfo &ch_total_info,
+              dtl::ObDtlChSet &ch_set) {
+    return ch_total_info.is_local_shuffle_ ?
+            get_sm_receive_dtl_channel_set(sqc_id, task_id, ch_total_info, ch_set) :
+            get_mn_receive_dtl_channel_set(sqc_id, task_id, ch_total_info, ch_set);
+  }
+  static int get_mn_receive_dtl_channel_set(
+              const int64_t sqc_id,
+              const int64_t task_id,
+              dtl::ObDtlChTotalInfo &ch_total_info,
+              dtl::ObDtlChSet &ch_set);
+  static int get_sm_receive_dtl_channel_set(
+              const int64_t sqc_id,
+              const int64_t task_id,
+              dtl::ObDtlChTotalInfo &ch_total_info,
               dtl::ObDtlChSet &ch_set);
   static int get_transmit_dtl_channel_set(
+              const int64_t sqc_id,
+              const int64_t task_id,
+              dtl::ObDtlChTotalInfo &ch_total_info,
+              dtl::ObDtlChSet &ch_set) {
+    return ch_total_info.is_local_shuffle_ ?
+            get_sm_transmit_dtl_channel_set(sqc_id, task_id, ch_total_info, ch_set) :
+            get_mn_transmit_dtl_channel_set(sqc_id, task_id, ch_total_info, ch_set);
+  }
+  static int get_mn_transmit_dtl_channel_set(
+              const int64_t sqc_id,
+              const int64_t task_id,
+              dtl::ObDtlChTotalInfo &ch_total_info,
+              dtl::ObDtlChSet &ch_set);
+  static int get_sm_transmit_dtl_channel_set(
               const int64_t sqc_id,
               const int64_t task_id,
               dtl::ObDtlChTotalInfo &ch_total_info,
@@ -578,7 +685,8 @@ class ObPxErrorUtil
 public:
   static inline void update_qc_error_code(int &current_error_code,
                                            const int new_error_code,
-                                           const ObPxUserErrorMsg &from)
+                                           const ObPxUserErrorMsg &from,
+                                           const common::ObAddr &exec_addr)
   {
     int ret = OB_SUCCESS;
     // **replace** error code & error msg
@@ -588,6 +696,8 @@ public:
            OB_GOT_SIGNAL_ABORTING == current_error_code) &&
            OB_SUCCESS != new_error_code) {
         current_error_code = new_error_code;
+        SQL_LOG(WARN, "QC update the error code. Please visit the corresponding address for more details.",
+            K(new_error_code), K(exec_addr));
         FORWARD_USER_ERROR(new_error_code, from.msg_);
       }
     }

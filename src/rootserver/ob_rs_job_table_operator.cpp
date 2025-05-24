@@ -73,7 +73,10 @@ static const char* job_type_str_array[JOB_TYPE_MAX] = {
   "UPGRADE_END",
   "UPGRADE_ALL",
   "ALTER_RESOURCE_TENANT_UNIT_NUM",
-  "ALTER_TENANT_PRIMARY_ZONE"
+  "ALTER_TENANT_PRIMARY_ZONE",
+  "UPGRADE_FINISH",
+  "LOAD_MYSQL_SYS_PACKAGE",
+  "LOAD_ORACLE_SYS_PACKAGE",
 };
 
 bool ObRsJobTableOperator::is_valid_job_type(const ObRsJobType &rs_job_type)
@@ -432,6 +435,24 @@ int ObRsJobTableOperator::complete_job(int64_t job_id, int result_code, common::
     } else {
       LOG_INFO("rootservice job completed", K(job_id), K(result_code));
     }
+  }
+  return ret;
+}
+
+int ObRsJobTableOperator::complete_all_job_for_dropping_tenant(int64_t tenant_id, common::ObISQLClient &trans)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  if (OB_FAIL(sql.assign_fmt("UPDATE %s SET job_status = '%s', result_code = %d "
+      "WHERE tenant_id = %lu AND job_status = '%s'",
+      OB_ALL_ROOTSERVICE_JOB_TNAME, job_status_str_array[JOB_STATUS_FAILED], OB_TENANT_NOT_EXIST,
+      tenant_id, job_status_str_array[JOB_STATUS_INPROGRESS]))) {
+    LOG_WARN("format sql failed", K(sql), K(ret));
+  } else if (OB_FAIL(trans.write(OB_SYS_TENANT_ID, sql.ptr(), affected_rows))) {
+    LOG_WARN("execute sql failed", K(sql), K(ret));
+  } else {
+    LOG_INFO("the tenant is dropped, set all its inprogress rs job as FAILED", K(tenant_id), K(affected_rows));
   }
   return ret;
 }

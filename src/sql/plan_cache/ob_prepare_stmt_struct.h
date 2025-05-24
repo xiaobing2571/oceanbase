@@ -115,7 +115,7 @@ public:
   ObPsStmtId get_ps_stmt_id() const { return stmt_id_; }
 
   bool check_erase_inc_ref_count();
-  void dec_ref_count_check_erase();
+  void dec_ref_count();
   int64_t get_ref_count() const { return ATOMIC_LOAD(&ref_count_); }
 
   int get_convert_size(int64_t &cv_size) const;
@@ -193,6 +193,10 @@ public:
   inline const ObPsSqlMeta &get_ps_sql_meta() const { return ps_sql_meta_; }
   inline bool can_direct_use_param() const { return can_direct_use_param_; }
   inline void set_can_direct_use_param(bool v) { can_direct_use_param_ = v; }
+
+  inline bool get_is_prexecute() const { return is_prexecute_; }
+  inline void set_is_prexecute(bool v) { is_prexecute_ = v; }
+
   inline void set_ps_stmt_checksum(uint64_t ps_checksum) { ps_stmt_checksum_ = ps_checksum; }
   inline uint64_t get_ps_stmt_checksum() const { return ps_stmt_checksum_; }
 
@@ -205,7 +209,7 @@ public:
 
   bool is_valid() const;
   bool check_erase_inc_ref_count();
-  bool dec_ref_count_check_erase();
+  void dec_ref_count();
   int deep_copy(const ObPsStmtInfo &other);
   int add_param_field(const common::ObField &param);
   int add_column_field(const common::ObField &column);
@@ -251,6 +255,7 @@ public:
   void set_is_expired() { ATOMIC_STORE(&is_expired_, true); }
   bool is_expired() { return ATOMIC_LOAD(&is_expired_); }
   bool *get_is_expired_evicted_ptr() { return &is_expired_evicted_; }
+  bool try_erase() { return 1 == ATOMIC_VCAS(&ref_count_, 1, 0); }
 
   DECLARE_VIRTUAL_TO_STRING;
 
@@ -265,6 +270,7 @@ private:
 
   // for call procedure
   bool can_direct_use_param_;
+  bool is_prexecute_;
   int64_t item_and_info_size_; // mem_used_;
   int64_t last_closed_timestamp_; //引用计数上次减到1时的时间;
   ObSchemaObjVersion *dep_objs_;
@@ -365,6 +371,7 @@ public:
   //{ param_types_.set_label(common::ObModIds::OB_PS_SESSION_INFO_ARRAY); }
   virtual ~ObPsSessionInfo() {}
 
+  int fill_param_types_with_null_type();
   void set_stmt_id(const ObPsStmtId stmt_id) { stmt_id_ = stmt_id; }
   ObPsStmtId get_stmt_id() const { return stmt_id_; }
 
@@ -389,6 +396,7 @@ public:
   void inc_ref_count() { ref_cnt_++; }
   void dec_ref_count() { ref_cnt_--; }
   bool need_erase() { return 0 == ref_cnt_; }
+  inline int64_t get_ref_cnt() { return ref_cnt_; }
 
   inline void set_inner_stmt_id(ObPsStmtId id) { inner_stmt_id_ = id; }
   inline ObPsStmtId get_inner_stmt_id() { return inner_stmt_id_; }

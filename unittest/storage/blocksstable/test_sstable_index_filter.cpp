@@ -14,11 +14,7 @@
 #define private public
 #define OK(ass) ASSERT_EQ(OB_SUCCESS, (ass))
 
-#include "share/schema/ob_table_param.h"
 #include "sql/engine/ob_exec_context.h"
-#include "storage/access/ob_sstable_index_filter.h"
-#include "storage/access/ob_table_access_param.h"
-#include "storage/blocksstable/index_block/ob_index_block_row_struct.h"
 
 namespace oceanbase
 {
@@ -81,10 +77,15 @@ void TestSSTableIndexFilter::TearDown() {}
 void TestSSTableIndexFilter::init()
 {
   ObIAllocator* allocator_ptr = &allocator_;
+  exec_ctx_ = OB_NEWx(ObExecContext, allocator_ptr, allocator_);
+  eval_ctx_ = OB_NEWx(ObEvalCtx, allocator_ptr, *exec_ctx_);
   expr_spec_ = OB_NEWx(ObPushdownExprSpec, allocator_ptr, allocator_);
   pushdown_operator_ = OB_NEWx(ObPushdownOperator, allocator_ptr, *eval_ctx_, *expr_spec_);
+  ASSERT_NE(nullptr, exec_ctx_);
+  ASSERT_NE(nullptr, eval_ctx_);
   ASSERT_NE(nullptr, expr_spec_);
   ASSERT_NE(nullptr, pushdown_operator_);
+  eval_ctx_->batch_size_ = 256;
   row_header_.row_count_ = TEST_ROW_CNT;
   read_info_.cols_index_.array_.init(1, allocator_);
   read_info_.cols_index_.array_.push_back(TEST_COLUMN_INDEX);
@@ -187,7 +188,7 @@ void TestSSTableIndexFilter::test_sstable_index_filter_check_range_1()
   ObObj min_obj;
   min_obj.set_uint64(100);
   init_micro_index_info(max_obj, min_obj, index_info);
-  OK(index_filter.check_range(&read_info_, index_info, allocator_));
+  OK(index_filter.check_range(&read_info_, index_info, allocator_, true));
   ASSERT_TRUE(index_info.is_filter_always_false());
 
   ObMicroIndexInfo index_info2;
@@ -196,7 +197,7 @@ void TestSSTableIndexFilter::test_sstable_index_filter_check_range_1()
   ObObj min_obj2;
   min_obj2.set_uint64(40);
   init_micro_index_info(max_obj2, min_obj2, index_info2);
-  OK(index_filter.check_range(&read_info_, index_info2, allocator_));
+  OK(index_filter.check_range(&read_info_, index_info2, allocator_, true));
   ASSERT_TRUE(index_info2.is_filter_uncertain());
 
   childs[2] = create_lt_white_filter(100);
@@ -210,7 +211,7 @@ void TestSSTableIndexFilter::test_sstable_index_filter_check_range_1()
   ObObj min_obj3;
   min_obj3.set_uint64(0);
   init_micro_index_info(max_obj3, min_obj3, index_info3);
-  OK(index_filter2.check_range(&read_info_, index_info3, allocator_));
+  OK(index_filter2.check_range(&read_info_, index_info3, allocator_, true));
   ASSERT_TRUE(index_info3.is_filter_always_true());
 }
 
@@ -270,7 +271,6 @@ ObPushdownFilterExecutor* TestSSTableIndexFilter::create_lt_white_filter(uint64_
   datum.ptr_ = reinterpret_cast<char *>(datum_buf) + 128;
   datum.from_obj(ref_obj);
   filter->datum_params_.push_back(datum);
-  filter->init_obj_set();
   filter->cmp_func_ = get_datum_cmp_func(obj_meta, obj_meta);
   return filter;
 }
@@ -330,8 +330,9 @@ void TestSSTableIndexFilter::init_micro_index_info(
     ObMicroIndexInfo &index_info)
 {
   ObArray<ObSkipIndexColMeta> agg_cols;
-  ObDatumRow agg_row;
-  agg_row.init(3);
+  ObSkipIndexAggResult agg_result;
+  ASSERT_EQ(OB_SUCCESS, agg_result.init(3, allocator_));
+  ObDatumRow &agg_row = agg_result.agg_row_;
 
   ObSkipIndexColMeta skip_col_meta;
   skip_col_meta.col_idx_ = TEST_COLUMN_ID;
@@ -350,8 +351,8 @@ void TestSSTableIndexFilter::init_micro_index_info(
   agg_row.storage_datums_[2].from_obj_enhance(null_count_obj);
 
   ObAggRowWriter row_writer;
-  row_writer.init(agg_cols, agg_row, allocator_);
-  int64_t buf_size = row_writer.get_data_size();
+  ASSERT_EQ(OB_SUCCESS, row_writer.init(agg_cols, agg_result, DATA_CURRENT_VERSION, allocator_));
+  int64_t buf_size = row_writer.get_serialize_data_size();
   char *buf = reinterpret_cast<char *>(allocator_.alloc(buf_size));
   EXPECT_TRUE(buf != nullptr);
   MEMSET(buf, 0, buf_size);
@@ -383,8 +384,8 @@ TEST_F(TestSSTableIndexFilter, test_bool_mask)
 
 TEST_F(TestSSTableIndexFilter, test_sstable_index_filter_extracter)
 {
-  ObPushdownFilterExecutor *white_filter = create_physical_filter(true);
-  ObPushdownFilterExecutor *black_filter = create_physical_filter(false);
+  ObPhysicalFilterExecutor *white_filter = static_cast<ObPhysicalFilterExecutor *>(create_physical_filter(true));
+  ObPhysicalFilterExecutor *black_filter = static_cast<ObPhysicalFilterExecutor *>(create_physical_filter(false));
   ASSERT_TRUE(nullptr != white_filter);
   ASSERT_TRUE(nullptr != black_filter);
   ObSkippingFilterNode node1;
@@ -393,7 +394,7 @@ TEST_F(TestSSTableIndexFilter, test_sstable_index_filter_extracter)
   OK(ObSSTableIndexFilterExtracter::extract_skipping_filter(*white_filter, skip_index_type, node1));
   OK(ObSSTableIndexFilterExtracter::extract_skipping_filter(*black_filter, skip_index_type, node2));
   ASSERT_TRUE(node1.is_useful());
-  ASSERT_FALSE(node2.is_useful());
+  ASSERT_TRUE(node2.is_useful());
 }
 
 TEST_F(TestSSTableIndexFilter, test_skipping_filter_nodes_builder)

@@ -15,12 +15,7 @@
 #include "sql/optimizer/ob_log_table_scan.h"
 #include "sql/optimizer/ob_log_subplan_filter.h"
 #include "sql/optimizer/ob_log_join.h"
-#include "sql/optimizer/ob_optimizer_util.h"
-#include "sql/optimizer/ob_log_plan.h"
-#include "sql/optimizer/ob_opt_est_cost.h"
 #include "sql/optimizer/ob_log_distinct.h"
-#include "common/ob_smart_call.h"
-#include "sql/optimizer/ob_join_order.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -44,7 +39,7 @@ int ObLogExchange::get_explain_name_internal(char *buf,
       (is_repart_exchange() || is_pq_dist())) {
     ret = BUF_PRINTF(" (");
     if (OB_FAIL(ret)){
-    } else if (is_repart_exchange()) {
+    } else if (is_repart_exchange() && ObPQDistributeMethod::SM_BROADCAST != dist_method_) {
       if (OB_SUCC(ret) && dist_method_ == ObPQDistributeMethod::PARTITION_RANDOM) {
         ret = BUF_PRINTF("PKEY RANDOM");
       } else if (OB_SUCC(ret) && dist_method_ == ObPQDistributeMethod::PARTITION_HASH) {
@@ -344,6 +339,13 @@ int ObLogExchange::print_annotation_keys(char *buf,
   return ret;
 }
 
+/* If using merge sort, then set local = False, range = False
+ * If using task sort and range order is True, then set local = False, range = False
+ * Otherwise,
+ * local,range    | inherit          | inherit          | True, False      | True, False |
+ * EXCHANGE IN    | LOCAL/REMOTE/ALL | DISTRUBUTE       | LOCAL/REMOTE/ALL | DISTRUBUTE  |
+ * EXCHANGE OUT   | LOCAL/REMOTE/ALL | LOCAL/REMOTE/ALL | DISTRUBUTE       | DISTRUBUTE  |
+*/
 int ObLogExchange::compute_op_ordering()
 {
   int ret = OB_SUCCESS;
@@ -356,7 +358,9 @@ int ObLogExchange::compute_op_ordering()
   } else if (is_producer()) {
     // for FULL_INPUT_SAMPLE, we cache all rows in transmit and send in random range
     // to avoid send to one worker at one time if input order is the same with %sort_keys_
-    is_local_order_ = FULL_INPUT_SAMPLE == sample_type_;
+    if (FULL_INPUT_SAMPLE == sample_type_) {
+      is_local_order_ = true;
+    }
   } else if (is_consumer()) {
     if (is_merge_sort_) {
       if (OB_UNLIKELY(sort_keys_.empty())) {
@@ -368,6 +372,9 @@ int ObLogExchange::compute_op_ordering()
         is_local_order_ = false;
         is_range_order_ = false;
       }
+    } else if (is_task_order_) {
+      is_local_order_ = false;
+      is_range_order_ = false;
     } else if (!get_op_ordering().empty() && child->is_distributed()) {
       is_local_order_ = true;
       is_range_order_ = false;
@@ -389,7 +396,7 @@ int ObLogExchange::compute_op_parallel_and_server_info()
     } else { /*do nothing*/ }
   } else if (is_pq_local()) {
     set_parallel(ObGlobalHint::DEFAULT_PARALLEL);
-    set_available_parallel(child->get_parallel());
+    set_available_parallel(child->get_available_parallel());
     set_server_cnt(1);
     static_cast<ObLogExchange*>(child)->set_in_server_cnt(1);
     get_server_list().reuse();
@@ -399,7 +406,7 @@ int ObLogExchange::compute_op_parallel_and_server_info()
   } else {
     // set_exchange_info not set these info, use child parallel and server info.
     if (OB_FAIL(ret)) {
-    } else if (is_pq_hash_dist()) {
+    } else if ((is_pq_hash_dist() && !is_slave_mapping()) || is_pq_random()) {
       server_list_.reuse();
       common::ObAddr all_server_list;
       all_server_list.set_max(); // a special ALL server list indicating hash data distribution
@@ -422,8 +429,10 @@ int ObLogExchange::compute_op_parallel_and_server_info()
         LOG_WARN("get unexpected exchange above match all sharding", K(ret));
       } else if (child->is_single()) {
         set_parallel(child->get_available_parallel());
+        set_available_parallel(child->get_available_parallel());
       } else {
         set_parallel(child->get_parallel());
+        set_available_parallel(child->get_available_parallel());
       }
     }
   }
@@ -458,8 +467,9 @@ int ObLogExchange::do_re_est_cost(EstimateCostInfo &param, double &card, double 
     double child_cost = child->get_cost();
     const int64_t parallel = param.need_parallel_;
     param.need_parallel_ = ObGlobalHint::UNSET_PARALLEL;
-    if (is_block_op()) {
-      param.need_row_count_ = -1; //reset need row count
+    //forbit limit re estimate cost
+    if (is_producer() || is_block_op()) {
+      param.need_row_count_ = -1;
     }
     if (OB_FAIL(SMART_CALL(child->re_est_cost(param, child_card, child_cost)))) {
       LOG_WARN("failed to re est exchange cost", K(ret));
@@ -637,6 +647,8 @@ int ObLogExchange::get_op_exprs(ObIArray<ObRawExpr*> &all_exprs)
     LOG_WARN("failed to push back exprs", K(ret));
   } else if (NULL != partition_id_expr_ && OB_FAIL(all_exprs.push_back(partition_id_expr_))) {
     LOG_WARN("failed to push back expr", K(ret));
+  } else if (NULL != ddl_slice_id_expr_ && OB_FAIL(all_exprs.push_back(ddl_slice_id_expr_))) {
+    LOG_WARN("failed to push back exprs", K(ret));
   } else if (NULL != random_expr_ && OB_FAIL(all_exprs.push_back(random_expr_))) {
     LOG_WARN("failed to push back expr", K(ret));
   } else {
@@ -875,8 +887,7 @@ int ObLogExchange::add_px_table_location(ObLogicalOperator *op,
         const ObDMLStmt *cur_stmt = NULL;
         const ObDataTypeCastParams dtc_params = ObBasicSessionInfo::create_dtc_params(
             get_plan()->get_optimizer_context().get_session_info());
-        int64_t ref_table_id = table_scan->get_is_index_global() ? table_scan->get_index_table_id() :
-            table_scan->get_ref_table_id();
+        int64_t ref_table_id = table_scan->get_index_table_id();
         if (cur_idx >= stmts.count()) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("stmts idx is unexpected", K(cur_idx), K(stmts.count()));
@@ -922,7 +933,7 @@ int ObLogExchange::find_need_drop_expr_idxs(ObLogicalOperator *op,
   if (OB_ISNULL(op->get_child(0))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null op", K(ret));
-  } else if (OB_FAIL(op->get_child(0)->check_has_exchange_below(left_has_exchange))) {
+  } else if (OB_FAIL(op->get_child(0)->check_has_op_below(log_op_def::LOG_EXCHANGE, left_has_exchange))) {
     LOG_WARN("fail to check has exchange below");
   } else if (!left_has_exchange) {
     if (type == log_op_def::LOG_SUBPLAN_FILTER) {
@@ -1028,17 +1039,29 @@ int ObLogExchange::allocate_startup_expr_post()
 int ObLogExchange::is_my_fixed_expr(const ObRawExpr *expr, bool &is_fixed)
 {
   int ret = OB_SUCCESS;
-  is_fixed = expr == calc_part_id_expr_ ||
-             expr == partition_id_expr_ ||
-             expr == random_expr_;
+  if (OB_ISNULL(expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else {
+    is_fixed = expr == calc_part_id_expr_ ||
+               expr == partition_id_expr_ ||
+               expr == ddl_slice_id_expr_ ||
+               expr == random_expr_ ||
+               T_OP_OUTPUT_PACK == expr->get_expr_type();
+    for (int64_t i = 0; OB_SUCC(ret) && !is_fixed && i < hash_dist_exprs_.count(); i++) {
+      if (OB_ISNULL(hash_dist_exprs_.at(i).expr_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null", K(ret));
+      } else {
+        is_fixed = expr == hash_dist_exprs_.at(i).expr_;
+      }
+    }
+  }
   return OB_SUCCESS;
 }
 
 bool ObLogExchange::support_rich_format_vectorize() const {
-  bool res = !(dist_method_ == ObPQDistributeMethod::SM_BROADCAST ||
-          dist_method_ == ObPQDistributeMethod::PARTITION_RANDOM ||
-          dist_method_ == ObPQDistributeMethod::PARTITION_RANGE ||
-          dist_method_ == ObPQDistributeMethod::PARTITION_HASH);
+  bool res = !(dist_method_ == ObPQDistributeMethod::SM_BROADCAST);
   int tmp_ret = abs(OB_E(EventTable::EN_OFS_IO_SUBMIT) OB_SUCCESS);
   if (tmp_ret & (1 << dist_method_)) {
     res = false;
@@ -1086,6 +1109,17 @@ int ObLogExchange::close_px_resource_analyze(CLOSE_PX_RESOURCE_ANALYZE_DECLARE_A
     }
     LOG_TRACE("[PxResAnaly] px coord close_px_resource_analyze", K(get_op_id()), KPC(px_info_),
               K(append_map), K(cur_parallel_thread_count), K(cur_parallel_group_count));
+    }
+  return ret;
+}
+
+int ObLogExchange::check_use_child_ordering(bool &used, int64_t &inherit_child_ordering_index)
+{
+  int ret = OB_SUCCESS;
+  used = true;
+  inherit_child_ordering_index = first_child;
+  if (is_producer() || !is_merge_sort()) {
+    used = false;
   }
   return ret;
 }

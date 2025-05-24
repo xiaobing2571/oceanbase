@@ -11,24 +11,10 @@
  */
 
 #define USING_LOG_PREFIX CLOG
-#include "lib/ob_define.h"
-#include "lib/ob_errno.h"
-#include "lib/oblog/ob_log_module.h"
-#include "lib/utility/ob_macro_utils.h"
-#include "lib/time/ob_time_utility.h"
-#include "logservice/palf_handle_guard.h"
-#include "ob_restore_log_function.h"
 #include "ob_log_restore_net_driver.h"
-#include "share/ob_ls_id.h"
-#include "share/rc/ob_tenant_base.h"
-#include "storage/tx_storage/ob_ls_service.h"    // ObLSService
 #include "logservice/ob_log_service.h"      // ObLogService
-#include "share/restore/ob_log_restore_source.h"   // ObLogRestoreSourceType
 #include "logservice/logfetcher/ob_log_fetcher.h"  // ObLogFetcher
-#include "observer/omt/ob_tenant_config_mgr.h"  // tenant_config
 
-#include "lib/mysqlclient/ob_mysql_proxy.h"
-#include "lib/string/ob_sql_string.h"    // ObSqlString
 
 namespace oceanbase
 {
@@ -283,7 +269,7 @@ int ObLogRestoreNetDriver::refresh_fetcher_if_needed_(const share::ObRestoreSour
 int ObLogRestoreNetDriver::refresh_proxy_(const share::ObRestoreSourceServiceAttr &source)
 {
   int ret = OB_SUCCESS;
-  const char *db_name = common::ObCompatibilityMode::ORACLE_MODE == source.user_.mode_ ? "SYS" : "OCEANBASE";
+  const char *db_name = common::ObCompatibilityMode::ORACLE_MODE == source.user_.mode_ ? OB_ORA_SYS_SCHEMA_NAME : OB_SYS_DATABASE_NAME;
   char passwd[OB_MAX_PASSWORD_LENGTH + 1] = {0};
   ObSqlString user;
   if (OB_FAIL(source.get_password(passwd, sizeof(passwd)))) {
@@ -349,7 +335,8 @@ int ObLogRestoreNetDriver::add_ls_if_needed_with_lock_(const share::ObLSID &id, 
   share::SCN end_scn;
   palf::PalfHandleGuard palf_handle_guard;
   if (OB_ISNULL(fetcher_)) {
-    LOG_ERROR("fetcher is NULL", K(fetcher_));
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("fetcher is NULL", K(ret), K(fetcher_));
   } else if (fetcher_->is_ls_exist(id)) {
     //TODO check ls in fetcher with proposal_id
   } else if (OB_FAIL(log_service_->open_palf(id, palf_handle_guard))) {
@@ -391,7 +378,10 @@ int ObLogRestoreNetDriver::init_fetcher_if_needed_(const int64_t cluster_id, con
     const logfetcher::ClientFetchingMode fetching_mode = logfetcher::ClientFetchingMode::FETCHING_MODE_INTEGRATED;
     share::ObBackupPathString archive_dest;
     common::ObMySQLProxy *proxy = NULL;
+    omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
     cfg_.fetch_log_rpc_timeout_sec = get_rpc_timeout_sec_();
+    cfg_.logfetcher_parallel_log_transport = tenant_config.is_valid() ?
+        tenant_config->_ob_enable_standby_db_parallel_log_transport : 0;
 
     if (OB_FAIL(proxy_.get_sql_proxy(proxy))) {
       LOG_WARN("get sql proxy failed");
@@ -434,7 +424,13 @@ void ObLogRestoreNetDriver::delete_fetcher_if_needed_with_lock_()
 void ObLogRestoreNetDriver::update_config_()
 {
   if (NULL != fetcher_) {
+    omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id_));
     const int64_t fetch_log_rpc_timeout_sec = get_rpc_timeout_sec_();
+    const bool standby_db_parallel_log_transport = tenant_config.is_valid() ?
+        tenant_config->_ob_enable_standby_db_parallel_log_transport : false;
+    if (standby_db_parallel_log_transport != cfg_.logfetcher_parallel_log_transport) {
+      cfg_.logfetcher_parallel_log_transport = standby_db_parallel_log_transport;
+    }
     if (fetch_log_rpc_timeout_sec != cfg_.fetch_log_rpc_timeout_sec) {
       cfg_.fetch_log_rpc_timeout_sec = fetch_log_rpc_timeout_sec;
       fetcher_->configure(cfg_);
@@ -445,10 +441,10 @@ void ObLogRestoreNetDriver::update_config_()
 int64_t ObLogRestoreNetDriver::get_rpc_timeout_sec_()
 {
   int64_t rpc_timeout = 0;
-  const int64_t DEFAULT_FETECH_LOG_RPC_TIMEOUT = 15;   // 15s
+  const int64_t DEFAULT_FETCH_LOG_RPC_TIMEOUT = 15;   // 15s
   omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id_));
   if (!tenant_config.is_valid()) {
-    rpc_timeout = DEFAULT_FETECH_LOG_RPC_TIMEOUT;
+    rpc_timeout = DEFAULT_FETCH_LOG_RPC_TIMEOUT;
   } else {
     rpc_timeout = tenant_config->standby_db_fetch_log_rpc_timeout / 1000 / 1000L;
   }
@@ -651,7 +647,7 @@ void ObLogRestoreNetDriver::LogErrHandler::handle_error(const share::ObLSID &ls_
       if (palf::LSN(palf::LOG_INVALID_LSN_VAL) == lsn ) {
         palf::LSN tmp_lsn = palf::LSN(palf::PALF_INITIAL_LSN_VAL);
         palf::PalfHandleGuard palf_handle_guard;
-        if (OB_FAIL(OB_FAIL(MTL(ObLogService*)->open_palf(ls_id, palf_handle_guard)))) {
+        if (OB_FAIL(MTL(ObLogService*)->open_palf(ls_id, palf_handle_guard))) {
           LOG_WARN("open palf failed", K(ls_id));
         } else if (OB_FAIL(palf_handle_guard.get_end_lsn(tmp_lsn))) {
           LOG_WARN("get end lsn failed", K(ls_id));

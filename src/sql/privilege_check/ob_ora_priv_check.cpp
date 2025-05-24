@@ -11,9 +11,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_SESSION
-#include "share/schema/ob_schema_getter_guard.h"
 #include "sql/privilege_check/ob_ora_priv_check.h"
-#include "share/schema/ob_sys_priv_type.h"
 #include "share/schema/ob_table_schema.h"
 #include "sql/engine/expr/ob_expr_user_can_access_obj.h"
 
@@ -1664,7 +1662,8 @@ int ObOraSysChecker::check_ora_obj_priv_for_create_view(
     const uint64_t obj_id,
     const uint64_t col_id,
     const uint64_t obj_type,
-    const uint64_t obj_owner_id)
+    const uint64_t obj_owner_id,
+    const ObIArray<uint64_t> &role_id_array)
 {
   int ret = OB_SUCCESS;
   UNUSED(database_name);
@@ -1676,6 +1675,7 @@ int ObOraSysChecker::check_ora_obj_priv_for_create_view(
       if (!is_owner) {
       /* 2. check sys priv */
         ObRawPrivArray priv_list;
+        ObRawObjPrivArray obj_p_list;
         if (!is_ora_sys_view_table(obj_id)) {
           OZ (priv_list.push_back(PRIV_ID_SELECT_ANY_TABLE));
           OZ (priv_list.push_back(PRIV_ID_INSERT_ANY_TABLE));
@@ -1695,7 +1695,6 @@ int ObOraSysChecker::check_ora_obj_priv_for_create_view(
         if (ret == OB_ERR_NO_PRIVILEGE) {
           /* 3. check obj priv */
           ret = OB_SUCCESS;
-          ObRawObjPrivArray obj_p_list;
           OZ (obj_p_list.push_back(OBJ_PRIV_ID_SELECT));
           OZ (obj_p_list.push_back(OBJ_PRIV_ID_INSERT));
           OZ (obj_p_list.push_back(OBJ_PRIV_ID_UPDATE));
@@ -1710,9 +1709,26 @@ int ObOraSysChecker::check_ora_obj_priv_for_create_view(
                                            obj_id, col_id, obj_p_list),
                 tenant_id, user_id, obj_type, obj_id, col_id, obj_p_list);  
         }
-        /* 调整错误码 to table or view not exists */
+        /* 4. check role priv for a proper error code */
+        /* if user can access object via a role, return OB_ERR_NO_PRIVILEGE, else OB_TABLE_NOT_EXIST */
         if (ret == OB_ERR_EMPTY_QUERY) {
-          ret = OB_TABLE_NOT_EXIST;
+          ret = OB_SUCCESS;
+          OZX1 (check_plist_or_in_roles(guard, tenant_id, user_id, priv_list, role_id_array),
+                OB_ERR_NO_PRIVILEGE);
+          if (OB_SUCC(ret)) {
+            ret = OB_ERR_NO_PRIVILEGE;
+          } else if (ret == OB_ERR_NO_PRIVILEGE) {
+            ret = OB_SUCCESS;
+            OZX1 (check_obj_plist_or_in_roles(guard, tenant_id, user_id, obj_type, obj_id, col_id,
+                                              obj_p_list, role_id_array), OB_ERR_NO_PRIVILEGE);
+            if (OB_SUCC(ret)) {
+              ret = OB_ERR_NO_PRIVILEGE;
+            } else if (ret == OB_ERR_NO_PRIVILEGE) {
+              /* 调整错误码 to table or view not exists */
+              ret = OB_TABLE_NOT_EXIST;
+            }
+          } else {
+          }
         }
       }
     } else if (obj_type == static_cast<uint64_t>(ObObjectType::SEQUENCE)) {
@@ -1971,15 +1987,18 @@ int ObOraSysChecker::check_ora_obj_privs_or(
             } 
           }
         } 
-      } else if (obj_type == static_cast<uint64_t>(ObObjectType::DIRECTORY)) {
-        /* directory对象的owner是sys */
+      } else if (obj_type == static_cast<uint64_t>(ObObjectType::DIRECTORY)
+                 || obj_type == static_cast<uint64_t>(ObObjectType::CATALOG)) {
+        /* directory, catalog对象的owner是sys */
         OZ (check_obj_plist_or(guard, tenant_id, user_id, obj_type, obj_id,
                                   col_id, raw_obj_priv_array, role_id_array),
             tenant_id, user_id, obj_type, obj_id, col_id, raw_obj_priv_array, NO_OPTION);
       
         /* 调整错误码 */
         if (!OB_SUCC(ret)) {
-          ret = OB_ERR_DIRECTORY_ACCESS_DENIED;
+          ret = (obj_type == static_cast<uint64_t>(ObObjectType::DIRECTORY))
+                ? OB_ERR_DIRECTORY_ACCESS_DENIED
+                : OB_ERR_NO_CATALOG_PRIVILEGE;
         }
       } else {
         ret = OB_ERR_NO_PRIVILEGE;
@@ -2029,7 +2048,8 @@ int ObOraSysChecker::check_ora_obj_priv(
                                             obj_id, 
                                             col_id,
                                             obj_type,
-                                            obj_owner_id));
+                                            obj_owner_id,
+                                            role_id_array));
     } else {
       bool is_owner = is_owner_user(user_id, obj_owner_id);
       
@@ -2121,15 +2141,18 @@ int ObOraSysChecker::check_ora_obj_priv(
               }
             }
           }
-        } else if (obj_type == static_cast<uint64_t>(ObObjectType::DIRECTORY)) {
-          /* directory对象的owner是sys */
+        } else if (obj_type == static_cast<uint64_t>(ObObjectType::DIRECTORY)
+                   || obj_type == static_cast<uint64_t>(ObObjectType::CATALOG)) {
+          /* directory, catalog对象的owner是sys */
           OZ (check_obj_p1(guard, tenant_id, user_id, obj_type,
                           obj_id, col_id, raw_obj_priv, NO_OPTION, role_id_array),
               tenant_id, user_id, obj_type, obj_id, col_id, raw_obj_priv, NO_OPTION);
         
           /* 调整错误码 */
           if (!OB_SUCC(ret)) {
-            ret = OB_ERR_DIRECTORY_ACCESS_DENIED;
+            ret = (obj_type == static_cast<uint64_t>(ObObjectType::DIRECTORY))
+                  ? OB_ERR_DIRECTORY_ACCESS_DENIED
+                  : OB_ERR_NO_CATALOG_PRIVILEGE;
           }
         } else {
           ret = OB_TABLE_NOT_EXIST;
@@ -2278,6 +2301,7 @@ int ObOraSysChecker::check_ora_ddl_priv(
         DEFINE_PUB_CHECK_CMD(PRIV_ID_CREATE_USER);
         break;
       }
+      case stmt::T_ALTER_USER_PROXY:
       case stmt::T_ALTER_USER_PROFILE:
       case stmt::T_ALTER_USER_PRIMARY_ZONE: 
       case stmt::T_ALTER_USER: {
@@ -2390,6 +2414,12 @@ int ObOraSysChecker::check_ora_ddl_priv(
       }
       case stmt::T_DROP_MLOG: {
         DEFINE_DROP_CHECK_CMD(PRIV_ID_DROP_ANY_TABLE);
+        break;
+      }
+      case stmt::T_CREATE_CATALOG:
+      case stmt::T_ALTER_CATALOG:
+      case stmt::T_DROP_CATALOG: {
+        DEFINE_PUB_CHECK_CMD(PRIV_ID_CREATE_CATALOG);
         break;
       }
       default: {
@@ -2681,9 +2711,9 @@ int ObOraSysChecker::check_ora_grant_obj_priv(
     const uint64_t obj_id,
     const uint64_t obj_type,
     const ObRawObjPrivArray &table_priv_array,
-    const ObSEArray<uint64_t, 4> &ins_col_ids,
-    const ObSEArray<uint64_t, 4> &upd_col_ids,
-    const ObSEArray<uint64_t, 4> &ref_col_ids,
+    const ObIArray<uint64_t> &ins_col_ids,
+    const ObIArray<uint64_t> &upd_col_ids,
+    const ObIArray<uint64_t> &ref_col_ids,
     uint64_t &grantor_id_out,
     const ObIArray<uint64_t> &role_id_array)
 {

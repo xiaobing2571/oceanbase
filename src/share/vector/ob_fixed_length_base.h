@@ -41,13 +41,13 @@ public:
                          const int64_t fixed_len, const int64_t start_idx,
                          const int64_t read_rows, char *data)
   {
-    has_null_ = has_null;
-    // TODO: fix deep copy bug
-    //nulls_->deep_copy(nulls, start_idx, start_idx + read_rows);
+    UNUSED(has_null);
+    has_null_ = false;
     nulls_->reset(read_rows);
     for (int64_t i = 0; i < read_rows; ++i) {
       if (nulls.at(start_idx + i)) {
         nulls_->set(i);
+        has_null_ = true;
       }
     }
     len_ = static_cast<int32_t> (fixed_len);
@@ -60,11 +60,15 @@ public:
       set_payload(idx, datum.ptr_, datum.len_);
     }
   }
-  virtual void to_rows(const sql::RowMeta &row_meta,
+  virtual int to_rows(const sql::RowMeta &row_meta,
                        sql::ObCompactRow **stored_rows,
                        const uint16_t selector[],
                        const int64_t size,
                        const int64_t col_idx) const override final;
+
+  virtual int to_rows(const sql::RowMeta &row_meta, sql::ObCompactRow **stored_rows,
+                       const int64_t size, const int64_t col_idx) const override final;
+
   inline void from(ObLength len, char *data)
   {
     len_ = len;

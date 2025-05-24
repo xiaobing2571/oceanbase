@@ -73219,7 +73219,7 @@ SQL: select sum(c1), count(*) from t1 group by c2 order by c2 limit 100;
           "dl":"",
           "type":0
         },
-        "is_nested_aggr":false,
+        "expr_in_inner_stmt":false,
         "pl_agg_udf_expr":null
       },
       "is_alias":false,
@@ -73280,7 +73280,7 @@ SQL: select sum(c1), count(*) from t1 group by c2 order by c2 limit 100;
           "dl":"",
           "type":0
         },
-        "is_nested_aggr":false,
+        "expr_in_inner_stmt":false,
         "pl_agg_udf_expr":null
       },
       "is_alias":false,
@@ -73466,7 +73466,7 @@ SQL: select sum(c1), count(*) from t1 group by c2 order by c2 limit 100;
         "dl":"",
         "type":0
       },
-      "is_nested_aggr":false,
+      "expr_in_inner_stmt":false,
       "pl_agg_udf_expr":null
     },
      {
@@ -73512,7 +73512,7 @@ SQL: select sum(c1), count(*) from t1 group by c2 order by c2 limit 100;
         "dl":"",
         "type":0
       },
-      "is_nested_aggr":false,
+      "expr_in_inner_stmt":false,
       "pl_agg_udf_expr":null
     }
   ],

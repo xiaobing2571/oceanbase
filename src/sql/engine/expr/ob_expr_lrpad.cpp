@@ -13,13 +13,8 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "sql/engine/expr/ob_expr_lrpad.h"
-#include "sql/engine/expr/ob_expr_util.h"
 #include "sql/engine/ob_exec_context.h"
-#include <limits.h>
-#include <string.h>
 
-#include "sql/session/ob_sql_session_info.h"
-#include "lib/worker.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 
 namespace oceanbase
@@ -199,18 +194,21 @@ int ObExprBaseLRpad::get_origin_len_obj(ObObj &len_obj) const
   if (OB_ISNULL(expr = get_raw_expr())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("fail to get_raw_expr", K(ret));
-  } else if (expr->get_children_count() >= 2 && OB_NOT_NULL(expr = expr->get_param_expr(1))
-             && expr->get_expr_type() == T_FUN_SYS_CAST && CM_IS_IMPLICIT_CAST(expr->get_extra())) {
+  } else if (expr->get_param_count() >= 2 && OB_NOT_NULL(expr = expr->get_param_expr(1))
+             && expr->get_expr_type() == T_FUN_SYS_CAST && CM_IS_IMPLICIT_CAST(expr->get_cast_mode())) {
     do {
-      if (expr->get_children_count() >= 1
+      if (expr->get_param_count() >= 1
           && OB_ISNULL(expr = expr->get_param_expr(0))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("fail to get_param_expr", K(ret));
       }
     } while (OB_SUCC(ret) && T_FUN_SYS_CAST == expr->get_expr_type()
-             && CM_IS_IMPLICIT_CAST(expr->get_extra()));
-    if (OB_SUCC(ret)) {
-      len_obj = expr->get_result_type().get_param();
+             && CM_IS_IMPLICIT_CAST(expr->get_cast_mode()));
+    if (OB_FAIL(ret)) {
+    } else if (!expr->is_const_raw_expr()) {
+      len_obj.set_null();
+    } else {
+      len_obj = static_cast<ObConstRawExpr *>(expr)->get_param();
     }
   }
   return ret;
@@ -269,8 +267,7 @@ int ObExprBaseLRpad::calc_type(ObExprResType &type,
       ObSEArray<ObExprResType, 2> types;
       OZ(types.push_back(text));
       OZ(types.push_back(*pad_text));
-      OZ(aggregate_charsets_for_string_result(type, &types.at(0), 2,
-                                              type_ctx.get_coll_type()));
+      OZ(aggregate_charsets_for_string_result(type, &types.at(0), 2, type_ctx));
       OX(text.set_calc_collation_type(type.get_collation_type()));
       OX(pad_text->set_calc_collation_type(type.get_collation_type()));
       if (OB_SUCC(ret)) {
@@ -478,7 +475,7 @@ int ObExprBaseLRpad::get_padding_info_mysql(const ObCollationType &cs,
              || OB_UNLIKELY(pad_size <= 0)) {
     // this should been resolve outside
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("wrong len", K(ret), K(len), K(text_len));
+    LOG_WARN("wrong len", K(ret), K(len), K(text_len), K(pad_len), K(pad_size));
   } else {
     repeat_count = std::min((len - text_len) / pad_len, (max_result_size - text_size) / pad_size);
     int64_t remain_len = len - (text_len + pad_len * repeat_count);
@@ -1043,6 +1040,7 @@ int ObExprOracleLpad::calc_result_typeN(ObExprResType &type,
     if (OB_ISNULL(types_array)
         || OB_ISNULL(types_array + 1)
         || OB_ISNULL(types_array + 2)) {
+      ret = OB_ERR_UNEXPECTED;
       LOG_WARN("NULL param", K(ret), K(types_array[0]), K(types_array[1]), K(types_array[2]));
     } else if (OB_FAIL(ObExprBaseLRpad::calc_type(
                 type, types_array[0], types_array[1], types_array + 2, type_ctx))) {
@@ -1051,6 +1049,7 @@ int ObExprOracleLpad::calc_result_typeN(ObExprResType &type,
   } else if (param_num == 2) {
     if (OB_ISNULL(types_array)
         || OB_ISNULL(types_array + 1)) {
+      ret = OB_ERR_UNEXPECTED;
       LOG_WARN("NULL param", K(ret), K(types_array[0]), K(types_array[1]));
     } else if (OB_FAIL(ObExprBaseLRpad::calc_type(
                 type, types_array[0], types_array[1], NULL, type_ctx))) {
@@ -1120,6 +1119,7 @@ int ObExprOracleRpad::calc_result_typeN(ObExprResType &type,
     if (OB_ISNULL(types_array)
         || OB_ISNULL(types_array + 1)
         || OB_ISNULL(types_array + 2)) {
+      ret = OB_ERR_UNEXPECTED;
       LOG_WARN("NULL param", K(ret), K(types_array[0]), K(types_array[1]), K(types_array[2]));
     } else if (OB_FAIL(ObExprBaseLRpad::calc_type(
                 type, types_array[0], types_array[1], &(types_array[2]), type_ctx))) {
@@ -1128,6 +1128,7 @@ int ObExprOracleRpad::calc_result_typeN(ObExprResType &type,
   } else if (param_num == 2) {
     if (OB_ISNULL(types_array)
         || OB_ISNULL(types_array + 1)) {
+      ret = OB_ERR_UNEXPECTED;
       LOG_WARN("NULL param", K(ret), K(types_array[0]), K(types_array[1]));
     } else if (OB_FAIL(ObExprBaseLRpad::calc_type(
                 type, types_array[0], types_array[1], NULL, type_ctx))) {

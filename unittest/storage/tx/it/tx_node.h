@@ -12,6 +12,7 @@
 
 #ifndef OCEANBASE_TRANSACTION_TEST_TX_NODE_DEFINE_
 #define OCEANBASE_TRANSACTION_TEST_TX_NODE_DEFINE_
+#include <sstream>
 #define private public
 #define protected public
 #include "lib/objectpool/ob_server_object_pool.h"
@@ -29,12 +30,14 @@
 #include "storage/tx_storage/ob_tenant_freezer.h"
 #include "lib/hash/ob_hashmap.h"
 #include "lib/lock/ob_scond.h"
-#include "storage/tx_storage/ob_ls_map.h"
+#include "storage/tx_storage/ob_ls_service.h"
 
 #include "../mock_utils/msg_bus.h"
 #include "../mock_utils/basic_fake_define.h"
 #include "../mock_utils/ob_fake_tx_rpc.h"
 #include "share/allocator/ob_shared_memory_allocator_mgr.h"
+#include "share/stat/ob_opt_stat_monitor_manager.h"
+#include "storage/memtable/ob_lock_wait_mgr.h"
 
 namespace oceanbase {
 using namespace transaction;
@@ -87,6 +90,7 @@ public:
   }
   void wakeup() { if (ATOMIC_BCAS(&is_sleeping_, true, false)) { cond_.signal(); } }
   void set_name(ObString &name) { name_ = name; }
+  bool is_idle() { return ATOMIC_LOAD(&is_sleeping_); }
   TO_STRING_KV(KP(this), K_(name), KP_(queue), K(queue_->size()), K_(stop));
 private:
   ObString name_;
@@ -139,7 +143,7 @@ public:
 
 public:
   TO_STRING_KV(KP(this), K(addr_), K_(ls_id), K(msg_queue_.size()));
-  ObString get_identifer_str() const;
+  ObString get_identifer_str();
   ObTxDescGuard get_tx_guard();
   // the simple r/w interface
   int read(ObTxDesc &tx, const int64_t key, int64_t &value, const ObTxIsolationLevel iso = ObTxIsolationLevel::RC);
@@ -262,11 +266,11 @@ public:
   // helpers
   int64_t ts_after_us(int64_t d) const { return ObTimeUtility::current_time() + d; }
   int64_t ts_after_ms(int64_t d) const { return ObTimeUtility::current_time() + d * 1000; }
+
 private:
   static void reset_localtion_adapter() {
     get_location_adapter_().reset();
   }
-
 public:
   void add_drop_msg_type(TX_MSG_TYPE type) {
     drop_msg_type_set_.set_refactored(type);
@@ -274,8 +278,10 @@ public:
   void del_drop_msg_type(TX_MSG_TYPE type) {
     drop_msg_type_set_.erase_refactored(type);
   }
+  void wait_all_msg_consumed();
+  void wait_tx_log_synced();
 public:
-  ObString name_; char name_buf_[32];
+  ObString name_; char name_buf_[MAX_IP_PORT_LENGTH];
   ObAddr addr_;
   ObLSID ls_id_;
   int64_t tenant_id_;
@@ -300,15 +306,18 @@ public:
   ObLockTable fake_lock_table_;
   ObFakeTxTable fake_tx_table_;
   ObTenantFreezer fake_tenant_freezer_;
+  ObSharedMemAllocMgr fake_shared_mem_alloc_mgr_;
   ObLS fake_ls_;
   ObFreezer fake_freezer_;
   ObTxNodeRole role_;
   ObFakeTxLogAdapter* fake_tx_log_adapter_;
   ObTabletMemtableMgr fake_memtable_mgr_;
-  storage::ObLS mock_ls_; // TODO mock required member on LS
+  ObOptStatMonitorManager fake_opt_stat_mgr_;
+  ObLockWaitMgr fake_lock_wait_mgr_;
+  ObLSService ls_service_;
   common::hash::ObHashSet<int16_t> drop_msg_type_set_;
-  ObLSMap fake_ls_map_;
   std::function<int(int,void *)> extra_msg_handler_;
+  char buf_[256];
 };
 
 } // transaction

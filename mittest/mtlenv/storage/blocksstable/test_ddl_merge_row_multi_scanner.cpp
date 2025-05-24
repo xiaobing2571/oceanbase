@@ -10,13 +10,10 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include <gtest/gtest.h>
 #define private public
 #define protected public
 
-#include "storage/access/ob_index_tree_prefetcher.h"
 #include "storage/access/ob_sstable_row_multi_scanner.h"
-#include "storage/access/ob_sstable_row_multi_getter.h"
 #include "ob_index_block_data_prepare.h"
 
 namespace oceanbase
@@ -68,6 +65,7 @@ private:
   ObArenaAllocator allocator_;
   ObDatumRow start_row_;
   ObDatumRow end_row_;
+  ObSSTable *ddl_sstable_ptr_array_[1];
 };
 
 TestDDLMergeRowMultiScanner::TestDDLMergeRowMultiScanner()
@@ -75,7 +73,7 @@ TestDDLMergeRowMultiScanner::TestDDLMergeRowMultiScanner()
 {
   is_ddl_merge_data_ = true;
   max_row_cnt_ = 150000;
-  max_partial_row_cnt_ = 78881;
+  max_partial_row_cnt_ = 77873;
   co_sstable_row_offset_ = max_partial_row_cnt_ - 1;
   partial_kv_start_idx_ = 3;
 }
@@ -107,10 +105,17 @@ void TestDDLMergeRowMultiScanner::SetUp()
 
   ASSERT_EQ(OB_SUCCESS, start_row_.init(allocator_, TEST_COLUMN_CNT));
   ASSERT_EQ(OB_SUCCESS, end_row_.init(allocator_, TEST_COLUMN_CNT));
+
+  ddl_sstable_ptr_array_[0] = &partial_sstable_;
+  tablet_handle_.get_obj()->table_store_addr_.get_ptr()->ddl_sstables_.reset();
+  tablet_handle_.get_obj()->table_store_addr_.get_ptr()->ddl_sstables_.sstable_array_ = ddl_sstable_ptr_array_;
+  tablet_handle_.get_obj()->table_store_addr_.get_ptr()->ddl_sstables_.cnt_ = 1;
+  tablet_handle_.get_obj()->table_store_addr_.get_ptr()->ddl_sstables_.is_inited_ = true;
 }
 
 void TestDDLMergeRowMultiScanner::TearDown()
 {
+  tablet_handle_.get_obj()->table_store_addr_.get_ptr()->ddl_sstables_.reset();
   tablet_handle_.get_obj()->ddl_kv_count_ = 0;
   tablet_handle_.get_obj()->ddl_kvs_ = nullptr;
   tablet_handle_.reset();
@@ -166,8 +171,8 @@ void TestDDLMergeRowMultiScanner::test_one_case(
   for (int64_t i = 0; i < start_seeds.count(); ++i) {
     ASSERT_EQ(OB_SUCCESS, ranges.push_back(mscan_ranges[i]));
   }
-  ASSERT_EQ(OB_SUCCESS, scanner.inner_open(iter_param_, context_, &sstable_, &ranges));
-  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.inner_open(iter_param_, context_, &partial_sstable_, &ranges));
+  ASSERT_EQ(OB_SUCCESS, scanner.init(iter_param_, context_, &sstable_, &ranges));
+  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.init(iter_param_, context_, &partial_sstable_, &ranges));
   for (int64_t i = 0; i < start_seeds.count(); ++i) {
     for (int64_t j = 0; j < count_per_range; ++j) {
       const int64_t k = is_reverse_scan ? start_seeds.at(i) + count_per_range - j - 1 : start_seeds.at(i) + j;
@@ -559,12 +564,12 @@ void TestDDLMergeRowMultiScanner::test_multi_scan_multi_get_with_scan(
     ASSERT_EQ(OB_SUCCESS, ret);
   }
   STORAGE_LOG(INFO, "multi scan begin");
-  ASSERT_EQ(OB_SUCCESS, scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, scanner.init(
           iter_param_,
           context_,
           &sstable_,
           &ranges));
-  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.init(
           iter_param_,
           context_,
           &partial_sstable_,
@@ -610,12 +615,12 @@ void TestDDLMergeRowMultiScanner::test_multi_scan_multi_get_with_scan(
     ASSERT_EQ(OB_SUCCESS, tmp_rowkey.deep_copy(mget_ranges[i].end_key_, allocator_));
     ASSERT_EQ(OB_SUCCESS, ranges.push_back(mget_ranges[i]));
   }
-  ASSERT_EQ(OB_SUCCESS, scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, scanner.init(
           iter_param_,
           context_,
           &sstable_,
           &ranges));
-  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.init(
           iter_param_,
           context_,
           &partial_sstable_,
@@ -664,12 +669,12 @@ void TestDDLMergeRowMultiScanner::test_multi_scan_multi_get_with_scan(
     ASSERT_EQ(OB_SUCCESS, tmp_rowkey.deep_copy(mget_ranges[i].end_key_, allocator_));
     ASSERT_EQ(OB_SUCCESS, ranges.push_back(mget_ranges[i]));
   }
-  ASSERT_EQ(OB_SUCCESS, scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, scanner.init(
           iter_param_,
           context_,
           &sstable_,
           &ranges));
-  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.init(
           iter_param_,
           context_,
           &partial_sstable_,
@@ -719,12 +724,12 @@ void TestDDLMergeRowMultiScanner::test_multi_scan_multi_get_with_scan(
     ASSERT_EQ(OB_SUCCESS, tmp_rowkey.deep_copy(mget_ranges[i].end_key_, allocator_));
     ASSERT_EQ(OB_SUCCESS, ranges.push_back(mget_ranges[i]));
   }
-  ASSERT_EQ(OB_SUCCESS, scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, scanner.init(
           iter_param_,
           context_,
           &sstable_,
           &ranges));
-  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.init(
           iter_param_,
           context_,
           &partial_sstable_,

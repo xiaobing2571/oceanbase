@@ -14,7 +14,6 @@
 #include "sql/engine/cmd/ob_mlog_executor.h"
 #include "sql/resolver/ddl/ob_create_mlog_stmt.h"
 #include "sql/resolver/ddl/ob_drop_mlog_stmt.h"
-#include "sql/engine/ob_exec_context.h"
 #include "sql/resolver/ob_resolver_utils.h"
 #include "sql/engine/cmd/ob_ddl_executor_util.h"
 #include "sql/engine/cmd/ob_index_executor.h"
@@ -75,7 +74,7 @@ int ObCreateMLogExecutor::execute(ObExecContext &ctx, ObCreateMLogStmt &stmt)
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected schema version", KR(ret), K(create_mlog_res));
     } else if (OB_FAIL(ObDDLExecutorUtil::wait_ddl_finish(create_mlog_arg.tenant_id_,
-        create_mlog_res.task_id_, my_session, common_rpc_proxy))) {
+        create_mlog_res.task_id_, false/*do not need retry at executor*/, my_session, common_rpc_proxy))) {
       LOG_WARN("failed to wait ddl finish", KR(ret));
     }
   }

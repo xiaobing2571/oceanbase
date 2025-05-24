@@ -13,11 +13,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_group_by_checker.h"
 #include "sql/rewrite/ob_transform_utils.h"
-#include "sql/plan_cache/ob_plan_cache_util.h"
-#include "sql/ob_sql_context.h"
 #include "sql/rewrite/ob_stmt_comparer.h"
-#include "lib/utility/ob_macro_utils.h"
-#include "common/ob_smart_call.h"
 
 namespace oceanbase
 {
@@ -250,7 +246,8 @@ int ObGroupByChecker::check_group_by(const ParamStore *param_store,
         }
       }
     }
-    if (OB_FAIL(append(all_rollup_exprs, ref_stmt->get_rollup_exprs()))) {
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(append(all_rollup_exprs, ref_stmt->get_rollup_exprs()))) {
       LOG_WARN("failed to expr", K(ret));
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < ref_stmt->get_rollup_items_size(); ++i) {
@@ -555,9 +552,9 @@ int ObGroupByChecker::add_abs_equal_constraint_in_grouping_sets(ObConstRawExpr &
           if (lib::is_oracle_mode() && c_expr != nullptr &&
               expr.get_expr_type() == T_QUESTIONMARK && c_expr->get_expr_type() == T_QUESTIONMARK) {
             const ObObj &left_value = expr.get_value().is_unknown() ?
-                                      expr.get_result_type().get_param() : expr.get_value();
+                                      expr.get_param() : expr.get_value();
             const ObObj &right_value = c_expr->get_value().is_unknown() ?
-                                       c_expr->get_result_type().get_param() : c_expr->get_value();
+                                       c_expr->get_param() : c_expr->get_value();
             if (check_obj_abs_equal(left_value, right_value)) {
               // add abs equal constraint
               ObPCParamEqualInfo abs_equal_info;
@@ -742,6 +739,8 @@ int ObGroupByChecker::check_select_stmt(const ObSelectStmt *ref_stmt)
       visitor.add_scope(SCOPE_ORDERBY);
     } else {
       // 如果是subquery，则需要check所有expression
+      // following is not allow, keep the old logic
+      // select (select d2 from t2 where max(t1.c1)=t2.d1) as c3 from t1 group by c1,c2;
     }
     // if order by has siblings, then order by belongs to connect by, so don't check
     // eg: select max(c2) from t1 start with c1 = 1 connect by nocycle prior c1 = c2 order siblings by c1, c2;
@@ -905,6 +904,38 @@ int ObGroupByChecker::visit(ObCaseOpRawExpr &expr)
   return ret;
 }
 
+int ObGroupByChecker::visit(ObMatchFunRawExpr &expr)
+{
+  int ret = OB_SUCCESS;
+  if (find_in_group_by(expr) || find_in_rollup(expr) ||
+      find_in_cube(expr) || find_in_grouping_sets(expr)) {
+    set_skip_expr(&expr);
+  }
+  return ret;
+}
+
+int ObGroupByChecker::visit(ObUnpivotRawExpr &expr)
+{
+  int ret = OB_SUCCESS;
+  if (find_in_group_by(expr) || find_in_rollup(expr) ||
+      find_in_cube(expr) || find_in_grouping_sets(expr)) {
+    set_skip_expr(&expr);
+  }
+  return ret;
+}
+
+
+// following case is allowed
+// select max(max(data)) from test group by id order by id, max(max(data)) ;
+// select max(max(data)) from test group by id order by id;
+// select max(max(data)) from test group by id having id=1;
+// select sum(sum(data)) from test group by id order by sum(data);
+// select sum(sum(data)) from test group by id having max(data) = 4 order by max(max(data))
+// following case is blocked
+// select max(data) from test group by id order by max(max(data))
+// select max(data) from test group by id order by max(max(data)),max(data)
+// having orderby select的顺序检查
+// having一定在内层，order by如果包含max max就在外层，否则在内层，select在外层
 int ObGroupByChecker::visit(ObAggFunRawExpr &expr)
 {
   int ret = OB_SUCCESS;
@@ -921,10 +952,10 @@ int ObGroupByChecker::visit(ObAggFunRawExpr &expr)
     LOG_WARN("failed to get belongs to stmt", K(ret));
   } else if (belongs_to) {
     // expr is aggregate function in current stmt, then skip it
-    if (expr.is_nested_aggr()) {
+    if (expr.in_inner_stmt()) {
       set_skip_expr(&expr);
     } else if (has_nested_aggr_) {
-      //do nothing.
+      // do nothing
     } else {
       set_skip_expr(&expr);
     }

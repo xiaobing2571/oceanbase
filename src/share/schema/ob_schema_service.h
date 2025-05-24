@@ -24,6 +24,7 @@
 #include "share/schema/ob_table_schema.h"
 #include "share/schema/ob_column_schema.h"
 #include "share/schema/ob_routine_info.h"
+#include "share/schema/ob_catalog_schema_struct.h"
 
 namespace oceanbase
 {
@@ -119,6 +120,12 @@ enum ObSchemaOperationCategory
   ACT(OB_DDL_MODIFY_MATERIALIZED_VIEW_STATUS, = 62)              \
   ACT(OB_DDL_ADD_COLUMN_GROUP, = 63)                             \
   ACT(OB_DDL_DROP_COLUMN_GROUP, = 64)                            \
+  ACT(OB_DDL_EXCHANGE_PARTITION, = 65)                           \
+  ACT(OB_DDL_MODIFY_MVIEW_REFERENCE_TABLE_STATUS, = 66)          \
+  ACT(OB_DDL_MODIFY_INDEX_TYPE, = 67)                            \
+  ACT(OB_DDL_RECOVER_TABLE_END, = 68)                            \
+  ACT(OB_DDL_ALTER_PARTITION_POLICY, = 69)                       \
+  ACT(OB_DDL_ALTER_SUBPARTITION_POLICY, = 70)                    \
   ACT(OB_DDL_TABLE_OPERATION_END, = 100)                         \
   ACT(OB_DDL_TENANT_OPERATION_BEGIN, = 101)                      \
   ACT(OB_DDL_ADD_TENANT,)                                        \
@@ -335,13 +342,39 @@ enum ObSchemaOperationCategory
   ACT(OB_DDL_DROP_RLS_CONTEXT, = 2053)                           \
   ACT(OB_DDL_RLS_CONTEXT_OPERATION_END, = 2060)                  \
   ACT(OB_DDL_ROUTINE_PRIV_OPERATION_BEGIN, = 2061)               \
-  ACT(OB_DDL_GRANT_REVOKE_ROUTINE_PRIV, = 2062)                  \
+  ACT(OB_DDL_GRANT_ROUTINE_PRIV, = 2062)                         \
   ACT(OB_DDL_DEL_ROUTINE_PRIV, = 2063)                           \
   ACT(OB_DDL_ROUTINE_PRIV_OPERATION_END, = 2070)                 \
-  ACT(OB_DDL_COLUMN_PRIV_OPERATION_BEGIN, = 2071)               \
-  ACT(OB_DDL_GRANT_COLUMN_PRIV, = 2072)                         \
-  ACT(OB_DDL_DEL_COLUMN_PRIV, = 2073)                           \
-  ACT(OB_DDL_COLUMN_PRIV_OPERATION_END, = 2080)                 \
+  ACT(OB_DDL_COLUMN_PRIV_OPERATION_BEGIN, = 2071)                \
+  ACT(OB_DDL_GRANT_COLUMN_PRIV, = 2072)                          \
+  ACT(OB_DDL_DEL_COLUMN_PRIV, = 2073)                            \
+  ACT(OB_DDL_COLUMN_PRIV_OPERATION_END, = 2080)                  \
+  ACT(OB_DDL_CATALOG_OPERATION_BEGIN, = 2081)                    \
+  ACT(OB_DDL_CREATE_CATALOG, = 2082)                             \
+  ACT(OB_DDL_ALTER_CATALOG, = 2083)                              \
+  ACT(OB_DDL_DROP_CATALOG, = 2084)                               \
+  ACT(OB_DDL_CATALOG_OPERATION_END, = 2090)                      \
+  ACT(OB_DDL_CATALOG_PRIV_OPERATION_BEGIN, = 2091)               \
+  ACT(OB_DDL_GRANT_REVOKE_CATALOG, = 2092)                       \
+  ACT(OB_DDL_DEL_CATALOG_PRIV, = 2093)                           \
+  ACT(OB_DDL_CATALOG_PRIV_OPERATION_END, = 2100)                 \
+  ACT(OB_DDL_CCL_RULE_OPERATION_BEGIN, = 2101)                   \
+  ACT(OB_DDL_CREATE_CCL_RULE, = 2102)                            \
+  ACT(OB_DDL_DROP_CCL_RULE, = 2103)                              \
+  ACT(OB_DDL_CCL_RULE_OPERATION_END, = 2110)                     \
+  ACT(OB_DDL_LOCATION_OPERATION_BEGIN, = 2111)                   \
+  ACT(OB_DDL_CREATE_LOCATION, )                                  \
+  ACT(OB_DDL_ALTER_LOCATION, )                                   \
+  ACT(OB_DDL_DROP_LOCATION, )                                    \
+  ACT(OB_DDL_LOCATION_OPERATION_END, = 2120)                     \
+  ACT(OB_DDL_OBJ_MYSQL_PRIV_OPERATION_BEGIN, = 2121)             \
+  ACT(OB_DDL_GRANT_OBJ_MYSQL_PRIV, )                             \
+  ACT(OB_DDL_DEL_OBJ_MYSQL_PRIV, )                               \
+  ACT(OB_DDL_OBJ_MYSQL_PRIV_OPERATION_END, = 2130)               \
+  ACT(OB_DDL_EXTERNAL_RESOURCE_OPERATION_BEGIN, = 2131)          \
+  ACT(OB_DDL_CREATE_EXTERNAL_RESOURCE, = 2132)                   \
+  ACT(OB_DDL_DROP_EXTERNAL_RESOURCE, = 2133)                     \
+  ACT(OB_DDL_EXTERNAL_RESOURCE_OPERATION_END, = 2140)            \
   ACT(OB_DDL_MAX_OP,)
 
 DECLARE_ENUM(ObSchemaOperationType, op_type, OP_TYPE_DEF);
@@ -357,8 +390,11 @@ IS_DDL_TYPE(TABLEGROUP, tablegroup)
 IS_DDL_TYPE(TENANT, tenant)
 IS_DDL_TYPE(DATABASE, database)
 IS_DDL_TYPE(USER, user)
+IS_DDL_TYPE(CATALOG_PRIV, catalog_priv)
 IS_DDL_TYPE(DB_PRIV, db_priv)
 IS_DDL_TYPE(TABLE_PRIV, table_priv)
+IS_DDL_TYPE(ROUTINE_PRIV, routine_priv)
+IS_DDL_TYPE(COLUMN_PRIV, column_priv)
 IS_DDL_TYPE(OUTLINE, outline)
 IS_DDL_TYPE(ZONE, zone)
 IS_DDL_TYPE(SYNONYM, synonym)
@@ -387,6 +423,7 @@ IS_DDL_TYPE(MOCK_FK_PARENT_TABLE, mock_fk_parent_table)
 IS_DDL_TYPE(RLS_POLICY, rls_policy)
 IS_DDL_TYPE(RLS_GROUP, rls_group)
 IS_DDL_TYPE(RLS_CONTEXT, rls_context)
+IS_DDL_TYPE(CATALOG, catalog)
 
 struct ObSchemaOperation
 {
@@ -399,10 +436,12 @@ public:
   union {
     uint64_t user_id_;
     uint64_t grantee_id_;
+    uint64_t client_user_id_;
   };
   union {
     uint64_t database_id_;
     uint64_t grantor_id_;
+    uint64_t proxy_user_id_;
   };
   common::ObString database_name_;
   uint64_t tablegroup_id_;
@@ -430,6 +469,11 @@ public:
     uint64_t rls_policy_id_;
     uint64_t rls_group_id_;
     uint64_t rls_context_id_;
+    uint64_t routine_type_;
+    uint64_t column_priv_id_;
+    uint64_t catalog_id_;
+    uint64_t obj_type_;
+    uint64_t ccl_rule_id_;
   };
   union {
     common::ObString table_name_;
@@ -439,10 +483,12 @@ public:
     common::ObString tablespace_name_;
     common::ObString context_name_;
     common::ObString mock_fk_parent_table_name_;
+    common::ObString routine_name_;
+    common::ObString catalog_name_;
+    common::ObString obj_name_;
   };
   ObSchemaOperationType op_type_;
   common::ObString ddl_stmt_str_;
-
   bool operator <(const ObSchemaOperation &rv) const { return schema_version_ < rv.schema_version_; }
   void reset();
   bool is_valid() const;
@@ -582,6 +628,7 @@ public:
       new_part_name_()
   {
   }
+  DISABLE_COPY_ASSIGN(AlterTableSchema);
   inline const common::ObString &get_origin_table_name() const { return origin_table_name_; }
   inline int set_origin_table_name(const common::ObString &origin_table_name);
   inline const common::ObString &get_database_name() const { return new_database_name_; }
@@ -694,6 +741,7 @@ class ObSimpleMockFKParentTableSchema;
 class ObRlsPolicySchema;
 class ObRlsGroupSchema;
 class ObRlsContextSchema;
+class ObCatalogSchema;
 
 class ObTenantSqlService;
 class ObDatabaseSqlService;
@@ -724,6 +772,7 @@ class ObRlsSqlService;
 //table schema service interface layer
 class ObServerSchemaService;
 class ObContextSqlService;
+class ObCatalogSqlService;
 class ObSchemaService
 {
 public:
@@ -780,19 +829,25 @@ public:
   DECLARE_GET_DDL_SQL_SERVICE_FUNC(Directory, directory);
   DECLARE_GET_DDL_SQL_SERVICE_FUNC(Context, context);
   DECLARE_GET_DDL_SQL_SERVICE_FUNC(Rls, rls);
+  DECLARE_GET_DDL_SQL_SERVICE_FUNC(Catalog, catalog);
   //DECLARE_GET_DDL_SQL_SERVICE_FUNC(sys_priv, priv);
 
 
   /* sequence_id related */
-  virtual int init_sequence_id(const int64_t rootservice_epoch) = 0;
+  virtual int init_sequence_id_by_rs_epoch(const int64_t rootservice_epoch) = 0; // for compatible use
+  virtual int init_sequence_id_by_sys_leader_epoch(const int64_t sys_leader_epoch) = 0;
   virtual int inc_sequence_id() = 0;
-  virtual uint64_t get_sequence_id() = 0;
+  virtual ObDDLSequenceID get_sequence_id() const = 0;
 
   virtual int set_refresh_schema_info(const ObRefreshSchemaInfo &schema_info) = 0;
   virtual int get_refresh_schema_info(ObRefreshSchemaInfo &schema_info) = 0;
 
   virtual void set_cluster_schema_status(const ObClusterSchemaStatus &schema_status) = 0;
   virtual ObClusterSchemaStatus get_cluster_schema_status() const = 0;
+#ifdef OB_BUILD_SHARED_STORAGE
+  //get sslog table schema
+  virtual int get_sslog_table_schema(ObTableSchema &table_schema) = 0;
+#endif
   //get all core table schema
   virtual int get_all_core_table_schema(ObTableSchema &table_schema) = 0;
   //get core table schemas
@@ -892,8 +947,11 @@ public:
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(user, ObSimpleUserSchema);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(database, ObSimpleDatabaseSchema);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(tablegroup, ObSimpleTablegroupSchema);
+  GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(catalog_priv, ObCatalogPriv);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(db_priv, ObDBPriv);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(table_priv, ObTablePriv);
+  GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(routine_priv, ObRoutinePriv);
+  GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(column_priv, ObColumnPriv);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(outline, ObSimpleOutlineSchema);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(routine, ObSimpleRoutineSchema);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(synonym, ObSimpleSynonymSchema);
@@ -919,6 +977,7 @@ public:
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(rls_policy, ObRlsPolicySchema);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(rls_group, ObRlsGroupSchema);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(rls_context, ObRlsContextSchema);
+  GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(catalog, ObCatalogSchema);
 
   //get tenant increment schema operation between (base_version, new_schema_version]
   virtual int get_increment_schema_operations(const ObRefreshSchemaStatus &schema_status,
@@ -993,6 +1052,8 @@ public:
   virtual int fetch_new_rls_policy_id(const uint64_t tenant_id, uint64_t &new_rls_policy_id) = 0;
   virtual int fetch_new_rls_group_id(const uint64_t tenant_id, uint64_t &new_rls_group_id) = 0;
   virtual int fetch_new_rls_context_id(const uint64_t tenant_id, uint64_t &new_rls_context_id) = 0;
+  virtual int fetch_new_priv_id(const uint64_t tenant_id, uint64_t &new_priv_id) = 0;
+  virtual int fetch_new_catalog_id(const uint64_t tenant_id, uint64_t &new_catalog_id) = 0;
 
 //------------------For managing privileges-----------------------------//
   #define GET_BATCH_SCHEMAS_WITH_ALLOCATOR_FUNC_DECLARE_PURE_VIRTUAL(SCHEMA, SCHEMA_TYPE)  \
@@ -1016,8 +1077,11 @@ public:
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(database, ObSimpleDatabaseSchema);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(tablegroup, ObSimpleTablegroupSchema);
   GET_BATCH_SCHEMAS_WITH_ALLOCATOR_FUNC_DECLARE_PURE_VIRTUAL(table, ObSimpleTableSchemaV2);
+  GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(catalog_priv, ObCatalogPriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(db_priv, ObDBPriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(table_priv, ObTablePriv);
+  GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(routine_priv, ObRoutinePriv);
+  GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(column_priv, ObColumnPriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(outline, ObSimpleOutlineSchema);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(routine, ObSimpleRoutineSchema);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(synonym, ObSimpleSynonymSchema);
@@ -1044,6 +1108,7 @@ public:
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(rls_policy, ObRlsPolicySchema);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(rls_group, ObRlsGroupSchema);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(rls_context, ObRlsContextSchema);
+  GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(catalog, ObCatalogSchema);
 
 
   //--------------For manaing recyclebin -----//
@@ -1311,6 +1376,18 @@ public:
               const common::ObIArray<uint64_t> &table_ids,
               common::ObIArray<ObSchemaIdVersion> &versions) = 0;
 
+  virtual int get_table_index_infos(
+              common::ObIAllocator &allocator,
+              common::ObISQLClient &sql_client,
+              const uint64_t tenant_id,
+              const uint64_t database_id,
+              const uint64_t data_table_id,
+              common::ObIArray<ObIndexSchemaInfo> &index_infos) = 0;
+  virtual bool schema_name_is_equal(
+               const ObString &src,
+               const ObString &dst,
+               const bool case_compare,
+               const bool compare_with_collation) = 0;
   /*----------- interfaces for latest schema end -------------*/
 
 };

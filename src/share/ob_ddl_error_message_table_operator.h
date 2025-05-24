@@ -35,13 +35,13 @@ public:
   public:
     ObBuildDDLErrorMessage()
       : ret_code_(common::OB_NOT_INIT), ddl_type_(ObDDLType::DDL_INVALID), affected_rows_(0),
-        user_message_(nullptr), dba_message_("\0"), allocator_()
+        user_message_(nullptr), dba_message_("\0"), allocator_(), consensus_schema_version_(OB_INVALID_VERSION)
     {}
     virtual ~ObBuildDDLErrorMessage();
     int prepare_user_message_buf(const int64_t len);
     bool operator==(const ObBuildDDLErrorMessage &other) const;
     bool operator!=(const ObBuildDDLErrorMessage &other) const;
-    TO_STRING_KV(K_(ret_code), K_(ddl_type), K_(affected_rows), K_(user_message), K_(dba_message));
+    TO_STRING_KV(K_(ret_code), K_(ddl_type), K_(affected_rows), K_(user_message), K_(dba_message), K_(consensus_schema_version));
   public:
     int ret_code_;
     ObDDLType ddl_type_;
@@ -49,6 +49,7 @@ public:
     char *user_message_;
     char dba_message_[common::OB_MAX_ERROR_MSG_LEN];
     common::ObArenaAllocator allocator_;
+    int64_t consensus_schema_version_;
   };
 
   //for add_column in ddl_error_message
@@ -95,12 +96,23 @@ public:
   static int get_ddl_error_message(const uint64_t tenant_id, const int64_t task_id, const int64_t target_object_id,
       const common::ObAddr &addr, const bool is_ddl_retry_task, common::ObMySQLProxy &sql_proxy, ObBuildDDLErrorMessage &error_message, 
       int64_t &forward_user_msg_len);
+  static int get_ddl_error_message(
+      const uint64_t tenant_id,
+      const int64_t task_id,
+      const int64_t target_object_id,
+      const int64_t object_id,
+      common::ObMySQLProxy &sql_proxy,
+      ObBuildDDLErrorMessage &error_message,
+      int64_t &forward_user_msg_len);
   static int report_ddl_error_message(const ObBuildDDLErrorMessage &error_message, const uint64_t tenant_id,
       const char *trace_id, const int64_t task_id, const int64_t parent_task_id, const uint64_t table_id,
       const int64_t schema_version, const int64_t object_id, const common::ObAddr &addr, common::ObMySQLProxy &sql_proxy);
   static int report_ddl_error_message(const ObBuildDDLErrorMessage &error_message, const uint64_t tenant_id,
       const ObCurTraceId::TraceId &trace_id, const int64_t task_id, const int64_t parent_task_id, const uint64_t table_id,
       const int64_t schema_version, const int64_t object_id, const common::ObAddr &addr, common::ObMySQLProxy &sql_proxy);
+  static int report_ddl_error_message(const ObBuildDDLErrorMessage &error_message, const uint64_t tenant_id,
+      const int64_t task_id, const uint64_t table_id, const int64_t schema_version, const int64_t object_id,
+      const int64_t parent_task_id, const common::ObAddr &addr, common::ObMySQLProxy &sql_proxy);
   static int build_ddl_error_message(const int ret_code, const uint64_t tenant_id, const uint64_t table_id,
       ObBuildDDLErrorMessage &error_message, const common::ObString index_name,
       const uint64_t index_id, const ObDDLType ddl_type, const char *message, int &report_ret_code);

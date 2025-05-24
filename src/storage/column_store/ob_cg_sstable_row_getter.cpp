@@ -10,7 +10,6 @@
  * See the Mulan PubL v2 for more details.
  */
 #define USING_LOG_PREFIX STORAGE
-#include "lib/stat/ob_diagnose_info.h"
 #include "ob_cg_sstable_row_getter.h"
 
 namespace oceanbase
@@ -62,7 +61,7 @@ int ObCGGetter::init(
                          1 != idx_key.get_datum_cnt())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Invalid argument to init ObCGGetter", K(ret), K(wrapper), K(iter_param));
-  } else if (OB_FAIL(wrapper.get_sstable(sstable))) {
+  } else if (OB_FAIL(wrapper.get_loaded_column_store_sstable(sstable))) {
     LOG_WARN("fail to get sstable", K(ret), K(wrapper));
   } else {
     is_same_data_block_ = false;
@@ -416,7 +415,7 @@ int ObCGSSTableRowGetter::fetch_row(ObSSTableReadHandle &read_handle, const ObNo
     if (OB_SUCC(ret) && iter_param_->need_scn_) {
       if (OB_FAIL(fetch_rowkey_row(read_handle, store_row))) {
         LOG_WARN("Fail to fetch row", K(ret));
-      } else if (OB_FAIL(set_row_scn(*iter_param_, store_row))) {
+      } else if (OB_FAIL(set_row_scn(access_ctx_->use_fuse_row_cache_, *iter_param_, store_row))) {
         LOG_WARN("failed to set row scn", K(ret));
       } else {
         int64_t trans_idx = iter_param_->get_read_info()->get_trans_col_index();
@@ -461,7 +460,7 @@ int ObCGSSTableRowGetter::fetch_rowkey_row(ObSSTableReadHandle &read_handle, con
   } else if (OB_FAIL(micro_getter_->get_row(
               read_handle,
               store_row,
-              macro_block_reader_))) {
+              &macro_block_reader_))) {
     LOG_WARN("Fail to get row", K(ret));
   }
   return ret;

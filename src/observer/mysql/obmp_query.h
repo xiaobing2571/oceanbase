@@ -61,6 +61,7 @@ protected:
   int deserialize();
   int check_readonly_stmt(ObMySQLResultSet &result);
   int is_readonly_stmt(ObMySQLResultSet &result, bool &is_readonly);
+  void assign_sql(const char * sql, int64_t sql_length) { sql_.assign_ptr(sql, sql_length); }
 private:
   int response_result(ObMySQLResultSet &result, bool force_sync_resp, bool &async_resp_used);
   int get_tenant_schema_info_(const uint64_t tenant_id,
@@ -73,20 +74,39 @@ private:
                  bool force_sync_resp,
                  bool &async_resp_used,
                  bool &need_disconnect);
+  int do_process_trans_ctrl(sql::ObSQLSessionInfo &session,
+                            bool has_more_result,
+                            bool force_sync_resp,
+                            bool &async_resp_used,
+                            bool &need_disconnect,
+                            stmt::StmtType stmt_type);
+  int process_trans_ctrl_cmd(ObSQLSessionInfo &session,
+                             bool &need_disconnect,
+                             bool &async_resp_used,
+                             const bool is_rollback,
+                             const bool force_sync_resp,
+                             stmt::StmtType stmt_type);
   int process_with_tmp_context(sql::ObSQLSessionInfo &session,
                     bool has_more_result,
                     bool force_sync_resp,
                     bool &async_resp_used,
                     bool &need_disconnect);
   int process_single_stmt(const sql::ObMultiStmtItem &multi_stmt_item,
+                          ObSMConnection *conn,
                           sql::ObSQLSessionInfo &session,
                           bool has_more_result,
                           bool force_sync_resp,
                           bool &async_resp_used,
                           bool &need_disconnect);
+  void check_is_trans_ctrl_cmd(const ObString &sql,
+                               bool &is_trans_ctrl_cmd,
+                               stmt::StmtType &stmt_type);
 
-
-  void record_stat(const sql::stmt::StmtType type, const int64_t end_time) const;
+  void record_stat(const sql::stmt::StmtType type, const int64_t end_time,
+                   const sql::ObSQLSessionInfo& session,
+                   const int64_t ret,
+                   const bool is_commit_cmd,
+                   const bool is_rollback_cmd) const;
   void update_audit_info(const ObWaitEventStat &total_wait_desc,
                          ObAuditRecordData &record);
   int fill_feedback_session_info(ObMySQLResultSet &result,
@@ -96,6 +116,7 @@ private:
     const share::ObPartitionLocation &partition_loc,
     share::ObFBPartitionParam &param);
   int try_batched_multi_stmt_optimization(sql::ObSQLSessionInfo &session,
+                                          ObSMConnection *conn,
                                           common::ObIArray<ObString> &queries,
                                           const ObMPParseStat &parse_stat,
                                           bool &optimization_done,
@@ -106,6 +127,8 @@ private:
   int store_params_value_to_str(ObIAllocator &allocator,
                                 sql::ObSQLSessionInfo &session,
                                 common::ParamStore &params);
+public:
+  static const int64_t MAX_SELF_OBJ_SIZE = 2 * 1024L;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObMPQuery);
 private:
@@ -122,6 +145,7 @@ private:
   int64_t params_value_len_;
   char *params_value_;
 }; // end of class ObMPQuery
+STATIC_ASSERT(sizeof(ObMPQuery) < ObMPQuery::MAX_SELF_OBJ_SIZE, "sizeof ObMPQuery not great to 2KB");
 } // end of namespace observer
 } // end of namespace oceanbase
 #endif /* _OBMP_QUERY_H_ */

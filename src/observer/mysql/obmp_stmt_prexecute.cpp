@@ -14,42 +14,11 @@
 
 
 #include "observer/mysql/obmp_stmt_prexecute.h"
-#include "lib/oblog/ob_log.h"
-#include "lib/stat/ob_session_stat.h"
-#include "lib/profile/ob_perf_event.h"
-#include "lib/timezone/ob_time_convert.h"
-#include "lib/encode/ob_base64_encode.h"
-#include "observer/mysql/obsm_utils.h"
-#include "rpc/ob_request.h"
-#include "rpc/obmysql/ob_mysql_packet.h"
-#include "rpc/obmysql/ob_mysql_util.h"
-#include "rpc/obmysql/packet/ompk_prepare.h"
 #include "rpc/obmysql/packet/ompk_prexecute.h"
-#include "rpc/obmysql/packet/ompk_eof.h"
-#include "rpc/obmysql/packet/ompk_resheader.h"
 #include "rpc/obmysql/packet/ompk_field.h"
-#include "rpc/obmysql/packet/ompk_row.h"
-#include "rpc/obmysql/obsm_struct.h"
-#include "observer/mysql/obsm_row.h"
 #include "observer/mysql/obmp_stmt_prepare.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "share/ob_time_utility2.h"
 #include "sql/ob_sql.h"
-#include "sql/ob_sql_context.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "sql/plan_cache/ob_prepare_stmt_struct.h"
-#include "observer/omt/ob_tenant.h"
-#include "observer/mysql/ob_sync_plan_driver.h"
 #include "observer/mysql/ob_sync_cmd_driver.h"
-#include "observer/mysql/ob_async_cmd_driver.h"
-#include "observer/mysql/ob_async_plan_driver.h"
-#include "observer/mysql/obmp_stmt_send_piece_data.h"
-#include "observer/ob_req_time_service.h"
-#include "pl/ob_pl_user_type.h"
-#include "pl/ob_pl_package.h"
-#include "pl/ob_pl_resolver.h"
-#include "pl/ob_pl_exception_handling.h"
-#include "rpc/obmysql/ob_mysql_field.h"
 
 namespace oceanbase
 {
@@ -81,6 +50,11 @@ int ObMPStmtPrexecute::before_process()
 
   if (OB_FAIL(ObMPBase::before_process())) {
     LOG_WARN("fail to call before process", K(ret));
+  } else if (!GCONF._ob_enable_prepared_statement) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "The disabled '_ob_enable_prepared_statement' parameter prevents the use of "
+                   "prepared statements");
   } else if ((OB_ISNULL(req_))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_ERROR("request should not be null", K(ret));
@@ -120,9 +94,11 @@ int ObMPStmtPrexecute::before_process()
     }
 
     // sql
-    if (OB_SUCC(ret) && OB_FAIL(ObMySQLUtil::get_length(pos, sql_len_))) {
-      LOG_WARN("failed to get length", K(ret));
-    } else {
+    PS_DEFENSE_CHECK(1)
+    {
+      if (OB_FAIL(ObMySQLUtil::get_length(pos, sql_len_))) {
+        LOG_WARN("failed to get length", K(ret));
+      }
       PS_DEFENSE_CHECK(sql_len_)
       {
         sql_.assign_ptr(pos, static_cast<ObString::obstr_size_t>(sql_len_));
@@ -150,28 +126,37 @@ int ObMPStmtPrexecute::before_process()
                              lib::Worker::CompatMode::ORACLE : lib::Worker::CompatMode::MYSQL);
       uint32_t ps_stmt_checksum = DEFAULT_ITERATION_COUNT;
       ObSQLSessionInfo::LockGuard lock_guard(session->get_query_lock());
+      bool need_response_error = false;
       session->set_current_trace_id(ObCurTraceId::get_trace_id());
       session->init_use_rich_format();
       session->set_proxy_version(get_proxy_version());
-      int64_t packet_len = (reinterpret_cast<const ObMySQLRawPacket &>
-                                (req_->get_packet())).get_clen();
       ObReqTimeGuard req_timeinfo_guard;
-      if (sql_len_ > 0 && 0 == stmt_id_) {
+      if (OB_FAIL(ret)) {
+      } else if (OB_UNLIKELY(!session->is_valid())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("invalid session", K_(sql), K(ret));
+      } else if (OB_FAIL(process_kill_client_session(*session))) {
+        LOG_WARN("client session has been killed", K(ret));
+      } else if (OB_UNLIKELY(session->is_zombie())) {
+        ret = OB_ERR_SESSION_INTERRUPTED;
+        LOG_WARN("session has been killed", K(session->get_session_state()), K_(sql),
+                K(session->get_server_sid()), "proxy_sessid", session->get_proxy_sessid(), K(ret));
+      } else if (pkt.exist_trace_info()
+                 && OB_FAIL(session->update_sys_variable(SYS_VAR_OB_TRACE_INFO,
+                                                         pkt.get_trace_info()))) {
+        LOG_WARN("fail to update trace info", K(ret));
+      } else if (FALSE_IT(session->set_txn_free_route(pkt.txn_free_route()))) {
+      } else if (OB_FAIL(process_extra_info(*session, pkt, need_response_error))) {
+        LOG_WARN("fail get process extra info", K(ret));
+      } else if (FALSE_IT(session->post_sync_session_info())) {
+      } else if (sql_len_ > 0 && 0 == stmt_id_) {
         int64_t query_timeout = 0;
         int64_t tenant_version = 0;
         int64_t sys_version = 0;
         bool force_sync_resp = false;
-        bool need_response_error = false;
-        if (OB_UNLIKELY(!session->is_valid())) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_ERROR("invalid session", K_(sql), K(ret));
-        } else if (OB_FAIL(process_kill_client_session(*session))) {
-          LOG_WARN("client session has been killed", K(ret));
-        } else if (OB_UNLIKELY(session->is_zombie())) {
-          ret = OB_ERR_SESSION_INTERRUPTED;
-          LOG_WARN("session has been killed", K(session->get_session_state()), K_(sql),
-                  K(session->get_sessid()), "proxy_sessid", session->get_proxy_sessid(), K(ret));
-        } else if (OB_UNLIKELY(packet_len > session->get_max_packet_size())) {
+        int64_t packet_len =
+            (reinterpret_cast<const ObMySQLRawPacket &>(req_->get_packet())).get_clen();
+        if (OB_UNLIKELY(packet_len > session->get_max_packet_size())) {
           ret = OB_ERR_NET_PACKET_TOO_LARGE;
           LOG_WARN("packet too large than allowd for the session", K_(sql), K(ret));
         } else if (OB_FAIL(session->get_query_timeout(query_timeout))) {
@@ -199,13 +184,16 @@ int ObMPStmtPrexecute::before_process()
           } else {
             oceanbase::lib::Thread::WaitGuard guard(oceanbase::lib::Thread::WAIT_FOR_LOCAL_RETRY);
             do {
+              // reset `ret` explicitly before local retry
+              ret = OB_SUCCESS;
               SMART_VAR(ObMySQLResultSet, result, *session, THIS_WORKER.get_allocator()) {
                 result.set_has_more_result(false);
                 share::schema::ObSchemaGetterGuard schema_guard;
                 const uint64_t tenant_id = session->get_effective_tenant_id();
                 ObVirtualTableIteratorFactory vt_iter_factory(*gctx_.vt_iter_creator_);
                 retry_ctrl_.clear_state_before_each_retry(session->get_retry_info_for_update());
-                if (OB_FAIL(gctx_.schema_service_->get_tenant_schema_guard(tenant_id, schema_guard))) {
+                if (OB_FAIL(ret)) {
+                } else if (OB_FAIL(gctx_.schema_service_->get_tenant_schema_guard(tenant_id, schema_guard))) {
                   LOG_WARN("get schema guard failed", K(ret));
                 } else if (OB_FAIL(schema_guard.get_schema_version(
                                     session->get_effective_tenant_id(), tenant_version))) {
@@ -242,7 +230,7 @@ int ObMPStmtPrexecute::before_process()
                     if (OB_FAIL(gctx_.sql_engine_->stmt_prepare(sql_,
                                                                 get_ctx(),
                                                                 result,
-                                                                false/*is_inner_sql*/))) {
+                                                                false /*is_inner_sql*/))) {
                       set_exec_start_timestamp(ObTimeUtility::current_time());
                       int cli_ret = OB_SUCCESS;
                       get_retry_ctrl().test_and_save_retry_state(gctx_,
@@ -304,7 +292,7 @@ int ObMPStmtPrexecute::before_process()
           } else {
             const bool enable_sql_audit =
             GCONF.enable_sql_audit && session->get_local_ob_enable_sql_audit();
-            if (!is_pl_stmt(stmt_type_) && enable_sql_audit) {
+            if (enable_sql_audit) {
               OZ (store_params_value_to_str(*allocator_, *session));
             }
             PS_DEFENSE_CHECK(4) // exec_mode
@@ -333,7 +321,7 @@ int ObMPStmtPrexecute::before_process()
                   //   if (OB_NOT_NULL(session->get_cursor(close_stmt_id))) {
                   //     if (OB_FAIL(session->close_cursor(close_stmt_id))) {
                   //       tmp_ret = ret;
-                  //       LOG_WARN("fail to close cursor", K(ret), K(stmt_id_), K(close_stmt_id), K(session->get_sessid()));
+                  //       LOG_WARN("fail to close cursor", K(ret), K(stmt_id_), K(close_stmt_id), K(session->get_server_sid()));
                   //     }
                   //   }
                   //   if (OB_FAIL(session->close_ps_stmt(close_stmt_id))) {
@@ -354,8 +342,13 @@ int ObMPStmtPrexecute::before_process()
                       || (OB_NOT_NULL(ps_session_info)
                           && ps_stmt_checksum != ps_session_info->get_ps_stmt_checksum())) {
                     ret = OB_ERR_PREPARE_STMT_CHECKSUM;
-                    LOG_ERROR("ps stmt checksum fail", K(ret), "session_id", session->get_sessid(),
+                    LOG_ERROR("ps stmt checksum fail", K(ret), "session_id", session->get_server_sid(),
                                                     K(ps_stmt_checksum), K(*ps_session_info));
+                    LOG_DBA_ERROR_V2(OB_SERVER_PS_STMT_CHECKSUM_MISMATCH, ret,
+                                     "ps stmt checksum fail. ",
+                                     "the ps stmt checksum is ", ps_stmt_checksum,
+                                     ", but current session stmt checksum is ", ps_session_info->get_ps_stmt_checksum(),
+                                     ". current session id is ", session->get_server_sid(), ". ");
                 } else {
                   PS_DEFENSE_CHECK(4) // extend_flag
                   {
@@ -411,6 +404,7 @@ int ObMPStmtPrexecute::clean_ps_stmt(ObSQLSessionInfo &session,
      *    其他时候都退化成了 local 重试，不需要清理
      */
     get_ctx().cur_sql_ = sql_;
+    get_ctx().raw_sql_ = sql_;
     if (OB_FAIL(session.close_ps_stmt(stmt_id_))) {
       LOG_WARN("close cursor failed.", K(ret), K(stmt_id_));
     }
@@ -431,6 +425,7 @@ int ObMPStmtPrexecute::execute_response(ObSQLSessionInfo &session,
                                         bool &async_resp_used,
                                         ObPsStmtId &inner_stmt_id)
 {
+  ACTIVE_SESSION_FLAG_SETTER_GUARD(in_sql_execution);
   int ret = OB_SUCCESS;
   if (OB_OCI_EXACT_FETCH != exec_mode_ && stmt::T_SELECT == stmt_type_) {
     LOG_DEBUG("begin server cursor.");
@@ -442,7 +437,7 @@ int ObMPStmtPrexecute::execute_response(ObSQLSessionInfo &session,
     ObPsStmtId inner_stmt_id = OB_INVALID_ID;
     if (OB_NOT_NULL(session.get_cursor(stmt_id_))) {
       if (OB_FAIL(session.close_cursor(stmt_id_))) {
-        LOG_WARN("fail to close result set", K(ret), K(stmt_id_), K(session.get_sessid()));
+        LOG_WARN("fail to close result set", K(ret), K(stmt_id_), K(session.get_server_sid()));
       }
     }
     OZ (session.make_dbms_cursor(cursor, stmt_id_));
@@ -468,7 +463,16 @@ int ObMPStmtPrexecute::execute_response(ObSQLSessionInfo &session,
       ObPLExecCtx pl_ctx(cursor->get_allocator(), &result.get_exec_context(), NULL/*params*/,
                         NULL/*result*/, &ret, NULL/*func*/, true);
       get_ctx().cur_sql_ = sql_;
-      if (OB_FAIL(ObSPIService::dbms_dynamic_open(&pl_ctx, *cursor))) {
+      int64_t orc_max_ret_rows = INT64_MAX;
+      if (lib::is_oracle_mode()
+          && OB_FAIL(session.get_oracle_sql_select_limit(orc_max_ret_rows))) {
+        LOG_WARN("failed to get sytem variable _oracle_sql_select_limit", K(ret));
+      } else if (
+#ifdef ERRSIM
+          OB_FAIL(common::EventTable::COM_STMT_PREXECUTE_PS_CURSOR_OPEN_ERROR) ||
+#endif
+          OB_FAIL(ObSPIService::dbms_dynamic_open(
+                     &pl_ctx, *cursor, false, orc_max_ret_rows))) {
         LOG_WARN("cursor open faild.", K(cursor->get_id()));
         // select do not support arraybinding
         if (!THIS_WORKER.need_retry()) {
@@ -494,6 +498,7 @@ int ObMPStmtPrexecute::execute_response(ObSQLSessionInfo &session,
         bool last_row = false;
         bool ac = true;
         int8_t has_result = 0;
+        ObSchemaGetterGuard schema_guard;
         if (0 != iteration_count_ && cursor->get_field_columns().count() > 0) {
           has_result = 1;
           LOG_DEBUG("has result set.", K(stmt_id_));
@@ -503,6 +508,8 @@ int ObMPStmtPrexecute::execute_response(ObSQLSessionInfo &session,
         } else if (OB_FAIL(response_param_query_header(session, &cursor->get_field_columns(),
                                           get_params(), stmt_id_, has_result, 0))) {
           LOG_WARN("send header packet faild.", K(ret));
+        } else if (OB_FAIL(gctx_.schema_service_->get_tenant_schema_guard(session.get_effective_tenant_id(), schema_guard))) {
+          LOG_WARN("get tenant schema guard failed ", K(ret), K(session.get_effective_tenant_id()));
         }
         if (-1 == cursor->get_current_position() && iteration_count_ > 0) {
           // execute 如果返回数据，需要更新一下cursor的指针位置
@@ -521,7 +528,7 @@ int ObMPStmtPrexecute::execute_response(ObSQLSessionInfo &session,
           ++cur;
           cursor->set_current_position(cur);
           is_fetched = true;
-          if (OB_FAIL(response_row(session, row, &cursor->get_field_columns(), cursor->is_packed()))) {
+          if (OB_FAIL(response_row(session, row, &cursor->get_field_columns(), cursor->is_packed(), &result.get_exec_context(), true, &schema_guard))) {
             LOG_WARN("response row fail at line: ", K(ret), K(row_num));
           } else {
             ++row_num;
@@ -543,6 +550,7 @@ int ObMPStmtPrexecute::execute_response(ObSQLSessionInfo &session,
           const ObWarningBuffer *warnings_buf = common::ob_get_tsi_warning_buffer();
           uint16_t warning_count = 0;
           if (OB_ISNULL(warnings_buf)) {
+            // ignore ret
             LOG_WARN("can not get thread warnings buffer");
           } else {
             warning_count = static_cast<uint16_t>(warnings_buf->get_readable_warning_count());
@@ -593,11 +601,11 @@ int ObMPStmtPrexecute::execute_response(ObSQLSessionInfo &session,
       LOG_WARN("execute server cursor failed.", K(ret));
     }
   } else if (OB_FAIL(gctx_.sql_engine_->stmt_execute(stmt_id_,
-                                                    stmt_type_,
-                                                    params,
-                                                    ctx,
-                                                    result,
-                                                    false /* is_inner_sql */))) {
+                                                     stmt_type_,
+                                                     params,
+                                                     ctx,
+                                                     result,
+                                                     false /* is_inner_sql */))) {
     set_exec_start_timestamp(ObTimeUtility::current_time());
     if (!THIS_WORKER.need_retry()) {
       int cli_ret = OB_SUCCESS;
@@ -673,6 +681,7 @@ int ObMPStmtPrexecute::execute_response(ObSQLSessionInfo &session,
     } else if (OB_FAIL(response_result(result, session, force_sync_resp, async_resp_used))) {
       ObPhysicalPlanCtx *plan_ctx = result.get_exec_context().get_physical_plan_ctx();
       if (OB_ISNULL(plan_ctx)) {
+        // ignore ret
         LOG_ERROR("execute query fail, and plan_ctx is NULL", K(ret));
       } else {
         LOG_WARN("execute query fail",
@@ -1024,7 +1033,7 @@ int ObMPStmtPrexecute::response_returning_rows(ObSQLSessionInfo &session,
         arraybinding_row_->get_cell(i+2) = value;
       }
       arraybinding_row_->get_cell(arraybinding_row_->get_count() - 1).set_null();
-      if (OB_SUCCESS != (response_ret = response_row(session, *arraybinding_row_, arraybinding_columns_, is_packed))) {
+      if (OB_SUCCESS != (response_ret = response_row(session, *arraybinding_row_, arraybinding_columns_, is_packed, &result.get_exec_context()))) {
         LOG_WARN("fail to response row to client", K(response_ret));
       }
     }
@@ -1043,7 +1052,7 @@ int ObMPStmtPrexecute::response_returning_rows(ObSQLSessionInfo &session,
       }
       arraybinding_row_->get_cell(arraybinding_row_->get_count() - 1).set_varchar(ob_oracle_strerror(ret));
       LOG_DEBUG("error occured before send arraybinding_row_", KPC(arraybinding_row_));
-      if (OB_SUCCESS != (response_ret = response_row(session, *arraybinding_row_, arraybinding_columns_, false))) {
+      if (OB_SUCCESS != (response_ret = response_row(session, *arraybinding_row_, arraybinding_columns_, false, &result.get_exec_context()))) {
         LOG_WARN("fail to response row to client", K(response_ret));
       }
       if (is_save_exception_) {

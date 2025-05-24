@@ -11,12 +11,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_OPT
-#include "lib/oblog/ob_log.h"
-#include "lib/oblog/ob_log_module.h"
-#include "share/config/ob_server_config.h"
-#include "share/inner_table/ob_inner_table_schema_constants.h"
-#include "storage/ob_tenant_tablet_stat_mgr.h"
-#include "share/stat/ob_opt_stat_monitor_manager.h"
+#include "src/share/interrupt/ob_interrupt_rpc_proxy.h"
 #include "ob_opt_stat_service.h"
 
 namespace oceanbase {
@@ -94,7 +89,7 @@ int ObOptStatService::get_column_stat(const uint64_t tenant_id,
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(ret), K(handles.count()));
   } else {
-    handle = handles.at(0);
+    handle.move_from(handles.at(0));
   }
   return ret;
 }
@@ -168,7 +163,7 @@ int ObOptStatService::load_table_stat_and_put_cache(const uint64_t tenant_id,
       if (OB_FAIL(table_stat_cache_.put_and_fetch_value(tmp_key, all_part_stats.at(i), hd))) {
         LOG_WARN("failed to put and fetch table stat", K(ret));
       } else if (tmp_key == key) {
-        handle = hd;
+        handle.move_from(hd);
         added = true;
       }
     }
@@ -306,6 +301,8 @@ int ObOptStatService::get_table_rowcnt(const uint64_t tenant_id,
   } else {
     ObSEArray<ObTabletID, 16> reload_tablet_ids;
     ObSEArray<share::ObLSID, 16> reload_ls_ids;
+    storage::ObTabletStat unused_tablet_stat;
+    share::schema::ObTableModeFlag unused_mode;
     for (int64_t i = 0; OB_SUCC(ret) && i < all_tablet_ids.count(); ++i) {
       ObOptTableStat::Key key(tenant_id, table_id, all_tablet_ids.at(i).id());
       ObOptTableStatHandle handle;
@@ -331,7 +328,7 @@ int ObOptStatService::get_table_rowcnt(const uint64_t tenant_id,
         storage::ObTabletStat tablet_stat;
         //try check the latest tablet stat from stroage
         if (stat_mgr != NULL) {
-          if (OB_FAIL(stat_mgr->get_latest_tablet_stat(all_ls_ids.at(i), all_tablet_ids.at(i), tablet_stat))) {
+          if (OB_FAIL(stat_mgr->get_latest_tablet_stat(all_ls_ids.at(i), all_tablet_ids.at(i), tablet_stat, unused_tablet_stat, unused_mode))) {
             if (OB_HASH_NOT_EXIST != ret) {
               LOG_WARN("failed to get latest tablet stat", K(ret), K(all_ls_ids.at(i)), K(all_tablet_ids.at(i)));
             } else {

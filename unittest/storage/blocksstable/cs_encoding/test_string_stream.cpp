@@ -13,16 +13,9 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include <gtest/gtest.h>
-#include <iostream>
-#include <random>
 #define protected public
 #define private public
-#include "storage/blocksstable/cs_encoding/ob_string_stream_encoder.h"
 #include "storage/blocksstable/cs_encoding/ob_string_stream_decoder.h"
-#include "storage/blocksstable/cs_encoding/ob_column_encoding_struct.h"
-#include "storage/blocksstable/cs_encoding/ob_cs_decoding_util.h"
-#include "lib/codec/ob_fast_delta.h"
-#include "lib/compress/ob_compress_util.h"
 
 namespace oceanbase
 {
@@ -167,7 +160,7 @@ public:
       total_len = datums->count() * fixed_len;
     }
     ctx.build_string_stream_meta(fixed_len, is_use_zero_len_as_null, total_len);
-    ctx.build_string_stream_encoder_info(type, false, &encoding_opt, nullptr, -1, &allocator_);
+    ctx.build_string_stream_encoder_info(type, false, &encoding_opt, nullptr, -1, DATA_VERSION_4_3_2_1, &allocator_);
     int64_t bitmap_size = pad8(size);
     char *bitmap = new char[bitmap_size];
     memset(bitmap, 0, bitmap_size);
@@ -213,8 +206,8 @@ public:
     }
 
     // test batch decode
-    int64_t *row_ids = new int64_t[size];
-    for (int64_t i = 0; i < size; i++) {
+    int32_t *row_ids = new int32_t[size];
+    for (int32_t i = 0; i < size; i++) {
       row_ids[i] = i;
     }
     ObDatum *datums3 = new ObDatum[size];
@@ -273,7 +266,7 @@ public:
       datums3[i].reset();
     }
     int64_t random_idx = ObTimeUtility::current_time()%size;
-    int64_t row_id = 0;
+    int32_t row_id = 0;
     for (int64_t i = 0; i < size; i++) {
       row_id = (i + random_idx) % size;
       row_ids[i] = row_id;

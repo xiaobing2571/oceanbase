@@ -13,12 +13,10 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "ob_balance_task_helper_operator.h"
-#include "lib/mysqlclient/ob_isql_client.h"//ObISQLClient
-#include "lib/mysqlclient/ob_mysql_result.h"//MySQLResult
 #include "lib/mysqlclient/ob_mysql_proxy.h"//MySQLResult
-#include "lib/mysqlclient/ob_mysql_transaction.h"//ObMySQLTrans
 #include "share/inner_table/ob_inner_table_schema.h"//ALL_LS_BALANCE_TASK_HELPER_TNAME
 #include "share/ob_dml_sql_splicer.h"//ObDMLSqlSplicer
+#include "share/ob_debug_sync.h"
 
 using namespace oceanbase;
 using namespace oceanbase::common;
@@ -311,6 +309,7 @@ int ObBalanceTaskHelperTableOperator::remove_task(const uint64_t tenant_id,
   int64_t affected_rows = 0;
   ObSqlString sql;
   const uint64_t exec_tenant_id = gen_meta_tenant_id(tenant_id);
+  DEBUG_SYNC(BEFORE_REMOVE_BALANCE_TASK_HELPER);
   if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id || !operation_scn.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(operation_scn));

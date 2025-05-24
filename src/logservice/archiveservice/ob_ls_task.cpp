@@ -11,17 +11,8 @@
  */
 
 #include "ob_ls_task.h"
-#include <cstdint>
-#include "lib/ob_define.h"
-#include "lib/ob_errno.h"
-#include "lib/time/ob_time_utility.h"
-#include "lib/utility/ob_print_utils.h"
-#include "ob_archive_define.h"                // ArchiveKey
-#include "share/backup/ob_archive_piece.h"    // ObArchivePiece
-#include "share/backup/ob_archive_struct.h"   // ObLSArchivePersistInfo
 #include "ob_archive_task.h"                  // Archive.*Task
 #include "ob_ls_mgr.h"                        // ObArchiveLSMgr
-#include "ob_archive_worker.h"                // ObArchiveWorker
 #include "ob_archive_allocator.h"             // ObArchiveAllocator
 #include "ob_archive_task_queue.h"            // ObArchiveTaskStatus
 
@@ -184,7 +175,7 @@ int ObLSArchiveTask::get_sorted_fetch_log(ObArchiveLogFetchTask *&task)
     ARCHIVE_LOG(WARN, "get top fetch log failed", K(ret));
   } else if (NULL == tmp_task) {
     // no task exist, just skip
-    ARCHIVE_LOG(INFO, "no task exist, just skip", K(tenant_id_), K(id_), K(tmp_task));
+    ARCHIVE_LOG(TRACE, "no task exist, just skip", K(tenant_id_), K(id_), K(tmp_task));
   }
   // 1. 同一个归档文件, 相同piece或者下一个piece
   else if (tmp_task->get_end_offset() > cur_offset && tmp_task->get_start_offset() <= cur_offset) {
@@ -664,7 +655,7 @@ int ObLSArchiveTask::ArchiveDest::pop_fetch_log(ObArchiveLogFetchTask *&task)
   } else {
     wait_send_task_array_[0] = wait_send_task_array_[wait_send_task_count_ - 1];
     wait_send_task_count_--;
-    std::sort(wait_send_task_array_, wait_send_task_array_ + wait_send_task_count_, LogFetchTaskCompare());
+    lib::ob_sort(wait_send_task_array_, wait_send_task_array_ + wait_send_task_count_, LogFetchTaskCompare());
   }
   return ret;
 }
@@ -744,7 +735,7 @@ int ObLSArchiveTask::ArchiveDest::push_fetch_log(ObArchiveLogFetchTask &task)
   } else {
     wait_send_task_array_[wait_send_task_count_] = &task;
     wait_send_task_count_++;
-    std::sort(wait_send_task_array_, wait_send_task_array_ + wait_send_task_count_, LogFetchTaskCompare());
+    lib::ob_sort(wait_send_task_array_, wait_send_task_array_ + wait_send_task_count_, LogFetchTaskCompare());
   }
   ARCHIVE_LOG(INFO, "print push_fetch_log", K(task), KPC(this));
   return ret;

@@ -10,9 +10,7 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "observer/net/ob_ingress_bw_alloc_service.h"
-#include "share/rc/ob_tenant_base.h"
-#include "observer/ob_server_struct.h"
+#include "ob_ingress_bw_alloc_service.h"
 #include "observer/ob_srv_network_frame.h"
 #define USING_LOG_PREFIX RS
 
@@ -196,7 +194,7 @@ int ObNetEndpointIngressManager::update_ingress_plan(ObNetEndpointKVArray &updat
         if (remain_bw_limit <= 0) {
           remain_bw_limit = 0;
         }
-        std::sort(predicted_bws, predicted_bws + valid_count);
+        lib::ob_sort(predicted_bws, predicted_bws + valid_count);
         int64_t average = remain_bw_limit / valid_count;
         bool is_done = false;
         for (int i = 0; i < valid_count && !is_done; i++) {

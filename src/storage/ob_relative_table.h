@@ -39,12 +39,13 @@ class ColumnMap;
 }
 namespace storage
 {
+class ObTruncatePartitionFilter;
 class ObRelativeTable final
 {
 public:
   ObTabletTableIterator tablet_iter_;
 
-  ObRelativeTable(): tablet_iter_(), allow_not_ready_(false), schema_param_(NULL),
+  ObRelativeTable(): tablet_iter_(), allow_not_ready_(false), schema_param_(NULL), truncate_part_filter_(NULL),
       tablet_id_(), is_inited_(false)
   {}
   ~ObRelativeTable();
@@ -86,10 +87,13 @@ public:
   bool is_index_table() const;
   bool is_lob_meta_table() const;
   bool is_storage_index_table() const;
+  bool is_index_local_storage() const;
   bool can_read_index() const;
   bool is_unique_index() const;
   bool is_domain_index() const;
   bool is_spatial_index() const;
+  bool is_fts_index() const;
+  bool is_vector_index() const;
   int check_rowkey_in_column_ids(const common::ObIArray<uint64_t> &column_ids,
                                   const bool has_other_column) const;
   int build_index_row(const common::ObNewRow &table_row,
@@ -98,6 +102,8 @@ public:
                       common::ObNewRow &index_row,
                       bool &null_idx_val,
                       common::ObIArray<share::schema::ObColDesc> *idx_columns);
+  int prepare_truncate_part_filter(common::ObIAllocator &allocator, const int64_t read_snapshot);
+  ObTruncatePartitionFilter *get_truncate_part_filter() const { return truncate_part_filter_; }
   const share::schema::ObTableSchemaParam *get_schema_param() const { return schema_param_;}
 
   DECLARE_TO_STRING;
@@ -115,6 +121,7 @@ private:
 private:
   bool allow_not_ready_;
   const share::schema::ObTableSchemaParam *schema_param_;
+  ObTruncatePartitionFilter *truncate_part_filter_;
   ObTabletID tablet_id_;
   bool is_inited_;
 

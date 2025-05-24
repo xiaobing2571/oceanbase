@@ -35,6 +35,7 @@ struct AChunk;
 struct ABlock;
 struct AObject;
 class ObTenantCtxAllocator;
+class ObTenantCtxAllocatorV2;
 }
 namespace common
 {
@@ -45,6 +46,21 @@ enum DumpType
   STAT_LABEL
 };
 
+struct ObMemoryCheckContext
+{
+  enum CheckType
+  {
+    SQL_MEMORY_LEAK,
+  };
+  ObMemoryCheckContext(CheckType type = SQL_MEMORY_LEAK)
+    : ret_(OB_SUCCESS), type_(type), cond_()
+  {}
+  bool is_sql_memory_leak() { return SQL_MEMORY_LEAK == type_; }
+  int ret_;
+  CheckType type_;
+  ObThreadCond cond_;
+};
+
 class ObMemoryDumpTask
 {
 public:
@@ -52,6 +68,7 @@ public:
                K(dump_tenant_ctx_), K(tenant_id_), K(ctx_id_), KP(p_chunk_));
   DumpType type_;
   bool dump_all_;
+  uint64_t min_print_size_;
   union
   {
     struct {
@@ -67,6 +84,9 @@ public:
         };
         void *p_chunk_;
       };
+    };
+    struct {
+      ObMemoryCheckContext *memory_check_ctx_;
     };
   };
 };
@@ -117,6 +137,7 @@ public:
 private:
 friend class observer::ObAllVirtualMemoryInfo;
 friend class lib::ObTenantCtxAllocator;
+friend class lib::ObTenantCtxAllocatorV2;
 friend class lib::ObMallocAllocator;
 
 static const int64_t TASK_NUM = 8;
@@ -189,10 +210,27 @@ public:
     lib::ObMutexGuard guard(task_mutex_);
     avaliable_task_set_ |= (1 << pos);
   }
-  int load_malloc_sample_map(lib::ObMallocSampleMap& malloc_sample_map);
+  int generate_mod_stat_task(ObMemoryCheckContext *memory_check_ctx = NULL, uint64_t min_print_size = 0);
+  int check_sql_memory_leak();
+  int load_malloc_sample_map(lib::ObMallocSampleMap &malloc_sample_map)
+  {
+    int ret = OB_SUCCESS;
+    if (is_inited_) {
+      ObLatchRGuard guard(iter_lock_, ObLatchIds::MEM_DUMP_ITER_LOCK);
+      lib::ObMallocSampleMap &map = r_stat_->malloc_sample_map_;
+      for (lib::ObMallocSampleMap::iterator it = map.begin(); OB_SUCC(ret) && it != map.end();
+           ++it) {
+        ret = malloc_sample_map.set_refactored(it->first, it->second);
+      }
+    }
+    return ret;
+  }
+
 private:
   void run1() override;
   void handle(void *task);
+
+  void print_malloc_sample_info();
 private:
   AChunk *find_chunk(void *ptr);
 private:

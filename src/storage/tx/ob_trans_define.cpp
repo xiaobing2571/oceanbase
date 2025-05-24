@@ -13,19 +13,7 @@
 #define USING_LOG_PREFIX TRANS
 
 #include "ob_trans_define.h"
-#include "lib/container/ob_array_iterator.h"
-#include "lib/container/ob_se_array_iterator.h"
-#include "lib/objectpool/ob_concurrency_objpool.h"
-#include "ob_trans_part_ctx.h"
-#include "storage/memtable/ob_memtable_interface.h"
-#include "storage/memtable/ob_lock_wait_mgr.h"
-#include "ob_trans_service.h"
 #include "observer/ob_server.h"
-#include "lib/profile/ob_trace_id.h"
-#include "sql/session/ob_sql_session_info.h"
-#include "sql/session/ob_sql_session_mgr.h"
-#include "share/ob_define.h"
-#include "ob_tx_log.h"
 
 namespace oceanbase
 {
@@ -697,42 +685,6 @@ bool is_transfer_ctx(PartCtxSource ctx_source)
   return PartCtxSource::TRANSFER == ctx_source || PartCtxSource::TRANSFER_RECOVER == ctx_source;
 }
 
-const char *to_str(PartCtxSource src)
-{
-  const char *str = "INVALID";
-  switch (src) {
-  case PartCtxSource::UNKOWN: {
-    str = "UNKOWN";
-    break;
-  }
-  case PartCtxSource::MVCC_WRITE: {
-    str = "MVCC_WRITE";
-    break;
-  }
-  case PartCtxSource::REGISTER_MDS: {
-    str = "REGISTER_MDS";
-    break;
-  }
-  case PartCtxSource::REPLAY: {
-    str = "REPLAY";
-    break;
-  }
-  case PartCtxSource::RECOVER: {
-    str = "RECOVER";
-    break;
-  }
-  case PartCtxSource::TRANSFER: {
-    str = "TRANSFER";
-    break;
-  }
-  case PartCtxSource::TRANSFER_RECOVER: {
-    str = "TRANSFER_RECOVER";
-    break;
-  }
-  }
-  return str;
-}
-
 void ObTxExecInfo::reset()
 {
   state_ = ObTxState::INIT;
@@ -770,6 +722,7 @@ void ObTxExecInfo::reset()
   exec_epoch_ = 0;
   serial_final_scn_.reset();
   serial_final_seq_no_.reset();
+  dli_batch_set_.destroy();
 }
 
 void ObTxExecInfo::destroy(ObTxMDSCache &mds_cache)
@@ -898,6 +851,8 @@ int ObTxExecInfo::assign(const ObTxExecInfo &exec_info)
     TRANS_LOG(WARN, "commit parts assign error", KR(ret), K(exec_info));
   } else if (OB_FAIL(transfer_parts_.assign(exec_info.transfer_parts_))) {
     TRANS_LOG(WARN, "transfer_epoch assign error", KR(ret), K(exec_info));
+  } else if (OB_FAIL(dli_batch_set_.assign(exec_info.dli_batch_set_))) {
+    TRANS_LOG(WARN, "direct load inc batch set assign error", K(ret), K(exec_info.dli_batch_set_));
   } else {
     // Prepare version should be initialized before state_
     // for ObTransPartCtx::get_prepare_version_if_preapred();
@@ -968,7 +923,23 @@ OB_SERIALIZE_MEMBER(ObTxExecInfo,
                     checksum_,
                     checksum_scn_,
                     serial_final_scn_,
-                    serial_final_seq_no_);
+                    serial_final_seq_no_,
+                    dli_batch_set_  // FARM COMPAT WHITELIST
+                    );
+
+void ObMulSourceDataNotifyArg::reset()
+{
+  tx_id_.reset();
+  scn_.reset();
+  trans_version_.reset();
+  for_replay_ = false;
+  notify_type_ = NotifyType::ON_ABORT;
+  redo_submitted_ = false;
+  redo_synced_ = false;
+  willing_to_commit_ = false;
+  is_force_kill_ = false;
+  is_incomplete_replay_ = false;
+}
 
 bool ObMulSourceDataNotifyArg::is_redo_submitted() const { return redo_submitted_; }
 
@@ -1019,10 +990,15 @@ int RollbackMaskSet::merge_part(const share::ObLSID add_ls_id, const int64_t exe
     for (int64_t i = 0; i < rollback_parts_->count(); i++) {
       if (rollback_parts_->at(i).ls_id_ == add_ls_id) {
         is_exist = true;
+        if (OB_FAIL(mask_set_.unmask(rollback_parts_->at(i)))) {
+          TRANS_LOG(WARN, "unmask fail", KR(ret), K(add_ls_id));
+        }
         break;
       }
     }
-    if (!is_exist && OB_FAIL(rollback_parts_->push_back(ObTxExecPart(add_ls_id, exec_epoch, transfer_epoch)))) {
+    if (!is_exist && OB_FAIL(rollback_parts_->push_back(ObTxExecPart(add_ls_id,
+                                                                     exec_epoch,
+                                                                     transfer_epoch)))) {
       TRANS_LOG(WARN, "push part to array failed", KR(ret), K(add_ls_id));
     }
   }
@@ -1031,6 +1007,7 @@ int RollbackMaskSet::merge_part(const share::ObLSID add_ls_id, const int64_t exe
 
 int RollbackMaskSet::find_part(const share::ObLSID ls_id,
                                const int64_t orig_epoch,
+                               const int64_t transfer_epoch,
                                ObTxExecPart &part)
 {
   int ret = OB_SUCCESS;
@@ -1046,6 +1023,8 @@ int RollbackMaskSet::find_part(const share::ObLSID ls_id,
           ret = OB_ERR_UNEXPECTED;
           TRANS_LOG(WARN, "check rollback part failed", K(ret), K(rollback_parts_), K(orig_epoch));
         } else {
+          rollback_parts_->at(idx).transfer_epoch_ =
+            MAX(transfer_epoch, rollback_parts_->at(idx).transfer_epoch_);
           part = rollback_parts_->at(idx);
           is_exist = true;
         }
@@ -1057,7 +1036,7 @@ int RollbackMaskSet::find_part(const share::ObLSID ls_id,
     ret = OB_ENTRY_NOT_EXIST;
   }
   if (OB_FAIL(ret)) {
-    TRANS_LOG(WARN, "find part", K(ret), K(ls_id), K(orig_epoch), K(rollback_parts_));
+    TRANS_LOG(WARN, "find part", K(ret), K(ls_id), K(orig_epoch), K(rollback_parts_), K(transfer_epoch));
   }
   return ret;
 }

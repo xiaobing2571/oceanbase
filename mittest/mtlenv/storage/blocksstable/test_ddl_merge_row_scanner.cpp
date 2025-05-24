@@ -10,15 +10,14 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include <gtest/gtest.h>
+#define USING_LOG_PREFIX STORAGE
 #define private public
 #define protected public
 
-#include "lib/random/ob_random.h"
-#include "storage/access/ob_index_tree_prefetcher.h"
 #include "storage/access/ob_sstable_row_getter.h"
 #include "storage/access/ob_sstable_row_scanner.h"
 #include "ob_index_block_data_prepare.h"
+#include "storage/column_store/ob_co_sstable_row_scanner.h"
 
 namespace oceanbase
 {
@@ -65,6 +64,8 @@ private:
   ObArenaAllocator allocator_;
   ObDatumRow start_row_;
   ObDatumRow end_row_;
+  ObSSTable *ddl_sstable_ptr_array_[1];
+  ObFixedArray<int32_t, ObIAllocator> out_cols_project_;
 };
 
 TestDDLMergeRowScanner::TestDDLMergeRowScanner()
@@ -72,7 +73,7 @@ TestDDLMergeRowScanner::TestDDLMergeRowScanner()
 {
   is_ddl_merge_data_ = true;
   max_row_cnt_ = 150000;
-  max_partial_row_cnt_ = 78881;
+  max_partial_row_cnt_ = 77873;
   co_sstable_row_offset_ = max_partial_row_cnt_ - 1;
   partial_kv_start_idx_ = 3;
 }
@@ -104,13 +105,28 @@ void TestDDLMergeRowScanner::SetUp()
   ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
 
   ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(tablet_id, tablet_handle_));
+
+  ddl_sstable_ptr_array_[0] = &partial_sstable_;
+  tablet_handle_.get_obj()->table_store_addr_.get_ptr()->ddl_sstables_.reset();
+  tablet_handle_.get_obj()->table_store_addr_.get_ptr()->ddl_sstables_.sstable_array_ = ddl_sstable_ptr_array_;
+  tablet_handle_.get_obj()->table_store_addr_.get_ptr()->ddl_sstables_.cnt_ = 1;
+  tablet_handle_.get_obj()->table_store_addr_.get_ptr()->ddl_sstables_.is_inited_ = true;
+  out_cols_project_.reset();
+  out_cols_project_.set_allocator(&allocator_);
+  out_cols_project_.init(table_schema_.get_column_count());
+  for (int64_t i = 0; i < table_schema_.get_column_count(); ++i) {
+    out_cols_project_.push_back(i);
+  }
+  iter_param_.out_cols_project_ = &out_cols_project_;
 }
 
 void TestDDLMergeRowScanner::TearDown()
 {
+  tablet_handle_.get_obj()->table_store_addr_.get_ptr()->ddl_sstables_.reset();
   tablet_handle_.get_obj()->ddl_kv_count_ = 0;
   tablet_handle_.get_obj()->ddl_kvs_ = nullptr;
   tablet_handle_.reset();
+  iter_param_.out_cols_project_ = nullptr;
   TestIndexBlockDataPrepare::TearDown();
 }
 
@@ -140,8 +156,8 @@ void TestDDLMergeRowScanner::test_one_rowkey(const int64_t seed)
   ObDatumRowkey query_rowkey;
   query_rowkey.assign(query_row.storage_datums_, TEST_ROWKEY_COLUMN_CNT);
   STORAGE_LOG(INFO, "Query rowkey", K(query_row));
-  ASSERT_EQ(OB_SUCCESS, getter.inner_open(iter_param_, context_, &sstable_, &query_rowkey));
-  ASSERT_EQ(OB_SUCCESS, merge_ddl_getter.inner_open(iter_param_, context_, &partial_sstable_, &query_rowkey));
+  ASSERT_EQ(OB_SUCCESS, getter.init(iter_param_, context_, &sstable_, &query_rowkey));
+  ASSERT_EQ(OB_SUCCESS, merge_ddl_getter.init(iter_param_, context_, &partial_sstable_, &query_rowkey));
 
   const ObDatumRow *prow = nullptr;
   const ObDatumRow *kv_prow = nullptr;
@@ -176,14 +192,14 @@ void TestDDLMergeRowScanner::test_single_case(
   const ObDatumRow *prow = nullptr;
   const ObDatumRow *kv_prow = nullptr;
   ObSSTableRowScanner<> scanner;
-  ObSSTableRowScanner<> merge_ddl_scanner;
+  ObCOSSTableRowScanner merge_ddl_scanner;
 
-  ASSERT_EQ(OB_SUCCESS, scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, scanner.init(
           iter_param_,
           context_,
           &sstable_,
           &range));
-  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.init(
           iter_param_,
           context_,
           &partial_sstable_,
@@ -208,9 +224,9 @@ void TestDDLMergeRowScanner::test_single_case(
 
       ret = merge_ddl_scanner.inner_get_next_row(kv_prow);
       ASSERT_EQ(OB_SUCCESS, ret) << i << "index: " << index << " start: " << start
-          << " end: " << end << " kv_prow: " << kv_prow;
+          << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
       ASSERT_TRUE(row == *kv_prow) << i << "index: " << index << " start: " << start
-          << " end: " << end << " kv_prow: " << kv_prow;
+          << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
     }
   }
   ASSERT_EQ(OB_ITER_END, scanner.inner_get_next_row(prow));
@@ -232,7 +248,7 @@ void TestDDLMergeRowScanner::test_full_case(
   const ObDatumRow *prow = nullptr;
   const ObDatumRow *kv_prow = nullptr;
   ObSSTableRowScanner<> scanner;
-  ObSSTableRowScanner<> merge_ddl_scanner;
+  ObCOSSTableRowScanner merge_ddl_scanner;
 
   if (HIT_PART == hit_mode) {
     const int64_t part_start = start + (end - start) / 3;
@@ -251,12 +267,12 @@ void TestDDLMergeRowScanner::test_full_case(
     ASSERT_EQ(OB_SUCCESS, tmp_rowkey.deep_copy(part_range.end_key_, allocator_));
     part_range.border_flag_.set_inclusive_start();
     part_range.border_flag_.set_inclusive_end();
-    ASSERT_EQ(OB_SUCCESS, scanner.inner_open(
+    ASSERT_EQ(OB_SUCCESS, scanner.init(
             iter_param_,
             context_,
             &sstable_,
             &part_range));
-    ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.inner_open(
+    ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.init(
             iter_param_,
             context_,
             &partial_sstable_,
@@ -277,12 +293,12 @@ void TestDDLMergeRowScanner::test_full_case(
     merge_ddl_scanner.reuse();
   }
 
-  ASSERT_EQ(OB_SUCCESS, scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, scanner.init(
           iter_param_,
           context_,
           &sstable_,
           &range));
-  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.inner_open(
+  ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.init(
           iter_param_,
           context_,
           &partial_sstable_,
@@ -305,9 +321,9 @@ void TestDDLMergeRowScanner::test_full_case(
           << " end: " << end << " prow: " << prow;
       ret = merge_ddl_scanner.inner_get_next_row(kv_prow);
       ASSERT_EQ(OB_SUCCESS, ret) << i << "index: " << index << " start: " << start
-          << " end: " << end << " kv_prow: " << kv_prow;
+          << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
       ASSERT_TRUE(row == *kv_prow) << i << "index: " << index << " start: " << start
-          << " end: " << end << " kv_prow: " << kv_prow;
+          << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
     }
   }
   ASSERT_EQ(OB_ITER_END, scanner.inner_get_next_row(prow));
@@ -319,12 +335,12 @@ void TestDDLMergeRowScanner::test_full_case(
 
   if (HIT_ALL == hit_mode) {
     int64_t index = 0;
-    ASSERT_EQ(OB_SUCCESS, scanner.inner_open(
+    ASSERT_EQ(OB_SUCCESS, scanner.init(
             iter_param_,
             context_,
             &sstable_,
             &range));
-    ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.inner_open(
+    ASSERT_EQ(OB_SUCCESS, merge_ddl_scanner.init(
             iter_param_,
             context_,
             &partial_sstable_,
@@ -346,9 +362,9 @@ void TestDDLMergeRowScanner::test_full_case(
             << " end: " << end << " prow: " << prow;
         ret = merge_ddl_scanner.inner_get_next_row(kv_prow);
         ASSERT_EQ(OB_SUCCESS, ret) << i << "index: " << index << " start: " << start
-            << " end: " << end << " kv_prow: " << kv_prow;
+            << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
         ASSERT_TRUE(row == *kv_prow) << i << "index: " << index << " start: " << start
-            << " end: " << end << " kv_prow: " << kv_prow;
+            << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
       }
     }
     ASSERT_EQ(OB_ITER_END, scanner.inner_get_next_row(prow));

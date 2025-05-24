@@ -70,6 +70,8 @@ public: // dalegate functions
                        const transaction::ObTxSEQ &sql_sequence,
                        storage::ObStoreRowLockState &lock_state);
 
+  int load_tx_op(const transaction::ObTransID &tx_id, ObTxData &tx_data);
+
   int check_sql_sequence_can_read(const transaction::ObTransID tx_id, const transaction::ObTxSEQ &sql_sequence, bool &can_read);
 
   int get_tx_state_with_scn(const transaction::ObTransID tx_id,
@@ -97,7 +99,8 @@ public: // dalegate functions
                        memtable::ObMvccTransNode &tnode,
                        const bool need_row_latch);
 
-  int get_recycle_scn(share::SCN &recycle_scn);
+  int get_recycle_scn(share::SCN &recycle_scn,
+                      const bool is_shared_minor = false);
 
   int self_freeze_task();
 

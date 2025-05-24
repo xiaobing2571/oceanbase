@@ -1,3 +1,6 @@
+// owner: weixiaoxian.wxx
+// owner group: transaction
+
 /**
  * Copyright (c) 2021 OceanBase
  * OceanBase CE is licensed under Mulan PubL v2.
@@ -10,15 +13,12 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include <gtest/gtest.h>
 #define USING_LOG_PREFIX SERVER
 #define protected public
 #define private public
 
 #include "env/ob_fast_bootstrap.h"
 #include "env/ob_multi_replica_util.h"
-#include "lib/mysqlclient/ob_mysql_result.h"
-#include "storage/tx/ob_trans_part_ctx.h"
 
 using namespace oceanbase::transaction;
 using namespace oceanbase::storage;
@@ -76,7 +76,7 @@ void minor_freeze_tx_ctx_memtable(ObLS *ls)
           checkpoint_executor->handlers_[logservice::TRANS_SERVICE_LOG_BASE_TYPE])
           ->common_checkpoints_[ObCommonCheckpointType::TX_CTX_MEMTABLE_TYPE]);
   ASSERT_EQ(true, tx_ctx_memtable->is_active_memtable());
-  ASSERT_EQ(OB_SUCCESS, tx_ctx_memtable->flush(share::SCN::max_scn()));
+  ASSERT_EQ(OB_SUCCESS, tx_ctx_memtable->flush(share::SCN::max_scn(), -1));
 
   // // TODO(handora.qc): use more graceful wait
   // usleep(10 * 1000 * 1000);

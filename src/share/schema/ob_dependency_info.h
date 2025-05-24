@@ -61,6 +61,9 @@ namespace schema
 class ObSchemaService;
 class ObReferenceObjTable;
 extern const char *ob_object_type_str(const ObObjectType object_type);
+using CriticalDepInfo = common::ObTuple<uint64_t /* dep_obj_id */,
+                                        int64_t /* dep_obj_type */,
+                                        int64_t /* schema_version */>;
 class ObDependencyInfo : public ObSchema 
 {
   OB_UNIS_VERSION(1);
@@ -130,6 +133,12 @@ public:
                                              int64_t schema_version,
                                              share::schema::ObObjectType dep_obj_type);
 
+  static int collect_dep_info(ObIArray<ObDependencyInfo> &deps,
+                              ObObjectType dep_obj_type,
+                              int64_t ref_obj_id,
+                              int64_t ref_timestamp,
+                              ObDependencyTableType dependent_type);
+
   static int collect_dep_infos(
              const common::ObIArray<share::schema::ObSchemaObjVersion> &schema_objs,
              common::ObIArray<share::schema::ObDependencyInfo> &deps,
@@ -178,6 +187,15 @@ public:
                                         uint64_t ref_obj_id,
                                         common::ObISQLClient &sql_proxy,
                                         common::ObIArray<std::pair<uint64_t, share::schema::ObObjectType>> &objs);
+  static int collect_all_dep_objs(uint64_t tenant_id,
+                                  uint64_t ref_obj_id,
+                                  ObObjectType ref_obj_type,
+                                  common::ObISQLClient &sql_proxy,
+                                  common::ObIArray<CriticalDepInfo> &objs);
+  static int batch_invalidate_dependents(const common::ObIArray<CriticalDepInfo> &objs,
+                                         common::ObMySQLTransaction &trans,
+                                         uint64_t tenant_id,
+                                         uint64_t ref_obj_id);
   static int cascading_modify_obj_status(common::ObMySQLTransaction &trans,
                                          uint64_t tenant_id,
                                          uint64_t obj_id,
@@ -193,6 +211,12 @@ public:
                                    uint64_t tenant_id,
                                    rootserver::ObDDLOperator &ddl_operator,
                                    share::schema::ObMultiVersionSchemaService &schema_service);
+
+  static int insert_dependency_infos(common::ObMySQLTransaction &trans,
+                              common::ObIArray<share::schema::ObDependencyInfo> &dep_infos,
+                              uint64_t tenant_id,
+                              uint64_t dep_obj_id,
+                              uint64_t schema_version, uint64_t owner_id);
 
   TO_STRING_KV(K_(tenant_id),
                K_(dep_obj_id),
@@ -210,6 +234,10 @@ public:
                K_(schema_version))
 private:
   static uint64_t extract_obj_id(uint64_t exec_tenant_id, uint64_t id);
+  static int collect_all_dep_objs(uint64_t tenant_id,
+                                  const common::ObIArray<std::pair<uint64_t, int64_t>>& ref_obj_infos,
+                                  common::ObISQLClient &sql_proxy,
+                                  common::ObIArray<CriticalDepInfo> &objs);
 
 private:
   uint64_t tenant_id_;
@@ -445,7 +473,6 @@ public:
   inline const RefObjVersionMap &get_ref_obj_table() const { return ref_obj_version_table_; }
   static int batch_execute_insert_or_update_obj_dependency(
     const uint64_t tenant_id,
-    const bool is_standby,
     const int64_t new_schema_version,
     const ObReferenceObjTable::DependencyObjKeyItemPairs &dep_objs,
     ObMySQLTransaction &trans,
@@ -453,7 +480,6 @@ public:
     rootserver::ObDDLOperator &ddl_operator);
   static int batch_execute_delete_obj_dependency(
     const uint64_t tenant_id,
-    const bool is_standby,
     const ObReferenceObjTable::DependencyObjKeyItemPairs &dep_objs,
     ObMySQLTransaction &trans);
   static int update_max_dependency_version(

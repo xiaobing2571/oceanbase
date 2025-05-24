@@ -17,6 +17,7 @@
 #include "sql/executor/ob_job.h"
 #include "lib/ob_name_id_def.h"
 #include "share/rpc/ob_batch_proxy.h"
+#include "share/detect/ob_detectable_id.h"
 
 namespace oceanbase
 {
@@ -69,11 +70,28 @@ public:
   void set_max_sql_no(int64_t max_sql_no) { max_sql_no_ = max_sql_no; }
   const common::ObIArray<ObNewRange> &get_ranges() const { return ranges_; }
   int assign_ranges(const ObIArray<ObNewRange> &ranges);
+  const ObString get_sql_string() const { return ObString(sql_string_); }
+  void set_sql_string(const ObString &sql_string)
+  {
+    if (0 == sql_string.length()) {
+      sql_string_[0] = '\0';
+    } else {
+      int64_t str_size = min(sql_string.length(), common::OB_TINY_SQL_LENGTH);
+      STRNCPY(sql_string_, sql_string.ptr(), str_size);
+      sql_string_[str_size] = '\0';
+    }
+  }
+
+  void set_detectable_id(const common::ObDetectableId &detectable_id) { detectable_id_ = detectable_id; }
+  const common::ObDetectableId &get_detectable_id() const { return detectable_id_; }
+  common::ObDetectableId &get_detectable_id() { return detectable_id_; }
+
   TO_STRING_KV(N_OB_TASK_ID, ob_task_id_,
                K_(runner_svr),
                K_(ctrl_svr),
                K_(ranges),
-               K_(location_idx));
+               K_(location_idx),
+               K_(detectable_id));
   DECLARE_TO_YSON_KV;
 protected:
   //TODO：晓楚
@@ -98,6 +116,7 @@ protected:
   common::ObSEArray<ObNewRange, 32> ranges_;
   int64_t max_sql_no_;
   char sql_string_[common::OB_TINY_SQL_LENGTH + 1];
+  common::ObDetectableId detectable_id_;
   //DISALLOW_COPY_AND_ASSIGN(ObTask);
 };
 
@@ -190,7 +209,9 @@ public:
     exec_ctx_(NULL),
     inner_alloc_("RemoteTask"),
     dependency_tables_(&inner_alloc_),
-    snapshot_()
+    snapshot_(),
+    ls_list_(),
+    detectable_id_()
   {
   }
   ~ObRemoteTask() = default;
@@ -202,6 +223,9 @@ public:
   }
   int64_t get_tenant_schema_version() const { return tenant_schema_version_; }
   int64_t get_sys_schema_version() const { return sys_schema_version_; }
+  int assign_ls_list(const share::ObLSArray ls_ids);
+  const share::ObLSArray &get_all_ls() const { return ls_list_; }
+  bool check_ls_list(share::ObLSArray &ls_ids) const;
   void set_session(ObSQLSessionInfo *session_info) { session_info_ = session_info; }
   void set_runner_svr(const common::ObAddr &runner_svr) { runner_svr_ = runner_svr; }
   const common::ObAddr &get_runner_svr() const { return runner_svr_; }
@@ -216,8 +240,11 @@ public:
   const DependenyTableStore &get_dependency_tables() const {
     return dependency_tables_;
   }
-  void set_snapshot(const transaction::ObTxReadSnapshot &snapshot) { snapshot_ = snapshot; }
+  int set_snapshot(const transaction::ObTxReadSnapshot &snapshot) { return snapshot_.assign(snapshot); }
   const transaction::ObTxReadSnapshot &get_snapshot() const { return snapshot_; }
+  void set_detectable_id(const common::ObDetectableId &detectable_id) { detectable_id_ = detectable_id; }
+  const common::ObDetectableId &get_detectable_id() const { return detectable_id_; }
+  common::ObDetectableId &get_detectable_id() { return detectable_id_; }
   int fill_buffer(char* buf, int64_t size, int64_t &filled_size) const
   {
     filled_size = 0;
@@ -230,7 +257,9 @@ public:
                K_(ctrl_svr),
                K_(task_id),
                KPC_(remote_sql_info),
-               K_(snapshot));
+               K_(snapshot),
+               K_(ls_list),
+               K_(detectable_id));
   DECLARE_TO_YSON_KV;
 private:
   int64_t tenant_schema_version_;
@@ -249,6 +278,9 @@ private:
   common::ModulePageAllocator inner_alloc_;
   DependenyTableStore dependency_tables_;
   transaction::ObTxReadSnapshot snapshot_;
+  // remote执行前保存的ls
+  share::ObLSArray ls_list_;
+  common::ObDetectableId detectable_id_;
 };
 }
 }

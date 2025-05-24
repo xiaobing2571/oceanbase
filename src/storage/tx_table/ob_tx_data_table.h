@@ -13,6 +13,7 @@
 #ifndef OCEANBASE_STORAGE_OB_TX_DATA_TABLE
 #define OCEANBASE_STORAGE_OB_TX_DATA_TABLE
 
+#include "lib/utility/ob_tracepoint.h" // ERRSIM_POINT_DEF
 #include "share/scn.h"
 #include "share/ob_occam_timer.h"
 #include "share/allocator/ob_tx_data_allocator.h"
@@ -77,37 +78,49 @@ public:
       memtable_handles_.reset();
     }
 
-    TO_STRING_KV(K(memtable_head_), K(memtable_tail_), K(memtable_handles_));
+    TO_STRING_KV(KP(this), K(memtable_head_), K(memtable_tail_));
   };
 
-  struct CalcUpperInfo
-  {
-    CalcUpperInfo() {reset();}
+  struct FreezeFrequencyController {
+    int64_t last_freeze_ts_;
+    int64_t last_request_ts_;
+    FreezeFrequencyController() : last_freeze_ts_(0), last_request_ts_(0) {}
 
     void reset()
     {
-      min_start_scn_in_ctx_.set_min();
-      keep_alive_scn_.set_min();
-      update_ts_ = 0;
+      last_freeze_ts_ = 0;
+      last_request_ts_ = 0;
     }
 
-    CalcUpperInfo &operator= (const CalcUpperInfo &rhs)
+    bool can_freeze(const int64_t current_time, int64_t &last_freeze_ts)
     {
-      min_start_scn_in_ctx_ = rhs.min_start_scn_in_ctx_;
-      keep_alive_scn_ = rhs.keep_alive_scn_;
-      update_ts_ = rhs.update_ts_;
-      return *this;
+      inc_update(&last_request_ts_, current_time);
+      last_freeze_ts = ATOMIC_LOAD(&last_freeze_ts_);
+      if (current_time - last_freeze_ts > MIN_FREEZE_TX_DATA_INTERVAL &&
+          ATOMIC_BCAS(&last_freeze_ts_, last_freeze_ts, current_time)) {
+        return true;
+      }
+      return false;
     }
 
-    share::SCN min_start_scn_in_ctx_;
-    share::SCN keep_alive_scn_;
-    int64_t update_ts_;
-    common::SpinRWLock lock_;
+    bool need_re_freeze(const share::ObLSID ls_id);
 
-    TO_STRING_KV(K(min_start_scn_in_ctx_), K(keep_alive_scn_), K(update_ts_));
+    void rollback_freeze_ts(const int64_t expected_val, const int64_t rollback_val)
+    {
+      if (ATOMIC_BCAS(&last_freeze_ts_, expected_val, rollback_val)) {
+        STORAGE_LOG(INFO, "rollback freeze ts success", KTIME(expected_val), KTIME(rollback_val));
+      } else {
+        STORAGE_LOG(
+            INFO, "rollback freeze ts failed", KTIME(last_freeze_ts_), KTIME(expected_val), KTIME(rollback_val));
+      }
+    }
   };
 
-  static int64_t UPDATE_CALC_UPPER_INFO_INTERVAL;
+  // The tx data table cannot be freezed more than once in 10 seconds
+  static const int64_t MIN_FREEZE_TX_DATA_INTERVAL = 10LL * 1000LL * 1000LL;
+
+  // The tx data table should be freezed at least once each 5 minutes
+  static const int64_t MAX_FREEZE_TX_DATA_INTERVAL = 5LL * 60LL * 1000LL * 1000LL;
 
   enum COLUMN_ID_LIST
   {
@@ -122,7 +135,6 @@ public:  // ObTxDataTable
   ObTxDataTable()
     : is_inited_(false),
       is_started_(false),
-      calc_upper_trans_is_disabled_(false),
       latest_transfer_scn_(),
       ls_id_(),
       tablet_id_(0),
@@ -132,8 +144,8 @@ public:  // ObTxDataTable
       ls_tablet_svr_(nullptr),
       memtable_mgr_(nullptr),
       tx_ctx_table_(nullptr),
+      freeze_freq_controller_(),
       read_schema_(),
-      calc_upper_info_(),
       calc_upper_trans_version_cache_(),
       memtables_cache_() {}
   ~ObTxDataTable() {}
@@ -143,6 +155,7 @@ public:  // ObTxDataTable
   virtual void stop();
   virtual void reset();
   virtual void destroy();
+  bool need_re_freeze() { return freeze_freq_controller_.need_re_freeze(ls_id_); }
   int offline();
   int online();
 
@@ -206,12 +219,14 @@ public:  // ObTxDataTable
   /**
    * @brief see ObTxTable::get_upper_trans_version_before_given_scn()
    */
-  int get_upper_trans_version_before_given_scn(const share::SCN sstable_end_scn, share::SCN &upper_trans_version);
+  int get_upper_trans_version_before_given_scn(const share::SCN sstable_end_scn,
+                                               share::SCN &upper_trans_version,
+                                               const bool force_print_log = false);
 
   /**
-   * @brief see ObTxTable::supplement_undo_actions_if_exist
+   * @brief see ObTxTable::supplement_tx_op_if_exist
    */
-  int supplement_undo_actions_if_exist(ObTxData *tx_data);
+  int supplement_tx_op_if_exist(ObTxData *tx_data);
 
   int self_freeze_task();
 
@@ -228,12 +243,13 @@ public:  // ObTxDataTable
 
   int dump_single_tx_data_2_text(const int64_t tx_id_int, FILE *fd);
 
+  int get_sstable_recycle_scn(share::SCN &recycle_scn);
+
   TO_STRING_KV(KP(this),
                K_(is_inited),
                K_(is_started),
                K_(ls_id),
                K_(tablet_id),
-               K_(calc_upper_info),
                K_(memtables_cache),
                KP_(ls),
                KP_(ls_tablet_svr),
@@ -314,23 +330,24 @@ private:
   int DEBUG_calc_with_row_iter_(ObStoreRowIterator *row_iter,
                                 const share::SCN &sstable_end_scn,
                                 share::SCN &tmp_upper_trans_version);
-  bool skip_this_sstable_end_scn_(const share::SCN &sstable_end_scn);
-  int check_min_start_in_ctx_(const share::SCN &sstable_end_scn, const share::SCN &max_decided_scn, bool &need_skip);
+  bool skip_this_sstable_end_scn_(const share::SCN &sstable_end_scn, const bool force_print_log);
+  int check_min_start_in_ctx_(const share::SCN &sstable_end_scn,
+                              const share::SCN &max_decided_scn,
+                              share::SCN &min_start_scn,
+                              share::SCN &effective_scn,
+                              bool &need_skip);
   int check_min_start_in_tx_data_(const share::SCN &sstable_end_scn,
                                   share::SCN &min_start_ts_in_tx_data_memtable,
                                   bool &need_skip);
   void print_alloc_size_for_test_();
   // free the whole undo status list allocated by slice allocator
   void free_undo_status_list_(ObUndoStatusNode *node_ptr);
-  void clean_sstable_cache_task_(int64_t cache_keeped_time);
-  void update_calc_upper_info_(const share::SCN &max_decided_log_ts);
 private:
   static const int64_t LS_TX_DATA_SCHEMA_VERSION = 0;
   static const int64_t LS_TX_DATA_SCHEMA_ROWKEY_CNT = 2;
   static const int64_t LS_TX_DATA_SCHEMA_COLUMN_CNT = 5;
   bool is_inited_;
   bool is_started_;
-  bool calc_upper_trans_is_disabled_;
   share::SCN latest_transfer_scn_;
   share::ObLSID ls_id_;
   ObTabletID tablet_id_;
@@ -343,8 +360,8 @@ private:
   // The tablet id of tx data table
   ObTxDataMemtableMgr *memtable_mgr_;
   ObTxCtxTable *tx_ctx_table_;
+  FreezeFrequencyController freeze_freq_controller_;
   TxDataReadSchema read_schema_;
-  CalcUpperInfo calc_upper_info_;
   CalcUpperTransSCNCache calc_upper_trans_version_cache_;
   MemtableHandlesCache memtables_cache_;
 };  // tx_table

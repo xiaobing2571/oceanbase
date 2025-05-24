@@ -18,10 +18,13 @@
 #include "share/ob_check_stop_provider.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "rootserver/ob_rs_job_table_operator.h"
-#include "rootserver/ob_ddl_operator.h"
 
 namespace oceanbase
 {
+namespace rootserver
+{
+struct ObSysStat;
+}
 namespace share
 {
 
@@ -88,6 +91,7 @@ public:
   int init(int64_t data_version,
            UpgradeMode mode,
            common::ObMySQLProxy &sql_proxy,
+           common::ObOracleSqlProxy &oracle_sql_proxy,
            obrpc::ObSrvRpcProxy &rpc_proxy,
            obrpc::ObCommonRpcProxy &common_proxy,
            share::schema::ObMultiVersionSchemaService &schema_service,
@@ -95,8 +99,14 @@ public:
   int64_t get_version() const { return data_version_; }
   void set_tenant_id(const uint64_t tenant_id) { tenant_id_ = tenant_id; }
   int64_t get_tenant_id() const { return tenant_id_; }
+  // pre_upgrade not used now
   virtual int pre_upgrade() = 0;
+  // post_upgrade is executed when compatible is not increased and system tables/variables are ready
+  // the code written here should satisfy reentrancy. For example, use `insert ignore` instead of `insert`
   virtual int post_upgrade() = 0;
+  // finish_upgrade is executed when compatible is increased
+  // the code wirtten here can use high version function. For example, add new privilege to root user
+  virtual int finish_upgrade() = 0;
   TO_STRING_KV(K_(inited), K_(data_version), K_(tenant_id), K_(mode));
 protected:
   virtual int check_inner_stat() const;
@@ -106,6 +116,7 @@ protected:
   uint64_t tenant_id_;
   UpgradeMode mode_;
   common::ObMySQLProxy *sql_proxy_;
+  common::ObOracleSqlProxy *oracle_sql_proxy_;
   obrpc::ObSrvRpcProxy *rpc_proxy_;
   obrpc::ObCommonRpcProxy *common_proxy_;
   share::schema::ObMultiVersionSchemaService *schema_service_;
@@ -121,6 +132,7 @@ public:
   virtual ~ObUpgradeProcesserSet();
   int init(ObBaseUpgradeProcessor::UpgradeMode mode,
            common::ObMySQLProxy &sql_proxy,
+           common::ObOracleSqlProxy &oracle_sql_proxy,
            obrpc::ObSrvRpcProxy &rpc_proxy,
            obrpc::ObCommonRpcProxy &common_proxy,
            share::schema::ObMultiVersionSchemaService &schema_service,
@@ -133,6 +145,7 @@ public:
                                  const int64_t end_version,
                                  int64_t &start_idx,
                                  int64_t &end_idx);
+  int get_all_version_processor(ObBaseUpgradeProcessor *&processor) const;
 private:
   virtual int check_inner_stat() const;
   int get_processor_idx_by_version(
@@ -142,6 +155,7 @@ private:
   bool inited_;
   common::ObArenaAllocator allocator_;
   common::ObArray<ObBaseUpgradeProcessor *> processor_list_;
+  ObBaseUpgradeProcessor *all_version_upgrade_processor_;
   DISALLOW_COPY_AND_ASSIGN(ObUpgradeProcesserSet);
 };
 
@@ -153,6 +167,7 @@ public: \
   virtual ~ObUpgradeFor##MAJOR##MINOR##MAJOR_PATCH##MINOR_PATCH##Processor() {} \
   virtual int pre_upgrade() override { return common::OB_SUCCESS; } \
   virtual int post_upgrade() override { return common::OB_SUCCESS; } \
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; } \
 };
 
 /*
@@ -165,16 +180,29 @@ class ObUpgradeChecker
 {
 public:
   static bool check_data_version_exist(const uint64_t version);
+  static bool check_data_version_valid_for_backup(const uint64_t data_version);
   static bool check_cluster_version_exist(const uint64_t version);
   static int get_data_version_by_cluster_version(
              const uint64_t cluster_version,
              uint64_t &data_version);
 public:
-  static const int64_t DATA_VERSION_NUM = 13;
+  static const int64_t DATA_VERSION_NUM = 32;
   static const uint64_t UPGRADE_PATH[];
 };
 
 /* =========== special upgrade processor start ============= */
+class ObUpgradeForAllVersionProcessor : public ObBaseUpgradeProcessor
+{
+public:
+  ObUpgradeForAllVersionProcessor() : ObBaseUpgradeProcessor() {}
+  virtual ~ObUpgradeForAllVersionProcessor() {}
+  virtual int pre_upgrade() override { return common::OB_SUCCESS; }
+  virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
+private:
+  int flush_ncomp_dll_job();
+};
+
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 0, 0, 0)
 
 class ObUpgradeFor4100Processor : public ObBaseUpgradeProcessor
@@ -184,6 +212,7 @@ public:
   virtual ~ObUpgradeFor4100Processor() {}
   virtual int pre_upgrade() override { return common::OB_SUCCESS; }
   virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
 private:
   int post_upgrade_for_srs();
   int post_upgrade_for_backup();
@@ -201,6 +230,7 @@ public:
   virtual ~ObUpgradeFor4200Processor() {}
   virtual int pre_upgrade() override { return common::OB_SUCCESS; }
   virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
 private:
   int post_upgrade_for_grant_create_database_link_priv();
   int post_upgrade_for_grant_drop_database_link_priv();
@@ -217,6 +247,7 @@ public:
   virtual ~ObUpgradeFor4211Processor() {}
   virtual int pre_upgrade() override { return common::OB_SUCCESS; }
   virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
 private:
   int post_upgrade_for_dbms_scheduler();
 
@@ -225,8 +256,115 @@ DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 1, 2)
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 2, 0)
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 2, 1)
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 3, 0)
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 3, 1)
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 4, 0)
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 0)
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 1)
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 2)
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 3)
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 4)
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 3, 0, 0)
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 3, 0, 1)
+
+class ObUpgradeFor4310Processor : public ObBaseUpgradeProcessor
+{
+public:
+  ObUpgradeFor4310Processor() : ObBaseUpgradeProcessor() {}
+  virtual ~ObUpgradeFor4310Processor() {}
+  virtual int pre_upgrade() override { return common::OB_SUCCESS; }
+  virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
+private:
+  int post_upgrade_for_create_replication_role_in_oracle();
+};
+
+class ObUpgradeFor4320Processor : public ObBaseUpgradeProcessor
+{
+public:
+  ObUpgradeFor4320Processor() : ObBaseUpgradeProcessor() {}
+  virtual ~ObUpgradeFor4320Processor() {}
+  virtual int pre_upgrade() override { return common::OB_SUCCESS; }
+  virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
+private:
+  int post_upgrade_for_reset_compat_version();
+  int try_reset_version(const uint64_t tenant_id, const char *var_name);
+  int post_upgrade_for_spm();
+  int post_upgrade_for_online_estimate_percent();
+};
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 3, 2, 1)
+
+class ObUpgradeFor4330Processor : public ObBaseUpgradeProcessor
+{
+public:
+  ObUpgradeFor4330Processor() : ObBaseUpgradeProcessor() {}
+  virtual ~ObUpgradeFor4330Processor() {}
+  virtual int pre_upgrade() override { return common::OB_SUCCESS; }
+  virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
+private:
+  int post_upgrade_for_external_table_flag();
+  int post_upgrade_for_service_name();
+  int post_upgrade_for_optimizer_stats();
+  int add_spm_stats_scheduler_job();
+};
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 3, 3, 1)
+
+class ObUpgradeFor4340Processor : public ObBaseUpgradeProcessor
+{
+public:
+  ObUpgradeFor4340Processor() : ObBaseUpgradeProcessor() {}
+  virtual ~ObUpgradeFor4340Processor() {}
+  virtual int pre_upgrade() override { return common::OB_SUCCESS; }
+  virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
+private:
+  int post_upgrade_for_persitent_routine();
+};
+
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 3, 4, 1)
+
+class ObUpgradeFor4350Processor : public ObBaseUpgradeProcessor
+{
+public:
+  ObUpgradeFor4350Processor() : ObBaseUpgradeProcessor() {}
+  virtual ~ObUpgradeFor4350Processor() {}
+  virtual int pre_upgrade() override { return common::OB_SUCCESS; }
+  virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
+private:
+  int add_spm_stats_scheduler_job();
+  int post_upgrade_for_optimizer_stats();
+};
+
+class ObUpgradeFor4351Processor : public ObBaseUpgradeProcessor
+{
+public:
+  ObUpgradeFor4351Processor() : ObBaseUpgradeProcessor() {}
+  virtual ~ObUpgradeFor4351Processor() {}
+  virtual int pre_upgrade() override { return common::OB_SUCCESS; }
+  virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
+private:
+  int post_upgrade_for_optimizer_stats();
+};
+
+class ObUpgradeFor4352Processor : public ObBaseUpgradeProcessor
+{
+public:
+  ObUpgradeFor4352Processor() : ObBaseUpgradeProcessor() {}
+  virtual ~ObUpgradeFor4352Processor() {}
+  virtual int pre_upgrade() override { return common::OB_SUCCESS; }
+  virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
+private:
+  int post_upgrade_for_dynamic_partition();
+};
+
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 3, 5, 3)
+
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 4, 0, 0)
+
 /* =========== special upgrade processor end   ============= */
 
 /* =========== upgrade processor end ============= */

@@ -12,28 +12,12 @@
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "ob_table_sql_service.h"
-#include "lib/oblog/ob_log.h"
-#include "lib/oblog/ob_log_module.h"
-#include "lib/charset/ob_dtoa.h"
-#include "lib/mysqlclient/ob_mysql_proxy.h"
-#include "lib/mysqlclient/ob_mysql_transaction.h"
-#include "common/ob_store_format.h"
-#include "share/ob_dml_sql_splicer.h"
 #include "share/ob_global_stat_proxy.h"
-#include "share/ob_rpc_struct.h"
-#include "share/inner_table/ob_inner_table_schema_constants.h"
-#include "share/schema/ob_table_schema.h"
-#include "share/schema/ob_schema_struct.h"
 #include "share/schema/ob_partition_sql_helper.h"
-#include "share/schema/ob_part_mgr_util.h"
-#include "share/ob_time_zone_info_manager.h"
-#include "observer/ob_server_struct.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "share/schema/ob_trigger_sql_service.h"
-#include "rootserver/ob_root_service.h"
 #include "observer/omt/ob_tenant_timezone_mgr.h"
-#include "sql/ob_sql_utils.h"
-#include "share/ob_time_utility2.h"
+#include "src/share/vector_index/ob_vector_index_util.h"
+#include "share/storage_cache_policy/ob_storage_cache_partition_sql_helper.h"
+
 namespace oceanbase
 {
 using namespace common;
@@ -494,19 +478,20 @@ int ObTableSqlService::rename_inc_part_info(
     ObISQLClient &sql_client,
     const ObTableSchema &table_schema,
     const ObTableSchema &inc_table_schema,
-    const int64_t new_schema_version)
+    const int64_t new_schema_version,
+    const bool update_part_idx)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_ddl_allowed(table_schema))) {
     LOG_WARN("check ddl allowed failed", KR(ret), K(table_schema));
-  } else if (!table_schema.is_user_table()) {
+  } else if (!table_schema.is_user_table() && !table_schema.is_external_table()) {
     ret = OB_NOT_SUPPORTED;
-    LOG_WARN("unsupport behavior on not user table", KR(ret), K(table_schema));
+    LOG_WARN("unsupport behavior on not user table", KR(ret), K(table_schema.is_external_table()),K(table_schema));
   } else {
     const ObPartitionSchema *table_schema_ptr = &table_schema;
     const ObPartitionSchema *inc_table_schema_ptr = &inc_table_schema;
     ObRenameIncPartHelper rename_part_helper(table_schema_ptr, inc_table_schema_ptr, new_schema_version, sql_client);
-    if (OB_FAIL(rename_part_helper.rename_partition_info())) {
+    if (OB_FAIL(rename_part_helper.rename_partition_info(update_part_idx))) {
       LOG_WARN("fail to rename partition", KR(ret), KPC(table_schema_ptr), KPC(inc_table_schema_ptr));
     }
   }
@@ -536,6 +521,58 @@ int ObTableSqlService::rename_inc_subpart_info(
   return ret;
 }
 
+int ObTableSqlService::alter_inc_part_policy(
+    ObISQLClient &sql_client,
+    const ObTableSchema &table_schema,
+    const ObTableSchema &inc_table_schema,
+    const int64_t new_schema_version)
+{
+  int ret = OB_SUCCESS;
+  FLOG_INFO("alter inc part policy", K(table_schema), K(inc_table_schema), K(new_schema_version));
+  if (OB_FAIL(check_ddl_allowed(table_schema))) {
+    LOG_WARN("check ddl allowed failed", KR(ret), K(table_schema));
+  } else if (!table_schema.is_user_table() || table_schema.is_external_table()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("unsupport behavior on not user table", KR(ret), K(table_schema.is_external_table()),K(table_schema));
+  } else {
+    FLOG_INFO("alter inc part policy progress", K(table_schema), K(inc_table_schema), K(new_schema_version));
+    const ObPartitionSchema *table_schema_ptr = &table_schema;
+    const ObPartitionSchema *inc_table_schema_ptr = &inc_table_schema;
+    ObAlterIncPartPolicyHelper alter_part_policy_helper(table_schema_ptr, inc_table_schema_ptr, new_schema_version, sql_client);
+    if (OB_FAIL(alter_part_policy_helper.alter_partition_policy())) {
+      LOG_WARN("fail to alter partition policy", KR(ret), KPC(table_schema_ptr), KPC(inc_table_schema_ptr));
+    }
+  }
+  FLOG_INFO("alter inc part policy success", K(table_schema), K(inc_table_schema), K(new_schema_version));
+  return ret;
+}
+
+int ObTableSqlService::alter_inc_subpart_policy(
+    ObISQLClient &sql_client,
+    const ObTableSchema &table_schema,
+    const ObTableSchema &inc_table_schema,
+    const int64_t new_schema_version)
+{
+  int ret = OB_SUCCESS;
+  FLOG_INFO("alter inc subpart policy", K(table_schema), K(inc_table_schema), K(new_schema_version));
+  if (OB_FAIL(check_ddl_allowed(table_schema))) {
+    LOG_WARN("check ddl allowed failed", KR(ret), K(table_schema));
+  } else if (!table_schema.is_user_table() && !table_schema.is_external_table()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("unsupport behavior on not user table", KR(ret), K(table_schema.is_external_table()),K(table_schema));
+  } else {
+    FLOG_INFO("alter inc subpart policy progress", K(table_schema), K(inc_table_schema), K(new_schema_version));
+    const ObPartitionSchema *table_schema_ptr = &table_schema;
+    const ObPartitionSchema *inc_table_schema_ptr = &inc_table_schema;
+    ObAlterIncSubpartPolicyHelper alter_subpart_policy_helper(table_schema_ptr, inc_table_schema_ptr, new_schema_version, sql_client);
+    if (OB_FAIL(alter_subpart_policy_helper.alter_subpartition_policy())) {
+      LOG_WARN("fail to alter subpartition policy", KR(ret), KPC(table_schema_ptr), KPC(inc_table_schema_ptr));
+    }
+  }
+  FLOG_INFO("alter inc subpart policy success", K(table_schema), K(inc_table_schema), K(new_schema_version));
+  return ret;
+}
+
 int ObTableSqlService::drop_inc_part_info(
     ObISQLClient &sql_client,
     const ObTableSchema &table_schema,
@@ -555,7 +592,7 @@ int ObTableSqlService::drop_inc_part_info(
     } else if (OB_FAIL(drop_inc_partition(sql_client, table_schema, inc_table_schema, is_truncate_table))) {
       // remove from __all_part
       LOG_WARN("failed to drop partition", K(ret), K(inc_table_schema));
-    } else if (OB_FAIL(drop_inc_all_sub_partition(sql_client, table_schema, inc_table_schema, is_truncate_table))) {
+    } else if (!table_schema.is_external_table() && OB_FAIL(drop_inc_all_sub_partition(sql_client, table_schema, inc_table_schema, is_truncate_table))) {
       // remove from __all_sub_part
       LOG_WARN("failed to drop subpartition", K(ret), K(inc_table_schema));
     } else {
@@ -713,12 +750,72 @@ int ObTableSqlService::truncate_subpart_info(
   return ret;
 }
 
+int ObTableSqlService::exchange_part_info(
+    common::ObISQLClient &sql_client,
+    const ObTableSchema &ori_table,
+    ObTableSchema &inc_table,
+    ObTableSchema &del_table,
+    const int64_t drop_schema_version,
+    const int64_t add_schema_version)
+{
+  int ret = OB_SUCCESS;
+  bool is_truncate_table = false;
+  bool is_truncate_partition = true;
+  if (OB_FAIL(check_ddl_allowed(ori_table))) {
+    LOG_WARN("check ddl allowd failed", K(ret), K(ori_table));
+  } else if (OB_FAIL(drop_inc_part_info(sql_client,
+                                        ori_table,
+                                        del_table,
+                                        drop_schema_version,
+                                        is_truncate_partition,
+                                        is_truncate_table))) {
+    LOG_WARN("delete inc part info failed", K(ret));
+  } else if (OB_FAIL(add_inc_partition_info(sql_client,
+                                            ori_table,
+                                            inc_table,
+                                            add_schema_version,
+                                            true/*is_truncate_table*/,
+                                            false/*is_subpart*/))) {
+    LOG_WARN("add inc part info failed", K(ret));
+  }
+  return ret;
+}
+
+int ObTableSqlService::exchange_subpart_info(
+    common::ObISQLClient &sql_client,
+    const ObTableSchema &ori_table,
+    ObTableSchema &inc_table,
+    ObTableSchema &del_table,
+    const int64_t drop_schema_version,
+    const int64_t add_schema_version,
+    const bool is_subpart_idx_specified)
+{
+  int ret = OB_SUCCESS;
+  const ObPartition *part = NULL;
+  if (OB_FAIL(check_ddl_allowed(ori_table))) {
+    LOG_WARN("check ddl allowd failed", K(ret), K(ori_table));
+  } else if (OB_FAIL(drop_inc_subpart_info(sql_client, ori_table, del_table,
+                                           drop_schema_version))) {
+    LOG_WARN("failed to drop partition", K(ret), K(del_table));
+  } else if (OB_FAIL(add_inc_partition_info(sql_client,
+                                            ori_table,
+                                            inc_table,
+                                            add_schema_version,
+                                            true/*is_truncate_table*/,
+                                            true/*is_subpart*/,
+                                            is_subpart_idx_specified))) {
+    LOG_WARN("add partition info failed", K(ret));
+  }
+  return ret;
+}
+
 int ObTableSqlService::drop_table(const ObTableSchema &table_schema,
                                   const int64_t new_schema_version,
                                   ObISQLClient &sql_client,
                                   const ObString *ddl_stmt_str/*=NULL*/,
                                   bool is_truncate_table /*false*/,
                                   bool is_drop_db /*false*/,
+                                  bool is_force_drop_lonely_lob_aux_table /*false*/,
                                   ObSchemaGetterGuard *schema_guard /*=NULL*/,
                                   DropTableIdHashSet *drop_table_set/*=NULL*/)
 {
@@ -829,7 +926,27 @@ int ObTableSqlService::drop_table(const ObTableSchema &table_schema,
     if (OB_FAIL(log_operation_wrapper(opt, sql_client))) {
       LOG_WARN("log operation failed", K(opt), K(ret));
     } else {
-      if (table_schema.is_index_table()
+      if (is_force_drop_lonely_lob_aux_table) {
+        // Due to some bugs, the lob aux table was not deleted along with the main table。
+        // which would affect some features, such as load balancing.
+        // Therefore, a way needs to be provided to force the deletion of the lob aux table.
+        // However, since the main table corresponding to the lob aux table has already been deleted
+        // the schema_version of the main table cannot be updated. Thus, this step needs to be skipped.
+        // But for safety, we try to update it, but the expectation was to fail.
+        if (table_schema.is_aux_lob_table()) {
+          ret = update_data_table_schema_version(sql_client, tenant_id, table_schema.get_data_table_id(), table_schema.get_in_offline_ddl_white_list());
+          if (OB_TABLE_NOT_EXIST != ret) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_ERROR("is_force_drop_lonely_lob_aux_table is true, but update_data_table_schema_version success ", K(table_schema));
+          } else {
+            ret = OB_SUCCESS;
+            LOG_ERROR("is_force_drop_lonely_lob_aux_table, skip update data table schema version", K(table_schema));
+          }
+        } else {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_ERROR("is_force_drop_lonely_lob_aux_table is true, but not drop lob aux table", K(table_schema));
+        }
+      } else if (table_schema.is_index_table()
           || table_schema.is_aux_vp_table()
           || table_schema.is_aux_lob_table()
           || table_schema.is_mlog_table()) {
@@ -976,7 +1093,8 @@ int ObTableSqlService::insert_single_column(
   }
   if (OB_SUCC(ret)) {
     if (new_column_schema.is_autoincrement()) {
-      if (OB_FAIL(add_sequence(new_table_schema.get_tenant_id(),
+      if (OB_FAIL(add_sequence(sql_client,
+                               new_table_schema.get_tenant_id(),
                                new_table_schema.get_table_id(),
                                new_column_schema.get_column_id(),
                                new_table_schema.get_auto_increment(),
@@ -1006,7 +1124,8 @@ int ObTableSqlService::update_single_column(
     const ObTableSchema &origin_table_schema,
     const ObTableSchema &new_table_schema,
     const ObColumnSchemaV2 &new_column_schema,
-    const bool record_ddl_operation)
+    const bool record_ddl_operation,
+    const bool need_del_stats)
 {
   int ret = OB_SUCCESS;
   const uint64_t tenant_id = new_table_schema.get_tenant_id();
@@ -1037,7 +1156,8 @@ int ObTableSqlService::update_single_column(
     if (new_column_schema.is_autoincrement()) {
       if (origin_table_schema.get_autoinc_column_id() == 0 &&
           new_table_schema.get_autoinc_column_id() == new_column_schema.get_column_id()) {
-        if (OB_FAIL(add_sequence(tenant_id,
+        if (OB_FAIL(add_sequence(sql_client,
+                                 tenant_id,
                                  new_table_schema.get_table_id(),
                                  new_column_schema.get_column_id(),
                                  new_table_schema.get_auto_increment(),
@@ -1059,6 +1179,12 @@ int ObTableSqlService::update_single_column(
           RS_LOG(WARN, "only one auto-increment column permitted", K(ret));
         }
       }
+    }
+  }
+  // for drop column online, delete column stat.
+  if (OB_SUCC(ret) && need_del_stats) {
+    if (OB_FAIL(delete_column_stat(sql_client, tenant_id, table_id, new_column_schema.get_column_id()))) {
+      LOG_WARN("fail to delete column stat", K(ret));
     }
   }
 
@@ -1125,14 +1251,18 @@ int ObTableSqlService::add_columns_for_core(ObISQLClient &sql_client, const ObTa
   }
   for (ObTableSchema::const_column_iterator iter = table.column_begin();
       OB_SUCC(ret) && iter != table.column_end(); ++iter) {
-    ObColumnSchemaV2 column = (**iter);
-    column.set_schema_version(table.get_schema_version());
-    column.set_tenant_id(table.get_tenant_id());
-    column.set_table_id(table.get_table_id());
     dml.reset();
     cells.reuse();
     int64_t affected_rows = 0;
-    if (OB_FAIL(gen_column_dml(tenant_id, column, dml))) {
+    ObColumnSchemaV2 column;
+    if (OB_FAIL(column.assign(**iter))) {
+      LOG_WARN("fail to assign column", KR(ret), KPC(*iter));
+    } else {
+      column.set_schema_version(table.get_schema_version());
+      column.set_tenant_id(table.get_tenant_id());
+      column.set_table_id(table.get_table_id());
+    }
+    if (FAILEDx(gen_column_dml(tenant_id, column, dml))) {
       LOG_WARN("gen column dml failed", K(ret));
     } else if (OB_FAIL(dml.splice_core_cells(kv, cells))) {
       LOG_WARN("splice core cells failed", K(ret));
@@ -1233,12 +1363,16 @@ int ObTableSqlService::add_columns_for_not_core(ObISQLClient &sql_client,
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("iter is NULL", K(ret));
     } else {
-      ObColumnSchemaV2 column = (**iter);
-      column.set_schema_version(new_schema_version);
-      column.set_tenant_id(table.get_tenant_id());
-      column.set_table_id(table.get_table_id());
+      ObColumnSchemaV2 column;
+      if (OB_FAIL(column.assign(**iter))) {
+        LOG_WARN("fail to assign column", KR(ret), KPC(*iter));
+      } else {
+        column.set_schema_version(new_schema_version);
+        column.set_tenant_id(table.get_tenant_id());
+        column.set_table_id(table.get_table_id());
+      }
       ObDMLSqlSplicer dml;
-      if (OB_FAIL(gen_column_dml(exec_tenant_id, column, dml))) {
+      if (FAILEDx(gen_column_dml(exec_tenant_id, column, dml))) {
         LOG_WARN("gen_column_dml failed", K(column), K(ret));
       } else if (column_sql.empty()) {
         if (OB_FAIL(dml.splice_insert_sql_without_plancache(OB_ALL_COLUMN_TNAME, column_sql))) {
@@ -1279,6 +1413,13 @@ int ObTableSqlService::add_columns_for_not_core(ObISQLClient &sql_client,
     stash_desc2->add_row_cnt(table.get_column_count());
     if (OB_FAIL(trans->do_stash_query_batch())) {
       LOG_WARN("do_stash_query fail", K(ret));
+    } else if (table.is_index_table() && is_virtual_table(table.get_data_table_id())
+        && OB_FAIL(trans->do_stash_query())) {
+      // for virtual table index who need to sync schema version, it will try to get data table schema from inner table
+      // the sql to insert into __all_column may not be executed if stash query is enabled, and get table schema will fail
+      LOG_WARN("failed to do stash query for virtual table index", K(ret),
+          "table_name", table.get_table_name(), "table_id", table.get_table_id(),
+          "data_table_id", table.get_data_table_id());
     }
   } else if (OB_FAIL(sql_client.write(exec_tenant_id, column_sql.ptr(), affected_rows))) {
     LOG_WARN("execute sql failed", K(column_sql), K(ret));
@@ -1670,7 +1811,7 @@ int ObTableSqlService::supplement_for_core_table(ObISQLClient &sql_client,
     MEMSET(orig_default_value_buf, 0, value_buf_len);
     lib::Worker::CompatMode compat_mode = lib::Worker::CompatMode::INVALID;
     if (!ob_is_string_type(column.get_data_type()) && !ob_is_json(column.get_data_type())
-        && !ob_is_geometry(column.get_data_type())) {
+        && !ob_is_geometry(column.get_data_type()) && !ob_is_roaringbitmap(column.get_data_type())) {
       if (OB_FAIL(ObCompatModeGetter::get_table_compat_mode(
           column.get_tenant_id(), column.get_table_id(), compat_mode))) {
         LOG_WARN("fail to get tenant mode", K(ret), K(column));
@@ -1688,7 +1829,7 @@ int ObTableSqlService::supplement_for_core_table(ObISQLClient &sql_client,
   ObString orig_default_value;
   if (OB_SUCC(ret)) {
     if (ob_is_string_type(column.get_data_type()) || ob_is_json(column.get_data_type())
-        || ob_is_geometry(column.get_data_type())) {
+        || ob_is_geometry(column.get_data_type()) || ob_is_roaringbitmap(column.get_data_type())) {
       ObString orig_default_value_str = column.get_orig_default_value().get_string();
       orig_default_value.assign_ptr(orig_default_value_str.ptr(), orig_default_value_str.length());
     } else {
@@ -1892,6 +2033,10 @@ int ObTableSqlService::add_table(
   uint64_t tenant_data_version = 0;
   if (OB_FAIL(GET_MIN_DATA_VERSION(exec_tenant_id, tenant_data_version))) {
     LOG_WARN("get tenant data version failed", K(ret));
+  } else if (tenant_data_version < DATA_VERSION_4_3_3_0 && table.is_vec_index()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("tenant data version is less than 4.3.3, vector index is not supported", K(ret), K(tenant_data_version));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.3.3, vector index");
   } else if (tenant_data_version < DATA_VERSION_4_1_0_0 && table.is_spatial_index()) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("tenant data version is less than 4.1, spatial index is not supported", K(ret), K(tenant_data_version));
@@ -1899,6 +2044,15 @@ int ObTableSqlService::add_table(
   } else if (tenant_data_version < DATA_VERSION_4_3_0_0 && table.is_materialized_view()) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("mview is not support before 4.3", KR(ret), K(table));
+  } else if (tenant_data_version < DATA_VERSION_4_3_1_0 && (table.is_fts_index() || table.is_multivalue_index())) {
+    ret = OB_NOT_SUPPORTED;
+    if (table.is_multivalue_index()) {
+      LOG_WARN("tenant data version is less than 4.3.1, multivalue index is not supported", K(ret), K(tenant_data_version));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.3.1, multivalue index");
+    } else {
+      LOG_WARN("tenant data version is less than 4.3.1, fulltext index is not supported", K(ret), K(tenant_data_version));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.3.1, fulltext index");
+    }
   } else if (OB_FAIL(check_ddl_allowed(table))) {
     LOG_WARN("check ddl allowd failed", K(ret), K(table));
   } else if (OB_FAIL(gen_table_dml(exec_tenant_id, table, update_object_status_ignore_version, dml))) {
@@ -2049,33 +2203,8 @@ int ObTableSqlService::update_table_options(ObISQLClient &sql_client,
   bool is_oracle_mode = false;
   const uint64_t tenant_id = table_schema.get_tenant_id();
   uint64_t table_id = table_schema.get_table_id();
-  ObDMLSqlSplicer dml;
-  const uint64_t exec_tenant_id = ObSchemaUtils::get_exec_tenant_id(tenant_id);
-  const bool update_object_status_ignore_version = false;
-  if (OB_FAIL(check_ddl_allowed(new_table_schema))) {
-    LOG_WARN("check ddl allowd failed", K(ret), K(new_table_schema));
-  } else if (OB_FAIL(gen_table_options_dml(exec_tenant_id, new_table_schema, update_object_status_ignore_version, dml))) {
-    LOG_WARN("gen table options dml failed", K(ret));
-  } else {
-    int64_t affected_rows = 0;
-    const char *table_name = NULL;
-    if (OB_FAIL(ObSchemaUtils::get_all_table_name(exec_tenant_id, table_name))) {
-      LOG_WARN("fail to get all table name", K(ret), K(exec_tenant_id));
-    } else if (OB_FAIL(exec_update(sql_client, tenant_id, table_id,
-                                   table_name, dml, affected_rows))) {
-      LOG_WARN("exec update failed", K(ret));
-    } else if (affected_rows > 1) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected value", K(ret), K(affected_rows));
-    }
-  }
-
-  // add to __all_table_history table
-  if (OB_SUCC(ret)) {
-    const bool only_history = true;
-    if (OB_FAIL(add_table(sql_client, new_table_schema, update_object_status_ignore_version, only_history))) {
-      LOG_WARN("add_table failed", K(new_table_schema), K(only_history), K(ret));
-    }
+  if (OB_FAIL(inner_update_table_options_(sql_client, new_table_schema))) {
+    LOG_WARN("fail to do inner update table option", KR(ret), KPC(ddl_stmt_str));
   }
 
   if (OB_SUCC(ret)) {
@@ -2281,7 +2410,8 @@ int ObTableSqlService::delete_single_column(
     const int64_t new_schema_version,
     common::ObISQLClient &sql_client,
     const ObTableSchema &new_table_schema,
-    const ObColumnSchemaV2 &orig_column_schema)
+    const ObColumnSchemaV2 &orig_column_schema,
+    const bool record_ddl_operation)
 {
   int ret = OB_SUCCESS;
 
@@ -2311,19 +2441,8 @@ int ObTableSqlService::delete_single_column(
   }
 
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(dml.add_pk_column("tenant_id", tenant_id))
-        || OB_FAIL(dml.add_pk_column("table_id", table_id))
-        || OB_FAIL(dml.add_pk_column("column_id", column_id))) {
-      LOG_WARN("add column failed", K(ret));
-    } else {
-      int64_t affected_rows = 0;
-      if (OB_FAIL(exec_delete(sql_client, tenant_id, table_id, OB_ALL_COLUMN_STAT_TNAME,
-                              dml, affected_rows))) {
-        LOG_WARN("exec delete column stat failed", K(ret));
-      } else if (OB_FAIL(exec_delete(sql_client, tenant_id, table_id, OB_ALL_HISTOGRAM_STAT_TNAME,
-                                     dml, affected_rows))) {
-        LOG_WARN("exec delete histogram stat failed", K(ret));
-      }
+    if (OB_FAIL(delete_column_stat(sql_client, tenant_id, table_id, column_id))) {
+      LOG_WARN("fail to delete column stat", K(ret));
     }
   }
 
@@ -2352,7 +2471,7 @@ int ObTableSqlService::delete_single_column(
   }
 
   // log delete column
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && record_ddl_operation) {
     ObSchemaOperation opt;
     opt.tenant_id_ = new_table_schema.get_tenant_id();
     opt.database_id_ = new_table_schema.get_database_id();
@@ -2380,14 +2499,20 @@ int ObTableSqlService::create_table(ObTableSchema &table,
   int64_t cost_usec = 0;
   const uint64_t tenant_id = table.get_tenant_id();
 
-  if (!table.is_valid()) {
-    ret = OB_INVALID_ARGUMENT;
+  lib::Worker::CompatMode compat_mode = lib::Worker::CompatMode::INVALID;
+  if (OB_FAIL(ObCompatModeGetter::get_table_compat_mode(tenant_id, table.get_table_id(), compat_mode))) {
+      LOG_WARN("fail to get table compat mode", K(ret));
+  }
+  lib::CompatModeGuard compat_mode_guard(compat_mode);
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(table.check_valid(true/*count by byte*/))) {
     LOG_WARN("invalid create table argument, ", K(table));
   } else if (OB_FAIL(check_ddl_allowed(table))) {
     LOG_WARN("check ddl allowd failed", K(ret), K(table));
   }
   if (OB_SUCCESS == ret && 0 != table.get_autoinc_column_id()) {
-    if (OB_FAIL(add_sequence(tenant_id, table.get_table_id(),
+    if (OB_FAIL(add_sequence(sql_client, tenant_id, table.get_table_id(),
                              table.get_autoinc_column_id(), table.get_auto_increment(),
                              table.get_truncate_version()))) {
       LOG_WARN("insert sequence record faild", K(ret), K(table));
@@ -2417,7 +2542,7 @@ int ObTableSqlService::create_table(ObTableSchema &table,
              && table.get_column_count() > 0
              && FALSE_IT(table.set_view_column_filled_flag(ObViewColumnFilledFlag::FILLED))) {
   } else if (OB_FAIL(add_table(sql_client, table, update_object_status_ignore_version, only_history))) {
-    LOG_WARN("insert table schema failed, ", K(ret), "table", to_cstring(table));
+    LOG_WARN("insert table schema failed, ", K(ret), K(table));
   }
   if (OB_FAIL(ret)) {
     //do nothing
@@ -2427,9 +2552,9 @@ int ObTableSqlService::create_table(ObTableSchema &table,
     start_usec = end_usec;
     LOG_INFO("add_table cost: ", K(cost_usec));
     if (OB_FAIL(add_columns(sql_client, table))) {
-      LOG_WARN("insert column schema failed, ", K(ret), "table", to_cstring(table));
+      LOG_WARN("insert column schema failed, ", K(ret), K(table));
     } else if (OB_FAIL(add_constraints(sql_client, table))) {
-      LOG_WARN("insert constraint schema failed, ", K(ret), "table", to_cstring(table));
+      LOG_WARN("insert constraint schema failed, ", K(ret), K(table));
     }
     end_usec = ObTimeUtility::current_time();
     cost_usec = end_usec - start_usec;
@@ -2452,11 +2577,11 @@ int ObTableSqlService::create_table(ObTableSchema &table,
     }
   } else if (table.view_column_filled() //view table
              && OB_FAIL(add_columns(sql_client, table))) {
-    LOG_WARN("insert column schema failed, ", K(ret), "table", to_cstring(table));
+    LOG_WARN("insert column schema failed, ", K(ret), K(table));
   }
 
   if (FAILEDx(add_column_groups(sql_client, table, table.get_schema_version()))) {
-    LOG_WARN("fail to add column groups", KR(ret), "table", to_cstring(table));
+    LOG_WARN("fail to add column groups", KR(ret), K(table));
   }
 
   ObSchemaOperation opt;
@@ -2589,6 +2714,76 @@ int ObTableSqlService::update_index_status(
   return ret;
 }
 
+
+int ObTableSqlService::update_index_type(const ObTableSchema &data_table_schema,
+                                         const uint64_t index_table_id,
+                                         const ObIndexType index_type,
+                                         const int64_t new_schema_version,
+                                         const common::ObString *ddl_stmt_str,
+                                         common::ObISQLClient &sql_client)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = data_table_schema.get_tenant_id();
+  const uint64_t exec_tenant_id = ObSchemaUtils::get_exec_tenant_id(tenant_id);
+  ObDMLSqlSplicer dml;
+  int64_t affected_rows = 0;
+  const char *table_name = NULL;
+
+  if (OB_INVALID_ID == index_table_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(index_table_id));
+  } else if (OB_FAIL(check_ddl_allowed(data_table_schema))) {
+    LOG_WARN("check ddl allowd failed", K(ret), K(data_table_schema));
+  } else if (OB_FAIL(dml.add_pk_column("tenant_id", ObSchemaUtils::get_extract_tenant_id(
+                                                    exec_tenant_id, tenant_id)))
+            || OB_FAIL(dml.add_pk_column("table_id", ObSchemaUtils::get_extract_schema_id(
+                                                    exec_tenant_id, index_table_id)))
+            || OB_FAIL(dml.add_column("schema_version", new_schema_version))
+            || OB_FAIL(dml.add_column("index_type", index_type))) {
+    LOG_WARN("add column failed", K(ret));
+  } else if (OB_FAIL(ObSchemaUtils::get_all_table_name(exec_tenant_id, table_name))) {
+    LOG_WARN("fail to get all table name", K(ret), K(exec_tenant_id));
+  } else if (OB_FAIL(exec_update(sql_client, tenant_id, index_table_id, table_name, dml, affected_rows))) {
+    LOG_WARN("exec update failed", K(ret));
+  } else if (affected_rows != 1) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected error", K(affected_rows), K(ret));
+  }
+
+  if (OB_SUCC(ret)) {
+    ObTableSchema index_schema;
+    ObRefreshSchemaStatus schema_status;
+    schema_status.tenant_id_ = tenant_id;
+    if (OB_FAIL(schema_service_.get_table_schema_from_inner_table(schema_status, index_table_id, sql_client, index_schema))) {
+      LOG_WARN("get_table_schema failed", K(index_table_id), K(ret));
+    } else {
+      const bool update_object_status_ignore_version = false;
+      const bool only_history = true;
+      index_schema.set_index_type(index_type);
+      index_schema.set_schema_version(new_schema_version);
+      index_schema.set_in_offline_ddl_white_list(data_table_schema.get_in_offline_ddl_white_list());
+      if (OB_FAIL(add_table(sql_client, index_schema, update_object_status_ignore_version, only_history))) {
+        LOG_WARN("add_table failed", K(index_schema), K(only_history), K(ret));
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    ObSchemaOperation opt;
+    opt.tenant_id_ = tenant_id;
+    opt.database_id_ = 0;
+    opt.tablegroup_id_ = 0;
+    opt.table_id_ = index_table_id;
+    opt.op_type_ = OB_DDL_MODIFY_INDEX_TYPE;
+    opt.schema_version_ = new_schema_version;
+    opt.ddl_stmt_str_ = ddl_stmt_str ? *ddl_stmt_str : ObString();
+    if (OB_FAIL(log_operation_wrapper(opt, sql_client))) {
+      LOG_WARN("log operation failed", K(opt), K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObTableSqlService::update_mview_status(
     const ObTableSchema &mview_table_schema,
     common::ObISQLClient &sql_client)
@@ -2661,6 +2856,84 @@ int ObTableSqlService::update_mview_status(
   return ret;
 }
 
+int ObTableSqlService::update_mview_reference_table_status(
+    const ObTableSchema &table_schema,
+    common::ObISQLClient &sql_client)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  const uint64_t tenant_id = table_schema.get_tenant_id();
+  const uint64_t exec_tenant_id = ObSchemaUtils::get_exec_tenant_id(tenant_id);
+  share::schema::ObTableMode table_mode_struct = table_schema.get_table_mode_struct();
+  uint64_t table_id = table_schema.get_table_id();
+  int64_t new_schema_version = table_schema.get_schema_version();
+  int64_t mv_mode = table_schema.get_mv_mode();
+  ObDMLSqlSplicer dml;
+  uint64_t data_version = 0;
+  if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, data_version))) {
+    LOG_WARN("failed to get data version", KR(ret));
+  } else if (OB_FAIL(dml.add_pk_column(
+                 "tenant_id", ObSchemaUtils::get_extract_tenant_id(exec_tenant_id, tenant_id))) ||
+             OB_FAIL(dml.add_pk_column(
+                 "table_id", ObSchemaUtils::get_extract_schema_id(exec_tenant_id, table_id))) ||
+             OB_FAIL(dml.add_column("schema_version", new_schema_version)) ||
+             OB_FAIL(dml.add_column("table_mode", table_mode_struct.mode_)) ||
+             (data_version >= DATA_VERSION_4_3_4_0 &&
+              OB_FAIL(dml.add_column("mv_mode", mv_mode)))) {
+    LOG_WARN("failed to add column", KR(ret), K(exec_tenant_id), K(tenant_id));
+  } else {
+    int64_t affected_rows = 0;
+    const char *table_name = NULL;
+    if (OB_FAIL(ObSchemaUtils::get_all_table_name(exec_tenant_id, table_name))) {
+      LOG_WARN("fail to get all table name", KR(ret), K(exec_tenant_id));
+    } else if (OB_FAIL(exec_update(sql_client,
+        tenant_id, table_id, table_name, dml, affected_rows))) {
+      LOG_WARN("failed to exec update", KR(ret),
+          K(tenant_id), K(table_id), K(table_name));
+    } else if (!is_single_row(affected_rows)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected error", KR(ret), K(affected_rows));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    ObRefreshSchemaStatus schema_status;
+    schema_status.tenant_id_ = tenant_id;
+    const bool update_object_status_ignore_version = false;
+    SMART_VAR(ObTableSchema, new_schema) {
+      if (OB_FAIL(schema_service_.get_table_schema_from_inner_table(
+          schema_status, table_id, sql_client, new_schema))) {
+        LOG_WARN("failed to get table schema for inner table", KR(ret), K(table_id));
+      } else {
+        const bool only_history = true;
+        new_schema.set_table_referenced_by_mv(ObTableMode::get_table_referenced_by_mv_flag(table_mode_struct.mode_));
+        new_schema.set_mv_mode(mv_mode);
+        new_schema.set_schema_version(new_schema_version);
+        new_schema.set_in_offline_ddl_white_list(table_schema.get_in_offline_ddl_white_list());
+        if (OB_FAIL(add_table(sql_client,
+                              new_schema,
+                              update_object_status_ignore_version,
+                              only_history))) {
+          LOG_WARN("failed to add_table", KR(ret), K(new_schema), K(only_history));
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    ObSchemaOperation opt;
+    opt.tenant_id_ = tenant_id;
+    opt.database_id_ = 0;
+    opt.tablegroup_id_ = 0;
+    opt.table_id_ = table_id;
+    opt.op_type_ = OB_DDL_MODIFY_MVIEW_REFERENCE_TABLE_STATUS;
+    opt.schema_version_ = new_schema_version;
+    if (OB_FAIL(log_operation_wrapper(opt, sql_client))) {
+      LOG_WARN("log operation failed", K(ret), K(opt));
+    }
+  }
+  return ret;
+}
 
 int ObTableSqlService::add_transition_point_val(ObDMLSqlSplicer &dml,
                                                 const ObTableSchema &table) {
@@ -2826,10 +3099,14 @@ int ObTableSqlService::gen_table_dml(
                          && (table.is_external_table()
                              || !table.get_external_file_location().empty()
                              || !table.get_external_file_format().empty()
+                             || !table.get_external_properties().empty()
                              || !table.get_external_file_location_access_info().empty()
                              || !table.get_external_file_pattern().empty()))) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("external table is not support before 4.2", K(ret), K(table));
+  } else if (data_version < DATA_VERSION_4_3_1_0 && table.get_table_flags() > 1) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("some table flag is not support before 4.3.1", K(ret), K(table));
   } else if (data_version < DATA_VERSION_4_2_1_2
              && OB_UNLIKELY(OB_DEFAULT_LOB_INROW_THRESHOLD != table.get_lob_inrow_threshold())) {
     ret = OB_NOT_SUPPORTED;
@@ -2845,6 +3122,15 @@ int ObTableSqlService::gen_table_dml(
                  || 0 == strcasecmp(table.get_compress_func_name(), all_compressor_name[ObCompressorType::ZLIB_LITE_COMPRESSOR]))) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("zlib_lite_1.0 not support before 4.3", K(ret), K(table));
+  } else if ((data_version < MOCK_DATA_VERSION_4_2_3_0 ||
+                (data_version >= DATA_VERSION_4_3_0_0 && data_version < DATA_VERSION_4_3_2_0))
+             && OB_UNLIKELY(0 != table.get_auto_increment_cache_size())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("auto increment cache size not support before 4.2.3", K(ret), K(table));
+  } else if (data_version < DATA_VERSION_4_3_3_0
+      && !table.get_index_params().empty()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("index params setting is not support in version less than 433");
   } else {
   if (data_version < DATA_VERSION_4_2_1_0
       && (!table.get_ttl_definition().empty() || !table.get_kv_attributes().empty())) {
@@ -2852,8 +3138,22 @@ int ObTableSqlService::gen_table_dml(
     LOG_WARN("ttl definition and kv attributes is not supported in version less than 4.2.1",
         "ttl_definition", table.get_ttl_definition().empty(),
         "kv_attributes", table.get_kv_attributes().empty());
+  } else if (data_version < DATA_VERSION_4_3_5_2 &&
+            !is_storage_cache_policy_default(table.get_storage_cache_policy())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("storage cache policy is not supported in version less than 4.3.5.2",
+        "storage_cache_policy", table.get_storage_cache_policy());
+  } else if (data_version < DATA_VERSION_4_3_5_2 && table.get_semistruct_encoding_flags() != 0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("semistruct encodin is not supported in version less than 4.3.5.2",
+        "semistruct_encoding_flags", table.get_semistruct_encoding_flags(),
+        "semistruct_encoding_type", table.get_semistruct_encoding_type());
+  } else if (not_compat_for_queuing_mode(data_version) && table.is_new_queuing_table_mode()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN(QUEUING_MODE_NOT_COMPAT_WARN_STR, K(ret), K(table));
   } else {}
   if (OB_SUCC(ret)) {
+    ObString empty_str("");
     const ObPartitionOption &part_option = table.get_part_option();
     const ObPartitionOption &sub_part_option = table.get_sub_part_option();
     const char *expire_info = table.get_expire_info().length() <= 0 ?
@@ -2873,14 +3173,44 @@ int ObTableSqlService::gen_table_dml(
         "" : table.get_ttl_definition().ptr();
     const char *kv_attributes = table.get_kv_attributes().empty() ?
         "" : table.get_kv_attributes().ptr();
+    const char *storage_cache_policy = table.get_storage_cache_policy().empty() ?
+        OB_DEFAULT_STORAGE_CACHE_POLICY_STR : table.get_storage_cache_policy().ptr();
+    ObString index_params = table.get_index_params().empty() ? empty_str : table.get_index_params();
+    const ObString parser_properties = table.get_parser_property_str().empty() ? empty_str : table.get_parser_property_str();
+    const char *dynamic_partition_policy = table.get_dynamic_partition_policy().empty() ?
+        "" : table.get_dynamic_partition_policy().ptr();
+    ObString local_session_var;
+    ObArenaAllocator allocator(ObModIds::OB_SCHEMA_OB_SCHEMA_ARENA);
     if (OB_FAIL(check_table_options(table))) {
       LOG_WARN("fail to check table option", K(ret), K(table));
     } else if (data_version < DATA_VERSION_4_1_0_0 && 0 != table.get_table_flags()) {
       ret = OB_NOT_SUPPORTED;
-      LOG_WARN("table flags is not suppported when tenant's data version is below 4.1.0.0", KR(ret),
+      LOG_WARN("table flags is not supported when tenant's data version is below 4.1.0.0", KR(ret),
                K(table));
+    } else if (data_version < DATA_VERSION_4_3_5_1 && !table.get_parser_property_str().empty()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("parser properities for full-text search index is not supported "
+               "when tenant's data version is below 4.3.5.1", KP(ret), K(table));
+    } else if (data_version < DATA_VERSION_4_3_4_0 &&
+               (table.get_part_option().get_auto_part() == true ||
+                table.get_part_option().get_auto_part_size() >= ObPartitionOption::MIN_AUTO_PART_SIZE)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("auto partition is not supported "
+               "when tenant's data version is below 4.4.0.0", KR(ret), K(table));
     } else if (OB_FAIL(check_column_store_valid(table, data_version))) {
       LOG_WARN("fail to check column store valid", KR(ret), K(table), K(data_version));
+    } else if (data_version < DATA_VERSION_4_3_3_0 && table.get_micro_index_clustered()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("can't set micro_index_clustered in current version", KR(ret), K(table));
+    } else if (data_version < DATA_VERSION_4_3_5_1 && table.get_enable_macro_block_bloom_filter()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("can't set enable_macro_block_bloom_filter in current version", KR(ret), K(table));
+    } else if (data_version < DATA_VERSION_4_3_5_2 && table.is_delete_insert_merge_engine()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("can't set merge_engine_type in current version", KR(ret), K(table));
+    } else if (table.is_materialized_view() && data_version >= DATA_VERSION_4_3_3_0
+               && OB_FAIL(table.get_local_session_var().gen_local_session_var_str(allocator, local_session_var))) {
+      LOG_WARN("fail to gen local session var str", K(ret));
     } else if (OB_FAIL(dml.add_pk_column("tenant_id", ObSchemaUtils::get_extract_tenant_id(
                                                exec_tenant_id, table.get_tenant_id())))
         || OB_FAIL(dml.add_pk_column("table_id", ObSchemaUtils::get_extract_schema_id(
@@ -2947,12 +3277,12 @@ int ObTableSqlService::gen_table_dml(
         || OB_FAIL(dml.add_column("tablespace_id", ObSchemaUtils::get_extract_schema_id(
                                   exec_tenant_id, table.get_tablespace_id())))
         // To avoid compatibility problems (such as error while upgrade virtual schema) in upgrade post stage,
-        // cluster version judgemenet is needed if columns are added in upgrade post stage.
+        // cluster version judgement is needed if columns are added in upgrade post stage.
         || OB_FAIL(dml.add_column("sub_part_template_flags", table.get_sub_part_template_flags()))
         || OB_FAIL(dml.add_column("dop", table.get_dop()))
         || OB_FAIL(dml.add_column("character_set_client", table.get_view_schema().get_character_set_client()))
         || OB_FAIL(dml.add_column("collation_connection", table.get_view_schema().get_collation_connection()))
-        || OB_FAIL(dml.add_column("auto_part", table.get_part_option().is_auto_range_part()))
+        || OB_FAIL(dml.add_column("auto_part", table.get_part_option().get_auto_part()))
         || OB_FAIL(dml.add_column("auto_part_size", table.get_part_option().get_auto_part_size()))
         || OB_FAIL(dml.add_column("association_table_id", ObSchemaUtils::get_extract_schema_id(
                                       exec_tenant_id, table.get_association_table_id())))
@@ -2988,7 +3318,32 @@ int ObTableSqlService::gen_table_dml(
             && OB_FAIL(dml.add_column("max_used_column_group_id", table.get_max_used_column_group_id())))
         || (data_version >= DATA_VERSION_4_3_0_0
             && OB_FAIL(dml.add_column("column_store", table.is_column_store_supported())))
-
+        || ((data_version >= DATA_VERSION_4_3_2_0 || (data_version < DATA_VERSION_4_3_0_0 && data_version >= MOCK_DATA_VERSION_4_2_3_0))
+            && OB_FAIL(dml.add_column("auto_increment_cache_size", table.get_auto_increment_cache_size())))
+        || ((data_version >= DATA_VERSION_4_3_4_0)
+            && OB_FAIL(dml.add_column("duplicate_read_consistency", table.get_duplicate_read_consistency())))
+        || ((data_version >= DATA_VERSION_4_3_4_0)
+            && OB_FAIL(dml.add_column("mv_mode", table.get_mv_mode())))
+        || (data_version >= DATA_VERSION_4_3_2_1 &&
+            OB_FAIL(dml.add_column("external_properties", ObHexEscapeSqlStr(table.get_external_properties()))))
+        || (data_version >= DATA_VERSION_4_3_3_0
+            && OB_FAIL(dml.add_column("index_params", ObHexEscapeSqlStr(index_params))))
+        || (data_version >= DATA_VERSION_4_3_3_0
+            && OB_FAIL(dml.add_column("micro_index_clustered", table.get_micro_index_clustered())))
+        || (data_version >= DATA_VERSION_4_3_3_0
+            && OB_FAIL(dml.add_column("local_session_vars", ObHexEscapeSqlStr(local_session_var))))
+        || (data_version >= DATA_VERSION_4_3_5_1
+            && OB_FAIL(dml.add_column("parser_properties", ObHexEscapeSqlStr(parser_properties))))
+        || (data_version >= DATA_VERSION_4_3_5_1
+            && OB_FAIL(dml.add_column("enable_macro_block_bloom_filter", table.get_enable_macro_block_bloom_filter())))
+        || (data_version >= DATA_VERSION_4_3_5_2
+            && OB_FAIL(dml.add_column("storage_cache_policy", ObHexEscapeSqlStr(storage_cache_policy))))
+        || (data_version >= DATA_VERSION_4_3_5_2
+            && OB_FAIL(dml.add_column("semistruct_encoding_type", table.get_semistruct_encoding_flags())))
+        || (data_version >= DATA_VERSION_4_3_5_2
+            && OB_FAIL(dml.add_column("dynamic_partition_policy", ObHexEscapeSqlStr(dynamic_partition_policy))))
+        || (data_version >= DATA_VERSION_4_3_5_2
+            && OB_FAIL(dml.add_column("merge_engine_type", table.get_merge_engine_type())))
         ) {
       LOG_WARN("add column failed", K(ret));
     }
@@ -3020,12 +3375,30 @@ int ObTableSqlService::gen_table_options_dml(
                  || 0 == strcasecmp(table.get_compress_func_name(), all_compressor_name[ObCompressorType::ZLIB_LITE_COMPRESSOR]))) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("zlib_lite_1.0 not support before 4.3", K(ret), K(table));
+  } else if (data_version < DATA_VERSION_4_3_5_2
+      && !is_storage_cache_policy_default(table.get_storage_cache_policy())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("storage_cache_policy is not supported in version less than 4.3.5.2", K(ret), K(table));
   } else if (data_version < DATA_VERSION_4_2_1_2
              && OB_UNLIKELY(OB_DEFAULT_LOB_INROW_THRESHOLD != table.get_lob_inrow_threshold())) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("lob_inrow_threshold not support before 4.2.1.2", K(ret), K(table));
+  } else if ((data_version < MOCK_DATA_VERSION_4_2_3_0
+        || (data_version >= DATA_VERSION_4_3_0_0 && data_version < DATA_VERSION_4_3_2_0))
+      && (table.get_auto_increment_cache_size() != 0)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("table auto_increment_cache_size not support before 4.2.3", K(ret), K(table));
+  } else if (data_version < DATA_VERSION_4_3_3_0 && (!table.get_index_params().empty())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("index params setting is not support before 433", K(ret), K(table));
+  } else if (data_version < DATA_VERSION_4_3_5_2 && table.get_semistruct_encoding_flags() != 0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("semistruct encodin is not supported in version less than 4.3.5.2",
+        "semistruct_encoding_mode", table.get_semistruct_encoding_flags(),
+        "semistruct_encoding_type", table.get_semistruct_encoding_type());
   } else {}
   if (OB_SUCC(ret)) {
+    ObString empty_str("");
     const ObPartitionOption &part_option = table.get_part_option();
     const ObPartitionOption &sub_part_option = table.get_sub_part_option();
     const char *table_name = table.get_table_name_str().length() <= 0 ?
@@ -3045,16 +3418,37 @@ int ObTableSqlService::gen_table_options_dml(
         "" : table.get_ttl_definition().ptr();
     const char *kv_attributes = table.get_kv_attributes().length() <= 0 ?
         "" : table.get_kv_attributes().ptr();
+    const char *storage_cache_policy = table.get_storage_cache_policy().length() <= 0 ?
+        OB_DEFAULT_STORAGE_CACHE_POLICY_STR : table.get_storage_cache_policy().ptr();
+    ObString index_params = table.get_index_params().empty() ? empty_str : table.get_index_params();
+    const ObString parser_properties = table.get_parser_property_str().empty() ? empty_str : table.get_parser_property_str();
+    const char *dynamic_partition_policy = table.get_dynamic_partition_policy().empty() ?
+        "" : table.get_dynamic_partition_policy().ptr();
 
     if (OB_FAIL(check_table_options(table))) {
       LOG_WARN("fail to check table option", K(ret), K(table));
     } else if (data_version < DATA_VERSION_4_1_0_0 && 0 != table.get_table_flags()) {
       ret = OB_NOT_SUPPORTED;
-      LOG_WARN("table flags is not suppported when tenant's data version is below 4.1.0.0", KR(ret),
+      LOG_WARN("table flags is not supported when tenant's data version is below 4.1.0.0", KR(ret),
                K(table));
+    } else if (data_version < DATA_VERSION_4_3_4_0 &&
+               (table.get_part_option().get_auto_part() == true ||
+                table.get_part_option().get_auto_part_size() >= ObPartitionOption::MIN_AUTO_PART_SIZE)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("auto partition is not supported "
+               "when tenant's data version is below 4.4.0.0", KR(ret), K(table));
     } else if (data_version < DATA_VERSION_4_1_0_0 && OB_UNLIKELY(table.view_column_filled())) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("option is not support before 4.1", K(ret), K(table));
+    } else if (data_version < DATA_VERSION_4_3_5_1 && table.get_enable_macro_block_bloom_filter()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("can't set enable_macro_block_bloom_filter in current version", KR(ret), K(table));
+    } else if (data_version < DATA_VERSION_4_3_5_2 && table.is_delete_insert_merge_engine()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("can't set merge_engine_type in current version", KR(ret), K(table));
+    } else if (not_compat_for_queuing_mode(data_version) && table.is_new_queuing_table_mode()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN(QUEUING_MODE_NOT_COMPAT_WARN_STR, K(ret), K(table));
     } else if (OB_FAIL(check_column_store_valid(table, data_version))) {
       LOG_WARN("fail to check column store valid", KR(ret), K(table));
     } else if (OB_FAIL(dml.add_pk_column("tenant_id", ObSchemaUtils::get_extract_tenant_id(
@@ -3100,9 +3494,9 @@ int ObTableSqlService::gen_table_options_dml(
         || OB_FAIL(dml.add_column("tablespace_id", ObSchemaUtils::get_extract_schema_id(
                                                    exec_tenant_id, table.get_tablespace_id())))
         // To avoid compatibility problems (such as error while upgrade virtual schema) in upgrade post stage,
-        // cluster version judgemenet is needed if columns are added in upgrade post stage.
+        // cluster version judgement is needed if columns are added in upgrade post stage.
         || OB_FAIL(dml.add_column("sub_part_template_flags", table.get_sub_part_template_flags()))
-        || OB_FAIL(dml.add_column("auto_part", table.get_part_option().is_auto_range_part()))
+        || OB_FAIL(dml.add_column("auto_part", table.get_part_option().get_auto_part()))
         || OB_FAIL(dml.add_column("auto_part_size", table.get_part_option().get_auto_part_size()))
         || OB_FAIL(dml.add_column("max_dependency_version", table.get_max_dependency_version()))
         || OB_FAIL(dml.add_column("dop", table.get_dop()))
@@ -3129,9 +3523,29 @@ int ObTableSqlService::gen_table_options_dml(
             && OB_FAIL(dml.add_column("max_used_column_group_id", table.get_max_used_column_group_id())))
         || (data_version >= DATA_VERSION_4_3_0_0
             && OB_FAIL(dml.add_column("column_store", table.is_column_store_supported())))
+        || ((data_version >= DATA_VERSION_4_3_2_0 || (data_version < DATA_VERSION_4_3_0_0 && data_version >= MOCK_DATA_VERSION_4_2_3_0))
+            && OB_FAIL(dml.add_column("auto_increment_cache_size", table.get_auto_increment_cache_size())))
+        || ((data_version >= DATA_VERSION_4_3_4_0)
+            && OB_FAIL(dml.add_column("duplicate_read_consistency", table.get_duplicate_read_consistency())))
+        || ((data_version >= DATA_VERSION_4_3_4_0)
+            && OB_FAIL(dml.add_column("mv_mode", table.get_mv_mode())))
+        || (data_version >= DATA_VERSION_4_3_3_0
+            && OB_FAIL(dml.add_column("index_params", ObHexEscapeSqlStr(index_params))))
+        || (data_version >= DATA_VERSION_4_3_5_1
+            && OB_FAIL(dml.add_column("parser_properties", ObHexEscapeSqlStr(parser_properties))))
+        || (data_version >= DATA_VERSION_4_3_5_1
+            && OB_FAIL(dml.add_column("enable_macro_block_bloom_filter", table.get_enable_macro_block_bloom_filter())))
+        || (data_version >= DATA_VERSION_4_3_5_2
+            && OB_FAIL(dml.add_column("storage_cache_policy", ObHexEscapeSqlStr(storage_cache_policy))))
+        || (data_version >= DATA_VERSION_4_3_5_2
+            && OB_FAIL(dml.add_column("semistruct_encoding_type", table.get_semistruct_encoding_flags())))
+        || (data_version >= DATA_VERSION_4_3_5_2
+            && OB_FAIL(dml.add_column("dynamic_partition_policy", ObHexEscapeSqlStr(dynamic_partition_policy))))
+        || (data_version >= DATA_VERSION_4_3_5_2
+            && OB_FAIL(dml.add_column("merge_engine_type", table.get_merge_engine_type())))
         ) {
-      LOG_WARN("add column failed", K(ret));
-    }
+          LOG_WARN("add column failed", K(ret));
+        }
   }
   return ret;
 }
@@ -3151,6 +3565,10 @@ int ObTableSqlService::update_table_attribute(ObISQLClient &sql_client,
         "" : new_table_schema.get_table_name_str().ptr();
   const ObPartitionOption &part_option = new_table_schema.get_part_option();
   uint64_t data_version = 0;
+  ObString local_session_var;
+  const char *dynamic_partition_policy = new_table_schema.get_dynamic_partition_policy().empty() ?
+        "" : new_table_schema.get_dynamic_partition_policy().ptr();
+  ObArenaAllocator allocator(ObModIds::OB_SCHEMA_OB_SCHEMA_ARENA);
   if (OB_FAIL(check_ddl_allowed(new_table_schema))) {
     LOG_WARN("check ddl allowd failed", K(ret), K(new_table_schema));
   } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, data_version))) {
@@ -3168,9 +3586,23 @@ int ObTableSqlService::update_table_attribute(ObISQLClient &sql_client,
              && OB_UNLIKELY((OB_INVALID_VERSION != new_table_schema.get_truncate_version()))) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("truncate version is not support before 4.1", K(ret), K(new_table_schema));
+  } else if (data_version < DATA_VERSION_4_3_5_2
+             && !is_storage_cache_policy_default(new_table_schema.get_storage_cache_policy())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("storage cache policy is not support before 4.3.5.2", K(ret), K(new_table_schema));
+  } else if (not_compat_for_queuing_mode(data_version) && new_table_schema.is_new_queuing_table_mode()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN(QUEUING_MODE_NOT_COMPAT_WARN_STR, K(ret), K(new_table_schema));
   } else if (OB_FAIL(check_column_store_valid(new_table_schema, data_version))) {
     LOG_WARN("fail to check column store valid", KR(ret), K(tenant_id), K(new_table_schema));
-  } else if (OB_FAIL(dml.add_pk_column("tenant_id", ObSchemaUtils::get_extract_tenant_id(
+  } else if (new_table_schema.is_materialized_view() && data_version >= DATA_VERSION_4_3_3_0
+             && OB_FAIL(new_table_schema.get_local_session_var().gen_local_session_var_str(allocator, local_session_var))) {
+    LOG_WARN("fail to gen local session var str", K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    const char *storage_cache_policy = new_table_schema.get_storage_cache_policy().empty() ?
+        OB_DEFAULT_STORAGE_CACHE_POLICY_STR : new_table_schema.get_storage_cache_policy().ptr();
+    if (OB_FAIL(dml.add_pk_column("tenant_id", ObSchemaUtils::get_extract_tenant_id(
                                              exec_tenant_id, tenant_id)))
       || OB_FAIL(dml.add_pk_column("table_id", ObSchemaUtils::get_extract_schema_id(
                                                exec_tenant_id, table_id)))
@@ -3199,7 +3631,13 @@ int ObTableSqlService::update_table_attribute(ObISQLClient &sql_client,
       || (data_version >= DATA_VERSION_4_1_0_0
           && OB_FAIL(dml.add_column("truncate_version", new_table_schema.get_truncate_version())))
       || (data_version >= DATA_VERSION_4_3_0_0
-          && OB_FAIL(dml.add_column("max_used_column_group_id", new_table_schema.get_max_used_column_group_id())))) {
+          && OB_FAIL(dml.add_column("max_used_column_group_id", new_table_schema.get_max_used_column_group_id())))
+      || (data_version >= DATA_VERSION_4_3_3_0
+          && OB_FAIL(dml.add_column("local_session_vars", ObHexEscapeSqlStr(local_session_var))))
+      || (data_version >= DATA_VERSION_4_3_5_2
+          && OB_FAIL(dml.add_column("storage_cache_policy", ObHexEscapeSqlStr(storage_cache_policy))))
+      || (data_version >= DATA_VERSION_4_3_5_2
+          && OB_FAIL(dml.add_column("dynamic_partition_policy", ObHexEscapeSqlStr(dynamic_partition_policy))))) {
             LOG_WARN("add column failed", K(ret));
   } else {
     if (new_table_schema.is_interval_part()) {
@@ -3228,6 +3666,7 @@ int ObTableSqlService::update_table_attribute(ObISQLClient &sql_client,
       LOG_WARN("unexpected error", K(affected_rows), K(ret));
     }
   }
+}
 
   // add updated table to __all_table_history
   if (OB_SUCC(ret)) {
@@ -3274,8 +3713,14 @@ int ObTableSqlService::gen_partition_option_dml(const ObTableSchema &table, ObDM
     LOG_WARN("fail to get min data version", K(ret));
   } else if (data_version < DATA_VERSION_4_1_0_0 && 0 != table.get_table_flags()) {
     ret = OB_NOT_SUPPORTED;
-    LOG_WARN("table flags is not suppported when tenant's data version is below 4.1.0.0", KR(ret),
+    LOG_WARN("table flags is not supported when tenant's data version is below 4.1.0.0", KR(ret),
              K(table));
+  } else if (data_version < DATA_VERSION_4_3_4_0 &&
+               (table.get_part_option().get_auto_part() == true ||
+                table.get_part_option().get_auto_part_size() >= ObPartitionOption::MIN_AUTO_PART_SIZE)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("auto partition is not supported "
+             "when tenant's data version is below 4.4.0.0", KR(ret), K(table));
   } else if (OB_FAIL(dml.add_pk_column("tenant_id", ObSchemaUtils::get_extract_tenant_id(
                                              exec_tenant_id, tenant_id)))
       || OB_FAIL(dml.add_pk_column("table_id", ObSchemaUtils::get_extract_schema_id(
@@ -3291,7 +3736,7 @@ int ObTableSqlService::gen_partition_option_dml(const ObTableSchema &table, ObDM
       || OB_FAIL(dml.add_column("partition_status", table.get_partition_status()))
       || OB_FAIL(dml.add_column("partition_schema_version", table.get_partition_schema_version()))
       || OB_FAIL(dml.add_column("sub_part_template_flags", table.get_sub_part_template_flags()))
-      || OB_FAIL(dml.add_column("auto_part", table.get_part_option().is_auto_range_part()))
+      || OB_FAIL(dml.add_column("auto_part", table.get_part_option().get_auto_part()))
       || OB_FAIL(dml.add_column("auto_part_size", table.get_part_option().get_auto_part_size()))
       || OB_FAIL(dml.add_gmt_create())
       || (table.is_interval_part() && OB_FAIL(add_transition_point_val(dml, table)))
@@ -3305,50 +3750,30 @@ int ObTableSqlService::gen_partition_option_dml(const ObTableSchema &table, ObDM
 }
 
 int ObTableSqlService::update_partition_option(ObISQLClient &sql_client,
-                                               ObTableSchema &table,
+                                               const ObTableSchema &table,
                                                const ObString *ddl_stmt_str)
 {
   int ret = OB_SUCCESS;
-  const uint64_t tenant_id = table.get_tenant_id();
-  const uint64_t table_id = table.get_table_id();
   ObDMLSqlSplicer dml;
-  const bool update_object_status_ignore_version = false;
   if (OB_FAIL(check_ddl_allowed(table))) {
-    LOG_WARN("check ddl allowd failed", K(ret), K(table));
+    LOG_WARN("check ddl allowd failed", KR(ret), K(table));
   } else if (OB_FAIL(gen_partition_option_dml(table, dml))) {
-    LOG_WARN("fail to gen dml", K(ret));
-  } else {
-    int64_t affected_rows = 0;
-    const uint64_t exec_tenant_id = ObSchemaUtils::get_exec_tenant_id(tenant_id);
-    const char *table_name = NULL;
-    if (OB_FAIL(ObSchemaUtils::get_all_table_name(exec_tenant_id, table_name))) {
-      LOG_WARN("fail to get all table name", K(ret), K(exec_tenant_id));
-    } else if (OB_FAIL(exec_update(sql_client, tenant_id, table_id,
-                                   table_name, dml, affected_rows))) {
-      LOG_WARN("exec update failed", K(ret));
-    } else if (affected_rows > 1) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected error", K(affected_rows), K(ret));
-    }
+    LOG_WARN("fail to gen dml", KR(ret));
+  } else if (OB_FAIL(update_partition_option_(sql_client, table, dml))) {
+    LOG_WARN("fail to update partition option", KR(ret), K(table));
   }
 
-  // add updated table to __all_table_history
   if (OB_SUCC(ret)) {
-    const bool only_history = true;
-    if (OB_FAIL(add_table(sql_client, table, update_object_status_ignore_version, only_history))) {
-      LOG_WARN("add_table failed", K(table), K(only_history));
-    } else {
-      ObSchemaOperation opt;
-      opt.tenant_id_ = tenant_id;
-      opt.database_id_ = table.get_database_id();
-      opt.tablegroup_id_ = table.get_tablegroup_id();
-      opt.table_id_ = table.get_table_id();
-      opt.op_type_ = OB_DDL_ALTER_TABLE;
-      opt.schema_version_ = table.get_schema_version();
-      opt.ddl_stmt_str_ = ddl_stmt_str ? *ddl_stmt_str : ObString();
-      if (OB_FAIL(log_operation_wrapper(opt, sql_client))) {
-        LOG_WARN("log operation failed", K(opt), K(ret));
-      }
+    ObSchemaOperation opt;
+    opt.tenant_id_ = table.get_tenant_id();
+    opt.database_id_ = table.get_database_id();
+    opt.tablegroup_id_ = table.get_tablegroup_id();
+    opt.table_id_ = table.get_table_id();
+    opt.op_type_ = OB_DDL_ALTER_TABLE;
+    opt.schema_version_ = table.get_schema_version();
+    opt.ddl_stmt_str_ = ddl_stmt_str ? *ddl_stmt_str : ObString();
+    if (OB_FAIL(log_operation_wrapper(opt, sql_client))) {
+      LOG_WARN("log operation failed", K(opt), KR(ret));
     }
   }
   return ret;
@@ -3359,28 +3784,71 @@ int ObTableSqlService::update_partition_option(ObISQLClient &sql_client,
                                                const int64_t new_schema_version)
 {
   int ret = OB_SUCCESS;
-
-  const uint64_t tenant_id = table.get_tenant_id();
-  const uint64_t table_id = table.get_table_id();
   table.set_schema_version(new_schema_version);
   ObDMLSqlSplicer dml;
+
   if (OB_FAIL(check_ddl_allowed(table))) {
-    LOG_WARN("check ddl allowd failed", K(ret), K(table));
+    LOG_WARN("check ddl allowd failed", KR(ret), K(table));
   } else if (OB_FAIL(gen_partition_option_dml(table, dml))) {
-    LOG_WARN("fail to gen dml", K(ret));
-  } else {
-    int64_t affected_rows = 0;
-    const uint64_t exec_tenant_id = ObSchemaUtils::get_exec_tenant_id(tenant_id);
-    const char *table_name = NULL;
-    if (OB_FAIL(ObSchemaUtils::get_all_table_name(exec_tenant_id, table_name))) {
-      LOG_WARN("fail to get all table name", K(ret), K(exec_tenant_id));
-    } else if (OB_FAIL(exec_update(sql_client, tenant_id, table_id,
-                                   table_name, dml, affected_rows))) {
-      LOG_WARN("exec update failed", K(ret));
-    } else if (affected_rows > 1) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected error", K(affected_rows), K(ret));
+    LOG_WARN("fail to gen dml", KR(ret));
+  } else if (OB_FAIL(update_partition_option_(sql_client, table, dml))) {
+    LOG_WARN("fail to update partition option", KR(ret), K(table));
+  }
+  return ret;
+}
+
+int ObTableSqlService::update_splitting_partition_option(ObISQLClient &sql_client,
+                                                         const ObTableSchema &table)
+{
+  int ret = OB_SUCCESS;
+  ObDMLSqlSplicer dml;
+
+  if (OB_FAIL(check_ddl_allowed(table))) {
+    LOG_WARN("check ddl allowd failed", KR(ret), K(table));
+  } else if (OB_FAIL(gen_partition_option_dml(table, dml))) {
+    LOG_WARN("fail to gen dml", KR(ret));
+  } else if (OB_FAIL(dml.add_column("tablet_id", table.get_tablet_id().id()))) {
+    // when first auto partitions non-partitioned table,
+    // the tablet_id record should be set as INVALID_TABLET_ID like partitioned_table
+    LOG_WARN("add column failed", KR(ret));
+  } else if (OB_FAIL(update_partition_option_(sql_client, table, dml))) {
+    LOG_WARN("fail to update partition option", KR(ret), K(table));
+  }
+
+  if (OB_SUCC(ret)) {
+    ObSchemaOperation opt;
+    opt.tenant_id_ = table.get_tenant_id();
+    opt.database_id_ = table.get_database_id();
+    opt.tablegroup_id_ = table.get_tablegroup_id();
+    opt.table_id_ = table.get_table_id();
+    opt.op_type_ = OB_DDL_SPLIT_PARTITION;
+    opt.schema_version_ = table.get_schema_version();
+    if (OB_FAIL(log_operation_wrapper(opt, sql_client))) {
+      LOG_WARN("log operation failed", K(opt), KR(ret));
     }
+  }
+  return ret;
+}
+
+int ObTableSqlService::update_partition_option_(ObISQLClient &sql_client,
+                                                const ObTableSchema &table,
+                                                ObDMLSqlSplicer &dml)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = table.get_tenant_id();
+  const uint64_t exec_tenant_id = ObSchemaUtils::get_exec_tenant_id(tenant_id);
+  const uint64_t table_id = table.get_table_id();
+  int64_t affected_rows = 0;
+  const char *table_name = NULL;
+
+  if (OB_FAIL(ObSchemaUtils::get_all_table_name(exec_tenant_id, table_name))) {
+    LOG_WARN("fail to get all table name", KR(ret), K(exec_tenant_id));
+  } else if (OB_FAIL(exec_update(sql_client, tenant_id, table_id,
+                                 table_name, dml, affected_rows))) {
+    LOG_WARN("exec update failed", KR(ret));
+  } else if (affected_rows > 1) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected error", K(affected_rows), KR(ret));
   }
 
   // add updated table to __all_table_history
@@ -3388,11 +3856,12 @@ int ObTableSqlService::update_partition_option(ObISQLClient &sql_client,
     const bool only_history = true;
     const bool update_object_status_ignore_version = false;
     if (OB_FAIL(add_table(sql_client, table, update_object_status_ignore_version, only_history))) {
-      LOG_WARN("add_table failed", K(table), K(only_history));
+      LOG_WARN("add_table failed", KR(ret), K(table), K(only_history));
     } else {}
   }
   return ret;
 }
+
 int ObTableSqlService::update_all_part_for_subpart(ObISQLClient &sql_client,
                                                    const ObTableSchema &table,
                                                    const ObIArray<ObPartition*> &update_part_array)
@@ -3663,6 +4132,32 @@ int ObTableSqlService::delete_from_all_column_stat(ObISQLClient &sql_client,
   return ret;
 }
 
+int ObTableSqlService::delete_column_stat(ObISQLClient &sql_client,
+                                          const uint64_t tenant_id,
+                                          const uint64_t table_id,
+                                          const uint64_t column_id)
+{
+  int ret = OB_SUCCESS;
+  ObDMLSqlSplicer del_stat_dml;
+  const uint64_t exec_tenant_id = ObSchemaUtils::get_exec_tenant_id(tenant_id);
+  if (OB_FAIL(del_stat_dml.add_pk_column("tenant_id", ObSchemaUtils::get_extract_tenant_id(
+                                            exec_tenant_id, tenant_id)))
+      || OB_FAIL(del_stat_dml.add_pk_column("table_id", table_id))
+      || OB_FAIL(del_stat_dml.add_pk_column("column_id", column_id))) {
+    LOG_WARN("add column failed", K(ret));
+  } else {
+    int64_t affected_rows = 0;
+    if (OB_FAIL(exec_delete(sql_client, tenant_id, table_id, OB_ALL_COLUMN_STAT_TNAME,
+                            del_stat_dml, affected_rows))) {
+      LOG_WARN("exec delete column stat failed", K(ret));
+    } else if (OB_FAIL(exec_delete(sql_client, tenant_id, table_id, OB_ALL_HISTOGRAM_STAT_TNAME,
+                                    del_stat_dml, affected_rows))) {
+      LOG_WARN("exec delete histogram stat failed", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObTableSqlService::delete_from_all_table_history(ObISQLClient &sql_client,
                                                      const ObTableSchema &table_schema,
                                                      const int64_t new_schema_version)
@@ -3852,56 +4347,45 @@ int ObTableSqlService::update_data_table_schema_version(
   return ret;
 }
 
-int ObTableSqlService::add_sequence(const uint64_t tenant_id,
+int ObTableSqlService::add_sequence(ObISQLClient &sql_client,
+                                    const uint64_t tenant_id,
                                     const uint64_t table_id,
                                     const uint64_t column_id,
                                     const uint64_t auto_increment,
                                     const int64_t truncate_version)
 {
   int ret = OB_SUCCESS;
-  ObMySQLTransaction trans;
   // FIXME:__all_time_zone contains auto increment column. Cyclic dependence may occur.
   const uint64_t exec_tenant_id = tenant_id;
-  if (OB_FAIL(trans.start(sql_proxy_, tenant_id, false))) {
-    LOG_WARN("failed to start trans, ", K(ret), K(tenant_id));
+  ObSqlString sql;
+  ObSqlString values;
+  if (OB_FAIL(sql.append_fmt("INSERT IGNORE INTO %s (", OB_ALL_AUTO_INCREMENT_TNAME))) {
+    LOG_WARN("append table name failed, ", K(ret));
   } else {
-    ObSqlString sql;
-    ObSqlString values;
-    if (OB_FAIL(sql.append_fmt("INSERT IGNORE INTO %s (", OB_ALL_AUTO_INCREMENT_TNAME))) {
-      LOG_WARN("append table name failed, ", K(ret));
-    } else {
-      SQL_COL_APPEND_VALUE(sql, values, ObSchemaUtils::get_extract_tenant_id(
-                                        exec_tenant_id, tenant_id), "tenant_id", "%lu");
-      SQL_COL_APPEND_VALUE(sql, values, ObSchemaUtils::get_extract_schema_id(
-                                        exec_tenant_id, table_id),  "sequence_key", "%lu");
-      SQL_COL_APPEND_VALUE(sql, values, column_id, "column_id", "%lu");
-      SQL_COL_APPEND_VALUE(sql, values, 0 == auto_increment ? 1 : auto_increment, "sequence_value", "%lu");
-      SQL_COL_APPEND_VALUE(sql, values, 0 == auto_increment ? 0 : auto_increment - 1, "sync_value", "%lu");
-      SQL_COL_APPEND_VALUE(sql, values, truncate_version, "truncate_version", "%ld");
-    }
-    if (OB_SUCC(ret)) {
-      if (OB_FAIL(sql.append_fmt(", gmt_modified) VALUES (%.*s, now(6))",
-              static_cast<int32_t>(values.length()), values.ptr()))) {
-        LOG_WARN("append sql failed, ", K(ret));
-      }
-    }
-    if (OB_SUCC(ret)) {
-      int64_t affected_rows = 0;
-      if (OB_FAIL(trans.write(exec_tenant_id, sql.ptr(), affected_rows))) {
-        LOG_WARN("fail to execute. ", "sql", sql.ptr(), K(ret));
-      } else {
-        if (!is_zero_row(affected_rows) && !is_single_row(affected_rows)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected value", K(affected_rows), "sql", sql.ptr(), K(ret));
-        }
-      }
+    SQL_COL_APPEND_VALUE(sql, values, ObSchemaUtils::get_extract_tenant_id(
+                                      exec_tenant_id, tenant_id), "tenant_id", "%lu");
+    SQL_COL_APPEND_VALUE(sql, values, ObSchemaUtils::get_extract_schema_id(
+                                      exec_tenant_id, table_id),  "sequence_key", "%lu");
+    SQL_COL_APPEND_VALUE(sql, values, column_id, "column_id", "%lu");
+    SQL_COL_APPEND_VALUE(sql, values, 0 == auto_increment ? 1 : auto_increment, "sequence_value", "%lu");
+    SQL_COL_APPEND_VALUE(sql, values, 0 == auto_increment ? 0 : auto_increment - 1, "sync_value", "%lu");
+    SQL_COL_APPEND_VALUE(sql, values, truncate_version, "truncate_version", "%ld");
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(sql.append_fmt(", gmt_modified) VALUES (%.*s, now(6))",
+            static_cast<int32_t>(values.length()), values.ptr()))) {
+      LOG_WARN("append sql failed, ", K(ret));
     }
   }
-  if (trans.is_started()) {
-    int temp_ret = OB_SUCCESS;
-    if (OB_SUCCESS != (temp_ret = trans.end(OB_SUCC(ret)))) {
-      LOG_WARN("trans end failed", "is_commit", OB_SUCCESS == ret, K(temp_ret));
-      ret = (OB_SUCC(ret)) ? temp_ret : ret;
+  if (OB_SUCC(ret)) {
+    int64_t affected_rows = 0;
+    if (OB_FAIL(sql_client.write(exec_tenant_id, sql.ptr(), affected_rows))) {
+      LOG_WARN("fail to execute. ", "sql", sql.ptr(), K(ret));
+    } else {
+      if (!is_zero_row(affected_rows) && !is_single_row(affected_rows)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected value", K(affected_rows), "sql", sql.ptr(), K(ret));
+      }
     }
   }
   return ret;
@@ -4048,8 +4532,27 @@ int ObTableSqlService::gen_column_dml(
   ObArenaAllocator allocator(ObModIds::OB_SCHEMA_OB_SCHEMA_ARENA);
   char *extended_type_info_buf = NULL;
   uint64_t tenant_data_version = 0;
+  lib::Worker::CompatMode compat_mode = lib::Worker::CompatMode::INVALID;
   if (OB_FAIL(GET_MIN_DATA_VERSION(exec_tenant_id, tenant_data_version))) {
     LOG_WARN("get tenant data version failed", K(ret));
+  } else if (! ((DATA_VERSION_4_2_2_0 <= tenant_data_version && tenant_data_version < DATA_VERSION_4_3_0_0) || tenant_data_version >= DATA_VERSION_4_3_1_0)
+      && column.get_lob_chunk_size() != OB_DEFAULT_LOB_CHUNK_SIZE) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("tenant data version is less than 4.3.1, lob chunk size is not supported", K(ret), K(tenant_data_version), K(column));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.3.1, lob chunk size");
+  } else if (OB_FAIL(ObCompatModeGetter::get_table_compat_mode(
+               column.get_tenant_id(), column.get_table_id(), compat_mode))) {
+      LOG_WARN("fail to get tenant mode", K(ret), K(column));
+  } else if (tenant_data_version < DATA_VERSION_4_3_3_0 && column.is_collection()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("tenant data version is less than 4.3.3, array type is not supported", K(ret), K(tenant_data_version), K(column));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.3.3, array");
+  } else if ((tenant_data_version < DATA_VERSION_4_2_2_0
+             || (tenant_data_version >= DATA_VERSION_4_3_0_0 && tenant_data_version < DATA_VERSION_4_3_1_0)) &&
+             column.is_geometry() && compat_mode ==lib::Worker::CompatMode::ORACLE) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("sdo_geometry is not supported when data_version is below 4.2.2.0 or data version is above 4.3.0.0 but below 4.3.1.0", K(ret), K(tenant_data_version), K(column));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.2.2 or data version is above 4.3.0.0 but below 4.3.1.0, sdo_geometry");
   } else if (tenant_data_version < DATA_VERSION_4_2_0_0 &&
              (column.is_xmltype() || column.get_udt_set_id() != 0 || column.get_sub_data_type() != 0)) {
     ret = OB_NOT_SUPPORTED;
@@ -4071,6 +4574,15 @@ int ObTableSqlService::gen_column_dml(
     LOG_WARN("tenant data version is less than 4.2, skip index feature is not supported",
         K(ret), K(tenant_data_version), K(column));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.2, skip index");
+  } else if (tenant_data_version < DATA_VERSION_4_3_2_0 &&
+             (ob_is_roaringbitmap(column.get_data_type()))) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("tenant data version is less than 4.3.2, roaringbitmap type is not supported", K(ret), K(tenant_data_version), K(column));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.3.2, roaringbitmap type");
+  } else if (tenant_data_version < DATA_VERSION_4_3_5_1 && column.is_string_lob()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("tenant data version is less than 4.3.5.1, string type is not supported", K(ret), K(tenant_data_version), K(column));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.3.5.1, string type");
   } else if (OB_FAIL(sql::ObSQLUtils::is_charset_data_version_valid(column.get_charset_type(),
                                                                     exec_tenant_id))) {
     LOG_WARN("failed to check charset data version valid",  K(column.get_charset_type()), K(ret));
@@ -4081,7 +4593,8 @@ int ObTableSqlService::gen_column_dml(
       column.is_identity_column() ||
       ob_is_string_type(column.get_data_type()) ||
       ob_is_json(column.get_data_type()) ||
-      ob_is_geometry(column.get_data_type())) {
+      ob_is_geometry(column.get_data_type()) ||
+      ob_is_roaringbitmap(column.get_data_type())) {
     //The default value of the generated column is the expression definition of the generated column
     ObString orig_default_value_str = column.get_orig_default_value().get_string();
     ObString cur_default_value_str = column.get_cur_default_value().get_string();
@@ -4100,15 +4613,11 @@ int ObTableSqlService::gen_column_dml(
     orig_default_value_buf = static_cast<char *>(allocator.alloc(value_buf_len));
     cur_default_value_buf = static_cast<char *>(allocator.alloc(value_buf_len));
     extended_type_info_buf = static_cast<char *>(allocator.alloc(OB_MAX_VARBINARY_LENGTH));
-    lib::Worker::CompatMode compat_mode = lib::Worker::CompatMode::INVALID;
     if (OB_ISNULL(orig_default_value_buf)
         || OB_ISNULL(cur_default_value_buf)
         || OB_ISNULL(extended_type_info_buf)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("allocate memory for default value buffer failed");
-    } else if (OB_FAIL(ObCompatModeGetter::get_table_compat_mode(
-               column.get_tenant_id(), column.get_table_id(), compat_mode))) {
-      LOG_WARN("fail to get tenant mode", K(ret), K(column));
     } else {
       MEMSET(orig_default_value_buf, 0, value_buf_len);
       MEMSET(cur_default_value_buf, 0, value_buf_len);
@@ -4145,7 +4654,7 @@ int ObTableSqlService::gen_column_dml(
       cur_default_value.reset();
     }
     ObString bin_extended_type_info;
-    if (OB_SUCC(ret) && column.is_enum_or_set()) {
+    if (OB_SUCC(ret) && (column.is_enum_or_set() || column.is_collection())) {
       int64_t pos = 0;
       extended_type_info_buf = static_cast<char *>(allocator.alloc(OB_MAX_VARBINARY_LENGTH));
       if (OB_ISNULL(extended_type_info_buf)) {
@@ -4158,25 +4667,9 @@ int ObTableSqlService::gen_column_dml(
       }
     }
     ObString local_session_var;
-    if (OB_SUCC(ret) && column.is_generated_column() && tenant_data_version >= DATA_VERSION_4_2_2_0) {
-      int64_t pos = 0;
-      int64_t buf_len = column.get_local_session_var().get_serialize_size();
-      char *binary_str = NULL;;
-      char *hex_str = NULL;
-      int64_t hex_pos = 0;
-      ObArenaAllocator tmp_allocator(ObModIds::OB_TEMP_VARIABLES);
-      if (OB_ISNULL(binary_str = static_cast<char *>(tmp_allocator.alloc(buf_len)))
-          || OB_ISNULL(hex_str = static_cast<char *>(allocator.alloc(buf_len * 2)))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("allocate memory for local_session_var failed", K(ret), KP(binary_str), KP(hex_str));
-      } else if (OB_FAIL(column.get_local_session_var().serialize_(binary_str, buf_len, pos))) {
-        LOG_WARN("fail to serialize local_session_var", K(ret));
-      } else if (OB_FAIL(common::hex_print(binary_str, pos, hex_str, buf_len * 2, hex_pos))) {
-        LOG_WARN("print hex string failed", K(ret));
-      } else {
-        local_session_var.assign(hex_str, hex_pos);
-        tmp_allocator.free(binary_str);
-      }
+    if (OB_SUCC(ret) && column.is_generated_column() && tenant_data_version >= DATA_VERSION_4_2_2_0
+        && OB_FAIL(column.get_local_session_var().gen_local_session_var_str(allocator, local_session_var))) {
+      LOG_WARN("fail to gen local session var str", K(ret));
     }
     if (OB_SUCC(ret) && (OB_FAIL(dml.add_pk_column("tenant_id", ObSchemaUtils::get_extract_tenant_id(
                                                     exec_tenant_id, column.get_tenant_id())))
@@ -4207,11 +4700,12 @@ int ObTableSqlService::gen_column_dml(
                          || OB_FAIL(dml.add_column("extended_type_info", ObHexEscapeSqlStr(bin_extended_type_info)))
                          || OB_FAIL(dml.add_column("prev_column_id", column.get_prev_column_id()))
                          || (tenant_data_version >= DATA_VERSION_4_1_0_0 && OB_FAIL(dml.add_column("srs_id", column.get_srs_id())))
-                            // todo : tenant_data_version >= DATA_VERSION_4_2_0_0
                          || (tenant_data_version >= DATA_VERSION_4_2_0_0 && OB_FAIL(dml.add_column("udt_set_id", column.get_udt_set_id())))
                          || (tenant_data_version >= DATA_VERSION_4_2_0_0 &&OB_FAIL(dml.add_column("sub_data_type", column.get_sub_data_type())))
                          || (tenant_data_version >= DATA_VERSION_4_3_0_0
                             && OB_FAIL(dml.add_column("skip_index_attr", column.get_skip_index_attr().get_packed_value())))
+                         || (((DATA_VERSION_4_2_2_0 <= tenant_data_version && tenant_data_version < DATA_VERSION_4_3_0_0) || tenant_data_version >= DATA_VERSION_4_3_1_0)
+                            && OB_FAIL(dml.add_column("lob_chunk_size", column.get_lob_chunk_size())))
                          || (tenant_data_version >= DATA_VERSION_4_2_2_0 &&OB_FAIL(dml.add_column("local_session_vars", ObHexEscapeSqlStr(local_session_var))))
                          || OB_FAIL(dml.add_gmt_create())
                          || OB_FAIL(dml.add_gmt_modified()))) {
@@ -4380,15 +4874,17 @@ int ObTableSqlService::add_inc_partition_info(
                        const ObTableSchema &ori_table,
                        ObTableSchema &inc_table,
                        const int64_t schema_version,
-                       bool is_truncate_table,
-                       bool is_subpart)
+                       bool ignore_log_operation,
+                       bool is_subpart,
+                       const bool is_subpart_idx_specified)
 {
   int ret = OB_SUCCESS;
   if (is_subpart) {
     if (OB_FAIL(add_inc_subpart_info(sql_client,
                                      ori_table,
                                      inc_table,
-                                     schema_version))) {
+                                     schema_version,
+                                     is_subpart_idx_specified))) {
       LOG_WARN("add inc part info failed", KR(ret));
     }
   } else {
@@ -4396,7 +4892,7 @@ int ObTableSqlService::add_inc_partition_info(
                                   ori_table,
                                   inc_table,
                                   schema_version,
-                                  is_truncate_table))) {
+                                  ignore_log_operation))) {
       LOG_WARN("add inc subpart info failed", KR(ret));
     }
   }
@@ -4407,7 +4903,7 @@ int ObTableSqlService::add_inc_part_info(ObISQLClient &sql_client,
                                          const ObTableSchema &ori_table,
                                          const ObTableSchema &inc_table,
                                          const int64_t schema_version,
-                                         bool is_truncate_table)
+                                         bool ignore_log_operation)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_ddl_allowed(ori_table))) {
@@ -4423,7 +4919,7 @@ int ObTableSqlService::add_inc_part_info(ObISQLClient &sql_client,
                                    sql_client);
     if (OB_FAIL(part_helper.add_partition_info())) {
       LOG_WARN("add partition info failed", K(ret));
-    } else if (!is_truncate_table && OB_INVALID_ID == ori_table.get_tablegroup_id()) {
+    } else if (!ignore_log_operation && OB_INVALID_ID == ori_table.get_tablegroup_id()) {
       /*
        * While table is in tablegroup, we only support to modify partition schema by tablegroup.
        * For tablegroup's partition modification, we only record tablegroup's ddl operation.
@@ -4440,6 +4936,52 @@ int ObTableSqlService::add_inc_part_info(ObISQLClient &sql_client,
       if (OB_FAIL(log_operation_wrapper(opt, sql_client))) {
         LOG_WARN("log operation failed", K(opt), K(ret));
       }
+    }
+  }
+  return ret;
+}
+
+int ObTableSqlService::add_split_inc_part_info(ObISQLClient &sql_client,
+                                               const ObTableSchema &ori_table,
+                                               const ObTableSchema &inc_table,
+                                               const int64_t schema_version)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(check_ddl_allowed(ori_table))) {
+    LOG_WARN("check ddl allowd failed", KR(ret), K(ori_table));
+  } else if (OB_UNLIKELY(is_inner_table(ori_table.get_table_id()))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid table type", KR(ret), K(ori_table));
+  } else {
+    ObAddSplitIncPartHelper part_helper(&ori_table,
+                                        &inc_table,
+                                        schema_version,
+                                        sql_client);
+    if (OB_FAIL(part_helper.add_split_partition_info())) {
+      LOG_WARN("add split partition info failed", KR(ret));
+    }
+  }
+  return ret;
+}
+
+int ObTableSqlService::update_part_info(ObISQLClient &sql_client,
+                                        const ObTableSchema &ori_table,
+                                        const ObTableSchema &upd_table,
+                                        const int64_t schema_version)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(check_ddl_allowed(ori_table))) {
+    LOG_WARN("check ddl allowd failed", K(ret), K(ori_table));
+  } else if (is_inner_table(ori_table.get_table_id())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("fail to update split partition info of a inner table", K(ret), K(ori_table.get_table_id()));
+  } else {
+    const ObPartitionSchema *ori_table_schema = &ori_table;
+    const ObPartitionSchema *upd_table_schema = &upd_table;
+    ObUpdatePartHelper part_helper(ori_table_schema, upd_table_schema,
+                                   schema_version, sql_client);
+    if (OB_FAIL(part_helper.update_partition_info())) {
+      LOG_WARN("update split partition info failed", K(ret));
     }
   }
   return ret;
@@ -4462,7 +5004,8 @@ int ObTableSqlService::add_inc_part_info(ObISQLClient &sql_client,
 int ObTableSqlService::add_inc_subpart_info(ObISQLClient &sql_client,
                                          const ObTableSchema &ori_table,
                                          const ObTableSchema &inc_table,
-                                         const int64_t schema_version)
+                                         const int64_t schema_version,
+                                         const bool is_subpart_idx_specified)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_ddl_allowed(ori_table))) {
@@ -4475,8 +5018,8 @@ int ObTableSqlService::add_inc_subpart_info(ObISQLClient &sql_client,
     const ObPartitionSchema *inc_table_schema = &inc_table;
     ObAddIncSubPartHelper subpart_helper(ori_table_schema, inc_table_schema, schema_version,
                                    sql_client);
-    if (OB_FAIL(subpart_helper.add_subpartition_info())) {
-      LOG_WARN("add partition info failed", KR(ret));
+    if (OB_FAIL(subpart_helper.add_subpartition_info(is_subpart_idx_specified))) {
+      LOG_WARN("add subpartition info failed", KR(ret), K(is_subpart_idx_specified));
     }
   }
   return ret;
@@ -4594,7 +5137,7 @@ int ObTableSqlService::gen_foreign_key_dml(const uint64_t exec_tenant_id,
       || OB_FAIL(dml.add_column("enable_flag", foreign_key_info.enable_flag_))
       || OB_FAIL(dml.add_column("validate_flag", foreign_key_info.validate_flag_))
       || OB_FAIL(dml.add_column("rely_flag", foreign_key_info.rely_flag_))
-      || OB_FAIL(dml.add_column("ref_cst_type", foreign_key_info.ref_cst_type_))
+      || OB_FAIL(dml.add_column("ref_cst_type", foreign_key_info.fk_ref_type_))
       || OB_FAIL(dml.add_column("ref_cst_id", foreign_key_info.ref_cst_id_))
       || OB_FAIL(dml.add_column("is_parent_table_mock", foreign_key_info.is_parent_table_mock_))
       || (data_version >= DATA_VERSION_4_2_1_0
@@ -5107,15 +5650,69 @@ int ObTableSqlService::check_table_options(const ObTableSchema &table)
   if (OB_FAIL(check_ddl_allowed(table))) {
     LOG_WARN("check ddl allowd failed", K(ret), K(table));
   }
+  return ret;
+}
 
+// this interface have been used by parallel set comment
+// since parallel ddl have to allocate schema version previously
+// any modification of this interface should think the times of generate schema version carefully
+int ObTableSqlService::only_update_table_options(ObISQLClient &sql_client,
+                                                 ObTableSchema &new_table_schema,
+                                                 share::schema::ObSchemaOperationType operation_type,
+                                                 const common::ObString *ddl_stmt_str)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(inner_update_table_options_(sql_client, new_table_schema))) {
+    LOG_WARN("fail to do inner update table", KR(ret), KPC(ddl_stmt_str));
+  } else {
+    ObSchemaOperation opt;
+    if (nullptr != ddl_stmt_str) {
+      opt.ddl_stmt_str_ = *ddl_stmt_str;
+    }
+    opt.tenant_id_ = new_table_schema.get_tenant_id();
+    opt.database_id_ = new_table_schema.get_database_id();
+    opt.tablegroup_id_ = new_table_schema.get_tablegroup_id();
+    opt.table_id_ = new_table_schema.get_table_id();
+    opt.op_type_ = operation_type;
+    opt.schema_version_ = new_table_schema.get_schema_version();
+    if (OB_FAIL(log_operation_wrapper(opt, sql_client))) {
+      LOG_WARN("log operation failed", KR(ret), K(opt));
+    }
+  }
+  return ret;
+}
+
+int ObTableSqlService::inner_update_table_options_(ObISQLClient &sql_client,
+                                       const ObTableSchema &new_table_schema)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = new_table_schema.get_tenant_id();
+  uint64_t table_id = new_table_schema.get_table_id();
+  ObDMLSqlSplicer dml;
+  const uint64_t exec_tenant_id = ObSchemaUtils::get_exec_tenant_id(tenant_id);
+  const bool update_object_status_ignore_version = false;
+  if (OB_FAIL(check_ddl_allowed(new_table_schema))) {
+    LOG_WARN("check ddl allowd failed", K(ret), K(new_table_schema));
+  } else if (OB_FAIL(gen_table_options_dml(exec_tenant_id, new_table_schema, update_object_status_ignore_version, dml))) {
+    LOG_WARN("gen table options dml failed", K(ret));
+  } else {
+    int64_t affected_rows = 0;
+    const char *table_name = nullptr;
+    if (OB_FAIL(ObSchemaUtils::get_all_table_name(exec_tenant_id, table_name))) {
+      LOG_WARN("fail to get all table name", KR(ret), K(exec_tenant_id));
+    } else if (OB_FAIL(exec_update(sql_client, tenant_id, table_id,
+                                   table_name, dml, affected_rows))) {
+      LOG_WARN("exec update failed", KR(ret));
+    } else if (affected_rows > 1) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected value", KR(ret), K(affected_rows));
+    }
+  }
+  // add to __all_table_history table
   if (OB_SUCC(ret)) {
-    if (table.is_auto_partitioned_table()
-        && OB_INVALID_ID != table.get_tablegroup_id()) {
-      ret = OB_OP_NOT_ALLOW;
-      LOG_WARN("auto part table in tablegroup not allowed",
-          K(ret), K(table));
-      LOG_USER_ERROR(OB_OP_NOT_ALLOW, "set atuo part table in tablegroup");
-
+    const bool only_history = true;
+    if (OB_FAIL(add_table(sql_client, new_table_schema, update_object_status_ignore_version, only_history))) {
+      LOG_WARN("add table failed", KR(ret), K(new_table_schema), K(only_history));
     }
   }
   return ret;
@@ -5718,6 +6315,36 @@ int ObTableSqlService::update_single_column_group(ObISQLClient &sql_client,
   return ret;
 }
 
+int ObTableSqlService::update_origin_column_group_with_new_schema(ObISQLClient &sql_client,
+                                                                  const int64_t delete_schema_version,
+                                                                  const int64_t insert_schema_version,
+                                                                  const ObTableSchema &origin_table_schema,
+                                                                  const ObTableSchema &new_table_schema)
+{
+  int ret = OB_SUCCESS;
+  uint64_t data_version = OB_INVALID_VERSION;
+  uint64_t origin_tenant_id = origin_table_schema.get_tenant_id();
+  uint64_t new_tenant_id = new_table_schema.get_tenant_id();
+  if (OB_UNLIKELY(!sql_client.is_active()
+                  || !origin_table_schema.is_valid()
+                  || !new_table_schema.is_valid()
+                  || origin_tenant_id != new_tenant_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(origin_table_schema), K(new_table_schema));
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(origin_tenant_id, data_version))) {
+    LOG_WARN("fail to get min data version", KR(ret), K(origin_table_schema));
+  } else if (OB_FAIL(check_column_store_valid(origin_table_schema, data_version))) {
+    LOG_WARN("fail to check column store valid for origin table schema", KR(ret), K(origin_table_schema));
+  } else if (OB_FAIL(check_column_store_valid(new_table_schema, data_version))) {
+    LOG_WARN("fail to check column store valid for new table schema", KR(ret), K(new_table_schema));
+  } else if (OB_FAIL(delete_column_group(sql_client, origin_table_schema, delete_schema_version))) {
+    LOG_WARN("fail to delete column group for origin table schema", KR(ret), K(origin_table_schema));
+  } else if (OB_FAIL(add_column_groups(sql_client, new_table_schema, insert_schema_version, false/*only_history*/))) {
+    LOG_WARN("fail to add column groups from new table schema", KR(ret), K(new_table_schema), K(insert_schema_version));
+  }
+  return ret;
+}
+
 // Three scenes :
 // 1. drop fk parent table
 // 2. create child table with a fk references a mock fk parent table not exist
@@ -6249,12 +6876,16 @@ int ObTableSqlService::update_view_columns(ObISQLClient &sql_client,
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("iter is NULL", K(ret));
     } else {
-      ObColumnSchemaV2 column = (**iter);
-      column.set_schema_version(new_schema_version);
-      column.set_tenant_id(table.get_tenant_id());
-      column.set_table_id(table.get_table_id());
+      ObColumnSchemaV2 column;
+      if (OB_FAIL(column.assign(**iter))) {
+        LOG_WARN("fail to assign column", KR(ret), KPC(*iter));
+      } else {
+        column.set_schema_version(new_schema_version);
+        column.set_tenant_id(table.get_tenant_id());
+        column.set_table_id(table.get_table_id());
+      }
       ObDMLSqlSplicer dml;
-      if (OB_FAIL(gen_column_dml(exec_tenant_id, column, dml))) {
+      if (FAILEDx(gen_column_dml(exec_tenant_id, column, dml))) {
         LOG_WARN("gen_column_dml failed", K(column), K(ret));
       } else if (OB_FAIL(dml.splice_insert_update_sql(OB_ALL_COLUMN_TNAME, column_sql))) {
         LOG_WARN("splice_insert_sql failed", "table_name", OB_ALL_COLUMN_TNAME, K(ret));

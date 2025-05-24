@@ -97,6 +97,19 @@ int ObRemoteLogIterator<LogEntryType>::init(const uint64_t tenant_id,
 }
 
 template<class LogEntryType>
+int ObRemoteLogIterator<LogEntryType>::set_io_context(const palf::LogIOContext &io_ctx)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!inited_) || OB_ISNULL(gen_)) {
+    ret = OB_NOT_INIT;
+    CLOG_LOG(WARN, "ObRemoteLogIterator not init", K(ret), K(inited_));
+  } else if (OB_FAIL(gen_->set_io_context(io_ctx))) {
+    CLOG_LOG(WARN, "set_io_context failed", K(ret), K(io_ctx));
+  } else { }
+  return ret;
+}
+
+template<class LogEntryType>
 int ObRemoteLogIterator<LogEntryType>::next(LogEntryType &entry, LSN &lsn, const char *&buf, int64_t &buf_size)
 {
   int ret = OB_SUCCESS;
@@ -199,14 +212,11 @@ int ObRemoteLogIterator<LogEntryType>::build_dest_data_generator_(const share::S
   int ret = OB_SUCCESS;
   UNUSED(pre_scn);
   logservice::DirArray array;
+  ObLogRawPathPieceContext *rawpath_ctx = NULL;
   share::SCN end_scn;
-  int64_t piece_index = 0;
-  int64_t min_file_id = 0;
-  int64_t max_file_id = 0;
-  source->get(array, end_scn);
-  source->get_locate_info(piece_index, min_file_id, max_file_id);
+  source->get(rawpath_ctx, end_scn);
   gen_ = MTL_NEW(RawPathDataGenerator, "ResDataGen", tenant_id_, id_, start_lsn_, end_lsn_,
-      array, end_scn, piece_index, min_file_id, max_file_id, log_ext_handler_);
+      rawpath_ctx, end_scn, log_ext_handler_);
   if (OB_ISNULL(gen_)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     CLOG_LOG(WARN, "alloc dest data generator failed", K(ret), KPC(this));
@@ -286,7 +296,7 @@ int ObRemoteLogIterator<LogEntryType>::next_entry_(LogEntryType &entry, LSN &lsn
 template<class LogEntryType>
 bool ObRemoteLogIterator<LogEntryType>::need_prepare_buf_(const int ret_code) const
 {
-  return OB_BUF_NOT_ENOUGH == ret_code || OB_NEED_RETRY == ret_code;
+  return OB_BUF_NOT_ENOUGH == ret_code;
 }
 
 template<class LogEntryType>

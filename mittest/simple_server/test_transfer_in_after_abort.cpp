@@ -1,3 +1,6 @@
+// owner: handora.qc
+// owner group: transaction
+
 /**
  * Copyright (c) 2021 OceanBase
  * OceanBase CE is licensed under Mulan PubL v2.
@@ -11,7 +14,6 @@
  */
 
 #include <gtest/gtest.h>
-#include <iostream>
 #define protected public
 #define private public
 
@@ -19,9 +21,7 @@
 #include "rootserver/ob_tenant_balance_service.h"
 #include "share/balance/ob_balance_job_table_operator.h"
 #include "mittest/env/ob_simple_server_helper.h"
-#include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tx/ob_tx_loop_worker.h"
-#include "storage/tx/ob_trans_part_ctx.h"
 
 namespace oceanbase
 {
@@ -221,7 +221,7 @@ public:
   void check_memtable_cleanout(ObTableHandleV2 &handle,
                                const bool memtable_is_all_delay_cleanout)
   {
-    memtable::ObIMemtable *imemtable;
+    ObIMemtable *imemtable;
     handle.get_memtable(imemtable);
     memtable::ObMemtable *memtable = dynamic_cast<memtable::ObMemtable *>(imemtable);
 

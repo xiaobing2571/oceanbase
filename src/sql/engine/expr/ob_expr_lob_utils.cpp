@@ -12,7 +12,6 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
-#include "lib/ob_errno.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 
@@ -21,6 +20,25 @@ using namespace oceanbase::sql;
 
 namespace oceanbase
 {
+
+namespace common
+{
+int ob_obj_read_lob_data(
+    ObIAllocator &allocator,
+    const common::ObObj &obj,
+    ObString &data)
+{
+  int ret = OB_SUCCESS;
+  if (MTL(storage::ObLobManager*) == nullptr) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("lob manager is null", K(ret), K(obj), K(lbt()));
+  } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(&allocator, obj, data, nullptr))) {
+    LOG_WARN("read_real_string_data fail", K(ret), K(obj), K(lbt()));
+  }
+  return ret;
+}
+}
+
 namespace sql
 {
 
@@ -62,6 +80,77 @@ void ObTextStringObObjResult::set_result()
     // Notice: should not be null or nop
     res_obj_->set_has_lob_header();
   }
+}
+
+int ObTextStringHelper::build_text_iter(
+    ObTextStringIter &text_iter,
+    ObExecContext *exec_ctx,
+    const sql::ObBasicSessionInfo *session,
+    ObIAllocator *res_allocator,
+    ObIAllocator *tmp_allocator)
+{
+  int ret = OB_SUCCESS;
+  ObLobAccessCtx *lob_access_ctx = nullptr;
+  if (OB_NOT_NULL(exec_ctx) && OB_FAIL(exec_ctx->get_lob_access_ctx(lob_access_ctx))) {
+    LOG_WARN("get_lob_access_ctx fail", K(ret));
+  } else if (OB_FAIL(text_iter.init(0/*buffer_len*/, session, res_allocator, tmp_allocator, lob_access_ctx))) {
+    LOG_WARN("init lob str iter fail", K(ret), K(text_iter));
+  }
+  return ret;
+}
+
+int ObTextStringHelper::read_real_string_data(
+    ObIAllocator *allocator,
+    ObObjType type,
+    ObCollationType cs_type,
+    bool has_lob_header,
+    ObString &str,
+    sql::ObExecContext *exec_ctx)
+{
+  int ret = OB_SUCCESS;
+  if (is_lob_storage(type)) {
+    uint64_t tenant_id = MTL_ID();
+    ObArenaAllocator *tmp_alloc_ptr = nullptr;
+    ObArenaAllocator tmp_allocator("ObLobRRSD", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
+    if (tenant_id != OB_INVALID_TENANT_ID) {
+      tmp_alloc_ptr = &tmp_allocator;
+    }
+    ObTextStringIter str_iter(type, cs_type, str, has_lob_header);
+    if (OB_FAIL(build_text_iter(str_iter, exec_ctx, nullptr/*session*/, allocator, tmp_alloc_ptr))) {
+      LOG_WARN("Lob: init lob str iter failed ", K(ret), K(str_iter));
+    } else if (OB_FAIL(str_iter.get_full_data(str))) {
+      COMMON_LOG(WARN, "Lob: str iter get full data failed ", K(ret), K(str_iter));
+    }
+  }
+  return ret;
+}
+
+int ObTextStringHelper::read_real_string_data(
+    ObIAllocator *allocator,
+    const common::ObObj &obj,
+    ObString &str,
+    sql::ObExecContext *exec_ctx)
+{
+  int ret = OB_SUCCESS;
+  const ObObjMeta& meta = obj.get_meta();
+  str = obj.get_string();
+  if (meta.is_null()) {
+    str.reset();
+  } else if (! obj.is_lob_storage()) {
+  } else if (obj.has_lob_header() && obj.get_string_len() != 0 &&
+      ! obj.get_lob_value()->is_mem_loc_ && obj.get_lob_value()->in_row_) {
+    const ObLobCommon* lob = obj.get_lob_value();
+    str.assign_ptr(lob->get_inrow_data_ptr(), static_cast<int32_t>(lob->get_byte_size(obj.get_string_len())));
+  } else if (OB_FAIL(read_real_string_data(
+      allocator,
+      meta.get_type(),
+      meta.get_collation_type(),
+      obj.has_lob_header(),
+      str,
+      exec_ctx))) {
+    COMMON_LOG(WARN, "read_real_string_data fail", K(ret));
+  }
+  return ret;
 }
 
 int ob_adjust_lob_datum(const ObObj &origin_obj,

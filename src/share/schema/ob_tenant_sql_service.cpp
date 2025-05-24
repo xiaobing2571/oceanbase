@@ -12,18 +12,9 @@
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "ob_tenant_sql_service.h"
-#include "lib/oblog/ob_log.h"
-#include "lib/oblog/ob_log_module.h"
-#include "lib/string/ob_sql_string.h"
-#include "lib/mysqlclient/ob_isql_client.h"
 #include "rootserver/tenant_snapshot/ob_tenant_snapshot_util.h"  // for ObTenantSnapshotUtil
-#include "share/ob_dml_sql_splicer.h"
-#include "share/inner_table/ob_inner_table_schema_constants.h"
-#include "share/schema/ob_schema_struct.h"
-#include "share/schema/ob_schema_service.h"
-#include "share/ob_zone_merge_table_operator.h"
-#include "share/ob_share_util.h" // for ObShareUtils
 #include "sql/ob_sql_utils.h"
+#include "rootserver/ob_rs_job_table_operator.h"
 
 namespace oceanbase
 {
@@ -169,6 +160,10 @@ int ObTenantSqlService::delete_tenant(
     }
   }
 
+  if (FAILEDx(RS_JOB_COMPLETE_ALL_JOB_FOR_DROPPING_TENANT(tenant_id, sql_client))) {
+    LOG_WARN("fail to complete all rs job for dropping tenant", KR(ret), K(tenant_id));
+  }
+
   if (OB_SUCC(ret)) {
     ObSchemaOperation delete_tenant_op;
     delete_tenant_op.tenant_id_ = tenant_id;
@@ -197,8 +192,9 @@ int ObTenantSqlService::replace_tenant(
   char *zone_list_buf = NULL;
   if (!tenant_schema.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
+    ObCStringHelper helper;
     LOG_WARN("tenant_schema is invalid", "tenant_schema",
-        to_cstring(tenant_schema), K(ret));
+        helper.convert(tenant_schema), K(ret));
   } else if (OB_DDL_ADD_TENANT != op
              && OB_DDL_ADD_TENANT_START != op
              && OB_DDL_ADD_TENANT_END != op

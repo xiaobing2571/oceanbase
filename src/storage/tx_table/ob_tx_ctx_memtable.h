@@ -22,6 +22,7 @@ namespace oceanbase
 {
 namespace storage
 {
+class ObFreezer;
 //
 // We need to maintain the filter location and the playback site
 // separately to modularly manage different table structures, remove
@@ -37,18 +38,20 @@ namespace storage
 //
 // [1]:
 // [2]:
-class ObTxCtxMemtable : public memtable::ObIMemtable, public checkpoint::ObCommonCheckpoint
+class ObTxCtxMemtable : public ObIMemtable, public checkpoint::ObCommonCheckpoint
 {
 public:
   ObTxCtxMemtable();
   ~ObTxCtxMemtable();
 
-  int init(const ObITable::TableKey &table_key, const share::ObLSID &ls_id);
+  int init(const ObITable::TableKey &table_key,
+           const share::ObLSID &ls_id,
+           storage::ObFreezer *freezer);
 
   void reset();
   int on_memtable_flushed() override;
-  bool is_frozen_memtable() const override;
-  bool is_active_memtable() const override;
+  bool is_frozen_memtable() override;
+  bool is_active_memtable() override;
 
   // ================ INHERITED FROM ObIMemtable ===============
   // We need to inherient the memtable method for merge process to iterate the
@@ -65,8 +68,8 @@ public:
   virtual int64_t get_occupied_size() const override { return 0; }
 
   // ================ INHERITED FROM ObCommonCheckpoint ===============
-  virtual share::SCN get_rec_scn();
-  virtual int flush(share::SCN recycle_scn, bool need_freeze = true);
+  virtual share::SCN get_rec_scn() override;
+  virtual int flush(share::SCN recycle_scn, const int64_t trace_id, bool need_freeze = true);
 
   virtual ObTabletID get_tablet_id() const override;
   virtual bool is_flushing() const override;
@@ -95,14 +98,18 @@ public:
 
   virtual int get_frozen_schema_version(int64_t &schema_version) const override;
 
+  void set_max_end_scn(const share::SCN end_scn);
+
   INHERIT_TO_STRING_KV("ObITable", ObITable, KP(this), K_(snapshot_version),
-                       K_(ls_id), K_(is_frozen));
+                       K_(ls_id), K_(is_frozen), K_(max_end_scn));
 
 private:
   bool is_inited_;
   bool is_frozen_;
   ObTxCtxTable ls_ctx_mgr_guard_;
+  storage::ObFreezer *freezer_;
   common::ObSpinLock flush_lock_;
+  share::SCN max_end_scn_;
 };
 
 }  // namespace storage

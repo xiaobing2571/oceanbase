@@ -9,27 +9,14 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PubL v2 for more details.
  */
-#include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
 #define USING_LOG_PREFIX SHARE
 #define protected public
 #define private public
 
-#include "env/ob_simple_server_restart_helper.h"
 #include "env/ob_simple_cluster_test_base.h"
 #include "storage_ha/test_transfer_common_fun.h"
-#include "lib/ob_errno.h"
-#include "rootserver/ob_tenant_transfer_service.h" // ObTenantTransferService
-#include "share/transfer/ob_transfer_task_operator.h" // ObTransferTaskOperator
-#include "share/location_cache/ob_location_service.h" // ObLocationService
-#include "share/ob_tablet_autoincrement_service.h"
-#include "storage/high_availability/ob_transfer_handler.h"  //ObTransferHandler
-#include "lib/utility/utility.h"
-#include "storage/ls/ob_ls_tablet_service.h"
-#include "storage/ls/ob_ls.h"
-#include "storage/tablet/ob_tablet.h"
-#include "storage/tx_storage/ob_ls_service.h"
 
 namespace oceanbase
 {
@@ -180,11 +167,13 @@ TEST_F(TestTabletAutoincMgr, test_lob_tablet_autoinc_location_cache)
 
   // transfer t1 to other ls
   ObTransferTaskID task_id;
+  ObTransferTask transfer_task;
   ObMySQLTransaction trans;
   const ObLSID src_ls_id(1001);
   const ObLSID dst_ls_id(1002);
   ASSERT_EQ(OB_SUCCESS, trans.start(&inner_sql_proxy, g_tenant_id));
-  ASSERT_EQ(OB_SUCCESS, tenant_transfer->generate_transfer_task(trans, src_ls_id, dst_ls_id, g_part_list, ObBalanceTaskID(123), task_id));
+  ASSERT_EQ(OB_SUCCESS, tenant_transfer->generate_transfer_task(trans, src_ls_id, dst_ls_id, g_part_list, ObBalanceTaskID(123), transfer_task));
+  task_id = transfer_task.get_task_id();
   ASSERT_EQ(OB_SUCCESS, trans.end(true));
   ObTransferStatus expected_status(ObTransferStatus::COMPLETED);
   ObTransferTask task;
@@ -199,7 +188,10 @@ TEST_F(TestTabletAutoincMgr, test_lob_tablet_autoinc_location_cache)
 
   // remove source ls and clear src ls cache
   ASSERT_EQ(OB_SUCCESS, MTL(ObLSService*)->remove_ls(src_ls_id));
-  ASSERT_EQ(OB_SUCCESS, ls_location_service->erase_location_(GCONF.cluster_id, g_tenant_id, src_ls_id));
+  ObLSLocationCacheKey cache_key(GCONF.cluster_id, g_tenant_id, src_ls_id);
+  ObLSLocation tmp_loc;
+  ASSERT_EQ(OB_SUCCESS, ls_location_service->inner_cache_.del(cache_key, 0/*safe_delete_time*/));
+  ASSERT_EQ(OB_LS_LOCATION_NOT_EXIST, ls_location_service->nonblock_get(GCONF.cluster_id, g_tenant_id, src_ls_id, tmp_loc));
 
   // insert lob
   ASSERT_EQ(OB_SUCCESS, sql.assign_fmt("insert into t1 values (2, repeat('abcde0123456789', 1000));"));

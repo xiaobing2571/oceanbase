@@ -10,10 +10,7 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "share/ob_light_hashmap.h"
 #include <gtest/gtest.h>
-#include "share/ob_errno.h"
-#include "lib/oblog/ob_log.h"
 #include "storage/tx/ob_trans_define.h"
 
 namespace oceanbase
@@ -109,9 +106,6 @@ public:
   bool operator() (ObTransTestValue *val)
   {
     TRANS_LOG(INFO, "currnet val info will be removed ", K(*val));
-    if (NULL != map_) {
-      map_->del(val->get_trans_id(), val);
-    }
     return true;
   }
 private:

@@ -19,6 +19,7 @@
 #include "share/throttle/ob_share_resource_throttle_tool.h"
 #include "share/rc/ob_tenant_base.h"
 #include "storage/tx_storage/ob_tenant_freezer.h"
+#include "storage/ls/ob_ls.h"
 
 namespace oceanbase {
 namespace share {
@@ -44,6 +45,8 @@ public:
       SHARE_LOG(ERROR, "init memstore allocator failed", KR(ret));
     } else if (OB_FAIL(mds_allocator_.init())) {
       SHARE_LOG(ERROR, "init mds allocator failed", KR(ret));
+    } else if (OB_FAIL(tx_data_op_allocator_.init())) {
+      SHARE_LOG(ERROR, "init tx data op allocator failed", KR(ret));
     } else if (OB_FAIL(
                    share_resource_throttle_tool_.init(&memstore_allocator_, &tx_data_allocator_, &mds_allocator_))) {
       SHARE_LOG(ERROR, "init share resource throttle tool failed", KR(ret));
@@ -65,6 +68,7 @@ public:
   ObTenantTxDataAllocator &tx_data_allocator() { return tx_data_allocator_; }
   ObTenantMdsAllocator &mds_allocator() { return mds_allocator_; }
   TxShareThrottleTool &share_resource_throttle_tool() { return share_resource_throttle_tool_; }
+  ObTenantTxDataOpAllocator &tx_data_op_allocator() { return tx_data_op_allocator_; }
 
 private:
   void update_share_throttle_config_(const int64_t total_memory, omt::ObTenantConfigGuard &config);
@@ -78,6 +82,7 @@ private:
   ObMemstoreAllocator memstore_allocator_;
   ObTenantTxDataAllocator tx_data_allocator_;
   ObTenantMdsAllocator mds_allocator_;
+  ObTenantTxDataOpAllocator tx_data_op_allocator_;
 };
 
 class TxShareMemThrottleUtil
@@ -88,6 +93,7 @@ public:
   static int do_throttle(const bool for_replay,
                          const int64_t abs_expire_time,
                          const int64_t throttle_memory_size,
+                         const ObLS &ls,
                          TxShareThrottleTool &throttle_tool,
                          ObThrottleInfoGuard &share_ti_guard,
                          ObThrottleInfoGuard &module_ti_guard)
@@ -108,8 +114,8 @@ public:
     while (throttle_tool.still_throttling<ALLOCATOR>(share_ti_guard, module_ti_guard) &&
            (left_interval > 0)) {
       int64_t expected_wait_time = 0;
-      if (for_replay && MTL(ObTenantFreezer *)->exist_ls_freezing()) {
-        // skip throttle if ls freeze exists
+      if ((for_replay && MTL(ObTenantFreezer *)->exist_ls_throttle_is_skipping()) || ls.is_offline()) {
+        // skip throttle if : 1) throttle need skipping; 2) this logstream offline
         break;
       } else if ((expected_wait_time =
                       throttle_tool.expected_wait_time<ALLOCATOR>(share_ti_guard, module_ti_guard)) <= 0) {
@@ -130,7 +136,7 @@ public:
       if (0 < sleep_interval) {
         sleep_time += sleep_interval;
         left_interval -= sleep_interval;
-        ::usleep(sleep_interval);
+        ob_usleep<ObWaitEventIds::STORAGE_WRITING_THROTTLE_SLEEP>(sleep_interval, sleep_interval, sleep_time, 0);
       }
 
       PrintThrottleUtil::pirnt_throttle_info(ret,
@@ -144,6 +150,7 @@ public:
                                              has_printed_lbt);
     }
     PrintThrottleUtil::print_throttle_statistic(ret, ALLOCATOR::throttle_unit_name(), sleep_time, throttle_memory_size);
+    EVENT_ADD(ObStatEventIds::STORAGE_WRITING_THROTTLE_TIME, sleep_time);
 
     if (for_replay && sleep_time > 0) {
       // avoid print replay_timeout

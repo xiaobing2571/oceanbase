@@ -40,6 +40,11 @@ public:
   int murmur_hash_v3_for_one_row(EVAL_HASH_ARGS_FOR_ROW) const override;
   int null_first_cmp(VECTOR_ONE_COMPARE_ARGS) const override;
   int null_last_cmp(VECTOR_ONE_COMPARE_ARGS) const override;
+  int no_null_cmp(VECTOR_NOT_NULL_COMPARE_ARGS) const override final;
+  int null_first_mul_cmp(VECTOR_MUL_COMPARE_ARGS) const override final;
+  int null_last_mul_cmp(VECTOR_MUL_COMPARE_ARGS) const override final;
+  int null_first_cmp_batch_rows(VECTOR_COMPARE_BATCH_ROWS_ARGS) const override;
+  int no_null_cmp_batch_rows(VECTOR_COMPARE_BATCH_ROWS_ARGS) const override;
 };
 
 } // end namespace common

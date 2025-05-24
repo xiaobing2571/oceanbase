@@ -728,10 +728,19 @@ question_mask_size: 0
       "str_val":"",
       "children": [
          {
-          "type":"T_IDENT",
+          "type":"T_DATABASE_FACTOR",
           "int_val":9223372036854775807,
-          "str_len":8,
-          "str_val":"rongxuan"
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             { },
+             {
+              "type":"T_IDENT",
+              "int_val":9223372036854775807,
+              "str_len":8,
+              "str_val":"rongxuan"
+            }
+          ]
         }
       ]
     }
@@ -1077,6 +1086,96 @@ question_mask_size: 0
   ]
 }
 **************   Case 20   ***************
+commit comment 'comment transaction commit';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_COMMIT",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 21   ***************
+commit work comment 'comment txn commit work';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_COMMIT",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 22   ***************
+commit/*hint+commit tx hint*/ comment 'comment + hint';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_COMMIT",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_HINT",
+          "int_val":9223372036854775807,
+          "str_len":15,
+          "str_val":"commit tx hint"
+        }
+      ]
+    }
+  ]
+}
+**************   Case 23   ***************
+commit/*hint+commit tx work hint*/ work comment 'comment + hint';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_COMMIT",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_HINT",
+          "int_val":9223372036854775807,
+          "str_len":20,
+          "str_val":"commit tx work hint"
+        }
+      ]
+    }
+  ]
+}
+**************   Case 24   ***************
 rollback;
 question_mask_size: 0
 {
@@ -1096,7 +1195,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 21   ***************
+**************   Case 25   ***************
 rollback/*hint+rollback*/;
 question_mask_size: 0
 {
@@ -1121,7 +1220,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 22   ***************
+**************   Case 26   ***************
 rollback work;
 question_mask_size: 0
 {
@@ -1141,7 +1240,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 23   ***************
+**************   Case 27   ***************
 rollback/*hint+rollback work*/ work;
 question_mask_size: 0
 {
@@ -1166,7 +1265,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 24   ***************
+**************   Case 28   ***************
 alter user 'zdy' account lock;
 question_mask_size: 0
 {
@@ -1214,7 +1313,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 25   ***************
+**************   Case 29   ***************
 alter user 'zdy' account unlock;
 question_mask_size: 0
 {
@@ -1262,7 +1361,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 26   ***************
+**************   Case 30   ***************
 select d.t1.c1, sum(t1.c2) from d.t1 where d.t1.c1 > 0 and c2 + d.t1.c1 = 100 group by d.t1.c2 order by t.d1.c1 desc limit 0, 1
 question_mask_size: 0
 {
@@ -1408,7 +1507,7 @@ question_mask_size: 0
           "children": [
              {
               "type":"T_OP_AND",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
@@ -1645,6 +1744,7 @@ question_mask_size: 0
              { }
           ]
         },
+         { },
          {
           "type":"T_COMMA_LIMIT_CLAUSE",
           "int_val":9223372036854775807,
@@ -1676,7 +1776,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 27   ***************
+**************   Case 31   ***************
 select c1, sum(d.t1.c2) from t1 where t1.c1 > 0 and c2 + t1.c1 = 100 group by t1.c2 order by t1.c1 desc limit 0, 1
 question_mask_size: 0
 {
@@ -1812,7 +1912,7 @@ question_mask_size: 0
           "children": [
              {
               "type":"T_OP_AND",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
@@ -2029,6 +2129,7 @@ question_mask_size: 0
              { }
           ]
         },
+         { },
          {
           "type":"T_COMMA_LIMIT_CLAUSE",
           "int_val":9223372036854775807,
@@ -2060,7 +2161,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 28   ***************
+**************   Case 32   ***************
 select t1.c1, sum(c2) from t1 where c1 > 0 and c2 + c1 = 100 group by c2 order by c1 desc limit 0, 1
 question_mask_size: 0
 {
@@ -2191,7 +2292,7 @@ question_mask_size: 0
           "children": [
              {
               "type":"T_OP_AND",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
@@ -2388,6 +2489,7 @@ question_mask_size: 0
              { }
           ]
         },
+         { },
          {
           "type":"T_COMMA_LIMIT_CLAUSE",
           "int_val":9223372036854775807,
@@ -2419,7 +2521,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 29   ***************
+**************   Case 33   ***************
 insert into t1 values(1, 2)
 question_mask_size: 0
 {
@@ -2477,13 +2579,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -2519,7 +2621,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 30   ***************
+**************   Case 34   ***************
 insert into t1.t1 values(1, 2)
 question_mask_size: 0
 {
@@ -2582,13 +2684,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -2624,7 +2726,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 31   ***************
+**************   Case 35   ***************
 insert into t1(c1) values(1), (2)
 question_mask_size: 0
 {
@@ -2705,13 +2807,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -2725,7 +2827,7 @@ question_mask_size: 0
                 },
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -2755,7 +2857,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 32   ***************
+**************   Case 36   ***************
 insert into t1(t1.c1) values(1), (2)
 question_mask_size: 0
 {
@@ -2841,13 +2943,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -2861,7 +2963,7 @@ question_mask_size: 0
                 },
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -2891,7 +2993,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 33   ***************
+**************   Case 37   ***************
 insert into d.t1(d.t1.c1) values(1), (2)
 question_mask_size: 0
 {
@@ -2987,13 +3089,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -3007,7 +3109,7 @@ question_mask_size: 0
                 },
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -3037,7 +3139,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 34   ***************
+**************   Case 38   ***************
 update t1 set d.t1.c2=t1.c1+1 where d.t1.c1 > 1 order by d.t1.c1 desc limit 0, 10
 question_mask_size: 0
 {
@@ -3300,7 +3402,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 35   ***************
+**************   Case 39   ***************
 update d.t1 set t1.c2=d.t1c1+1 where t1.c1 > 1 order by c1 desc limit 0, 10
 question_mask_size: 0
 {
@@ -3548,7 +3650,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 36   ***************
+**************   Case 40   ***************
 delete from d.t1 where d.t1.c2 > 10 order by c1 limit 0, 1
 question_mask_size: 0
 {
@@ -3732,12 +3834,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 37   ***************
+**************   Case 41   ***************
 select t1.c1, t2.c1 from d.t1 join d.t2 on d.t1.c1=t2.c1 where t1.c1>0;
 question_mask_size: 0
 {
@@ -4023,12 +4126,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 38   ***************
+**************   Case 42   ***************
 select d.t1.c1, t2.c1 from d.t1 join t2 on t1.c1=t2.c1 where t1.c1>0;
 question_mask_size: 0
 {
@@ -4309,12 +4413,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 39   ***************
+**************   Case 43   ***************
 select d.t1.c1, t2.c1 from d.t1 join t2 on c1=c1 where t1.c1>0;
 question_mask_size: 0
 {
@@ -4585,12 +4690,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 40   ***************
+**************   Case 44   ***************
 insert into t1 value (1, 2), (3, 4) on duplicate key update d.t.c1 = t.c2 + 1, c2 = c2 + 3;
 question_mask_size: 0
 {
@@ -4648,13 +4754,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -4674,7 +4780,7 @@ question_mask_size: 0
                 },
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -4840,7 +4946,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 41   ***************
+**************   Case 45   ***************
 insert into d.t1 value (1, 2), (3, 4) on duplicate key update t.c1 = t.c2 + 1, d.t.c2 = t.c2 + 3;
 question_mask_size: 0
 {
@@ -4903,13 +5009,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -4929,7 +5035,7 @@ question_mask_size: 0
                 },
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -5105,7 +5211,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 42   ***************
+**************   Case 46   ***************
 create table rongxuan(c int primary key, c2 int)
 question_mask_size: 0
 {
@@ -5231,7 +5337,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 43   ***************
+**************   Case 47   ***************
 create table rongxuan(rongxuan.c int primary key, c2 int)
 question_mask_size: 0
 {
@@ -5362,7 +5468,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 44   ***************
+**************   Case 48   ***************
 create table rongxuan(d.rongxuan.c int primary key, c2 int)
 question_mask_size: 0
 {
@@ -5498,7 +5604,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 45   ***************
+**************   Case 49   ***************
 drop table t1
 question_mask_size: 0
 {
@@ -5543,7 +5649,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 46   ***************
+**************   Case 50   ***************
 drop table oceanbase.t, t1
 question_mask_size: 0
 {
@@ -5609,7 +5715,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 47   ***************
+**************   Case 51   ***************
 alter table rongxuan add c3 int;
 question_mask_size: 0
 {
@@ -5696,12 +5802,13 @@ question_mask_size: 0
             }
           ]
         },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 48   ***************
+**************   Case 52   ***************
 alter table rongxuan add rongxuan.c4 int;
 question_mask_size: 0
 {
@@ -5793,12 +5900,13 @@ question_mask_size: 0
             }
           ]
         },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 49   ***************
+**************   Case 53   ***************
 alter table rongxuan add test.rongxuan.c5 int;
 question_mask_size: 0
 {
@@ -5895,12 +6003,13 @@ question_mask_size: 0
             }
           ]
         },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 50   ***************
+**************   Case 54   ***************
 drop database rongxuan
 question_mask_size: 0
 {
@@ -5926,7 +6035,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 51   ***************
+**************   Case 55   ***************
 create database rongxuan
 question_mask_size: 0
 {
@@ -5953,7 +6062,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 52   ***************
+**************   Case 56   ***************
 create database if not exists rongxuan
 question_mask_size: 0
 {
@@ -5985,7 +6094,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 53   ***************
+**************   Case 57   ***************
 create database if not exists rongxuan default character set = 'utf8'  default collate = 'default_collate'
 question_mask_size: 0
 {
@@ -6036,7 +6145,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 54   ***************
+**************   Case 58   ***************
 select * from d.t1 PARTITION(p1, p2);
 question_mask_size: 0
 {
@@ -6160,12 +6269,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 55   ***************
+**************   Case 59   ***************
 delete from d.t1 PARTITION(p0, p1);
 question_mask_size: 0
 {
@@ -6263,12 +6373,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 56   ***************
+**************   Case 60   ***************
 update d.t1 PARTITION (p2) SET id = 2 WHERE name = 'Jill';
 question_mask_size: 0
 {
@@ -6442,7 +6553,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 57   ***************
+**************   Case 61   ***************
 INSERT INTO d.t1 PARTITION (p3, p4) VALUES (24, 'Tim', 'Greene', 3, 1),  (26, 'Linda', 'Mills', 2, 1);
 question_mask_size: 0
 {
@@ -6532,13 +6643,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":8,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -6594,7 +6705,7 @@ question_mask_size: 0
                 },
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":8,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -6666,7 +6777,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 58   ***************
+**************   Case 62   ***************
 REPLACE INTO d.t1 PARTITION (p0) VALUES (20, 'Jan', 'Jones', 3, 2);
 question_mask_size: 0
 {
@@ -6750,13 +6861,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":8,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -6828,7 +6939,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 59   ***************
+**************   Case 63   ***************
 SELECT e.id, s.city, d.name FROM e JOIN stores PARTITION (p1) ON e.id=s.id JOIN departments PARTITION (p0) ON e.id=d.id;
 question_mask_size: 0
 {
@@ -7219,12 +7330,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 60   ***************
+**************   Case 64   ***************
 alter system report replica;
 question_mask_size: 0
 {
@@ -7244,7 +7356,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 61   ***************
+**************   Case 65   ***************
 alter system report replica server = '127.0.0.1:80';
 question_mask_size: 0
 {
@@ -7277,7 +7389,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 62   ***************
+**************   Case 66   ***************
 alter system report replica zone = 'z1';
 question_mask_size: 0
 {
@@ -7310,7 +7422,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 63   ***************
+**************   Case 67   ***************
 alter system recycle replica;
 question_mask_size: 0
 {
@@ -7330,7 +7442,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 64   ***************
+**************   Case 68   ***************
 alter system recycle replica server = '127.0.0.1:80';
 question_mask_size: 0
 {
@@ -7363,7 +7475,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 65   ***************
+**************   Case 69   ***************
 alter system recycle replica server '127.0.0.1:80';
 question_mask_size: 0
 {
@@ -7396,7 +7508,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 66   ***************
+**************   Case 70   ***************
 alter system recycle replica zone = 'z1';
 question_mask_size: 0
 {
@@ -7429,7 +7541,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 67   ***************
+**************   Case 71   ***************
 alter system recycle replica zone 'z1';
 question_mask_size: 0
 {
@@ -7462,7 +7574,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 68   ***************
+**************   Case 72   ***************
 alter system major freeze;
 question_mask_size: 0
 {
@@ -7489,7 +7601,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 69   ***************
+**************   Case 73   ***************
 alter system start merge zone = 'z1';
 question_mask_size: 0
 {
@@ -7528,7 +7640,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 70   ***************
+**************   Case 74   ***************
 alter system suspend merge;
 question_mask_size: 0
 {
@@ -7554,7 +7666,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 71   ***************
+**************   Case 75   ***************
 alter system suspend merge tenant = sys;
 question_mask_size: 0
 {
@@ -7593,7 +7705,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 72   ***************
+**************   Case 76   ***************
 alter system suspend merge tenant = all_user;
 question_mask_size: 0
 {
@@ -7632,7 +7744,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 73   ***************
+**************   Case 77   ***************
 alter system suspend merge tenant = all_meta;
 question_mask_size: 0
 {
@@ -7671,7 +7783,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 74   ***************
+**************   Case 78   ***************
 alter system resume merge;
 question_mask_size: 0
 {
@@ -7697,7 +7809,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 75   ***************
+**************   Case 79   ***************
 alter system resume merge tenant = sys;
 question_mask_size: 0
 {
@@ -7736,7 +7848,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 76   ***************
+**************   Case 80   ***************
 alter system resume merge tenant = all_user;
 question_mask_size: 0
 {
@@ -7775,7 +7887,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 77   ***************
+**************   Case 81   ***************
 alter system resume merge tenant = all_meta;
 question_mask_size: 0
 {
@@ -7814,7 +7926,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 78   ***************
+**************   Case 82   ***************
 alter system clear roottable;
 question_mask_size: 0
 {
@@ -7834,7 +7946,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 79   ***************
+**************   Case 83   ***************
 alter system clear roottable tenant = 'xxx';
 question_mask_size: 0
 {
@@ -7867,7 +7979,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 80   ***************
+**************   Case 84   ***************
 alter system modify zone 'z1' set region 'r1'
 question_mask_size: 0
 {
@@ -7912,9 +8024,9 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 81   ***************
+**************   Case 85   ***************
 alter system start zone 'z1' region 'r1'
-**************   Case 82   ***************
+**************   Case 86   ***************
 alter system modify zone 'z1' IDC 'idc1'
 question_mask_size: 0
 {
@@ -7959,7 +8071,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 83   ***************
+**************   Case 87   ***************
 alter system modify zone 'z1' set IDC 'idc1', region 'r1'
 question_mask_size: 0
 {
@@ -8010,7 +8122,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 84   ***************
+**************   Case 88   ***************
 alter system add zone 'z1' idc 'idc1', region 'r1'
 question_mask_size: 0
 {
@@ -8061,7 +8173,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 85   ***************
+**************   Case 89   ***************
 alter system add zone 'z1' idc 'idc1'
 question_mask_size: 0
 {
@@ -8106,7 +8218,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 86   ***************
+**************   Case 90   ***************
 alter system modify zone 'z1'
 question_mask_size: 0
 {
@@ -8138,11 +8250,11 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 87   ***************
+**************   Case 91   ***************
 alter system start zone 'z1' IDC 'idc1'
-**************   Case 88   ***************
+**************   Case 92   ***************
 alter system start zone 'z1' zone_type 'ReadWrite'
-**************   Case 89   ***************
+**************   Case 93   ***************
 alter system add zone 'z1' zone_type 'ReadWrite', idc 'idc1', region 'r1'
 question_mask_size: 0
 {
@@ -8199,7 +8311,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 90   ***************
+**************   Case 94   ***************
 alter system add zone 'z1' zone_type 'ReadWrite', idc 'idc1'
 question_mask_size: 0
 {
@@ -8250,7 +8362,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 91   ***************
+**************   Case 95   ***************
 alter system add zone 'z1' zone_type 'ReadWrite', region 'r1'
 question_mask_size: 0
 {
@@ -8301,7 +8413,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 92   ***************
+**************   Case 96   ***************
 alter system add zone 'z1' zone_type 'ReadWrite'
 question_mask_size: 0
 {
@@ -8346,7 +8458,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 93   ***************
+**************   Case 97   ***************
 alter system modify zone 'z1' zone_type 'ReadWrite', idc 'idc1', region 'r1'
 question_mask_size: 0
 {
@@ -8403,7 +8515,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 94   ***************
+**************   Case 98   ***************
 alter system modify zone 'z1' zone_type 'ReadWrite', idc 'idc1'
 question_mask_size: 0
 {
@@ -8454,7 +8566,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 95   ***************
+**************   Case 99   ***************
 alter system modify zone 'z1' zone_type 'ReadWrite', region 'r1'
 question_mask_size: 0
 {
@@ -8505,7 +8617,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 96   ***************
+**************   Case 100   ***************
 alter system modify zone 'z1' zone_type 'ReadWrite'
 question_mask_size: 0
 {
@@ -8550,7 +8662,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 97   ***************
+**************   Case 101   ***************
 select * from t1 where c1>ANY(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -8790,6 +8902,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -8816,12 +8929,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 98   ***************
+**************   Case 102   ***************
 select * from t1 where c1>SOME(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -9061,6 +9175,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -9087,12 +9202,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 99   ***************
+**************   Case 103   ***************
 select * from t1 where c1>ALL(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -9332,6 +9448,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -9358,12 +9475,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 100   ***************
+**************   Case 104   ***************
 select * from t1 where c1>(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -9597,6 +9715,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -9621,12 +9740,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 101   ***************
+**************   Case 105   ***************
 select * from t1 where c1<ANY(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -9866,6 +9986,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -9892,12 +10013,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 102   ***************
+**************   Case 106   ***************
 select * from t1 where c1<SOME(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -10137,6 +10259,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -10163,12 +10286,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 103   ***************
+**************   Case 107   ***************
 select * from t1 where c1<ALL(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -10408,6 +10532,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -10434,12 +10559,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 104   ***************
+**************   Case 108   ***************
 select * from t1 where c1<(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -10673,6 +10799,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -10697,12 +10824,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 105   ***************
+**************   Case 109   ***************
 select * from t1 where c1>=ANY(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -10942,6 +11070,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -10968,12 +11097,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 106   ***************
+**************   Case 110   ***************
 select * from t1 where c1>=SOME(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -11213,6 +11343,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -11239,12 +11370,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 107   ***************
+**************   Case 111   ***************
 select * from t1 where c1>=ALL(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -11484,6 +11616,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -11510,12 +11643,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 108   ***************
+**************   Case 112   ***************
 select * from t1 where c1>=(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -11749,6 +11883,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -11773,12 +11908,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 109   ***************
+**************   Case 113   ***************
 select * from t1 where c1<=ANY(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -12018,6 +12154,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -12044,12 +12181,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 110   ***************
+**************   Case 114   ***************
 select * from t1 where c1<=SOME(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -12289,6 +12427,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -12315,12 +12454,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 111   ***************
+**************   Case 115   ***************
 select * from t1 where c1<=ALL(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -12560,6 +12700,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -12586,12 +12727,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 112   ***************
+**************   Case 116   ***************
 select * from t1 where c1<=(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -12825,6 +12967,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -12849,12 +12992,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 113   ***************
+**************   Case 117   ***************
 select * from t1 where c1=ANY(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -13094,6 +13238,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -13120,12 +13265,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 114   ***************
+**************   Case 118   ***************
 select * from t1 where c1=SOME(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -13365,6 +13511,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -13391,12 +13538,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 115   ***************
+**************   Case 119   ***************
 select * from t1 where c1=ALL(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -13636,6 +13784,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -13662,12 +13811,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 116   ***************
+**************   Case 120   ***************
 select * from t1 where c1=(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -13901,6 +14051,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -13925,12 +14076,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 117   ***************
+**************   Case 121   ***************
 select * from t1 where c1!=ANY(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -14170,6 +14322,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -14196,12 +14349,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 118   ***************
+**************   Case 122   ***************
 select * from t1 where c1!=SOME(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -14441,6 +14595,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -14467,12 +14622,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 119   ***************
+**************   Case 123   ***************
 select * from t1 where c1!=ALL(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -14712,6 +14868,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -14738,12 +14895,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 120   ***************
+**************   Case 124   ***************
 select * from t1 where c1!=(select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -14977,6 +15135,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -15001,12 +15160,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 121   ***************
+**************   Case 125   ***************
 select * from t1 where c1 in (select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -15240,6 +15400,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -15264,12 +15425,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 122   ***************
+**************   Case 126   ***************
 select * from t1 where c1 not in (select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -15503,6 +15665,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -15527,12 +15690,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 123   ***************
+**************   Case 127   ***************
 select * from t1 where exists (select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -15750,6 +15914,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -15774,12 +15939,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 124   ***************
+**************   Case 128   ***************
 select * from t1 where not exists (select c1 from t2 where c2>1);
 question_mask_size: 0
 {
@@ -16003,6 +16169,7 @@ question_mask_size: 0
                          { },
                          { },
                          { },
+                         { },
                          { }
                       ]
                     }
@@ -16029,12 +16196,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 125   ***************
+**************   Case 129   ***************
 select * from t1 where (select c1 from t1) like (select c2 from t2);
 question_mask_size: 0
 {
@@ -16214,6 +16382,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 },
@@ -16310,6 +16479,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -16334,12 +16504,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 126   ***************
+**************   Case 130   ***************
 select * from t1 where (select c1 from t1) not like (select c2 from t2);
 question_mask_size: 0
 {
@@ -16519,6 +16690,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 },
@@ -16615,6 +16787,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -16639,12 +16812,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 127   ***************
+**************   Case 131   ***************
 select * from t1 where (c1) in (select c1 from t2);
 question_mask_size: 0
 {
@@ -16840,6 +17014,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -16864,12 +17039,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 128   ***************
+**************   Case 132   ***************
 select * from t1 where (c1, c2) in (select c1, c2 from t2);
 question_mask_size: 0
 {
@@ -16958,7 +17134,7 @@ question_mask_size: 0
               "children": [
                  {
                   "type":"T_EXPR_LIST",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -17113,6 +17289,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -17137,12 +17314,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 129   ***************
+**************   Case 133   ***************
 select * from t1 where ROW(c1, c2) in (select c1, c2 from t2);
 question_mask_size: 0
 {
@@ -17231,7 +17409,7 @@ question_mask_size: 0
               "children": [
                  {
                   "type":"T_EXPR_LIST",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -17386,6 +17564,7 @@ question_mask_size: 0
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -17410,12 +17589,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 130   ***************
+**************   Case 134   ***************
 set names latin1;
 question_mask_size: 0
 {
@@ -17425,23 +17605,31 @@ question_mask_size: 0
   "str_val":"",
   "children": [
      {
-      "type":"T_SET_NAMES",
+      "type":"T_VARIABLE_SET",
       "int_val":0,
       "str_len":0,
       "str_val":"",
       "children": [
          {
-          "type":"T_CHAR_CHARSET",
+          "type":"T_SET_NAMES",
           "int_val":9223372036854775807,
-          "str_len":6,
-          "str_val":"latin1"
-        },
-         { }
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_CHAR_CHARSET",
+              "int_val":9223372036854775807,
+              "str_len":6,
+              "str_val":"latin1"
+            },
+             { }
+          ]
+        }
       ]
     }
   ]
 }
-**************   Case 131   ***************
+**************   Case 135   ***************
 set names 'latin1';
 question_mask_size: 0
 {
@@ -17451,23 +17639,31 @@ question_mask_size: 0
   "str_val":"",
   "children": [
      {
-      "type":"T_SET_NAMES",
+      "type":"T_VARIABLE_SET",
       "int_val":0,
       "str_len":0,
       "str_val":"",
       "children": [
          {
-          "type":"T_VARCHAR",
+          "type":"T_SET_NAMES",
           "int_val":9223372036854775807,
-          "str_len":6,
-          "str_val":"latin1"
-        },
-         { }
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":6,
+              "str_val":"latin1"
+            },
+             { }
+          ]
+        }
       ]
     }
   ]
 }
-**************   Case 132   ***************
+**************   Case 136   ***************
 set names utf8 collate 'utf8_general_ci';
 question_mask_size: 0
 {
@@ -17477,28 +17673,36 @@ question_mask_size: 0
   "str_val":"",
   "children": [
      {
-      "type":"T_SET_NAMES",
+      "type":"T_VARIABLE_SET",
       "int_val":0,
       "str_len":0,
       "str_val":"",
       "children": [
          {
-          "type":"T_CHAR_CHARSET",
+          "type":"T_SET_NAMES",
           "int_val":9223372036854775807,
-          "str_len":4,
-          "str_val":"utf8"
-        },
-         {
-          "type":"T_COLLATION",
-          "int_val":9223372036854775807,
-          "str_len":15,
-          "str_val":"utf8_general_ci"
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_CHAR_CHARSET",
+              "int_val":9223372036854775807,
+              "str_len":4,
+              "str_val":"utf8"
+            },
+             {
+              "type":"T_COLLATION",
+              "int_val":9223372036854775807,
+              "str_len":15,
+              "str_val":"utf8_general_ci"
+            }
+          ]
         }
       ]
     }
   ]
 }
-**************   Case 133   ***************
+**************   Case 137   ***************
 set names utf8 collate utf8_general_ci;
 question_mask_size: 0
 {
@@ -17508,28 +17712,36 @@ question_mask_size: 0
   "str_val":"",
   "children": [
      {
-      "type":"T_SET_NAMES",
+      "type":"T_VARIABLE_SET",
       "int_val":0,
       "str_len":0,
       "str_val":"",
       "children": [
          {
-          "type":"T_CHAR_CHARSET",
+          "type":"T_SET_NAMES",
           "int_val":9223372036854775807,
-          "str_len":4,
-          "str_val":"utf8"
-        },
-         {
-          "type":"T_COLLATION",
-          "int_val":9223372036854775807,
-          "str_len":15,
-          "str_val":"utf8_general_ci"
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_CHAR_CHARSET",
+              "int_val":9223372036854775807,
+              "str_len":4,
+              "str_val":"utf8"
+            },
+             {
+              "type":"T_COLLATION",
+              "int_val":9223372036854775807,
+              "str_len":15,
+              "str_val":"utf8_general_ci"
+            }
+          ]
         }
       ]
     }
   ]
 }
-**************   Case 134   ***************
+**************   Case 138   ***************
 set character set utf8;
 question_mask_size: 0
 {
@@ -17539,22 +17751,30 @@ question_mask_size: 0
   "str_val":"",
   "children": [
      {
-      "type":"T_SET_CHARSET",
+      "type":"T_VARIABLE_SET",
       "int_val":0,
       "str_len":0,
       "str_val":"",
       "children": [
          {
-          "type":"T_CHAR_CHARSET",
+          "type":"T_SET_CHARSET",
           "int_val":9223372036854775807,
-          "str_len":4,
-          "str_val":"utf8"
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_CHAR_CHARSET",
+              "int_val":9223372036854775807,
+              "str_len":4,
+              "str_val":"utf8"
+            }
+          ]
         }
       ]
     }
   ]
 }
-**************   Case 135   ***************
+**************   Case 139   ***************
 set character set 'utf8';
 question_mask_size: 0
 {
@@ -17564,22 +17784,30 @@ question_mask_size: 0
   "str_val":"",
   "children": [
      {
-      "type":"T_SET_CHARSET",
+      "type":"T_VARIABLE_SET",
       "int_val":0,
       "str_len":0,
       "str_val":"",
       "children": [
          {
-          "type":"T_VARCHAR",
+          "type":"T_SET_CHARSET",
           "int_val":9223372036854775807,
-          "str_len":4,
-          "str_val":"utf8"
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":4,
+              "str_val":"utf8"
+            }
+          ]
         }
       ]
     }
   ]
 }
-**************   Case 136   ***************
+**************   Case 140   ***************
 set charset utf8;
 question_mask_size: 0
 {
@@ -17589,22 +17817,30 @@ question_mask_size: 0
   "str_val":"",
   "children": [
      {
-      "type":"T_SET_CHARSET",
+      "type":"T_VARIABLE_SET",
       "int_val":0,
       "str_len":0,
       "str_val":"",
       "children": [
          {
-          "type":"T_CHAR_CHARSET",
+          "type":"T_SET_CHARSET",
           "int_val":9223372036854775807,
-          "str_len":4,
-          "str_val":"utf8"
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_CHAR_CHARSET",
+              "int_val":9223372036854775807,
+              "str_len":4,
+              "str_val":"utf8"
+            }
+          ]
         }
       ]
     }
   ]
 }
-**************   Case 137   ***************
+**************   Case 141   ***************
 select _utf8 'abc', _utf8mb4 'def' collate utf8mb4_general_ci from t1 where c1 collate utf8_bin = 'xyz' collate utf8_bin;
 question_mask_size: 0
 {
@@ -17869,12 +18105,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 138   ***************
+**************   Case 142   ***************
 select * from t1 where c1=?;
 question_mask_size: 1
 {
@@ -18004,12 +18241,13 @@ question_mask_size: 1
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 139   ***************
+**************   Case 143   ***************
 select * from t1 where c1>?;
 question_mask_size: 1
 {
@@ -18139,12 +18377,13 @@ question_mask_size: 1
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 140   ***************
+**************   Case 144   ***************
 select * from t1 where (select c1 from t1 where c1 = ?) not like (select c2 from t2 where c2=?);
 question_mask_size: 2
 {
@@ -18362,6 +18601,7 @@ question_mask_size: 2
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 },
@@ -18496,6 +18736,7 @@ question_mask_size: 2
                      { },
                      { },
                      { },
+                     { },
                      { }
                   ]
                 }
@@ -18520,12 +18761,13 @@ question_mask_size: 2
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 141   ***************
+**************   Case 145   ***************
 select * from t1 join t2;
 question_mask_size: 0
 {
@@ -18660,12 +18902,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 142   ***************
+**************   Case 146   ***************
 select * from t1 inner join t2;
 question_mask_size: 0
 {
@@ -18800,12 +19043,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 143   ***************
+**************   Case 147   ***************
 select * from t1 cross join t2;
 question_mask_size: 0
 {
@@ -18940,12 +19184,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 144   ***************
+**************   Case 148   ***************
 select * from t1 cross join t2 join t3;
 question_mask_size: 0
 {
@@ -19123,12 +19368,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 145   ***************
+**************   Case 149   ***************
 select "1234";
 question_mask_size: 0
 {
@@ -19195,12 +19441,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 146   ***************
+**************   Case 150   ***************
 select '1234';
 question_mask_size: 0
 {
@@ -19267,12 +19514,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 147   ***************
+**************   Case 151   ***************
 create table test(c1 varchar(3) binary charset utf8mb4);
 question_mask_size: 0
 {
@@ -19368,7 +19616,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 148   ***************
+**************   Case 152   ***************
 replace into test values(1,2);
 question_mask_size: 0
 {
@@ -19426,13 +19674,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -19468,7 +19716,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 149   ***************
+**************   Case 153   ***************
 replace ignore into test values(1,2);
 question_mask_size: 0
 {
@@ -19526,13 +19774,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -19573,7 +19821,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 150   ***************
+**************   Case 154   ***************
 insert ignore into test values(1,2);
 question_mask_size: 0
 {
@@ -19631,13 +19879,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -19678,7 +19926,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 151   ***************
+**************   Case 155   ***************
 insert ignore into test values(1,2) on duplicate key update c2 = c1 + 1;
 question_mask_size: 0
 {
@@ -19736,13 +19984,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -19844,7 +20092,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 152   ***************
+**************   Case 156   ***************
 create outline out_name on select * from t1;
 question_mask_size: 0
 {
@@ -19964,15 +20212,22 @@ question_mask_size: 0
              { },
              { },
              { },
+             { },
              { }
           ]
         },
-         { }
+         { },
+         {
+          "type":"T_INT",
+          "int_val":0,
+          "str_len":0,
+          "str_val":""
+        }
       ]
     }
   ]
 }
-**************   Case 153   ***************
+**************   Case 157   ***************
 create or replace outline out_name on select * from t1;
 question_mask_size: 0
 {
@@ -20097,15 +20352,22 @@ question_mask_size: 0
              { },
              { },
              { },
+             { },
              { }
           ]
         },
-         { }
+         { },
+         {
+          "type":"T_INT",
+          "int_val":0,
+          "str_len":0,
+          "str_val":""
+        }
       ]
     }
   ]
 }
-**************   Case 154   ***************
+**************   Case 158   ***************
 create outline out_name on select * from t1;
 question_mask_size: 0
 {
@@ -20225,15 +20487,22 @@ question_mask_size: 0
              { },
              { },
              { },
+             { },
              { }
           ]
         },
-         { }
+         { },
+         {
+          "type":"T_INT",
+          "int_val":0,
+          "str_len":0,
+          "str_val":""
+        }
       ]
     }
   ]
 }
-**************   Case 155   ***************
+**************   Case 159   ***************
 create outline out_name on select /*+ssssss*/* from t1;
 question_mask_size: 0
 {
@@ -20353,15 +20622,22 @@ question_mask_size: 0
              { },
              { },
              { },
+             { },
              { }
           ]
         },
-         { }
+         { },
+         {
+          "type":"T_INT",
+          "int_val":0,
+          "str_len":0,
+          "str_val":""
+        }
       ]
     }
   ]
 }
-**************   Case 156   ***************
+**************   Case 160   ***************
 create outline out_name on select /*+ssssss*/* from t1 to select /*+ssssss*/* from t1;
 question_mask_size: 0
 {
@@ -20481,6 +20757,7 @@ question_mask_size: 0
              { },
              { },
              { },
+             { },
              { }
           ]
         },
@@ -20567,14 +20844,21 @@ question_mask_size: 0
              { },
              { },
              { },
+             { },
              { }
           ]
+        },
+         {
+          "type":"T_INT",
+          "int_val":0,
+          "str_len":0,
+          "str_val":""
         }
       ]
     }
   ]
 }
-**************   Case 157   ***************
+**************   Case 161   ***************
 create outline out_name on select /*+ssssss*/* from t1 to select * from t1;
 question_mask_size: 0
 {
@@ -20694,6 +20978,7 @@ question_mask_size: 0
              { },
              { },
              { },
+             { },
              { }
           ]
         },
@@ -20780,14 +21065,21 @@ question_mask_size: 0
              { },
              { },
              { },
+             { },
              { }
           ]
+        },
+         {
+          "type":"T_INT",
+          "int_val":0,
+          "str_len":0,
+          "str_val":""
         }
       ]
     }
   ]
 }
-**************   Case 158   ***************
+**************   Case 162   ***************
 create outline out_name on insert /*+ssssss*/ into t1 values(1, 2)  to insert /*+ssssss*/ into t1 values(1, 2);
 question_mask_size: 0
 {
@@ -20873,13 +21165,13 @@ question_mask_size: 0
                 },
                  {
                   "type":"T_VALUE_LIST",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
                      {
                       "type":"T_VALUE_VECTOR",
-                      "int_val":9223372036854775807,
+                      "int_val":2,
                       "str_len":0,
                       "str_val":"",
                       "children": [
@@ -20962,13 +21254,13 @@ question_mask_size: 0
                 },
                  {
                   "type":"T_VALUE_LIST",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
                      {
                       "type":"T_VALUE_VECTOR",
-                      "int_val":9223372036854775807,
+                      "int_val":2,
                       "str_len":0,
                       "str_val":"",
                       "children": [
@@ -21001,12 +21293,18 @@ question_mask_size: 0
              { },
              { }
           ]
+        },
+         {
+          "type":"T_INT",
+          "int_val":0,
+          "str_len":0,
+          "str_val":""
         }
       ]
     }
   ]
 }
-**************   Case 159   ***************
+**************   Case 163   ***************
 drop outline out_name;
 question_mask_size: 0
 {
@@ -21036,12 +21334,18 @@ question_mask_size: 0
             },
              { }
           ]
+        },
+         {
+          "type":"T_INT",
+          "int_val":0,
+          "str_len":0,
+          "str_val":""
         }
       ]
     }
   ]
 }
-**************   Case 160   ***************
+**************   Case 164   ***************
 drop outline db_name.out_name;
 question_mask_size: 0
 {
@@ -21076,12 +21380,18 @@ question_mask_size: 0
             },
              { }
           ]
+        },
+         {
+          "type":"T_INT",
+          "int_val":0,
+          "str_len":0,
+          "str_val":""
         }
       ]
     }
   ]
 }
-**************   Case 161   ***************
+**************   Case 165   ***************
 create tenant tt1 replica_num = 1, primary_zone = 'zone1', resource_pool_list = ('zone1') set ob_tcp_invited_nodes='%';
 question_mask_size: 0
 {
@@ -21194,7 +21504,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 162   ***************
+**************   Case 166   ***************
 create tenant if not exists tt1 replica_num = 1, primary_zone = 'zone1', resource_pool_list = ('zone1') set ob_tcp_invited_nodes='%';
 question_mask_size: 0
 {
@@ -21312,7 +21622,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 163   ***************
+**************   Case 167   ***************
 create tenant tt1 replica_num = 1, primary_zone = 'zone1', resource_pool_list = ('zone1'), locality = 'auto_locality_strategy' set ob_tcp_invited_nodes='%';
 question_mask_size: 0
 {
@@ -21440,7 +21750,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 164   ***************
+**************   Case 168   ***************
 create tenant if not exists tt1 replica_num = 1, primary_zone = 'zone1', resource_pool_list = ('zone1'), locality = 'auto_locality_strategy' set ob_tcp_invited_nodes='%';
 question_mask_size: 0
 {
@@ -21573,7 +21883,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 165   ***************
+**************   Case 169   ***************
 create tenant tt1 replica_num = 1, primary_zone = 'zone1', resource_pool_list = ('zone1'), logonly_replica_num = 1 set ob_tcp_invited_nodes='%';
 question_mask_size: 0
 {
@@ -21700,7 +22010,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 166   ***************
+**************   Case 170   ***************
 create tenant if not exists tt1 replica_num = 1, primary_zone = 'zone1', resource_pool_list = ('zone1'), logonly_replica_num = 1 set ob_tcp_invited_nodes='%';
 question_mask_size: 0
 {
@@ -21832,7 +22142,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 167   ***************
+**************   Case 171   ***************
 select /*+max_concurrent(-10)*/* from t1;
 question_mask_size: 0
 {
@@ -21919,6 +22229,7 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          {
           "type":"T_HINT_OPTION_LIST",
           "int_val":9223372036854775807,
@@ -21934,7 +22245,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 168   ***************
+**************   Case 172   ***************
 select /*+max_concurrent(10)*/* from t1;
 question_mask_size: 0
 {
@@ -22021,6 +22332,7 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          {
           "type":"T_HINT_OPTION_LIST",
           "int_val":9223372036854775807,
@@ -22052,42 +22364,25 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 169   ***************
-alter system refresh time_zone_info;
-question_mask_size: 0
-{
-  "type":"T_STMT_LIST",
-  "int_val":9223372036854775807,
-  "str_len":0,
-  "str_val":"",
-  "children": [
-     {
-      "type":"T_REFRESH_TIME_ZONE_INFO",
-      "int_val":0,
-      "str_len":0,
-      "str_val":""
-    }
-  ]
-}
-**************   Case 170   ***************
-merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when matched then update set t1.sales = t2.sales when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales);
-**************   Case 171   ***************
-merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when matched then update set t1.sales = t2.sales where t2.id!= t1.id when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales);
-**************   Case 172   ***************
-merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when matched then update set t1.sales = t2.sales where t1.id < 3 delete where t1.id < 5 when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales);
 **************   Case 173   ***************
-merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when matched then update set t1.sales = t2.sales delete where t1.sales =2 when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales);
+merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when matched then update set t1.sales = t2.sales when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales);
 **************   Case 174   ***************
-merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales) where t2.id > 0;
+merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when matched then update set t1.sales = t2.sales where t2.id!= t1.id when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales);
 **************   Case 175   ***************
-merge into targetTable t1 using sourceTable t2 on (1 = 2) when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales) where t2.id > 0;
+merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when matched then update set t1.sales = t2.sales where t1.id < 3 delete where t1.id < 5 when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales);
 **************   Case 176   ***************
-merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when matched then update set t1.sales = t2.sales;
+merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when matched then update set t1.sales = t2.sales delete where t1.sales =2 when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales);
 **************   Case 177   ***************
-merge into targetTable using sourceTable on (targetTable.id = sourceTable.id) when matched then update set targetTable.sales = sourceTable.sales;
+merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales) where t2.id > 0;
 **************   Case 178   ***************
-merge into targetTable using (select * from t1 ) sourceTable on (targetTable.id = sourceTable.id) when matched then update set targetTable.sales = sourceTable.sales;
+merge into targetTable t1 using sourceTable t2 on (1 = 2) when not matched then insert(t1.id, t1.sales) values(t2.id, t2.sales) where t2.id > 0;
 **************   Case 179   ***************
+merge into targetTable t1 using sourceTable t2 on (t1.id = t2.id) when matched then update set t1.sales = t2.sales;
+**************   Case 180   ***************
+merge into targetTable using sourceTable on (targetTable.id = sourceTable.id) when matched then update set targetTable.sales = sourceTable.sales;
+**************   Case 181   ***************
+merge into targetTable using (select * from t1 ) sourceTable on (targetTable.id = sourceTable.id) when matched then update set targetTable.sales = sourceTable.sales;
+**************   Case 182   ***************
 select unique(c1), c2 from t1;
 question_mask_size: 0
 {
@@ -22226,12 +22521,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 180   ***************
+**************   Case 183   ***************
 select unique(c1+1), c2 from t1;
 question_mask_size: 0
 {
@@ -22384,12 +22680,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 181   ***************
+**************   Case 184   ***************
 select distinct unique(    max(c1)), c2 from t1;
 question_mask_size: 0
 {
@@ -22543,12 +22840,13 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 182   ***************
+**************   Case 185   ***************
 select unique distinct(    max(c1)), c2 from t1;
 question_mask_size: 0
 {
@@ -22702,14 +23000,671 @@ question_mask_size: 0
          { },
          { },
          { },
+         { },
          { }
       ]
     }
   ]
 }
-**************   Case 183   ***************
+**************   Case 186   ***************
 select unique(*) from t1;
-**************   Case 184   ***************
+**************   Case 187   ***************
+delete from t1 where c1 = 1 returning c1 + 1, c2 * 2;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_DELETE",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         { },
+         {
+          "type":"T_DELETE_TABLE_NODE",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             { },
+             {
+              "type":"T_TABLE_REFERENCES",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_ORG",
+                  "int_val":9223372036854775807,
+                  "str_len":0,
+                  "str_val":"",
+                  "children": [
+                     {
+                      "type":"T_RELATION_FACTOR",
+                      "int_val":9223372036854775807,
+                      "str_len":2,
+                      "str_val":"T1",
+                      "children": [
+                         { },
+                         {
+                          "type":"T_IDENT",
+                          "int_val":1,
+                          "str_len":2,
+                          "str_val":"T1"
+                        },
+                         { }
+                      ]
+                    },
+                     { },
+                     { },
+                     { },
+                     { }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+         {
+          "type":"T_WHERE_CLAUSE",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_OP_EQ",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_OBJ_ACCESS_REF",
+                  "int_val":9223372036854775807,
+                  "str_len":0,
+                  "str_val":"",
+                  "children": [
+                     {
+                      "type":"T_IDENT",
+                      "int_val":1,
+                      "str_len":2,
+                      "str_val":"C1"
+                    },
+                     { }
+                  ]
+                },
+                 {
+                  "type":"T_INT",
+                  "int_val":1,
+                  "str_len":1,
+                  "str_val":"1"
+                }
+              ]
+            },
+             { }
+          ]
+        },
+         { },
+         { },
+         { },
+         { },
+         {
+          "type":"T_RETURNING",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_PROJECT_LIST",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_PROJECT_STRING",
+                  "int_val":9223372036854775807,
+                  "str_len":4,
+                  "str_val":"C1+1",
+                  "children": [
+                     {
+                      "type":"T_OP_ADD",
+                      "int_val":9223372036854775807,
+                      "str_len":0,
+                      "str_val":"",
+                      "children": [
+                         {
+                          "type":"T_OBJ_ACCESS_REF",
+                          "int_val":9223372036854775807,
+                          "str_len":0,
+                          "str_val":"",
+                          "children": [
+                             {
+                              "type":"T_IDENT",
+                              "int_val":1,
+                              "str_len":2,
+                              "str_val":"C1"
+                            },
+                             { }
+                          ]
+                        },
+                         {
+                          "type":"T_INT",
+                          "int_val":1,
+                          "str_len":1,
+                          "str_val":"1"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                 {
+                  "type":"T_PROJECT_STRING",
+                  "int_val":9223372036854775807,
+                  "str_len":4,
+                  "str_val":"C2*2",
+                  "children": [
+                     {
+                      "type":"T_OP_MUL",
+                      "int_val":9223372036854775807,
+                      "str_len":0,
+                      "str_val":"",
+                      "children": [
+                         {
+                          "type":"T_OBJ_ACCESS_REF",
+                          "int_val":9223372036854775807,
+                          "str_len":0,
+                          "str_val":"",
+                          "children": [
+                             {
+                              "type":"T_IDENT",
+                              "int_val":1,
+                              "str_len":2,
+                              "str_val":"C2"
+                            },
+                             { }
+                          ]
+                        },
+                         {
+                          "type":"T_INT",
+                          "int_val":2,
+                          "str_len":1,
+                          "str_val":"2"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+             { }
+          ]
+        },
+         { },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 188   ***************
+update t1 set c1 = 1 where c2 = 2 returning c1, c2 + 3, c3 * c4;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_UPDATE",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         { },
+         {
+          "type":"T_TABLE_REFERENCES",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_ALIAS",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_RELATION_FACTOR",
+                  "int_val":9223372036854775807,
+                  "str_len":2,
+                  "str_val":"T1",
+                  "children": [
+                     { },
+                     {
+                      "type":"T_IDENT",
+                      "int_val":1,
+                      "str_len":2,
+                      "str_val":"T1"
+                    },
+                     { }
+                  ]
+                },
+                 { },
+                 { },
+                 { },
+                 { }
+              ]
+            }
+          ]
+        },
+         {
+          "type":"T_ASSIGN_LIST",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_ASSIGN_ITEM",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_COLUMN_REF",
+                  "int_val":9223372036854775807,
+                  "str_len":2,
+                  "str_val":"C1",
+                  "children": [
+                     { },
+                     { },
+                     {
+                      "type":"T_IDENT",
+                      "int_val":1,
+                      "str_len":2,
+                      "str_val":"C1"
+                    }
+                  ]
+                },
+                 {
+                  "type":"T_INT",
+                  "int_val":1,
+                  "str_len":1,
+                  "str_val":"1"
+                }
+              ]
+            }
+          ]
+        },
+         {
+          "type":"T_WHERE_CLAUSE",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_OP_EQ",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_OBJ_ACCESS_REF",
+                  "int_val":9223372036854775807,
+                  "str_len":0,
+                  "str_val":"",
+                  "children": [
+                     {
+                      "type":"T_IDENT",
+                      "int_val":1,
+                      "str_len":2,
+                      "str_val":"C2"
+                    },
+                     { }
+                  ]
+                },
+                 {
+                  "type":"T_INT",
+                  "int_val":2,
+                  "str_len":1,
+                  "str_val":"2"
+                }
+              ]
+            },
+             { }
+          ]
+        },
+         { },
+         { },
+         { },
+         { },
+         { },
+         {
+          "type":"T_RETURNING",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_PROJECT_LIST",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_PROJECT_STRING",
+                  "int_val":9223372036854775807,
+                  "str_len":2,
+                  "str_val":"C1",
+                  "children": [
+                     {
+                      "type":"T_OBJ_ACCESS_REF",
+                      "int_val":9223372036854775807,
+                      "str_len":0,
+                      "str_val":"",
+                      "children": [
+                         {
+                          "type":"T_IDENT",
+                          "int_val":1,
+                          "str_len":2,
+                          "str_val":"C1"
+                        },
+                         { }
+                      ]
+                    }
+                  ]
+                },
+                 {
+                  "type":"T_PROJECT_STRING",
+                  "int_val":9223372036854775807,
+                  "str_len":4,
+                  "str_val":"C2+3",
+                  "children": [
+                     {
+                      "type":"T_OP_ADD",
+                      "int_val":9223372036854775807,
+                      "str_len":0,
+                      "str_val":"",
+                      "children": [
+                         {
+                          "type":"T_OBJ_ACCESS_REF",
+                          "int_val":9223372036854775807,
+                          "str_len":0,
+                          "str_val":"",
+                          "children": [
+                             {
+                              "type":"T_IDENT",
+                              "int_val":1,
+                              "str_len":2,
+                              "str_val":"C2"
+                            },
+                             { }
+                          ]
+                        },
+                         {
+                          "type":"T_INT",
+                          "int_val":3,
+                          "str_len":1,
+                          "str_val":"3"
+                        }
+                      ]
+                    }
+                  ]
+                },
+                 {
+                  "type":"T_PROJECT_STRING",
+                  "int_val":9223372036854775807,
+                  "str_len":5,
+                  "str_val":"C3*C4",
+                  "children": [
+                     {
+                      "type":"T_OP_MUL",
+                      "int_val":9223372036854775807,
+                      "str_len":0,
+                      "str_val":"",
+                      "children": [
+                         {
+                          "type":"T_OBJ_ACCESS_REF",
+                          "int_val":9223372036854775807,
+                          "str_len":0,
+                          "str_val":"",
+                          "children": [
+                             {
+                              "type":"T_IDENT",
+                              "int_val":1,
+                              "str_len":2,
+                              "str_val":"C3"
+                            },
+                             { }
+                          ]
+                        },
+                         {
+                          "type":"T_OBJ_ACCESS_REF",
+                          "int_val":9223372036854775807,
+                          "str_len":0,
+                          "str_val":"",
+                          "children": [
+                             {
+                              "type":"T_IDENT",
+                              "int_val":1,
+                              "str_len":2,
+                              "str_val":"C4"
+                            },
+                             { }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+             { }
+          ]
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 189   ***************
+insert into t1 values(1, 2, 3) returning c1, c2, c3;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_INSERT",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_SINGLE_TABLE_INSERT",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INSERT_INTO_CLAUSE",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_ALIAS",
+                  "int_val":9223372036854775807,
+                  "str_len":0,
+                  "str_val":"",
+                  "children": [
+                     {
+                      "type":"T_RELATION_FACTOR",
+                      "int_val":9223372036854775807,
+                      "str_len":2,
+                      "str_val":"T1",
+                      "children": [
+                         { },
+                         {
+                          "type":"T_IDENT",
+                          "int_val":1,
+                          "str_len":2,
+                          "str_val":"T1"
+                        },
+                         { }
+                      ]
+                    },
+                     { },
+                     { },
+                     { },
+                     { }
+                  ]
+                },
+                 { }
+              ]
+            },
+             {
+              "type":"T_VALUE_LIST",
+              "int_val":2,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_VALUE_VECTOR",
+                  "int_val":4,
+                  "str_len":0,
+                  "str_val":"",
+                  "children": [
+                     {
+                      "type":"T_INT",
+                      "int_val":1,
+                      "str_len":1,
+                      "str_val":"1"
+                    },
+                     {
+                      "type":"T_INT",
+                      "int_val":2,
+                      "str_len":1,
+                      "str_val":"2"
+                    },
+                     {
+                      "type":"T_INT",
+                      "int_val":3,
+                      "str_len":1,
+                      "str_val":"3"
+                    }
+                  ]
+                }
+              ]
+            },
+             {
+              "type":"T_RETURNING",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_PROJECT_LIST",
+                  "int_val":9223372036854775807,
+                  "str_len":0,
+                  "str_val":"",
+                  "children": [
+                     {
+                      "type":"T_PROJECT_STRING",
+                      "int_val":9223372036854775807,
+                      "str_len":2,
+                      "str_val":"C1",
+                      "children": [
+                         {
+                          "type":"T_OBJ_ACCESS_REF",
+                          "int_val":9223372036854775807,
+                          "str_len":0,
+                          "str_val":"",
+                          "children": [
+                             {
+                              "type":"T_IDENT",
+                              "int_val":1,
+                              "str_len":2,
+                              "str_val":"C1"
+                            },
+                             { }
+                          ]
+                        }
+                      ]
+                    },
+                     {
+                      "type":"T_PROJECT_STRING",
+                      "int_val":9223372036854775807,
+                      "str_len":2,
+                      "str_val":"C2",
+                      "children": [
+                         {
+                          "type":"T_OBJ_ACCESS_REF",
+                          "int_val":9223372036854775807,
+                          "str_len":0,
+                          "str_val":"",
+                          "children": [
+                             {
+                              "type":"T_IDENT",
+                              "int_val":1,
+                              "str_len":2,
+                              "str_val":"C2"
+                            },
+                             { }
+                          ]
+                        }
+                      ]
+                    },
+                     {
+                      "type":"T_PROJECT_STRING",
+                      "int_val":9223372036854775807,
+                      "str_len":2,
+                      "str_val":"C3",
+                      "children": [
+                         {
+                          "type":"T_OBJ_ACCESS_REF",
+                          "int_val":9223372036854775807,
+                          "str_len":0,
+                          "str_val":"",
+                          "children": [
+                             {
+                              "type":"T_IDENT",
+                              "int_val":1,
+                              "str_len":2,
+                              "str_val":"C3"
+                            },
+                             { }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                 { }
+              ]
+            },
+             { }
+          ]
+        },
+         {
+          "type":"T_INSERT",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":""
+        },
+         { },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 190   ***************
+replace into t1 values(1, 2) returning c1, c2, c3, c4, c5, c6;
+**************   Case 191   ***************
 alter tablegroup tg2 add table t1,t2;
 question_mask_size: 0
 {
@@ -22774,7 +23729,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 185   ***************
+**************   Case 192   ***************
 insert into t1 values(X'');
 question_mask_size: 0
 {
@@ -22832,13 +23787,13 @@ question_mask_size: 0
             },
              {
               "type":"T_VALUE_LIST",
-              "int_val":9223372036854775807,
+              "int_val":2,
               "str_len":0,
               "str_val":"",
               "children": [
                  {
                   "type":"T_VALUE_VECTOR",
-                  "int_val":9223372036854775807,
+                  "int_val":2,
                   "str_len":0,
                   "str_val":"",
                   "children": [
@@ -22868,7 +23823,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 186   ***************
+**************   Case 193   ***************
 create table t1(`thedate` date NOT NULL COMMENT '日期');
 question_mask_size: 0
 {
@@ -22976,7 +23931,7 @@ question_mask_size: 0
     }
   ]
 }
-**************   Case 187   ***************
+**************   Case 194   ***************
 alter system bootstrap REGION 'sys_region' ZONE 'zone1' SERVER '10.101.74.122:41425';
 question_mask_size: 0
 {
@@ -23024,8 +23979,1384 @@ question_mask_size: 0
               ]
             }
           ]
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 195   ***************
+alter system transfer partition table_id = 1, object_id = 1 to ls 1001;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_TRANSFER_PARTITION",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_TRANSFER_PARTITION_TO_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_PARTITION_INFO",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_INT",
+                  "int_val":1,
+                  "str_len":1,
+                  "str_val":"1"
+                },
+                 {
+                  "type":"T_INT",
+                  "int_val":1,
+                  "str_len":1,
+                  "str_val":"1"
+                }
+              ]
+            },
+             {
+              "type":"T_INT",
+              "int_val":1001,
+              "str_len":4,
+              "str_val":"1001"
+            }
+          ]
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 196   ***************
+alter system transfer partition table_id = 1, object_id = 1 to ls 1001 tenant 'mysql';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_TRANSFER_PARTITION",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_TRANSFER_PARTITION_TO_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_PARTITION_INFO",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_INT",
+                  "int_val":1,
+                  "str_len":1,
+                  "str_val":"1"
+                },
+                 {
+                  "type":"T_INT",
+                  "int_val":1,
+                  "str_len":1,
+                  "str_val":"1"
+                }
+              ]
+            },
+             {
+              "type":"T_INT",
+              "int_val":1001,
+              "str_len":4,
+              "str_val":"1001"
+            }
+          ]
+        },
+         {
+          "type":"T_TENANT_NAME",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":5,
+              "str_val":"mysql"
+            }
+          ]
         }
       ]
     }
   ]
 }
+**************   Case 197   ***************
+alter system cancel transfer partition  table_id = 1, object_id = 1;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_CANCEL_TRANSFER_PARTITION",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_PARTITION_INFO",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":1,
+              "str_len":1,
+              "str_val":"1"
+            },
+             {
+              "type":"T_INT",
+              "int_val":1,
+              "str_len":1,
+              "str_val":"1"
+            }
+          ]
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 198   ***************
+alter system cancel transfer partition  table_id = 1, object_id = 1 tenant 'mysql';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_CANCEL_TRANSFER_PARTITION",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_PARTITION_INFO",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":1,
+              "str_len":1,
+              "str_val":"1"
+            },
+             {
+              "type":"T_INT",
+              "int_val":1,
+              "str_len":1,
+              "str_val":"1"
+            }
+          ]
+        },
+         {
+          "type":"T_TENANT_NAME",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":5,
+              "str_val":"mysql"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+**************   Case 199   ***************
+alter system cancel transfer partition ALL;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_CANCEL_TRANSFER_PARTITION",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_ALL",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":""
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 200   ***************
+alter system cancel transfer partition ALL tenant 'mysql';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_CANCEL_TRANSFER_PARTITION",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_ALL",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":""
+        },
+         {
+          "type":"T_TENANT_NAME",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":5,
+              "str_val":"mysql"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+**************   Case 201   ***************
+alter system cancel balance job;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_CANCEL_BALANCE_JOB",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 202   ***************
+alter system cancel balance job tenant 'mysql';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_CANCEL_BALANCE_JOB",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_TENANT_NAME",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":5,
+              "str_val":"mysql"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+**************   Case 203   ***************
+alter system add replica ls=100 server='100.88.107.212:5000' replica_type='F' data_source='100.88.107.212:5001' paxos_replica_num=3 tenant='mysql_tenant';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_ADD_LS_REPLICA",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":1,
+          "str_val":"F"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5001"
+        },
+         {
+          "type":"T_INT",
+          "int_val":3,
+          "str_len":1,
+          "str_val":"3"
+        },
+         {
+          "type":"T_TENANT_NAME",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":12,
+              "str_val":"mysql_tenant"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+**************   Case 204   ***************
+alter system add replica ls=100 server='100.88.107.212:5000' replica_type='F' data_source='100.88.107.212:5001' paxos_replica_num=3;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_ADD_LS_REPLICA",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":1,
+          "str_val":"F"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5001"
+        },
+         {
+          "type":"T_INT",
+          "int_val":3,
+          "str_len":1,
+          "str_val":"3"
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 205   ***************
+alter system add replica ls=100 server='100.88.107.212:5000' replica_type='F' data_source='100.88.107.212:5001';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_ADD_LS_REPLICA",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":1,
+          "str_val":"F"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5001"
+        },
+         { },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 206   ***************
+alter system add replica ls=100 server='100.88.107.212:5000' replica_type='F';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_ADD_LS_REPLICA",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":1,
+          "str_val":"F"
+        },
+         { },
+         { },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 207   ***************
+alter system remove replica ls=100 server='100.88.107.212:5000' paxos_replica_num=3 tenant='mysql_tenant';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_REMOVE_LS_REPLICA",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_INT",
+          "int_val":3,
+          "str_len":1,
+          "str_val":"3"
+        },
+         {
+          "type":"T_TENANT_NAME",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":12,
+              "str_val":"mysql_tenant"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+**************   Case 208   ***************
+alter system remove replica ls=100 server='100.88.107.212:5000' paxos_replica_num=3;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_REMOVE_LS_REPLICA",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_INT",
+          "int_val":3,
+          "str_len":1,
+          "str_val":"3"
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 209   ***************
+alter system remove replica ls=100 server='100.88.107.212:5000';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_REMOVE_LS_REPLICA",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         { },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 210   ***************
+alter system modify replica ls=100 server='100.88.107.212:5000' replica_type='F' paxos_replica_num=3 tenant='mysql_tenant';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_MODIFY_LS_REPLICA_TYPE",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":1,
+          "str_val":"F"
+        },
+         {
+          "type":"T_INT",
+          "int_val":3,
+          "str_len":1,
+          "str_val":"3"
+        },
+         {
+          "type":"T_TENANT_NAME",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":12,
+              "str_val":"mysql_tenant"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+**************   Case 211   ***************
+alter system modify replica ls=100 server='100.88.107.212:5000' replica_type='F' paxos_replica_num=3;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_MODIFY_LS_REPLICA_TYPE",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":1,
+          "str_val":"F"
+        },
+         {
+          "type":"T_INT",
+          "int_val":3,
+          "str_len":1,
+          "str_val":"3"
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 212   ***************
+alter system modify replica ls=100 server='100.88.107.212:5000' replica_type='F';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_MODIFY_LS_REPLICA_TYPE",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":1,
+          "str_val":"F"
+        },
+         { },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 213   ***************
+alter system modify ls=100 paxos_replica_num=3 tenant='mysql_tenant';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_MODIFY_LS_PAXOS_REPLICA_NUM",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_INT",
+          "int_val":3,
+          "str_len":1,
+          "str_val":"3"
+        },
+         {
+          "type":"T_TENANT_NAME",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":12,
+              "str_val":"mysql_tenant"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+**************   Case 214   ***************
+alter system modify ls=100 paxos_replica_num=3;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_MODIFY_LS_PAXOS_REPLICA_NUM",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_INT",
+          "int_val":3,
+          "str_len":1,
+          "str_val":"3"
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 215   ***************
+alter system migrate replica ls=100 source='100.88.107.212:5000' destination='100.88.107.212:5000' data_source='100.88.107.212:5001' tenant='mysql_tenant';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_MIGRATE_LS_REPLICA",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5001"
+        },
+         {
+          "type":"T_TENANT_NAME",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":12,
+              "str_val":"mysql_tenant"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+**************   Case 216   ***************
+alter system migrate replica ls=100 source='100.88.107.212:5000' destination='100.88.107.212:5000' data_source='100.88.107.212:5001';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_MIGRATE_LS_REPLICA",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5001"
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 217   ***************
+alter system migrate replica ls=100 source='100.88.107.212:5000' destination='100.88.107.212:5000';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_MIGRATE_LS_REPLICA",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":100,
+              "str_len":3,
+              "str_val":"100"
+            }
+          ]
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":19,
+          "str_val":"100.88.107.212:5000"
+        },
+         { },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 218   ***************
+alter system cancel replica task task_id = 'xxx' tenant='mysql_tenant';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_CANCEL_LS_REPLICA_TASK",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":3,
+          "str_val":"xxx"
+        },
+         {
+          "type":"T_TENANT_NAME",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_VARCHAR",
+              "int_val":9223372036854775807,
+              "str_len":12,
+              "str_val":"mysql_tenant"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+**************   Case 219   ***************
+alter system cancel replica task task_id = 'xxx';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_CANCEL_LS_REPLICA_TASK",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_VARCHAR",
+          "int_val":9223372036854775807,
+          "str_len":3,
+          "str_val":"xxx"
+        },
+         { }
+      ]
+    }
+  ]
+}
+<<<<<<< HEAD
+=======
+**************   Case 220   ***************
+alter system create ls unit_group 1001, primary_zone 'z1';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_ALTER_LS",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_INT",
+          "int_val":1,
+          "str_len":0,
+          "str_val":""
+        },
+         {
+          "type":"T_LS_ATTR_LIST",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_UNIT_GROUP",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_INT",
+                  "int_val":1001,
+                  "str_len":4,
+                  "str_val":"1001"
+                }
+              ]
+            },
+             {
+              "type":"T_PRIMARY_ZONE",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_VARCHAR",
+                  "int_val":9223372036854775807,
+                  "str_len":2,
+                  "str_val":"z1"
+                }
+              ]
+            }
+          ]
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 221   ***************
+alter system modify ls 1001 unit_group 1001, primary_zone  'z1';
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_ALTER_LS",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_INT",
+          "int_val":2,
+          "str_len":0,
+          "str_val":""
+        },
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":1001,
+              "str_len":4,
+              "str_val":"1001"
+            }
+          ]
+        },
+         {
+          "type":"T_LS_ATTR_LIST",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_UNIT_GROUP",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_INT",
+                  "int_val":1001,
+                  "str_len":4,
+                  "str_val":"1001"
+                }
+              ]
+            },
+             {
+              "type":"T_PRIMARY_ZONE",
+              "int_val":9223372036854775807,
+              "str_len":0,
+              "str_val":"",
+              "children": [
+                 {
+                  "type":"T_VARCHAR",
+                  "int_val":9223372036854775807,
+                  "str_len":2,
+                  "str_val":"z1"
+                }
+              ]
+            }
+          ]
+        },
+         { }
+      ]
+    }
+  ]
+}
+**************   Case 222   ***************
+alter system drop ls 1001;
+question_mask_size: 0
+{
+  "type":"T_STMT_LIST",
+  "int_val":9223372036854775807,
+  "str_len":0,
+  "str_val":"",
+  "children": [
+     {
+      "type":"T_ALTER_LS",
+      "int_val":0,
+      "str_len":0,
+      "str_val":"",
+      "children": [
+         {
+          "type":"T_INT",
+          "int_val":3,
+          "str_len":0,
+          "str_val":""
+        },
+         {
+          "type":"T_LS",
+          "int_val":9223372036854775807,
+          "str_len":0,
+          "str_val":"",
+          "children": [
+             {
+              "type":"T_INT",
+              "int_val":1001,
+              "str_len":4,
+              "str_val":"1001"
+            }
+          ]
+        },
+         { }
+      ]
+    }
+  ]
+}
+>>>>>>> 97f4d4b7466e... support alter system load timezone info
