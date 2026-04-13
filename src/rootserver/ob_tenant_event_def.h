@@ -91,6 +91,12 @@
                 IS_SYS_LS_SYNCED,
                 IS_ALL_LS_SYNCED,
                 NON_SYNC_INFO);
+      DEF_EVENT(TENANT_ROLE_CHANGE, FLASHBACK_STANDBY_LOG, "FLASHBACK STANDBY LOG",
+                FLASHBACK_LOG_SCN,
+                OP_START_TENANT_INFO,
+                OP_END_TENANT_INFO,
+                ALL_FLASHBACK_LS,
+                COST_DETAIL);
   };
 
   class SERVICE_NAME {
@@ -133,6 +139,140 @@
       DEF_EVENT(DBMS_PARTITION, MANAGE_DYNAMIC_PARTITION, "MANAGE_DYNAMIC_PARTITION",
                 SUCCESS_TABLE_ID_LIST,
                 FAILED_TABLE_ID_LIST);
+  };
+
+  class DBMS_BALANCE {
+    public:
+      DEF_MODULE(DBMS_BALANCE, "DBMS_BALANCE");
+
+      DEF_EVENT(DBMS_BALANCE, TRIGGER_PARTITION_BALANCE, "TRIGGER PARTITION BALANCE",
+                BALANCE_TIMEOUT_S);
+
+      DEF_EVENT(DBMS_BALANCE, SET_BALANCE_WEIGHT, "SET BALANCE WEIGHT",
+                WEIGHT,
+                DATABASE_NAME,
+                TABLE_NAME,
+                PARTITION_NAME,
+                SUBPARTITION_NAME);
+
+      DEF_EVENT(DBMS_BALANCE, CLEAR_BALANCE_WEIGHT, "CLEAR BALANCE WEIGHT",
+                DATABASE_NAME,
+                TABLE_NAME,
+                PARTITION_NAME,
+                SUBPARTITION_NAME);
+
+      DEF_EVENT(DBMS_BALANCE, CLEAR_EXPIRED_BALANCE_WEIGHT, "CLEAR EXPIRED BALANCE WEIGHT",
+                TABLE_ID,
+                PARTITION_ID,
+                SUBPARTITION_ID);
+
+      DEF_EVENT(DBMS_BALANCE, SET_TABLEGROUP_BALANCE_WEIGHT, "SET TABLEGROUP BALANCE WEIGHT",
+                WEIGHT,
+                TABLEGROUP_NAME);
+
+      DEF_EVENT(DBMS_BALANCE, CLEAR_TABLEGROUP_BALANCE_WEIGHT, "CLEAR TABLEGROUP BALANCE WEIGHT",
+                TABLEGROUP_NAME);
+  };
+  class LS_COMMAND {
+    public:
+      DEF_MODULE(LS_COMMAND, "LS COMMAND");
+
+      DEF_EVENT(LS_COMMAND, CREATE_LS, "CREATE LS",
+                ARGS,
+                LS_ID,
+                LS_GROUP_ID,
+                UNIT_LIST,
+                PRIMARY_ZONE);
+      DEF_EVENT(LS_COMMAND, MODIFY_LS, "MODIFY LS",
+                ARGS,
+                LS_ID,
+                LS_GROUP_ID,
+                UNIT_LIST,
+                PRIMARY_ZONE);
+  };
+  class LS_EVENT {
+    public:
+    DEF_MODULE(LS_EVENT, "LS EVENT");
+    DEF_EVENT(LS_EVENT, INSERT_LS, "INSERT LS",
+              LS_ID,
+              LS_INFO,
+              SQL);
+    DEF_EVENT(LS_EVENT, DROP_LS, "DROP LS",
+              LS_ID,
+              SQL);
+    DEF_EVENT(LS_EVENT, UPDATE_LS_PRIMARY_ZONE, "UPDATE LS PRIMARY ZONE",
+              LS_ID,
+              PRIMARY_ZONE,
+              SQL);
+    DEF_EVENT(LS_EVENT, UPDATE_LS_STATUS, "UPDATE LS STATUS",
+              LS_ID,
+              NEW_STATUS,
+              OLD_STATUS,
+              SQL);
+    DEF_EVENT(LS_EVENT, ALTER_LS_GROUP, "ALTER LS GROUP",
+              LS_ID,
+              NEW_LS_GROUP_ID,
+              NEW_UNIT_LIST,
+              OLD_LS_GROUP_ID,
+              OLD_UNIT_LIST,
+              SQL);
+    DEF_EVENT(LS_EVENT, ALTER_LS_GROUP_UNIT_LIST, "ALTER LS GROUP UNIT LIST",
+              LS_GROUP_ID,
+              NEW_UNIT_LIST,
+              OLD_UNIT_LIST,
+              SQL);
+    DEF_EVENT(LS_EVENT, UPDATE_LS_INIT_MEMBER_LIST, "UPDATE LS INIT MEMBER LIST",
+              LS_ID,
+              INIT_MEMBER_LIST,
+              INIT_LEARNER_LIST,
+              SQL);
+    DEF_EVENT(LS_EVENT, CREATE_ABORT_LS_FOR_SWICHOVER, "CREATE ABORT LS FOR SWICHOVER",
+              SQL);
+    DEF_EVENT(LS_EVENT, CREATE_LS_FINISH, "CREATE LS FINISH",
+              LS_ID,
+              PAXOS_REPLICA_NUM);
+    DEF_EVENT(LS_EVENT, CREATE_LS, "CREATE LS",
+              LS_ID,
+              PAXOS_REPLICA_NUM,
+              MEMBER_LIST);
+    DEF_EVENT(LS_EVENT, SET_LS_MEMBER_LIST, "SET LS MEMBER LIST",
+              LS_ID,
+              PAXOS_REPLICA_NUM,
+              SUCCESS_CNT);
+    DEF_EVENT(LS_EVENT, ALTER_LS_GROUP_ID, "ALTER LS GROUP ID",
+              LS_ID,
+              NEW_LS_GROUP_ID,
+              OLD_LS_GROUP_ID,
+              SQL);
+    DEF_EVENT(LS_EVENT, UPDATE_LS_FLAG, "UPDATE LS FLAG",
+              LS_ID,
+              NEW_LS_FLAG,
+              OLD_LS_FLAG,
+              SQL);
+  };
+  class MVIEW {
+    public:
+      DEF_MODULE(MVIEW, "MVIEW");
+
+      DEF_EVENT(MVIEW, AUTO_BUILD_MLOG, "AUTO_BUILD_MLOG",
+                BASE_TABLE_ID,
+                BASE_TABLE_NAME,
+                OLD_MLOG_ID,
+                NEW_MLOG_ID,
+                NEW_MLOG_COLUMN_LIST,
+                RELATED_CREATE_MVIEW_DDL);
+
+      DEF_EVENT(MVIEW, AUTO_CLIP_MLOG, "AUTO_CLIP_MLOG",
+                BASE_TABLE_ID,
+                BASE_TABLE_NAME,
+                OLD_MLOG_ID,
+                NEW_MLOG_ID,
+                NEW_MLOG_COLUMN_LIST);
+
+      DEF_EVENT(MVIEW, AUTO_DROP_MLOG, "AUTO_DROP_MLOG",
+                BASE_TABLE_ID,
+                BASE_TABLE_NAME,
+                OLD_MLOG_ID);
   };
 #endif
 #endif
@@ -242,6 +382,16 @@ namespace tenant_event
 #define TENANT_EVENT(tenant_id, MODULE, EVENT, event_timestamp, user_ret, cost_us, args...) \
   MODULE::MODULE##_##EVENT##_func(tenant_id, MODULE::MODULE##_STR, MODULE::EVENT##_STR, event_timestamp, user_ret, cost_us, args)
 
+#define PRINT_OBJ_INFO(obj_info, obj_info_buf) \
+    do { \
+        int64_t pos = 0; \
+        size_t obj_buf_size = sizeof(obj_info_buf) / sizeof(obj_info_buf[0]); \
+        if ((obj_info).is_valid()) { \
+            (void)databuff_print_multi_objs(obj_info_buf, obj_buf_size, pos, obj_info); \
+        } else { \
+            (void)databuff_printf(obj_info_buf, obj_buf_size, pos, "NULL"); \
+        } \
+    } while(0)
 #include "ob_tenant_event_def.h"
 #undef DEF_MODULE
 #undef DEF_EVENT

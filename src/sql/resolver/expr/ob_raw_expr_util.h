@@ -106,6 +106,34 @@ private:
   ObIAllocator *allocator_;
 };
 
+class ObExecParamExtractor
+{
+public:
+ObExecParamExtractor();
+  ObExecParamExtractor(ObRawExprFactory &expr_factory)
+                     : expr_factory_(expr_factory),
+                       current_exec_params_(NULL),
+                       fixed_exprs_() {}
+  virtual ~ObExecParamExtractor() {}
+
+  int extract(ObRawExpr *outer_val_expr);
+
+  inline void set_current_exec_params(ObQueryRefRawExpr * query_ref)
+  { current_exec_params_ = query_ref; }
+
+  int init(const ObDMLStmt *stmt);
+  int is_existed(const ObRawExpr *target, bool &found);
+
+  int is_fixed_expr(const ObRawExpr *target, bool &is_fixed_expr);
+  int create_new_exec_param(ObRawExpr *target);
+  DISALLOW_COPY_AND_ASSIGN(ObExecParamExtractor);
+private:
+  ObRawExprFactory &expr_factory_;
+  ObQueryRefRawExpr *current_exec_params_;
+  ObSEArray<ObRawExpr *, 4> fixed_exprs_;
+};
+
+
 class ObRawExprUniqueSet
 {
 public:
@@ -151,7 +179,7 @@ private:
   int build_and_add_attr_exprs(ObRawExpr *raw_expr);
   DISALLOW_COPY_AND_ASSIGN(ObRawExprUniqueSet);
 private:
-  ObSEArray<ObRawExpr *, 16, common::ModulePageAllocator, true> expr_array_;
+  ObSEArray<ObRawExpr *, 16> expr_array_;
   bool need_unique_;
   ObRawExprFactory *expr_factory_;
   ObSQLSessionInfo *session_info_;
@@ -409,7 +437,8 @@ public:
                             bool is_prepare_protocol/*= false*/,
                             TgTimingEvent tg_timing_event = TgTimingEvent::TG_TIMING_EVENT_INVALID,
                             bool use_def_collation = false,
-                            ObCollationType def_collation = CS_TYPE_INVALID);
+                            ObCollationType def_collation = CS_TYPE_INVALID,
+                            bool for_cdc_resolve_generated_col = false);
   static bool is_same_raw_expr(const ObRawExpr *src, const ObRawExpr *dst);
   /// replace all `from' to `to' in the raw_expr
   static int replace_all_ref_column(ObRawExpr *&raw_expr, const common::ObIArray<ObRawExpr *> &exprs, int64_t& offset);
@@ -433,10 +462,8 @@ public:
                                 ObIArray<ObRawExpr *> &from,
                                 ObIArray<ObRawExpr *> &to,
                                 const ObIArray<ObRawExpr*> *except_exprs = NULL);
-  static int contain_virtual_generated_column(ObRawExpr *&expr,
-                                  bool &is_contain_vir_gen_column);
-  static int extract_virtual_generated_column_parents(
-  ObRawExpr *&par_expr, ObRawExpr *&child_expr, ObIArray<ObRawExpr*> &vir_gen_par_exprs);
+  static int extract_virtual_generated_columns(ObRawExpr *&expr,
+                                               ObIArray<ObRawExpr *> &vir_gen_columns);
 
   static bool is_all_column_exprs(const common::ObIArray<ObRawExpr*> &exprs);
   static int extract_set_op_exprs(const ObRawExpr *raw_expr,
@@ -605,6 +632,10 @@ public:
                                 ObRawExpr *second_expr,
                                 ObRawExpr *third_expr,
                                 ObSysFunRawExpr *&out_expr);
+  static int create_concat_expr(ObRawExprFactory &expr_factory,
+                                       ObSQLSessionInfo *session_info,
+                                       ObIArray<ObRawExpr *> &exprs,
+                                       ObOpRawExpr *&out_expr);
   static int create_prefix_pattern_expr(ObRawExprFactory &expr_factory,
                                         ObSQLSessionInfo *session_info,
                                         ObRawExpr *first_expr,
@@ -632,14 +663,18 @@ public:
                                                const ObSQLSessionInfo *session_info,
                                                ObIArray<common::ObString> &type_info_value);
   static int get_exec_param_expr(ObRawExprFactory &expr_factory,
-                                 ObQueryRefRawExpr *query_ref,
-                                 ObRawExpr *correlated_expr,
-                                 ObRawExpr *&exec_param);
-
-  static int get_exec_param_expr(ObRawExprFactory &expr_factory,
                                  ObIArray<ObExecParamRawExpr*> *query_ref_exec_params,
                                  ObRawExpr *correlated_expr,
                                  ObRawExpr *&exec_param);
+  static int get_exec_param_expr(ObRawExprFactory &expr_factory,
+                                 ObQueryRefRawExpr *query_ref,
+                                 ObRawExpr *correlated_expr,
+                                 ObRawExpr *&exec_param);
+  static int extract_exec_param_exprs(const ObDMLStmt *stmt,
+                                      ObRawExprFactory &expr_factory,
+                                      ObQueryRefRawExpr *query_ref,
+                                      ObRawExpr *correlated_expr,
+                                      ObRawExpr *&param_expr);
   static int create_new_exec_param(ObQueryCtx *query_ctx,
                                    ObRawExprFactory &expr_factory,
                                    ObRawExpr *&expr,
@@ -762,7 +797,7 @@ public:
                                            int n,
                                            ObRawExpr *&expr_out);
   static int build_interval_ym_diff_exprs(ObRawExprFactory &raw_expr_factory,
-                                          ObObj &const_val,
+                                          const ObObj &const_val,
                                           const ObObj &transition_val,
                                           const ObObj &interval_val,
                                           ObRawExpr *&diff_1_out,
@@ -770,7 +805,7 @@ public:
                                           ObConstRawExpr *&transition_expr,
                                           ObConstRawExpr *&interval_expr);
   static int build_interval_ds_diff_exprs(ObRawExprFactory &raw_expr_factory,
-                                          ObObj &const_val,
+                                          const ObObj &const_val,
                                           const ObObj &transition_val,
                                           const ObObj &interval_val,
                                           ObRawExpr *&diff_1_out,
@@ -782,16 +817,24 @@ public:
                                        ObObj &const_val,
                                        const ObObj &transition_val,
                                        const ObObj &interval_val,
+                                       const ColumnType &col_dt,
                                        ObRawExpr *&result_expr_out,
                                        ObRawExpr *&n_part_expr);
   static int build_common_diff_exprs(ObRawExprFactory &raw_expr_factory,
-                                     ObObj &const_val,
+                                     const ObObj &const_val,
                                      const ObObj &transition_val,
                                      const ObObj &interval_val,
                                      ObRawExpr *&diff_1_out,
                                      ObRawExpr *&diff_2_out,
                                      ObConstRawExpr *&transition_expr,
                                      ObConstRawExpr *&interval_expr);
+  static int build_val_interval_pos_expr(ObRawExprFactory &raw_expr_factory,
+                                           const ObObj &val,
+                                           const ObObj &transition_point_val,
+                                           const ObObj &interval_range_val,
+                                           ObRawExpr *&val_interval_pos_expr,
+                                           ObConstRawExpr *&transition_point_expr,
+                                           ObConstRawExpr *&interval_range_expr);
   static int build_sign_expr(ObRawExprFactory &expr_factory,
                              ObRawExpr *param,
                              ObRawExpr *&sign_expr);
@@ -799,6 +842,10 @@ public:
                                   ObRawExpr *left,
                                   ObRawExpr *right,
                                   ObOpRawExpr *&less_than_expr);
+  static int build_less_than_or_equal_expr(ObRawExprFactory &expr_factory,
+                                           ObRawExpr *left,
+                                           ObRawExpr *right,
+                                           ObOpRawExpr *&less_than_or_equal_expr);
   static int build_op_pseudo_column_expr(ObRawExprFactory &expr_factory,
                                          const ObItemType expr_type,
                                          const char *expr_name,
@@ -882,6 +929,7 @@ public:
                                    ObIArray<ObRawExpr *> &param_exprs);
   template <typename T>
   static bool find_expr(const common::ObIArray<T> &exprs, const ObRawExpr* expr);
+  static int find_expr(ObRawExpr *root, const ObRawExpr *expected, bool &found);
   template <typename T>
   static int64_t get_expr_idx(const common::ObIArray<T> &exprs, const ObRawExpr* expr);
   static int create_equal_expr(ObRawExprFactory &expr_factory,
@@ -965,20 +1013,23 @@ public:
                                      int64_t type_id,
                                      ObUDFInfo &udf_info,
                                      uint64_t dblink_id,
-                                     const ObString &dblink_name);
+                                     const ObString &dblink_name,
+                                     ObExternalRoutineType external_routine_type,
+                                     bool is_mysql_udtf);
   static int resolve_udf_param_types(const share::schema::ObIRoutineInfo* func_info,
                                      share::schema::ObSchemaGetterGuard &schema_guard,
                                      sql::ObSQLSessionInfo &session_info,
-                                     common::ObIAllocator &allocator,
                                      common::ObMySQLProxy &sql_proxy,
                                      ObUDFInfo &udf_info,
                                      pl::ObPLDbLinkGuard &dblink_guard,
-                                     pl::ObPLEnumSetCtx &enum_set_ctx);
+                                     pl::ObPLEnumSetCtx &enum_set_ctx,
+                                     pl::ObPLResolveCache *resolve_cache = nullptr);
   static int resolve_udf_param_exprs(ObResolverParams &params,
                                      const share::schema::ObIRoutineInfo *func_info,
                                      ObUDFInfo &udf_info,
                                      pl::ObPLEnumSetCtx &enum_set_ctx,
-                                     pl::ObPLDependencyTable &deps);
+                                     pl::ObPLDependencyTable &deps,
+                                     pl::ObPLResolveCache *resolve_cache = nullptr);
   static int resolve_udf_param_exprs(const share::schema::ObIRoutineInfo* func_info,
                                      pl::ObPLBlockNS &secondary_namespace_,
                                      ObSchemaChecker &schema_checker,
@@ -990,7 +1041,8 @@ public:
                                      ExternalParams *extern_param_info,
                                      ObUDFInfo &udf_info,
                                      pl::ObPLEnumSetCtx &enum_set_ctx,
-                                     pl::ObPLDependencyTable &deps);
+                                     pl::ObPLDependencyTable &deps,
+                                     pl::ObPLResolveCache *resolve_cache = nullptr);
 
   static int rebuild_expr_params(ObUDFInfo &udf_info,
                                  sql::ObRawExprFactory *expr_factory,
@@ -1081,7 +1133,14 @@ public:
                                  const ObSQLSessionInfo &session_info,
                                  ObRawExpr *&out);
   static int build_grouping_id(ObRawExprFactory &factory, const ObSQLSessionInfo &session_info,
-                               ObOpPseudoColumnRawExpr *&out);
+                               ObOpPseudoColumnRawExpr *&out, bool is_three_stage_grouping_id = false);
+
+  static int build_encoded_dup(ObRawExprFactory &factory, const ObSQLSessionInfo &session_info,
+                               const ObRawExprResType &res_type, ObOpPseudoColumnRawExpr *&out);
+
+  static int build_hash_val_expr(ObRawExprFactory &factory, const ObSQLSessionInfo &session_info,
+                                 ObOpPseudoColumnRawExpr *&out);
+
   static bool is_pseudo_column_like_expr(const ObRawExpr &expr);
   static bool is_sharable_expr(const ObRawExpr &expr);
 
@@ -1173,6 +1232,7 @@ public:
                               const ObIArray<ObRawExpr *> &rowkey_exprs,
                               ObRawExpr *part_expr,
                               ObRawExpr *subpart_expr,
+                              bool copy_part_expr,
                               ObSysFunRawExpr *&rowid_expr);
   static int build_empty_rowid_expr(ObRawExprFactory &expr_factory,
                                     const TableItem &table_item,
@@ -1262,6 +1322,17 @@ public:
 
   static int extract_params(const common::ObIArray<ObRawExpr*> &exprs,
                             common::ObIArray<ObRawExpr*> &params);
+
+  static int extract_dynamic_params(ObRawExpr* expr,
+                                    common::ObIArray<ObRawExpr*> &params,
+                                    const bool without_const_expr = false);
+
+  static int extract_dynamic_params(const common::ObIArray<ObRawExpr*> &exprs,
+                                    common::ObIArray<ObRawExpr*> &params,
+                                    const bool without_const_expr = false);
+
+  static int extract_udf_exprs(ObRawExpr *expr, ObIArray<ObRawExpr *> &udf_exprs);
+  static int check_all_params_const(ObRawExpr *expr, bool &all_params_const);
   static int is_contain_params(const common::ObIArray<ObRawExpr*> &exprs, bool &is_contain);
   static int is_contain_params(const ObRawExpr *expr, bool &is_contain);
   static int get_col_ref_expr_recursively(ObRawExpr *expr,
@@ -1300,7 +1371,10 @@ public:
                              ObRawExpr *related_token_cnt,
                              ObRawExpr *total_doc_cnt,
                              ObRawExpr *doc_token_cnt,
+                             ObRawExpr *doc_length,
+                             ObRawExpr *avg_doc_token_cnt,
                              ObOpRawExpr *&bm25,
+                             const bool use_avg_doc_token_cnt_pseudo_column,
                              const ObSQLSessionInfo *session);
   static int extract_match_against_filters(const ObIArray<ObRawExpr *> &filters,
                                            ObIArray<ObRawExpr *> &other_filters,
@@ -1319,6 +1393,9 @@ public:
   static int extract_local_vars_for_gencol(ObRawExpr *expr,
                                            const ObSQLSessionInfo *session,
                                            ObColumnSchemaV2 &gen_col);
+  static int extract_local_vars_for_prefix_gen_col(ObColumnSchemaV2 &origin_col,
+                                                  const ObSQLSessionInfo &session,
+                                                  ObColumnSchemaV2 &gen_col);
   static int check_contain_op_row_expr(const ObRawExpr *raw_expr, bool &contain);
   /*
     in mysql mode: ret left_expr <=> right_expr
@@ -1326,7 +1403,6 @@ public:
   */
   static int create_null_safe_equal_expr(ObRawExprFactory &expr_factory,
                                          const ObSQLSessionInfo *session_info,
-                                         const bool is_mysql_mode,
                                          ObRawExpr *left_expr,
                                          ObRawExpr *right_expr,
                                          ObRawExpr *&expr);
@@ -1363,6 +1439,41 @@ public:
                                 ObIArray<ObRawExpr *> &param_exprs,
                                 ObRawExpr *&unpivot_expr,
                                 bool is_label_expr);
+  static int build_greatest_or_least_expr(ObRawExprFactory &expr_factory,
+                                          const ObSQLSessionInfo *session_info,
+                                          bool is_greatest,
+                                          ObIArray<ObRawExpr *> &param_exprs,
+                                          ObRawExpr *&func_expr);
+  static bool is_auxiliary_generated_column(const ObColumnRefRawExpr &col_ref);
+  static int resolve_identifier(ObIAllocator &allocator,
+      sql::ObSQLSessionInfo &session,
+      const common::ObObj &param,
+      const char* const param_name,
+      ObString &value,
+      bool nullable = true,
+      bool check_length = true);
+  static int resolve_qualified_names(ObIAllocator &allocator,
+      sql::ObSQLSessionInfo &session,
+      const common::ObObj &param,
+      const char* const param_name,
+      common::ObIArray<sql::ObQualifiedName> &q_name,
+      bool nullable);
+  static bool is_invalid_type_for_compare(const ObRawExprResType &type);
+  static int build_json_member_of_expr(ObRawExprFactory &expr_factory,
+                                       const ObSQLSessionInfo &session,
+                                       ObRawExpr *json_val,
+                                       ObRawExpr *json_array,
+                                       ObRawExpr *&expr);
+  static int build_json_contains_expr(ObRawExprFactory &expr_factory,
+                                     const ObSQLSessionInfo &session,
+                                     ObRawExpr *json_target,
+                                     ObRawExpr *json_candidate,
+                                     ObRawExpr *&expr);
+  static int build_json_extract_expr(ObRawExprFactory &expr_factory,
+                                     const ObSQLSessionInfo &session,
+                                     ObRawExpr *json_val,
+                                     const ObString &json_path,
+                                     ObRawExpr *&expr);
 private:
   static int need_extra_cast_for_enumset(const ObRawExprResType &src_type,
                                          const ObRawExprResType &dst_type,

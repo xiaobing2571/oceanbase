@@ -18,6 +18,7 @@
 #include "lib/container/ob_array_array.h"
 #include "observer/ob_server_struct.h"
 #include "storage/compaction/ob_partition_merge_policy.h"
+#include "storage/compaction/ob_window_compaction_utils.h"
 #include "storage/multi_data_source/mds_key_serialize_util.h"
 #include "storage/compaction/ob_mds_filter_info.h"
 
@@ -70,15 +71,17 @@ public:
   int64_t get_serialize_size() const;
   int generate_from_range_array(
       ObIAllocator &allocator,
-      common::ObArrayArray<ObStoreRange> &paral_range);
+      common::ObArrayArray<ObStoreRange> &paral_range,
+      const uint64_t data_version);
   int deep_copy_datum_rowkey(
     const int64_t idx,
     ObIAllocator &allocator,
     blocksstable::ObDatumRowkey &rowkey) const;
+  OB_INLINE bool is_special_serial_merge() const { return (list_size_ == 1) && parallel_datum_rowkey_list_[0].is_max_rowkey(); }
 public:
   int64_t to_string(char* buf, const int64_t buf_len) const;
   static const int64_t MAX_PARALLEL_RANGE_SERIALIZE_LEN = 1 * 1024 * 1024;
-  static const int64_t VALID_CONCURRENT_CNT = 1;
+  static const int64_t MIN_VALID_CONCURRENT_CNT = 1;
   static const int64_t PARALLEL_INFO_VERSION_V0 = 0; // StoreRowkey
   static const int64_t PARALLEL_INFO_VERSION_V1 = 1; // DatumRowkey
 private:
@@ -101,6 +104,113 @@ private:
   ObStoreRowkey *parallel_store_rowkey_list_;
   // concurrent_cnt - 1; valid when compat_ = PARALLEL_INFO_VERSION_V1
   blocksstable::ObDatumRowkey *parallel_datum_rowkey_list_;
+};
+
+
+struct ObIncMajorSSTableInfo
+{
+public:
+  struct IncMajorInfo {
+  public:
+    IncMajorInfo() { reset(); }
+    IncMajorInfo(const int64_t start_scn, const int64_t end_scn, const int64_t data_checksum, const int64_t row_count)
+      : start_scn_(start_scn),
+        end_scn_(end_scn),
+        data_checksum_(data_checksum),
+        row_count_(row_count)
+    {}
+    ~IncMajorInfo() { reset(); }
+    void reset() { start_scn_ = 0; end_scn_ = 0; data_checksum_ = 0; row_count_ = 0; }
+    bool is_valid() const { return start_scn_ >= 0 && start_scn_ < end_scn_; }
+    bool operator==(const IncMajorInfo &other) const {
+      return start_scn_ == other.start_scn_
+          && end_scn_ == other.end_scn_
+          && data_checksum_ == other.data_checksum_
+          && row_count_ == other.row_count_;
+    }
+    bool operator!=(const IncMajorInfo &other) const { return !(*this == other); }
+    TO_STRING_KV(K_(start_scn), K_(end_scn), K_(data_checksum), K_(row_count));
+    int64_t start_scn_;
+    int64_t end_scn_;
+    int64_t data_checksum_;
+    int64_t row_count_; // for cs replica validation
+    OB_UNIS_VERSION(1);
+  };
+
+  enum IncMajorType : uint8_t {
+    INVALID = 0,
+    ALL_ROW_STORE = 1,
+    ALL_COLUMN_STORE = 2,
+    MIXED = 3,
+  };
+
+  ObIncMajorSSTableInfo();
+  ~ObIncMajorSSTableInfo();
+  int init(
+      common::ObIAllocator &allocator,
+      const int64_t boundary_snapshot,
+      const common::ObIArray<ObITable *> &tables);
+  int assign(common::ObIAllocator &allocator, const ObIncMajorSSTableInfo &other);
+  void destroy(common::ObIAllocator &allocator);
+  int64_t get_size() const { return list_size_; }
+  bool is_valid() const { return list_size_ > 0 && nullptr != info_list_; }
+  int serialize(char *buf, const int64_t buf_len, int64_t &pos) const;
+  int deserialize(
+      common::ObIAllocator &allocator,
+      const char *buf,
+      const int64_t data_len,
+      int64_t &pos);
+  int64_t get_serialize_size() const;
+  int64_t to_string(char* buf, const int64_t buf_len) const;
+private:
+  int alloc_list(common::ObIAllocator &allocator, const int64_t list_size);
+public:
+  static const int64_t INC_MAJOR_INFO_VERSION_V0 = 0;
+  union {
+    uint32_t inc_major_info_;
+    struct {
+      uint32_t version_         : 8;
+      uint32_t inc_major_type_  : 8;
+      uint32_t reserved_        : 16;
+    };
+  };
+  int64_t list_size_;
+  IncMajorInfo *info_list_;
+};
+
+// Window compaction decision info synced via medium clog
+struct ObWindowCompactionDecisionLogInfo final
+{
+public:
+  ObWindowCompactionDecisionLogInfo()
+    : info_(0),
+      score_(0),
+      base_inc_row_cnt_(0),
+      dynamic_info_()
+  {}
+  ~ObWindowCompactionDecisionLogInfo() = default;
+  void reset();
+  void init(const ObTabletCompactionScore &candidate);
+  bool is_inited() const { return is_inited_; }
+  int assign(const ObWindowCompactionDecisionLogInfo &other);
+  void gen_info(char* buf, const int64_t buf_len, int64_t &pos) const;
+  TO_STRING_KV(K_(score), K_(base_inc_row_cnt), K_(dynamic_info), K_(is_inited), K_(compat_version));
+  OB_UNIS_VERSION(1);
+public:
+  static constexpr uint32_t MAX_TABLET_SCORE = UINT32_MAX;
+  static constexpr uint32_t MAX_INC_ROW_CNT = UINT32_MAX;
+public:
+  union {
+    uint8_t info_;
+    struct {
+      uint8_t compat_version_ : 4;
+      uint8_t is_inited_      : 1;
+      uint8_t reserved_       : 3;
+    };
+  };
+  uint32_t score_;
+  uint32_t base_inc_row_cnt_;
+  ObTabletCompactionScoreDynamicInfo dynamic_info_;
 };
 
 struct ObMediumCompactionInfoKey final
@@ -178,6 +288,7 @@ public:
   {
     MEDIUM_COMPACTION = 0,
     MAJOR_COMPACTION = 1,
+    INC_MAJOR_COMPACTION = 2,
     COMPACTION_TYPE_MAX,
   };
   static const char *ObCompactionTypeStr[];
@@ -199,13 +310,15 @@ public:
     medium_merge_reason_ = merge_reason;
     medium_snapshot_ = medium_snapshot;
   }
-  int gene_parallel_info(
-      common::ObArrayArray<ObStoreRange> &paral_range);
+  int gene_parallel_info(common::ObArrayArray<ObStoreRange> &paral_range);
+  int try_gene_inc_major_info(const storage::ObTablesHandleArray &table_array);
   static inline bool is_valid_compaction_type(const ObCompactionType type) { return MEDIUM_COMPACTION <= type && type < COMPACTION_TYPE_MAX; }
   static inline bool is_medium_compaction(const ObCompactionType type) { return MEDIUM_COMPACTION == type; }
   static inline bool is_major_compaction(const ObCompactionType type) { return MAJOR_COMPACTION == type; }
+  static inline bool is_inc_major_compaction(const ObCompactionType type) { return INC_MAJOR_COMPACTION == type; }
   inline bool is_major_compaction() const { return is_major_compaction((ObCompactionType)compaction_type_); }
   inline bool is_medium_compaction() const { return is_medium_compaction((ObCompactionType)compaction_type_); }
+  inline bool is_inc_major_compaction() const { return is_inc_major_compaction((ObCompactionType)compaction_type_); }
   inline bool is_invalid_mview_compaction() const { return storage_schema_.is_mv_major_refresh_table() && medium_merge_reason_ != ObAdaptiveMergePolicy::TENANT_MAJOR; }
   void clear_parallel_range()
   {
@@ -227,6 +340,9 @@ public:
   int64_t get_serialize_size() const;
   void gene_info(char* buf, const int64_t buf_len, int64_t &pos) const;
   int64_t to_string(char* buf, const int64_t buf_len) const;
+  void set_co_major_merge_strategy(const ObCOMajorMergeStrategy &strategy);
+  void get_co_major_merge_strategy(ObCOMajorMergeStrategy &strategy) const;
+  void set_contain_noinc_storage_schema();
 private:
   bool contain_storage_schema() const;
 public:
@@ -236,10 +352,12 @@ public:
   static const int64_t MEDIUM_COMPAT_VERSION_V3 = 3; // for stanby tenant, not throw medium info
   static const int64_t MEDIUM_COMPAT_VERSION_V4 = 4; // after this version, use is_schema_changed on medium info
   static const int64_t MEDIUM_COMPAT_VERSION_V5 = 5; // after this version, use encoding row limit
-  static const int64_t MEDIUM_COMPAT_VERSION_LATEST = MEDIUM_COMPAT_VERSION_V5;
+  // < V6: co_major_merge_type_, >= V6: co_major_merge_strategy_ to record merge strategy / support window decision info in medium info
+  static const int64_t MEDIUM_COMPAT_VERSION_V6 = 6;
+  static const int64_t MEDIUM_COMPAT_VERSION_LATEST = MEDIUM_COMPAT_VERSION_V6;
 private:
   static const int32_t SCS_ONE_BIT = 1;
-  static const int32_t SCS_RESERVED_BITS = 26;
+  static const int32_t SCS_RESERVED_BITS = 23;
 
 public:
   union {
@@ -251,9 +369,12 @@ public:
       uint64_t medium_merge_reason_             : 8;
       uint64_t is_schema_changed_               : SCS_ONE_BIT;
       uint64_t tenant_id_                       : 16; // record tenant_id of ls primary_leader, just for throw medium
-      uint64_t co_major_merge_type_             : 4;
+      uint64_t co_major_merge_type_             : 4; // abandoned after MEDIUM_COMPAT_VERSION_V6
       uint64_t is_skip_tenant_major_            : SCS_ONE_BIT;
       uint64_t contain_mds_filter_info_         : SCS_ONE_BIT;
+      uint64_t contain_inc_major_info_          : SCS_ONE_BIT;
+      uint64_t contain_window_decision_log_info_: SCS_ONE_BIT;
+      uint64_t contain_noinc_storage_schema_    : SCS_ONE_BIT;
       uint64_t reserved_                        : SCS_RESERVED_BITS;
     };
   };
@@ -263,9 +384,12 @@ public:
   int64_t medium_snapshot_;
   int64_t last_medium_snapshot_;
   storage::ObStorageSchema storage_schema_;
-  ObParallelMergeInfo parallel_merge_info_;
+  ObParallelMergeInfo parallel_merge_info_; // not used for inc major merge
   uint64_t encoding_granularity_;
   ObMdsFilterInfo mds_filter_info_;
+  ObIncMajorSSTableInfo inc_major_info_; // store inc major sstable checksum and end scn
+  ObCOMajorMergeStrategy co_major_merge_strategy_;
+  ObWindowCompactionDecisionLogInfo window_decision_log_info_; // store score and other dynamic info for window compaction decision
   ObIAllocator *allocator_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObMediumCompactionInfo);

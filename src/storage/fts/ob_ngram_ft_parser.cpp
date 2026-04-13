@@ -64,6 +64,21 @@ int ObNgramFTParser::init(ObFTParserParam *param)
   return ret;
 }
 
+int ObNgramFTParser::reuse_parser(const char *fulltext, const int64_t fulltext_len)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("Ngram ft parser has not been inited", K(ret));
+  } else if (OB_UNLIKELY(nullptr == fulltext || 0 >= fulltext_len)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("There are invalid fulltext", K(ret), KP(fulltext), K(fulltext_len));
+  } else if (OB_FAIL(ngram_impl_.reuse_parser(fulltext, fulltext_len))) {
+    LOG_WARN("fail to reuse ngram impl", K(ret));
+  }
+  return ret;
+}
+
 int ObNgramFTParser::get_next_token(
     const char *&word,
     int64_t &word_len,
@@ -109,24 +124,25 @@ int ObNgramFTParserDesc::segment(
     ObITokenIterator *&iter) const
 {
   int ret = OB_SUCCESS;
-  void *buf = nullptr;
+  ObNgramFTParser *parser = nullptr;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("ngram ft parser desc hasn't be initialized", K(ret), K(is_inited_));
-  } else if (OB_ISNULL(param) || OB_ISNULL(param->fulltext_) || OB_UNLIKELY(!param->is_valid())) {
+  } else if (OB_ISNULL(param) || OB_ISNULL(param->metadata_alloc_)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), KPC(param));
-  } else if (OB_ISNULL(buf = param->allocator_->alloc(sizeof(ObNgramFTParser)))) {
+    LOG_WARN("there are invalid arguments", K(ret), KPC(param));
+  } else if (OB_ISNULL(parser = OB_NEWx(ObNgramFTParser, param->metadata_alloc_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("fail to allocate ngram ft parser", K(ret));
   } else {
-    ObNgramFTParser *parser = new (buf) ObNgramFTParser();
     if (OB_FAIL(parser->init(param))) {
       LOG_WARN("fail to init ngram fulltext parser", K(ret), KPC(param));
-      param->allocator_->free(parser);
     } else {
       iter = parser;
     }
+  }
+  if (OB_FAIL(ret) && OB_NOT_NULL(param) && OB_NOT_NULL(param->metadata_alloc_)) {
+    OB_DELETEx(ObNgramFTParser, param->metadata_alloc_, parser);
   }
   return ret;
 }
@@ -137,17 +153,17 @@ void ObNgramFTParserDesc::free_token_iter(
 {
   if (OB_NOT_NULL(iter)) {
     abort_unless(nullptr != param);
-    abort_unless(nullptr != param->allocator_);
+    abort_unless(nullptr != param->metadata_alloc_);
     iter->~ObITokenIterator();
-    param->allocator_->free(iter);
+    param->metadata_alloc_->free(iter);
   }
 }
 
-int ObNgramFTParserDesc::get_add_word_flag(ObAddWordFlag &flag) const
+int ObNgramFTParserDesc::get_add_word_flag(ObProcessTokenFlag &flag) const
 {
   int ret = OB_SUCCESS;
-  flag.set_casedown();
-  flag.set_groupby_word();
+  flag.set_casedown_token();
+  flag.set_groupby_token();
   return ret;
 }
 

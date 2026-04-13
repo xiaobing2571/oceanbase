@@ -18,6 +18,8 @@
 #include "ob_row_data.h"
 #include "ob_mvcc_row.h"
 #include "ob_mvcc.h"
+#include "share/rc/ob_tenant_base.h"
+#include "storage/memtable/hash_holder/ob_row_hash_holder_map.h"
 #include "storage/memtable/ob_memtable_key.h"
 #include "storage/tx/ob_trans_define.h"
 #include "storage/memtable/mvcc/ob_tx_callback_list.h"
@@ -188,7 +190,6 @@ public:
 
   friend class ObITransCallbackIterator;
   enum { MAX_CALLBACK_LIST_COUNT = transaction::MAX_CALLBACK_LIST_COUNT };
-  enum { MAX_CB_ALLOCATOR_COUNT = OB_MAX_CPU_NUM };
   enum {
     PARALLEL_STMT = -1
   };
@@ -218,8 +219,7 @@ public:
       callback_ext_info_log_count_(0),
       pending_log_size_(0),
       flushed_log_size_(0),
-      cb_allocator_(cb_allocator),
-      cb_allocators_(NULL)
+      cb_allocator_(cb_allocator)
   {
   }
   ~ObTransCallbackMgr() {}
@@ -251,7 +251,7 @@ public:
   void set_for_replay(const bool for_replay);
   bool is_for_replay() const { return ATOMIC_LOAD(&for_replay_); }
   int remove_callbacks_for_fast_commit(const int16_t callback_list_idx, const share::SCN stop_scn);
-  int remove_callbacks_for_fast_commit(const ObCallbackScopeArray &callbacks_arr);
+  int remove_callbacks_for_fast_commit(const uint64_t callback_scope_host_bitmap);
   int remove_callback_for_uncommited_txn(const memtable::ObMemtableSet *memtable_set);
   int get_memtable_key_arr(transaction::ObMemtableKeyArray &memtable_key_arr);
   int acquire_callback_list(const bool new_epoch);
@@ -263,9 +263,10 @@ private:
   void wakeup_waiting_txns_();
   int extend_callback_lists_(const int16_t cnt);
 public:
-  bool is_logging_blocked(bool &has_pending_log) const;
+  bool has_pending_log_for_freeze(const uint32_t freeze_clock) const;
   int fill_log(ObTxFillRedoCtx &ctx, ObITxFillRedoFunctor &func);
   int log_submitted(const ObCallbackScopeArray &callbacks, share::SCN scn, int &submitted);
+  int prepare_log_submitted(const ObCallbackScopeArray &callbacks);
   int log_sync_succ(const ObCallbackScopeArray &callbacks, const share::SCN scn, int64_t &sync_cnt);
   int log_sync_fail(const ObCallbackScopeArray &callbacks, const share::SCN scn, int64_t &removed_cnt);
   void check_all_redo_flushed();
@@ -280,7 +281,9 @@ public:
   void inc_flushed_log_size(const int64_t size);
   void clear_pending_log_size() { ATOMIC_STORE(&pending_log_size_, 0); }
   int64_t get_pending_log_size() const;
-  bool pending_log_size_too_large(const transaction::ObTxSEQ &write_seq_no, const int64_t limit);
+  int64_t get_branch_pending_log_size(const int16_t branch) const;
+  int16_t get_pending_log_size_too_large_list(const int64_t limit) const;
+  bool pending_log_size_too_large(const int16_t branch_id, const int64_t limit);
   int64_t get_flushed_log_size() const;
   int get_log_guard(const transaction::ObTxSEQ &write_seq,
                     ObCallbackListLogGuard &log_guard,
@@ -321,6 +324,7 @@ public:
   { return  callback_lists_ ? MAX_CALLBACK_LIST_COUNT : 1; }
   int get_logging_list_count() const;
   ObTxCallbackList *get_callback_list_(const int16_t index, const bool nullable);
+  const ObTxCallbackList *get_callback_list_(const int16_t index, const bool nullable) const;
   bool is_serial_final() const { return is_serial_final_(); }
   bool is_callback_list_append_only(const int idx) const
   {
@@ -416,41 +420,13 @@ private:
   // current flushed log size in leader participant
   int64_t flushed_log_size_;
   ObMemtableCtxCbAllocator &cb_allocator_;
-  ObMemtableCtxCbAllocator *cb_allocators_;
 };
 
 //class ObIMvccCtx;
 class ObMvccRowCallback final : public ObITransCallback
 {
 public:
-  ObMvccRowCallback(ObIMvccCtx &ctx, ObMvccRow& value, ObMemtable *memtable) :
-      ObITransCallback(),
-      ctx_(ctx),
-      value_(value),
-      tnode_(NULL),
-      data_size_(-1),
-      memtable_(memtable),
-      is_link_(false),
-      not_calc_checksum_(false),
-      is_non_unique_local_index_cb_(false),
-      seq_no_(),
-      column_cnt_(0)
-  {}
-  ObMvccRowCallback(ObMvccRowCallback &cb, ObMemtable *memtable) :
-      ObITransCallback(cb.need_submit_log_),
-      ctx_(cb.ctx_),
-      value_(cb.value_),
-      tnode_(cb.tnode_),
-      data_size_(cb.data_size_),
-      memtable_(memtable),
-      is_link_(cb.is_link_),
-      not_calc_checksum_(cb.not_calc_checksum_),
-      is_non_unique_local_index_cb_(cb.is_non_unique_local_index_cb_),
-      seq_no_(cb.seq_no_),
-      column_cnt_(cb.column_cnt_)
-  {
-    (void)key_.encode(cb.key_.get_rowkey());
-  }
+  ObMvccRowCallback(ObIMvccCtx &ctx, ObMvccRow& value, ObMemtable *memtable);
   virtual ~ObMvccRowCallback() {}
   int link_trans_node();
   void unlink_trans_node();
@@ -460,13 +436,10 @@ public:
            ObMvccTransNode *node,
            const int64_t data_size,
            const ObRowData &old_row,
-           const bool is_replay,
            const transaction::ObTxSEQ seq_no,
            const int64_t column_cnt,
            const bool is_non_unique_local_index_cb)
   {
-    UNUSED(is_replay);
-
     if (NULL != key) {
       key_.encode(*key);
     }
@@ -498,11 +471,16 @@ public:
   transaction::ObTxSEQ get_seq_no() const { return seq_no_; }
   int get_trans_id(transaction::ObTransID &trans_id) const;
   int get_cluster_version(uint64_t &cluster_version) const override;
-  transaction::ObTransCtx *get_trans_ctx() const;
+  transaction::ObPartTransCtx *get_trans_ctx() const;
   int64_t to_string(char *buf, const int64_t buf_len) const;
   virtual int before_append(const bool is_replay) override;
   virtual int log_submitted(const share::SCN scn, storage::ObIMemtable *&last_mt) override;
   virtual void after_append_fail(const bool is_replay) override;
+  virtual int get_holder_info(RowHolderInfo &holder_info) const override final;
+  virtual int64_t get_old_row_data_size() override
+  {
+    return old_row_.size_;
+  }
   int64_t get_data_size()
   {
     return data_size_;
@@ -536,6 +514,7 @@ private:
   void inc_unsubmitted_cnt_();
   int dec_unsubmitted_cnt_();
   int wakeup_row_waiter_if_need_();
+  void commit_trans_node_();
 private:
   ObIMvccCtx &ctx_;
   ObMemtableKey key_;
@@ -553,6 +532,7 @@ private:
   };
   transaction::ObTxSEQ seq_no_;
   int64_t column_cnt_;
+  uint32_t freeze_clock_;
 };
 
 }; // end namespace memtable

@@ -121,14 +121,14 @@ int ObPLPackageAST::process_generic_type()
     " SYS$REC_V2TABLE",
     "<ASSOC_ARRAY_1>"
   };
-  if (0 == get_name().case_compare("STANDARD")
-      && 0 == get_db_name().case_compare(OB_SYS_DATABASE_NAME)) {
+  if (get_name().case_compare_equal("STANDARD")
+      && get_db_name().case_compare_equal(OB_SYS_DATABASE_NAME)) {
     const ObPLUserTypeTable &user_type_table = get_user_type_table();
     const ObUserDefinedType *user_type = NULL;
     for (int64_t i = 0; OB_SUCC(ret) && i < user_type_table.get_count(); ++i) {
       if (OB_NOT_NULL(user_type = user_type_table.get_type(i))) {
         for (int64_t j = 0; OB_SUCC(ret) && j < PL_GENERIC_MAX; ++j) {
-          if (0 == user_type->get_name().case_compare(generic_type_table[j])) {
+          if (user_type->get_name().case_compare_equal(generic_type_table[j])) {
             (const_cast<ObUserDefinedType *>(user_type))
               ->set_generic_type(static_cast<ObPLGenericType>(j));
           }
@@ -180,10 +180,14 @@ int ObPLPackage::instantiate_package_state(const ObPLResolveCtx &resolve_ctx,
   int ret = OB_SUCCESS;
   ObString key;
   ObObj value;
+  bool is_system_tenant = get_tenant_id_by_object_id(id_) == OB_SYS_TENANT_ID;
+  package_state.set_is_dbms_profiler(is_system_tenant && get_name().compare_equal("DBMS_PROFILER"));
+  package_state.set_is_dbms_plsql_code_coverage(is_system_tenant && get_name().compare_equal("DBMS_PLSQL_CODE_COVERAGE"));
   ARRAY_FOREACH(var_table_, var_idx) {
     const ObPLVar *var = var_table_.at(var_idx);
     const ObPLDataType &var_type = var->get_type();
-    OZ (package_state.add_package_var_val(value, var_type.get_type()));
+    ObPLPackageVarMetaInfo meta_info(var_type.get_type(), var->is_not_null(), var->get_name().case_compare_equal("RUN_STATUS"));
+    OZ (package_state.add_package_var_val(value, meta_info));
   }
   ARRAY_FOREACH(var_table_, var_idx) {
     const ObPLVar *var = var_table_.at(var_idx);
@@ -213,8 +217,7 @@ int ObPLPackage::instantiate_package_state(const ObPLResolveCtx &resolve_ctx,
       LOG_WARN("cannot assign null to var with not null attribution", K(ret));
     }
     //NOTE: do not remove package user variable! distribute plan will sync it to remote if needed!
-    //OZ (package_state.add_package_var_val(value, var_type.get_type()));
-    OZ (package_state.set_package_var_val(var_idx, value, resolve_ctx, false));
+    OZ (package_state.set_package_var_val(var_idx, value, false));
     if (OB_NOT_NULL(var) && var->get_type().is_cursor_type() && !var->get_type().is_cursor_var()) {
       // package ref cursor variable, refrence outside, do not destruct it.
     } else if (OB_FAIL(ret)) {
@@ -312,7 +315,7 @@ int ObPLPackage::instantiate_package_state(const ObPLResolveCtx &resolve_ctx,
             if (var_type.is_obj_type()) {
               OZ (ObUserDefinedType::destruct_objparam(package_state.get_pkg_allocator(), value, &(resolve_ctx.session_info_)));
               // set basic type value inside symbol table to null
-              OZ (package_state.set_package_var_val(var_idx, value, resolve_ctx, false));
+              OZ (package_state.set_package_var_val(var_idx, value, false));
             } else {
               OZ (ObUserDefinedType::reset_composite(value, &(resolve_ctx.session_info_)));
             }
@@ -326,7 +329,7 @@ int ObPLPackage::instantiate_package_state(const ObPLResolveCtx &resolve_ctx,
                                     value));
             // need set var again if var is baisc type
             if (var_type.is_obj_type()) {
-              OZ (package_state.set_package_var_val(var_idx, value, resolve_ctx, !need_deserialize));
+              OZ (package_state.set_package_var_val(var_idx, value, !need_deserialize));
             }
           }
           // record sync variable, avoid to sync tiwce!
@@ -372,6 +375,11 @@ int ObPLPackage::execute_init_routine(ObIAllocator &allocator, ObExecContext &ex
       ObObj result;
       int status;
       ObSEArray<int64_t, 2> subp_path;
+      pl::ObPLExecuteArg pl_execute_arg;
+      OZ (pl_execute_arg.obtain_routine(exec_ctx,
+                                        init_routine->get_package_id(),
+                                        init_routine->get_routine_id(),
+                                        subp_path));
       OZ (pl_engine->execute(exec_ctx,
                              exec_ctx.get_allocator(),
                              init_routine->get_package_id(),
@@ -380,6 +388,7 @@ int ObPLPackage::execute_init_routine(ObIAllocator &allocator, ObExecContext &ex
                              params,
                              nocopy_param,
                              result,
+                             pl_execute_arg,
                              &status,
                              false,
                              init_routine->is_function()));
@@ -500,7 +509,7 @@ int ObPLPackage::get_cursor(
     const ObPLVar *v = NULL;
     CK (OB_NOT_NULL(it));
     CK (OB_NOT_NULL(v = get_var_table().at(it->get_index())));
-    if (OB_SUCC(ret) && 0 == v->get_name().case_compare(cursor_name)) {
+    if (OB_SUCC(ret) && v->get_name().case_compare_equal(cursor_name)) {
       cursor = it;
       cursor_idx = i;
       break;

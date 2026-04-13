@@ -22,6 +22,7 @@
 #include "storage/ddl/ob_ddl_struct.h"
 #include "storage/blocksstable/ob_table_flag.h"
 #include "storage/compaction/ob_compaction_util.h"
+#include "storage/compaction/ob_uncommit_tx_info.h"
 
 namespace oceanbase
 {
@@ -35,6 +36,7 @@ class ObSSTableMeta;
 class ObMigrationSSTableParam;
 class ObSSTable;
 class ObSSTableIndexBuilder;
+class ObSSTableMetaHandle;
 }
 namespace compaction
 {
@@ -63,7 +65,8 @@ public:
                                    const ObStorageSchema &storage_schema,
                                    const int64_t snapshot_version,
                                    const int64_t column_group_idx,
-                                   const bool has_all_column_group);
+                                   const bool has_all_column_group,
+                                   const bool is_shared);
 
   // Without checking the validity of the input parameters, necessary to ensure the correctness of the method call.
   int init_for_small_sstable(const blocksstable::ObSSTableMergeRes &res,
@@ -90,19 +93,25 @@ public:
   int init_for_ddl_mem(const ObITable::TableKey &table_key,
                        const share::SCN &ddl_start_scn,
                        const ObStorageSchema &storage_schema,
+                       const transaction::ObTransID &trans_id,
+                       const transaction::ObTxSEQ &seq_no,
                        ObBlockMetaTree &block_meta_tree);
 
   // Without checking the validity of the input parameters, necessary to ensure the correctness of the method call.
   int init_for_ss_ddl(blocksstable::ObSSTableMergeRes &res,
                       const ObITable::TableKey &table_key,
                       const ObStorageSchema &storage_schema,
-                      const int64_t create_schema_version_on_tablet);
+                      const int64_t create_schema_version_on_tablet,
+                      const ObDirectLoadType direct_load_type,
+                      const transaction::ObTransID &tx_id,
+                      const transaction::ObTxSEQ &seq_no);
 
   // Without checking the validity of the input parameters, necessary to ensure the correctness of the method call.
   int init_for_split(const ObTabletID &dst_tablet_id,
-                     const ObITable::TableKey &src_table_key,
+                     const blocksstable::ObSSTable &src_sstable,
                      const blocksstable::ObSSTableBasicMeta &basic_meta,
                      const int64_t schema_version,
+                     const ObIArray<blocksstable::MacroBlockId> &split_point_macros_id,
                      const blocksstable::ObSSTableMergeRes &res);
 
   // Without checking the validity of the input parameters, necessary to ensure the correctness of the method call.
@@ -127,13 +136,20 @@ public:
                   const blocksstable::ObSSTableMergeRes &res);
 
   // Without checking the validity of the input parameters, necessary to ensure the correctness of the method call.
-  int init_for_ha(const blocksstable::ObMigrationSSTableParam &migration_param);
+  int init_for_ha(
+      const blocksstable::ObMigrationSSTableParam &migration_param,
+      const common::ObIArray<blocksstable::MacroBlockId> &data_block_ids,
+      const common::ObIArray<blocksstable::MacroBlockId> &other_block_ids);
+  int init_for_ss_mini_upload(const blocksstable::ObMigrationSSTableParam &migration_param,
+                              const blocksstable::ObSSTableMergeRes &res,
+                              const int64_t root_macro_seq);
 
   // Without checking the validity of the input parameters, necessary to ensure the correctness of the method call.
-  int init_for_transfer_empty_minor_sstable(const common::ObTabletID &tablet_id,
-                                            const share::SCN &start_scn,
-                                            const share::SCN &end_scn,
-                                            const ObStorageSchema &table_schema);
+  int init_for_transfer_empty_mini_minor_sstable(const common::ObTabletID &tablet_id,
+                                                 const share::SCN &start_scn,
+                                                 const share::SCN &end_scn,
+                                                 const ObStorageSchema &table_schema,
+                                                 const ObITable::TableType &table_type);
 
   // Without checking the validity of the input parameters, necessary to ensure the correctness of the method call.
   int init_for_remote(const blocksstable::ObMigrationSSTableParam &migration_param);
@@ -141,6 +157,13 @@ public:
   int init_for_mds(const compaction::ObBasicTabletMergeCtx &ctx,
                    const blocksstable::ObSSTableMergeRes &res,
                    const ObStorageSchema &mds_schema);
+  int init_for_inc_major_ddl_aggregate(const ObITable::TableKey &table_key,
+                                       blocksstable::ObSSTable &base_sstable,
+                                       blocksstable::ObSSTableMetaHandle &meta_handle,
+                                       const int64_t column_group_cnt,
+                                       const int64_t rowkey_column_cnt,
+                                       const int64_t column_cnt,
+                                       const int64_t row_cnt);
 
   inline const ObITable::TableKey& table_key() const { return table_key_; }
   inline const share::SCN& rec_scn() const { return rec_scn_; };
@@ -151,6 +174,7 @@ public:
   inline bool is_co_table_without_cgs() const { return is_co_table_without_cgs_; }
   inline int64_t column_group_cnt() const { return column_group_cnt_; }
   inline int64_t full_column_cnt() const { return full_column_cnt_; }
+  inline int64_t co_base_snapshot_version() const { return co_base_snapshot_version_; }
 
   // TODO: delete this interface
   // ObTabletMergeInfo::record_start_tx_scn_for_tx_data
@@ -205,16 +229,23 @@ public:
       K_(table_shared_flag),
       K_(uncommitted_tx_id),
       K_(co_base_snapshot_version),
-      K_(rec_scn));
+      K_(uncommit_tx_info),
+      K_(rec_scn),
+      K_(upper_trans_version),
+      K_(min_merged_trans_version));
 private:
   static const int64_t DEFAULT_MACRO_BLOCK_CNT = 64;
   int inner_init_with_merge_res(const blocksstable::ObSSTableMergeRes &res);
-  int inner_init_with_shared_sstable(const blocksstable::ObMigrationSSTableParam &migration_param);
+  int inner_init_with_shared_sstable(
+      const blocksstable::ObMigrationSSTableParam &migration_param,
+      const common::ObIArray<blocksstable::MacroBlockId> &data_block_ids,
+      const common::ObIArray<blocksstable::MacroBlockId> &other_block_ids);
   void set_init_value_for_column_store_();
 private:
   friend class blocksstable::ObSSTableMeta;
   friend class blocksstable::ObSSTableMacroInfo;
-private:
+  int assign_uncommit_tx_info_from_ctx(const compaction::ObBasicTabletMergeCtx &ctx);
+public:
   ObITable::TableKey table_key_;
   int16_t sstable_logic_seq_;
   int64_t schema_version_;
@@ -266,7 +297,10 @@ private:
   storage::ObTableSharedFlag table_shared_flag_; //ObTableSharedFlag will be updated by ObTabletCreateSSTableParam
   int64_t uncommitted_tx_id_;
   int64_t co_base_snapshot_version_;
+  compaction::ObMemUncommitTxInfo uncommit_tx_info_;
   share::SCN rec_scn_;
+  int64_t upper_trans_version_;
+  int64_t min_merged_trans_version_;
 };
 
 } // namespace storage

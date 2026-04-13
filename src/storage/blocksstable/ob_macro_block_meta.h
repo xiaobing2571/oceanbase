@@ -36,10 +36,6 @@ enum ObMacroBlockMetaType
 class ObDataBlockMetaVal final
 {
 public:
-  static const int32_t DATA_BLOCK_META_VAL_VERSION = 1;
-  static const int32_t DATA_BLOCK_META_VAL_VERSION_V2 = 2;
-
-public:
   ObDataBlockMetaVal();
   explicit ObDataBlockMetaVal(ObIAllocator &allocator);
   ~ObDataBlockMetaVal();
@@ -57,11 +53,14 @@ public:
         K_(row_count_delta), K_(max_merged_trans_version), K_(is_encrypted),
         K_(is_deleted), K_(contain_uncommitted_row), K_(compressor_type),
         K_(master_key_id), K_(encrypt_id), K_(encrypt_key), K_(row_store_type),
-        K_(schema_version), K_(snapshot_version), K_(is_last_row_last_flag),
+        K_(schema_version), K_(snapshot_version), K_(is_last_row_last_flag), K_(is_first_row_first_flag),
         K_(logic_id), K_(macro_id), K_(column_checksums), K_(has_string_out_row), K_(all_lob_in_row),
         K_(agg_row_len), KP_(agg_row_buf), K_(ddl_end_row_offset), K_(macro_block_bf_size), KP_(macro_block_bf_buf));
 
 private:
+  static const int32_t DATA_BLOCK_META_VAL_VERSION = 1; // abandon after 431
+  static const int32_t DATA_BLOCK_META_VAL_VERSION_V2 = 2;
+
   DISALLOW_COPY_AND_ASSIGN(ObDataBlockMetaVal);
 
 public:
@@ -84,7 +83,15 @@ public:
   bool is_encrypted_;
   bool is_deleted_;
   bool contain_uncommitted_row_;
-  bool is_last_row_last_flag_;
+  union {
+    uint8_t data_flag_pack_;
+    struct
+    {
+      uint8_t is_last_row_last_flag_:    1;       // Whether the last row in macro is with last flag
+      uint8_t is_first_row_first_flag_:  1;       // Whether the first row in macro is with first flag
+      uint8_t reserved_ : 6;
+    };
+  };
   ObCompressorType compressor_type_;
   int64_t master_key_id_;
   int64_t encrypt_id_;
@@ -120,6 +127,9 @@ public:
                          ObIAllocator &allocator,
                          const uint64_t data_version) const;
   int parse_row(ObDatumRow &row);
+  int serialize(char *buf, const int64_t buf_len, int64_t &pos, const int64_t data_version) const;
+  int deserialize(const char *buf, const int64_t data_len, ObIAllocator &allocator, int64_t& pos);
+  int64_t get_serialize_size(const int64_t data_version) const;
   OB_INLINE const ObDataBlockMetaVal &get_meta_val() const { return val_; }
   OB_INLINE const MacroBlockId &get_macro_id() const
   {
@@ -137,9 +147,13 @@ public:
   {
     return val_.is_last_row_last_flag_;
   }
+  OB_INLINE bool is_first_row_first_flag() const
+  {
+    return val_.is_first_row_first_flag_;
+  }
   OB_INLINE bool is_valid() const
   {
-    return val_.is_valid() && end_key_.is_valid();
+    return version_ == ObDataMacroBlockMeta::MACRO_BLOCK_META_VERSION && val_.is_valid() && end_key_.is_valid();
   }
   OB_INLINE void reset()
   {
@@ -147,13 +161,19 @@ public:
     end_key_.reset();
     nested_offset_ = 0;
     nested_size_ = 0;
+    version_ = ObDataMacroBlockMeta::MACRO_BLOCK_META_VERSION;
   }
   TO_STRING_KV(K_(val), K_(end_key), K_(nested_offset), K_(nested_size));
+
+public:
+  static const int64_t MACRO_BLOCK_META_VERSION = 1;
+
 public:
   ObDataBlockMetaVal val_;
   ObDatumRowkey end_key_; // rowkey is primary key
   int64_t nested_offset_;
   int64_t nested_size_;
+  int32_t version_;
   DISALLOW_COPY_AND_ASSIGN(ObDataMacroBlockMeta);
 };
 

@@ -34,7 +34,7 @@ public:
   static const int64_t DEFAULT_LOG_CB_POOL_CNT = 4;
 
 public:
-  ObTxLogCbPoolMgr() : allocator_("TxLogCbPool", common::OB_SERVER_TENANT_ID) { reset(); }
+  ObTxLogCbPoolMgr() : allocator_("TxLogCbPool", common::OB_SERVER_TENANT_ID), pool_list_rw_lock_(common::ObLatchIds::OB_TX_LOG_CB_POOL_MGR_POOL_LIST_LOCK), sync_size_his_lock_(common::ObLatchIds::OB_TX_LOG_CB_POOL_MGR_SYNC_SIZE_HIS_LOCK) { reset(); }
 
   int init(const int64_t tenant_id, const ObLSID ls_id);
   void reset();
@@ -61,8 +61,9 @@ private:
   int append_new_log_cb_pool_();
 
   int alloc_log_cb_pool_(ObTxLogCbPool *&alloc_ptr);
-  int free_log_cb_pool_(ObTxLogCbPool *free_ptr, const int64_t wait_timeout = INT64_MAX);
+  int free_log_cb_pool_(ObTxLogCbPool *&free_ptr, const int64_t wait_timeout = 1000);
 
+  void print_gc_pool_list_();
   int iter_idle_pool_(ObTxLogCbPoolRefGuard &ref_guard);
 
   enum SyncSizeHistoryFlag
@@ -107,6 +108,8 @@ private:
   common::SpinRWLock pool_list_rw_lock_;
   TxLogCbPoolList pool_list_;
   bool allow_expand_;
+
+  TxLogCbPoolList gc_pool_list_;
 
   common::SpinRWLock sync_size_his_lock_;
   int64_t sync_size_history_[MAX_SYNC_SIZE_HISTORY_RECORD_SIZE * 2];

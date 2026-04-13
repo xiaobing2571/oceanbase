@@ -39,6 +39,7 @@
 #include "close_modules/shared_storage/storage/shared_storage/micro_cache/ob_ss_micro_cache_common_meta.h"
 #include "close_modules/shared_storage/storage/shared_storage/prewarm/ob_ha_prewarm_struct.h"
 #include "close_modules/shared_storage/storage/shared_storage/ob_ss_micro_cache.h"
+#include "close_modules/shared_storage/storage/shared_storage/prewarm/ob_ha_prewarm_rpc_struct.h"
 #endif
 
 namespace oceanbase
@@ -47,6 +48,7 @@ namespace storage
 {
 class ObLogStreamService;
 class ObICopySSTableMacroRangeObProducer;
+class ObCopyPhysicalMacroBlockIdObProducer;
 }
 
 namespace obrpc
@@ -82,7 +84,7 @@ public:
   common::ObSArray<ObCopyMacroBlockArg> arg_list_;
 };
 
-enum ObCopyMacroBlockDataType {
+enum class ObCopyMacroBlockDataType {
   MACRO_DATA = 0,
   MACRO_META_ROW = 1,
   MAX
@@ -189,12 +191,13 @@ public:
   bool is_valid() const;
   void reset();
   TO_STRING_KV(K_(tablet_id), K_(max_major_sstable_snapshot), K_(minor_sstable_scn_range),
-      K_(ddl_sstable_scn_range));
+      K_(ddl_sstable_scn_range), K_(inc_major_ddl_sstable_end_scn));
 
   common::ObTabletID tablet_id_;
   int64_t max_major_sstable_snapshot_;
   share::ObScnRange minor_sstable_scn_range_;
   share::ObScnRange ddl_sstable_scn_range_;
+  share::SCN inc_major_ddl_sstable_end_scn_;
 };
 
 struct ObCopyTabletsSSTableInfoArg final
@@ -386,6 +389,33 @@ public:
 
   ObITable::TableKey copy_table_key_;
   int64_t macro_range_count_;
+};
+
+struct ObCopySSTableMacroIdInfoHeader final
+{
+  OB_UNIS_VERSION(1);
+public:
+  enum CopyMacroBlockType {
+    DATA_BLOCK = 0,
+    OTHER_BLOCK = 1,
+    BLOCK_TYPE_MAX
+  };
+  enum CopyMacroBlockIdType {
+    // ObLogicMacroBlockId
+    LOGICAL_ID = 0,
+    // MacroBlockId
+    PHYSICAL_ID = 1,
+    BLOCK_ID_TYPE_MAX
+  };
+public:
+  ObCopySSTableMacroIdInfoHeader();
+  ~ObCopySSTableMacroIdInfoHeader() {};
+  bool is_valid() const;
+  void reset();
+  TO_STRING_KV(K_(block_type), K_(id_type), K_(block_count));
+  CopyMacroBlockType block_type_;
+  CopyMacroBlockIdType id_type_;
+  int64_t block_count_;
 };
 
 struct ObCopyTabletSSTableHeader final
@@ -631,6 +661,37 @@ public:
   bool backfill_finished_;
 };
 
+#ifdef OB_BUILD_SHARED_STORAGE
+struct ObCheckTransferOutTabletStatusArg final
+{
+OB_UNIS_VERSION(1);
+public:
+  ObCheckTransferOutTabletStatusArg();
+  ~ObCheckTransferOutTabletStatusArg() {}
+  bool is_valid() const;
+  void reset();
+  int assign(const ObCheckTransferOutTabletStatusArg &other);
+  TO_STRING_KV(K_(tenant_id), K_(ls_id), K_(tablet_list), K_(transfer_scn));
+  uint64_t tenant_id_;
+  share::ObLSID ls_id_;
+  common::ObSArray<share::ObTransferTabletInfo> tablet_list_;
+  share::SCN transfer_scn_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObCheckTransferOutTabletStatusArg);
+};
+
+struct ObCheckTransferOutTabletStatusRes final
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObCheckTransferOutTabletStatusRes();
+  ~ObCheckTransferOutTabletStatusRes() {}
+  void reset();
+  TO_STRING_KV(K_(is_transfer_out_deleted));
+  bool is_transfer_out_deleted_;
+};
+#endif
+
 struct ObStorageChangeMemberArg final
 {
   OB_UNIS_VERSION(1);
@@ -817,6 +878,26 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObUpdateTransferMetaInfoArg);
 };
 
+struct ObCopySSTableMacroLogicIdInfoArg final
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObCopySSTableMacroLogicIdInfoArg();
+  ~ObCopySSTableMacroLogicIdInfoArg() {}
+  void reset();
+  bool is_valid() const;
+
+  TO_STRING_KV(K_(tenant_id), K_(ls_id), K_(table_key), K_(version), K_(filled_tx_scn), K_(need_check_seq), K_(ls_rebuild_seq));
+public:
+  uint64_t tenant_id_;
+  share::ObLSID ls_id_;
+  storage::ObITable::TableKey table_key_;
+  uint64_t version_;
+  share::SCN filled_tx_scn_;
+  bool need_check_seq_;
+  int64_t ls_rebuild_seq_;
+};
+
 #ifdef OB_BUILD_SHARED_STORAGE
 // migration micro cache related
 struct ObGetHAMicroCacheLSInfoArg final
@@ -950,7 +1031,26 @@ public:
 private:
   DISALLOW_COPY_AND_ASSIGN(ObGetLSReplicaMicroBlockArg);
 };
-#endif
+
+struct ObNotifySSWriterDoBackfillArg final
+{
+public:
+  OB_UNIS_VERSION(1);
+public:
+  ObNotifySSWriterDoBackfillArg();
+  ~ObNotifySSWriterDoBackfillArg() {}
+  bool is_valid() const;
+  void reset();
+  TO_STRING_KV(K_(tenant_id), K_(ls_id), K_(tablet_id));
+public:
+  uint64_t tenant_id_;
+  share::ObLSID ls_id_;
+  common::ObTabletID tablet_id_;
+  ObSSWriterType type_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObNotifySSWriterDoBackfillArg);
+};
+#endif // OB_BUILD_SHARED_STORAGE
 
 struct ObRebuildTabletSSTableInfoArg final
 {
@@ -970,6 +1070,21 @@ public:
   uint64_t version_;
 };
 
+struct ObAdvanceSrcLSCheckpointArg final
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObAdvanceSrcLSCheckpointArg();
+  ~ObAdvanceSrcLSCheckpointArg();
+  bool is_valid() const;
+  void reset();
+  TO_STRING_KV(K_(tenant_id), K_(ls_id), K_(recycle_scn));
+public:
+  uint64_t tenant_id_;
+  share::ObLSID ls_id_;
+  share::SCN recycle_scn_;
+};
+
 //src
 class ObStorageRpcProxy : public obrpc::ObRpcProxy
 {
@@ -981,6 +1096,7 @@ public:
   RPC_SS(PR5 fetch_tablet_info, OB_HA_FETCH_TABLET_INFO, (ObCopyTabletInfoArg), common::ObDataBuffer);
   RPC_SS(PR5 fetch_tablet_sstable_info, OB_HA_FETCH_SSTABLE_INFO, (ObCopyTabletsSSTableInfoArg), common::ObDataBuffer);
   RPC_SS(PR5 fetch_sstable_macro_info, OB_HA_FETCH_SSTABLE_MACRO_INFO, (ObCopySSTableMacroRangeInfoArg), common::ObDataBuffer);
+  RPC_SS(PR5 fetch_sstable_macro_logic_id_info, OB_HA_FETCH_MACRO_LOGIC_ID_INFO, (ObCopySSTableMacroLogicIdInfoArg), common::ObDataBuffer);
   RPC_SS(PR5 lob_query, OB_LOB_QUERY, (ObLobQueryArg), common::ObDataBuffer);
   RPC_SS(PR5 fetch_ls_view, OB_HA_FETCH_LS_VIEW, (ObCopyLSViewArg), common::ObDataBuffer);
 #ifdef OB_BUILD_SHARED_STORAGE
@@ -1008,8 +1124,13 @@ public:
   RPC_S(PR5 fetch_micro_block_keys, OB_HA_FETCH_MICRO_BLOCK_KEYS, (ObGetMicroBlockKeyArg), ObGetHAMicroMetaSetRes);
   RPC_S(PR5 get_micro_block_cache_info, OB_HA_GET_MICRO_BLOCK_CACHE_INFO, (ObGetHAMicroCacheLSInfoArg), ObGetHAMicroCacheLSInfoRes);
   RPC_S(PR5 get_migration_cache_job_info, OB_HA_GET_MIGRATION_CACHE_JOB_INFO, (ObGetMigrationCacheJobInfoArg), ObGetMigrationCacheJobInfoRes);
+  RPC_S(PR5 notify_sswriter_do_backfill, OB_HA_NOTIFY_SSWRITER_DO_BACKFILL, (ObNotifySSWriterDoBackfillArg), obrpc::Int64);
+  RPC_S(PR5 get_ha_local_cache_info, OB_HA_GET_LOCAL_CACHE_INFO, (storage::ObGetHALocalCacheLSInfoArg), storage::ObGetHALocalCacheLSInfoRes);
+  RPC_S(PR5 get_ha_cache_job_info, OB_HA_GET_CACHE_JOB_INFO, (storage::ObGetHACacheJobInfoArg), storage::ObGetHACacheJobInfoRes);
+  RPC_S(PR5 get_local_cache_key, OB_HA_FETCH_LOCAL_CACHE_KEYS, (ObGetLocalCacheKeyArg), ObGetLocalCacheKeyRes);
+  RPC_SS(PR5 fetch_local_cache_block, OB_HA_FETCH_LOCAL_CACHE_BLOCK, (ObHAFetchLocalCacheBlockArg), common::ObDataBuffer);
 #endif
-
+  RPC_S(PR5 advance_src_ls_checkpoint, OB_HA_ADVANCE_SRC_LS_CHECKPOINT, (ObAdvanceSrcLSCheckpointArg), obrpc::Int64);
 
   // RPC_AP stands for asynchronous RPC.
   RPC_AP(PR5 check_transfer_tablet_backfill_completed, OB_HA_CHECK_TRANSFER_TABLET_BACKFILL, (obrpc::ObCheckTransferTabletBackfillArg), obrpc::ObCheckTransferTabletBackfillRes);
@@ -1018,6 +1139,9 @@ public:
   RPC_AP(PR5 update_transfer_meta_info, OB_HA_UPDATE_TRANSFER_META_INFO, (obrpc::ObUpdateTransferMetaInfoArg), obrpc::Int64);
   RPC_AP(PR5 check_transfer_in_tablet_aborted, OB_HA_CHECK_TRANSFER_IN_TABLET_ABORTED, (obrpc::ObTransferTabletInfoArg), obrpc::ObTransferInTabletAbortedRes);
   RPC_AP(PR5 fetch_ls_replay_scn, OB_HA_FETCH_LS_REPLAY_SCN, (obrpc::ObFetchLSReplayScnArg), obrpc::ObFetchLSReplayScnRes);
+#ifdef OB_BUILD_SHARED_STORAGE
+  RPC_AP(PR5 check_transfer_out_tablet_status, OB_HA_CHECK_TRANSFER_OUT_TABLET_STATUS, (obrpc::ObCheckTransferOutTabletStatusArg), obrpc::ObCheckTransferOutTabletStatusRes);
+#endif
 };
 
 template <ObRpcPacketCode RPC_CODE>
@@ -1052,6 +1176,10 @@ public:
   virtual ~ObHAFetchMacroBlockP() {}
 protected:
   int process();
+private:
+#ifdef ERRSIM
+  void errsim_spin_wait_for_specific_tablet_();
+#endif
 private:
   int64_t total_macro_block_count_;
 };
@@ -1145,6 +1273,18 @@ private:
       const obrpc::ObCopySSTableMacroRangeInfoHeader &header,
       ObICopySSTableMacroRangeObProducer *&producer);
   void free_sstable_macro_range_producer_(ObICopySSTableMacroRangeObProducer *&producer);
+};
+
+class ObFetchSSTableMacroLogicIdInfoP :
+    public ObStorageStreamRpcP<OB_HA_FETCH_MACRO_LOGIC_ID_INFO>
+{
+public:
+  explicit ObFetchSSTableMacroLogicIdInfoP(common::ObInOutBandwidthThrottle *bandwidth_throttle);
+  virtual ~ObFetchSSTableMacroLogicIdInfoP() {}
+protected:
+  int process();
+private:
+  int fetch_sstable_macro_logic_id_info_();
 };
 
 class ObNotifyRestoreTabletsP :
@@ -1247,6 +1387,34 @@ public:
 protected:
   int process();
 };
+
+#ifdef OB_BUILD_SHARED_STORAGE
+class ObCheckTransferOutTabletStatusDelegate final
+{
+public:
+  ObCheckTransferOutTabletStatusDelegate(obrpc::ObCheckTransferOutTabletStatusRes &result);
+  int init(const obrpc::ObCheckTransferOutTabletStatusArg &arg);
+  int process();
+private:
+  int check_is_transfer_out_deleted_(const share::ObTransferTabletInfo &tablet_info, const share::SCN &transfer_scn,
+      storage::ObLS *ls, bool &is_transfer_out_deleted);
+private:
+  bool is_inited_;
+  obrpc::ObCheckTransferOutTabletStatusArg arg_;
+  obrpc::ObCheckTransferOutTabletStatusRes &result_;
+  DISALLOW_COPY_AND_ASSIGN(ObCheckTransferOutTabletStatusDelegate);
+};
+
+class ObCheckTransferOutTabletStatusP:
+    public ObStorageRpcProxy::Processor<OB_HA_CHECK_TRANSFER_OUT_TABLET_STATUS>
+{
+public:
+  ObCheckTransferOutTabletStatusP() = default;
+  virtual ~ObCheckTransferOutTabletStatusP() {}
+protected:
+  int process();
+};
+#endif
 
 class ObStorageGetConfigVersionAndTransferScnP:
     public ObStorageRpcProxy::Processor<OB_HA_CHANGE_MEMBER_SERVICE>
@@ -1495,6 +1663,65 @@ public:
 protected:
   int process();
 };
+
+class ObHAGetLocalCacheInfoP:
+    public ObStorageRpcProxy::Processor<OB_HA_GET_LOCAL_CACHE_INFO>
+{
+public:
+  ObHAGetLocalCacheInfoP() = default;
+  virtual ~ObHAGetLocalCacheInfoP() {}
+protected:
+  int process();
+};
+
+class ObHAGetCacheJobInfoP:
+    public ObStorageRpcProxy::Processor<OB_HA_GET_CACHE_JOB_INFO>
+{
+public:
+  ObHAGetCacheJobInfoP() = default;
+  virtual ~ObHAGetCacheJobInfoP() {}
+protected:
+  int process();
+};
+
+class ObGetLocalCacheKeyP:
+    public ObStorageRpcProxy::Processor<OB_HA_FETCH_LOCAL_CACHE_KEYS>
+{
+public:
+  ObGetLocalCacheKeyP() = default;
+  virtual ~ObGetLocalCacheKeyP() {}
+protected:
+  int process();
+
+private:
+  int process_micro_cache_job_();
+  int process_macro_cache_job_();
+protected:
+  static const int64_t MAX_KEY_SET_SIZE = WARMUP_MAX_KEY_SET_SIZE_IN_RPC; // 4MB
+  static const int64_t KEY_SET_RESERVE_SIZE = (1LL << 13); // 8KB
+  // forbid too many iterations due to the rpc timeout
+  static const int64_t MICRO_MAX_ITER_COUNT = 3000;
+};
+
+class ObFetchLocalCacheBlockP:
+    public ObStorageStreamRpcP<OB_HA_FETCH_LOCAL_CACHE_BLOCK>
+{
+public:
+  explicit ObFetchLocalCacheBlockP(common::ObInOutBandwidthThrottle *bandwidth_throttle);
+  virtual ~ObFetchLocalCacheBlockP() {}
+protected:
+  int process();
+};
+class ObNotifySSWriterDoBackfillP:
+    public ObStorageRpcProxy::Processor<OB_HA_NOTIFY_SSWRITER_DO_BACKFILL>
+{
+public:
+  ObNotifySSWriterDoBackfillP() = default;
+  virtual ~ObNotifySSWriterDoBackfillP() {}
+protected:
+  int process();
+  int notify_sswriter_do_backfill_();
+};
 #endif
 
 class ObRebuildTabletSSTableInfoP :
@@ -1507,6 +1734,16 @@ protected:
   int process();
 private:
   int build_sstable_info_(ObLS *ls);
+};
+
+class ObAdvanceSrcLSCheckpointP:
+  public ObStorageRpcProxy::Processor<OB_HA_ADVANCE_SRC_LS_CHECKPOINT>
+{
+public:
+  ObAdvanceSrcLSCheckpointP() = default;
+  virtual ~ObAdvanceSrcLSCheckpointP() {}
+protected:
+  int process();
 };
 
 } // obrpc
@@ -1716,6 +1953,11 @@ public:
       const share::ObLSID &ls_id,
       const ObStorageHASrcInfo &src_info,
       obrpc::ObFetchLSMemberAndLearnerListInfo &member_info);
+  virtual int advance_src_ls_checkpoint(
+      const uint64_t tenant_id,
+      const ObStorageHASrcInfo &src_info,
+      const share::ObLSID &ls_id,
+      const share::SCN &recycle_scn);
 #ifdef OB_BUILD_SHARED_STORAGE
   virtual int get_ls_micro_block_cache_info(
       const uint64_t tenant_id,
@@ -1734,6 +1976,29 @@ public:
       const ObStorageHASrcInfo &src_info,
       const ObMigrationCacheJobInfo &job_info,
       obrpc::ObGetHAMicroMetaSetRes &res);
+  virtual int get_local_cache_ls_info(
+      const uint64_t tenant_id,
+      const share::ObLSID &ls_id,
+      const ObStorageHASrcInfo &src_info,
+      ObSSLocalCacheLSInfo &ls_cache_info);
+  virtual int get_ls_migration_cache_job_info(
+      const uint64_t tenant_id,
+      const share::ObLSID &ls_id,
+      const ObStorageHASrcInfo &src_info,
+      const ObHALocalCacheTaskCount &task_count,
+      ObGetHACacheJobInfoRes &res);
+  virtual int notify_sswriter_do_backfill(
+      const uint64_t tenant_id,
+      const share::ObLSID &ls_id,
+      const common::ObTabletID &tablet_id,
+      const ObSSWriterType type,
+      const ObStorageHASrcInfo &src_info);
+  virtual int get_local_cache_key(
+      const uint64_t tenant_id,
+      const share::ObLSID &ls_id,
+      const ObStorageHASrcInfo &src_info,
+      const ObHACacheJobInfo &job_info,
+      ObGetLocalCacheKeyRes &res);
 #endif
 private:
   bool is_inited_;
@@ -1757,6 +2022,8 @@ public:
   int fetch_and_decode(Data &data);
   template<typename Data>
   int fetch_and_decode(common::ObIAllocator &allocator, Data &data);
+  template<typename Data>
+  int fetch_and_decode_list(common::ObIArray<Data> &data_list);
   template<typename Data>
   int fetch_and_decode_list(common::ObIAllocator &allocator,
                             common::ObIArray<Data> &data_list);

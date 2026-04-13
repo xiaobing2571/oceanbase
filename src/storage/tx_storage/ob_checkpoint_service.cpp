@@ -12,13 +12,19 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "rootserver/ob_tenant_info_loader.h" // ObTenantInfoLoader
 #include "storage/tx_storage/ob_checkpoint_service.h"
 #include "logservice/ob_log_service.h"
 #include "logservice/archiveservice/ob_archive_service.h"
+#include "storage/tx_storage/ob_tenant_freezer.h"
 
 #ifdef OB_BUILD_SHARED_STORAGE
+#include "observer/ob_srv_network_frame.h"
 #include "storage/incremental/share/ob_shared_ls_meta.h"
+#include "storage/incremental/share/ob_ss_diagnose_mgr.h"
 #include "storage/incremental/ob_shared_meta_service.h"
+#include "storage/incremental/ob_ss_checkpoint_rpc.h"
+#include "storage/incremental/garbage_collector/ob_ss_garbage_collector_service.h"
 #endif
 
 namespace oceanbase
@@ -38,8 +44,8 @@ int64_t ObCheckPointService::TRAVERSAL_FLUSH_INTERVAL = 5000 * 1000L;
 // Update ss checkpoint scn each 10 seconds
 int64_t ObCheckPointService::SS_UPDATE_CKPT_INTERVAL = 10LL * 1000LL * 1000LL;
 
-// Flush all CLOG module each 10 minutes
-int64_t ObCheckPointService::SS_ADVANCE_CKPT_INTERVAL = 10LL * 60LL * 1000LL * 1000LL;
+// Check if need flush all CLOG module each 1 minute
+int64_t ObCheckPointService::SS_TRY_ADVANCE_CKPT_INTERVAL = 60LL * 1000LL * 1000LL;
 
 // try schedule full/emergency upload each second
 int64_t ObCheckPointService::SS_TRY_SCHEDULE_UPLOAD_INTERVAL = 1LL * 1000LL * 1000LL;
@@ -53,13 +59,21 @@ int ObCheckPointService::mtl_init(ObCheckPointService* &m)
 int ObCheckPointService::init(const int64_t tenant_id)
 {
   int ret = OB_SUCCESS;
+
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
     LOG_WARN("ObCheckPointService init twice.", K(ret));
   } else if (OB_FAIL(freeze_thread_.init(tenant_id, lib::TGDefIDs::LSFreeze))) {
     LOG_WARN("fail to initialize freeze thread", K(ret));
+#ifdef OB_BUILD_SHARED_STORAGE
+  } else if (GCTX.is_shared_storage_mode() && OB_FAIL(ss_sche_upload_thread_pool_.init())) {
+    LOG_WARN("fail to init ss sche upload thread pool", KR(ret));
+#endif
   } else {
     is_inited_ = true;
+#ifdef OB_BUILD_SHARED_STORAGE
+    prev_ss_advance_ckpt_task_ts_ = 0;
+#endif
   }
   return ret;
 }
@@ -105,30 +119,34 @@ int ObCheckPointService::start()
 
 #ifdef OB_BUILD_SHARED_STORAGE
   if (GCTX.is_shared_storage_mode()) {
-    INIT_AND_START_TIMER_TASK(ss_update_ckpt_scn_timer_,
-                              ss_update_ckpt_scn_task_,
-                              "SSUpCkptSCN",
-                              "SSUpSCNTimer",
-                              SS_UPDATE_CKPT_INTERVAL,
-                              true/* repeat */);
-    INIT_AND_START_TIMER_TASK(ss_update_ckpt_lsn_timer_,
-                              ss_update_ckpt_lsn_task_,
-                              "SSUpCkptLSN",
-                              "SSUpLSNTimer",
-                              SS_UPDATE_CKPT_INTERVAL,
-                              true/* repeat */);
-    INIT_AND_START_TIMER_TASK(ss_advance_ckpt_timer_,
-                              ss_advance_ckpt_task_,
-                              "SSAdvanceCKPT",
-                              "SSAdvanceTimer",
-                              SS_ADVANCE_CKPT_INTERVAL,
-                              true/* repeat */);
-    INIT_AND_START_TIMER_TASK(ss_schedule_upload_timer_,
-                              ss_schedule_upload_task_,
-                              "SSUploader",
-                              "SSUploaderTimer",
-                              SS_TRY_SCHEDULE_UPLOAD_INTERVAL,
-                              true/* repeat */);
+    if (OB_FAIL(ss_sche_upload_thread_pool_.start())) {
+      LOG_WARN("fail to start ss sche upload thread pool", KR(ret));
+    } else {
+      INIT_AND_START_TIMER_TASK(ss_update_ckpt_scn_timer_,
+                                ss_update_ckpt_scn_task_,
+                                "SSUpCkptSCN",
+                                "SSUpSCNTimer",
+                                SS_UPDATE_CKPT_INTERVAL,
+                                true /* repeat */);
+      INIT_AND_START_TIMER_TASK(ss_update_ckpt_lsn_timer_,
+                                ss_update_ckpt_lsn_task_,
+                                "SSUpCkptLSN",
+                                "SSUpLSNTimer",
+                                SS_UPDATE_CKPT_INTERVAL,
+                                true /* repeat */);
+      INIT_AND_START_TIMER_TASK(ss_advance_ckpt_timer_,
+                                ss_advance_ckpt_task_,
+                                "SSAdvanceCKPT",
+                                "SSAdvanceTimer",
+                                SS_TRY_ADVANCE_CKPT_INTERVAL,
+                                true /* repeat */);
+      INIT_AND_START_TIMER_TASK(ss_schedule_upload_timer_,
+                                ss_schedule_upload_task_,
+                                "SSUploader",
+                                "SSUploaderTimer",
+                                SS_TRY_SCHEDULE_UPLOAD_INTERVAL,
+                                true /* repeat */);
+    }
   }
 #endif // OB_BUILD_SHARED_STORAGE
   return ret;
@@ -154,7 +172,10 @@ int ObCheckPointService::stop()
     ss_update_ckpt_scn_timer_.stop();
     ss_update_ckpt_lsn_timer_.stop();
     ss_advance_ckpt_timer_.stop();
+
+    // stop ss_schedule_upload_timer_ before ss_sche_upload_thread_pool_
     ss_schedule_upload_timer_.stop();
+    ss_sche_upload_thread_pool_.stop();
   }
 #endif
 
@@ -172,7 +193,10 @@ void ObCheckPointService::wait()
     ss_update_ckpt_scn_timer_.wait();
     ss_update_ckpt_lsn_timer_.wait();
     ss_advance_ckpt_timer_.wait();
+
+    // wait ss_schedule_upload_timer_ before ss_sche_upload_thread_pool_
     ss_schedule_upload_timer_.wait();
+    ss_sche_upload_thread_pool_.wait();
   }
 #endif
   TG_WAIT(freeze_thread_.get_tg_id());
@@ -202,7 +226,10 @@ void ObCheckPointService::destroy()
     ss_update_ckpt_scn_timer_.destroy();
     ss_update_ckpt_lsn_timer_.destroy();
     ss_advance_ckpt_timer_.destroy();
+
+    // destroy ss_schedule_upload_timer_ before ss_sche_upload_thread_pool_
     ss_schedule_upload_timer_.destroy();
+    ss_sche_upload_thread_pool_.destroy();
   }
 #endif
 }
@@ -215,21 +242,61 @@ public:
     const ObLSID ls_id = ls.get_ls_id();
     ObCheckpointExecutor *checkpoint_executor = nullptr;
     ObDataCheckpoint *data_checkpoint = nullptr;
-    if (OB_ISNULL(data_checkpoint = ls.get_data_checkpoint())) {
-      ret = OB_ERR_UNEXPECTED;
-      STORAGE_LOG(WARN, "data_checkpoint should not be null", K(ret), K(ls_id));
-    } else if (OB_FAIL(data_checkpoint->check_can_move_to_active_in_newcreate())) {
-      STORAGE_LOG(WARN, "check can move to active failed", K(ret), K(ls_id));
-    } else if (OB_ISNULL(checkpoint_executor = ls.get_checkpoint_executor())) {
-      ret = OB_ERR_UNEXPECTED;
-      STORAGE_LOG(WARN, "checkpoint_executor should not be null", K(ls_id));
-    } else if (OB_FAIL(checkpoint_executor->update_clog_checkpoint())) {
-      STORAGE_LOG(WARN, "update_clog_checkpoint failed", K(ret), K(ls_id));
-    } else if (GCONF.enable_logservice) {
-      succ_ls_cnt_++;
-      STORAGE_LOG(DEBUG, "skip advance_local_clog_base_lsn_ in logservice mode", K(ls_id));
-    } else if (OB_FAIL(advance_local_clog_base_lsn_(ls))) {
-      STORAGE_LOG(WARN, "advance_local_clog_base_lsn_ failed", K(ret), K(ls_id));
+
+    if (ObReplicaTypeCheck::is_log_replica(ls.get_replica_type())) {
+      rootserver::ObTenantInfoLoader *tenant_info_loader = MTL(rootserver::ObTenantInfoLoader*);
+      share::SCN checkpoint_scn;
+      palf::LSN checkpoint_lsn;
+      // When clog recycle mode is strict (which is default value), we set clog recycle
+      // point at pure_readable_scn. But pure_readable_scn can not promoted when
+      // majority of F-replicas are down, thus making clog can not be recycled
+      // In this case, we can set clog strict recycle mode to false.
+      // When clog recycle mode is not strict, we set clog recycle point at sync_scn
+      // sync_scn can promoted when majority of F-replicas are down
+      bool is_strict_clog_recycle_mode = ObServerConfig::get_instance()._ob_enable_log_replica_strict_recycle_mode;
+      if (OB_ISNULL(tenant_info_loader)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("tenant_info_loader is null", KR(ret), KP(tenant_info_loader));
+      } else if (!is_strict_clog_recycle_mode) {
+        // not strict recycle mode, recycle clog based on sync_scn
+        if (OB_FAIL(tenant_info_loader->get_sync_scn(checkpoint_scn))) {
+          LOG_WARN("fail to get tenant sync scn", KR(ret));
+        }
+      } else {
+        // is strict recycle mode, recycle clog based on pure_readable_scn
+        if (OB_FAIL(tenant_info_loader->get_pure_readable_scn(checkpoint_scn))) {
+          LOG_WARN("fail to get tenant readable scn", KR(ret));
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(ls.get_log_handler()->locate_by_scn_coarsely(checkpoint_scn, checkpoint_lsn))) {
+        LOG_WARN("fail to convert scn to lsn", KR(ret), K(checkpoint_scn));
+      } else if (OB_FAIL(ls.set_clog_checkpoint(checkpoint_lsn, checkpoint_scn, true/*write_slog*/))) {
+        LOG_WARN("fail to set clog checkpoint", KR(ret), K(checkpoint_lsn), K(checkpoint_scn));
+      } else if (OB_FAIL(ls.get_log_handler()->advance_base_lsn(checkpoint_lsn))) {
+        LOG_WARN("fail to advance base lsn", KR(ret), K(checkpoint_lsn));
+      } else {
+        succ_ls_cnt_++;
+      }
+      FLOG_INFO("[CHECKPOINT] log replica update checkpoint", KR(ret), "tenant_id", MTL_ID(), K(ls.get_ls_id()),
+                K(checkpoint_lsn), K(checkpoint_scn), K(is_strict_clog_recycle_mode));
+    } else {
+      if (OB_ISNULL(data_checkpoint = ls.get_data_checkpoint())) {
+        ret = OB_ERR_UNEXPECTED;
+        STORAGE_LOG(WARN, "data_checkpoint should not be null", K(ret), K(ls_id));
+      } else if (OB_FAIL(data_checkpoint->check_can_move_to_active_in_newcreate())) {
+        STORAGE_LOG(WARN, "check can move to active failed", K(ret), K(ls_id));
+      } else if (OB_ISNULL(checkpoint_executor = ls.get_checkpoint_executor())) {
+        ret = OB_ERR_UNEXPECTED;
+        STORAGE_LOG(WARN, "checkpoint_executor should not be null", K(ls_id));
+      } else if (OB_FAIL(checkpoint_executor->update_clog_checkpoint())) {
+        STORAGE_LOG(WARN, "update_clog_checkpoint failed", K(ret), K(ls_id));
+      } else if (GCONF.enable_logservice) {
+        succ_ls_cnt_++;
+        STORAGE_LOG(DEBUG, "skip advance_local_clog_base_lsn_ in logservice mode", K(ls_id));
+      } else if (OB_FAIL(advance_local_clog_base_lsn_(ls))) {
+        STORAGE_LOG(WARN, "advance_local_clog_base_lsn_ failed", K(ret), K(ls_id));
+      }
     }
 
     iterated_ls_cnt_++;
@@ -300,7 +367,10 @@ public:
   {
     int ret = OB_SUCCESS;
     ObCheckpointExecutor *checkpoint_executor = nullptr;
-    if (OB_ISNULL(checkpoint_executor = ls.get_checkpoint_executor())) {
+
+    if (ObReplicaTypeCheck::is_log_replica(ls.get_replica_type())) {
+        // do nothing
+    } else if (OB_ISNULL(checkpoint_executor = ls.get_checkpoint_executor())) {
       ret = OB_ERR_UNEXPECTED;
       STORAGE_LOG(WARN, "checkpoint_executor should not be null", K(ls.get_ls_id()));
     } else if (OB_FAIL(checkpoint_executor->traversal_flush())) {
@@ -331,7 +401,10 @@ public:
     int ret = OB_SUCCESS;
     ObCheckpointExecutor *checkpoint_executor = ls.get_checkpoint_executor();
     ObDataCheckpoint *data_checkpoint = ls.get_data_checkpoint();
-    if (OB_ISNULL(checkpoint_executor) || OB_ISNULL(data_checkpoint)) {
+    if (ObReplicaTypeCheck::is_log_replica(ls.get_replica_type())) {
+      // do nothing
+      ++succ_ls_cnt_;
+    } else if (OB_ISNULL(checkpoint_executor) || OB_ISNULL(data_checkpoint)) {
       ret = OB_ERR_UNEXPECTED;
       STORAGE_LOG(WARN,
                   "checkpoint_executor or data_checkpoint should not be null",
@@ -386,6 +459,75 @@ void ObCheckPointService::ObCheckClogDiskUsageTask::runTimerTask()
 }
 
 #ifdef OB_BUILD_SHARED_STORAGE
+
+void ScheLSUploadTask::run()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ls_handle_.get_ls()->get_inc_sstable_uploader().try_schedule_upload_task())) {
+    STORAGE_LOG(WARN, "process ls fail", K(ret), K(ls_handle_.get_ls()->get_ls_id()));
+  }
+}
+
+int ObSSScheUploadThreadPool::push_task(ScheLSUploadTask *task)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(TG_PUSH_TASK(tg_id_, task))) {
+    LOG_WARN("fail to push task", K(ret));
+  }
+  return ret;
+}
+
+void ObSSScheUploadThreadPool::handle(void *task)
+{
+  STORAGE_LOG(DEBUG, "====== ss sche upload thread pool handle ======");
+  if (OB_ISNULL(task)) {
+    STORAGE_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "task is null", KP(task));
+  } else {
+    ScheLSUploadTask *sche_ls_upload_task = static_cast<ScheLSUploadTask *>(task);
+    (void)sche_ls_upload_task->run();
+    MTL_DELETE(ScheLSUploadTask, "ScheLSUploadTask", sche_ls_upload_task);
+  }
+}
+
+int ObSSScheUploadThreadPool::init()
+{
+  int ret = OB_SUCCESS;
+  STORAGE_LOG(INFO, "====== ss sche upload thread pool init ======");
+  if (OB_FAIL(TG_CREATE_TENANT(lib::TGDefIDs::SSScheduleUpload, tg_id_))) {
+    LOG_WARN("create tg failed", K(ret));
+  }
+  return ret;
+}
+
+int ObSSScheUploadThreadPool::start()
+{
+  int ret = OB_SUCCESS;
+  STORAGE_LOG(INFO, "====== ss sche upload thread pool start ======");
+  if (OB_FAIL(TG_SET_HANDLER_AND_START(tg_id_, *this))) {
+    LOG_WARN("fail to set handler and start", K(ret));
+  }
+  return ret;
+}
+
+void ObSSScheUploadThreadPool::stop()
+{
+  STORAGE_LOG(INFO, "====== ss sche upload thread pool stop ======");
+  TG_STOP(tg_id_);
+}
+
+void ObSSScheUploadThreadPool::wait()
+{
+  STORAGE_LOG(INFO, "====== ss sche upload thread pool wait ======");
+  TG_WAIT(tg_id_);
+}
+
+
+void ObSSScheUploadThreadPool::destroy()
+{
+  STORAGE_LOG(INFO, "====== ss sche upload thread pool destroy ======");
+  TG_DESTROY(tg_id_);
+}
+
 class UpdateSSCkptFunctorForMetaSvr : public ObIMetaFunction {
   OB_UNIS_VERSION(1);
 public:
@@ -402,36 +544,59 @@ public:
     } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
       ret = OB_ERR_UNEXPECTED;
       STORAGE_LOG(WARN, "log stream not exist", K(ret), K(ls_id_));
+    } else if (ObReplicaTypeCheck::is_log_replica(ls->get_replica_type())) {
+      // do nothing
     } else {
-      SCN ss_checkpoint_scn(ObScnRange::MAX_SCN);
-      SCN sslog_max_committed_scn(ObScnRange::MAX_SCN);
-      LSN ss_checkpoint_lsn;
-      PalfBaseInfo palf_meta;
+      SCN prev_ss_checkpoint_scn(ObScnRange::MAX_SCN);
+      LSN prev_ss_checkpoint_lsn;
+      LSN sn_checkpoint_lsn;
 
-      // NOTICE!!! : must get ss_rec_scn before get max_committed_meta_scn
       ObSSCheckpointExecutor &ss_ckpt_executor = ls->get_ss_checkpoint_executor();
-      if (OB_FAIL(ss_ckpt_executor.get_ss_rec_scn(ss_checkpoint_scn))) {
-        STORAGE_LOG(WARN, "get ss rec scn failed", KR(ret), KPC(ls));
-      } else if (OB_FAIL(ls->get_log_handler()->locate_by_scn_coarsely(ss_checkpoint_scn, ss_checkpoint_lsn))) {
-        STORAGE_LOG(WARN, "locate ss_checkpoint_lsn failed", KR(ret), KPC(ls));
-      } else if (OB_FAIL(MTL(ObSSMetaService *)->get_max_committed_meta_scn(ls_id_, sslog_max_committed_scn))) {
-        STORAGE_LOG(WARN, "get max comiitted meta scn failed", KR(ret), KPC(ls));
-      } else if (OB_FAIL(ls->get_palf_base_info(ss_checkpoint_lsn, palf_meta))) {
-        STORAGE_LOG(WARN, "get palf base info failed", KR(ret), KPC(ls));
-      } else if (OB_FAIL(ss_ls_meta.set_ss_ckpt_with_sslog_snapshot(
-                     ss_checkpoint_scn, ss_checkpoint_lsn, sslog_max_committed_scn))) {
-        STORAGE_LOG(WARN, "set ss checkpoint failed", KR(ret), KPC(ls));
-      } else if (OB_FAIL(ss_ls_meta.set_palf_meta(palf_meta))) {
-        STORAGE_LOG(WARN, "set palf meta failed", KR(ret), KPC(ls));
+      sn_checkpoint_lsn = ls->get_clog_base_lsn();
+      if (OB_FAIL(MTL(ObSSMetaService *)->get_ls_meta(ls_id_, ss_ls_meta))) {
+        STORAGE_LOG(WARN, "get ls meta failed", KR(ret), K(ss_ls_meta));
+      } else if (FALSE_IT(prev_ss_checkpoint_scn = ss_ls_meta.get_ss_checkpoint_scn())) {
+      } else if (FALSE_IT(prev_ss_checkpoint_lsn = ss_ls_meta.get_ss_base_lsn())) {
+      } else if (sn_checkpoint_lsn < prev_ss_checkpoint_lsn) {
+        FLOG_INFO("SSWriter changed. Current Replica is not catching up the latest clog.",
+                  K(sn_checkpoint_lsn),
+                  K(prev_ss_checkpoint_lsn));
       } else {
-        FLOG_INFO("finish update ss_checkpoint_scn",
-                  K(ls_id_),
-                  K(ss_checkpoint_scn),
-                  K(sslog_max_committed_scn),
-                  K(ss_checkpoint_lsn),
-                  K(palf_meta));
+        SCN ss_checkpoint_scn(ObScnRange::MAX_SCN);
+        LSN ss_checkpoint_lsn;
+        PalfBaseInfo palf_meta;
+        SCN transfer_scn;
+        ObLSTransferMetaInfo transfer_meta_info;
+        if (OB_FAIL(ss_ckpt_executor.get_ss_rec_scn(ss_checkpoint_scn))) {
+          STORAGE_LOG(WARN, "get ss rec scn failed", KR(ret), KPC(ls));
+        } else if (prev_ss_checkpoint_scn >= ss_checkpoint_scn) {
+          FLOG_INFO("finish update ss_checkpoint_scn: no need update because pre_ss_checkpoint_scn is larger or equal",
+                    K(ls_id_),
+                    K(prev_ss_checkpoint_scn),
+                    K(ss_checkpoint_scn));
+          ret = OB_SUCCESS;
+        } else if (OB_FAIL(ls->get_log_handler()->locate_by_scn_coarsely(ss_checkpoint_scn, ss_checkpoint_lsn))) {
+          STORAGE_LOG(WARN, "locate ss_checkpoint_lsn failed", KR(ret), KPC(ls));
+        } else if (OB_FAIL(ls->get_palf_base_info(ss_checkpoint_lsn, palf_meta))) {
+          STORAGE_LOG(WARN, "get palf base info failed", KR(ret), KPC(ls));
+        } else if (OB_FAIL(ls->get_transfer_meta(transfer_scn, transfer_meta_info))) {
+          STORAGE_LOG(WARN, "get transfer meta failed", KR(ret), KPC(ls));
+        } else if (OB_FAIL(ss_ls_meta.set_ss_checkpoint(ss_checkpoint_scn, ss_checkpoint_lsn))) {
+          STORAGE_LOG(WARN, "set ss checkpoint failed", KR(ret), KPC(ls));
+        } else if (OB_FAIL(ss_ls_meta.set_palf_meta(palf_meta))) {
+          STORAGE_LOG(WARN, "set palf meta failed", KR(ret), KPC(ls));
+        } else if (OB_FAIL(ss_ls_meta.set_transfer_meta(transfer_scn, transfer_meta_info))) {
+          STORAGE_LOG(WARN, "set transfer meta failed", KR(ret), KPC(ls));
+        } else {
+          FLOG_INFO("finish update ss_checkpoint_scn",
+                    K(ls_id_),
+                    K(ss_checkpoint_scn),
+                    K(ss_checkpoint_lsn),
+                    K(palf_meta),
+                    K(transfer_scn),
+                    K(transfer_meta_info));
+        }
       }
-
     }
     return ret;
   }
@@ -448,30 +613,140 @@ public:
   {
     int ret = OB_SUCCESS;
     const ObLSID ls_id = ls.get_ls_id();
-    ObSSMetaService *meta_svr = MTL(ObSSMetaService *);
-    UpdateSSCkptFunctorForMetaSvr func(ObIMetaFunction::MetaFuncType::UPDATE_SS_CKPT_FUNC, ls_id);
+    ObSSLSMeta ss_ls_meta;
+    LSN ss_checkpoint_lsn;
+    LSN sn_checkpoint_lsn = ls.get_clog_base_lsn();
 
-    ObSSWriterKey sswriter_key(ObSSWriterType::META, ls_id);
-    bool is_sswriter = false;
-    int64_t unused_epoch = 0;
-    if (OB_ISNULL(meta_svr)) {
-      ret = OB_ERR_UNEXPECTED;
-      STORAGE_LOG(WARN, "mtl MetaService should not be null", K(ret), K(MTL_ID()), KP(meta_svr));
-    } else if (OB_FAIL(MTL(ObSSWriterService *)->check_lease(sswriter_key, is_sswriter, unused_epoch))) {
-      STORAGE_LOG(WARN, "check lease fail", KR(ret), K(sswriter_key));
-    } else if (!is_sswriter) {
-      if (REACH_TIME_INTERVAL(10LL * 1000LL * 1000LL)) {
-        STORAGE_LOG(INFO, "this replica is not meta sswriter", K(is_sswriter));
-      }
-    } else if (OB_FAIL(meta_svr->update_ls_meta(ls_id, ObMetaUpdateReason::UPDATE_LS_SS_CHECKPOINT_SCN, func))) {
-      STORAGE_LOG_RET(WARN, 0, "update ls meta failed", KR(ret), K(ls));
+    if (OB_FAIL(MTL(ObSSMetaService *)->get_ls_meta(ls_id, ss_ls_meta))) {
+      STORAGE_LOG(WARN, "get ls meta failed", KR(ret), K(ss_ls_meta));
+    } else if (FALSE_IT(ss_checkpoint_lsn = ss_ls_meta.get_ss_base_lsn())) {
+    } else if (FALSE_IT(throttle_flush_if_needed(
+                   ss_ls_meta, sn_checkpoint_lsn, ss_checkpoint_lsn, ls))) {
+    } else if (sn_checkpoint_lsn < ss_checkpoint_lsn) {
+      FLOG_INFO("local ckpt less than ss ckpt", K(ls_id), K(sn_checkpoint_lsn), K(ss_checkpoint_lsn));
     } else {
-      // finish update ls meta
+      ObSSMetaService *meta_svr = MTL(ObSSMetaService *);
+      UpdateSSCkptFunctorForMetaSvr func(ObIMetaFunction::MetaFuncType::UPDATE_SS_CKPT_FUNC, ls_id);
+      ObSSWriterKey sswriter_key(ObSSWriterType::META, ls_id);
+      bool is_sswriter = false;
+      int64_t unused_epoch = 0;
+      if (OB_ISNULL(meta_svr)) {
+        ret = OB_ERR_UNEXPECTED;
+        STORAGE_LOG(WARN, "mtl MetaService should not be null", K(ret), K(MTL_ID()), KP(meta_svr));
+      } else if (OB_FAIL(MTL(ObSSWriterService *)->check_lease(sswriter_key, is_sswriter, unused_epoch))) {
+        STORAGE_LOG(WARN, "check lease fail", KR(ret), K(sswriter_key));
+      } else if (!is_sswriter) {
+        if (REACH_TIME_INTERVAL(10LL * 1000LL * 1000LL)) {
+          STORAGE_LOG(INFO, "this replica is not meta sswriter", K(is_sswriter));
+        }
+      } else if (OB_FAIL(meta_svr->update_ls_meta(ls_id, ObMetaUpdateReason::UPDATE_LS_SS_CHECKPOINT_SCN, func))) {
+        STORAGE_LOG_RET(WARN, 0, "update ls meta failed", KR(ret), K(ls));
+      } else {
+        // finish update ls meta
+      }
     }
-
     // returen OB_SUCCESS to iterate all logstreams
     return OB_SUCCESS;
   }
+
+private:
+  bool is_leader_(ObLS &ls)
+  {
+    int ret = OB_SUCCESS;
+    // set default value as leader because leader do not skip throttle
+    bool is_leader = true;
+    ObRole role;
+    int64_t proposal_id = 0;
+    if (OB_FAIL(ls.get_log_handler()->get_role(role, proposal_id))) {
+      LOG_WARN("get ls role failed", KR(ret), K(ls.get_ls_id()));
+    } else if (common::is_strong_leader(role)) {
+      is_leader = true;
+    } else {
+      is_leader = false;
+    }
+    return is_leader;
+  }
+
+#define PRINT_CKPT_INFO_WRAPPER                                                                   \
+  "ls_id", ls.get_ls_id(), K(sn_ckpt_lsn), K(ss_ckpt_lsn), K(sn_ckpt_scn), K(ss_ckpt_scn),        \
+      KTIME(sn_ckpt_scn.convert_to_ts()), KTIME(ss_ckpt_scn.convert_to_ts()), "SCN GAP(seconds)", \
+      scn_ts_gap / 1000 / 1000, "MAX LSN GAP(MB)", max_lsn_gap / 1024 / 1024
+  void throttle_flush_if_needed(const ObSSLSMeta &ss_ls_meta, LSN sn_ckpt_lsn, LSN ss_ckpt_lsn, ObLS &ls)
+  {
+    const bool prev_flush_disabled = ls.flush_is_disabled();
+    if (is_leader_(ls)) {
+      bool ckpt_lag_too_large = false;
+      // use 16GB as default lsn gap
+      int64_t max_lsn_gap = 16LL * 1024LL * 1024LL * 1024LL;
+      (void)MTL(ObTenantFreezer *)->get_tenant_memstore_limit(max_lsn_gap);
+      const int64_t config_trigger = ObTenantFreezer::get_freeze_trigger_percentage();
+      const int64_t freeze_trigger = config_trigger > 0 ? config_trigger : 20;
+      // use 1/8 freeze_trigger as lsn_gap
+      max_lsn_gap = max_lsn_gap * freeze_trigger / 100 / 8;
+
+      // get advance_checkpoint interval
+      int64_t advance_ckpt_interval = 10LL * 60LL * 1000LL * 1000LL; // default 10 minutes
+      omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+      if (tenant_config.is_valid()) {
+        advance_ckpt_interval = tenant_config->_ss_advance_checkpoint_interval;
+      }
+
+      const SCN sn_ckpt_scn = ls.get_clog_checkpoint_scn();
+      const SCN ss_ckpt_scn = ss_ls_meta.get_ss_checkpoint_scn();
+      const int64_t scn_ts_gap = (sn_ckpt_scn.convert_to_ts() - ss_ckpt_scn.convert_to_ts());
+
+      // Check if SSLOG_TABLE size exceeds meta tenant memory limit threshold
+      bool sslog_table_size_exceeded = false;
+      if (is_sys_tenant(MTL_ID()) || is_meta_tenant(MTL_ID())) {
+        // if disable the flush in sys or meta tenant, the size of the sslog table may not be reduced
+        // because it cannot meet the conditions required for minor compaction.
+      } else {
+        ObSSGarbageCollectorService *gc_service = MTL(ObSSGarbageCollectorService *);
+        if (OB_NOT_NULL(gc_service)) {
+          (void)gc_service->sslog_table_size_exceeded(sslog_table_size_exceeded);
+        }
+      }
+
+      if (!ls.get_inc_sstable_uploader().finish_reloading()) {
+        (void)ls.disable_flush();
+        FLOG_INFO("disable ls flush to wait uploader reloading", PRINT_CKPT_INFO_WRAPPER);
+      } else if (ls.get_inc_sstable_uploader().task_overflowed()) {
+        (void)ls.disable_flush();
+        FLOG_INFO("disable ls flush to handle current tasks", PRINT_CKPT_INFO_WRAPPER);
+      } else if (sslog_table_size_exceeded) {
+        (void)ls.disable_flush();
+        FLOG_INFO("disable ls flush because SSLOG_TABLE size exceeded meta tenant memory limit threshold",
+                  PRINT_CKPT_INFO_WRAPPER);
+      } else if ((sn_ckpt_lsn > ss_ckpt_lsn) && (sn_ckpt_lsn - ss_ckpt_lsn > max_lsn_gap) &&
+                 (scn_ts_gap > 2 * advance_ckpt_interval)) {
+        (void)ls.disable_flush();
+        ckpt_lag_too_large = true;
+        FLOG_INFO("disable ls flush to throttle writes and allow ss checkpoint to catch up with sn checkpoint",
+                  PRINT_CKPT_INFO_WRAPPER);
+      } else if (ls.flush_is_disabled()) {
+        (void)ls.enable_flush();
+        FLOG_INFO("enable ls flush", PRINT_CKPT_INFO_WRAPPER);
+      }
+    } else {
+      // this ls replica is not leader
+      if (ls.flush_is_disabled()) {
+        (void)ls.enable_flush();
+        FLOG_INFO("enable ls flush because this ls is not leader", K(ls.get_ls_id()));
+      }
+    }
+    const bool cur_flush_disabled = ls.flush_is_disabled();
+    if (prev_flush_disabled != cur_flush_disabled) {
+      const char* INFO = "Disable flush state change";
+      ADD_SS_DIAGNOSE_INFO(ObSSDiagnoseInfo::DIA_TYPE_SS_CKPT,
+                           ls.get_ls_id(),
+                           ObTabletID(0),
+                           ObClockGenerator::getClock(),
+                           K(INFO),
+                           K(prev_flush_disabled),
+                           K(cur_flush_disabled));
+    }
+  }
+#undef  PRINT_CKPT_INFO_WRAPPER
 };
 
 void ObCheckPointService::ObSSUpdateCkptSCNTask::runTimerTask()
@@ -492,21 +767,136 @@ public:
   int operator()(ObLS &ls)
   {
     int ret = OB_SUCCESS;
+
     ObSSLSMeta ss_ls_meta;
-    if (OB_FAIL(MTL(ObSSMetaService *)->get_ls_meta(ls.get_ls_id(), ss_ls_meta))) {
-      STORAGE_LOG(ERROR, "get ls meta failed", KR(ret), K(ss_ls_meta));
+    SCN min_checkpoint_scn_from_cn;
+    const ObLSID ls_id = ls.get_ls_id();
+    if (!is_ls_leader_(ls)) {
+      STORAGE_LOG(INFO, "current replica is not ls leader, no need advance base lsn", K(ls_id));
+    } else if (OB_FAIL(MTL(ObSSMetaService *)->get_ls_meta(ls_id, ss_ls_meta))) {
+      STORAGE_LOG(WARN, "get ls meta failed", KR(ret), K(ls_id),K(ss_ls_meta));
+    } else if (OB_FAIL(get_min_clog_checkpoint_scn_from_compute_node_(ls, min_checkpoint_scn_from_cn))) {
+      STORAGE_LOG(WARN, "get min clog checkpoint scn from compute nodes failed", KR(ret), K(ls_id));
     } else {
-      palf::LSN checkpoint_lsn = ss_ls_meta.get_ss_base_lsn();
-      if (OB_FAIL(ls.get_log_handler()->advance_base_lsn(checkpoint_lsn))) {
-        STORAGE_LOG(WARN, "advance base lsn failed", K(ret), K(checkpoint_lsn));
-      } else {
-        FLOG_INFO("[CHECKPOINT] advance palf base lsn successfully", K(checkpoint_lsn), K(ls.get_ls_id()));
+      SCN delay_recycle_checkpoint_scn;
+      LSN ss_clog_recycle_lsn;
+      // Delay clog recycling to avoid rebuilding
+      int64_t clog_recycle_delay_time_us = 10LL * 60LL * 1000LL * 1000LL; // default 10 minutes
+      omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+      if (tenant_config.is_valid()) {
+        clog_recycle_delay_time_us = tenant_config->_ss_clog_retention_period;
       }
+
+      SCN base_scn = MIN(ss_ls_meta.get_ss_checkpoint_scn(), min_checkpoint_scn_from_cn);
+      int64_t delay_recycle_ts_us = base_scn.convert_to_ts() - clog_recycle_delay_time_us;
+      if (delay_recycle_ts_us < 0) {
+        delay_recycle_ts_us = 0;
+      }
+
+      delay_recycle_checkpoint_scn.convert_from_ts(delay_recycle_ts_us);
+      if (OB_FAIL(ls.get_log_handler()->locate_by_scn_coarsely(delay_recycle_checkpoint_scn, ss_clog_recycle_lsn))) {
+        STORAGE_LOG(WARN, "locate lsn failed", K(ret), KTIME(delay_recycle_ts_us), K(ss_clog_recycle_lsn));
+      } else if (OB_FAIL(ls.get_log_handler()->advance_base_lsn(ss_clog_recycle_lsn))) {
+        STORAGE_LOG(WARN, "advance base lsn failed", K(ret), K(ss_clog_recycle_lsn));
+      } else {
+        FLOG_INFO("[CHECKPOINT] advance palf base lsn successfully",
+                  K(base_scn),
+                  KTIME(delay_recycle_ts_us),
+                  K(delay_recycle_checkpoint_scn),
+                  K(ss_clog_recycle_lsn),
+                  K(ls_id));
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+      FLOG_INFO("[CHECKPOINT] advance palf base lsn fail", KR(ret), K(ls_id));
     }
 
     // returen OB_SUCCESS to iterate all logstreams
     return OB_SUCCESS;
   }
+private:
+  bool is_ls_leader_(ObLS &ls)
+  {
+    int ret = OB_SUCCESS;
+    // set default value as leader because leader do not skip throttle
+    bool is_leader = true;
+    ObRole role;
+    int64_t proposal_id = 0;
+    if (OB_FAIL(ls.get_log_handler()->get_role(role, proposal_id))) {
+      LOG_WARN("get ls role failed", KR(ret), K(ls.get_ls_id()));
+    } else if (common::is_strong_leader(role)) {
+      is_leader = true;
+    } else {
+      is_leader = false;
+    }
+    return is_leader;
+  }
+
+
+  int get_min_clog_checkpoint_scn_from_compute_node_(ObLS &ls, SCN &min_clog_checkpoint_scn)
+  {
+    int ret = OB_SUCCESS;
+    min_clog_checkpoint_scn.set_max();
+    const uint64_t tenant_id = MTL_ID();
+    const ObLSID ls_id = ls.get_ls_id();
+
+    common::ObMemberList member_list;
+    int64_t paxos_replica_num = 0;
+    common::GlobalLearnerList learner_list;
+    obrpc::ObSSCkptRpcProxy ss_ckpt_rpc_proxy;
+    ObSSRpcCollectCNClogCkptArg arg(tenant_id, ls_id);
+    if (OB_FAIL(ls.get_log_handler()->get_paxos_member_list_and_learner_list(
+            member_list, paxos_replica_num, learner_list))) {
+      LOG_WARN("get paxos member list and learner list failed", KR(ret), K(tenant_id), K(ls_id));
+    } else if (OB_FAIL(GCTX.net_frame_->get_proxy(ss_ckpt_rpc_proxy))) {
+      STORAGE_LOG(WARN, "get proxy failed", KR(ret), K(ls_id), K(arg));
+    } else {
+      // collect checkpoint scn from paxos members
+      for (int64_t i = 0; i < member_list.get_member_number() && OB_SUCC(ret); ++i) {
+        ObAddr server;
+        ObSSRpcCollectCNClogCkptResult result;
+        if (OB_FAIL(member_list.get_server_by_index(i, server))) {
+          STORAGE_LOG(WARN, "get server by index from member_list failed", KR(ret), K(i), K(ls_id));
+        } else if (OB_FAIL(ss_ckpt_rpc_proxy.to(server).by(tenant_id).collect_cn_clog_ckpt(arg, result))) {
+          STORAGE_LOG(WARN, "post rpc collect cn clog ckpt failed", KR(ret), K(ls_id), K(server), K(arg));
+        } else if (OB_FAIL(result.ret_code_)) {
+          STORAGE_LOG(WARN, "collect cn clog ckpt failed", KR(ret), K(ls_id), K(server), K(arg), K(result));
+        } else {
+          min_clog_checkpoint_scn = MIN(min_clog_checkpoint_scn, result.clog_checkpoint_scn_);
+          FLOG_INFO("finish get clog_checkpoint_scn from one paxos member",
+                    K(ls_id),
+                    K(server),
+                    K(result),
+                    K(min_clog_checkpoint_scn));
+        }
+      }
+      // collect checkpoint scn from learners
+      for (int64_t i = 0; i < learner_list.get_member_number() && OB_SUCC(ret); ++i) {
+        ObAddr server;
+        ObSSRpcCollectCNClogCkptResult result;
+        if (OB_FAIL(learner_list.get_server_by_index(i, server))) {
+          STORAGE_LOG(WARN, "get server by index from learner_list failed", KR(ret), K(i), K(ls_id));
+        } else if (OB_FAIL(ss_ckpt_rpc_proxy.to(server).by(tenant_id).collect_cn_clog_ckpt(arg, result))) {
+          STORAGE_LOG(WARN, "post rpc collect cn clog ckpt failed", KR(ret), K(ls_id), K(server), K(arg));
+        } else if (OB_FAIL(result.ret_code_)) {
+          STORAGE_LOG(WARN, "collect cn clog ckpt failed", KR(ret), K(ls_id), K(server), K(arg), K(result));
+        } else {
+          min_clog_checkpoint_scn = MIN(min_clog_checkpoint_scn, result.clog_checkpoint_scn_);
+          FLOG_INFO("finish get clog_checkpoint_scn from one learner",
+                    K(ls_id),
+                    K(server),
+                    K(result),
+                    K(min_clog_checkpoint_scn));
+        }
+      }
+    }
+
+    return ret;
+  }
+
+private:
+  obrpc::ObSSCkptRpcProxy ss_ckpt_rpc_proxy_;
 };
 
 void ObCheckPointService::ObSSUpdateCkptLSNTask::runTimerTask()
@@ -529,45 +919,90 @@ public:
   int operator()(ObLS &ls)
   {
     int ret = OB_SUCCESS;
-    if (OB_FAIL(ls.advance_checkpoint_by_flush(
+    if (ls.flush_is_disabled()) {
+      FLOG_INFO("memtable flush is disabled, skip advance checkpoint once", K(ls.get_ls_id()));
+    } else if (OB_FAIL(ls.advance_checkpoint_by_flush(
             SCN::max_scn(), INT64_MAX /*timeout*/, false /*is_tenant_freeze*/, ObFreezeSourceFlag::CLOG_CHECKPOINT))) {
       STORAGE_LOG(WARN, "flush ls to recycle clog failed", KR(ret), K(ls));
     }
 
-    // returen OB_SUCCESS to iterate all logstreams
+    // return OB_SUCCESS to iterate all logstreams
     return OB_SUCCESS;
   }
 };
 
 void ObCheckPointService::ObSSAdvanceCkptTask::runTimerTask()
 {
-  int ret = OB_SUCCESS;
   STORAGE_LOG(INFO, "====== SS Advance Checkpoint Task ======");
+  int ret = OB_SUCCESS;
   INIT_TRACE_GUARD;
-  SSAdvanceCkptFunctorForLS advance_ckpt_func_for_ls;
-  if (OB_FAIL(MTL(ObLSService *)->foreach_ls(advance_ckpt_func_for_ls))) {
-    STORAGE_LOG(WARN, "for each ls functor failed", KR(ret));
+
+  // set 10 minutes as default value
+  int64_t advance_checkpoint_interval = 10LL * 60LL * 1000LL * 1000LL;
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+  if (tenant_config.is_valid()) {
+    // use config value if config is valid
+    advance_checkpoint_interval = tenant_config->_ss_advance_checkpoint_interval;
+  }
+
+  const int64_t current_ts = ObClockGenerator::getClock();
+  const int64_t prev_ss_advance_ckpt_task_ts = MTL(ObCheckPointService *)->prev_ss_advance_ckpt_task_ts();
+  if (current_ts - prev_ss_advance_ckpt_task_ts > advance_checkpoint_interval) {
+    SSAdvanceCkptFunctorForLS advance_ckpt_func_for_ls;
+    if (OB_FAIL(MTL(ObLSService *)->foreach_ls(advance_ckpt_func_for_ls))) {
+      STORAGE_LOG(WARN, "for each ls functor failed", KR(ret));
+    } else {
+      MTL(ObCheckPointService *)->set_prev_ss_advance_ckpt_task_ts(current_ts);
+    }
+  } else {
+    STORAGE_LOG(INFO,
+                "skip advance checkpoint because interval is not reached",
+                K(advance_checkpoint_interval),
+                KTIME(current_ts),
+                KTIME(prev_ss_advance_ckpt_task_ts));
   }
 }
 
-struct ScheduleUploadFunctorForLS {
+struct ScheduleParallelUploadFunctor {
 public:
+  ScheduleParallelUploadFunctor(ObCheckPointService &host_ckpt_sv) : host_ckpt_sv_(host_ckpt_sv) {}
   int operator()(ObLS &ls)
   {
     int ret = OB_SUCCESS;
-    if (OB_FAIL(ls.get_inc_sstable_upload_handler().try_schedule_upload_task())) {
-      STORAGE_LOG(WARN, "process ls fail", K(ret), K(ls.get_ls_id()));
+    void *task_buffer = nullptr;
+    if (ls.get_inc_sstable_uploader().is_processing()) {
+      STORAGE_LOG(INFO, "skip push new upload task because uploader is processing", K(ls.get_ls_id()));
+    } else if (OB_ISNULL(task_buffer = mtl_malloc(sizeof(ScheLSUploadTask), "ScheLSUpload"))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      STORAGE_LOG(WARN, "allocate sche_ls_upload_task failed", K(ret), K(ls.get_ls_id()));
+    } else {
+      ScheLSUploadTask *sche_ls_upload_task = new (task_buffer) ScheLSUploadTask();
+      // hold ls handle to avoid ls being destroyed
+      if (OB_FAIL(MTL(ObLSService *)->get_ls(ls.get_ls_id(), sche_ls_upload_task->ls_handle(), ObLSGetMod::STORAGE_MOD))) {
+        STORAGE_LOG(WARN, "get ls failed", K(ret), K(ls.get_ls_id()));
+      } else if (OB_FAIL(host_ckpt_sv_.ss_sche_upload_thread_pool().push_task(sche_ls_upload_task))) {
+        STORAGE_LOG(WARN, "push sche_ls_upload_task failed", K(ret), K(ls.get_ls_id()));
+      }
+
+      if (OB_FAIL(ret)) {
+        sche_ls_upload_task->~ScheLSUploadTask();
+        mtl_free(sche_ls_upload_task);
+        sche_ls_upload_task = nullptr;
+      }
     }
 
     // returen OB_SUCCESS to iterate all logstreams
     return OB_SUCCESS;
   }
+
+public:
+  ObCheckPointService &host_ckpt_sv_;
 };
 
 void ObCheckPointService::ObSSScheduleIncUploadTask::runTimerTask()
 {
   int ret = OB_SUCCESS;
-  ScheduleUploadFunctorForLS schedule_upload_func;
+  ScheduleParallelUploadFunctor schedule_upload_func(host_ckpt_sv_);
   if (OB_FAIL(MTL(ObLSService *)->foreach_ls(schedule_upload_func))) {
     STORAGE_LOG(WARN, "for each ls functor failed", KR(ret));
   }

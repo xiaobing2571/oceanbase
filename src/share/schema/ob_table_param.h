@@ -22,6 +22,7 @@
 #include "sql/engine/basic/ob_pushdown_filter.h"
 #include "src/storage/meta_mem/ob_fixed_meta_obj_array.h"
 #include "src/storage/access/ob_table_read_info.h"
+#include "share/schema/ob_schema_struct_fts.h"
 
 namespace oceanbase
 {
@@ -31,6 +32,7 @@ class ObTableReadInfo;
 }
 namespace share
 {
+class ObAggrParamProperty;
 namespace schema
 {
 // A customized hash map to store schema information in plan
@@ -311,6 +313,7 @@ public:
                   const common::ObIArray<uint64_t> &output_column_ids,
                   const common::ObIArray<uint64_t> &aggregate_column_ids,
                   const common::ObIArray<uint64_t> &group_by_column_ids,
+                  const common::ObIArray<ObAggrParamProperty> &aggregate_param_props,
                   const sql::ObStoragePushdownFlag &pd_pushdown_flag);
   // convert right table scan parameter of join MV scan.
   // (right table index back not supported)
@@ -336,20 +339,25 @@ public:
   inline bool is_normal_cgs_at_the_end() const { return is_normal_cgs_at_the_end_; }
   inline bool is_enable_semistruct_encoding() const { return is_enable_semistruct_encoding_; }
   inline void set_is_enable_semistruct_encoding(const bool v) { is_enable_semistruct_encoding_ = v; }
+  inline void set_plan_enable_rich_format(const bool enable) { plan_enable_rich_format_ = enable; }
+  inline bool plan_enable_rich_format() const { return plan_enable_rich_format_; }
   inline const common::ObIArray<int32_t> &get_rowid_projector() const { return rowid_projector_; }
   inline const common::ObIArray<int32_t> &get_output_projector() const { return output_projector_; }
   inline const common::ObIArray<int32_t> &get_aggregate_projector() const { return aggregate_projector_; }
   inline const common::ObIArray<int32_t> &get_group_by_projector() const { return group_by_projector_; }
   inline const common::ObIArray<bool> &get_output_sel_mask() const { return output_sel_mask_; }
   inline const common::ObIArray<int32_t> &get_pad_col_projector() const { return pad_col_projector_; }
+  inline const common::ObIArray<ObAggrParamProperty> &get_aggr_param_props() const { return aggregate_param_props_; }
   inline void disable_padding() { pad_col_projector_.reset(); }
   inline const storage::ObTableReadInfo &get_read_info() const { return main_read_info_; }
   inline const ObString &get_parser_name() const { return parser_name_; }
   inline const ObString &get_parser_property() const { return parser_properties_; }
+  inline ObFTSIndexType get_fts_index_type() const { return fts_index_type_; }
   inline const common::ObIArray<storage::ObTableReadInfo *> *get_cg_read_infos() const
   { return cg_read_infos_.empty() ? nullptr : &cg_read_infos_; }
-  inline bool is_filter_on_lob_column() const { return has_lob_column_pushdown_; }
-
+  inline bool is_safe_filter_with_di() const { return is_safe_filter_with_di_; }
+  inline int8_t get_access_virtual_col_cnt() const { return access_virtual_col_cnt_; }
+  inline ObMergeEngineType get_merge_engine_type() const { return merge_engine_type_; }
   DECLARE_TO_STRING;
 
   static int convert_column_schema_to_param(const ObColumnSchemaV2 &column_schema,
@@ -360,7 +368,9 @@ public:
   static int deserialize_columns(const char *buf, const int64_t data_len,
                                  int64_t &pos, Columns &columns, common::ObIAllocator &allocator);
   static int alloc_column(common::ObIAllocator &allocator, ObColumnParam *& col_ptr);
-  int check_lob_column_pushdown(sql::ObPushdownFilterNode &pushdown_filters);
+  int check_is_safe_filter_with_di(const common::ObIArray<sql::ObRawExpr *> &exprs,
+                                   sql::ObPushdownFilterNode &pushdown_filters);
+  inline ObTableType get_table_type() const { return table_type_; }
 private:
   int construct_columns_and_projector(const ObTableSchema &table_schema,
                                       const common::ObIArray<uint64_t> &output_column_ids,
@@ -422,6 +432,7 @@ private:
   Projector rowid_projector_;
   ObString parser_name_;
   ObString parser_properties_;
+  ObFTSIndexType fts_index_type_;
   // if min cluster version < 4.1 use lob locator v1, else use lob locator v2.
   // use enable_lob_locator_v2_ to avoid locator type sudden change while table scan is running
   bool enable_lob_locator_v2_;
@@ -436,8 +447,13 @@ private:
   // for read time query check of mview
   bool is_mlog_table_;
   bool is_enable_semistruct_encoding_;
-  // for delete_insert, whether lob columns included in pushdown filters
-  bool has_lob_column_pushdown_;
+  bool is_safe_filter_with_di_;
+  int8_t access_virtual_col_cnt_;
+  common::ObFixedArray<ObAggrParamProperty, common::ObIAllocator> aggregate_param_props_;
+  // whether the whole plan use rich format, table scan may not use new format, but the whole plan uses new format
+  bool plan_enable_rich_format_;
+  ObTableType table_type_;
+  ObMergeEngineType merge_engine_type_;
 };
 } //namespace schema
 } //namespace share

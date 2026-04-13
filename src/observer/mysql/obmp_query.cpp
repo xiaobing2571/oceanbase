@@ -187,8 +187,6 @@ int ObMPQuery::process()
         retry_ctrl_.set_sys_global_schema_version(sys_version);
         session.partition_hit().reset();
         session.set_pl_can_retry(true);
-        session.set_enable_mysql_compatible_dates(
-          session.get_enable_mysql_compatible_dates_from_config());
 
         bool has_more = false;
         bool force_sync_resp = false;
@@ -215,6 +213,9 @@ int ObMPQuery::process()
           // 进入本分支，说明push_back出错，OOM，委托外层代码返回错误码
           // 且进入此分支之后，要断连接
           need_response_error = true;
+          if (OB_ERR_PARSE_SQL == ret) {
+            need_disconnect = false;
+          }
         } else if (OB_UNLIKELY(queries.count() <= 0)) {
           ret = OB_ERR_UNEXPECTED;
           need_response_error = true;//进入此分支之后，要断连接，极其严重错误
@@ -448,7 +449,6 @@ int ObMPQuery::try_batched_multi_stmt_optimization(sql::ObSQLSessionInfo &sessio
   return ret;
 }
 
-ERRSIM_POINT_DEF(ERRSIM_BEGIN_COMMIT_OPT_DISABLE)
 int ObMPQuery::process_single_stmt(const ObMultiStmtItem &multi_stmt_item,
                                    ObSMConnection *conn,
                                    ObSQLSessionInfo &session,
@@ -458,7 +458,74 @@ int ObMPQuery::process_single_stmt(const ObMultiStmtItem &multi_stmt_item,
                                    bool &need_disconnect)
 {
   int ret = OB_SUCCESS;
+  const bool enable_mem_perf = session.is_user_session() && session.get_optimizer_tracer().enable_mem_perf();
+  if (!enable_mem_perf) {
+    ret = do_process_single_stmt(multi_stmt_item,
+                                 conn,
+                                 session,
+                                 has_more_result,
+                                 force_sync_resp,
+                                 async_resp_used,
+                                 need_disconnect);
+  } else {
+    ret = process_with_mem_perf(multi_stmt_item,
+                                conn,
+                                session,
+                                has_more_result,
+                                force_sync_resp,
+                                async_resp_used,
+                                need_disconnect);
+  }
+  return ret;
+}
+
+int ObMPQuery::process_with_mem_perf(const ObMultiStmtItem &multi_stmt_item,
+                                     ObSMConnection *conn,
+                                     ObSQLSessionInfo &session,
+                                     bool has_more_result,
+                                     bool force_sync_resp,
+                                     bool &async_resp_used,
+                                     bool &need_disconnect)
+{
+  int ret = OB_SUCCESS;
+  int64_t last_mem_usage = session.get_raw_audit_record().request_memory_used_;
+  observer::ObMemPerfCallback mpcb(session.get_optimizer_tracer());
+  ObSQLSessionInfo *session_info = &session;
+  BEGIN_MEM_PERF(session_info);
+  {
+    lib::ObMallocCallbackGuard guard(mpcb);
+    int tmp_ret = OB_SUCCESS;
+
+    ret = do_process_single_stmt(multi_stmt_item,
+                                 conn,
+                                 session,
+                                 has_more_result,
+                                 force_sync_resp,
+                                 async_resp_used,
+                                 need_disconnect);
+    MEM_TRACE("memory stat", K(last_mem_usage),
+                             "cur_mem_usage", session.get_raw_audit_record().request_memory_used_,
+                             K(mpcb.cur_used_), K(mpcb.max_used_),
+                             K(mpcb.total_used_), K(mpcb.total_freed_));
+    MEM_TRACE("malloc_callback", (void*)malloc_callback, "mpcb", (void*)(&mpcb));
+  }
+  END_MEM_PERF(session_info);
+  return ret;
+}
+
+ERRSIM_POINT_DEF(ERRSIM_BEGIN_COMMIT_OPT_DISABLE)
+int ObMPQuery::do_process_single_stmt(const ObMultiStmtItem &multi_stmt_item,
+                                      ObSMConnection *conn,
+                                      ObSQLSessionInfo &session,
+                                      bool has_more_result,
+                                      bool force_sync_resp,
+                                      bool &async_resp_used,
+                                      bool &need_disconnect)
+{
+  int ret = OB_SUCCESS;
   FLTSpanGuard(mpquery_single_stmt);
+  ObReqTimeGuard req_timeinfo_guard;
+  ObMemPerfGuard mem_perf_guard("mpquery_single_stmt");
   ctx_.spm_ctx_.reset();
   bool need_response_error = true;
   session.get_raw_audit_record().request_memory_used_ = 0;
@@ -500,7 +567,6 @@ int ObMPQuery::process_single_stmt(const ObMultiStmtItem &multi_stmt_item,
       //每次执行不同sql都需要更新
       ctx_.self_add_plan_ = false;
       retry_ctrl_.reset_retry_times();//每个statement单独记录retry times
-      oceanbase::lib::Thread::WaitGuard guard(oceanbase::lib::Thread::WAIT_FOR_LOCAL_RETRY);
       do {
         ret = OB_SUCCESS; //当发生本地重试的时候，需要重置错误码，不然无法推进重试
         need_disconnect = true;
@@ -563,7 +629,7 @@ int ObMPQuery::process_single_stmt(const ObMultiStmtItem &multi_stmt_item,
   //对于tracelog的处理，不影响正常逻辑，错误码无须赋值给ret
   int tmp_ret = OB_SUCCESS;
   //清空WARNING BUFFER
-  tmp_ret = do_after_process(session, ctx_, async_resp_used);
+  tmp_ret = do_after_process(session, async_resp_used);
 
   // 设置上一条语句的结束时间，由于这里只用于实现事务内部的语句之间的执行超时，
   // 因此，首先，需要判断是否处于事务执行的过程中。然后对于事务提交的时候的异步回包,
@@ -581,6 +647,7 @@ int ObMPQuery::process_single_stmt(const ObMultiStmtItem &multi_stmt_item,
         !ctx_.multi_stmt_item_.is_batched_multi_stmt()) {
     send_error_packet(ret, NULL);
   }
+  ctx_.spm_ctx_.reset();
   ctx_.reset();
   return ret;
 }
@@ -728,6 +795,10 @@ OB_INLINE int ObMPQuery::do_process_trans_ctrl(ObSQLSessionInfo &session,
     is_rollback = true;
   }
   single_process_timestamp_ = ObTimeUtility::current_time();
+  //if single_process_timestamp_ is set and session is killed when set session active,
+  //exec_start_timestamp_ will not be set, so get plan time and execute time in sql audit will be wrong.
+  //so set exec_start_timestamp_ to single_process_timestamp_ here.
+  exec_start_timestamp_ = single_process_timestamp_;
   /* !!!
    * 注意req_timeinfo_guard一定要放在result前面
    * !!!
@@ -758,6 +829,7 @@ OB_INLINE int ObMPQuery::do_process_trans_ctrl(ObSQLSessionInfo &session,
       sqlstat_record.set_is_in_retry(false);
       session.sql_sess_record_sql_stat_start_value(sqlstat_record);
     }
+    session.set_retry_wait_event_begin_time();
     ctx_.enable_sql_resource_manage_ = true;
     if (OB_FAIL(set_session_active(sql, session, single_process_timestamp_))) {
       LOG_WARN("fail to set session active", K(ret));
@@ -774,6 +846,7 @@ OB_INLINE int ObMPQuery::do_process_trans_ctrl(ObSQLSessionInfo &session,
 
       // exec cmd
       FLTSpanGuard(sql_execute);
+      ObMemPerfGuard mem_perf_guard("sql_execute");
       if (OB_FAIL(process_trans_ctrl_cmd(session,
                                          need_disconnect,
                                          async_resp_used,
@@ -818,7 +891,7 @@ OB_INLINE int ObMPQuery::do_process_trans_ctrl(ObSQLSessionInfo &session,
 
     // some statistics must be recorded for plan stat, even though sql audit disabled
     bool first_record = (1 == audit_record.try_cnt_);
-    ObExecStatUtils::record_exec_timestamp(*this, first_record, audit_record.exec_timestamp_);
+    ObExecStatUtils::record_exec_timestamp(*this, first_record, audit_record.exec_timestamp_, async_resp_used);
     audit_record.exec_timestamp_.update_stage_time();
 
     // store the warning message from the most recent statement in the current session
@@ -872,11 +945,16 @@ OB_INLINE int ObMPQuery::do_process_trans_ctrl(ObSQLSessionInfo &session,
     MEMCPY(audit_record.sql_id_, ctx_.sql_id_, (int32_t)sizeof(audit_record.sql_id_));
     MEMCPY(audit_record.format_sql_id_, ctx_.format_sql_id_, (int32_t)sizeof(audit_record.format_sql_id_));
     audit_record.format_sql_id_[common::OB_MAX_SQL_ID_LENGTH] = '\0';
+    audit_record.sql_ = const_cast<char *>(session.get_current_query_string().ptr());
+    audit_record.sql_len_ = min(session.get_current_query_string().length(), session.get_tenant_query_record_size_limit());
+    audit_record.sql_cs_type_ = session.get_local_collation_connection();
 
     if (OB_FAIL(ret) && audit_record.trans_id_ == 0) {
       // normally trans_id is set in the `start-stmt` phase,
       // if `start-stmt` hasn't run, set trans_id from session if an active txn exist
-      audit_record.trans_id_ = session.get_tx_id();
+      if (session.is_in_transaction()) {
+        audit_record.trans_id_ = session.get_tx_id();
+      }
     }
     // for begin/commit/rollback, the following values are 0
     audit_record.affected_rows_ = 0;
@@ -951,13 +1029,7 @@ int ObMPQuery::process_trans_ctrl_cmd(ObSQLSessionInfo &session,
       need_end_trans_callback = true;
     }
 
-#ifndef OB_BUILD_SPM
     bool need_trans_cb  = need_end_trans_callback && (!force_sync_resp);
-#else
-    bool need_trans_cb  = need_end_trans_callback &&
-                          (!force_sync_resp) &&
-                          (!ctx_.spm_ctx_.check_execute_status_);
-#endif
     if (need_trans_cb) {
       is_async_end_trans = true;
       ObSqlEndTransCb &sql_end_cb = session.get_mysql_end_trans_cb();
@@ -1013,6 +1085,10 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
     GCONF.enable_sql_audit && session.get_local_ob_enable_sql_audit();
   const bool enable_sqlstat = session.is_sqlstat_enabled();
   single_process_timestamp_ = ObTimeUtility::current_time();
+  //if single_process_timestamp_ is set and session is killed when set session active,
+  //exec_start_timestamp_ will not be set, so get plan time and execute time in sql audit will be wrong.
+  //so set exec_start_timestamp_ to single_process_timestamp_ here.
+  exec_start_timestamp_ = single_process_timestamp_;
   /* !!!
    * 注意req_timeinfo_guard一定要放在result前面
    * !!!
@@ -1026,7 +1102,11 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
   SQL_INFO_GUARD(sql, session.get_cur_sql_id());
   ObIAllocator &allocator = CURRENT_CONTEXT->get_arena_allocator();
   SMART_VAR(ObMySQLResultSet, result, session, allocator) {
-    if (OB_FAIL(get_tenant_schema_info_(session.get_effective_tenant_id(),
+    ObString audit_sql;
+    ObString truncate_sql(min(sql.length(), session.get_tenant_query_record_size_limit()), sql.ptr());
+    if (enable_sql_audit && OB_FAIL(ob_write_string(allocator, truncate_sql, audit_sql))) {
+      LOG_WARN("fail to write sql to audit_sql", K(ret));
+    } else if (OB_FAIL(get_tenant_schema_info_(session.get_effective_tenant_id(),
                                         &cached_schema_info,
                                         schema_guard,
                                         tenant_version,
@@ -1062,6 +1142,7 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
         sqlstat_record.set_is_in_retry(session.get_is_in_retry());
         session.sql_sess_record_sql_stat_start_value(sqlstat_record);
       }
+      session.set_retry_wait_event_begin_time();
       result.set_has_more_result(has_more_result);
       ObTaskExecutorCtx &task_ctx = result.get_exec_context().get_task_exec_ctx();
       task_ctx.schema_service_ = gctx_.schema_service_;
@@ -1112,13 +1193,16 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
       } else {
         //监控项统计开始
         exec_start_timestamp_ = ObTimeUtility::current_time();
+        plan = result.get_physical_plan();
+        if (OB_NOT_NULL(plan)) {
+          plan->stat_.set_executing_record(exec_start_timestamp_);
+        }
         result.get_exec_context().set_plan_start_time(exec_start_timestamp_);
         // 本分支内如果出错，全部会在response_result内部处理妥当
         // 无需再额外处理回复错误包
         need_response_error = false;
         is_diagnostics_stmt = ObStmt::is_diagnostic_stmt(result.get_literal_stmt_type());
         ctx_.is_show_trace_stmt_ = ObStmt::is_show_trace_stmt(result.get_literal_stmt_type());
-        plan = result.get_physical_plan();
 
         if (get_is_com_filed_list()) {
           result.set_is_com_filed_list();
@@ -1166,10 +1250,13 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
 
       //监控项统计结束
       exec_end_timestamp_ = ObTimeUtility::current_time();
+      if (OB_NOT_NULL(plan)) {
+        plan->stat_.erase_executing_record(exec_start_timestamp_);
+      }
 
       // some statistics must be recorded for plan stat, even though sql audit disabled
       bool first_record = (1 == audit_record.try_cnt_);
-      ObExecStatUtils::record_exec_timestamp(*this, first_record, audit_record.exec_timestamp_);
+      ObExecStatUtils::record_exec_timestamp(*this, first_record, audit_record.exec_timestamp_, async_resp_used);
       audit_record.exec_timestamp_.update_stage_time();
 
       if (enable_perf_event && !THIS_THWORKER.need_retry()
@@ -1245,6 +1332,12 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
       sqlstat_record.set_partition_cnt(result.get_exec_context().get_das_ctx().get_related_tablet_cnt());
       sqlstat_record.set_is_route_miss(result.get_session().partition_hit().get_bool()? 0 : 1);
       sqlstat_record.set_is_plan_cache_hit(ctx_.plan_cache_hit_);
+      sqlstat_record.set_is_muti_query(session.get_capability().cap_flags_.OB_CLIENT_MULTI_STATEMENTS);
+      sqlstat_record.set_is_muti_query_batch(ctx_.multi_stmt_item_.is_batched_multi_stmt());
+      if (OB_NOT_NULL(result.get_physical_plan())) {
+        sqlstat_record.set_is_full_table_scan(result.get_physical_plan()->contain_table_scan());
+      }
+      sqlstat_record.set_is_failed(0 != ret && OB_ITER_END != ret);
       sqlstat_record.move_to_sqlstat_cache(result.get_session(),
                                                  ctx_.cur_sql_,
                                                  result.get_physical_plan());
@@ -1261,6 +1354,13 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
       MEMCPY(audit_record.sql_id_, ctx_.sql_id_, (int32_t)sizeof(audit_record.sql_id_));
       MEMCPY(audit_record.format_sql_id_, ctx_.format_sql_id_, (int32_t)sizeof(audit_record.format_sql_id_));
       audit_record.format_sql_id_[common::OB_MAX_SQL_ID_LENGTH] = '\0';
+      if (audit_record.sql_ == nullptr) {
+        audit_record.sql_ = const_cast<char *>(audit_sql.ptr());
+        audit_record.sql_len_ = audit_sql.length();
+        audit_record.sql_cs_type_ = session.get_local_collation_connection();
+      }
+      audit_record.ccl_rule_id_ = ctx_.ccl_rule_id_;
+      audit_record.ccl_match_time_ = ctx_.ccl_match_time_;
 
       if (NULL != plan) {
         audit_record.plan_type_ = plan->get_plan_type();
@@ -1276,7 +1376,9 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
       if (OB_FAIL(ret) && audit_record.trans_id_ == 0) {
         // normally trans_id is set in the `start-stmt` phase,
         // if `start-stmt` hasn't run, set trans_id from session if an active txn exist
-        audit_record.trans_id_ = session.get_tx_id();
+        if (session.is_in_transaction()) {
+          audit_record.trans_id_ = session.get_tx_id();
+        }
       }
       audit_record.affected_rows_ = result.get_affected_rows();
       audit_record.return_rows_ = result.get_return_rows();
@@ -1292,7 +1394,7 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
 
       audit_record.is_executor_rpc_ = false;
       audit_record.is_inner_sql_ = false;
-      audit_record.is_hit_plan_cache_ = result.get_is_from_plan_cache();
+      audit_record.is_hit_plan_cache_ = result.get_is_from_plan_cache() && !ctx_.self_add_plan_;
       audit_record.is_multi_stmt_ = session.get_capability().cap_flags_.OB_CLIENT_MULTI_STATEMENTS;
       audit_record.is_batched_multi_stmt_ = ctx_.multi_stmt_item_.is_batched_multi_stmt();
 
@@ -1368,11 +1470,6 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
     }
     bool is_need_retry = THIS_THWORKER.need_retry() ||
         RETRY_TYPE_NONE != retry_ctrl_.get_retry_type();
-#ifdef OB_BUILD_SPM
-    if (!is_need_retry) {
-      (void)ObSQLUtils::handle_plan_baseline(audit_record, plan, ret, ctx_);
-    }
-#endif
     (void)ObSQLUtils::handle_audit_record(is_need_retry, EXECUTE_LOCAL, session,
         ctx_.is_sensitive_);
 #ifdef OB_BUILD_AUDIT_SECURITY
@@ -1381,6 +1478,7 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
       (void)ObSecurityAuditUtils::handle_security_audit(result,
                                                         ctx_.schema_guard_,
                                                         ctx_.cur_stmt_,
+                                                        sql,
                                                         ObString::make_empty_string(),
                                                         ret);
     }
@@ -1404,11 +1502,13 @@ int ObMPQuery::store_params_value_to_str(ObIAllocator &allocator,
       params_value_ = NULL;
       params_value_len_ = 0;
       break;
-    } else {
+    } else if (OB_LIKELY(!param.is_lob_storage())) {
       OZ (param.print_sql_literal(params_value_, length, pos, allocator, TZ_INFO(&session)));
-      if (i != params.count() - 1) {
-        OZ (databuff_printf(params_value_, length, pos, allocator, ","));
-      }
+    } else {
+      OZ (param.print_varchar_literal(params_value_, length, pos, allocator, TZ_INFO(&session)));
+    }
+    if (i != params.count() - 1) {
+      OZ (databuff_printf(params_value_, length, pos, allocator, ","));
     }
   }
   if (OB_FAIL(ret)) {
@@ -1420,52 +1520,6 @@ int ObMPQuery::store_params_value_to_str(ObIAllocator &allocator,
   }
   return ret;
 }
-
-//int ObMPQuery::fill_feedback_session_info(ObMySQLResultSet &result,
-//                                          ObSQLSessionInfo &session)
-//{
-//  int ret = OB_SUCCESS;
-//  ObPhysicalPlan *temp_plan = NULL;
-//  ObTaskExecutorCtx *temp_task_ctx = NULL;
-//  ObSchemaGetterGuard *schema_guard = NULL;
-//  if (session.is_abundant_feedback_support() &&
-//      NULL != (temp_plan = result.get_physical_plan()) &&
-//      NULL != (temp_task_ctx = result.get_exec_context().get_task_executor_ctx()) &&
-//      NULL != (schema_guard = ctx_.schema_guard_) &&
-//      temp_plan->get_plan_type() == ObPhyPlanType::OB_PHY_PLAN_REMOTE &&
-//      temp_plan->get_location_type() != ObPhyPlanType::OB_PHY_PLAN_UNCERTAIN &&
-//      temp_task_ctx->get_table_locations().count() == 1 &&
-//      temp_task_ctx->get_table_locations().at(0).get_partition_location_list().count() == 1) {
-//    bool is_cache_hit = false;
-//    ObFBPartitionParam param;
-//    //FIXME: should remove ObPartitionKey
-//    ObPartitionKey partition_key;
-//    ObPartitionLocation partition_loc;
-//    const ObTableSchema *table_schema = NULL;
-//    ObPartitionReplicaLocationIArray &pl_array =
-//        temp_task_ctx->get_table_locations().at(0).get_partition_location_list();
-//    if (OB_FAIL(pl_array.at(0).get_partition_key(partition_key))) {
-//      LOG_WARN("failed to get partition key", K(ret));
-//    } else if (OB_FAIL(temp_cache->get(partition_key,
-//                                       partition_loc,
-//                                       0,
-//                                       is_cache_hit))) {
-//      LOG_WARN("failed to get partition location", K(ret));
-//    } else if (OB_FAIL(schema_guard->get_table_schema(partition_key.get_tenant_id(),
-//                                                      partition_key.get_table_id(),
-//                                                      table_schema))) {
-//      LOG_WARN("failed to get table schema", K(ret), K(partition_key));
-//    } else if (OB_ISNULL(table_schema)) {
-//      ret = OB_ERR_UNEXPECTED;
-//      LOG_WARN("null table schema", K(ret));
-//    } else if (OB_FAIL(build_fb_partition_param(*table_schema, partition_loc, param))) {
-//      LOG_WARN("failed to build fb partition pararm", K(ret));
-//    } else if (OB_FAIL(session.set_partition_location_feedback(param))) {
-//      LOG_WARN("failed to set partition location feedback", K(param), K(ret));
-//    } else { /*do nothing*/ }
-//  } else { /*do nothing*/}
-//  return ret;
-//}
 
 //int ObMPQuery::build_fb_partition_param(
 //    const ObTableSchema &table_schema,
@@ -1596,7 +1650,10 @@ int ObMPQuery::is_readonly_stmt(ObMySQLResultSet &result, bool &is_readonly)
     case stmt::T_SHOW_CREATE_USER:
     case stmt::T_SET_CATALOG:
     case stmt::T_SHOW_CATALOGS:
-    case stmt::T_SHOW_CREATE_CATALOG: {
+    case stmt::T_SHOW_CREATE_CATALOG:
+    case stmt::T_SHOW_LOCATIONS:
+    case stmt::T_SHOW_CREATE_LOCATION:
+    case stmt::T_LOCATION_UTILS_LIST: {
       is_readonly = true;
       break;
     }
@@ -1635,17 +1692,12 @@ OB_INLINE int ObMPQuery::response_result(ObMySQLResultSet &result,
 {
   int ret = OB_SUCCESS;
   FLTSpanGuard(sql_execute);
+  ObMemPerfGuard mem_perf_guard("sql_execute");
   //ac = 1时线程新启事务进行oracle临时表数据清理会和clog回调形成死锁, 这里改成同步方式
   ObSQLSessionInfo &session = result.get_session();
   CHECK_COMPATIBILITY_MODE(&session);
 
-#ifndef OB_BUILD_SPM
-  bool need_trans_cb  = result.need_end_trans_callback() && (!force_sync_resp);
-#else
-  bool need_trans_cb  = result.need_end_trans_callback() &&
-                        (!force_sync_resp) &&
-                        (!ctx_.spm_ctx_.check_execute_status_);
-#endif
+  bool need_trans_cb  = result.need_end_trans_callback(force_sync_resp);
 
   // 通过判断 plan 是否为 null 来确定是 plan 还是 cmd
   // 针对 plan 和 cmd 分开处理，逻辑会较为清晰。
@@ -1669,15 +1721,21 @@ OB_INLINE int ObMPQuery::response_result(ObMySQLResultSet &result,
   } else {
 
 #define CMD_EXEC \
+    if (session.is_pl_async_commit()) { \
+      ObPLEndTransCb &pl_end_trans_cb = session.get_pl_end_trans_cb(); \
+      pl_end_trans_cb.init(packet_sender_, &session); \
+    } \
     if (need_trans_cb) {\
       ObSqlEndTransCb &sql_end_cb = session.get_mysql_end_trans_cb(); \
       ObAsyncCmdDriver drv(gctx_, ctx_, session, retry_ctrl_, *this); \
+      session.set_pl_query_sender(&drv); \
       if (OB_FAIL(sql_end_cb.init(packet_sender_, &session))) { \
         LOG_WARN("failed to init sql end callback", K(ret)); \
       } else if (OB_FAIL(drv.response_result(result))) { \
         LOG_WARN("fail response async result", K(ret)); \
       } \
       async_resp_used = result.is_async_end_trans_submitted(); \
+      session.set_pl_query_sender(NULL); \
     } else { \
       ObSyncCmdDriver drv(gctx_, ctx_, session, retry_ctrl_, *this); \
       session.set_pl_query_sender(&drv); \
@@ -1714,8 +1772,8 @@ inline void ObMPQuery::record_stat(const stmt::StmtType type,
       if (OB_SUCCESS != ret) {                  \
         EVENT_INC(SQL_FAIL_COUNT);              \
       }                                         \
+      EVENT_ADD(SQL_##type##_TIME, time_cost);  \
     }                                           \
-    EVENT_ADD(SQL_##type##_TIME, time_cost);    \
     break
   int64_t start_ts = 0;
   if (session.get_raw_audit_record().exec_timestamp_.multistmt_start_ts_ > 0) {
@@ -1751,6 +1809,8 @@ inline void ObMPQuery::record_stat(const stmt::StmtType type,
               EVENT_INC(SQL_FAIL_COUNT);
             }
           }
+        } else {
+          LOG_WARN_RET(OB_SUCCESS, "unexpected stmt type for T_END_TRANS", K(session));
         }
         break;
 
@@ -1804,7 +1864,7 @@ int ObMPQuery::deserialize_com_field_list()
     const int64_t str2_len = strlen(str2);
     const int pre_size = str1_len + str2_len;
     //寻找client传过来的table_name和filed wildcard之间的分隔符（table_name [NULL] filed wildcard）
-    for (; static_cast<int>(str[i]) != 0 && i < length; ++i) {}
+    for (; i < length && static_cast<int>(str[i]) != 0; ++i) {}
     char *dest_str = static_cast<char *>(alloc->alloc(length + pre_size));
     if (OB_ISNULL(dest_str)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;

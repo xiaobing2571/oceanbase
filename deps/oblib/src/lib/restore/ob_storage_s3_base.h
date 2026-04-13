@@ -69,7 +69,7 @@ void fin_s3_env();
 
 static constexpr int64_t S3_CONNECT_TIMEOUT_MS = 10 * 1000;
 static constexpr int64_t S3_REQUEST_TIMEOUT_MS = 10 * 1000;
-static constexpr int64_t MAX_S3_CONNECTIONS_PER_CLIENT = 128;
+static constexpr int64_t MAX_S3_CONNECTIONS_PER_CLIENT = 512;
 static constexpr int64_t STOP_S3_TIMEOUT_US = 10 * 1000L;   // 10ms
 
 static constexpr int MAX_S3_REGION_LENGTH = 128;
@@ -82,6 +82,12 @@ static constexpr int64_t S3_MULTIPART_UPLOAD_BUFFER_SIZE = 8 * 1024 * 1024L;
 
 static constexpr char OB_STORAGE_S3_ALLOCATOR[] = "StorageS3";
 static constexpr char S3_SDK[] = "S3SDK";
+
+constexpr int S3_BAD_REQUEST = 400;
+constexpr int S3_PERMISSION_DENIED = 403;
+constexpr int S3_ITEM_NOT_EXIST = 404;
+constexpr int S3_TOO_MANY_REQUESTS = 429;
+constexpr int S3_SLOW_DOWN = 503;
 
 // TODO @fangdan: Validate the effectiveness of the ZeroCopyStreambuf
 class ZeroCopyStreambuf : public std::streambuf
@@ -160,6 +166,7 @@ public:
   ObS3MemoryManager() : attr_(), mem_limiter_(), allocator_()
   {
     attr_.label_ = S3_SDK;
+    attr_.ctx_id_ = ObCtxIds::GLIBC;
   }
   virtual ~ObS3MemoryManager() {}
   // when aws init/shutdown, it will execute like this: init/shutdown_memory_system->Begin()/End()
@@ -292,6 +299,8 @@ public:
   using typename ObStorageIORetryStrategy<OutcomeType>::RetType;
   using ObStorageIORetryStrategy<OutcomeType>::start_time_us_;
   using ObStorageIORetryStrategy<OutcomeType>::timeout_us_;
+  using ObStorageIORetryStrategyBase<OutcomeType>::errsim_retry_count_;
+  using ObStorageIORetryStrategyBase<OutcomeType>::MAX_ERRSIM_RETRY_COUNT;
 
   ObStorageS3RetryStrategy(const int64_t timeout_us = ObObjectStorageTenantGuard::get_timeout_us())
       : ObStorageIORetryStrategy<OutcomeType>(timeout_us)
@@ -319,16 +328,22 @@ public:
 
 protected:
   virtual bool should_retry_impl_(
-      const RetType &outcome, const int64_t attempted_retries) const override
+      const RetType &outcome, const int64_t attempted_retries) override
   {
     bool bret = false;
-    if (OB_SUCCESS != EventTable::EN_OBJECT_STORAGE_IO_RETRY) {
+    if (OB_SUCCESS != EventTable::EN_OBJECT_STORAGE_IO_RETRY && errsim_retry_count_ < MAX_ERRSIM_RETRY_COUNT) {
       bret = true;
+      errsim_retry_count_++;
       OB_LOG(INFO, "errsim object storage IO retry", K(outcome.IsSuccess()));
     } else if (outcome.IsSuccess()) {
       bret = false;
     } else if (outcome.GetError().ShouldRetry()) {
       bret = true;
+    } else {
+      const int http_code = static_cast<int>(outcome.GetError().GetResponseCode());
+      if (S3_TOO_MANY_REQUESTS == http_code || S3_SLOW_DOWN == http_code) {
+        bret = true;
+      }
     }
     return bret;
   }

@@ -18,6 +18,7 @@
 #endif
 #include "logservice/ob_log_service.h"
 #include "logservice/ob_reconfig_checker_adapter.h"
+#include "storage/concurrency_control/ob_data_validation_service.h"
 
 #define INVOKE_PALF_HANDLE_FN(fn, args...) \
   do { \
@@ -66,7 +67,7 @@ ObLogHandler::ObLogHandler() : self_(),
                                apply_service_(NULL),
                                replay_service_(NULL),
                                rc_service_(NULL),
-                               deps_lock_(),
+                               deps_lock_(common::ObLatchIds::OB_LOG_HANDLER_DEPS_LOCK),
                                lc_cb_(NULL),
                                rpc_proxy_(NULL),
                                append_cost_stat_("[PALF STAT APPEND COST TIME]", 1 * 1000 * 1000),
@@ -76,8 +77,10 @@ ObLogHandler::ObLogHandler() : self_(),
 #endif
 #ifdef OB_BUILD_SHARED_LOG_SERVICE
                                libpalf_proposer_config_mgr_(),
+                               shared_log_submit_log_rate_limiter_(NULL),
 #endif
-                               get_max_decided_scn_debug_time_(OB_INVALID_TIMESTAMP)
+                               get_max_decided_scn_debug_time_(OB_INVALID_TIMESTAMP),
+                               max_decided_scn_snapshot_()
 {
 }
 
@@ -93,6 +96,9 @@ int ObLogHandler::init(const int64_t id,
                        ObRoleChangeService *rc_service,
                        ipalf::IPalfEnv *palf_env,
                        PalfLocationCacheCb *lc_cb,
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+                       ObLogLSSubmitLogRateLimiter *shared_log_submit_log_rate_limiter,
+#endif // OB_BUILD_SHARED_LOG_SERVICE
                        obrpc::ObLogServiceRpcProxy *rpc_proxy,
                        common::ObILogAllocator *alloc_mgr)
 {
@@ -109,6 +115,12 @@ int ObLogHandler::init(const int64_t id,
              OB_ISNULL(alloc_mgr)) {
     ret = OB_INVALID_ARGUMENT;
     CLOG_LOG(WARN, "invalid arguments", K(id), KP(palf_env), KP(lc_cb), KP(rpc_proxy), KP(alloc_mgr));
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+  } else if (GCONF.enable_logservice && OB_ISNULL(shared_log_submit_log_rate_limiter)) {
+    ret = OB_INVALID_ARGUMENT;
+    CLOG_LOG(WARN, "shared_log_submit_log_rate_limiter is null", K(ret), K(id));
+  } else if (GCONF.enable_logservice && FALSE_IT(shared_log_submit_log_rate_limiter_ = shared_log_submit_log_rate_limiter)) { // do nothing
+#endif // OB_BUILD_SHARED_LOG_SERVICE
   } else if (OB_FAIL(apply_service->get_apply_status(ls_id, guard))) {
     CLOG_LOG(WARN, "guard get apply status failed", K(ret), K(id));
   } else if (NULL == (apply_status_ = guard.get_apply_status())) {
@@ -123,7 +135,7 @@ int ObLogHandler::init(const int64_t id,
 #ifdef OB_BUILD_SHARED_LOG_SERVICE
   } else if (GCONF.enable_logservice && OB_FAIL(libpalf_proposer_config_mgr_.init(MTL_ID(), id, palf_handle_))) {
     CLOG_LOG(WARN, "failed to init libpalf_proposer_config_mgr_", K(id));
-#endif
+#endif // OB_BUILD_SHARED_LOG_SERVICE
   } else {
     get_max_decided_scn_debug_time_ = OB_INVALID_TIMESTAMP;
     apply_service_ = apply_service;
@@ -164,6 +176,9 @@ bool ObLogHandler::is_valid() const
 #ifdef OB_BUILD_LOG_STORAGE_COMPRESS
          compressor_wrapper_.is_valid() &&
 #endif
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+         !(GCONF.enable_logservice && NULL == shared_log_submit_log_rate_limiter_) &&
+#endif // OB_BUILD_SHARED_LOG_SERVICE
          NULL != rpc_proxy_;
 }
 
@@ -176,6 +191,11 @@ int ObLogHandler::stop()
   if (IS_INIT) {
     is_in_stop_state_ = true;
     common::TCWLockGuard deps_guard(deps_lock_);
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+    if (OB_NOT_NULL(shared_log_submit_log_rate_limiter_)) {
+      shared_log_submit_log_rate_limiter_ = nullptr;
+    }
+#endif // OB_BUILD_SHARED_LOG_SERVICE
     //unregister_file_size_cb不能在apply status锁内, 可能会导致死锁
     apply_status_->unregister_file_size_cb();
     tg.click("unreg cb end");
@@ -238,6 +258,9 @@ void ObLogHandler::destroy()
   replay_service_ = NULL;
 #ifdef OB_BUILD_SHARED_LOG_SERVICE
   libpalf_proposer_config_mgr_.destroy();
+  if (OB_NOT_NULL(shared_log_submit_log_rate_limiter_)) {
+    shared_log_submit_log_rate_limiter_ = NULL;
+  }
 #endif
   if (OB_NOT_NULL(palf_env_) && OB_NOT_NULL(palf_handle_) && true == palf_handle_->is_valid()) {
     palf_env_->close(palf_handle_);
@@ -252,6 +275,7 @@ void ObLogHandler::destroy()
 #ifdef OB_BUILD_LOG_STORAGE_COMPRESS
   compressor_wrapper_.reset();
 #endif
+  max_decided_scn_snapshot_.reset();
 }
 
 int ObLogHandler::append(const void *buffer,
@@ -514,7 +538,7 @@ int ObLogHandler::locate_by_lsn_coarsely(const LSN &lsn, SCN &result_scn)
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (OB_FAIL(palf_handle_->locate_by_lsn_coarsely(lsn, result_scn))) {
-    CLOG_LOG(WARN, "locate_by_scn_coarsely from palf failed", KR(ret), K(id_), K(lsn));
+    CLOG_LOG(WARN, "locate_by_lsn_coarsely from palf failed", KR(ret), K(id_), K(lsn));
   }
   return ret;
 }
@@ -537,7 +561,16 @@ int ObLogHandler::get_max_decided_scn_as_leader(share::SCN &scn) const
 
 int ObLogHandler::advance_base_lsn(const LSN &lsn)
 {
-  return advance_base_lsn_impl_(lsn);
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(concurrency_control::ObDataValidationService::
+                  need_delay_resource_recycle(share::ObLSID(id_)))) {
+    if (REACH_TIME_INTERVAL(1_s)) {
+      CLOG_LOG(WARN, "4377 stopping the resource recyle", K(id_));
+    }
+  } else {
+    ret = advance_base_lsn_impl_(lsn);
+  }
+  return ret;
 }
 
 int ObLogHandler::get_begin_lsn(LSN &lsn) const
@@ -610,7 +643,7 @@ int ObLogHandler::get_end_scn(SCN &scn) const
   return ret;
 }
 
-int ObLogHandler::get_paxos_member_list(common::ObMemberList &member_list, int64_t &paxos_replica_num) const
+int ObLogHandler::get_paxos_member_list(common::ObMemberList &member_list, int64_t &paxos_replica_num, const bool &filter_logonly_replica) const
 {
   int ret = OB_SUCCESS;
   RLockGuard guard(lock_);
@@ -619,14 +652,15 @@ int ObLogHandler::get_paxos_member_list(common::ObMemberList &member_list, int64
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else {
-    PALF_MEMBER_PROXY_WITH_RET(get_paxos_member_list, member_list, paxos_replica_num);
+    PALF_MEMBER_PROXY_WITH_RET(get_paxos_member_list, member_list, paxos_replica_num, filter_logonly_replica);
   }
   return ret;
 }
 
 int ObLogHandler::get_paxos_member_list_and_learner_list(common::ObMemberList &member_list,
                                                          int64_t &paxos_replica_num,
-                                                         common::GlobalLearnerList &learner_list) const
+                                                         common::GlobalLearnerList &learner_list,
+                                                         const bool &filter_logonly_replica) const
 {
   int ret = OB_SUCCESS;
   RLockGuard guard(lock_);
@@ -635,7 +669,7 @@ int ObLogHandler::get_paxos_member_list_and_learner_list(common::ObMemberList &m
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else {
-    PALF_MEMBER_PROXY_WITH_RET(get_paxos_member_list_and_learner_list, member_list, paxos_replica_num, learner_list);
+    PALF_MEMBER_PROXY_WITH_RET(get_paxos_member_list_and_learner_list, member_list, paxos_replica_num, learner_list, filter_logonly_replica);
   }
   return ret;
 }
@@ -658,7 +692,8 @@ int ObLogHandler::get_stable_membership(
     palf::LogConfigVersion &config_version,
     common::ObMemberList &member_list,
     int64_t &paxos_replica_num,
-    common::GlobalLearnerList &learner_list) const
+    common::GlobalLearnerList &learner_list,
+    const bool &filter_logonly_replica) const
 {
   int ret = OB_SUCCESS;
   RLockGuard guard(lock_);
@@ -670,7 +705,7 @@ int ObLogHandler::get_stable_membership(
     CLOG_LOG(INFO, "loghandler is stopped", K(ret), K_(id));
   } else {
     PALF_MEMBER_PROXY_WITH_RET(get_stable_membership, config_version,
-      member_list, paxos_replica_num, learner_list);
+      member_list, paxos_replica_num, learner_list, filter_logonly_replica);
   }
   return ret;
 }
@@ -740,6 +775,7 @@ int ObLogHandler::disable_sync()
 
 bool ObLogHandler::is_sync_enabled() const
 {
+  bool bool_ret = false;
   int ret = OB_SUCCESS;
   RLockGuard guard(lock_);
   if (IS_NOT_INIT) {
@@ -747,9 +783,9 @@ bool ObLogHandler::is_sync_enabled() const
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else {
-    ret = palf_handle_->is_sync_enabled();
+    bool_ret = palf_handle_->is_sync_enabled();
   }
-  return ret;
+  return bool_ret;
 }
 
 int ObLogHandler::advance_base_info(const PalfBaseInfo &palf_base_info, const bool is_rebuild)
@@ -872,9 +908,14 @@ int ObLogHandler::change_replica_num(const common::ObMemberList &member_list,
                                      const int64_t timeout_us)
 {
   int ret = OB_SUCCESS;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(member_list), K(curr_replica_num), K(new_replica_num),
+        K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!member_list.is_valid() ||
@@ -955,6 +996,22 @@ int ObLogHandler::force_set_member_list(const common::ObMemberList &new_member_l
   return ret;
 }
 
+int ObLogHandler::inc_config_version(int64_t timeout_us)
+{
+  int ret = OB_SUCCESS;
+  common::TCWLockGuard deps_guard(deps_lock_);
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    CLOG_LOG(WARN, "ObLogHandler is not inited", KR(ret));
+  } else if (is_in_stop_state_) {
+    ret = OB_NOT_RUNNING;
+    CLOG_LOG(WARN, "ObLogHandler is in stop state", KR(ret));
+  } else {
+    // direct execute inc_config_version for SS mode
+    PALF_MEMBER_PROXY_WITH_RET(inc_config_version, timeout_us);
+  }
+  return ret;
+}
 
 // @desc: add_member interface
 //        | 1.add_member()
@@ -968,9 +1025,14 @@ int ObLogHandler::add_member(const common::ObMember &added_member,
                              const int64_t timeout_us)
 {
   int ret = OB_SUCCESS;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(added_member), K(new_replica_num),
+        K(config_version), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!added_member.is_valid() ||
@@ -1004,9 +1066,13 @@ int ObLogHandler::remove_member(const common::ObMember &removed_member,
                                 const int64_t timeout_us)
 {
   int ret = OB_SUCCESS;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(removed_member), K(new_replica_num), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!removed_member.is_valid() ||
@@ -1039,9 +1105,14 @@ int ObLogHandler::replace_member(const common::ObMember &added_member,
                                  const palf::LogConfigVersion &config_version,
                                  const int64_t timeout_us) {
   int ret = OB_SUCCESS;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(added_member), K(removed_member),
+        K(config_version), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!added_member.is_valid() ||
@@ -1068,9 +1139,14 @@ int ObLogHandler::replace_member_with_learner(const common::ObMember &added_memb
                                               const int64_t timeout_us)
 {
   int ret = OB_SUCCESS;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(added_member), K(removed_member),
+        K(config_version), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!added_member.is_valid() ||
@@ -1104,9 +1180,13 @@ int ObLogHandler::add_learner(const common::ObMember &added_learner,
                               const int64_t timeout_us)
 {
   int ret = OB_SUCCESS;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(added_learner), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!added_learner.is_valid() ||
@@ -1135,9 +1215,13 @@ int ObLogHandler::remove_learner(const common::ObMember &removed_learner,
                                  const int64_t timeout_us)
 {
   int ret = OB_SUCCESS;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(removed_learner), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!removed_learner.is_valid() ||
@@ -1162,9 +1246,13 @@ int ObLogHandler::replace_learners(const common::ObMemberList &added_learners,
                                    const int64_t timeout_us)
 {
   int ret = OB_SUCCESS;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(added_learners), K(removed_learners), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!added_learners.is_valid() ||
@@ -1195,9 +1283,14 @@ int ObLogHandler::switch_learner_to_acceptor(const common::ObMember &learner,
                                              const int64_t timeout_us)
 {
   int ret = OB_SUCCESS;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(learner), K(new_replica_num),
+        K(config_version), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!learner.is_valid() ||
@@ -1229,9 +1322,13 @@ int ObLogHandler::switch_acceptor_to_learner(const common::ObMember &member,
                                              const int64_t timeout_us)
 {
   int ret = OB_SUCCESS;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(member), K(new_replica_num), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!member.is_valid() ||
@@ -1315,9 +1412,13 @@ int ObLogHandler::add_arbitration_member(const common::ObMember &added_member,
   int ret = OB_SUCCESS;
   const int64_t begin_ts = ObTimeUtility::current_time();
   int64_t current_timeout_us = timeout_us;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(added_member), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!added_member.is_valid() || timeout_us <= 0) {
@@ -1355,9 +1456,13 @@ int ObLogHandler::remove_arbitration_member(const common::ObMember &removed_memb
   int ret = OB_SUCCESS;
   int64_t current_timeout_us = timeout_us;
   const int64_t begin_ts = ObTimeUtility::current_time();
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(removed_member), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (!removed_member.is_valid() || timeout_us <= 0) {
@@ -1435,9 +1540,13 @@ int ObLogHandler::upgrade_learner_to_acceptor(const palf::LogMemberAckInfoList &
 int ObLogHandler::try_lock_config_change(const int64_t lock_owner, const int64_t timeout_us)
 {
   int ret = OB_SUCCESS;
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(lock_owner), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (palf::OB_INVALID_CONFIG_CHANGE_LOCK_OWNER == lock_owner || timeout_us <= 0) {
@@ -1459,9 +1568,13 @@ int ObLogHandler::unlock_config_change(const int64_t lock_owner, const int64_t t
   int ret = OB_SUCCESS;
   // Note: rlock is safe, the deps_lock_ is used to protect states of ObLogHandler
   // such as is_in_stop_state_.
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us / 2;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(lock_owner), K(timeout_us));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else if (palf::OB_INVALID_CONFIG_CHANGE_LOCK_OWNER == lock_owner || timeout_us <= 0) {
@@ -1482,9 +1595,13 @@ int ObLogHandler::get_config_change_lock_stat(int64_t &lock_owner, bool &is_lock
 {
   int ret = OB_SUCCESS;
   const int64_t CONFIG_CHANGE_TIMEOUT = 10 * 1000 * 1000L; // 10s
-  RLockGuard deps_guard(deps_lock_);
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + CONFIG_CHANGE_TIMEOUT / 2;
+  RLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(lock_owner), K(is_locked));
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
   } else {
@@ -1559,8 +1676,8 @@ int ObLogHandler::submit_config_change_cmd_(const LogConfigChangeCmd &req,
       if (OB_FAIL(lc_cb_->get_leader(id_, leader))) {
         need_renew_leader = true;
         ret = OB_SUCCESS;
-      } else if (leader == self_ && FALSE_IT(handle_config_change_cmd(req, resp))) {
-        CLOG_LOG(WARN, "failed to handle_config_change_cmd", KR(ret), K_(id), K(req));
+      } else if (leader == self_ && FALSE_IT(handle_config_change_cmd_(req, resp))) {
+        CLOG_LOG(WARN, "failed to handle_config_change_cmd_", KR(ret), K_(id), K(req));
       } else if (leader != self_  && OB_FAIL(rpc_proxy_->to(leader).timeout(conn_timeout_us).trace_time(true).
                          max_process_handler_time(timeout_us).by(MTL_ID()).send_log_config_change_cmd(req, resp))) {
         // if RPC fails, try again
@@ -1595,8 +1712,10 @@ int ObLogHandler::submit_config_change_cmd_(const LogConfigChangeCmd &req,
           has_added_to_blacklist = true;
           need_renew_leader = true;
         }
+        CLOG_LOG(INFO, "not allow removing leader, try again", KR(ret), KPC(this), K(req), K(leader), K_(self), K(resp),
+            K(has_added_to_blacklist), K(need_renew_leader));
       } else {
-        CLOG_LOG(WARN, "handle_config_change_cmd failed", KR(ret), KPC(this), K(req), K(leader));
+        CLOG_LOG(WARN, "handle_config_change_cmd_ failed", KR(ret), KPC(this), K(req), K(leader));
       }
       if (need_renew_leader &&
           common::ObTimeUtility::current_time() - last_renew_leader_time_us > RENEW_LEADER_INTERVAL_US) {
@@ -1604,8 +1723,31 @@ int ObLogHandler::submit_config_change_cmd_(const LogConfigChangeCmd &req,
         ret = lc_cb_->nonblock_renew_leader(id_);
         CLOG_LOG(INFO, "renew location cache leader", KR(ret), K_(id));
       }
+      ob_usleep(1000000); // sleep 1 sec and retry
     }
   }
+  return ret;
+}
+
+int ObLogHandler::handle_config_change_cmd_rpc(
+    const LogConfigChangeCmd &req,
+    LogConfigChangeCmdResp &resp)
+{
+  int ret = OB_SUCCESS;
+  const int64_t timeout_us = req.timeout_us_;
+  const int64_t abs_timeout_us = common::ObTimeUtility::current_time() + timeout_us;
+  WLockGuardWithTimeout deps_guard(deps_lock_, abs_timeout_us, ret);
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ret)) {
+    CLOG_LOG(WARN, "get_lock failed", KR(ret), K_(id), K(req), K(timeout_us));
+  } else if (is_in_stop_state_) {
+    ret = OB_NOT_RUNNING;
+  } else if (OB_FAIL(handle_config_change_cmd_(req, resp))) {
+    CLOG_LOG(WARN, "handle_config_change_cmd_ failed", KR(ret), K(req), K(resp));
+  }
+
   return ret;
 }
 
@@ -1677,6 +1819,14 @@ int ObLogHandler::append_(const void *buffer,
         ret = OB_NOT_RUNNING;
       } else if (LEADER != ATOMIC_LOAD(&role_)) {
         ret = OB_NOT_MASTER;
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+      } else if (enable_logservice_ && OB_FAIL(shared_log_submit_log_rate_limiter_->try_acquire(nbytes, ref_scn.get_val_for_logservice() / 1000, nbytes))) {
+        if (OB_EAGAIN == ret && REACH_TIME_INTERVAL(1*1000*1000)) {
+          CLOG_LOG(WARN, "[RTO.REPLAY] try_acquire failed, rate limit exceeded", KR(ret), KPC(this), K(ref_scn));
+        } else if (OB_EAGAIN != ret) {
+          CLOG_LOG(WARN, "try_acquire failed", KR(ret), KPC(this), K(ref_scn));
+        }
+#endif // OB_BUILD_SHARED_LOG_SERVICE
       } else if (OB_FAIL(palf_handle_->append(opts, final_buf, final_nbytes, ref_scn, lsn, scn))) {
         if (REACH_TIME_INTERVAL(1*1000*1000)) {
           CLOG_LOG(WARN, "palf_handle_ append failed", K(ret), KPC(this));
@@ -1769,7 +1919,8 @@ int ObLogHandler::get_member_gc_stat(const common::ObAddr &addr,
       ret = OB_ERR_UNEXPECTED;
       CLOG_LOG(ERROR, "get_role failed", K(ret), KPC(this));
     } else if (role == new_role && proposal_id == new_proposal_id) {
-      is_valid_member = member_list.contains(addr) || learner_list.contains(addr);
+      // member_list may be empty before set_member_list, set is_valid_member = true in case of gc unexpected;
+      is_valid_member = member_list.contains(addr) || learner_list.contains(addr) || member_list.is_empty();
       if (learner_list.contains(addr)) {
         ObMember member;
         if (OB_FAIL(learner_list.get_learner_by_addr(addr, member))) {
@@ -1840,7 +1991,8 @@ int ObLogHandler::pend_submit_replay_log()
   } else if (OB_FAIL(replay_service_->block_submit_log(id))) {
     CLOG_LOG(WARN, "failed to block_submit_log", K(ret), K(id));
   } else {
-    CLOG_LOG(INFO, "block_submit_log success", K(ret), K(id));
+    const int64_t pending_task_size_MB = replay_service_->get_pending_task_size() / 1024 / 1024;
+    FLOG_INFO("block_submit_log success", K(ret), K(id), K(pending_task_size_MB));
   }
   return ret;
 }
@@ -1856,7 +2008,8 @@ int ObLogHandler::restore_submit_replay_log()
   } else if (OB_FAIL(replay_service_->unblock_submit_log(id))) {
     CLOG_LOG(WARN, "failed to unblock_submit_log", K(ret), K(id));
   } else {
-    CLOG_LOG(INFO, "unblock_submit_log success", K(ret), K(id));
+    const int64_t pending_task_size_MB = replay_service_->get_pending_task_size() / 1024 / 1024;
+    FLOG_INFO("unblock_submit_log success", K(ret), K(id), K(pending_task_size_MB));
   }
   return ret;
 }
@@ -1913,7 +2066,24 @@ int ObLogHandler::get_max_decided_scn(SCN &scn)
   } else {
     scn = std::max(max_replayed_scn, max_applied_scn) > SCN::min_scn() ?
              std::max(max_replayed_scn, max_applied_scn) : SCN::min_scn();
+    max_decided_scn_snapshot_.atomic_set(scn);
     CLOG_LOG(TRACE, "get_max_decided_scn", K(ret), K(id), K(max_replayed_scn), K(max_applied_scn), K(scn));
+  }
+  return ret;
+}
+
+// just for check dup tablet readable, do not use without the owner's confirmation.
+int ObLogHandler::get_max_decided_scn_snapshot(SCN &scn, const bool is_force_refresh)
+{
+  int ret = OB_SUCCESS;
+  SCN snapshot_scn = max_decided_scn_snapshot_.atomic_load();
+  if (!is_force_refresh && snapshot_scn.is_valid()) {
+    scn = snapshot_scn;
+  } else if (OB_FAIL(get_max_decided_scn(snapshot_scn))) {
+    CLOG_LOG(WARN, "get_max_decided_scn refresh snapshot failed", K(ret), K(snapshot_scn));
+  } else {
+    scn = snapshot_scn;
+    max_decided_scn_snapshot_.atomic_set(snapshot_scn);
   }
   return ret;
 }
@@ -2018,7 +2188,7 @@ int ObLogHandler::offline()
     PALF_LOG(INFO, "ObLogHandler has already been destroyed", K(ret), KPC(this));
   } else if (OB_FAIL(disable_replay())) {
     CLOG_LOG(WARN, "disable_replay failed", K(ret), KPC(this));
-  } else if (OB_FAIL(disable_sync()) && OB_NOT_INIT != ret) {
+  } else if (OB_FAIL(disable_sync()) && OB_NOT_INIT != ret && OB_NOT_RUNNING != ret) {
     CLOG_LOG(WARN, "disable_sync failed", K(ret), KPC(this));
   } else {
     WLockGuard guard(lock_);
@@ -2071,14 +2241,14 @@ int ObLogHandler::diagnose_palf(palf::PalfDiagnoseInfo &diagnose_info) const
   return ret;
 }
 
-int ObLogHandler::online(const LSN &lsn, const SCN &scn)
+int ObLogHandler::online(const LSN &lsn, const SCN &scn, const bool is_logonly_replica)
 {
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
   } else if (true == is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
-  } else if (OB_FAIL(enable_replay(lsn, scn))) {
+  } else if (!is_logonly_replica && OB_FAIL(enable_replay(lsn, scn))) {
     CLOG_LOG(WARN, "enable_replay failed", K(ret), KPC(this), K(lsn), K(scn));
   } else if (OB_FAIL(enable_sync())) {
     CLOG_LOG(WARN, "enable_sync failed", K(ret), KPC(this));
@@ -2124,7 +2294,7 @@ int ObLogHandler::is_replay_fatal_error(bool &has_fatal_error)
   return ret;
 }
 
-int ObLogHandler::handle_config_change_cmd(
+int ObLogHandler::handle_config_change_cmd_(
     const LogConfigChangeCmd &req,
     LogConfigChangeCmdResp &resp)
 {
@@ -2132,7 +2302,6 @@ int ObLogHandler::handle_config_change_cmd(
   ObLogReporterAdapter *reporter;
   logservice::ObLogService *log_service = NULL;
   logservice::ObReconfigCheckerAdapter reconfig_checker;
-  RLockGuard guard(lock_);
 
   if (IS_NOT_INIT || OB_ISNULL(palf_handle_)) {
     ret = OB_NOT_INIT;
@@ -2148,69 +2317,77 @@ int ObLogHandler::handle_config_change_cmd(
     CLOG_LOG(WARN, "log_service.get_reporter failed", K(ret));
   } else if (OB_FAIL(reconfig_checker.init(MTL_ID(), share::ObLSID(req.palf_id_), req.timeout_us_))) {
     CLOG_LOG(WARN, "ObReconfigCheckerAdapter init failed", K(ret), K(req.palf_id_));
-  } else if (OB_FAIL(palf_handle_->set_reconfig_checker_cb(&reconfig_checker))) {
-    CLOG_LOG(WARN, "set_reconfig_checker_cb failed, another reconfiguration is running", K(ret), K(req.palf_id_));
-    ret = OB_EAGAIN;
   } else {
-    switch (req.cmd_type_) {
-      case FORCE_SINGLE_MEMBER_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(force_set_as_single_replica);
-        break;
-      case FORCE_SET_MEMBER_LIST_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(force_set_member_list, req.new_member_list_, req.new_replica_num_);
-        break;
-      case CHANGE_REPLICA_NUM_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(change_replica_num, req.curr_member_list_, req.curr_replica_num_,
-            req.new_replica_num_, req.timeout_us_);
-        break;
-      case ADD_MEMBER_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(add_member, req.added_member_, req.new_replica_num_, req.config_version_, req.timeout_us_);
-        break;
-      case REMOVE_MEMBER_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(remove_member, req.removed_member_, req.new_replica_num_, req.timeout_us_);
-        break;
+    PALF_MEMBER_PROXY_WITH_RET(set_reconfig_checker_cb, &reconfig_checker);
+    if (OB_FAIL(ret)) {
+      ret = OB_EAGAIN;
+    } else {
+      switch (req.cmd_type_) {
+        case FORCE_SINGLE_MEMBER_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(force_set_as_single_replica);
+          break;
+        case FORCE_SET_MEMBER_LIST_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(force_set_member_list, req.new_member_list_, req.new_replica_num_);
+          break;
+        case CHANGE_REPLICA_NUM_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(change_replica_num, req.curr_member_list_, req.curr_replica_num_,
+              req.new_replica_num_, req.timeout_us_);
+          break;
+        case ADD_MEMBER_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(add_member, req.added_member_, req.new_replica_num_, req.config_version_, req.timeout_us_);
+          break;
+        case REMOVE_MEMBER_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(remove_member, req.removed_member_, req.new_replica_num_, req.timeout_us_);
+          break;
 #ifdef OB_BUILD_ARBITRATION
-      case ADD_ARB_MEMBER_CMD:
-        ret = static_cast<palf::PalfHandle*>(palf_handle_)->add_arb_member(req.added_member_, req.timeout_us_);
-        break;
-      case REMOVE_ARB_MEMBER_CMD:
-        ret = static_cast<palf::PalfHandle*>(palf_handle_)->remove_arb_member(req.removed_member_, req.timeout_us_);
-        break;
+        case ADD_ARB_MEMBER_CMD:
+          ret = static_cast<palf::PalfHandle*>(palf_handle_)->add_arb_member(req.added_member_, req.timeout_us_);
+          break;
+        case REMOVE_ARB_MEMBER_CMD:
+          ret = static_cast<palf::PalfHandle*>(palf_handle_)->remove_arb_member(req.removed_member_, req.timeout_us_);
+          break;
 #endif
-      case REPLACE_MEMBER_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(replace_member, req.added_member_, req.removed_member_, req.config_version_, req.timeout_us_);
-        break;
-      case ADD_LEARNER_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(add_learner, req.added_member_, req.timeout_us_);
-        break;
-      case REMOVE_LEARNER_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(remove_learner, req.removed_member_, req.timeout_us_);
-        break;
-      case SWITCH_TO_ACCEPTOR_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(switch_learner_to_acceptor, req.added_member_, req.new_replica_num_, req.config_version_, req.timeout_us_);
-        break;
-      case SWITCH_TO_LEARNER_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(switch_acceptor_to_learner, req.removed_member_, req.new_replica_num_, req.timeout_us_);
-        break;
-      case TRY_LOCK_CONFIG_CHANGE_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(try_lock_config_change, req.lock_owner_, req.timeout_us_);
-        break;
-      case UNLOCK_CONFIG_CHANGE_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(unlock_config_change, req.lock_owner_, req.timeout_us_);
-        break;
-      case GET_CONFIG_CHANGE_LOCK_STAT_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(get_config_change_lock_stat, resp.lock_owner_, resp.is_locked_);
-        break;
-      case REPLACE_LEARNERS_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(replace_learners, req.added_list_, req.removed_list_, req.timeout_us_);
-        break;
-      case REPLACE_MEMBER_WITH_LEARNER_CMD:
-        PALF_MEMBER_PROXY_WITH_RET(replace_member_with_learner, req.added_member_, req.removed_member_, req.config_version_, req.timeout_us_);
-        break;
-      default:
-        break;
+        case REPLACE_MEMBER_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(replace_member, req.added_member_, req.removed_member_, req.config_version_, req.timeout_us_);
+          break;
+        case ADD_LEARNER_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(add_learner, req.added_member_, req.timeout_us_);
+          break;
+        case REMOVE_LEARNER_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(remove_learner, req.removed_member_, req.timeout_us_);
+          break;
+        case SWITCH_TO_ACCEPTOR_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(switch_learner_to_acceptor, req.added_member_, req.new_replica_num_, req.config_version_, req.timeout_us_);
+          break;
+        case SWITCH_TO_LEARNER_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(switch_acceptor_to_learner, req.removed_member_, req.new_replica_num_, req.timeout_us_);
+          break;
+        case TRY_LOCK_CONFIG_CHANGE_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(try_lock_config_change, req.lock_owner_, req.timeout_us_);
+          break;
+        case UNLOCK_CONFIG_CHANGE_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(unlock_config_change, req.lock_owner_, req.timeout_us_);
+          break;
+        case GET_CONFIG_CHANGE_LOCK_STAT_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(get_config_change_lock_stat, resp.lock_owner_, resp.is_locked_);
+          break;
+        case REPLACE_LEARNERS_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(replace_learners, req.added_list_, req.removed_list_, req.timeout_us_);
+          break;
+        case REPLACE_MEMBER_WITH_LEARNER_CMD:
+          PALF_MEMBER_PROXY_WITH_RET(replace_member_with_learner, req.added_member_, req.removed_member_, req.config_version_, req.timeout_us_);
+          break;
+        default:
+          break;
+      }
+      if (enable_logservice_) {
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+        libpalf_proposer_config_mgr_.reset_reconfig_checker_cb();
+#endif
+      } else {
+        palf_handle_->reset_reconfig_checker_cb();
+      }
     }
-    palf_handle_->reset_reconfig_checker_cb();
   }
   resp.ret_ = ret;
   if (OB_SUCC(ret) && OB_FAIL(reporter->report_replica_info(req.palf_id_))) {
@@ -2228,10 +2405,79 @@ void ObLogHandler::refresh_proposer_member_info() const
   } else if (OB_UNLIKELY(is_in_stop_state_)) {
     CLOG_LOG(TRACE, "ObLogHandler is not running", K_(id));
   } else {
-    libpalf_proposer_config_mgr_.try_refresh_member_info();
+    libpalf_proposer_config_mgr_.try_refresh_member_info(libpalf::RefreshType::PERIODIC_REFRESH);
   }
 }
-#endif
+
+int ObLogHandler::set_allow_election_without_memlist(const bool allow_election_without_memlist)
+{
+  int ret = OB_SUCCESS;
+  RLockGuard guard(lock_);
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    CLOG_LOG(WARN, "ObLogHandler is not init", KR(ret), K_(id));
+  } else if (is_in_stop_state_) {
+    ret = OB_NOT_RUNNING;
+    CLOG_LOG(WARN, "ObLogHandler is not running", KR(ret), K_(id));
+  } else if (!enable_logservice_) {
+    ret = OB_ERR_UNEXPECTED;
+    CLOG_LOG(WARN, "logservice is not enable, unexpected error", KR(ret), K_(id), K_(enable_logservice));
+  } else if (OB_FAIL(palf_handle_->set_allow_election_without_memlist(allow_election_without_memlist))) {
+    CLOG_LOG(WARN, "failed to set allow_election_without_memlist flag", KR(ret), K_(id), K(allow_election_without_memlist));
+  } else {
+    CLOG_LOG(INFO, "set allow_election_without_memlist flag successfully", K_(id), K(allow_election_without_memlist));
+  }
+  return ret;
+}
+
+int ObLogHandler::report_replica_replay_process(const common::ObAddr &replica, const share::ObLSID &ls_id, const LSReplicaReplayReachingMachine &replay_reaching_machine)
+{
+  int ret = OB_SUCCESS;
+  bool leader_view_follower_is_in_sync = false;
+  share::SCN leader_end_scn;
+  share::SCN added_scn;
+  common::ObRole role = common::FOLLOWER;
+  int64_t proposal_id = palf::INVALID_PROPOSAL_ID;
+  bool is_pending_state = false;
+  RLockGuard guard(lock_);
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    CLOG_LOG(WARN, "ObLogHandler is not init", KR(ret), K_(id));
+  } else if (is_in_stop_state_) {
+    ret = OB_NOT_RUNNING;
+    CLOG_LOG(WARN, "ObLogHandler is not running", KR(ret), K_(id));
+  } else if (!enable_logservice_) {
+    ret = OB_ERR_UNEXPECTED;
+    CLOG_LOG(WARN, "logservice is not enable, unexpected error", KR(ret), K_(id), K_(enable_logservice));
+  } else if (!replay_reaching_machine.max_replayed_scn_.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    CLOG_LOG(WARN, "max_replayed_scn is invalid", KR(ret), K(replay_reaching_machine));
+  } else if (OB_FAIL(palf_handle_->get_role(role, proposal_id, is_pending_state))) {
+    CLOG_LOG(WARN, "get_role failed", KR(ret), K_(id));
+  } else if (common::LEADER != role || is_pending_state) {
+    ret = OB_NOT_MASTER;
+    CLOG_LOG(WARN, "not leader or in pending state", KR(ret), K_(id), K(role), K(is_pending_state));
+  } else if (replay_reaching_machine.proposal_id_ != proposal_id) {
+    ret = OB_STATE_NOT_MATCH;
+    CLOG_LOG(WARN, "proposal_id not match", KR(ret), K_(id), K(proposal_id),
+        "req_proposal_id", replay_reaching_machine.proposal_id_);
+  } else if (OB_FAIL(palf_handle_->get_end_scn(leader_end_scn))) {
+    CLOG_LOG(WARN, "failed to get leader end scn", KR(ret), K_(id));
+  } else if (!leader_end_scn.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    CLOG_LOG(WARN, "leader end scn is invalid", KR(ret), K_(id));
+  } else if (!(added_scn = share::SCN::plus(replay_reaching_machine.max_replayed_scn_, palf::PALF_LOG_SYNC_DELAY_THRESHOLD_US * 1000)).is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    CLOG_LOG(WARN, "added scn is invalid", KR(ret), K(replay_reaching_machine));
+  } else if (FALSE_IT(leader_view_follower_is_in_sync = (added_scn >= leader_end_scn))) { // do nothing
+  } else if (OB_FAIL(shared_log_submit_log_rate_limiter_->update_replica_replay_process(replica, replay_reaching_machine, leader_view_follower_is_in_sync))) {
+    CLOG_LOG(WARN, "failed to report replica replay process", KR(ret), K(replica), K(ls_id), K(replay_reaching_machine));
+  } else {
+    CLOG_LOG(INFO, "report replica replay process successfully", KR(ret), K(replica), K(ls_id), K(replay_reaching_machine));
+  }
+  return ret;
+}
+#endif // OB_BUILD_SHARED_LOG_SERVICE
 
 int ObLogHandler::advance_base_lsn_impl_(const LSN &lsn)
 {
@@ -2243,6 +2489,12 @@ int ObLogHandler::advance_base_lsn_impl_(const LSN &lsn)
   } else if (is_in_stop_state_) {
     ret = OB_NOT_RUNNING;
     CLOG_LOG(WARN, "ObLogHandler is not running", KR(ret), K_(id));
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+  } else if (enable_logservice_) {
+    if (OB_FAIL(palf_env_->advance_base_lsn(id_, lsn))) {
+      CLOG_LOG(WARN, "advance_base_lsn failed", K(lsn));
+    }
+#endif
   } else if (OB_FAIL(palf_handle_->advance_base_lsn(lsn))) {
     CLOG_LOG(WARN, "advance_base_lsn failed", KR(ret), K(lsn));
   } else {}

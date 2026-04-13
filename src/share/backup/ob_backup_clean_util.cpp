@@ -13,6 +13,10 @@
 #define USING_LOG_PREFIX SHARE
 #include "share/backup/ob_backup_clean_util.h"
 #include "share/backup/ob_backup_io_adapter.h"
+#include "storage/tablelock/ob_lock_utils.h"
+#include "storage/tablelock/ob_table_lock_common.h"
+#include "share/ob_debug_sync.h"
+#include "lib/mysqlclient/ob_mysql_transaction.h"
 
 using namespace oceanbase;
 using namespace share;
@@ -250,6 +254,59 @@ int ObBackupCleanUtil::delete_backup_dir(
   return ret;
 }
 
+int ObBackupCleanUtil::lock_policy_table_then_check(
+      common::ObMySQLTransaction &trans, const uint64_t tenant_id, const bool log_only, bool &policy_exists) {
+  int ret = OB_SUCCESS;
+  ObSqlString check_sql;
+  if (OB_FAIL(oceanbase::transaction::tablelock::ObInnerTableLockUtil::lock_inner_table_in_trans(
+      trans,
+      gen_meta_tenant_id(tenant_id),
+      share::OB_ALL_BACKUP_DELETE_POLICY_TID,
+      log_only ? transaction::tablelock::SHARE : transaction::tablelock::SHARE_ROW_EXCLUSIVE,
+      /*if log_only is true, this lock is used when setting backup_dest, will not modify this policy table*/
+      false))) {
+    COMMON_LOG(WARN, "failed to lock inner table", K(ret), K(tenant_id));
+  } else {
+    if (log_only) {
+      DEBUG_SYNC(BACKUP_DELETE_AFTER_LOCK_POLICY_TABLE_LOG_ONLY);
+      if (OB_FAIL(check_sql.assign_fmt("SELECT COUNT(*) as cnt FROM %s WHERE %s=%lu AND %s='%s'",
+      share::OB_ALL_BACKUP_DELETE_POLICY_TNAME, share::OB_STR_TENANT_ID, tenant_id,
+      share::OB_STR_POLICY_NAME, share::OB_STR_BACKUP_CLEAN_POLICY_NAME_LOG_ONLY))) {
+        LOG_WARN("failed to generate check sql", K(ret), K(tenant_id));
+      }
+    } else {
+      if (OB_FAIL(check_sql.assign_fmt("SELECT COUNT(*) as cnt FROM %s WHERE %s=%lu",
+      share::OB_ALL_BACKUP_DELETE_POLICY_TNAME, share::OB_STR_TENANT_ID, tenant_id))) {
+        LOG_WARN("failed to generate check sql", K(ret), K(tenant_id));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    HEAP_VAR(ObMySQLProxy::ReadResult, res) {
+      ObMySQLResult *result = NULL;
+      if (OB_FAIL(trans.read(res, gen_meta_tenant_id(tenant_id), check_sql.ptr()))) {
+        LOG_WARN("failed to check log only policy", K(ret), K(check_sql));
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("result is null", K(ret), K(check_sql));
+      } else if (OB_FAIL(result->next())) {
+        LOG_WARN("failed to get next row", K(ret), K(check_sql));
+      } else {
+        int64_t policy_count = 0;
+        EXTRACT_INT_FIELD_MYSQL(*result, "cnt", policy_count, int64_t);
+        policy_exists = (policy_count > 0);
+        if (policy_count > 1) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected result", K(ret), K(policy_count), K(policy_exists), K(tenant_id));
+        }
+        LOG_INFO("query result", K(policy_count), K(policy_exists), K(tenant_id));
+      }
+    }
+  }
+  LOG_INFO("check log only policy exist", K(ret), K(tenant_id), K(policy_exists));
+  return ret;
+}
+
 int ObBackupCleanUtil::delete_backup_file(
     const ObBackupPath &path,
     const share::ObBackupStorageInfo *storage_info)
@@ -298,6 +355,49 @@ int ObBackupCleanUtil::delete_backup_file(
   return ret;
 }
 
+int ObBackupCleanUtil::delete_meta_info(
+  const ObBackupPath &path,
+  const share::ObBackupStorageInfo *storage_info)
+{
+  int ret = OB_SUCCESS;
+  ObBackupIoAdapter util;
+  ObArray<ObIODirentEntry> d_entrys;
+  const char meta_info_prefix[OB_BACKUP_DIR_PREFIX_LENGTH] = "meta_info_turn_";
+  ObDirPrefixEntryNameFilter prefix_op(d_entrys);
+  if (OB_ISNULL(storage_info) || path.is_empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("storage info is null or path is empty", K(ret), KP(storage_info), K(path));
+  } else if (OB_FAIL(prefix_op.init(meta_info_prefix, strlen(meta_info_prefix)))) {
+    LOG_WARN("failed to init dir prefix", K(ret), K(meta_info_prefix));
+  } else if (OB_FAIL(util.list_directories(path.get_obstr(), storage_info, prefix_op))) {
+    if (OB_DIR_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+      LOG_INFO("path not exist, skip", K(path));
+    } else {
+      LOG_WARN("failed to list directories", K(ret), K(path));
+    }
+  } else {
+    ObIODirentEntry tmp_entry;
+    ObBackupPath meta_path;
+    for (int64_t i = 0; OB_SUCC(ret) && i < d_entrys.count(); ++i) {
+      tmp_entry = d_entrys.at(i);
+      meta_path.reset();
+      if (OB_ISNULL(tmp_entry.name_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("file name is null", K(ret));
+      } else if (OB_FAIL(meta_path.init(path.get_ptr()))) {
+        LOG_WARN("failed to init meta path", K(ret), K(path));
+      } else if (OB_FAIL(meta_path.join(tmp_entry.name_, ObBackupFileSuffix::NONE))) {
+        LOG_WARN("failed to join meta path", K(ret));
+      } else if (OB_FAIL(delete_backup_dir_files(meta_path, storage_info))) {
+        LOG_WARN("failed to delete backup log stream meta info turn dir files", K(ret), K(meta_path));
+      } else {
+        LOG_INFO("[BACKUP_CLEAN]success delete meta info turn", K(meta_path));
+      }
+    }
+  }
+  return ret;
+}
 
 void ObBackupCleanUtil::check_need_retry(
     const int64_t result,
@@ -325,4 +425,81 @@ void ObBackupCleanUtil::check_need_retry(
       need_retry = false;
     }
   }
+}
+
+int ObBackupCleanUtil::string_to_number_(const char *token, char *&p_end, int64_t &value)
+{
+  return ob_strtoll(token, p_end, value);
+}
+
+int ObBackupCleanUtil::string_to_number_(const char *token, char *&p_end, uint64_t &value)
+{
+  return ob_strtoull(token, p_end, value);
+}
+
+int ObBackupCleanUtil::parse_int64_list(const ObString &str, ObIArray<int64_t> &value_list)
+{
+  return parse_list<int64_t>(str, value_list);
+}
+
+int ObBackupCleanUtil::parse_uint64_list(const ObString &str, ObIArray<uint64_t> &value_list)
+{
+  return parse_list<uint64_t>(str, value_list);
+}
+
+int ObBackupCleanUtil::format_int64_list(const ObIArray<int64_t> &value_list, char *buffer,
+                                         int64_t buffer_size, int64_t &cur_pos)
+{
+  return format_list<int64_t>(value_list, buffer, buffer_size, cur_pos);
+}
+
+int ObBackupCleanUtil::format_uint64_list(const ObIArray<uint64_t> &value_list, char *buffer,
+                                         int64_t buffer_size, int64_t &cur_pos)
+{
+  return format_list<uint64_t>(value_list, buffer, buffer_size, cur_pos);
+}
+
+int ObBackupCleanUtil::parse_time_interval(const char *str, int64_t &val)
+{
+  int ret = OB_SUCCESS;
+  bool is_valid = true;
+  val = 0;
+
+  if (OB_ISNULL(str)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid args", K(ret), KP(str));
+  } else {
+    val = ObConfigTimeParser::get(str, is_valid);
+    if (!is_valid) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid time interval str", K(ret), K(str));
+    }
+  }
+  return ret;
+}
+
+int ObBackupCleanUtil::get_ls_ids_from_backup_set_path(
+    const common::ObString &path,
+    const ObBackupStorageInfo *storage_info,
+    common::ObIArray<ObLSID> &ls_ids)
+{
+  int ret = OB_SUCCESS;
+  common::ObBackupIoAdapter util;
+  ObArray<ObLSID> ls_entrys;
+  common::ObDirPrefixLSIDFilter prefix_lsid_op(ls_entrys);
+  char logstream_prefix[OB_BACKUP_DIR_PREFIX_LENGTH] = { 0 };
+  int64_t logstream_prefix_len = 0;
+
+  // list logstream_* directories under backup_set_path
+  if (OB_FAIL(databuff_printf(logstream_prefix, sizeof(logstream_prefix), logstream_prefix_len, "%s_", OB_STR_LS))) {
+    LOG_WARN("failed to set log stream prefix for filter", K(ret), K(OB_STR_LS));
+  } else if (OB_FAIL(prefix_lsid_op.init(logstream_prefix, strlen(logstream_prefix)))) {
+    LOG_WARN("failed to init dir prefix operator", K(ret), K(logstream_prefix));
+  // TODO(lyh444845) iterate dir sequentially 4.4.1
+  } else if (OB_FAIL(util.list_directories(path, storage_info, prefix_lsid_op))) {
+    LOG_WARN("failed to list directories", K(ret), K(path));
+  } else if (OB_FAIL(ls_ids.assign(ls_entrys))) {
+    LOG_WARN("failed to assign ls id array", K(ret));
+  }
+  return ret;
 }

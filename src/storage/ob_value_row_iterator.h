@@ -23,6 +23,7 @@
 #include "storage/access/ob_dml_param.h"
 #include "blocksstable/ob_datum_rowkey.h"
 #include "blocksstable/ob_datum_row_iterator.h"
+#include "storage/access/ob_table_access_context.h"
 
 namespace oceanbase
 {
@@ -37,13 +38,14 @@ class ObValueRowIterator : public blocksstable::ObDatumRowIterator
 public:
   ObValueRowIterator();
   virtual ~ObValueRowIterator();
-  virtual int init(bool unique);
+  virtual int init();
   virtual int get_next_row(blocksstable::ObDatumRow *&row);
-  virtual int add_row(blocksstable::ObDatumRow &row, const blocksstable::ObStorageDatumUtils &rowkey_datum_utils);
   virtual void reset();
+  void rescan() { cur_idx_ = 0; }
+  int add_row(blocksstable::ObDatumRow &row);
+  int add_row(blocksstable::ObDatumRow &row,  const ObIArray<int32_t> &projector);
 private:
   bool is_inited_;
-  bool unique_;
   common::ObArenaAllocator allocator_;
   RowArray rows_;
   int64_t cur_idx_;
@@ -52,14 +54,14 @@ private:
 };
 
 class ObSingleMerge;
-class ObSingleRowGetter
+class ObMultipleGetMerge;
+class ObRowGetter
 {
   static const int64_t DEFAULT_PROJECTOR_CNT = 16;
   typedef common::ObSEArray<int32_t, DEFAULT_PROJECTOR_CNT> Projector;
-  const ObQRIterType ITER_TYPE = T_SINGLE_GET;
 public:
-  ObSingleRowGetter(common::ObIAllocator &allocator, ObTablet &tablet);
-  ~ObSingleRowGetter();
+  ObRowGetter(common::ObIAllocator &allocator, ObTablet &tablet);
+  ~ObRowGetter();
 
   int init_dml_access_ctx(
       ObStoreCtx &store_ctx,
@@ -68,18 +70,25 @@ public:
       ObRelativeTable &data_table,
       const common::ObIArray<uint64_t> &out_col_ids,
       const bool skip_read_lob = false);
-  int prepare_cached_iter_node(const ObDMLBaseParam &dml_param);
+  int prepare_cached_iter_node(const ObDMLBaseParam &dml_param, const bool is_multi_get);
   ObTableAccessParam &get_access_param() { return access_param_; }
   ObTableAccessContext &get_access_ctx() { return access_ctx_; }
   void set_relative_table(ObRelativeTable *relative_table) { relative_table_ = relative_table; }
   int open(const blocksstable::ObDatumRowkey &rowkey, bool use_fuse_row_cache = false);
+  int open(const ObIArray<blocksstable::ObDatumRowkey> &rowkeys, bool use_fuse_row_cache);
   int get_next_row(blocksstable::ObDatumRow *&row);
+  TO_STRING_KV(K(iter_type_), KPC(row_iter_));
 private:
   bool can_use_global_iter_pool(const ObDMLBaseParam &dml_param) const;
   int init_single_merge();
+  int init_multi_get_merge();
 private:
   ObTablet *tablet_;
+  ObQRIterType iter_type_;
   ObSingleMerge *single_merge_;
+  ObMultipleGetMerge *multi_get_merge_;
+  ObQueryRowIterator *row_iter_;
+
   ObStoreCtx *store_ctx_;
   Projector output_projector_;
   ObTableAccessParam access_param_;
@@ -89,6 +98,7 @@ private:
   common::ObIAllocator &allocator_;
   CachedIteratorNode *cached_iter_node_;
 };
+
 } // end namespace storage
 } // end namespace oceanbase
 

@@ -98,6 +98,22 @@ private:
                           bool force_sync_resp,
                           bool &async_resp_used,
                           bool &need_disconnect);
+
+  int process_with_mem_perf(const sql::ObMultiStmtItem &multi_stmt_item,
+                            ObSMConnection *conn,
+                            sql::ObSQLSessionInfo &session,
+                            bool has_more_result,
+                            bool force_sync_resp,
+                            bool &async_resp_used,
+                            bool &need_disconnect);
+
+  int do_process_single_stmt(const sql::ObMultiStmtItem &multi_stmt_item,
+                             ObSMConnection *conn,
+                             sql::ObSQLSessionInfo &session,
+                             bool has_more_result,
+                             bool force_sync_resp,
+                             bool &async_resp_used,
+                             bool &need_disconnect);
   void check_is_trans_ctrl_cmd(const ObString &sql,
                                bool &is_trans_ctrl_cmd,
                                stmt::StmtType &stmt_type);
@@ -128,7 +144,7 @@ private:
                                 sql::ObSQLSessionInfo &session,
                                 common::ParamStore &params);
 public:
-  static const int64_t MAX_SELF_OBJ_SIZE = 2 * 1024L;
+  static const int64_t MAX_SELF_OBJ_SIZE = 2.5 * 1024L;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObMPQuery);
 private:

@@ -32,6 +32,7 @@
 #endif
 #ifdef OB_BUILD_SHARED_LOG_SERVICE
 #include "logservice/ob_log_service_garbage_collector.h"
+#include "logservice/ob_log_submit_log_rate_limiter.h"
 #endif
 #include "ob_reporter_adapter.h"
 #include "ob_ls_adapter.h"
@@ -222,7 +223,14 @@ public:
 #ifdef OB_BUILD_ARBITRATION
   int diagnose_arb_srv(const share::ObLSID &id, LogArbSrvDiagnoseInfo &diagnose_info);
 #endif
-  int get_io_start_time(int64_t &last_working_time);
+  int get_io_statistic_info(int64_t &last_working_time,
+                            int64_t &pending_write_size,
+                            int64_t &pending_write_count,
+                            int64_t &pending_write_rt,
+                            int64_t &accum_write_size,
+                            int64_t &accum_write_count,
+                            int64_t &accum_write_rt);
+
   int check_disk_space_enough(bool &is_disk_enough);
 
   ipalf::IPalfEnv *get_palf_env() { return palf_env_; }
@@ -294,6 +302,7 @@ private:
   SharedGarbageCollector shared_gc_;
   // for logservice mode, cache configured log disk size to make get_palf_stable_disk_usage() work as shared nothing mode
   int64_t configured_log_disk_size_;
+  ObLogSSRTOKeeper shared_log_rto_keeper_;
 #endif
   ObLocalityAdapter locality_adapter_;
 private:

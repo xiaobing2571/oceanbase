@@ -13,9 +13,9 @@
 #include "ob_admin_routine.h"
 #include "ob_admin_utils.h"
 #include "../ob_admin_common_utils.h"
-
 #include "share/ob_io_device_helper.h"
 #ifdef OB_BUILD_SHARED_STORAGE
+#include "storage/shared_storage/ob_file_helper.h"
 #endif
 using namespace std;
 
@@ -73,6 +73,7 @@ bool ObAdminRoutine::match(const string &cmd) const
 DEF_COMMAND(TRANS, dump_memtable, 1, "tenant_id:ls_id:tablet_id # dump memtable to /tmp/memtable.*")
 {
   int ret = OB_SUCCESS;
+  COMMON_LOG(INFO, "start dump_memtable");
   string arg_str;
   uint64_t tablet_id;
   obrpc::ObDumpMemtableArg arg;
@@ -88,10 +89,12 @@ DEF_COMMAND(TRANS, dump_memtable, 1, "tenant_id:ls_id:tablet_id # dump memtable 
     ret = OB_INVALID_ARGUMENT;
     COMMON_LOG(WARN, "invalid arg", K(ret));
   } else if (FALSE_IT(arg.tablet_id_ = tablet_id)) {
-  } else if (OB_SUCCESS != (ret = client_->dump_memtable(arg))) {
-    COMMON_LOG(ERROR, "send req fail", K(ret));
+  } else if (OB_FAIL(client_->dump_memtable(arg))) {
+    COMMON_LOG(ERROR, "send req fail", K(ret), K(arg));
+  } else {
+    COMMON_LOG(INFO, "dump_memtable success", K(arg));
   }
-  COMMON_LOG(INFO, "dump_memtable", K(arg));
+  COMMON_LOG(INFO, "finish dump_memtable", K(arg));
   return ret;
 }
 
@@ -671,6 +674,98 @@ DEF_COMMAND(TRANS, remove_lock, 1, "tenant_id ls_id obj_type obj_id lock_mode ow
   return ret;
 }
 
+// remove_priority
+// @params [in]  tenant_id, which tenant to modify
+// @params [in]  ls_id, which log stream to modify
+// @params [in]  obj_type, lock object type (1:OBJ_TYPE_TABLE, 2:OBJ_TYPE_TABLET)
+// @params [in]  obj_id, lock object id
+// @params [in]  lock_mode, lock mode (1:EXCLUSIVE, 2:SHARE, 4:ROW_EXCLUSIVE, 6:SHARE_ROW_EXCLUSIVE, 8:ROW_SHARE)
+// @params [in]  owner_id, for OUT_TRANS lock and unlock
+// @params [in]  owner_type, for OUT_TRANS lock and unlock
+// @params [in]  create_tx_id, which transaction create this lock
+// @params [in]  op_type, (1:IN_TRANS_DML_LOCK; 2:OUT_TRANS_LOCK; 3:OUT_TRANS_UNLOCK; 4:IN_TRANS_LOCK_TABLE_LOCK)
+// @params [in]  priority, (0:HIGH1; 10:HIGH2; 20:NORMAL; 30:LOW)
+DEF_COMMAND(TRANS, remove_priority, 1, "tenant_id ls_id obj_type obj_id lock_mode owner_id owner_type create_tx_id op_type priority # remove_priority")
+{
+  int ret = OB_SUCCESS;
+  string arg_str;
+  ObAdminRemoveLockPriorityArg arg;
+  int64_t tenant_id_to_set = OB_INVALID_TENANT_ID;
+  int64_t ls_id_to_set = 0;
+  int64_t obj_type = 0; // how to change int64_t to be enum class
+  int64_t obj_id = 0;
+  int64_t lock_mode = 0;
+  int64_t owner_id = 0;
+  int64_t owner_type = 0;
+  int64_t create_tx_id = 0;
+  int64_t op_type = 0;
+  int64_t lock_op_status = 1; // does not used.
+  ObTxSEQ seq_no;
+  int64_t create_timestamp = 0;
+  int64_t create_schema_version = 0;
+  int64_t priority = 0;
+
+  if (cmd_ == action_name_) {
+    ret = OB_INVALID_ARGUMENT;
+    ADMIN_WARN("should provide tenant_id, ls_id, obj_type, obj_id, lock_mode, owner_id, owner_type, create_tx_id, op_type, priority");
+  } else {
+    arg_str = cmd_.substr(action_name_.length() + 1);
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (10
+             != sscanf(arg_str.c_str(),
+                       "%ld %ld %ld %ld %ld %ld %ld %ld %ld %ld",
+                       &tenant_id_to_set,
+                       &ls_id_to_set,
+                       &obj_type,
+                       &obj_id,
+                       &lock_mode,
+                       &owner_id,
+                       &owner_type,
+                       &create_tx_id,
+                       &op_type,
+                       &priority)) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid arg", K(ret), K(arg_str.c_str()), K(cmd_.c_str()),
+               K(tenant_id_to_set), K(ls_id_to_set), K(obj_type), K(obj_id),
+               K(lock_mode), K(owner_id), K(owner_type), K(create_tx_id),
+               K(op_type), K(lock_op_status), K(seq_no), K(create_timestamp),
+               K(create_schema_version), K(priority));
+  } else {
+    share::ObLSID ls_id(ls_id_to_set);
+    ObLockID lock_id;
+    ObLockOBJType real_obj_type = static_cast<ObLockOBJType>(obj_type);
+    ObTableLockMode real_lock_mode = static_cast<ObTableLockMode>(lock_mode);
+    ObTableLockOwnerID real_owner_id;
+    ObTransID real_create_tx_id = create_tx_id;
+    ObTableLockOpType real_op_type = static_cast<ObTableLockOpType>(op_type);
+    ObTableLockOpStatus real_lock_op_status = static_cast<ObTableLockOpStatus>(lock_op_status);
+    ObTableLockOp lock_op;
+    ObTableLockPrioArg prio_arg(static_cast<ObTableLockPriority>(priority));
+    lock_id.set(real_obj_type, obj_id);
+
+    real_owner_id.convert_from_value(static_cast<transaction::tablelock::ObLockOwnerType>(owner_type),
+                                     owner_id);
+    lock_op.set(lock_id, real_lock_mode, real_owner_id, real_create_tx_id, real_op_type,
+                real_lock_op_status, seq_no, create_timestamp, create_schema_version);
+    if (OB_ISNULL(client_)
+        || OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id_to_set
+                       || !ls_id.is_valid_with_tenant(tenant_id_to_set)
+                       || !lock_op.is_valid()
+                       || !prio_arg.is_valid())) {
+      ret = OB_INVALID_ARGUMENT;
+      COMMON_LOG(WARN, "invalid argument", K(ret), K(tenant_id_to_set), K(ls_id), K(lock_op), K(prio_arg), KP(client_));
+    } else if (OB_FAIL(arg.set(tenant_id_to_set, ls_id, lock_op, prio_arg))) {
+      COMMON_LOG(WARN, "set remove lock op arg failed", K(ret), K(tenant_id_to_set), K(ls_id), K(lock_op), K(prio_arg));
+    } else if (OB_FAIL(client_->admin_remove_lock_priority(arg))) {
+      COMMON_LOG(ERROR, "send req fail", K(ret));
+    }
+  }
+  COMMON_LOG(INFO, "remove_lock", K(ret), K(arg));
+  return ret;
+}
+
 // update_lock
 // @params [in]  tenant_id, which tenant to modify
 // @params [in]  ls_id, which log stream to modify
@@ -764,6 +859,34 @@ DEF_COMMAND(TRANS, update_lock, 1, "tenant_id ls_id obj_type obj_id lock_mode ow
   return ret;
 }
 
+// switch_replica_role
+// @params [in]  ls_id, which log stream to modify
+// @params [in]  tenant_id, which tenant to modify
+// @params [in]  server, the server address of the replica to switch role
+// @params [in]  role, the role to switch to
+DEF_COMMAND(TRANS, switch_replica_role, 1, "ls_id=xxx,tenant_id=xxx,server=xxx,role=xxx] # switch_replica_role")
+{
+  int ret = OB_SUCCESS;
+  string arg_str;
+  ObAdminSwitchReplicaRoleStr arg;
+  if (cmd_ == action_name_) {
+    ret = OB_INVALID_ARGUMENT;
+    ADMIN_WARN("should provide ls_id, tenant_id, server, role");
+  } else {
+    arg_str = cmd_.substr(action_name_.length() + 1);
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(client_)) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid client", KR(ret));
+  } else if (OB_FAIL(arg.init(arg_str.c_str()))) {
+    COMMON_LOG(WARN, "fail to construct admin command arg", KR(ret), K(arg_str.c_str()));
+  } else if (OB_FAIL(client_->ob_exec_switch_replica_role(arg))) {
+    COMMON_LOG(ERROR, "send req fail", KR(ret), K(arg));
+  }
+  COMMON_LOG(INFO, "switch_replica_role over", KR(ret), K(arg));
+  return ret;
+}
 
 // remove_ls_replica
 // @params [in]  tenant_id, which tenant to modify
@@ -1059,8 +1182,8 @@ DEF_COMMAND(SERVER, dump_ss_macro_block, 1,  "tenant_id:ver:mode:obj_type:incar_
 
     if (OB_SUCC(ret)) {
       blocksstable::MacroBlockId macro_id;
-      macro_id.set_ss_version(version);
-      macro_id.set_ss_id_mode(mode);
+      macro_id.set_version_v2();
+      macro_id.set_id_mode(mode);
       macro_id.set_storage_object_type(obj_type);
       macro_id.set_incarnation_id(incar_id);
       macro_id.set_column_group_id(cg_id);
@@ -1073,6 +1196,7 @@ DEF_COMMAND(SERVER, dump_ss_macro_block, 1,  "tenant_id:ver:mode:obj_type:incar_
       } else if (OB_FAIL(client_->get_ss_macro_block(arg, result))) {
         COMMON_LOG(ERROR, "send req fail", KR(ret), K(arg), K(result));
       } else {
+        const ObDumpMacroBlockParam param(ObDumpMacroBlockContext(), false/*hex_print*/);
         int64_t pos = 0;
         char *macro_buf = result.macro_buf_.ptr();
         int64_t buf_size = result.macro_buf_.length();
@@ -1083,12 +1207,12 @@ DEF_COMMAND(SERVER, dump_ss_macro_block, 1,  "tenant_id:ver:mode:obj_type:incar_
         } else if (OB_FAIL(common_header.check_integrity())) {
           COMMON_LOG(ERROR, "invalid common header", KR(ret), K(common_header));
         } else if (ObMacroBlockCommonHeader::SharedSSTableData == common_header.get_type()) {
-          if (OB_FAIL(ObAdminCommonUtils::dump_shared_macro_block(ObDumpMacroBlockContext(), macro_buf, buf_size))) {
-            COMMON_LOG(ERROR, "dump shared block fail", KR(ret), K(buf_size));
+          if (OB_FAIL(ObAdminCommonUtils::dump_shared_macro_block(param, macro_buf, buf_size))) {
+            COMMON_LOG(ERROR, "dump shared block fail", KR(ret), K(buf_size), K(param));
           }
         } else {
-          if (OB_FAIL(ObAdminCommonUtils::dump_single_macro_block(ObDumpMacroBlockContext(), macro_buf, buf_size))) {
-            COMMON_LOG(ERROR, "dump single block fail", KR(ret), K(buf_size));
+          if (OB_FAIL(ObAdminCommonUtils::dump_single_macro_block(param, macro_buf, buf_size))) {
+            COMMON_LOG(ERROR, "dump single block fail", KR(ret), K(buf_size), K(param));
           }
         }
       }
@@ -1210,8 +1334,8 @@ DEF_COMMAND(SERVER, get_ss_micro_block_meta, 1, "tenant_id:micro_key_mode:micro_
       } else {
         ObSSMicroBlockId micro_id;
         MacroBlockId &macro_id = micro_id.macro_id_;
-        macro_id.set_ss_version(ver);
-        macro_id.set_ss_id_mode(mode);
+        macro_id.set_version_v2();
+        macro_id.set_id_mode(mode);
         macro_id.set_storage_object_type(obj_type);
         macro_id.set_incarnation_id(incar_id);
         macro_id.set_column_group_id(cg_id);
@@ -1274,6 +1398,7 @@ DEF_COMMAND(SERVER, dump_ss_macro_block_by_uri, 1, "tenant_id:uri")
   } else if (OB_FAIL(client_->get_ss_macro_block_by_uri(arg, result))) {
     COMMON_LOG(ERROR, "send req fail", K(ret));
   } else {
+    const ObDumpMacroBlockParam param(ObDumpMacroBlockContext(), false/*hex_print*/);
     int64_t pos = 0;
     char *macro_buf = result.macro_buf_.ptr();
     int64_t buf_size = result.macro_buf_.length();
@@ -1284,12 +1409,12 @@ DEF_COMMAND(SERVER, dump_ss_macro_block_by_uri, 1, "tenant_id:uri")
     } else if (OB_FAIL(common_header.check_integrity())) {
       COMMON_LOG(ERROR, "invalid common header", KR(ret), K(common_header));
     } else if (ObMacroBlockCommonHeader::SharedSSTableData == common_header.get_type()) {
-      if (OB_FAIL(ObAdminCommonUtils::dump_shared_macro_block(ObDumpMacroBlockContext(), macro_buf, buf_size))) {
-        COMMON_LOG(ERROR, "dump shared block fail", KR(ret), K(buf_size));
+      if (OB_FAIL(ObAdminCommonUtils::dump_shared_macro_block(param, macro_buf, buf_size))) {
+        COMMON_LOG(ERROR, "dump shared block fail", KR(ret), K(buf_size), K(param));
       }
     } else {
-      if (OB_FAIL(ObAdminCommonUtils::dump_single_macro_block(ObDumpMacroBlockContext(), macro_buf, buf_size))) {
-        COMMON_LOG(ERROR, "dump single block fail", KR(ret), K(buf_size));
+      if (OB_FAIL(ObAdminCommonUtils::dump_single_macro_block(param, macro_buf, buf_size))) {
+        COMMON_LOG(ERROR, "dump single block fail", KR(ret), K(buf_size), K(param));
       }
     }
   }
@@ -1298,50 +1423,6 @@ DEF_COMMAND(SERVER, dump_ss_macro_block_by_uri, 1, "tenant_id:uri")
   }
 
   COMMON_LOG(INFO, "dump ss_macro_block by uri", K(arg));
-  return ret;
-}
-
-DEF_COMMAND(SERVER, del_ss_tablet_meta, 1, "tenant_id:tablet_id:compaction_scn")
-{
-  int ret = OB_SUCCESS;
-  string arg_str;
-  ObDelSSTabletMetaArg arg;
-  if (cmd_ == action_name_) {
-    ret = OB_INVALID_ARGUMENT;
-    ADMIN_WARN("should provide tenant_id, tablet_id, compaction_scn");
-  } else {
-    arg_str = cmd_.substr(action_name_.length() + 1);
-  }
-
-  int64_t tablet_id = 0;
-  int64_t compaction_scn = 0;
-  if (OB_FAIL(ret)) {
-  } else if (3 != sscanf(arg_str.c_str(), "%ld:%ld:%ld", &arg.tenant_id_, &tablet_id, &compaction_scn)) {
-    ret = OB_INVALID_ARGUMENT;
-    COMMON_LOG(WARN, "invalid arg", K(ret), K(arg_str.c_str()));
-  } else {
-    MacroBlockId macro_id;
-    macro_id.set_ss_version(MacroBlockId::MACRO_BLOCK_ID_VERSION_V2);
-    macro_id.set_ss_id_mode(static_cast<uint64_t>(ObMacroBlockIdMode::ID_MODE_SHARE));
-    macro_id.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::SHARED_MAJOR_TABLET_META));
-    macro_id.set_second_id(tablet_id);
-    macro_id.set_third_id(compaction_scn);
-    arg.macro_id_ = macro_id;
-    if (!arg.is_valid()) {
-      ret = OB_INVALID_ARGUMENT;
-      COMMON_LOG(WARN, "argument is invalid", K(ret), K(arg));
-    } else if (OB_FAIL(client_->del_ss_tablet_meta(arg))) {
-      COMMON_LOG(ERROR, "send req fail", K(ret));
-    } else {
-      fprintf(stdout,
-          "Successfully delete ss_tablet_meta[tenant_id:%ld, tablet_id:%ld, compaction_scn:%ld]",
-          arg.tenant_id_, tablet_id, compaction_scn);
-    }
-  }
-  if (OB_FAIL(ret)) {
-    fprintf(stderr, "fail to del_ss_tablet_meta, ret=%s\n", ob_error_name(ret));
-  }
-  COMMON_LOG(INFO, "del ss_tablet_meta", K(arg));
   return ret;
 }
 
@@ -1364,8 +1445,8 @@ DEF_COMMAND(SERVER, del_ss_local_tmpfile, 1, "tenant_id:tmpfile_id")
     COMMON_LOG(WARN, "invalid arg", K(ret), K(arg_str.c_str()));
   } else {
     MacroBlockId macro_id;
-    macro_id.set_ss_version(MacroBlockId::MACRO_BLOCK_ID_VERSION_V2);
-    macro_id.set_ss_id_mode(static_cast<uint64_t>(ObMacroBlockIdMode::ID_MODE_SHARE));
+    macro_id.set_version_v2();
+    macro_id.set_id_mode(static_cast<uint64_t>(ObMacroBlockIdMode::ID_MODE_SHARE));
     macro_id.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::TMP_FILE));
     macro_id.set_second_id(tmpfile_id);
     arg.macro_id_ = macro_id;
@@ -1467,9 +1548,8 @@ DEF_COMMAND(SERVER, del_ss_tablet_micro, 1, "tenant_id:tablet_id")
   } else {
     arg_str = cmd_.substr(action_name_.length() + 1);
   }
-
   int64_t tablet_id = 0;
-  const int64_t rpc_timeout = 1800000000; // 3min
+  const int64_t RPC_TIMEOUT_US = 1800000000; // 30min
   if (OB_FAIL(ret)) {
   } else if (2 != sscanf(arg_str.c_str(), "%ld:%ld", &arg.tenant_id_, &tablet_id)) {
     ret = OB_INVALID_ARGUMENT;
@@ -1479,14 +1559,13 @@ DEF_COMMAND(SERVER, del_ss_tablet_micro, 1, "tenant_id:tablet_id")
     if (!arg.is_valid()) {
       ret = OB_INVALID_ARGUMENT;
       COMMON_LOG(WARN, "argument is invalid", K(ret), K(arg));
-    } else if (OB_FALSE_IT(client_->set_timeout(rpc_timeout))) {
+    } else if (OB_FALSE_IT(client_->set_timeout(RPC_TIMEOUT_US))) {
     } else if (OB_FAIL(client_->del_ss_tablet_micro(arg))) {
       COMMON_LOG(ERROR, "send req fail", K(ret));
     } else {
       fprintf(stdout, "Successfully del_ss_tablet_micro [tenant_id:%ld, tablet_id:%ld]", arg.tenant_id_, arg.tablet_id_.id());
     }
   }
-
   if (OB_FAIL(ret)) {
     fprintf(stderr, "fail to del_ss_tablet_micro, ret=%s\n", ob_error_name(ret));
   }
@@ -1537,8 +1616,8 @@ DEF_COMMAND(SERVER, download_ss_macro_block, 1,  "tenant_id:ver:mode:obj_type:in
 
     if (OB_SUCC(ret)) {
       blocksstable::MacroBlockId macro_id;
-      macro_id.set_ss_version(version);
-      macro_id.set_ss_id_mode(mode);
+      macro_id.set_version_v2();
+      macro_id.set_id_mode(mode);
       macro_id.set_storage_object_type(obj_type);
       macro_id.set_incarnation_id(incar_id);
       macro_id.set_column_group_id(cg_id);
@@ -1806,6 +1885,181 @@ DEF_COMMAND(SERVER, set_ss_cache_size_ratio, 1, "tenant_id:new_micro_size_ratio:
     fprintf(stderr, "fail to set_ss_cache_size_ratio, ret=%s\n", ob_error_name(ret));
   }
   COMMON_LOG(INFO, "set_ss_cache_size_ratio", K(arg));
+  return ret;
+}
+
+DEF_COMMAND(SERVER, del_ss_macro_cache, 1, "tenant_id:ver:mode:obj_type:incar_id:cg_id:second_id:third_id:fourth_id #del ss_macro_cache")
+{
+  int ret = OB_SUCCESS;
+  string arg_str;
+  obrpc::ObGetSSMacroBlockArg arg;
+  obrpc::ObDelSSMacroCacheRes result;
+  if (cmd_ == action_name_) {
+    ret = OB_INVALID_ARGUMENT;
+    ADMIN_WARN("should provide tenant_id, macro_id, ret: %d", ret);
+  } else {
+    arg_str = cmd_.substr(action_name_.length() + 1);
+  }
+  char macro_id_str[common::MAX_PATH_SIZE] = {0};
+  if (OB_FAIL(ret)) {
+  } else if (2 != sscanf(arg_str.c_str(), "%ld:%s", &arg.tenant_id_, macro_id_str)) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid arg", K(ret), K(arg_str.c_str()));
+  } else {
+    blocksstable::MacroBlockId macro_id;
+    const int64_t RPC_TIMEOUT_US = 600000000; // 10min
+    // tenant_id:path=%s, tenant_id:path:%s
+    if (0 == strncmp(macro_id_str, "path", 4)) {
+      char path_str[common::MAX_PATH_SIZE] = {0};
+      COMMON_LOG(INFO, "try to convert path to macro id", K(macro_id_str));
+      if (1 != sscanf(macro_id_str, "path%*[=:]%s", path_str)) {
+        ret = OB_INVALID_ARGUMENT;
+        COMMON_LOG(WARN, "invalid macro_id arg", KR(ret), K(macro_id_str));
+      } else {
+        if (OB_FAIL(ObFileHelper::convert_path_to_macro_id(path_str, macro_id))) {
+          COMMON_LOG(WARN, "fail to convert path to macro id", KR(ret), K(path_str));
+        }
+      }
+    } else {
+      int64_t version = 0;
+      int64_t mode = 0;
+      int64_t obj_type = 0;
+      int64_t incar_id = 0;
+      int64_t cg_id = 0;
+      int64_t second_id = 0;
+      int64_t third_id = 0;
+      int64_t fourth_id = 0;
+      COMMON_LOG(INFO, "try to convert macro id", K(macro_id_str));
+      if (0 == strncmp(macro_id_str, "macro_id", 8)) {
+        if (8 != sscanf(macro_id_str, "macro_id%*[=:]{[ver=%ld,mode=%ld,obj_type=%ld,obj_type_str=%*[^,],incar_id=%ld,cg_id=%ld]"
+                    "[2nd=%ld][3rd=%ld][4th=%ld]}",
+                    &version, &mode, &obj_type, &incar_id, &cg_id, &second_id, &third_id, &fourth_id)) {
+          ret = OB_INVALID_ARGUMENT;
+          COMMON_LOG(WARN, "invalid macro_id arg", KR(ret), K(macro_id_str));
+        }
+      } else {
+        if (8 != sscanf(macro_id_str, "%ld:%ld:%ld:%ld:%ld:%ld:%ld:%ld", &version, &mode,
+                    &obj_type, &incar_id, &cg_id, &second_id, &third_id, &fourth_id)) {
+          ret = OB_INVALID_ARGUMENT;
+          COMMON_LOG(WARN, "invalid macro_id arg", KR(ret), K(macro_id_str));
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else {
+        macro_id.set_version_v2();
+        macro_id.set_id_mode(mode);
+        macro_id.set_storage_object_type(obj_type);
+        macro_id.set_incarnation_id(incar_id);
+        macro_id.set_column_group_id(cg_id);
+        macro_id.set_second_id(second_id);
+        macro_id.set_third_id(third_id);
+        macro_id.set_fourth_id(fourth_id);
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else {
+      arg.macro_id_ = macro_id;
+      if (!arg.is_valid()) {
+        ret = OB_INVALID_ARGUMENT;
+        COMMON_LOG(WARN, "argument is invalid", K(ret), K(arg));
+      } else if (OB_FALSE_IT(client_->set_timeout(RPC_TIMEOUT_US))) {
+      } else if (OB_FAIL(client_->del_ss_macro_cache(arg, result))) {
+        COMMON_LOG(ERROR, "send req fail", K(ret));
+        if (result.get_ret() == OB_TIMEOUT) {
+          COMMON_LOG(WARN, "wait write cache to be read cache timeout, just retry", K(ret), K(arg), K(result));
+          fprintf(stderr, "please wait write cache to be read cache, just retry after one minute.\n");
+        }
+      } else {
+        ObCStringHelper helper;
+        fprintf(stdout, "Successfully del_ss_macro_cache, tenant_id=%ld, micro_id=%s.\n",
+          arg.tenant_id_, helper.convert(arg.macro_id_));
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    fprintf(stderr, "fail to del_ss_macro_cache, ret=%s\n.", ob_error_name(ret));
+  }
+  COMMON_LOG(INFO, "del_ss_macro_cache", KR(ret), K(arg), K(result));
+  return ret;
+}
+
+DEF_COMMAND(SERVER, del_ss_tablet_macro_cache, 1, "tenant_id:tablet_id")
+{
+  int ret = OB_SUCCESS;
+  string arg_str;
+  obrpc::ObDelSSTabletMacroCacheArg arg;
+  obrpc::ObDelSSTabletMacroCacheRes result;
+  if (cmd_ == action_name_) {
+    ret = OB_INVALID_ARGUMENT;
+    ADMIN_WARN("should provide tenant_id, tablet_id");
+  } else {
+    arg_str = cmd_.substr(action_name_.length() + 1);
+  }
+  int64_t tablet_id = 0;
+  const int64_t RPC_TIMEOUT_US = 1800000000; // 30min
+  if (OB_FAIL(ret)) {
+  } else if (2 != sscanf(arg_str.c_str(), "%ld:%ld", &arg.tenant_id_, &tablet_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid arg", K(ret), K(arg_str.c_str()));
+  } else {
+    arg.tablet_id_ = ObTabletID(tablet_id);
+    if (!arg.is_valid()) {
+      ret = OB_INVALID_ARGUMENT;
+      COMMON_LOG(WARN, "argument is invalid", K(ret), K(arg));
+    } else if (OB_FALSE_IT(client_->set_timeout(RPC_TIMEOUT_US))) {
+    } else if (OB_FAIL(client_->del_ss_tablet_macro_cache(arg, result))) {
+      COMMON_LOG(ERROR, "send req fail", K(ret));
+    } else {
+      if (result.macro_write_cache_cnt_ > 0) {
+        fprintf(stderr, "please retry del_ss_tablet_macro_cache [tenant_id:%ld, tablet_id:%ld] for macro_write_cache_cnt is not 0, macro_write_cache_cnt=%ld, macro_read_cache_cnt=%ld.\n",
+          arg.tenant_id_, arg.tablet_id_.id(), result.macro_write_cache_cnt_, result.macro_read_cache_cnt_);
+        ret = OB_EAGAIN;
+        COMMON_LOG(WARN, "macro_write_cache_cnt is not 0, just retry", K(ret), K(arg), K(result));
+      } else {
+        fprintf(stdout, "Successfully del_ss_tablet_macro_cache [tenant_id:%ld, tablet_id:%ld], macro_write_cache_cnt=%ld, macro_read_cache_cnt=%ld.\n",
+          arg.tenant_id_, arg.tablet_id_.id(), result.macro_write_cache_cnt_, result.macro_read_cache_cnt_);
+        COMMON_LOG(INFO, "Successfully del_ss_tablet_macro_cache", K(arg), K(result));
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    fprintf(stderr, "fail to del_ss_tablet_macro_cache, ret=%s.\n", ob_error_name(ret));
+  }
+  COMMON_LOG(INFO, "del_ss_tablet_macro_cache", KR(ret), K(arg), K(result));
+  return ret;
+}
+
+DEF_COMMAND(SERVER, push_ss_gc_last_succ_scn, 1, "tenant_id:succ_scn # push ss gc last_succ_scn to specified value")
+{
+  int ret = OB_SUCCESS;
+  string arg_str;
+  obrpc::ObSSGCPushLastSuccScnArg arg;
+  if (cmd_ == action_name_) {
+    ret = OB_INVALID_ARGUMENT;
+    ADMIN_WARN("should provide tenant_id and succ_scn");
+  } else {
+    arg_str = cmd_.substr(action_name_.length() + 1);
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (2 != sscanf(arg_str.c_str(), "%ld:%ld", &arg.tenant_id_, &arg.succ_scn_ns_)) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid arg", K(ret), K(arg_str.c_str()));
+  } else if (!arg.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "argument is invalid", K(ret), K(arg));
+  } else if (OB_FAIL(client_->push_ss_gc_last_succ_scn(arg))) {
+    COMMON_LOG(ERROR, "send req fail", K(ret), K(arg));
+  } else {
+    fprintf(stdout, "push_ss_gc_last_succ_scn success, tenant_id=%ld, succ_scn_ns=%ld\n",
+            arg.tenant_id_, arg.succ_scn_ns_);
+  }
+
+  if (OB_FAIL(ret)) {
+    fprintf(stderr, "fail to push_ss_gc_last_succ_scn, ret=%s\n", ob_error_name(ret));
+  }
+
+  COMMON_LOG(INFO, "push_ss_gc_last_succ_scn finished", KR(ret), K(arg));
   return ret;
 }
 #endif

@@ -85,7 +85,7 @@ int ObSetCommentHelper::lock_objects_()
     ret = OB_ERR_PARALLEL_DDL_CONFLICT;
     LOG_WARN("database_id_ is not equal to table schema's databse_id",
              KR(ret), K_(database_id), K(orig_table_schema_->get_database_id()));
-  } else if (OB_FAIL(latest_schema_guard_.get_database_schema(database_id_, database_schema))) {
+  } else if (OB_FAIL(schema_guard_wrapper_.get_database_schema(database_id_, database_schema))) {
     LOG_WARN("fail to get database schema", KR(ret), K_(tenant_id), K_(database_id));
   } else if (OB_ISNULL(database_schema)) {
     ret = OB_ERR_UNEXPECTED;
@@ -136,8 +136,9 @@ int ObSetCommentHelper::lock_objects_by_name_()
   const ObString &table_name = arg_.table_name_;
   if (OB_FAIL(check_inner_stat_())) {
     LOG_WARN("fail to check inner stat", KR(ret));
-  } else if (OB_FAIL(add_lock_object_by_name_(database_name, table_name,
-      share::schema::TABLE_SCHEMA, transaction::tablelock::EXCLUSIVE))) {
+  // comment on no need to consider temp table now
+  } else if (OB_FAIL(add_lock_table_by_name_with_session_id_zero_(database_name, table_name,
+                     transaction::tablelock::EXCLUSIVE, arg_.session_id_))) {
     LOG_WARN("fail to lock object by table name", KR(ret), K_(tenant_id), K(database_name), K(table_name));
   } else if (OB_FAIL(lock_existed_objects_by_name_())) {
     LOG_WARN("fail to lock objects by name", KR(ret), K_(tenant_id));
@@ -159,7 +160,7 @@ int ObSetCommentHelper::lock_objects_by_id_()
   } else if (OB_FAIL(add_lock_object_by_id_(database_id_,
     share::schema::DATABASE_SCHEMA, transaction::tablelock::SHARE))) {
     LOG_WARN("fail to lock database id", KR(ret), K_(database_id));
-  } else if (OB_FAIL(latest_schema_guard_.get_table_id(database_id_, arg_.session_id_, arg_.table_name_, table_id_, table_type, schema_version))) {
+  } else if (OB_FAIL(schema_guard_wrapper_.get_table_id(database_id_, arg_.session_id_, arg_.table_name_, table_id_, table_type, schema_version))) {
     LOG_WARN("fail to get table id", KR(ret), K_(database_id), K_(arg_.session_id), K_(arg_.table_name));
   } else if (OB_UNLIKELY(OB_INVALID_ID == table_id_)) {
     ret = OB_ERR_OBJECT_NOT_EXIST;
@@ -190,15 +191,17 @@ int ObSetCommentHelper::check_table_legitimacy_()
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "alter materialized view is");
   } else if (OB_UNLIKELY(orig_table_schema_->is_ctas_tmp_table())) {
     ret = OB_ERR_WRONG_OBJECT;
+    ObCStringHelper helper;
     LOG_USER_ERROR(OB_ERR_WRONG_OBJECT,
-    to_cstring(arg_.database_name_), to_cstring(arg_.table_name_), "BASE TABLE");
+    helper.convert(arg_.database_name_), helper.convert(arg_.table_name_), "BASE TABLE");
   } else if (OB_UNLIKELY((!orig_table_schema_->is_user_table()
                           && !orig_table_schema_->is_tmp_table()
                           && !orig_table_schema_->is_view_table()
                           && !orig_table_schema_->is_external_table()))) {
     ret = OB_ERR_WRONG_OBJECT;
+    ObCStringHelper helper;
     LOG_USER_ERROR(OB_ERR_WRONG_OBJECT,
-    to_cstring(arg_.database_name_), to_cstring(arg_.table_name_), "BASE TABLE");
+    helper.convert(arg_.database_name_), helper.convert(arg_.table_name_), "BASE TABLE");
   } else if (OB_UNLIKELY(orig_table_schema_->is_sys_view() && !GCONF.enable_sys_table_ddl)) {
     ret = OB_OP_NOT_ALLOW;
     LOG_WARN("comment on sys view is not allowed", KR(ret), K(orig_table_schema_->get_table_id()));
@@ -239,7 +242,7 @@ int ObSetCommentHelper::lock_for_common_ddl_()
   } else if (OB_UNLIKELY(OB_INVALID_ID == table_id_)) {
     ret = OB_ERR_OBJECT_NOT_EXIST;
     LOG_WARN("table not exist", KR(ret), K_(database_id), K_(arg_.session_id), K_(arg_.table_name));
-  } else if (OB_FAIL(latest_schema_guard_.get_table_schema(table_id_, orig_table_schema_))) {
+  } else if (OB_FAIL(schema_guard_wrapper_.get_table_schema(table_id_, orig_table_schema_))) {
     LOG_WARN("fail to get orig table schema", KR(ret), K_(table_id));
   } else if (OB_ISNULL(orig_table_schema_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -250,7 +253,7 @@ int ObSetCommentHelper::lock_for_common_ddl_()
   } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id_, tenant_data_version))) {
     LOG_WARN("get min data version failed", KR(ret), K_(tenant_id));
   } else {
-    if (OB_FAIL(ObDDLLock::lock_for_common_ddl_in_trans(*orig_table_schema_, false/*require_strict_binary_format*/,trans_))) {
+    if (OB_FAIL(ObDDLLock::lock_for_common_ddl_in_trans(*orig_table_schema_, false/*require_strict_binary_format*/,get_trans_()))) {
       LOG_WARN("fail to lock for common ddl", KR(ret));
     }
   }
@@ -337,14 +340,14 @@ int ObSetCommentHelper::operate_schemas_()
     for (uint64_t column_idx = 0; OB_SUCC(ret) && column_idx < arg_.column_name_list_.size(); column_idx++) {
       new_column_schemas_.at(column_idx)->set_schema_version(new_schema_version);
       if (OB_FAIL(schema_service_impl->get_table_sql_service().update_single_column(
-                trans_, *orig_table_schema_, *new_table_schema_,
+                get_trans_(), *orig_table_schema_, *new_table_schema_,
                 *new_column_schemas_.at(column_idx), false /* record ddl operation*/, need_del_stat))) {
         LOG_WARN("fail to update single column", KR(ret));
       }
     }
     new_table_schema_->set_schema_version(new_schema_version);
     if (FAILEDx(schema_service_impl->get_table_sql_service().only_update_table_options(
-                                                             trans_,
+                                                             get_trans_(),
                                                              *new_table_schema_,
                                                              OB_DDL_ALTER_TABLE,
                                                              ddl_stmt_str))) {

@@ -39,6 +39,9 @@ class ObSynonymChecker;
 }
 namespace share
 {
+
+struct ObTimeTravelInfo;
+
 namespace schema
 {
 class ObTenantSchema;
@@ -55,6 +58,7 @@ class ObSchemaGetterGuard;
 class ObUDF;
 class ObUDTTypeInfo;
 class ObKeystoreSchema;
+class ObSensitiveRuleSchema;
 }
 }
 namespace sql
@@ -139,7 +143,7 @@ public:
                          const bool with_hidden_flag,
                          bool &is_exist,
                          const bool is_built_in_index = false,
-                         const uint64_t catalog_id = OB_INTERNAL_CATALOG_ID); // to many place used this function, assign default catalog_id
+                         const uint64_t catalog_id = OB_INTERNAL_CATALOG_ID); // too many place used this function, assign default catalog_id
 
   // mock_fk_parent_table begin
   int get_mock_fk_parent_table_with_name(
@@ -168,6 +172,22 @@ public:
                           uint64_t &catalog_id,
                           ObIAllocator *allocator = NULL,
                           bool allow_not_exist = false) const;
+  int get_sensitive_rule_schema_count(const uint64_t tenant_id, int64_t &count) const;
+  int get_sensitive_rule_id_name(const uint64_t tenant_id,
+                                 common::ObString &sensitive_rule_name,
+                                 uint64_t &sensitive_rule_id,
+                                 ObIAllocator *allocator = NULL,
+                                 bool allow_not_exist = false) const;
+  int get_sensitive_rule_schema_by_column(const uint64_t tenant_id,
+                                          const uint64_t table_id,
+                                          const uint64_t column_id,
+                                          bool allow_not_exist,
+                                          const share::schema::ObSensitiveRuleSchema *&schema) const;
+  int get_location_id_name(const uint64_t tenant_id,
+                           common::ObString &location_name,
+                           uint64_t &location_id,
+                           ObIAllocator *allocator = NULL,
+                           bool allow_not_exist = false) const;
   //int get_local_table_id(const uint64_t tenant_id,
   //                       const uint64_t database_id,
   //                       const common::ObString &table_name,
@@ -217,7 +237,8 @@ public:
                        const bool cte_table_fisrt,
                        const bool with_hidden_flag,
                        const share::schema::ObTableSchema *&table_schema,
-                       const bool is_built_in_index = false);
+                       const bool is_built_in_index = false,
+                       const share::ObTimeTravelInfo *time_travel_info = NULL);
   int get_table_schema(const uint64_t tenant_id,
                        const uint64_t database_id,
                        const common::ObString &table_name,
@@ -225,7 +246,8 @@ public:
                        const bool cte_table_fisrt,
                        const bool with_hidden_flag,
                        const share::schema::ObTableSchema *&table_schema,
-                       const bool is_built_in_index = false);
+                       const bool is_built_in_index = false,
+                       const share::ObTimeTravelInfo *time_travel_info = NULL);
   int get_table_schema(const uint64_t tenant_id, const uint64_t table_id, const share::schema::ObTableSchema *&table_schema, bool is_link = false) const;
   int get_link_table_schema(const uint64_t dblink_id,
                             const common::ObString &database_name,
@@ -462,11 +484,15 @@ public:
                             uint64_t database_id,
                             const common::ObString &object_name,
                             uint64_t &object_id);
+  int check_object_exists_by_name(const uint64_t tenant_id,
+                                     uint64_t database_id,
+                                     const common::ObString &object_name,
+                                     bool &exist,
+                                     bool &is_private_syn);
   int check_exist_same_name_object_with_synonym(const uint64_t tenant_id,
                                                 uint64_t database_id,
                                                 const common::ObString &object_name,
-                                                bool &exist,
-                                                bool &is_private_syn);
+                                                bool &exist);
   int get_object_type(const uint64_t tenant_id,
                       const common::ObString &database_name,
                       const common::ObString &table_name,
@@ -477,7 +503,9 @@ public:
                       bool explicit_db,
                       const common::ObString &prev_table_name,
                       ObSynonymChecker &synonym_checker,
-                      bool is_catalog = false);
+                      bool is_catalog = false,
+                      bool is_location = false,
+                      bool is_sensitive_rule = false);
   int get_object_type_with_view_info(common::ObIAllocator* allocator,
                                      void* param,
                                      const uint64_t tenant_id,
@@ -491,7 +519,9 @@ public:
                                      bool explicit_db,
                                      const common::ObString &prev_table_name,
                                      ObSynonymChecker &synonym_checker,
-                                     bool is_catalog = false);
+                                     bool is_catalog = false,
+                                     bool is_location = false,
+                                     bool is_sensitive_rule = false);
   int check_access_to_obj(const uint64_t tenant_id,
                           const uint64_t user_id,
                           const uint64_t obj_id,
@@ -553,6 +583,8 @@ public:
   int check_set_default_role_priv(const ObSqlCtx &sql_ctx);
   int set_lbca_op();
   bool is_lbca_op();
+  int set_search_index_ddl();
+  bool is_search_index_ddl() const;
 
   static bool is_ora_priv_check(); 
   static bool enable_mysql_pl_priv_check(int64_t tenant_id, share::schema::ObSchemaGetterGuard &schema_guard);
@@ -569,6 +601,10 @@ public:
   int get_directory_id(const uint64_t tenant_id,
                        const common::ObString &directory_name,
                        uint64_t &directory_id);
+  // location
+  int get_location_id(const uint64_t tenant_id,
+                      const common::ObString &location_name,
+                      uint64_t &location_id);
 int flatten_udt_attributes(const uint64_t tenant_id,
                            const uint64_t udt_id,
                            ObIAllocator &allocator,
@@ -580,6 +616,7 @@ int flatten_udt_attributes(const uint64_t tenant_id,
 
 
   int remove_tmp_cte_schemas(const ObString& cte_table_name);
+  int add_ddl_tmp_schema(const share::schema::ObTableSchema *schema);
 private:
 
 int construct_udt_qualified_name(const share::schema::ObUDTTypeInfo &udt_info, ObIAllocator &allocator,
@@ -597,6 +634,20 @@ int construct_udt_qualified_name(const share::schema::ObUDTTypeInfo &udt_info, O
   int get_column_schema_inner(const uint64_t tenant_id, uint64_t table_id, const uint64_t column_id,
                               const share::schema::ObColumnSchemaV2 *&column_schema,
                               bool is_link = false) const;
+  int get_ddl_tmp_column_schema(const uint64_t tenant_id, uint64_t table_id,
+                                const common::ObString &column_name,
+                                bool &is_ddl_tmp,
+                                const share::schema::ObColumnSchemaV2 *&column_schema) const;
+  int get_column_schema_from_mgr(const uint64_t tenant_id, uint64_t table_id,
+                                 const common::ObString &column_name,
+                                 const share::schema::ObColumnSchemaV2 *&column_schema,
+                                 bool is_link = false) const;
+  int get_column_schema_from_mgr(const uint64_t tenant_id, uint64_t table_id, const uint64_t column_id,
+                                 const share::schema::ObColumnSchemaV2 *&column_schema,
+                                 bool is_link = false) const;
+  int get_search_index_data_table_schema(const uint64_t tenant_id,
+                                         const uint64_t table_id,
+                                         const share::schema::ObTableSchema *&table_schema) const;
 private:
   bool is_inited_;
   share::schema::ObSchemaGetterGuard *schema_mgr_;
@@ -604,8 +655,19 @@ private:
   // cte tmp schema，用于递归的cte服务，生命周期仅在本次查询有效
   common::ObArray<share::schema::ObTableSchema*,
                   common::ModulePageAllocator, true> tmp_cte_schemas_;
+  // when resolve stmt during ddl procedure, the latest schema is not available in schema guard
+  common::ObArray<const share::schema::ObTableSchema*,
+                  common::ModulePageAllocator, true> ddl_tmp_schemas_;
   // 记录checker的额外信息，例如安全员的操作等
-  int flag_;
+  union {
+    uint32_t flag_;
+    struct {
+      uint32_t lbca_op_flag_ : 1;
+      uint32_t search_index_ddl_ : 1;
+      uint32_t reserved_;
+    };
+  };
+
   // disallow copy
   DISALLOW_COPY_AND_ASSIGN(ObSchemaChecker);
 };

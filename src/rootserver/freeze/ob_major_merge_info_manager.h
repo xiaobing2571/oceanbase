@@ -67,6 +67,11 @@ public:
   };
 
   int set_freeze_info(const ObMajorFreezeReason freeze_reason);
+  int set_window_compaction_info(
+      const ObWindowCompactionParam &param,
+      const int64_t expected_epoch);
+  int finish_window_compaction(
+      const int64_t expected_epoch);
   int get_freeze_info(const share::SCN &frozen_scn,
                       share::ObFreezeInfo &frozen_status);
 
@@ -77,7 +82,7 @@ public:
   int check_snapshot_gc_scn();
   int check_need_broadcast(bool &need_broadcast);
   int broadcast_freeze_info(const int64_t expected_epoch);
-  int get_local_latest_frozen_scn(share::SCN &frozen_scn);
+  int get_local_latest_freeze_info(share::ObFreezeInfo &freeze_info);
   int adjust_global_merge_info(const int64_t expected_epoch);
   int get_gts(share::SCN &gts_scn) const;
 

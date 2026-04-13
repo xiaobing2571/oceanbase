@@ -149,10 +149,16 @@ int ObMdsTableMgr::flush(SCN recycle_scn, int64_t trace_id, bool need_freeze)
   MdsTableHandle *flushing_mds_table = nullptr;
   share::SCN max_consequent_callbacked_scn;
   FlusherForSome order_flusher_for_some;
+  const int64_t flush_start_ts = ObClockGenerator::getClock();
 
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     MDS_LOG_FREEZE(ERROR, "mds table mgr not inited");
+  } else if (!can_flush()) {
+    ret = OB_EAGAIN;
+    if (REACH_TIME_INTERVAL(10LL * 1000LL * 1000LL/*10 seconds*/)) {
+      FLOG_INFO("mds flush is disabled", K(ls_->get_ls_id()));
+    }
   } else if (!freeze_guard.can_freeze()) {
     MDS_LOG_FREEZE(INFO, "mds table mgr is doing flush, skip flush once");
   } else if (MDS_FAIL(for_each_in_t3m_mds_table(OrderOp<FlusherForSome>(order_flusher_for_some)))) {
@@ -184,8 +190,15 @@ int ObMdsTableMgr::flush(SCN recycle_scn, int64_t trace_id, bool need_freeze)
       MDS_LOG_FREEZE(INFO, "no need do flush cause min_rec_scn is larger than freezing scn");
     }
   }
+  const int64_t flush_end_ts = ObClockGenerator::getClock();
+  FLOG_INFO("mds flush finish", KTIME(flush_start_ts), "flush cost time(ms)", (flush_end_ts - flush_start_ts) / 1000);
   return ret;
   #undef PRINT_WRAPPER
+}
+
+bool ObMdsTableMgr::can_flush()
+{
+  return !ls_->flush_is_disabled();
 }
 
 void ObMdsTableMgr::order_flush_(FlusherForSome &order_flusher_for_some,

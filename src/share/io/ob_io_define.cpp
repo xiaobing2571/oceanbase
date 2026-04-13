@@ -22,6 +22,11 @@ static const char *read_mode_name = "READ";
 static const char *read_mode_name_short = "R";
 static const char *write_mode_name = "WRITE";
 static const char *write_mode_name_short = "W";
+enum ObIODirType : int {
+  OB_DIR_TYPE_LOCAL = 0,
+  OB_DIR_TYPE_SS_PRIVATE = 1,
+  OB_DIR_TYPE_SS_PUBLIC = 2
+};
 const char *oceanbase::common::get_io_mode_string(const ObIOMode mode)
 {
   const char *ret_name = "UNKNOWN";
@@ -36,6 +41,18 @@ const char *oceanbase::common::get_io_mode_string(const ObIOMode mode)
       break;
   }
   return ret_name;
+}
+
+// some read mode doesn't need buffer, e.g., unlink, adaptive_unlink, mkdir, rmdir, complete, abort, seal_file
+bool oceanbase::common::is_without_read_buf(const ObIOReadMode read_mode)
+{
+  return read_mode == ObIOReadMode::UNLINK
+        || read_mode == ObIOReadMode::ADAPTIVE_UNLINK
+        || read_mode == ObIOReadMode::MKDIR
+        || read_mode == ObIOReadMode::RMDIR
+        || read_mode == ObIOReadMode::COMPLETE
+        || read_mode == ObIOReadMode::ABORT
+        || read_mode == ObIOReadMode::SEAL_FILE;
 }
 
 const char *oceanbase::common::get_io_mode_string(const ObIOGroupMode group_mode)
@@ -117,8 +134,12 @@ public:
   {
     int ret = OB_SUCCESS;
     if (REACH_TIME_INTERVAL(60 * 1000L * 1000L)) {
-      is_clog_data_in_same_disk_ = is_same_disk(oceanbase::ObFileSystemRouter::get_instance().get_data_dir(),
-          oceanbase::ObFileSystemRouter::get_instance().get_clog_dir());
+      is_clog_data_in_same_disk_ =
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+        !GCONF.enable_logservice &&
+#endif
+        is_same_disk(oceanbase::ObFileSystemRouter::get_instance().get_data_dir(),
+        oceanbase::ObFileSystemRouter::get_instance().get_clog_dir());
     }
     return is_clog_data_in_same_disk_;
   }
@@ -207,6 +228,7 @@ const char *oceanbase::common::get_io_sys_group_name(ObIOModule module)
 /******************             IOFlag              **********************/
 ObIOFlag::ObIOFlag()
     : mode_(0),
+      read_mode_(0),
       func_type_(oceanbase::share::ObFunctionType::DEFAULT_FUNCTION),
       wait_event_id_(0),
       is_sync_(false),
@@ -215,6 +237,10 @@ ObIOFlag::ObIOFlag()
       is_write_through_(false),
       is_sealed_(true),
       need_close_dev_and_fd_(false),
+      is_buffered_read_(true),
+      is_preread_(false),
+      is_upload_part_(false),
+      ss_dir_type_(ObIODirType::OB_DIR_TYPE_LOCAL),
       reserved_(0),
       group_id_(USER_RESOURCE_OTHER_GROUP_ID),
       sys_module_id_(OB_INVALID_ID)
@@ -229,6 +255,7 @@ ObIOFlag::~ObIOFlag()
 void ObIOFlag::reset()
 {
   mode_ = 0;
+  read_mode_ = 0;
   group_id_ = USER_RESOURCE_OTHER_GROUP_ID;
   sys_module_id_ = OB_INVALID_ID;
   wait_event_id_ = 0;
@@ -238,6 +265,10 @@ void ObIOFlag::reset()
   is_write_through_ = false;
   is_sealed_ = true;
   need_close_dev_and_fd_ = false;
+  is_buffered_read_ = true;
+  ss_dir_type_ = ObIODirType::OB_DIR_TYPE_LOCAL;
+  is_preread_ = false;
+  is_upload_part_ = false;
   reserved_ = 0;
   group_id_ = USER_RESOURCE_OTHER_GROUP_ID;
   sys_module_id_ = OB_INVALID_ID;
@@ -246,6 +277,7 @@ void ObIOFlag::reset()
 bool ObIOFlag::is_valid() const
 {
   return mode_ >= 0 && mode_ < static_cast<int>(ObIOMode::MAX_MODE)
+    && read_mode_ >= 0 && read_mode_ < static_cast<uint8_t>(ObIOReadMode::MAX_MODE)
     && is_valid_group(group_id_)
     && wait_event_id_ > 0;
 }
@@ -306,12 +338,12 @@ bool ObIOFlag::is_sys_module() const
           && sys_module_id_ < SYS_MODULE_END_ID;
 }
 
-bool ObIORequest::is_object_device_req() const
+bool ObIORequest::is_limit_net_bandwidth_req() const
 {
   bool ret = false;
   if (io_result_ == nullptr) {
   } else {
-    ret = io_result_->is_object_device_req_;
+    ret = io_result_->is_limit_net_bandwidth_req_;
   }
   return ret;
 }
@@ -321,14 +353,20 @@ int64_t ObIOFlag::get_wait_event() const
   return wait_event_id_;
 }
 
-void ObIOFlag::set_read()
+void ObIOFlag::set_read(ObIOReadMode read_mode)
 {
   set_mode(ObIOMode::READ);
+  read_mode_ = static_cast<uint8_t>(read_mode);
 }
 
 bool ObIOFlag::is_read() const
 {
   return static_cast<int>(ObIOMode::READ) == mode_;
+}
+
+ObIOReadMode ObIOFlag::get_read_mode() const
+{
+  return static_cast<ObIOReadMode>(read_mode_);
 }
 
 void ObIOFlag::set_write()
@@ -341,12 +379,12 @@ bool ObIOFlag::is_write() const
   return static_cast<int>(ObIOMode::WRITE) == mode_;
 }
 
-void ObIOFlag::set_sync()
+void ObIOFlag::set_sync_()
 {
   is_sync_ = true;
 }
 
-void ObIOFlag::set_async()
+void ObIOFlag::set_async_()
 {
   is_sync_ = false;
 }
@@ -426,6 +464,64 @@ bool ObIOFlag::is_need_close_dev_and_fd() const
   return need_close_dev_and_fd_;
 }
 
+void ObIOFlag::set_buffered_read(const bool is_buffered_read)
+{
+  is_buffered_read_ = is_buffered_read;
+}
+
+bool ObIOFlag::is_buffered_read() const
+{
+  return is_buffered_read_;
+}
+
+void ObIOFlag::set_preread()
+{
+  is_preread_ = true;
+}
+
+void ObIOFlag::set_no_preread()
+{
+  is_preread_ = false;
+}
+
+bool ObIOFlag::is_preread() const
+{
+  return is_preread_;
+}
+
+void ObIOFlag::set_upload_part()
+{
+  is_upload_part_ = true;
+}
+
+void ObIOFlag::set_no_upload_part()
+{
+  is_upload_part_ = false;
+}
+
+bool ObIOFlag::is_upload_part() const
+{
+  return is_upload_part_;
+}
+void ObIOFlag::set_ss_private_dir()
+{
+  ss_dir_type_ = ObIODirType::OB_DIR_TYPE_SS_PRIVATE;
+}
+
+void ObIOFlag::set_ss_public_dir()
+{
+  ss_dir_type_ = ObIODirType::OB_DIR_TYPE_SS_PUBLIC;
+}
+
+bool ObIOFlag::is_ss_private_dir() const
+{
+  return ss_dir_type_ == ObIODirType::OB_DIR_TYPE_SS_PRIVATE;
+}
+
+bool ObIOFlag::is_ss_public_dir() const
+{
+  return ss_dir_type_ == ObIODirType::OB_DIR_TYPE_SS_PUBLIC;
+}
 
 bool oceanbase::common::is_atomic_write_callback(const ObIOCallbackType type)
 {
@@ -474,12 +570,13 @@ ObSNIOInfo::ObSNIOInfo()
     fd_(),
     offset_(0),
     size_(0),
-    timeout_us_(DEFAULT_IO_WAIT_TIME_US),
+    timeout_us_(GCONF._data_storage_io_timeout),
     flag_(),
     callback_(nullptr),
     buf_(nullptr),
     user_data_buf_(nullptr),
-    part_id_(-1)
+    part_id_(-1),
+    uri_()
 {
 }
 
@@ -500,12 +597,13 @@ void ObSNIOInfo::reset()
   fd_.reset();
   offset_ = 0;
   size_ = 0;
-  timeout_us_ = DEFAULT_IO_WAIT_TIME_US;
+  timeout_us_ = GCONF._data_storage_io_timeout;
   flag_.reset();
   callback_ = nullptr;
   buf_ = nullptr;
   user_data_buf_ = nullptr;
   part_id_ = -1;
+  uri_.reset();
 }
 
 bool ObSNIOInfo::is_valid() const
@@ -515,7 +613,7 @@ bool ObSNIOInfo::is_valid() const
     && offset_ >= 0
     // in order to address concurrent write issues, archive checkpoint module would write
     // multiple non-content objects (it stores content in object name) whose size = 0
-    && (flag_.is_sync() ? size_ >= 0 : size_ > 0)
+    && size_ >= 0
     && timeout_us_ >= 0 //todo qilu: reopen after column_store steady
     && flag_.is_valid()
     && (flag_.is_read() || nullptr != buf_);
@@ -535,6 +633,7 @@ ObSNIOInfo &ObSNIOInfo::operator=(const ObSNIOInfo &other)
     buf_ = other.buf_;
     user_data_buf_ = other.user_data_buf_;
     part_id_ = other.part_id_;
+    uri_ = other.uri_;
   }
   return (*this);
 }
@@ -544,7 +643,9 @@ ObSNIOInfo &ObSNIOInfo::operator=(const ObSNIOInfo &other)
 #ifdef OB_BUILD_SHARED_STORAGE
 ObSSIOInfo::ObSSIOInfo()
   : ObSNIOInfo(), phy_block_handle_(), fd_cache_handle_(), tmp_file_valid_length_(0),
-    effective_tablet_id_(ObTabletID::INVALID_TABLET_ID), is_write_cache_(true)
+    effective_tablet_id_(ObTabletID::INVALID_TABLET_ID), is_write_cache_(true),
+    write_strategy_(ObStorageObjectWriteStrategy::INVALID_WRITE_STRATEGY),
+    is_batch_write_(false)
 {}
 
 ObSSIOInfo::ObSSIOInfo(const ObSSIOInfo &other)
@@ -564,6 +665,8 @@ void ObSSIOInfo::reset()
   tmp_file_valid_length_ = 0;
   effective_tablet_id_ = ObTabletID::INVALID_TABLET_ID;
   is_write_cache_ = true;
+  write_strategy_ = ObStorageObjectWriteStrategy::INVALID_WRITE_STRATEGY;
+  is_batch_write_ = false;
 }
 
 ObSSIOInfo &ObSSIOInfo::operator=(const ObSSIOInfo &other)
@@ -584,6 +687,8 @@ ObSSIOInfo &ObSSIOInfo::operator=(const ObSSIOInfo &other)
     tmp_file_valid_length_ = other.tmp_file_valid_length_;
     effective_tablet_id_ = other.effective_tablet_id_;
     is_write_cache_ = other.is_write_cache_;
+    write_strategy_ = other.write_strategy_;
+    is_batch_write_ = other.is_batch_write_;
     // ignore ret, cuz assign fails only when other.phy_block_handle_/fd_cache_handle_ is invalid.
     // in case when other.phy_block_handle_/fd_cache_handle_ is invalid, ret is unnecessary.
     int tmp_ret = OB_SUCCESS;
@@ -631,6 +736,28 @@ void ObIOTimeLog::reset()
   end_ts_ = 0;
 }
 
+DEF_TO_STRING(ObIOTimeLog)
+{
+  int64_t pos = 0;
+  int64_t cost_time = 0;
+  J_OBJ_START();
+  J_KV("begin_ts", begin_ts_);
+  const int64_t times[] = {enqueue_ts_, dequeue_ts_, submit_ts_, return_ts_, callback_enqueue_ts_, callback_dequeue_ts_, callback_finish_ts_, end_ts_};
+  const char *keys[] = {"enqueue_used", "dequeue_used", "submit_used", "return_used", "callback_enqueue_used", "callback_dequeue_used", "callback_finish_used", "end_used"};
+
+  for (int i = 0; i < ARRAYSIZEOF(times); ++i) {
+    int64_t used = -1;
+    if (times[i] > 0) {
+      used = times[i] - begin_ts_ - cost_time;
+      cost_time += used;
+    }
+    J_COMMA();
+    J_KV(keys[i], used);
+  }
+  J_OBJ_END();
+  return pos;
+}
+
 int64_t oceanbase::common::get_io_interval(const int64_t &end_time, const int64_t &begin_time)
 {
   int64_t ret_time = end_time - begin_time;
@@ -673,13 +800,13 @@ ObIOResult::ObIOResult()
     is_finished_(false),
     is_canceled_(false),
     has_estimated_(false),
-    is_object_device_req_(false),
+    is_limit_net_bandwidth_req_(false),
     result_ref_cnt_(0),
     out_ref_cnt_(0),
     complete_size_(0),
     offset_(0),
     size_(0),
-    timeout_us_(DEFAULT_IO_WAIT_TIME_US),
+    timeout_us_(GCONF._data_storage_io_timeout),
     aligned_size_(DIO_ALIGN_SIZE),
     tenant_io_mgr_(),
     buf_(nullptr),
@@ -703,10 +830,15 @@ bool ObIOResult::is_valid() const
   return offset_ >= 0
     // in order to address concurrent write issues, archive checkpoint module would write
     // multiple non-content objects (it stores content in object name) whose size = 0
-    && (flag_.is_sync() ? size_ >= 0 : size_ > 0)
+    && size_ >= 0
     && timeout_us_ >= 0 //todo qilu: reopen after column_store steady
     && flag_.is_valid()
-    && (flag_.is_read() ? (nullptr != io_callback_ || nullptr != user_data_buf_ || flag_.is_detect()) : nullptr != buf_);
+    && (flag_.is_read() ?
+       (nullptr != io_callback_
+        || nullptr != user_data_buf_
+        || flag_.is_detect()
+        || is_without_read_buf(flag_.get_read_mode()))
+      : nullptr != buf_);
 }
 
 int ObIOResult::basic_init()
@@ -714,6 +846,39 @@ int ObIOResult::basic_init()
   int ret = OB_SUCCESS;
   if (OB_FAIL(cond_.init(ObWaitEventIds::IO_CONTROLLER_COND_WAIT))) {
     LOG_WARN("init result condition failed", K(ret));
+  }
+  return ret;
+}
+
+int ObIOResult::set_flag_sync_or_async_(const ObIOInfo &info)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(info.fd_.device_handle_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(info));
+  } else {
+    if (info.fd_.device_handle_->is_local_device() || info.fd_.device_handle_->is_local_cache_device()) {
+      flag_.set_async_();
+    } else if (info.fd_.device_handle_->is_object_device()) {
+      // is_object_storage_async_io_ indicates that the handle(such as ObStorageAsyncReader)
+      // supports asynchronous I/O, but not all the interfaces of the handle support async io.
+      // (such as ObStorageAsyncMultipartWriter complete)
+      // Utility I/O uses read mode, so we need to verify if the read mode is default.
+      if (info.fd_.is_object_storage_async_io_) {
+        if (flag_.is_read() && flag_.get_read_mode() != ObIOReadMode::DEFAULT) {
+          flag_.set_sync_();
+        } else if (info.fd_.is_backup_block_file()) {
+          flag_.set_sync_();
+        } else {
+          flag_.set_async_();
+        }
+      } else {
+        flag_.set_sync_();
+      }
+    } else {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("unknown device type, please check", KR(ret), K(info));
+    }
   }
   return ret;
 }
@@ -729,14 +894,9 @@ int ObIOResult::init(const ObIOInfo &info)
     LOG_WARN("thread_cond not init yet", K(ret));
   } else if (OB_ISNULL(info.fd_.device_handle_)) {
     ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(info.fd_.device_handle_));
   } else {
-    if (info.flag_.is_sync()) {
-      if (OB_FAIL(info.fd_.device_handle_->get_io_aligned_size(aligned_size_))) {
-        LOG_WARN("get io aligned size failed", K(ret));
-      }
-    } else {
-      aligned_size_ = DIO_ALIGN_SIZE;
-    }
+    aligned_size_ = info.fd_.device_handle_->get_io_aligned_size();
   }
   if (OB_SUCC(ret)) {
     //init info and check valid
@@ -755,8 +915,11 @@ int ObIOResult::init(const ObIOInfo &info)
     buf_ = info.buf_;
     user_data_buf_ = info.user_data_buf_;
     time_log_.begin_ts_ = ObTimeUtility::fast_current_time();
-    is_object_device_req_ = info.fd_.device_handle_->is_object_device();
-    if (OB_UNLIKELY(!is_valid())) {
+    is_limit_net_bandwidth_req_ = info.fd_.device_handle_->should_limit_net_bandwidth();
+
+    if (OB_FAIL(set_flag_sync_or_async_(info))) {
+      LOG_WARN("fail to set flag sync or async", K(ret), K(info));
+    } else if (OB_UNLIKELY(!is_valid())) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid argument", K(ret), K(*this));
     }
@@ -772,13 +935,13 @@ void ObIOResult::reset()
   is_finished_ = false;
   is_canceled_ = false;
   has_estimated_ = false;
-  is_object_device_req_ = false;
+  is_limit_net_bandwidth_req_ = false;
   complete_size_ = 0;
   offset_ = 0;
   size_ = 0;
   result_ref_cnt_ = 0;
   out_ref_cnt_ = 0;
-  timeout_us_ = DEFAULT_IO_WAIT_TIME_US;
+  timeout_us_ = GCONF._data_storage_io_timeout;
   buf_ = nullptr;
   user_data_buf_ = nullptr;
   io_callback_ = nullptr;
@@ -795,13 +958,13 @@ void ObIOResult::destroy()
   is_finished_ = false;
   is_canceled_ = false;
   has_estimated_ = false;
-  is_object_device_req_ = false;
+  is_limit_net_bandwidth_req_ = false;
   complete_size_ = 0;
   offset_ = 0;
   size_ = 0;
   result_ref_cnt_ = 0;
   out_ref_cnt_ = 0;
-  timeout_us_ = DEFAULT_IO_WAIT_TIME_US;
+  timeout_us_ = GCONF._data_storage_io_timeout;
   buf_ = nullptr;
   user_data_buf_ = nullptr;
   io_callback_ = nullptr;
@@ -821,6 +984,11 @@ int64_t ObIOResult::get_data_size() const
   return data_size;
 }
 
+int64_t ObIOResult::get_user_io_size() const
+{
+  return size_;
+}
+
 ObIOMode ObIOResult::get_mode() const
 {
   return flag_.get_mode();
@@ -828,7 +996,7 @@ ObIOMode ObIOResult::get_mode() const
 
 ObIOGroupKey ObIOResult::get_group_key() const
 {
-  return ObIOGroupKey(flag_.get_resource_group_id(), is_object_device_req_ ? get_mode() : ObIOMode::MAX_MODE);
+  return ObIOGroupKey(flag_.get_resource_group_id(), is_limit_net_bandwidth_req_ ? get_mode() : ObIOMode::MAX_MODE);
 }
 
 uint64_t ObIOResult::get_sys_module_id() const
@@ -853,6 +1021,7 @@ uint64_t ObIOResult::get_tenant_id() const
 {
   return this->tenant_id_;
 }
+
 void ObIOResult::cancel()
 {
   int ret = OB_SUCCESS;
@@ -864,6 +1033,13 @@ void ObIOResult::cancel()
       } else if (is_finished_) {
         // do nothing
       } else {
+        if (REACH_TIME_INTERVAL(1000000)) {
+          LOG_WARN("io canceled", K(lbt()), K(*this));
+        }
+        ObRefHolder<ObTenantIOManager> tenant_holder(tenant_io_mgr_.get_ptr());
+        if (OB_NOT_NULL(tenant_holder.get_ptr())) {
+          tenant_holder.get_ptr()->inc_io_cancel_count();
+        }
         is_canceled_ = true;
         //note: not support channel cancel now
       }
@@ -886,6 +1062,13 @@ int ObIOResult::wait(int64_t wait_ms)
       } else if (!is_finished_) {
         int64_t duration_ms = ObTimeUtility::current_time() - begin_ms;
         wait_ms -= duration_ms;
+      }
+      if (REACH_TIME_INTERVAL(1000L * 1000L)) {
+        int64_t cur_time = ObTimeUtility::fast_current_time();
+        if (this->time_log_.enqueue_ts_ > 0 && this->time_log_.dequeue_ts_ <= 0 && cur_time - this->time_log_.enqueue_ts_ > 4 * 1000L * 1000L) {
+          LOG_WARN("schedule time is too long", K(*this), K(wait_ms), K(cur_time), K(this->time_log_.enqueue_ts_));
+          IGNORE_RETURN faststack();
+        }
       }
     }
     if (OB_UNLIKELY(wait_ms <= 0)) { // rarely happen
@@ -939,7 +1122,7 @@ void ObIOResult::finish(const ObIORetCode &ret_code, ObIORequest *req)
           tenant_io_mgr_.get_ptr()->io_usage_.accumulate(*req);
         }
         time_log_.end_ts_ = ObTimeUtility::fast_current_time();
-        if (req->fd_.device_handle_->is_object_device()) {
+        if (req->is_limit_net_bandwidth_req()) {
           const ObStorageIdMod &storage_info = ((ObObjectDevice*)(req->fd_.device_handle_))->get_storage_id_mod();
           if (OB_UNLIKELY(!storage_info.is_valid())) {
             LOG_WARN("invalid storage id", K(storage_info));
@@ -1022,7 +1205,7 @@ int ObIOResult::transform_group_config_index_to_usage_index(const ObIOGroupKey &
   // REMOTE READ = 2,
   // REMOTE WRITE = 3
   if (is_sys_module()) {
-    offset = is_object_device_req_ ? 1 : 0;
+    offset = is_limit_net_bandwidth_req_ ? 1 : 0;
     offset = offset * 2 + static_cast<uint64_t>(get_mode());
     tmp_index = get_sys_module_id() - SYS_MODULE_START_ID;
     usage_index = tmp_index * GROUP_MODE_CNT + offset;
@@ -1043,10 +1226,11 @@ int ObIOResult::transform_group_config_index_to_usage_index(const ObIOGroupKey &
 int ObIOResult::cal_delay_us(int64_t &prepare_delay, int64_t &schedule_delay, int64_t &submit_delay, int64_t &device_delay, int64_t &total_delay)
 {
   int ret = OB_SUCCESS;
-  prepare_delay = get_io_interval(this->time_log_.enqueue_ts_, this->time_log_.begin_ts_);
-  schedule_delay = get_io_interval(this->time_log_.dequeue_ts_, this->time_log_.enqueue_ts_);
-  submit_delay = get_io_interval(this->time_log_.submit_ts_, this->time_log_.dequeue_ts_);
-  device_delay = get_io_interval(this->time_log_.return_ts_, this->time_log_.submit_ts_);
+  int64_t prev_delay = 0;
+  prev_delay += (prepare_delay = get_io_interval(this->time_log_.enqueue_ts_, this->time_log_.begin_ts_));
+  prev_delay += (schedule_delay = get_io_interval(this->time_log_.dequeue_ts_, this->time_log_.begin_ts_ + prev_delay));
+  prev_delay += (submit_delay = get_io_interval(this->time_log_.submit_ts_, this->time_log_.begin_ts_ + prev_delay));
+  prev_delay += (device_delay = get_io_interval(this->time_log_.return_ts_, this->time_log_.begin_ts_ + prev_delay));
   total_delay = get_io_interval(this->time_log_.return_ts_, this->time_log_.begin_ts_);
   return ret;
 }
@@ -1055,6 +1239,7 @@ int ObIOResult::cal_delay_us(int64_t &prepare_delay, int64_t &schedule_delay, in
 
 ObIORequest::ObIORequest()
   : io_result_(nullptr),
+    qsched_req_(this),
     is_inited_(false),
     retry_count_(0),
     ref_cnt_(0),
@@ -1065,7 +1250,8 @@ ObIORequest::ObIORequest()
     storage_accesser_(),
     fd_(),
     trace_id_(),
-    part_id_(-1)
+    part_id_(-1),
+    uri_cstr_(nullptr)
 {
 
 }
@@ -1107,7 +1293,9 @@ int ObIORequest::init(const ObIOInfo &info, ObIOResult *result)
     part_id_ = info.part_id_;
     char *io_buf = nullptr;
     buf_size_ = 0;
-    if (OB_FAIL(set_block_handle(info))) {
+    if (OB_FAIL(alloc_uri_cstr(info))) {
+      LOG_WARN("fail to alloc uri_cstr", K(ret), K(info));
+    } else if (OB_FAIL(set_block_handle(info))) {
       LOG_WARN("fail to set block handle", K(ret), K(info));
     } else if (OB_FAIL(set_fd_cache_handle(info))) {
       LOG_WARN("fail to fd cache handle", K(ret), K(info));
@@ -1118,17 +1306,16 @@ int ObIORequest::init(const ObIOInfo &info, ObIOResult *result)
       LOG_WARN("device handle is null", KR(ret), K(*this));
     } else if (fd_.device_handle_->is_object_device()) {
       ObObjectDevice *obj_device_handle = static_cast<ObObjectDevice *>(fd_.device_handle_);
-      int flag = -1;
-      ObFdSimulator::get_fd_flag(fd_, flag);
+      ObStorageAccessType op_type = ObStorageAccessType::OB_STORAGE_ACCESS_MAX_TYPE;
+      ObFdSimulator::get_fd_op_type(fd_, op_type);
 
-      io_result_->flag_.set_sync();
       // alloc buffer for sync read/write request when ObIORequest init
       if (OB_UNLIKELY(!is_valid())) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("invalid argument", K(ret), K(*this));
-      } else if ((info.flag_.is_read() || info.flag_.is_write())
+      } else if (info.flag_.is_write()
                  && (io_result_->size_ > 0) // size == 0 does not need to alloc io buf
-                 && (OB_STORAGE_ACCESS_BUFFERED_MULTIPART_WRITER != flag)
+                 && (OB_STORAGE_ACCESS_BUFFERED_MULTIPART_WRITER != op_type)
                  && OB_FAIL(alloc_io_buf(io_buf))) {
         LOG_WARN("fail to alloc io buffer for sync read or write", K(ret), K(info));
       } else if (OB_FAIL(hold_storage_accesser(fd_, *obj_device_handle))) {
@@ -1196,14 +1383,20 @@ void ObIORequest::destroy()
 {
   int ret = OB_SUCCESS;
   retry_count_ = 0;
-  if (nullptr != control_block_ && nullptr != fd_.device_handle_) {
-    fd_.device_handle_->free_iocb(control_block_);
-    control_block_ = nullptr;
+  if (nullptr != control_block_) {
+    if (OB_ISNULL(fd_.device_handle_)) {
+      ret = OB_ERR_SYS;
+      OB_LOG(ERROR, "device_handle is nullptr, memory leak", K(ret), K(*this), KP(this));
+    } else {
+      fd_.device_handle_->free_iocb(control_block_);
+      control_block_ = nullptr;
+    }
   }
 
   fd_.reset();
   tenant_id_ = 0;
   free_io_buffer();
+  free_uri_cstr();
   ref_cnt_ = 0;
   trace_id_.reset();
   if (nullptr != io_result_) {
@@ -1216,7 +1409,7 @@ void ObIORequest::destroy()
   part_id_ = -1;
 }
 
-bool ObIORequest::is_canceled()
+bool ObIORequest::is_canceled() const
 {
   //result = null should not happen, no need to continue request
   return nullptr == io_result_ ? true : io_result_->is_canceled_;
@@ -1257,30 +1450,31 @@ oceanbase::share::ObFunctionType ObIORequest::get_func_type() const
   return func_type;
 }
 
+bool ObIORequest::is_local_clog_io() const {
+  const oceanbase::share::ObFunctionType func_type = get_func_type();
+  const ObIOGroupKey group_key = get_group_key();
+  bool is_clog_io = group_key.mode_ == ObIOMode::MAX_MODE &&
+                    (func_type == ObFunctionType::PRIO_CLOG_HIGH ||
+                     func_type == ObFunctionType::PRIO_CLOG_MID ||
+                     func_type == ObFunctionType::PRIO_CLOG_LOW);
+  return is_clog_io;
+}
+
 bool ObIORequest::is_local_clog_not_isolated()
 {
   bool clog_not_isolated = false;
   const int64_t clog_io_isolation_mode = GCONF.clog_io_isolation_mode;
-  const ObIOGroupKey group_key = get_group_key();
-  const oceanbase::share::ObFunctionType func_type = get_func_type();
   if (OB_UNLIKELY(OBSERVER.is_arbitration_mode())) {
-  } else if (group_key.mode_ != ObIOMode::MAX_MODE) {
+  } else if (GCONF.enable_logservice) {
+    clog_not_isolated = true;
   } else if (clog_io_isolation_mode == 0 || clog_io_isolation_mode > 2) {
-    if ((func_type == ObFunctionType::PRIO_CLOG_HIGH ||
-         func_type == ObFunctionType::PRIO_CLOG_MID ||
-         func_type == ObFunctionType::PRIO_CLOG_LOW)) {
-      clog_not_isolated = !DiskChecker::get_instance().is_clog_data_in_same_disk();
-    }
+    clog_not_isolated = !DiskChecker::get_instance().is_clog_data_in_same_disk();
   } else if (clog_io_isolation_mode == 1) {
-    if ((func_type == ObFunctionType::PRIO_CLOG_HIGH ||
-         func_type == ObFunctionType::PRIO_CLOG_MID ||
-         func_type == ObFunctionType::PRIO_CLOG_LOW)) {
-      clog_not_isolated = true;
-    }
+    clog_not_isolated = true;
   } else if (clog_io_isolation_mode == 2) {
   }
   if (REACH_TIME_INTERVAL(60 * 1000L * 1000L)) { // 60s
-    LOG_INFO("clog_not_isolated", K(clog_not_isolated), K(clog_io_isolation_mode), K(group_key), K(func_type));
+    LOG_INFO("clog_not_isolated", K(clog_not_isolated), K(clog_io_isolation_mode));
   }
   return clog_not_isolated;
 }
@@ -1336,7 +1530,7 @@ const char *ObIORequest::get_io_data_buf()
 
 int64_t ObIORequest::get_align_size() const
 {
-  return std::max(1L, align_size_);
+  return align_size_;
 }
 
 int64_t ObIORequest::get_align_offset() const
@@ -1356,7 +1550,7 @@ ObIOMode ObIORequest::get_mode() const
 ObIOGroupMode ObIORequest::get_group_mode() const
 {
   ObIOGroupMode group_mode = ObIOGroupMode::MODECNT;
-  if (fd_.device_handle_->is_object_device()) {
+  if (is_limit_net_bandwidth_req()) {
     if (get_mode() == ObIOMode::READ) {
       group_mode = ObIOGroupMode::REMOTEREAD;
     } else if (get_mode() == ObIOMode::WRITE) {
@@ -1418,13 +1612,16 @@ int ObIORequest::alloc_aligned_io_buf(char *&io_buf)
       && OB_UNLIKELY(!is_io_aligned(io_result_->offset_, aligned_size)
                      || !is_io_aligned(io_result_->size_, aligned_size))) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("write io info not aligned", K(ret), K(*this));
+    LOG_WARN("write io info not aligned", K(ret), K(*this), K(aligned_size));
   } else {
     align_offset_size(io_result_->offset_, io_result_->size_, aligned_size, io_offset, io_size);
     const int64_t io_buffer_size = ((1 == aligned_size) ? io_size : (io_size + aligned_size));
     if (OB_ISNULL(tenant_io_mgr_.get_ptr())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("tenant io manager is null", K(ret));
+    } else if (NULL != raw_buf_) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_ERROR("raw buf is not null", K(ret), K(*this));
     } else if (OB_ISNULL(raw_buf_ = tenant_io_mgr_.get_ptr()->io_allocator_.alloc(io_buffer_size))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("allocate memory failed", K(ret), K(io_size));
@@ -1464,17 +1661,22 @@ int ObIORequest::prepare(char *next_buffer, int64_t next_size, int64_t next_offs
     io_size = this->get_align_size();
   }
   char *io_buf = next_buffer != nullptr ? next_buffer : calc_io_buf();
+  ObStorageAccessType op_type = ObStorageAccessType::OB_STORAGE_ACCESS_MAX_TYPE;
+  ObFdSimulator::get_fd_op_type(fd_, op_type);
 
   if (OB_ISNULL(fd_.device_handle_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("device handle is null", K(ret), K(*this));
-  } else if (fd_.device_handle_->is_object_device()) {
+  } else if (fd_.device_handle_->is_object_device() && get_flag().is_sync()) {
     // do nothing
   } else if (OB_ISNULL(control_block_) && OB_ISNULL(control_block_ = fd_.device_handle_->alloc_iocb(tenant_id_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("alloc io control block failed", K(ret), K(*this));
   } else if (FALSE_IT(tg.click("alloc_iocb"))) {
-  } else if (OB_ISNULL(io_buf) && OB_FAIL(alloc_io_buf(io_buf))) {
+  } else if (OB_ISNULL(io_buf)
+             && (io_result_->size_ > 0)
+             && (op_type != OB_STORAGE_ACCESS_BUFFERED_MULTIPART_WRITER)
+             && OB_FAIL(alloc_io_buf(io_buf))) {
     // delayed alloc buffer for read request here to reduce memory usage when io request enqueue
     LOG_WARN("alloc io buffer for read failed", K(ret), K(*this));
   } else if (FALSE_IT(tg.click("alloc_buf"))) {
@@ -1495,7 +1697,7 @@ int ObIORequest::prepare(char *next_buffer, int64_t next_size, int64_t next_offs
         LOG_WARN("prepare io read failed", K(ret), K(*this));
       }
       tg.click("prepare_read");
-    } else if (io_result_->flag_.is_write()) {
+    } else if (io_result_->flag_.is_write() && !io_result_->flag_.is_upload_part()) {
       if (OB_FAIL(fd_.device_handle_->io_prepare_pwrite(
               fd_,
               io_buf,
@@ -1506,6 +1708,17 @@ int ObIORequest::prepare(char *next_buffer, int64_t next_size, int64_t next_offs
         LOG_WARN("prepare io write failed", K(ret), K(*this));
       }
       tg.click("prepare_write");
+    } else if (io_result_->flag_.is_write() && io_result_->flag_.is_upload_part()) {
+      if (OB_FAIL(fd_.device_handle_->io_prepare_upload_part(
+              fd_,
+              io_buf,
+              io_size,
+              part_id_,
+              control_block_,
+              this/*data*/))) {
+        LOG_WARN("prepare io upload part failed", K(ret), K(*this));
+      }
+      tg.click("prepare_upload_part");
     } else {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("not supported io mode", K(ret), K(*this));
@@ -1726,6 +1939,28 @@ int ObIORequest::hold_storage_accesser(const ObIOFd &fd, ObObjectDevice &object_
   return ret;
 }
 
+int ObIORequest::alloc_uri_cstr(const ObIOInfo &info)
+{
+  int ret = OB_SUCCESS;
+  if (info.uri_.empty()) {
+    // do-nothing
+  } else if (OB_ISNULL(tenant_io_mgr_.get_ptr())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tenant io manager is null", K(ret));
+  } else if (OB_FAIL(ob_dup_cstring(tenant_io_mgr_.get_ptr()->io_allocator_, info.uri_, uri_cstr_))) {
+    LOG_WARN("fail to copy url", K(ret), K(info));
+  }
+  return ret;
+}
+
+void ObIORequest::free_uri_cstr()
+{
+  if (nullptr != uri_cstr_ && nullptr != tenant_io_mgr_.get_ptr()) {
+    tenant_io_mgr_.get_ptr()->io_allocator_.free(uri_cstr_);
+    uri_cstr_ = nullptr;
+  }
+}
+
 
 /******************             IOPhyQueue              **********************/
 
@@ -1891,6 +2126,19 @@ int ObIOHandle::get_io_time_us(int64_t &io_time_us) const
   return ret;
 }
 
+int ObIOHandle::get_io_callback_time_us(int64_t &io_callback_time_us) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(result_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("io result is null", KR(ret));
+  } else {
+    io_callback_time_us = get_io_interval(static_cast<int64_t>(result_->time_log_.callback_finish_ts_),
+                                          static_cast<int64_t>(result_->time_log_.callback_enqueue_ts_));
+  }
+  return ret;
+}
+
 int ObIOHandle::check_is_finished(bool &is_finished)
 {
   int ret = OB_SUCCESS;
@@ -1902,6 +2150,16 @@ int ObIOHandle::check_is_finished(bool &is_finished)
     is_finished = true;
   }
   return ret;
+}
+
+void ObIOHandle::get_remained_io_timeout_ms(int64_t &real_wait_timeout_ms) const
+{
+  const int64_t timeout_ms = ((result_->time_log_.begin_ts_ > 0
+                               ? result_->time_log_.begin_ts_ + result_->timeout_us_ - ObTimeUtility::current_time()
+                               : 0) / 1000L);
+  real_wait_timeout_ms = (result_->is_limit_net_bandwidth_req_
+                          ? timeout_ms
+                          : min(OB_IO_MANAGER.get_io_config().data_storage_io_timeout_ms_, timeout_ms));
 }
 
 int ObIOHandle::wait(const int64_t wait_timeout_ms)
@@ -1917,18 +2175,11 @@ int ObIOHandle::wait(const int64_t wait_timeout_ms)
   } else if (0 == wait_timeout_ms) {
     ret = OB_EAGAIN;
   } else if (UINT64_MAX == wait_timeout_ms) {
-    const int64_t timeout_ms =
-        ((result_->time_log_.begin_ts_ > 0
-                ? result_->time_log_.begin_ts_ + result_->timeout_us_ - ObTimeUtility::current_time()
-                : 0)) /
-        1000L;
-    ObWaitEventGuard wait_guard(result_->flag_.get_wait_event(), timeout_ms);
-    const int64_t real_wait_timeout = (result_->is_object_device_req_
-                                       ? timeout_ms
-                                       : min(OB_IO_MANAGER.get_io_config().data_storage_io_timeout_ms_, timeout_ms));
-
+    int64_t real_wait_timeout = 0;
+    get_remained_io_timeout_ms(real_wait_timeout);
     if (real_wait_timeout > 0) {
       int64_t wait_ms = real_wait_timeout;
+      ObWaitEventGuard wait_guard(result_->flag_.get_wait_event(), wait_ms);
       if (OB_FAIL(result_->wait(wait_ms))) {
         if (OB_TIMEOUT == ret) {
           LOG_WARN("fail to wait result condition due to spurious wakeup", K(ret), K(wait_ms), K(*result_));
@@ -1940,7 +2191,7 @@ int ObIOHandle::wait(const int64_t wait_timeout_ms)
       ret = OB_TIMEOUT;
       if (REACH_TIME_INTERVAL(10 * 1000 * 1000L)) {  // 10s
         LOG_WARN(
-            "real_wait_timeout is unexpected < 0", K(ret), K(real_wait_timeout), K(timeout_ms), K(result_), K(lbt()));
+            "real_wait_timeout is unexpected < 0", K(ret), K(real_wait_timeout), K(result_), K(lbt()));
       }
     }
     ObLocalDiagnosticInfo::set_io_time(
@@ -1972,13 +2223,9 @@ int ObIOHandle::wait(const int64_t wait_timeout_ms)
     }
   } else if (OB_TIMEOUT == ret || OB_IO_TIMEOUT == ret) {
     LOG_WARN("IO wait timeout", K(ret), K(*result_));
+    ret = OB_TIMEOUT;
   }
   estimate();
-
-  // TODO(binifei.bnf) just for debug, remove this log later
-  if (OB_UNLIKELY(NULL != (strstr(GETTNAME(), "DiskCB")))) {
-    FLOG_INFO("wait io in DiskCB thread", K(lbt()));
-  }
 
   return ret;
 }
@@ -1991,10 +2238,32 @@ void ObIOHandle::estimate()
       EVENT_INC(ObStatEventIds::IO_READ_COUNT);
       EVENT_ADD(ObStatEventIds::IO_READ_BYTES, result_->size_);
       EVENT_ADD(ObStatEventIds::IO_READ_DELAY, result_delay);
+
+      // SS directory type statistics for read
+      if (result_->flag_.is_ss_private_dir() && result_->is_limit_net_bandwidth_req_) { // private
+        EVENT_INC(ObStatEventIds::IO_REMOTE_PRIVATE_READ_COUNT);
+        EVENT_ADD(ObStatEventIds::IO_REMOTE_PRIVATE_READ_BYTES, result_->size_);
+        EVENT_ADD(ObStatEventIds::IO_REMOTE_PRIVATE_READ_DELAY, result_delay);
+      } else if (result_->flag_.is_ss_public_dir() && result_->is_limit_net_bandwidth_req_) { // public
+        EVENT_INC(ObStatEventIds::IO_REMOTE_PUBLIC_READ_COUNT);
+        EVENT_ADD(ObStatEventIds::IO_REMOTE_PUBLIC_READ_BYTES, result_->size_);
+        EVENT_ADD(ObStatEventIds::IO_REMOTE_PUBLIC_READ_DELAY, result_delay);
+      }
     } else {
       EVENT_INC(ObStatEventIds::IO_WRITE_COUNT);
       EVENT_ADD(ObStatEventIds::IO_WRITE_BYTES, result_->size_);
       EVENT_ADD(ObStatEventIds::IO_WRITE_DELAY, result_delay);
+
+      // SS directory type statistics for write
+      if (result_->flag_.is_ss_private_dir() && result_->is_limit_net_bandwidth_req_) { // private
+        EVENT_INC(ObStatEventIds::IO_REMOTE_PRIVATE_WRITE_COUNT);
+        EVENT_ADD(ObStatEventIds::IO_REMOTE_PRIVATE_WRITE_BYTES, result_->size_);
+        EVENT_ADD(ObStatEventIds::IO_REMOTE_PRIVATE_WRITE_DELAY, result_delay);
+      } else if (result_->flag_.is_ss_public_dir() && result_->is_limit_net_bandwidth_req_) { // public
+        EVENT_INC(ObStatEventIds::IO_REMOTE_PUBLIC_WRITE_COUNT);
+        EVENT_ADD(ObStatEventIds::IO_REMOTE_PUBLIC_WRITE_BYTES, result_->size_);
+        EVENT_ADD(ObStatEventIds::IO_REMOTE_PUBLIC_WRITE_DELAY, result_delay);
+      }
     }
     static const int64_t LONG_IO_PRINT_TRIGGER_US = 1000L * 1000L * 3L; // 3s
     if (result_delay > LONG_IO_PRINT_TRIGGER_US) {
@@ -2031,6 +2300,11 @@ const char *ObIOHandle::get_buffer()
 int64_t ObIOHandle::get_data_size() const
 {
   return OB_NOT_NULL(result_) ? result_->get_data_size() : 0;
+}
+
+int64_t ObIOHandle::get_user_io_size() const
+{
+  return OB_NOT_NULL(result_) ? result_->get_user_io_size() : 0;
 }
 
 int64_t ObIOHandle::get_rt() const
@@ -2707,4 +2981,3 @@ int ObMClockQueue::pop_with_ready_queue(const int64_t current_ts, ObIORequest *&
   }
   return ret;
 }
-

@@ -91,6 +91,12 @@ void ObBlockBatchedRowStore::reset()
   len_array_ = nullptr;
 }
 
+void ObBlockBatchedRowStore::reuse()
+{
+  ObBlockRowStore::reuse();
+  iter_end_flag_ = IterEndState::PROCESSING;
+}
+
 int ObBlockBatchedRowStore::reuse_capacity(const int64_t capacity)
 {
   int ret = OB_SUCCESS;
@@ -137,7 +143,7 @@ int ObBlockBatchedRowStore::get_row_ids(
       }
       begin_index = begin_index + capacity * step;
     } else if (res.bitmap_->is_all_false()) {
-      begin_index = begin_index + capacity * step;
+      begin_index = end_index;
     } else {
       if (1 == step && 0 == res.filter_start_) {
         if (OB_FAIL(res.bitmap_->get_row_ids(row_ids_, row_count, begin_index, end_index, capacity))) {

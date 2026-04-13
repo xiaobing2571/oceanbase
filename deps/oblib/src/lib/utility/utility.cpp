@@ -1157,10 +1157,17 @@ static int use_daemon()
 {
   int ret = OB_SUCCESS;
   const int nochdir = 1;
-  const int noclose = 0;
+  const int noclose = 1;
   if (daemon(nochdir, noclose) < 0) {
     LOG_ERROR("create daemon process fail", K(errno));
     ret = OB_ERR_SYS;
+  } else {
+    int fd = open("/dev/null", O_RDONLY);
+    if (fd >= 0) {
+      dup2(fd, STDIN_FILENO);
+      close(fd);
+    }
+    // stdout and stderr will be redirected to file when execute OBLOGGER.set_file_name
   }
   reset_tid_cache();
   // bt("enable_preload_bt") = 1;
@@ -1678,12 +1685,15 @@ int ob_strtoll(const char *str, char *&endptr, int64_t &res)
 {
   int ret = OB_SUCCESS;
   res = 0;
+  errno = 0;
   if (OB_ISNULL(str)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     res = strtoll(str, &endptr, 10);
-    if (INT64_MAX == res) {
+    if (ERANGE == errno) {
       ret = OB_SIZE_OVERFLOW;
+    } else if (errno != 0) {
+      ret = OB_INVALID_ARGUMENT;
     }
   }
   return ret;
@@ -1694,12 +1704,15 @@ int ob_strtoull(const char *str, char *&endptr, uint64_t &res)
   int ret = OB_SUCCESS;
   res = 0;
   int64_t tmp_res = 0;
+  errno = 0;
   if (OB_ISNULL(str)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     tmp_res = strtoull(str, &endptr, 10);
-    if (UINT64_MAX == tmp_res) {
+    if (ERANGE == errno) {
       ret = OB_SIZE_OVERFLOW;
+    } else if (errno != 0) {
+      ret = OB_INVALID_ARGUMENT;
     } else {
       res = tmp_res;
     }

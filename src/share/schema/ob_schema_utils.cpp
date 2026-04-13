@@ -12,9 +12,12 @@
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "ob_schema_utils.h"
+#include "share/config/ob_config.h"
+#include "share/config/ob_config_helper.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "sql/engine/cmd/ob_ddl_executor_util.h"
 #include "share/ob_fts_index_builder_util.h"
+#include "share/search_index/ob_search_index_builder_util.h"
 namespace oceanbase
 {
 using namespace common;
@@ -133,12 +136,16 @@ int ObSchemaUtils::cascaded_generated_column(ObTableSchema &table_schema,
         column.add_column_flag(GENERATED_VEC_TYPE_COLUMN_FLAG);
       } else if (T_FUN_SYS_VEC_VECTOR == root_expr_type) {
         column.add_column_flag(GENERATED_VEC_VECTOR_COLUMN_FLAG);
+      } else if (T_FUN_SYS_EMBEDDED_VEC == root_expr_type) {
+        column.add_column_flag(GENERATED_VEC_VECTOR_COLUMN_FLAG);
       } else if (T_FUN_SYS_VEC_SCN == root_expr_type) {
         column.add_column_flag(GENERATED_VEC_SCN_COLUMN_FLAG);
       } else if (T_FUN_SYS_VEC_KEY == root_expr_type) {
         column.add_column_flag(GENERATED_VEC_KEY_COLUMN_FLAG);
       } else if (T_FUN_SYS_VEC_DATA == root_expr_type) {
         column.add_column_flag(GENERATED_VEC_DATA_COLUMN_FLAG);
+      } else if (T_FUN_SYS_VEC_VISIBLE == root_expr_type) {
+        column.add_column_flag(GENERATED_VEC_VISIBLE_COLUMN_FLAG);
       } else if (T_FUN_SYS_SPIV_DIM == root_expr_type) {
         column.add_column_flag(GENERATED_VEC_SPIV_DIM_COLUMN_FLAG);
       } else if (T_FUN_SYS_SPIV_VALUE == root_expr_type) {
@@ -149,6 +156,10 @@ int ObSchemaUtils::cascaded_generated_column(ObTableSchema &table_schema,
         column.add_column_flag(GENERATED_FTS_WORD_COUNT_COLUMN_FLAG);
       } else if (T_FUN_SYS_DOC_LENGTH == root_expr_type) {
         column.add_column_flag(GENERATED_FTS_DOC_LENGTH_COLUMN_FLAG);
+      } else if (T_FUN_SYS_POS_LIST == root_expr_type) {
+        column.add_column_flag(GENERATED_FTS_POS_LIST_COLUMN_FLAG);
+      } else if (T_FUN_SYS_HYBRID_VEC_CHUNK == root_expr_type) {
+        column.add_column_flag(GENERATED_HYBRID_VEC_CHUNK_COLUMN_FLAG);
       } else if (T_FUN_SYS_SPATIAL_CELLID == root_expr_type || T_FUN_SYS_SPATIAL_MBR == root_expr_type) {
         column.add_column_flag(SPATIAL_INDEX_GENERATED_COLUMN_FLAG);
       } else if (T_FUN_SYS_JSON_QUERY == root_expr_type) {
@@ -254,6 +265,7 @@ bool ObSchemaUtils::is_vec_index_column(const uint64_t flag)
       || is_vec_hnsw_scn_column(flag)
       || is_vec_hnsw_key_column(flag)
       || is_vec_hnsw_data_column(flag)
+      || is_vec_hnsw_visible_column(flag)
       || is_vec_ivf_center_id_column(flag)
       || is_vec_ivf_center_vector_column(flag)
       || is_vec_ivf_data_vector_column(flag)
@@ -262,7 +274,8 @@ bool ObSchemaUtils::is_vec_index_column(const uint64_t flag)
       || is_vec_ivf_meta_id_column(flag)
       || is_vec_ivf_meta_vector_column(flag)
       || is_vec_spiv_dim_column(flag)
-      || is_vec_spiv_value_column(flag);
+      || is_vec_spiv_value_column(flag)
+      || is_hybrid_vec_index_chunk_column(flag);
 }
 
 bool ObSchemaUtils::is_vec_spiv_dim_column(const uint64_t flag)
@@ -345,12 +358,23 @@ bool ObSchemaUtils::is_vec_hnsw_data_column(const uint64_t flag)
   return flag & GENERATED_VEC_DATA_COLUMN_FLAG;
 }
 
+bool ObSchemaUtils::is_hybrid_vec_index_chunk_column(const uint64_t flag)
+{
+  return flag & GENERATED_HYBRID_VEC_CHUNK_COLUMN_FLAG;
+}
+
+bool ObSchemaUtils::is_vec_hnsw_visible_column(const uint64_t flag)
+{
+  return flag & GENERATED_VEC_VISIBLE_COLUMN_FLAG;
+}
+
 bool ObSchemaUtils::is_fulltext_column(const uint64_t flag)
 {
   return is_doc_id_column(flag)
       || is_word_segment_column(flag)
       || is_word_count_column(flag)
-      || is_doc_length_column(flag);
+      || is_doc_length_column(flag)
+      || is_pos_list_column(flag);
 }
 
 bool ObSchemaUtils::is_doc_id_column(const uint64_t flag)
@@ -373,6 +397,11 @@ bool ObSchemaUtils::is_doc_length_column(const uint64_t flag)
   return flag & GENERATED_FTS_DOC_LENGTH_COLUMN_FLAG;
 }
 
+bool ObSchemaUtils::is_pos_list_column(const uint64_t flag)
+{
+  return flag & GENERATED_FTS_POS_LIST_COLUMN_FLAG;
+}
+
 bool ObSchemaUtils::is_spatial_generated_column(uint64_t flag)
 {
   return flag & SPATIAL_INDEX_GENERATED_COLUMN_FLAG;
@@ -381,6 +410,11 @@ bool ObSchemaUtils::is_spatial_generated_column(uint64_t flag)
 bool ObSchemaUtils::is_label_se_column(uint64_t flag)
 {
   return (flag & LABEL_SE_COLUMN_FLAG) != 0;
+}
+
+bool ObSchemaUtils::is_clustering_key_column(const uint64_t flag)
+{
+  return flag & HEAP_TABLE_CLUSTERING_KEY_FLAG;
 }
 
 int ObSchemaUtils::add_column_to_table_schema(ObColumnSchemaV2 &column, ObTableSchema &table_schema)
@@ -415,6 +449,18 @@ int ObSchemaUtils::convert_sys_param_to_sysvar_schema(const ObSysParam &sysparam
     sysvar_schema.set_data_type(static_cast<ObObjType>(sysparam.data_type_));
   }
   return ret;
+}
+
+bool ObSchemaUtils::is_support_parallel_drop(const ObTableType table_type)
+{
+  // TODO(ziqian.zzq): support more table type for parallel drop
+  return USER_TABLE == table_type
+         || TMP_TABLE == table_type
+         || TMP_TABLE_ORA_SESS == table_type
+         || TMP_TABLE_ORA_TRX == table_type
+         || TMP_TABLE_ORA_TRX_V2 == table_type
+         || TMP_TABLE_ORA_SESS_V2 == table_type
+         || EXTERNAL_TABLE == table_type;
 }
 
 int ObSchemaUtils::get_tenant_int_variable(uint64_t tenant_id,
@@ -604,66 +650,214 @@ int ObSchemaUtils::add_sys_table_lob_aux_table(
 }
 
 // construct inner table schemas in tenant space
+template <typename Array>
 int ObSchemaUtils::construct_inner_table_schemas(
-    const uint64_t tenant_id,
-    ObSArray<ObTableSchema> &tables,
-    ObIAllocator &allocator)
+      const uint64_t tenant_id,
+      const ObIArray<uint64_t> &table_ids,
+      const bool include_index_and_lob_aux_schemas,
+      ObIAllocator &allocator,
+      Array &tables,
+      const bool ignore_tenant_id)
 {
   int ret = OB_SUCCESS;
-  const schema_create_func *creator_ptr_arrays[] = {
-    all_core_table_schema_creator,
-    core_table_schema_creators,
-    sys_table_schema_creators,
-    virtual_table_schema_creators,
-    sys_view_schema_creators
-  };
-  int64_t capacity = 0;
-  for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(creator_ptr_arrays); ++i) {
-    for (const schema_create_func *creator_ptr = creator_ptr_arrays[i];
-        OB_SUCC(ret) && OB_NOT_NULL(*creator_ptr); ++creator_ptr) {
-      ++capacity;
+  const bool construct_all = table_ids.empty();
+  hash::ObHashSet<uint64_t> table_ids_set;
+  if (!construct_all) {
+    if (OB_FAIL(table_ids_set.create(hash::cal_next_prime(table_ids.count())))) {
+      LOG_WARN("failed to create table_ids_set", KR(ret), K(table_ids));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < table_ids.count(); i++) {
+        if (OB_FAIL(table_ids_set.set_refactored(table_ids.at(i)))) {
+          LOG_WARN("failed to add table_id to table_ids_set", KR(ret), K(table_ids.at(i)));
+        }
+      }
     }
   }
-  if (FAILEDx(tables.prepare_allocate_and_keep_count(capacity, &allocator))) {
-    LOG_WARN("fail to prepare allocate table schemas", KR(ret), K(tenant_id), K(capacity));
-  }
-  HEAP_VARS_2((ObTableSchema, table_schema), (ObTableSchema, data_schema)) {
-    for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(creator_ptr_arrays); ++i) {
-      for (const schema_create_func *creator_ptr = creator_ptr_arrays[i];
-          OB_SUCC(ret) && OB_NOT_NULL(*creator_ptr); ++creator_ptr) {
-        table_schema.reset();
-        bool exist = false;
-        if (OB_FAIL((*creator_ptr)(table_schema))) {
-          LOG_WARN("fail to gen sys table schema", KR(ret));
-        } else if (is_sys_tenant(tenant_id) && table_schema.get_table_id() == OB_ALL_CORE_TABLE_TID) {
-          // sys tenant's __all_core_table's schema is built separately in bootstrap
-        } else if (OB_FAIL(ObSchemaUtils::construct_tenant_space_full_table(
-                tenant_id, table_schema))) {
-          LOG_WARN("fail to construct tenant space table", KR(ret), K(tenant_id));
-        } else if (OB_FAIL(ObSysTableChecker::is_inner_table_exist(
-                tenant_id, table_schema, exist))) {
-          LOG_WARN("fail to check inner table exist",
-              KR(ret), K(tenant_id), K(table_schema));
-        } else if (!exist) {
-          // skip
-        } else if (OB_FAIL(tables.push_back(table_schema))) {
-          LOG_WARN("fail to push back table schema", KR(ret), K(table_schema));
-        } else if (OB_FAIL(ObSysTableChecker::append_sys_table_index_schemas(
-                tenant_id, table_schema.get_table_id(), tables))) {
-          LOG_WARN("fail to append sys table index schemas",
-              KR(ret), K(tenant_id), "table_id", table_schema.get_table_id());
+  if (OB_SUCC(ret)) {
+    const schema_create_func *creator_ptr_arrays[] = {
+      all_core_table_schema_creator,
+      core_table_schema_creators,
+      sys_table_schema_creators,
+      virtual_table_schema_creators,
+      virtual_table_index_schema_creators,
+      sys_view_schema_creators
+    };
+    bool finish = false;
+    int64_t capacity = 0;
+    if (construct_all) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(creator_ptr_arrays); ++i) {
+        for (const schema_create_func *creator_ptr = creator_ptr_arrays[i];
+            OB_SUCC(ret) && OB_NOT_NULL(*creator_ptr); ++creator_ptr) {
+          capacity++;
         }
-        const int64_t data_table_id = table_schema.get_table_id();
-        if (OB_SUCC(ret) && exist) {
-          if (OB_FAIL(add_sys_table_lob_aux_table(tenant_id, data_table_id, tables))) {
-            LOG_WARN("fail to add lob table to sys table", KR(ret), K(data_table_id));
-          }
-        } // end lob aux table
       }
+    } else {
+      // we assume one table has no more than 3 index table
+      // table schema + 3 * index + lob_meta + lob_piece
+      const int CAPACITY_UPGRADE_RATE = 6;
+      if (include_index_and_lob_aux_schemas) {
+        capacity = table_ids.count() * CAPACITY_UPGRADE_RATE;
+      } else {
+        capacity = table_ids.count();
+      }
+    }
+    if (FAILEDx(tables.prepare_allocate_and_keep_count(capacity, &allocator))) {
+      LOG_WARN("failed to prepare_allocate_and_keep_count", KR(ret), K(capacity));
+    }
+    HEAP_VARS_2((ObTableSchema, table_schema), (ObTableSchema, data_schema)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(creator_ptr_arrays) && !finish; ++i) {
+        for (const schema_create_func *creator_ptr = creator_ptr_arrays[i];
+             OB_SUCC(ret) && OB_NOT_NULL(*creator_ptr) && !finish; ++creator_ptr) {
+          table_schema.reset();
+          bool exist = false;
+          bool push = false;
+          uint64_t table_id = 0;
+          if (OB_FAIL((*creator_ptr)(table_schema))) {
+            LOG_WARN("fail to gen sys table schema", KR(ret));
+          } else if (is_sys_tenant(tenant_id) && table_schema.get_table_id() == OB_ALL_CORE_TABLE_TID) {
+            // sys tenant's __all_core_table's schema is built separately in bootstrap
+          } else if (OB_FAIL(ObSchemaUtils::construct_tenant_space_full_table(tenant_id, table_schema))) {
+            LOG_WARN("failed to construct_tenant_space_full_table", KR(ret), K(tenant_id), K(table_schema));
+          } else if (OB_FAIL(ObSysTableChecker::is_inner_table_exist(
+                  tenant_id, table_schema, exist))) {
+            LOG_WARN("fail to check inner table exist",
+                KR(ret), K(tenant_id), K(table_schema));
+          } else if (!exist) {
+            push = false;
+          } else if (construct_all) {
+            push = true;
+          } else if (FALSE_IT(table_id = table_schema.get_table_id())) {
+          } else if (OB_HASH_EXIST == table_ids_set.exist_refactored(table_id)) {
+            push = true;
+            if (OB_FAIL(table_ids_set.erase_refactored(table_id))) {
+              LOG_WARN("failed to erase table_id from set", KR(ret), K(table_id));
+            } else if (table_ids_set.empty()) {
+              finish = true;
+            }
+          }
+          if (OB_FAIL(ret) || !push) {
+          } else if (OB_FAIL(push_inner_table_schema_(tenant_id, include_index_and_lob_aux_schemas, table_schema, tables))) {
+            LOG_WARN("failed to construct inner table schema", KR(ret), K(tenant_id),
+                K(include_index_and_lob_aux_schemas), K(table_schema));
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !table_ids_set.empty()) {
+      // table_id is from upgrade executor, which should exist in hard code schemas
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("table_id in table_ids_set not in hard code schemas", KR(ret), K(table_ids_set));
     }
   }
   return ret;
 }
+
+int ObSchemaUtils::push_inner_table_schema_(
+    const uint64_t tenant_id,
+    const bool include_index_and_lob_aux_schemas,
+    const ObTableSchema &tmp_table_schema,
+    ObIArray<ObTableSchema> &table_schemas)
+{
+  int ret = OB_SUCCESS;
+  const int64_t data_table_id = tmp_table_schema.get_table_id();
+  const int64_t table_id = tmp_table_schema.get_table_id();
+  if (OB_FAIL(table_schemas.push_back(tmp_table_schema))) {
+    LOG_WARN("fail to push back table schema", KR(ret), K(tmp_table_schema));
+  } else if (!include_index_and_lob_aux_schemas) {
+    // not push index and lob aux table
+  } else if (OB_FAIL(ObSysTableChecker::append_sys_table_index_schemas(
+          tenant_id, table_id, table_schemas))) {
+    LOG_WARN("fail to append sys table index schemas", KR(ret), K(tenant_id), K(table_id));
+  } else if (OB_FAIL(add_sys_table_lob_aux_table(tenant_id, data_table_id, table_schemas))) {
+    LOG_WARN("fail to add lob table to sys table", KR(ret), K(data_table_id));
+  }
+  return ret;
+}
+
+// used for generating hard code schema version when add table in development
+// for virtual table with index, we should make index schema version less than virtual table schema version
+// otherwise, schema service cannot bind index schema to virtual table schema
+// system table index is no need to do this because system table indexes are hard code
+// see also:
+// the algorithm:
+// 1. For the input array, construct a map from table_id to table pointer.
+// 2. Traverse the array in reverse order. For virtual table index, first insert the corresponding virtual table into the table_id array, then insert its own table_id; for other system tables, insert them directly into table_id array. Ensure that the virtual table appears in the array before its index. At this point, the schema_version in the table_id array that ranks higher is larger.
+// 3. Traverse the table_id array in order, if a table does not have a valid schema_version, assign it a schema_version from largest to smallest.
+
+int ObSchemaUtils::generate_hard_code_schema_version(ObIArray<ObTableSchema> &tables)
+{
+  int ret = OB_SUCCESS;
+  hash::ObHashMap<uint64_t, ObTableSchema *> tid2table;
+  if (OB_FAIL(tid2table.create(tables.count(), "Tid2Table"))) {
+    LOG_WARN("failed to create tid2table", KR(ret), K(tables.count()));
+  } else {
+    int64_t current_schema_version = (HARD_CODE_SCHEMA_VERSION_BEGIN + tables.count()) * ObSchemaVersionGenerator::SCHEMA_VERSION_INC_STEP;
+    ObArray<uint64_t> table_id_in_schema_version_order;
+    FOREACH_CNT_X(table, tables, OB_SUCC(ret)) {
+      if (OB_ISNULL(table)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("pointer is null", KR(ret), KP(table));
+      } else if (OB_FAIL(tid2table.set_refactored(table->get_table_id(), table))) {
+        LOG_WARN("failed to add tid to table", KR(ret), K(table));
+      }
+    }
+    for (int64_t i = tables.count() - 1; i >= 0 && OB_SUCC(ret); i--) {
+      ObTableSchema &table = tables.at(i);
+      table.set_schema_version(OB_INVALID_VERSION);
+      if (table.is_index_table() && is_virtual_table(table.get_data_table_id())) {
+        if (OB_FAIL(table_id_in_schema_version_order.push_back(table.get_data_table_id()))) {
+          LOG_WARN("failed to push data_table_id", KR(ret), K(table));
+        }
+      }
+      if (FAILEDx(table_id_in_schema_version_order.push_back(table.get_table_id()))) {
+        LOG_WARN("failed to push table_id", KR(ret), K(table));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_id_in_schema_version_order.count(); i++) {
+      const uint64_t table_id = table_id_in_schema_version_order.at(i);
+      ObTableSchema **table_ptr = nullptr;
+      ObTableSchema *table = nullptr;
+      if (OB_ISNULL(table_ptr = tid2table.get(table_id)) || OB_ISNULL(table = *table_ptr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("pointer is null", KR(ret), KP(table_ptr), K(table));
+      } else if (table->get_schema_version() != OB_INVALID_VERSION) {
+        // table schema version is set, ignore
+      } else {
+        table->set_schema_version(current_schema_version);
+        for (ObTableSchema::const_column_iterator iter = table->column_begin();
+            OB_SUCC(ret) && iter != table->column_end(); ++iter) {
+          (*iter)->set_schema_version(current_schema_version);
+          (*iter)->set_tenant_id(OB_INVALID_TENANT_ID);
+          (*iter)->set_table_id(table->get_table_id());
+        }
+        current_schema_version -= ObSchemaVersionGenerator::SCHEMA_VERSION_INC_STEP;
+      }
+    }
+    if (OB_SUCC(ret) && current_schema_version != HARD_CODE_SCHEMA_VERSION_BEGIN *
+        ObSchemaVersionGenerator::SCHEMA_VERSION_INC_STEP) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("schema count not match", KR(ret), K(current_schema_version), K(HARD_CODE_SCHEMA_VERSION_BEGIN));
+    }
+  }
+  return ret;
+}
+
+// Explicit instantiations
+template int ObSchemaUtils::construct_inner_table_schemas<common::ObArray<ObTableSchema>>(
+    const uint64_t tenant_id,
+    const ObIArray<uint64_t> &table_ids,
+    const bool include_index_and_lob_aux_schemas,
+    ObIAllocator &allocator,
+    common::ObArray<ObTableSchema> &tables,
+    const bool ignore_tenant_id);
+
+template int ObSchemaUtils::construct_inner_table_schemas<common::ObSArray<ObTableSchema>>(
+    const uint64_t tenant_id,
+    const ObIArray<uint64_t> &table_ids,
+    const bool include_index_and_lob_aux_schemas,
+    ObIAllocator &allocator,
+    common::ObSArray<ObTableSchema> &tables,
+    const bool ignore_tenant_id);
 
 int ObSchemaUtils::try_check_parallel_ddl_schema_in_sync(
     const ObTimeoutCtx &ctx,
@@ -676,9 +870,11 @@ int ObSchemaUtils::try_check_parallel_ddl_schema_in_sync(
   int64_t start_time = ObTimeUtility::current_time();
   ObMultiVersionSchemaService *schema_service = NULL;
   int64_t consensus_timeout = 30 * 1000 * 1000L; // 30s
+  bool is_async = false;
   omt::ObTenantConfigGuard tenant_config(OTC_MGR.get_tenant_config_with_lock(tenant_id));
   if (tenant_config.is_valid()) {
     consensus_timeout = tenant_config->_wait_interval_after_parallel_ddl;
+    is_async = (0 == tenant_config->_publish_schema_mode.case_compare(PUBLISH_SCHEMA_MODE_ASYNC));
   }
   if (OB_ISNULL(session) || OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id
       || schema_version <= 0
@@ -690,7 +886,7 @@ int ObSchemaUtils::try_check_parallel_ddl_schema_in_sync(
     LOG_WARN("schema_service is null", KR(ret));
   }
   bool is_dropped = false;
-  while (OB_SUCC(ret) && ctx.get_timeout() > 0) {
+  while (OB_SUCC(ret) && ctx.get_timeout() > 0 && !is_async) {
     int64_t refreshed_schema_version = OB_INVALID_VERSION;
     int64_t consensus_schema_version = OB_INVALID_VERSION;
     if (OB_FAIL(schema_service->check_if_tenant_has_been_dropped(tenant_id, is_dropped))) {
@@ -784,14 +980,37 @@ int ObSchemaUtils::batch_get_latest_table_schemas(
     common::ObIArray<ObSimpleTableSchemaV2 *> &table_schemas)
 {
   int ret = OB_SUCCESS;
+  const int64_t schema_version = INT64_MAX - 1; // get latest schema
+  if (OB_FAIL(batch_get_table_schemas_by_version(
+      sql_client,
+      allocator,
+      tenant_id,
+      schema_version,
+      table_ids,
+      table_schemas))) {
+    LOG_WARN("batch get table schemas by version failed",
+        KR(ret), K(tenant_id), K(table_ids), K(schema_version));
+  }
+  return ret;
+}
+
+int ObSchemaUtils::batch_get_table_schemas_by_version(
+    common::ObISQLClient &sql_client,
+    common::ObIAllocator &allocator,
+    const uint64_t tenant_id,
+    const int64_t schema_version,
+    const common::ObIArray<ObObjectID> &table_ids,
+    common::ObIArray<ObSimpleTableSchemaV2 *> &table_schemas)
+{
+  int ret = OB_SUCCESS;
   table_schemas.reset();
   ObSchemaService *schema_service = NULL;
   ObArray<ObTableLatestSchemaVersion> table_schema_versions;
   ObArray<SchemaKey> need_refresh_table_schema_keys;
   ObArray<ObSimpleTableSchemaV2 *> table_schemas_from_inner_table;
-  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || table_ids.empty())) {
+  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || table_ids.empty() || schema_version < 0)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid args", KR(ret), K(tenant_id), K(table_ids));
+    LOG_WARN("invalid args", KR(ret), K(tenant_id), K(table_ids), K(schema_version));
   } else if (OB_ISNULL(GCTX.schema_service_)
       || OB_ISNULL(schema_service = GCTX.schema_service_->get_schema_service())) {
     ret = OB_ERR_UNEXPECTED;
@@ -805,6 +1024,7 @@ int ObSchemaUtils::batch_get_latest_table_schemas(
   } else if (OB_FAIL(batch_get_table_schemas_from_cache_(
       allocator,
       tenant_id,
+      schema_version,
       table_schema_versions,
       need_refresh_table_schema_keys,
       table_schemas))) {
@@ -813,6 +1033,7 @@ int ObSchemaUtils::batch_get_latest_table_schemas(
       sql_client,
       allocator,
       tenant_id,
+      schema_version,
       need_refresh_table_schema_keys,
       table_schemas_from_inner_table))) {
     LOG_WARN("batch get table_schemas from inner table failed", KR(ret), K(need_refresh_table_schema_keys));
@@ -1247,6 +1468,7 @@ int ObSchemaUtils::get_latest_table_schema(
 int ObSchemaUtils::batch_get_table_schemas_from_cache_(
     common::ObIAllocator &allocator,
     const uint64_t tenant_id,
+    const int64_t specified_schema_version,
     const ObIArray<ObTableLatestSchemaVersion> &table_schema_versions,
     common::ObIArray<SchemaKey> &need_refresh_table_schema_keys,
     common::ObIArray<ObSimpleTableSchemaV2 *> &table_schemas)
@@ -1255,9 +1477,9 @@ int ObSchemaUtils::batch_get_table_schemas_from_cache_(
   need_refresh_table_schema_keys.reset();
   table_schemas.reset();
   ObSchemaGetterGuard schema_guard;
-  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id))) {
+  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || specified_schema_version < 0)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid tenant_id", KR(ret), K(tenant_id));
+    LOG_WARN("invalid args", KR(ret), K(tenant_id), K(specified_schema_version));
   } else if (OB_ISNULL(GCTX.schema_service_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("multiversion_schema_service is null", KR(ret));
@@ -1279,7 +1501,8 @@ int ObSchemaUtils::batch_get_table_schemas_from_cache_(
           cached_table_schema))) {
         LOG_WARN("get simple table schema failed", KR(ret), K(tenant_id), K(table_schema_version));
       } else if (OB_ISNULL(cached_table_schema)
-          || (cached_table_schema->get_schema_version() < table_schema_version.get_schema_version())) {
+          || (cached_table_schema->get_schema_version() < table_schema_version.get_schema_version())
+          || (cached_table_schema->get_schema_version() > specified_schema_version)) {
         // need fetch new table schema
         SchemaKey table_schema_key;
         table_schema_key.tenant_id_ = tenant_id;
@@ -1301,6 +1524,7 @@ int ObSchemaUtils::batch_get_table_schemas_from_inner_table_(
     common::ObISQLClient &sql_client,
     common::ObIAllocator &allocator,
     const uint64_t tenant_id,
+    const int64_t schema_version,
     common::ObArray<SchemaKey> &need_refresh_table_schema_keys,
     common::ObIArray<ObSimpleTableSchemaV2 *> &table_schemas)
 {
@@ -1309,10 +1533,9 @@ int ObSchemaUtils::batch_get_table_schemas_from_inner_table_(
   ObSchemaService *schema_service = NULL;
   ObRefreshSchemaStatus schema_status;
   schema_status.tenant_id_ = tenant_id;
-  int64_t schema_version = INT64_MAX - 1; // get latest schema
-  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id))) {
+  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || schema_version < 0)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid tenant_id", KR(ret), K(tenant_id));
+    LOG_WARN("invalid args", KR(ret), K(tenant_id), K(schema_version));
   } else if (OB_ISNULL(GCTX.schema_service_)
       || OB_ISNULL(schema_service = GCTX.schema_service_->get_schema_service())) {
     ret = OB_ERR_UNEXPECTED;
@@ -1423,8 +1646,6 @@ const char* DDLType[]
 
 const char* NOT_SUPPORT_DDLType[]
 {
-  "CREATE_VIEW",
-  "DROP_TABLE"
 };
 
 int ObParallelDDLControlMode::string_to_ddl_type(const ObString &ddl_string, ObParallelDDLType &ddl_type)
@@ -1446,6 +1667,24 @@ int ObParallelDDLControlMode::string_to_ddl_type(const ObString &ddl_string, ObP
   return ret;
 }
 
+template <int64_t N>
+int ObParallelDDLControlMode::pack_bytes_to_value_(const uint8_t *bytes)
+{
+  STATIC_ASSERT(N >= 8, "pack_bytes_to_value_ requires at least 8 bytes");
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(bytes)) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "bytes is null", KR(ret));
+  } else {
+    value_ = 0;
+    // Only first 8 bytes are used to pack value_
+    for (uint64_t i = 0; i < 8; ++i) {
+      value_ |= (static_cast<uint64_t>(bytes[i]) << (8 * i));
+    }
+  }
+  return ret;
+}
+
 int ObParallelDDLControlMode::set_value(const ObConfigModeItem &mode_item)
 {
   int ret = OB_SUCCESS;
@@ -1457,9 +1696,8 @@ int ObParallelDDLControlMode::set_value(const ObConfigModeItem &mode_item)
     STATIC_ASSERT(((sizeof(value_)/sizeof(uint8_t) <= ObConfigModeItem::MAX_MODE_BYTES)),
                   "value_ size overflow");
     STATIC_ASSERT( (MAX_TYPE * 2) <= (sizeof(value_) * 8), "type size overflow");
-    value_ = 0;
-    for (uint64_t i = 0; i < 8; ++i) {
-      value_ = (value_ | static_cast<uint64_t>(values[i]) << (8 * i));
+    if (OB_FAIL(pack_bytes_to_value_<common::ObConfigModeItem::MAX_MODE_BYTES>(values))) {
+      OB_LOG(WARN, "fail to pack bytes to value", KR(ret));
     }
   }
   return ret;
@@ -1484,7 +1722,7 @@ int ObParallelDDLControlMode::set_parallel_ddl_mode(const ObParallelDDLType type
   return ret;
 }
 
-int ObParallelDDLControlMode::is_parallel_ddl(const ObParallelDDLType type, bool &is_parallel)
+int ObParallelDDLControlMode::is_parallel_ddl(const ObParallelDDLType type, bool &is_parallel) const
 {
   int ret = OB_SUCCESS;
   is_parallel = true;
@@ -1565,6 +1803,107 @@ int ObParallelDDLControlMode::generate_parallel_ddl_control_config_for_create_te
     config_value.set_length(config_value.length()-2);
   }
   return ret;
+}
+
+int ObParallelDDLControlMode::to_config_string(ObSqlString &config_value) const
+{
+  int ret = OB_SUCCESS;
+  int ddl_type_size = ARRAYSIZEOF(DDLType);
+  int not_support_ddl_size = ARRAYSIZEOF(NOT_SUPPORT_DDLType);
+  config_value.reset();
+  for (int i = 0; OB_SUCC(ret) && i < ddl_type_size; ++i) {
+    ObString tmp_str = DDLType[i];
+    bool not_support = false;
+    for (int j = 0; OB_SUCC(ret) && j < not_support_ddl_size; ++j) {
+      if (tmp_str.case_compare(NOT_SUPPORT_DDLType[j]) == 0) {
+        not_support = true;
+        break;
+      }
+    }
+    if (not_support) {
+      continue;
+    } else {
+      bool is_parallel = false;
+      const char *mode_str = nullptr;
+      if (OB_FAIL(is_parallel_ddl(static_cast<ObParallelDDLType>(i), is_parallel))) {
+        LOG_WARN("fail to check is parallel ddl", KR(ret));
+      } else if (is_parallel) {
+        mode_str = "ON";
+      } else {
+        mode_str = "OFF";
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(config_value.append_fmt("%s:%s, ", DDLType[i], mode_str))) {
+        LOG_WARN("fail to append fmt", KR(ret), K(i));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && config_value.is_valid()) {
+    config_value.set_length(config_value.length() - 2);
+  }
+  return ret;
+}
+
+int ObParallelDDLControlMode::to_config_string(common::ObIAllocator &allocator, common::ObString &out_str) const
+{
+  int ret = OB_SUCCESS;
+  ObSqlString buf;
+  if (OB_FAIL(to_config_string(buf))) {
+    LOG_WARN("fail to build config string", KR(ret));
+  } else if (OB_FAIL(ob_write_string(allocator, buf.string(), out_str))) {
+    LOG_WARN("fail to deep copy config string", KR(ret));
+  }
+  return ret;
+}
+
+int ObParallelDDLControlMode::parse_from_config_string(const char *str)
+{
+  int ret = OB_SUCCESS;
+  ObParallelDDLControlParser parser;
+  uint8_t arr[8];
+  MEMSET(arr, 0, sizeof(arr));
+  if (OB_ISNULL(str)) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "invalid null str", KR(ret));
+  } else if (!parser.parse(str, arr, common::ObConfigModeItem::MAX_MODE_BYTES)) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "parse config string failed", KR(ret));
+  } else if (OB_FAIL(pack_bytes_to_value_<ARRAYSIZEOF(arr)>(arr))) {
+    OB_LOG(WARN, "fail to pack bytes to value", KR(ret));
+  }
+  return ret;
+}
+
+int ObTenantDDLCountGuard::try_inc_ddl_count(const int64_t cpu_quota_concurrency)
+{
+  int ret = OB_SUCCESS;
+  omt::ObMultiTenant *omt = GCTX.omt_;
+  if (OB_INVALID_TENANT_ID == tenant_id_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid tenant id", KR(ret));
+  } else if (OB_ISNULL(omt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("omt is null", KR(ret));
+  } else if (OB_FAIL(omt->inc_tenant_ddl_count(tenant_id_, cpu_quota_concurrency))) {
+    LOG_WARN("fail to inc tenant ddl count", KR(ret), K_(tenant_id));
+  } else {
+    had_inc_ddl_ = true;
+  }
+  return ret;
+}
+
+ObTenantDDLCountGuard::~ObTenantDDLCountGuard()
+{
+  int ret = OB_SUCCESS;
+  if (had_inc_ddl_) {
+    omt::ObMultiTenant *omt = GCTX.omt_;
+    if (OB_ISNULL(omt)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("omt is null", KR(ret));
+    } else if (OB_FAIL(omt->dec_tenant_ddl_count(tenant_id_))) {
+      LOG_WARN("fail to dec tenant ddl count", KR(ret), K_(tenant_id));
+    }
+  }
 }
 
 } // end schema

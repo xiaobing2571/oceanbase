@@ -93,6 +93,7 @@ public:
   inline int64_t get_required_size() const { return required_size_; }
   inline int64_t get_report_scn() const { return report_scn_; }
   inline ScnStatus get_status() const { return status_; }
+  inline int64_t get_ddl_create_snapshot() const { return ddl_create_snapshot_; }
   int init(
       const uint64_t tenant_id,
       const common::ObTabletID &tablet_id,
@@ -102,7 +103,8 @@ public:
       const int64_t data_size,
       const int64_t required_size,
       const int64_t report_scn,
-      const ScnStatus status);
+      const ScnStatus status,
+      const int64_t ddl_create_snapshot);
   void fake_for_diagnose(
     const uint64_t tenant_id,
     const share::ObLSID &ls_id,
@@ -121,7 +123,8 @@ public:
       K_(data_size),
       K_(required_size),
       K_(report_scn),
-      K_(status));
+      K_(status),
+      K_(ddl_create_snapshot));
 private:
   uint64_t tenant_id_;
   common::ObTabletID tablet_id_;
@@ -133,6 +136,7 @@ private:
   // below: tablet level member for compaction
   int64_t report_scn_;
   ScnStatus status_;
+  int64_t ddl_create_snapshot_;
 };
 
 class ObTabletInfo

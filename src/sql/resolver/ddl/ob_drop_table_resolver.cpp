@@ -137,7 +137,7 @@ int ObDropTableResolver::resolve(const ParseNode &parse_tree)
       for (i = 0; OB_SUCC(ret) && i < max_table_num; ++i) {
         table_node = lib::is_oracle_mode() ? parse_tree.children_[TABLE_LIST_NODE]
             : parse_tree.children_[TABLE_LIST_NODE]->children_[i];
-        ObString dblink_name;
+        ObString dblink_name;  // nouse
         bool has_reverse_link = false;
         bool has_dblink_node = false;
         if (NULL == table_node) {
@@ -222,6 +222,10 @@ int ObDropTableResolver::resolve(const ParseNode &parse_tree)
                       LOG_USER_ERROR(OB_TABLE_NOT_EXIST, helper.convert(db_name),
                           helper.convert(table_name));
                     }
+                  } else if (table_view_schema->mv_container_table()) {
+                    ret = OB_NOT_SUPPORTED;
+                    SQL_RESV_LOG(WARN, "drop container table is not supported", KR(ret));
+                    LOG_USER_ERROR(OB_NOT_SUPPORTED, "drop mview container table is");
                   } else if (OB_FAIL(schema_checker_->check_ora_ddl_priv(
                                 tenant_id,
                                 session_info_->get_priv_user_id(),

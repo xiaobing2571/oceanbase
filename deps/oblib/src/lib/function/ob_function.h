@@ -30,8 +30,8 @@
  *   - the callable object' copy contruct action is very heavy, which can not be accepted.
  *
  * Memory usage:
- *   - ObFunction<Ret(Args...)> object has constant size: 64 Bytes in common.
- *   - if the stored callable object's size not more than SMALL_OBJ_MAX_SIZE(40 Bytes in common) By-
+ *   - ObFunction<Ret(Args...)> object has constant size: 128 Bytes in common.
+ *   - if the stored callable object's size not more than SMALL_OBJ_MAX_SIZE(112 Bytes in common) By-
  *     tes, it will be stored in ObFunction's inner buffer, no extra memory will be allocated.
  *   - if the stored callable object's size more than SMALL_OBJ_MAX_SIZE Bytes, it will be stored in
  *     heap memory.
@@ -84,6 +84,8 @@
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_print_utils.h"
 #include "lib/allocator/ob_allocator.h"
+#include "meta_programming/ob_meta_copy.h"
+#include "lib/allocator/ob_vslice_alloc.h"
 
 namespace oceanbase
 {
@@ -118,15 +120,20 @@ struct DebugRecorder {
 #endif
 
 struct DefaultFunctionAllocator : public ObIAllocator {
+public:
+  DefaultFunctionAllocator()
+  {
+    lib::ObMemAttr attr(OB_SERVER_TENANT_ID, "ObFunction");
+    SET_USE_500(attr);
+    vslice_allocator_.init(OB_MALLOC_BIG_BLOCK_SIZE, default_blk_alloc, attr);
+  }
   void *alloc(const int64_t size) override {
 #ifdef UNITTEST_DEBUG
     total_alive_num++;
 #endif
-    static lib::ObMemAttr attr(OB_SERVER_TENANT_ID, "ObFunction");
-    SET_USE_500(attr);
-    return ob_malloc(size, attr);
+    return vslice_allocator_.alloc(size);
   }
-  void* alloc(const int64_t size, const ObMemAttr &attr) override {
+  void *alloc(const int64_t size, const ObMemAttr &attr) override {
     UNUSED(attr);
     return alloc(size);
   }
@@ -134,7 +141,7 @@ struct DefaultFunctionAllocator : public ObIAllocator {
 #ifdef UNITTEST_DEBUG
     total_alive_num--;
 #endif
-    ob_free(ptr);
+    vslice_allocator_.free(ptr);
   }
 #ifdef UNITTEST_DEBUG
   int total_alive_num = 0;
@@ -143,11 +150,15 @@ struct DefaultFunctionAllocator : public ObIAllocator {
     static DefaultFunctionAllocator default_allocator;
     return default_allocator;
   }
+
+public:
+  common::ObVSliceAlloc vslice_allocator_;
 };
 
-// sizeof(ObFunction<*>) will be 64 bytes, and inner buffer will be 48 bytes.
-// cause there is a vtable ptr, so when sizeof(Fn) <= 40 bytes, no extra memory will be allocated.
-static const int64_t SMALL_OBJ_MAX_SIZE = 64 - sizeof(void*) - sizeof(ObIAllocator &);
+// sizeof(ObFunction<*>) will be ~128 bytes, and inner buffer will be 112 bytes.
+// cause there is a vtable ptr, so when sizeof(Fn) <= ~104 bytes, no extra memory will be allocated.
+// SMALL_OBJ_MAX_SIZE = 128 - sizeof(void*) - sizeof(ObIAllocator &) = 112 bytes (on 64-bit systems)
+static const int64_t SMALL_OBJ_MAX_SIZE = 128 - sizeof(void*) - sizeof(ObIAllocator &);
 }// namespace function
 
 #define RECORDER function::DebugRecorder::get_instance()
@@ -169,41 +180,62 @@ class ObFunction<Ret(Args...)> {
 
   template <typename Fn>
   class Derived : public Abstract {
+    friend class ObFunction<Ret(Args...)>;
   static_assert(!std::is_const<Fn>::value, "Fn should not be const");
   public:
-    Derived() = delete;
-    Derived(const Derived<Fn> &fn) = delete;
-    Derived(const Derived<Fn> &&fn) = delete;
-    template <typename Arg>
-    Derived(Arg &&fn) : func_(std::forward<Arg>(fn)) {
+    Derived() {
 #ifdef UNITTEST_DEBUG
       RECORDER.derived_construct_time++;
+      OCCAM_LOG(DEBUG, "init Derived", K(lbt()));
 #endif
+      default_construct_fn_if_supported_();
     }
+    template <typename T2 = Fn, typename std::enable_if<std::is_default_constructible<T2>::value, bool>::type = true>
+    void default_construct_fn_if_supported_() {
+      new (func_) Fn();
+    }
+    template <typename T2 = Fn, typename std::enable_if<!std::is_default_constructible<T2>::value, bool>::type = true>
+    void default_construct_fn_if_supported_() {
+    }
+    ~Derived() override {
+      ((Fn*)func_)->~Fn();
+    }
+    Derived(const Derived<Fn> &fn) = delete;
+    Derived &operator=(const Derived<Fn> &fn) = delete;
     Ret invoke(Args ...args) const override {
-      return (const_cast<Derived *>(this))->func_(std::forward<Args>(args)...);
+      return (*((Fn*)func_))(std::forward<Args>(args)...);
     }
     Abstract *copy(ObIAllocator &allocator, void *local_buffer) const override {
+      int ret = OB_SUCCESS;
       Derived<Fn> *ptr = nullptr;
       if (sizeof(Derived<Fn>) <= function::SMALL_OBJ_MAX_SIZE) {
         ptr = (Derived<Fn>*)local_buffer;// small obj use local buffer
       } else {
         ptr = (Derived<Fn>*)allocator.alloc(sizeof(Derived<Fn>));// big obj need malloc heap memory
       }
-      if (OB_LIKELY(nullptr != ptr)) {
-        ptr = new (ptr)Derived<Fn>(func_);
-      } else {
+      if (OB_UNLIKELY(nullptr == ptr)) {
         const char* class_name = typeid(Fn).name();
         int class_size = sizeof(Derived<Fn>);
         OCCAM_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "ptr is nullptr",
                       K(class_name), K(class_size),
                       K(function::SMALL_OBJ_MAX_SIZE), KP(local_buffer));
+      } else {
+        new (ptr) Derived<Fn>();
+        if constexpr (std::is_polymorphic_v<Fn>) {
+          // for polymorphic type, use memcpy to safe copy
+          std::memcpy(ptr->func_, func_, sizeof(Fn));
+        } else if (OB_FAIL(meta::copy_or_assign<Fn>(*((Fn*)func_), *((Fn*)ptr->func_)))) {
+          OCCAM_LOG(ERROR, "failed to copy funtion", K(ret), KP(ptr), KP(this));
+          if ((void *)ptr != (void *)local_buffer) {
+            allocator.free(ptr);
+          }
+          ptr = nullptr;
+        }
       }
       return ptr;
     }
-    ~Derived() override {}
   private:
-    Fn func_;
+    char func_[sizeof(Fn)];
   };
 
 public:
@@ -283,6 +315,10 @@ public:
   // function operator
   Ret operator()(Args ...args) const {
     assert(nullptr != base_);
+    if (nullptr == base_) {
+      OCCAM_LOG_RET(ERROR, common::OB_ALLOCATE_MEMORY_FAILED, "copy user function failed", K(ret));
+      return Ret();
+    }
     return base_->invoke(std::forward<Args>(args)...);
   }
 
@@ -339,12 +375,25 @@ public:
     } else {
       base_ = (Abstract*)allocator_.alloc(sizeof(Derived<typename std::decay<Fn>::type>));
     }
-    if (OB_LIKELY(nullptr != base_)) {
-      base_ = new (base_)Derived<typename std::decay<Fn>::type>(std::forward<Fn>(rhs));
-    } else {
+    if (OB_UNLIKELY(nullptr == base_)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       OCCAM_LOG(WARN, "no memory, function is invalid", K(ret), KP_(base), KP(&allocator_),
-                   KP(&DEFAULT_ALLOCATOR), K(lbt()));
+                KP(&DEFAULT_ALLOCATOR), K(lbt()));
+    } else {
+      using DecayFn = typename std::decay<Fn>::type;
+      base_ = new (base_)Derived<DecayFn>();
+      if constexpr (std::is_polymorphic_v<DecayFn>) {
+        // for polymorphic type, use memcpy to safe copy
+        std::memcpy(((Derived<DecayFn> *)base_)->func_, (void*)&std::forward<Fn>(rhs), sizeof(DecayFn));
+      } else if (OB_FAIL(meta::move_or_copy_or_assign<DecayFn>(std::forward<Fn>(rhs),
+                  *(DecayFn *)((Derived<DecayFn> *)base_)->func_))) {
+        OCCAM_LOG(WARN, "failed to move_or_copy function", K(ret), KP_(base), KP(&allocator_),
+                  KP(&DEFAULT_ALLOCATOR), K(lbt()));
+        if ((void *)base_ != (void *)local_buffer_) {
+          allocator_.free(base_);
+        }
+        base_ = nullptr;
+      }
     }
     return ret;
   }

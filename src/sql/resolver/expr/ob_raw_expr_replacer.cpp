@@ -53,6 +53,9 @@ int ObRawExprReplacer::replace(ObRawExpr *&expr)
   } else if (OB_FAIL(expr->preorder_accept(*this))) {
     LOG_WARN("failed to preorder accept expr", K(ret));
   }
+  if (OB_SUCC(ret) && replace_happened_) {
+    expr->calc_hash();
+  }
   return ret;
 }
 
@@ -154,7 +157,7 @@ int ObRawExprReplacer::visit(ObAliasRefRawExpr &expr)
   } else if (!skip_expr) {
     ObRawExpr *new_expr = NULL;
     bool need_replace = false;
-    if (OB_FAIL(check_need_replace(expr.get_ref_expr(), new_expr, need_replace))) {
+    if (OB_FAIL(check_need_replace(expr.get_query_ref_expr(), new_expr, need_replace))) {
       LOG_WARN("failed to check need replace", K(ret));
     } else if (need_replace) {
       expr.set_ref_expr(new_expr);

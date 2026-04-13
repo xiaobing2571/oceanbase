@@ -175,7 +175,7 @@ int ObTxRedoSubmitter::parallel_submit(const ObTxSEQ &write_seq_no)
   }
   if (do_submit) {
     ret = _submit_redo_pipeline_(false);
-    ret = save_ret != OB_SUCCESS ? save_ret : ret;
+    ret = COVER_SUCC(save_ret);
   }
   return ret;
 }
@@ -300,7 +300,7 @@ int ObTxRedoSubmitter::_submit_redo_pipeline_(const bool display_blocked_info)
           ret = OB_ERR_UNEXPECTED;
           TRANS_LOG(ERROR, "oops! fatal panic", K(ret), K(ctx), KPC(this));
 #ifdef ENABLE_DEBUG_LOG
-          usleep(1000);
+          ob_usleep(1000);
           ob_abort();
 #endif
           break;
@@ -339,7 +339,7 @@ int ObTxRedoSubmitter::_submit_redo_pipeline_(const bool display_blocked_info)
     }
   }
   if (OB_UNLIKELY(display_blocked_info) && fill_ret == OB_BLOCK_FROZEN) {
-    if (TC_REACH_TIME_INTERVAL(5_s)) {
+    if (!ctx.reach_freeze_clock_ && TC_REACH_TIME_INTERVAL(5_s)) {
       TRANS_LOG(INFO, "[display-blocked-info]", "submit_redo_ctx", ctx);
     }
   }
@@ -356,8 +356,7 @@ int ObTxRedoSubmitter::submit_log_block_out_(const int64_t replay_hint, bool &su
   } else {
     share::SCN submitted_scn;
     helper_->callback_redo_submitted_ = false;
-    bool has_hold_ctx_lock = from_all_list_;
-    ret = tx_ctx_.submit_redo_log_out(*log_block_, log_cb_, *helper_, replay_hint, has_hold_ctx_lock, submitted_scn);
+    ret = tx_ctx_.submit_redo_log_out(*log_block_, log_cb_, *helper_, replay_hint, submitted_scn);
     OB_ASSERT(log_cb_ == NULL);
     if (submitted_scn.is_valid()) {
       submitted = true;
@@ -375,7 +374,7 @@ int ObTxRedoSubmitter::after_submit_redo_out_()
   if (OB_FAIL(mt_ctx_.log_submitted(*helper_))) {
     TRANS_LOG(WARN, "callback memctx fail", K(ret));
 #ifdef ENABLE_DEBUG_LOG
-    usleep(1000);
+    ob_usleep(1000);
     ob_abort();
 #endif
   }
@@ -413,6 +412,7 @@ int ObTxRedoSubmitter::fill_log_block_(memtable::ObTxFillRedoCtx &ctx)
     ctx.skip_lock_node_ = false;
     ctx.all_list_ = from_all_list_;
     ctx.freeze_clock_ = flush_freeze_clock_;
+    ctx.reach_freeze_clock_ = false;
     ctx.fill_count_ = 0;
     ctx.list_idx_ = submit_cb_list_idx_;
     int64_t start_ts = ObTimeUtility::fast_current_time();

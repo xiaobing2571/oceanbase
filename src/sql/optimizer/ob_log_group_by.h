@@ -14,6 +14,7 @@
 #define OCEANBASE_SQL_OB_LOG_GROUP_BY_H
 #include "lib/allocator/page_arena.h"
 #include "ob_logical_operator.h"
+#include "sql/optimizer/ob_log_plan.h"
 #include "ob_select_log_plan.h"
 #include "sql/engine/aggregate/ob_adaptive_bypass_ctrl.h"
 namespace oceanbase
@@ -21,16 +22,20 @@ namespace oceanbase
 using namespace common;
 namespace sql
 {
+
+using GroupDistinctExprs = ObSqlArray<ObRawExpr*>;
 class ObLogSort;
+template<typename R, typename C>
+class PlanVisitor;
 struct ObThreeStageAggrInfo
 {
-  ObThreeStageAggrInfo() :
+  ObThreeStageAggrInfo(common::ObIAllocator &allocator) :
     aggr_stage_(ObThreeStageAggrStage::NONE_STAGE),
     distinct_aggr_count_(-1),
     aggr_code_idx_(-1),
     aggr_code_expr_(NULL),
-    distinct_aggr_batch_(),
-    distinct_exprs_(),
+    distinct_aggr_batch_(allocator),
+    distinct_exprs_(allocator),
     aggr_code_ndv_(1.0)
   {}
 
@@ -38,8 +43,8 @@ struct ObThreeStageAggrInfo
   int64_t distinct_aggr_count_;
   int64_t aggr_code_idx_;
   ObRawExpr *aggr_code_expr_;
-  ObArray<ObDistinctAggrBatch, ModulePageAllocator, true> distinct_aggr_batch_;
-  common::ObArray<ObRawExpr *, common::ModulePageAllocator, true> distinct_exprs_;
+  ObSqlArray<ObDistinctAggrBatch, true> distinct_aggr_batch_;
+  ObSqlArray<ObRawExpr *> distinct_exprs_;
   double aggr_code_ndv_;
 
   int assign(const ObThreeStageAggrInfo &info);
@@ -60,18 +65,18 @@ struct ObThreeStageAggrInfo
 
 struct ObRollupAdaptiveInfo
 {
-  ObRollupAdaptiveInfo()
+  ObRollupAdaptiveInfo(common::ObIAllocator &allocator)
   : rollup_id_expr_(NULL),
     rollup_status_(ObRollupStatus::NONE_ROLLUP),
-    sort_keys_(),
-    ecd_sort_keys_(),
+    sort_keys_(allocator),
+    ecd_sort_keys_(allocator),
     enable_encode_sort_(false)
   {}
 
   ObRawExpr *rollup_id_expr_;
   ObRollupStatus rollup_status_;
-  ObArray<OrderItem, common::ModulePageAllocator, true> sort_keys_;
-  ObArray<OrderItem, common::ModulePageAllocator, true> ecd_sort_keys_;
+  ObSqlArray<OrderItem> sort_keys_;
+  ObSqlArray<OrderItem> ecd_sort_keys_;
   bool enable_encode_sort_;
 
   int assign(const ObRollupAdaptiveInfo &info);
@@ -79,16 +84,49 @@ struct ObRollupAdaptiveInfo
 
 struct ObHashRollupInfo
 {
-  ObHashRollupInfo()
-  :rollup_grouping_id_(nullptr)
+  ObHashRollupInfo(common::ObIAllocator &allocator)
+  : expand_exprs_(allocator),
+    gby_exprs_(allocator),
+    dup_expr_pairs_(allocator),
+    rollup_grouping_id_(nullptr),
+    replaced_agg_pairs_(allocator)
   {
 
   }
-
-  common::ObSEArray<ObRawExpr *, 8, common::ModulePageAllocator, true> expand_exprs_;
-  common::ObSEArray<ObRawExpr *, 8, common::ModulePageAllocator, true> gby_exprs_;
-  common::ObSEArray<ObTuple<ObRawExpr *, ObRawExpr *>, 8, common::ModulePageAllocator, true> dup_expr_pairs_;
+  int assign(const ObHashRollupInfo &other);
+  ObSqlArray<ObRawExpr *> expand_exprs_;
+  ObSqlArray<ObRawExpr *> gby_exprs_;
+  ObSqlArray<ObTuple<ObRawExpr *, ObRawExpr *>> dup_expr_pairs_;
   ObOpPseudoColumnRawExpr *rollup_grouping_id_;
+  ObSqlArray<ObTuple<ObRawExpr *, ObRawExpr *>> replaced_agg_pairs_;
+};
+
+struct ObGroupingSetInfo
+{
+  ObGroupingSetInfo(common::ObIAllocator &allocator)
+    : common_group_exprs_(allocator),
+      group_exprs_(allocator),
+      group_dirs_(allocator),
+      groupset_exprs_(allocator),
+      pruned_groupset_exprs_(allocator),
+      dup_expr_pairs_(allocator),
+      replaced_agg_pairs_(allocator),
+      grouping_set_id_(nullptr),
+      hash_val_expr_(nullptr)
+  {
+  }
+  ObSqlArray<ObRawExpr *> common_group_exprs_;
+  ObSqlArray<ObRawExpr *> group_exprs_;
+  ObSqlArray<ObOrderDirection> group_dirs_;
+  ObSqlArray<ObGroupbyExpr, true> groupset_exprs_;
+  ObSqlArray<ObGroupbyExpr, true> pruned_groupset_exprs_;
+  ObSqlArray<ObTuple<ObRawExpr *, ObRawExpr *>> dup_expr_pairs_;
+  ObSqlArray<ObTuple<ObRawExpr *, ObRawExpr *>> replaced_agg_pairs_;
+  ObOpPseudoColumnRawExpr *grouping_set_id_;
+  ObRawExpr *hash_val_expr_;
+  TO_STRING_KV(KP_(grouping_set_id), K_(group_exprs), K_(groupset_exprs), K_(pruned_groupset_exprs),
+               K_(dup_expr_pairs));
+  int assign(const ObGroupingSetInfo &other);
 };
 
 class ObLogGroupBy : public ObLogicalOperator
@@ -96,24 +134,34 @@ class ObLogGroupBy : public ObLogicalOperator
 public:
   ObLogGroupBy(ObLogPlan &plan)
       : ObLogicalOperator(plan),
-        group_exprs_(),
-        rollup_exprs_(),
-        aggr_exprs_(),
+        group_exprs_(plan.get_allocator()),
+        rollup_exprs_(plan.get_allocator()),
+        aggr_exprs_(plan.get_allocator()),
         algo_(AGGREGATE_UNINITIALIZED),
+        step_(SINGLE),
         from_pivot_(false),
         is_push_down_(false),
         is_partition_gi_(false),
         total_ndv_(-1.0),
         origin_child_card_(-1.0),
-        three_stage_info_(),
-        rollup_adaptive_info_(),
+        three_stage_info_(plan.get_allocator()),
+        rollup_adaptive_info_(plan.get_allocator()),
         force_push_down_(false),
         use_hash_aggr_(false),
         has_push_down_(false),
         use_part_sort_(false),
         gby_dop_(ObGlobalHint::UNSET_PARALLEL),
         is_pushdown_scalar_aggr_(false),
-        hash_rollup_info_()
+        hash_rollup_info_(nullptr),
+        grouping_set_info_(nullptr),
+        distinct_pairs_(plan.get_allocator()),
+        grouping_id_(nullptr),
+        second_stage_expand_replace_pairs_(plan.get_allocator()),
+        third_stage_expand_replace_pairs_(plan.get_allocator()),
+        group_distinct_exprs_(plan.get_allocator()),
+        is_three_stage_expand_aggr_(false),
+        limit_expr_(NULL),
+        first_stage_hash_val_expr_(nullptr)
   {}
   virtual ~ObLogGroupBy()
   {}
@@ -135,7 +183,7 @@ public:
   const ObIArray<ObDistinctAggrBatch> &get_distinct_aggr_batch()
   { return three_stage_info_.distinct_aggr_batch_; }
 
-
+  ObThreeStageAggrInfo &get_three_stage_info_for_update() { return three_stage_info_; }
   // Get the 'group-by' expressions
   inline common::ObIArray<ObRawExpr *> &get_group_by_exprs()
   { return group_exprs_; }
@@ -150,6 +198,12 @@ public:
   inline void set_hash_type() { algo_ = HASH_AGGREGATE; }
   inline void set_merge_type() { algo_ = MERGE_AGGREGATE; }
   inline void set_scalar_type() { algo_ = SCALAR_AGGREGATE; }
+  inline void set_step(AggregatePathType step) { step_ = step; }
+  inline AggregatePathType get_step() const { return step_; }
+  inline void set_step_partial() { step_ = PARTIAL; }
+  inline void set_step_final() { step_ = FINAL; }
+  inline bool is_final() { return step_ == FINAL; }
+  inline bool is_partial() { return step_ == PARTIAL; }
   inline void set_algo_type(AggregateAlgo type) { algo_ = type; }
   inline AggregateAlgo get_algo() const { return algo_; }
 
@@ -172,8 +226,11 @@ public:
   int get_child_est_info(const int64_t parallel, double &child_card, double &child_ndv, double &selectivity);
   int get_gby_output_exprs(ObIArray<ObRawExpr *> &output_exprs);
   virtual bool is_block_op() const override
-  { return (MERGE_AGGREGATE != get_algo() && !is_adaptive_aggregate())
-        || ObRollupStatus::ROLLUP_DISTRIBUTOR == rollup_adaptive_info_.rollup_status_; }
+  {
+    return !is_gby_with_ordered_grouping_id()
+           && ((MERGE_AGGREGATE != get_algo() && !is_adaptive_aggregate())
+               || ObRollupStatus::ROLLUP_DISTRIBUTOR == rollup_adaptive_info_.rollup_status_);
+  }
 
   virtual int compute_const_exprs() override;
   virtual int compute_equal_set() override;
@@ -206,9 +263,12 @@ public:
   inline bool is_second_stage() const { return ObThreeStageAggrStage::SECOND_STAGE == three_stage_info_.aggr_stage_; }
   inline bool is_third_stage() const { return ObThreeStageAggrStage::THIRD_STAGE == three_stage_info_.aggr_stage_; }
   inline bool force_push_down() const { return force_push_down_; }
+  inline bool has_push_down() const { return has_push_down_; }
   inline bool is_adaptive_aggregate() const { return HASH_AGGREGATE == get_algo()
                                                      && !force_push_down()
-                                                     && (is_first_stage() || (!is_three_stage_aggr() && is_push_down())); }
+                                                     && (get_second_stage_expand_replace_pairs().count() <= 0) // second stage can't be adaptive
+                                                     && (is_first_stage() || (!is_three_stage_aggr() && is_push_down()));
+                                            }
 
 
   inline void set_rollup_status(const ObRollupStatus rollup_status)
@@ -257,17 +317,87 @@ public:
   virtual int get_card_without_filter(double &card) override;
 
   void set_hash_rollup_info(ObHashRollupInfo *info) { hash_rollup_info_ = info; }
+  void set_grouping_set_info(ObGroupingSetInfo *info) { grouping_set_info_ = info; }
   const ObHashRollupInfo *get_hash_rollup_info() const
   {
     return hash_rollup_info_;
   }
-  bool is_hash_rollup_groupby() const
+  bool is_gby_from_expansion() const
   {
-    return NULL != hash_rollup_info_;
+    return NULL != hash_rollup_info_ || NULL != grouping_set_info_;
   }
+  const ObGroupingSetInfo *get_grouping_set_info() const
+  {
+    return grouping_set_info_;
+  }
+  inline bool use_vec_grouping() const
+  {
+    return hash_rollup_info_ != nullptr || grouping_set_info_ != nullptr;
+  }
+  int unwrap_cast_for_aggr_expr();
+
+  int is_duplicate_insensitive_aggregation(bool & is_duplicate_insensitive);
+
+  int set_distinct_pairs(const ObIArray<ObTuple<ObRawExpr *, ObRawExpr *>> &distinct_pairs)
+  {
+    return distinct_pairs_.assign(distinct_pairs);
+  }
+
+  const ObIArray<ObTuple<ObRawExpr *, ObRawExpr *>> &get_distinct_pairs() const
+  {
+    return distinct_pairs_;
+  }
+
+  bool is_gby_with_ordered_grouping_id() const { return grouping_id_ != nullptr; }
+
+  ObRawExpr *get_grouping_id() const { return grouping_id_; }
+  void set_grouping_id(ObRawExpr *grouping_id) { grouping_id_ = grouping_id; }
+
+  int set_second_stage_expand_replace_pairs(ObIArray<ObTuple<ObRawExpr *, ObRawExpr *>> &replace_agg_pairs)
+  {
+    return second_stage_expand_replace_pairs_.assign(replace_agg_pairs);
+  }
+
+  const ObIArray<ObTuple<ObRawExpr *, ObRawExpr *>> &get_second_stage_expand_replace_pairs() const
+  {
+    return second_stage_expand_replace_pairs_;
+  }
+
+  int set_third_stage_expand_replace_pairs(ObIArray<ObTuple<ObRawExpr *, ObRawExpr *>> &replace_agg_pairs)
+  {
+    return third_stage_expand_replace_pairs_.assign(replace_agg_pairs);
+  }
+  const ObIArray<ObTuple<ObRawExpr *, ObRawExpr *>> &get_third_stage_expand_replace_pairs() const
+  {
+    return third_stage_expand_replace_pairs_;
+  }
+
+  void set_is_three_stage_expand_aggr(bool is_three_stage_expand_aggr)
+  {
+    is_three_stage_expand_aggr_ = is_three_stage_expand_aggr;
+  }
+  bool is_three_stage_expand_aggr() const
+  {
+    return is_three_stage_expand_aggr_;
+  }
+
+  int set_group_distinct_exprs(const ObIArray<GroupDistinctExprs> &group_distinct_exprs)
+  {
+    return group_distinct_exprs_.assign(group_distinct_exprs);
+  }
+  ObIArray<GroupDistinctExprs>& get_group_distinct_exprs()
+  {
+    return group_distinct_exprs_;
+  }
+
+  inline ObRawExpr *get_limit_expr() const { return limit_expr_; }
+  inline void set_limit_expr(ObRawExpr *limit_expr) { limit_expr_ = limit_expr; }
+  void set_first_stage_hash_val_expr(ObRawExpr *hash_val_expr) { first_stage_hash_val_expr_ = hash_val_expr; }
+  ObRawExpr *get_first_stage_hash_val_expr() const { return first_stage_hash_val_expr_; }
 
 private:
   virtual int inner_replace_op_exprs(ObRawExprReplacer &replacer) override;
+
   virtual int allocate_granule_post(AllocGIContext &ctx) override;
   virtual int allocate_granule_pre(AllocGIContext &ctx) override;
   int create_fd_item_from_select_list(ObFdItemSet *fd_item_set);
@@ -277,10 +407,11 @@ private:
   virtual int check_use_child_ordering(bool &used, int64_t &inherit_child_ordering_index)override;
   virtual int compute_op_parallel_and_server_info() override;
 private:
-  common::ObSEArray<ObRawExpr *, 8, common::ModulePageAllocator, true> group_exprs_;
-  common::ObSEArray<ObRawExpr *, 8, common::ModulePageAllocator, true> rollup_exprs_;
-  common::ObSEArray<ObRawExpr *, 8, common::ModulePageAllocator, true> aggr_exprs_;
+  ObSqlArray<ObRawExpr *> group_exprs_;
+  ObSqlArray<ObRawExpr *> rollup_exprs_;
+  ObSqlArray<ObRawExpr *> aggr_exprs_;
   AggregateAlgo algo_;
+  AggregatePathType step_;
   bool from_pivot_;
   bool is_push_down_;
   bool is_partition_gi_;
@@ -299,6 +430,16 @@ private:
   // end use print outline
   bool is_pushdown_scalar_aggr_;
   ObHashRollupInfo *hash_rollup_info_;
+  ObGroupingSetInfo *grouping_set_info_;
+  // used for transform distinct agg plan
+  ObSqlArray<ObTuple<ObRawExpr *, ObRawExpr *>> distinct_pairs_;
+  ObRawExpr *grouping_id_;
+  ObSqlArray<ObTuple<ObRawExpr *, ObRawExpr *>> second_stage_expand_replace_pairs_;
+  ObSqlArray<ObTuple<ObRawExpr *, ObRawExpr *>> third_stage_expand_replace_pairs_;
+  ObSqlArray<GroupDistinctExprs, true> group_distinct_exprs_;
+  bool is_three_stage_expand_aggr_;
+  ObRawExpr *limit_expr_;
+  ObRawExpr *first_stage_hash_val_expr_;
 };
 } // end of namespace sql
 } // end of namespace oceanbase

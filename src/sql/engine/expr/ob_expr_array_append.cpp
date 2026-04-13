@@ -63,8 +63,6 @@ int ObExprArrayAppendCommon::calc_result_type2(ObExprResType &type,
   } else if (!ob_is_collection_sql_type(type1.get_type())) {
     ret = OB_ERR_INVALID_TYPE_FOR_OP;
     LOG_USER_ERROR(OB_ERR_INVALID_TYPE_FOR_OP, "ARRAY", ob_obj_type_str(type1.get_type()));
-  } else if (type2.is_null()) {
-    // do nothing
   } else if (OB_FAIL(ObArrayExprUtils::deduce_array_type(exec_ctx, type1, type2, subschema_id))) {
     LOG_WARN("failed to get result array type subschema id", K(ret));
   }
@@ -163,7 +161,6 @@ int ObExprArrayAppendCommon::eval_append_batch(const ObExpr &expr, ObEvalCtx &ct
       if (skip.at(j) || eval_flags.at(j)) {
         continue;
       }
-      eval_flags.set(j);
       if (arr_datum.at(j)->is_null()) {
         is_null_res = true;
       } else if (OB_FAIL(ObArrayExprUtils::get_array_obj(tmp_allocator, ctx, subschema_id,

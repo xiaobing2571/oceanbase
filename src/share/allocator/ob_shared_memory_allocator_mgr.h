@@ -16,6 +16,7 @@
 #include "share/allocator/ob_memstore_allocator.h"
 #include "share/allocator/ob_tx_data_allocator.h"
 #include "share/allocator/ob_mds_allocator.h"
+#include "share/allocator/ob_tenant_vector_allocator.h"
 #include "share/throttle/ob_share_resource_throttle_tool.h"
 #include "share/rc/ob_tenant_base.h"
 #include "storage/tx_storage/ob_tenant_freezer.h"
@@ -29,7 +30,8 @@ public:
   ObSharedMemAllocMgr(): share_resource_throttle_tool_(),
         memstore_allocator_(),
         tx_data_allocator_(),
-        mds_allocator_() {}
+        mds_allocator_(),
+        vector_allocator_() {}
   ObSharedMemAllocMgr(ObSharedMemAllocMgr &rhs) = delete;
   ObSharedMemAllocMgr &operator=(ObSharedMemAllocMgr &rhs) = delete;
   ~ObSharedMemAllocMgr() {}
@@ -39,7 +41,7 @@ public:
   int init()
   {
     int ret = OB_SUCCESS;
-    if (OB_FAIL(tx_data_allocator_.init("TX_DATA_SLICE"))) {
+    if (OB_FAIL(tx_data_allocator_.init("TX_DATA_SLICE", &share_resource_throttle_tool_))) {
       SHARE_LOG(ERROR, "init tx data allocator failed", KR(ret));
     } else if (OB_FAIL(memstore_allocator_.init())) {
       SHARE_LOG(ERROR, "init memstore allocator failed", KR(ret));
@@ -47,12 +49,16 @@ public:
       SHARE_LOG(ERROR, "init mds allocator failed", KR(ret));
     } else if (OB_FAIL(tx_data_op_allocator_.init())) {
       SHARE_LOG(ERROR, "init tx data op allocator failed", KR(ret));
+    } else if (OB_FAIL(vector_allocator_.init())) {
+      SHARE_LOG(ERROR, "init vector allocator failed", KR(ret));
     } else if (OB_FAIL(
-                   share_resource_throttle_tool_.init(&memstore_allocator_, &tx_data_allocator_, &mds_allocator_))) {
+                   share_resource_throttle_tool_.init(&memstore_allocator_, &tx_data_allocator_, &mds_allocator_, &vector_allocator_))) {
       SHARE_LOG(ERROR, "init share resource throttle tool failed", KR(ret));
     } else {
       tenant_id_ = MTL_ID();
-      share_resource_throttle_tool_.enable_adaptive_limit<FakeAllocatorForTxShare>();
+      if (!is_meta_tenant(tenant_id_)) {
+        share_resource_throttle_tool_.enable_adaptive_limit<FakeAllocatorForTxShare>();
+      }
       SHARE_LOG(INFO, "finish init mtl share mem allocator mgr", K(tenant_id_), KP(this));
     }
     return ret;
@@ -61,7 +67,7 @@ public:
   int start() { return OB_SUCCESS; }
   void stop() {}
   void wait() {}
-  void destroy() {}
+  void destroy() { vector_allocator_.destroy(); }
   void update_throttle_config();
 
   ObMemstoreAllocator &memstore_allocator() { return memstore_allocator_; }
@@ -69,6 +75,15 @@ public:
   ObTenantMdsAllocator &mds_allocator() { return mds_allocator_; }
   TxShareThrottleTool &share_resource_throttle_tool() { return share_resource_throttle_tool_; }
   ObTenantTxDataOpAllocator &tx_data_op_allocator() { return tx_data_op_allocator_; }
+  ObTenantVectorAllocator &vector_allocator() { return vector_allocator_; }
+
+  TO_STRING_KV(K(tenant_id_),
+               KP(this),
+               KP(&memstore_allocator_),
+               KP(&tx_data_allocator_),
+               KP(&mds_allocator_),
+               KP(&share_resource_throttle_tool_),
+               KP(&tx_data_op_allocator_));
 
 private:
   void update_share_throttle_config_(const int64_t total_memory, omt::ObTenantConfigGuard &config);
@@ -83,6 +98,7 @@ private:
   ObTenantTxDataAllocator tx_data_allocator_;
   ObTenantMdsAllocator mds_allocator_;
   ObTenantTxDataOpAllocator tx_data_op_allocator_;
+  ObTenantVectorAllocator vector_allocator_;
 };
 
 class TxShareMemThrottleUtil

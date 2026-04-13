@@ -544,7 +544,7 @@ int ObKVCacheStore::get_avg_cache_item_size(const uint64_t tenant_id, const int6
   } else {
     HazptrHolder hazptr_holder;
     bool protect_success;
-    for (int64_t i = 0; i < cur_mb_num_; ++i) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < cur_mb_num_; ++i) {
       if (OB_FAIL(hazptr_holder.protect(protect_success, &mb_handles_[i]))) {
         COMMON_LOG(WARN, "failed to protect mb_handle");
       } else if (protect_success) {
@@ -580,9 +580,9 @@ int ObKVCacheStore::get_washable_size(const uint64_t tenant_id, int64_t &washabl
   return ret;
 }
 
-void ObKVCacheStore::flush_washable_mbs()
+int ObKVCacheStore::flush_washable_mbs()
 {
-  int ret = OB_SUCCESS;
+  int ret = OB_SUCCESS, last_error_code = OB_SUCCESS;
 
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
@@ -593,17 +593,19 @@ void ObKVCacheStore::flush_washable_mbs()
       COMMON_LOG(WARN, "Fail to get all tenant ids", K(ret));
     } else {
       uint64_t tenant_id = OB_INVALID_TENANT_ID;
-      for (int64_t i = 0 ; i < tenant_ids.count() ; ++i) {
-        int tmp_ret = OB_SUCCESS;
+      // record error code in last_error_code
+      for (int64_t i = 0 ; /* OB_SUCC(ret) && */ i < tenant_ids.count() ; ++i) {
         if (OB_FAIL(tenant_ids.at(i, tenant_id))) {
           COMMON_LOG(WARN, "Fail to get tenant id, continue to flush rest tenants", K(ret), K(i));
-        } else if (OB_TMP_FAIL(flush_washable_mbs(tenant_id))) {
-          COMMON_LOG(WARN, "Fail to flush tenant washable memblock", K(tmp_ret));
+        } else if (OB_FAIL(flush_washable_mbs(tenant_id))) {
+          COMMON_LOG(WARN, "Fail to flush tenant washable memblock");
         }
+        last_error_code = ret;
       }
     }
   }
 
+  return ret == OB_SUCCESS ? last_error_code : ret;
 }
 
 int ObKVCacheStore::flush_washable_mbs(const uint64_t tenant_id, const bool force_flush)
@@ -799,6 +801,7 @@ int ObKVCacheStore::try_flush_washable_mb(const uint64_t tenant_id, ObICacheWash
   } else {
     int64_t size_washed = 0;
     const int64_t start = ObTimeUtility::current_time();
+    const bool is_flush = size_to_wash == INT64_MAX;
     if (OB_FAIL(inner_flush_washable_mb(cache_id, size_to_wash, size_washed, wash_blocks, list_handle, force_flush))) {
       COMMON_LOG(WARN,
           "failed to inner flush washable mb",
@@ -809,7 +812,7 @@ int ObKVCacheStore::try_flush_washable_mb(const uint64_t tenant_id, ObICacheWash
           K(force_flush));
       free_mbs(*list_handle.get_resource_handle(), tenant_id, wash_blocks);
       wash_blocks = nullptr;
-    } else if (size_to_wash == INT64_MAX) {
+    } else if (is_flush) {
       // flush
       free_mbs(*list_handle.get_resource_handle(), tenant_id, wash_blocks);
       wash_blocks = nullptr;
@@ -818,7 +821,7 @@ int ObKVCacheStore::try_flush_washable_mb(const uint64_t tenant_id, ObICacheWash
       if (OB_SUCC(ret) && size_washed < size_to_wash) {
         ret = OB_CACHE_FREE_BLOCK_NOT_ENOUGH;
         INIT_SUCC(tmp_ret);
-        if (TC_REACH_TIME_INTERVAL(3 * 1000 * 1000 /* 3s */)) {
+        if (REACH_TIME_INTERVAL(3 * 1000 * 1000 /* 3s */)) {
           if (OB_TMP_FAIL(print_tenant_memblock_info(head))) {
             COMMON_LOG(WARN, "Fail to print tenant memblock info", K(tmp_ret));
           }
@@ -833,6 +836,12 @@ int ObKVCacheStore::try_flush_washable_mb(const uint64_t tenant_id, ObICacheWash
       // free memory of memory blocks washed if any error occur
       free_mbs(*list_handle.get_resource_handle(), tenant_id, wash_blocks);
       wash_blocks = nullptr;
+    }
+
+    if (!is_flush && (OB_CACHE_FREE_BLOCK_NOT_ENOUGH == ret || OB_SYNC_WASH_MB_TIMEOUT == ret)) {
+      if (REACH_TIME_INTERVAL(500 * 1000 /* 500 ms */)) {
+        insts_->print_tenant_cache_info(tenant_id);
+      }
     }
 
     COMMON_LOG(INFO,
@@ -861,6 +870,7 @@ int ObKVCacheStore::inner_flush_washable_mb(const int64_t cache_id, const int64_
   HazardList retire_list;
   ObDLink* head = list_handle.get_head();
   int64_t tenant_id = list_handle.list_->tenant_id_;
+  int64_t timeout_us = INT_MAX == size_to_wash ? FLUSH_MB_TIMEOUT_US : SYNC_WASH_MB_TIMEOUT_US;
   if (OB_LIKELY(GCONF._enable_kvcache_hazard_pointer)) {
     // retire memblock and reclaim until
     // 1. wash out enough memory, or
@@ -898,7 +908,7 @@ int ObKVCacheStore::inner_flush_washable_mb(const int64_t cache_id, const int64_
               size_retired += size;
             }
           } else {
-            if (force_flush && protect_success) {
+            if (OB_SUCC(ret) && force_flush && protect_success) {
               ret = OB_ERR_UNEXPECTED;
               COMMON_LOG(WARN,
                   "Can not sync wash memblock of erased tenant",
@@ -911,19 +921,19 @@ int ObKVCacheStore::inner_flush_washable_mb(const int64_t cache_id, const int64_
           }
           handle = static_cast<ObKVMemBlockHandle*>(link_next(handle));
 
-          if (!force_flush && check_idx > 0 && 0 == check_idx % check_interval) {
+          if (OB_SUCC(ret) && !force_flush && check_idx > 0 && 0 == check_idx % check_interval) {
             const int64_t cost = ObTimeUtility::current_time() - start;
-            if (cost > SYNC_WASH_MB_TIMEOUT_US) {
+            if (cost > timeout_us) {
               ret = OB_SYNC_WASH_MB_TIMEOUT;
-              COMMON_LOG(WARN, "sync wash mb timeout", K(cost), LITERAL_K(SYNC_WASH_MB_TIMEOUT_US));
+              COMMON_LOG(WARN, "sync wash mb timeout", K(cost), K(timeout_us));
             }
           }
           ++check_idx;
         }
       }  // qclock guard
 
-      if (OB_FAIL(ret)) {
-      } else if (size_retired >= size_to_wash - size_washed || size_to_wash == INT64_MAX) {
+      if (OB_FAIL(ret) && OB_SYNC_WASH_MB_TIMEOUT != ret) {
+      } else if (size_retired >= size_to_wash - size_washed || size_to_wash == INT64_MAX || HazardDomain::get_instance().get_retired_size() > size_to_wash - size_washed) {
         // do recliam if has retired enough memory
         int64_t start_time = ObTimeUtility::current_time();
         SyncWashCallBack callback(*this, retire_list, wash_blocks, size_washed, size_to_wash, tenant_id);
@@ -1004,9 +1014,9 @@ int ObKVCacheStore::inner_flush_washable_mb(const int64_t cache_id, const int64_
 
       if (!force_flush && check_idx > 0 && 0 == check_idx % check_interval) {
         const int64_t cost = ObTimeUtility::current_time() - start;
-        if (cost > SYNC_WASH_MB_TIMEOUT_US) {
+        if (cost > timeout_us) {
           ret = OB_SYNC_WASH_MB_TIMEOUT;
-          COMMON_LOG(WARN, "sync wash mb timeout", K(cost), LITERAL_K(SYNC_WASH_MB_TIMEOUT_US));
+          COMMON_LOG(WARN, "sync wash mb timeout", K(cost), K(timeout_us));
         }
       }
       ++check_idx;
@@ -1312,7 +1322,7 @@ bool ObKVCacheStore::compute_tenant_wash_size()
 
   if (OB_FAIL(mem_limit_getter_->get_all_tenant_id(tenant_ids_))) {
     COMMON_LOG(WARN, "Fail to get all tenant ids, ", K(ret));
-  } else if (OB_FAIL(insts_->get_cache_info(OB_SYS_TENANT_ID, inst_handles_))) {
+  } else if (OB_FAIL(insts_->get_cache_info(inst_handles_))) {
     COMMON_LOG(WARN, "Fail to get all cache infos, ", K(ret));
   }
 
@@ -1757,7 +1767,11 @@ void ObKVCacheStore::retire_mb_handles(HazardList &retire_list, const bool do_re
     if (wash_itid_ == get_itid()) {  // wash thread should not sync wash
       retire_limit = WASH_THREAD_RETIRE_LIMIT;
     }
+    bool need_purge = retire_list.size() > retire_limit;
     get_retire_station().retire(reclaim_list, retire_list, retire_limit);
+    if (need_purge) {
+      get_retire_station().retire(reclaim_list, retire_list, -1);
+    }
     reuse_mb_handles(reclaim_list);
   }
 }

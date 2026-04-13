@@ -7,7 +7,7 @@ import mysql.connector
 from mysql.connector import errorcode
 import logging
 import re
-
+from my_utils import set_session_timeout_for_upgrade
 import config
 import opts
 import run_modules
@@ -65,6 +65,8 @@ def do_upgrade(my_host, my_port, my_user, my_passwd, timeout, my_module_set, upg
     cur = conn.cursor(buffered=True)
     try:
       query_cur = actions.QueryCursor(cur)
+      if timeout != 0:
+        set_session_timeout_for_upgrade(cur, timeout)
       actions.check_server_version_by_cluster(cur)
 
       if run_modules.MODULE_BEGIN_UPGRADE in my_module_set:
@@ -93,7 +95,7 @@ def do_upgrade(my_host, my_port, my_user, my_passwd, timeout, my_module_set, upg
 
       if run_modules.MODULE_HEALTH_CHECK in my_module_set:
         logging.info('================begin to run health check action ===============')
-        upgrade_health_checker.do_check(my_host, my_port, my_user, my_passwd, upgrade_params, timeout, True) # need_check_major_status = True
+        upgrade_health_checker.do_check(my_host, my_port, my_user, my_passwd, upgrade_params, timeout, False) # need_check_major_status = False
         logging.info('================succeed to run health check action ===============')
 
     except Exception as e:

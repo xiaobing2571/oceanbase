@@ -27,6 +27,8 @@
 #include "sql/ob_sql_utils.h"
 #include "sql/plan_cache/ob_plan_cache_util.h"
 #include "sql/udr/ob_udr_struct.h"
+#include "sql/plan_cache/ob_plan_cache_param_constraint.h"
+#include "sql/plan_cache/ob_lib_cache_miss_diag.h"
 
 namespace oceanbase
 {
@@ -58,7 +60,8 @@ struct ObPlanCacheKey : public ObILibCacheKey
         sessid_(0),
         mode_(PC_TEXT_MODE),
         flag_(0),
-        sys_var_config_hash_val_(0) {}
+        sys_var_config_hash_val_(0),
+        collation_connection_(CS_TYPE_INVALID) {}
 
   inline void reset()
   {
@@ -72,6 +75,7 @@ struct ObPlanCacheKey : public ObILibCacheKey
     flag_ = 0;
     namespace_ = NS_INVALID;
     sys_var_config_hash_val_ = 0;
+    collation_connection_ = CS_TYPE_INVALID;
   }
 
   virtual inline int deep_copy(common::ObIAllocator &allocator,
@@ -97,6 +101,7 @@ struct ObPlanCacheKey : public ObILibCacheKey
       namespace_ = pc_key.namespace_;
       flag_ = pc_key.flag_;
       sys_var_config_hash_val_ = pc_key.sys_var_config_hash_val_;
+      collation_connection_ = pc_key.collation_connection_;
     }
     return ret;
   }
@@ -124,6 +129,7 @@ struct ObPlanCacheKey : public ObILibCacheKey
     hash_ret = common::murmurhash(&mode_, sizeof(PlanCacheMode), hash_ret);
     hash_ret = common::murmurhash(&flag_, sizeof(flag_), hash_ret);
     hash_ret = common::murmurhash(&namespace_, sizeof(ObLibCacheNameSpace), hash_ret);
+    hash_ret = common::murmurhash(&collation_connection_, sizeof(ObCollationType), hash_ret);
     return hash_ret;
   }
 
@@ -139,7 +145,8 @@ struct ObPlanCacheKey : public ObILibCacheKey
                    config_str_ == pc_key.config_str_ &&
                    flag_ == pc_key.flag_ &&
                    namespace_ == pc_key.namespace_&&
-                   sys_var_config_hash_val_ == pc_key.sys_var_config_hash_val_;
+                   sys_var_config_hash_val_ == pc_key.sys_var_config_hash_val_ &&
+                   collation_connection_ == pc_key.collation_connection_;
 
     return cmp_ret;
   }
@@ -151,7 +158,8 @@ struct ObPlanCacheKey : public ObILibCacheKey
                K_(sys_vars_str),
                K_(config_str),
                K_(flag),
-               K_(namespace));
+               K_(namespace),
+               K_(collation_connection));
   //通过name来进行查找，一般是shared sql/procedure
   //cursor用这种方式，对应的namespace是CRSR
   common::ObString name_;
@@ -176,6 +184,7 @@ struct ObPlanCacheKey : public ObILibCacheKey
     };
   };
   uint64_t sys_var_config_hash_val_;
+  ObCollationType collation_connection_;
 };
 
 //记录快速化参数后不需要扣参数的原始字符串及相关信息
@@ -260,6 +269,7 @@ public:
     question_mark_ctx_.by_ordinal_ = false;
     question_mark_ctx_.by_name_ = false;
     question_mark_ctx_.by_defined_name_ = false;
+    question_mark_ctx_.by_order_ = false;
   }
   int assign(const ObFastParserResult &other)
   {
@@ -366,7 +376,8 @@ struct ObPlanCacheCtx : public ObILibCacheCtx
                  ObSqlCtx &sql_ctx,
                  ObExecContext &exec_ctx,
                  uint64_t tenant_id)
-    : mode_(mode),
+    : ObILibCacheCtx(&allocator),
+      mode_(mode),
       raw_sql_(sql),
       allocator_(allocator),
       sql_ctx_(sql_ctx),
@@ -400,12 +411,13 @@ struct ObPlanCacheCtx : public ObILibCacheCtx
       tpl_sql_const_cons_(allocator),
       need_retry_add_plan_(true),
       insert_batch_opt_info_(allocator),
-      is_max_curr_limit_(false),
       is_batch_insert_opt_(false),
       is_arraybinding_(false),
       exist_local_plan_(false),
       compare_plan_(nullptr),
-      flag_(0)
+      flag_(0),
+      regenerating_expired_plan_(false),
+      params_constraint_(allocator)
   {
     fp_result_.pc_key_.mode_ = mode_;
   }
@@ -479,11 +491,12 @@ struct ObPlanCacheCtx : public ObILibCacheCtx
     K(new_raw_sql_),
     K(need_retry_add_plan_),
     K(insert_batch_opt_info_),
-    K(is_max_curr_limit_),
     K(is_batch_insert_opt_),
     K(is_arraybinding_),
     K(exist_local_plan_),
-    K(flag_)
+    K(flag_),
+    K(regenerating_expired_plan_),
+    K(params_constraint_)
     );
   PlanCacheMode mode_; //control use which variables to do match
 
@@ -545,7 +558,6 @@ struct ObPlanCacheCtx : public ObILibCacheCtx
   // when schema version of cache node is old, whether remove this node and retry add cache obj.
   bool need_retry_add_plan_;
   ObInsertBatchOptInfo insert_batch_opt_info_;
-  bool is_max_curr_limit_;
   bool is_batch_insert_opt_;
 
   bool is_arraybinding_;
@@ -565,6 +577,8 @@ struct ObPlanCacheCtx : public ObILibCacheCtx
     };
     uint16_t flag_;
   };
+  bool regenerating_expired_plan_;
+  common::ObFixedArray<ObPCParamConstraint *, common::ObIAllocator> params_constraint_;
 };
 
 struct ObPlanCacheStat

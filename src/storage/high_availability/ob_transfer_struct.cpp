@@ -14,6 +14,14 @@
 #include "ob_transfer_struct.h"
 #include "common/ob_version_def.h"
 #include "observer/ob_server_event_history_table_operator.h"
+#include "share/schema/ob_tenant_schema_service.h"
+#include "storage/meta_mem/ob_tenant_meta_mem_mgr.h"
+#include "src/storage/tablet/ob_tablet_meta.h"
+#include "storage/tablet/ob_tablet_create_delete_helper.h"
+#include "storage/ls/ob_ls.h"
+#include "storage/high_availability/ob_storage_ha_utils.h"
+#include "storage/ob_storage_schema_util.h"
+#include "storage/tx/ob_ts_mgr.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "src/storage/tx_storage/ob_ls_map.h"
 #include "storage/high_availability/ob_storage_ha_diagnose_mgr.h"
@@ -25,6 +33,8 @@ using namespace oceanbase;
 using namespace share;
 using namespace storage;
 using namespace transaction;
+
+ERRSIM_POINT_DEF(EN_GET_TABLET_INFO_HUNG)
 
 ObTXStartTransferOutInfo::ObTXStartTransferOutInfo()
   : src_ls_id_(),
@@ -512,14 +522,14 @@ int ObTXTransferUtils::get_tablet_status_(
 {
   int ret = OB_SUCCESS;
   if (get_commit) {
-    if (OB_FAIL(tablet->get_latest_committed(user_data))) {
+    if (OB_FAIL(tablet->get_latest_committed_tablet_status(user_data))) {
       LOG_WARN("failed to get committed tablet status", K(ret), KPC(tablet), K(user_data));
     }
   } else {
     mds::MdsWriter unused_writer;// will be removed later
     mds::TwoPhaseCommitState unused_trans_stat;// will be removed later
     share::SCN unused_trans_version;// will be removed later
-    if (OB_FAIL(tablet->get_latest(user_data,
+    if (OB_FAIL(tablet->get_latest_tablet_status(user_data,
         unused_writer, unused_trans_stat, unused_trans_version))) {
       LOG_WARN("failed to get latest tablet status", K(ret), KPC(tablet), K(user_data));
     }
@@ -556,8 +566,6 @@ int ObTXTransferUtils::set_tablet_freeze_flag(storage::ObLS &ls, ObTablet *table
       if (OB_UNLIKELY(memtables.at(i).get_tablet_memtable(mt))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("table in tables_handle is not memtable", K(ret), K(memtables.at(i)));
-      } else if (!mt->is_active_memtable()) {
-        // skip
       } else if (OB_UNLIKELY(!mt->is_data_memtable())) {
         // incremental direct load hold table lock will block transfer scheduling, so there will be no active direct load memtable
         ret = OB_TRANSFER_SYS_ERROR;
@@ -587,18 +595,19 @@ int ObTXTransferUtils::traverse_trans_to_submit_redo_log_with_retry(
          && ObTimeUtil::current_time() - start_time < timeout) {
     ret = ls.get_tx_svr()->traverse_trans_to_submit_redo_log(failed_tx_id);
     if (OB_TX_NOLOGCB == ret) {
-      usleep(10_ms);
+      ob_usleep(10_ms);
     }
   }
 
   return ret;
 }
 
-int ObTXTransferUtils::create_empty_minor_sstable(
+int ObTXTransferUtils::create_empty_mini_minor_sstable(
     const common::ObTabletID &tablet_id,
     const SCN start_scn,
     const SCN end_scn,
     const ObStorageSchema &table_schema,
+    const ObITable::TableType &table_type,
     common::ObArenaAllocator &allocator,
     ObTableHandleV2 &table_handle)
 {
@@ -608,8 +617,8 @@ int ObTXTransferUtils::create_empty_minor_sstable(
   if (!tablet_id.is_valid() || !table_schema.is_valid() || !start_scn.is_valid() || !end_scn.is_valid() || start_scn == end_scn) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("create empty minor sstable get invalid argument", K(ret), K(table_schema), K(tablet_id), K(start_scn), K(end_scn));
-  } else if (OB_FAIL(build_empty_minor_sstable_param_(start_scn, end_scn, table_schema,
-      tablet_id, create_sstable_param))) {
+  } else if (OB_FAIL(build_empty_mini_minor_sstable_param_(start_scn, end_scn, table_schema,
+      tablet_id, table_type, create_sstable_param))) {
     LOG_WARN("failed to build empty minor sstable param", K(ret), K(tablet_id), K(start_scn), K(end_scn));
   } else if (OB_FAIL(ObTabletCreateDeleteHelper::create_sstable<ObSSTable>(create_sstable_param, allocator, table_handle))) {
     LOG_WARN("failed to create minor sstable", K(ret), K(create_sstable_param), K(tablet_id));
@@ -619,11 +628,12 @@ int ObTXTransferUtils::create_empty_minor_sstable(
   return ret;
 }
 
-int ObTXTransferUtils::build_empty_minor_sstable_param_(
+int ObTXTransferUtils::build_empty_mini_minor_sstable_param_(
     const SCN start_scn,
     const SCN end_scn,
     const ObStorageSchema &table_schema,
     const common::ObTabletID &tablet_id,
+    const ObITable::TableType &table_type,
     ObTabletCreateSSTableParam &param)
 {
   int ret = OB_SUCCESS;
@@ -632,7 +642,7 @@ int ObTXTransferUtils::build_empty_minor_sstable_param_(
       || !table_schema.is_valid() || !tablet_id.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("build empty minor sstable param get invalid argument", K(ret), K(table_schema), K(tablet_id), K(start_scn), K(end_scn));
-  } else if (OB_FAIL(param.init_for_transfer_empty_minor_sstable(tablet_id, start_scn, end_scn, table_schema))) {
+  } else if (OB_FAIL(param.init_for_transfer_empty_mini_minor_sstable(tablet_id, start_scn, end_scn, table_schema, table_type))) {
     LOG_WARN("fail to init sstable param", K(ret), K(tablet_id), K(start_scn), K(end_scn), K(table_schema));
   }
   return ret;
@@ -757,7 +767,7 @@ ObTransferRelatedInfo::ObTransferRelatedInfo()
     finish_out_log_replay_num_(0),
     finish_in_log_replay_num_(0),
     map_(),
-    lock_()
+    lock_(common::ObLatchIds::OB_TRANSFER_STRUCT_RELATED_INFO_LOCK)
 {
 }
 
@@ -1165,7 +1175,7 @@ int ObTransferRelatedInfo::get_related_info_task_id(share::ObTransferTaskID &tas
 
 /******************ObTransferTabletInfoMgr*********************/
 ObTransferBuildTabletInfoCtx::ObTransferTabletInfoMgr::ObTransferTabletInfoMgr()
-  : lock_(),
+  : lock_(common::ObLatchIds::OB_TRANSFER_TABLET_INFO_MGR_LOCK),
     tablet_info_array_(),
     storage_schema_mgr_()
 
@@ -1258,7 +1268,7 @@ int ObTransferBuildTabletInfoCtx::ObTransferTabletInfoMgr::build_storage_schema(
 
 /******************ObTransferBuildTabletInfoCtx*********************/
 ObTransferBuildTabletInfoCtx::ObTransferBuildTabletInfoCtx()
-  : lock_(),
+  : lock_(common::ObLatchIds::OB_TRANSFER_BUILD_TABLET_INFO_CTX_LOCK),
     dest_ls_id_(),
     index_(0),
     tablet_info_array_(),
@@ -1339,6 +1349,25 @@ int ObTransferBuildTabletInfoCtx::get_next_tablet_info(share::ObTransferTabletIn
     tablet_info = tablet_info_array_.at(index_);
     ++index_;
   }
+
+#ifdef ERRSIM
+  if (OB_SUCC(ret)) {
+    if (OB_SUCCESS != EN_GET_TABLET_INFO_HUNG) {
+      int64_t start_time = ObTimeUtil::current_time();
+      int64_t hung_time = 1 * 1000 * 1000; //1s
+      omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+      if (tenant_config.is_valid()) {
+        hung_time = tenant_config->_transfer_start_trans_timeout;
+      }
+      int64_t current_time = ObTimeUtil::current_time();
+      while (current_time - start_time < hung_time) {
+        ob_usleep(1000);
+        current_time = ObTimeUtil::current_time();
+      }
+    }
+  }
+#endif
+
   return ret;
 }
 
@@ -1583,8 +1612,8 @@ int ObTransferBuildTabletInfoCtx::ObTransferStorageSchemaMgr::build_tablet_stora
   ObTabletHandle tablet_handle;
   ObTablet *tablet = nullptr;
   ObStorageSchema *storage_schema = nullptr;
-  bool is_skip_merge_index = false;
   uint64_t compat_version = 0;
+  uint64_t unused_table_id = OB_INVALID_ID;
 
   if (!is_inited_) {
     ret = OB_NOT_INIT;
@@ -1603,7 +1632,7 @@ int ObTransferBuildTabletInfoCtx::ObTransferStorageSchemaMgr::build_tablet_stora
   } else if (OB_FAIL(ObStorageSchemaUtil::alloc_storage_schema(allocator_, storage_schema))) {
     LOG_WARN("failed to alloc storage schema", K(ret));
   } else if (OB_FAIL(compaction::ObMediumCompactionScheduleFunc::get_table_schema_to_merge(
-      schema_service, *tablet, schema_version, compat_version, allocator_, *storage_schema, is_skip_merge_index))) {
+      schema_service, *tablet, schema_version, compat_version, allocator_, *storage_schema, unused_table_id))) {
     LOG_WARN("failed to get table schema to merge", K(ret), KPC(tablet), K(task_info));
   } else if (OB_FAIL(storage_schema_map_.set_refactored(tablet_id, storage_schema))) {
     LOG_WARN("failed to push storage schema into map", K(ret), K(tablet_id), KPC(storage_schema));
@@ -1639,6 +1668,7 @@ int ObTransferBuildTabletInfoCtx::build_src_reorganization_scn(
   } else {
     ObTabletHandle tablet_handle;
     ObTablet *tablet = nullptr;
+    src_reorganization_scn_array_.reuse();
     for (int64_t i = 0; OB_SUCC(ret) && i < task_info.tablet_list_.count(); ++i) {
       tablet_handle.reset();
       tablet = nullptr;
@@ -1667,5 +1697,10 @@ int ObTransferBuildTabletInfoCtx::get_src_reorganization_scn(
   }
   return ret;
 }
-
 #endif
+
+void ObTransferLSInfo::reset()
+{
+  src_is_duplicate_ls_ = false;
+  dest_is_duplicate_ls_ = false;
+}

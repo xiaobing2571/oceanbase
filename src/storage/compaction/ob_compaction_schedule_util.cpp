@@ -15,10 +15,6 @@
 #include "storage/compaction/ob_tenant_tablet_scheduler.h"
 #include "storage/meta_store/ob_server_storage_meta_service.h"
 #include "storage/compaction/ob_tenant_compaction_progress.h"
-#ifdef OB_BUILD_SHARED_STORAGE
-#include "storage/compaction/ob_tenant_ls_merge_scheduler.h"
-#include "share/compaction/ob_shared_storage_compaction_util.h"
-#endif
 
 namespace oceanbase
 {
@@ -29,7 +25,7 @@ namespace compaction
  * -------------------------------------------------------------------ObBasicMergeScheduler-------------------------------------------------------------------
  */
 ObBasicMergeScheduler::ObBasicMergeScheduler()
-  : frozen_version_lock_(),
+  : frozen_version_lock_(common::ObLatchIds::MERGE_FROZEN_LOCK),
     frozen_version_(INIT_COMPACTION_SCN),
     inner_table_merged_scn_(INIT_COMPACTION_SCN),
     merged_version_(INIT_COMPACTION_SCN),
@@ -45,7 +41,7 @@ ObBasicMergeScheduler::~ObBasicMergeScheduler()
 void ObBasicMergeScheduler::reset()
 {
   is_stop_ = true;
-  obsys::ObWLockGuard frozen_version_guard(frozen_version_lock_);
+  obsys::ObWLockGuard<> frozen_version_guard(frozen_version_lock_);
   frozen_version_ = 0;
   inner_table_merged_scn_ = 0;
   merged_version_ = 0;
@@ -57,13 +53,6 @@ ObBasicMergeScheduler* ObBasicMergeScheduler::get_merge_scheduler()
 {
   ObBasicMergeScheduler *scheduler = nullptr;
   scheduler = MTL(ObTenantTabletScheduler *);
-
-#ifdef OB_BUILD_SHARED_STORAGE
-  if (GCTX.is_shared_storage_mode()) {
-    scheduler = MTL(ObTenantLSMergeScheduler *);
-  }
-#endif
-
   return scheduler;
 }
 
@@ -95,13 +84,13 @@ void ObBasicMergeScheduler::resume_major_merge()
 
 int64_t ObBasicMergeScheduler::get_frozen_version() const
 {
-  obsys::ObRLockGuard frozen_version_guard(frozen_version_lock_);
+  obsys::ObRLockGuard<> frozen_version_guard(frozen_version_lock_);
   return frozen_version_;
 }
 
 bool ObBasicMergeScheduler::is_compacting() const
 {
-  obsys::ObRLockGuard frozen_version_guard(frozen_version_lock_);
+  obsys::ObRLockGuard<> frozen_version_guard(frozen_version_lock_);
   return frozen_version_ > get_inner_table_merged_scn();
 }
 
@@ -109,7 +98,7 @@ void ObBasicMergeScheduler::update_frozen_version_and_merge_progress(const int64
 {
   if (broadcast_version > get_frozen_version()) {
     {
-      obsys::ObWLockGuard frozen_version_guard(frozen_version_lock_);
+      obsys::ObWLockGuard<> frozen_version_guard(frozen_version_lock_);
       frozen_version_ = broadcast_version;
     }
     int tmp_ret = OB_SUCCESS;
@@ -122,6 +111,27 @@ void ObBasicMergeScheduler::update_frozen_version_and_merge_progress(const int64
 void ObBasicMergeScheduler::update_merged_version(const int64_t merged_version)
 {
    merged_version_ = merged_version;
+}
+
+int ObBasicMergeScheduler::update_merge_info(
+    const share::ObGlobalMergeInfo::MergeMode merge_mode,
+    const share::ObZoneMergeInfo::MergeStatus merge_status,
+    const int64_t merge_start_time)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(merge_mode < share::ObGlobalMergeInfo::MERGE_MODE_TENANT
+               || merge_mode >= share::ObGlobalMergeInfo::MERGE_MODE_MAX
+               || merge_status < share::ObZoneMergeInfo::MERGE_STATUS_IDLE
+               || merge_status >= share::ObZoneMergeInfo::MERGE_STATUS_MAX
+               || merge_start_time < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid merge mode, status or start time", K(ret), K(merge_mode), K(merge_status), K(merge_start_time));
+  } else {
+    merge_info_.merge_mode_ = merge_mode;
+    merge_info_.merge_status_ = merge_status;
+    merge_info_.merge_start_time_ = merge_start_time;
+  }
+  return ret;
 }
 
 void ObBasicMergeScheduler::try_finish_merge_progress(const int64_t merge_version)

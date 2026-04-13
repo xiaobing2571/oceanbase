@@ -19,6 +19,7 @@
 #include "lib/lock/ob_spin_lock.h"
 #include "lib/lock/ob_small_spin_lock.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "lib/alloc/alloc_struct.h"
 #include "ob_clock_generator.h"
 #include "share/ob_define.h"
 #include "storage/ob_memtable_ctx_obj_pool.h"
@@ -30,6 +31,7 @@
 #include "storage/tx/ob_trans_define.h"
 #include "storage/tablelock/ob_mem_ctx_table_lock.h"
 #include "storage/tx_table/ob_tx_table.h"
+#include "ob_row_conflict_info.h"
 
 namespace oceanbase
 {
@@ -45,6 +47,7 @@ struct ObTableLockInfo;
 
 namespace memtable
 {
+using SmallTCCounter = common::ObCounter<8, common::ObCounterSlotPickerByThread>;
 class ObTxCallbackListStat;
 struct RetryInfo
 {
@@ -236,29 +239,22 @@ class ObMemtableCtxCbAllocator final : public common::ObIAllocator
 {
 public:
   explicit ObMemtableCtxCbAllocator()
-    : alloc_count_(0),
-      free_count_(0),
-      alloc_size_(0),
-      is_inited_(false) {}
+    : ctx_cb_mem_limiter_(),
+      is_inited_(false),
+      expand_nway_called_(false) {}
   ~ObMemtableCtxCbAllocator()
   {
-    if (OB_UNLIKELY(ATOMIC_LOAD(&free_count_) != ATOMIC_LOAD(&alloc_count_))) {
-      TRANS_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "callback memory leak found", K(alloc_count_), K(free_count_), K(alloc_size_));
-    }
     ATOMIC_STORE(&is_inited_, false);
   }
-  // FIFOAllocator doesn't support double init, even after reset, so is_inited_ is handled specially here.
+  // Allocator doesn't support double init, even after reset, so is_inited_ is handled specially here.
   int init(const uint64_t tenant_id)
   {
     int ret = OB_SUCCESS;
     ObMemAttr attr(tenant_id, ObModIds::OB_MEMTABLE_CALLBACK, ObCtxIds::TX_CALLBACK_CTX_ID);
-    if (OB_UNLIKELY(free_count_ != alloc_count_)) {
-      TRANS_LOG(ERROR, "callback memory leak found", K(alloc_count_), K(free_count_), K(alloc_size_));
-    }
     if (IS_NOT_INIT) {
-      if (OB_FAIL(allocator_.init(NULL,
-                                  common::OB_MALLOC_NORMAL_BLOCK_SIZE,
-                                  attr))) {
+      if (OB_FAIL(allocator_.init(common::OB_MALLOC_NORMAL_BLOCK_SIZE,
+                                  ctx_cb_mem_limiter_,
+                                  SET_IGNORE_MEM_VERSION(attr)))) {
         TRANS_LOG(ERROR, "callback allocator init failed", K(ret), K(lbt()), K(tenant_id));
       } else {
         ATOMIC_STORE(&is_inited_, true);
@@ -266,35 +262,44 @@ public:
     }
     if (OB_SUCC(ret)) {
       allocator_.set_attr(attr);
+      allocator_.set_nway(1);
+      ATOMIC_STORE(&expand_nway_called_, false);
     }
-    ATOMIC_STORE(&alloc_count_, 0);
-    ATOMIC_STORE(&free_count_, 0);
-    ATOMIC_STORE(&alloc_size_, 0);
     return ret;
   }
   void reset(bool only_check = false)
   {
-    if (OB_UNLIKELY(free_count_ != alloc_count_)) {
-      TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "callback memory leak found", K(alloc_count_), K(free_count_), K(alloc_size_));
-      OB_SAFE_ABORT();
+    // ObVSliceAlloc default constructed using default_blk_alloc,
+    // if ObVSliceAlloc has not been initialized, ObVSliceAlloc::used() may not equal 0.
+    if (IS_INIT) {
+      if (OB_UNLIKELY(allocator_.used() != 0)) {
+        // If VSliceAlloc::set_nway is called during VSliceAlloc::alloc, Arena may cache unused block,
+        // call ObVSliceAlloc::purge() to purge the unused block. However, this case is extremely rare,
+        // and purge is an expensive operation, so it is only called when used() != 0
+        allocator_.purge();
+        if (OB_UNLIKELY(allocator_.used() != 0)) {
+          TRANS_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "callback memory leak found", K(used()));
+          OB_SAFE_ABORT();
+        }
+      }
+      if (!only_check) {
+        ATOMIC_STORE(&is_inited_, false);
+      }
     }
-    if (!only_check) {
-      allocator_.reset();
-      ATOMIC_STORE(&alloc_count_, 0);
-      ATOMIC_STORE(&free_count_, 0);
-      ATOMIC_STORE(&alloc_size_, 0);
-      ATOMIC_STORE(&is_inited_, false);
+  }
+  inline void expand_nway()
+  {
+    if (!expand_nway_called_) {
+      if (ATOMIC_BCAS(&expand_nway_called_, false, true)) {
+        allocator_.set_nway(get_cpu_num() / 2);
+      }
     }
   }
   void *alloc(const int64_t size) override
   {
     void *ret = nullptr;
     if (OB_ISNULL(ret = allocator_.alloc(size))) {
-      TRANS_LOG_RET(ERROR, OB_ALLOCATE_MEMORY_FAILED, "callback memory failed",
-        K(alloc_count_), K(free_count_), K(alloc_size_), K(size));
-    } else {
-      ATOMIC_INC(&alloc_count_);
-      ATOMIC_FAA(&alloc_size_, size);
+      TRANS_LOG_RET(ERROR, OB_ALLOCATE_MEMORY_FAILED, "callback memory failed", K(used()), K(size));
     }
     return ret;
   }
@@ -308,17 +313,15 @@ public:
     if (OB_ISNULL(ptr)) {
       // do nothing
     } else {
-      ATOMIC_INC(&free_count_);
       allocator_.free(ptr);
     }
   }
 private:
-  ObFIFOAllocator allocator_;
-  int64_t alloc_count_;
-  int64_t free_count_;
-  int64_t alloc_size_;
-  // used to record the init condition of FIFO allocator
+  ObBlockAllocMgr ctx_cb_mem_limiter_;
+  ObDynamicVSliceAlloc allocator_;
+  // used to record the init condition of allocator
   bool is_inited_;
+  bool expand_nway_called_;
 };
 
 class ObMemtable;
@@ -341,11 +344,6 @@ public:
   virtual void old_row_free(void *row) override;
   virtual common::ObIAllocator &get_query_allocator();
   virtual void inc_lock_for_read_retry_count();
-  // When row lock conflict occurs in a remote execution, record the trans id in
-  // transaction context, and carries it back after execution, for dead lock detect use
-  virtual int add_conflict_trans_id(const transaction::ObTransID conflict_trans_id);
-  void reset_conflict_trans_ids();
-  int get_conflict_trans_ids(common::ObIArray<transaction::ObTransIDAndAddr> &array);
   virtual int read_lock_yield()
   {
     return ATOMIC_LOAD(&end_code_);
@@ -389,8 +387,8 @@ public:
   //method called when leader revoke
   virtual int commit_to_replay();
   virtual int fill_redo_log(ObTxFillRedoCtx &ctx);
-  bool is_logging_blocked(bool &has_pending_log) const {
-    return trans_mgr_.is_logging_blocked(has_pending_log);
+  bool has_pending_log_for_freeze(const uint32_t freeze_clock) const {
+    return trans_mgr_.has_pending_log_for_freeze(freeze_clock);
   }
   void check_all_redo_flushed();
   int get_log_guard(const transaction::ObTxSEQ &write_seq,
@@ -402,6 +400,7 @@ public:
   int update_checksum(const ObIArray<uint64_t> &checksum,
                       const ObIArray<share::SCN> &checksum_scn);
   int log_submitted(const ObRedoLogSubmitHelper &helper);
+  int prepare_log_submitted(const ObRedoLogSubmitHelper &helper);
   int sync_log_succ(const share::SCN scn, const ObCallbackScopeArray &callbacks);
   void sync_log_fail(const ObCallbackScopeArray &callbacks, const share::SCN &max_applied_scn);
   bool is_slow_query() const;
@@ -415,7 +414,7 @@ public:
   uint64_t get_tenant_id() const;
   inline bool has_row_updated() const { return has_row_updated_; }
   inline void set_row_updated() { has_row_updated_ = true; }
-  int remove_callbacks_for_fast_commit(const ObCallbackScopeArray &callbacks);
+  int remove_callbacks_for_fast_commit(const uint64_t callback_scope_host_bitmap);
   int remove_callbacks_for_fast_commit(const int16_t callback_list_idx, const share::SCN stop_scn);
   int remove_callback_for_uncommited_txn(const memtable::ObMemtableSet *memtable_set);
   int rollback(const transaction::ObTxSEQ seq_no, const transaction::ObTxSEQ from_seq_no,
@@ -430,10 +429,15 @@ public:
   int64_t get_trans_mem_total_size() const { return trans_mem_total_size_; }
   void add_lock_for_read_elapse(const int64_t elapse) { lock_for_read_elapse_ += elapse; }
   int64_t get_lock_for_read_elapse() const { return lock_for_read_elapse_; }
-  bool pending_log_size_too_large(const transaction::ObTxSEQ &write_seq_no);
+  bool pending_log_size_too_large(const int16_t branch_id, int64_t limit = 0);
+  int16_t get_pending_log_size_too_large_list(const int64_t limit = 0) const;
   void reset_pdml_stat();
   int clean_unlog_callbacks();
   int check_tx_mem_size_overflow(bool &is_overflow);
+  // When row lock conflict occurs in a remote execution, record the trans id in
+  // transaction context, and carries it back after execution, for dead lock detect use
+  int add_conflict_info(meta::ObMover<ObRowConflictInfo> rhs);
+  int fetch_conflict_info_array(common::ObIArray<ObRowConflictInfo> &array);
 public:
   void on_key_duplication_retry(const ObMemtableKey& key,
                                 const ObMvccRow *value,
@@ -477,6 +481,7 @@ public: // callback
     return trans_mgr_.append(head, tail, length);
   }
   int64_t get_pending_log_size() { return trans_mgr_.get_pending_log_size(); }
+  int64_t get_branch_pending_log_size(const int16_t branch) { return trans_mgr_.get_branch_pending_log_size(branch); }
   int64_t get_flushed_log_size() { return trans_mgr_.get_flushed_log_size(); }
   int acquire_callback_list(const bool new_epoch)
   { return trans_mgr_.acquire_callback_list(new_epoch); }
@@ -489,6 +494,7 @@ public: // callback
   void free_prio_link_node(void *ptr)
   { mem_ctx_obj_pool_.free<transaction::tablelock::ObMemCtxLockPrioOpLinkNode>(ptr); }
   int64_t get_write_epoch() const { return trans_mgr_.get_write_epoch(); }
+  bool check_if_contains_conflict_info_(meta::ObMover<ObRowConflictInfo> conflict_info);
 public:
   // tx_status
   enum ObTxStatus {
@@ -602,19 +608,17 @@ private:
   int64_t trans_mem_total_size_;
   // statistics for txn logging
   int64_t unsubmitted_cnt_;
-  int64_t callback_mem_used_;
-  int64_t callback_alloc_count_;
-  int64_t callback_free_count_;
+  SmallTCCounter callback_alloc_count_;
+  SmallTCCounter callback_free_count_;
   bool is_read_only_;
   bool is_master_;
   // Used to indicate whether mvcc row is updated or not.
   // When a statement is update or select for update, the value can be set ture;
   bool has_row_updated_;
   // For deaklock detection
-  // The trans id of the holder of the conflict row lock
   // TODO(Handora), for non-local execution, if no-occupy-thread wait is implemented,
   // it should be carried back the same way as local execution
-  common::ObArray<transaction::ObTransID> conflict_trans_ids_;
+  common::ObArray<ObRowConflictInfo> row_conflict_info_array_;
   transaction::ObMemtableCtxObjPool mem_ctx_obj_pool_;
   // table lock mem ctx.
   transaction::tablelock::ObLockMemCtx lock_mem_ctx_;

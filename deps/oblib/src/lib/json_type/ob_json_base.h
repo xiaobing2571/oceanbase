@@ -67,6 +67,8 @@ enum class ObJsonNodeType
   J_OYEARMONTH = 29, // yearMonthInterval string
   J_MYSQL_DATE = 30, // mysql date
   J_MYSQL_DATETIME = 31, // mysql datetime
+  J_SEMI_HETE_COL = 34, //  semistruct heterogeneous columns
+  J_SEMI_BIN = 35, //  semistruct bin data
   J_MAX_TYPE,
 
   J_ERROR = 200 // 14
@@ -107,6 +109,7 @@ OB_INLINE ObObjType json_type_to_obj_type(const  ObJsonNodeType json_type)
     ObMaxType,                           // ObJsonNodeType::J_OYEARMONTH = 29,
     ObMySQLDateType,                     // ObJsonNodeType::J_MYSQL_DATE = 30,
     ObMySQLDateTimeType,                 // ObJsonNodeType::J_MYSQL_DATETIME = 31,
+    ObMaxType,                           // ObJsonNodeType::J_SEMI_HETE_COL = 34,
     ObMaxType,                           // ObJsonNodeType::J_MAX_TYPE
   };
   return JSON_TYPE_TO_OBJ_TYPE[static_cast<int64_t>(json_type)];
@@ -422,6 +425,7 @@ public:
   virtual ObScale get_decimal_scale() const = 0;
   virtual int get_obtime(ObTime &t) const = 0;
   bool is_json_number(ObJsonNodeType json_type) const;
+  static bool is_json_number_type(ObJsonNodeType json_type);
   bool is_json_scalar(ObJsonNodeType json_type) const;
   bool is_json_string(ObJsonNodeType json_type) const;
   bool is_json_date(ObJsonNodeType json_type) const;

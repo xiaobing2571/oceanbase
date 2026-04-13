@@ -242,6 +242,82 @@ bool ObConfigItem::is_default(const char *value_str_,
   return 0 == strncasecmp(value_str_, value_default_str_, size);
 }
 
+int ObConfigItem::to_json_obj(ObIAllocator &allocator, ObJsonObject &j_obj) const
+{
+  int ret = OB_SUCCESS;
+  ObString k_name("name");
+  ObString k_type("type");
+  ObString k_default_value("default_value");
+  ObString k_range("range");
+  ObString k_scope("scope");
+  ObString k_section("section");
+  ObString k_edit_level("edit_level");
+  ObString k_description_en("description");
+  ObString k_optional_values("optional_values");
+
+  ObJsonString *v_name = nullptr;
+  ObJsonString *v_type = nullptr;
+  ObJsonString *v_default_value = nullptr;
+  ObJsonString *v_range = nullptr;
+  ObJsonString *v_scope = nullptr;
+  ObJsonString *v_section = nullptr;
+  ObJsonString *v_edit_level = nullptr;
+  ObJsonString *v_description_en = nullptr;
+  ObJsonString *v_optional_values = nullptr;
+
+  if (nullptr == (v_name = OB_NEWx(ObJsonString, &allocator, ObString(name())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    OB_LOG(WARN, "create json value 'name' failed", K(ret));
+  } else if (nullptr == (v_type = OB_NEWx(ObJsonString, &allocator, ObString(data_type())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    OB_LOG(WARN, "create json value 'type' failed", K(ret));
+  } else if (nullptr == (v_default_value = OB_NEWx(ObJsonString, &allocator, ObString(default_str())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    OB_LOG(WARN, "create json value 'default_value' failed", K(ret));
+  } else if (nullptr == (v_range = OB_NEWx(ObJsonString, &allocator, ObString(range())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    OB_LOG(WARN, "create json value 'range' failed", K(ret));
+  } else if (nullptr == (v_scope = OB_NEWx(ObJsonString, &allocator, ObString(scope())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    OB_LOG(WARN, "create json value 'scope' failed", K(ret));
+  } else if (nullptr == (v_section = OB_NEWx(ObJsonString, &allocator, ObString(section())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    OB_LOG(WARN, "create json value 'section' failed", K(ret));
+  } else if (nullptr == (v_edit_level = OB_NEWx(ObJsonString, &allocator, ObString(edit_level())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    OB_LOG(WARN, "create json value 'edit_level' failed", K(ret));
+  } else if (nullptr == (v_description_en = OB_NEWx(ObJsonString, &allocator, ObString(info())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    OB_LOG(WARN, "create json value 'description_en' failed", K(ret));
+  } else if (OB_FAIL(j_obj.add(k_name, v_name))) {
+    OB_LOG(WARN, "add json kv 'name' failed", K(ret));
+  } else if (OB_FAIL(j_obj.add(k_type, v_type))) {
+    OB_LOG(WARN, "add json kv 'type' failed", K(ret));
+  } else if (OB_FAIL(j_obj.add(k_default_value, v_default_value))) {
+    OB_LOG(WARN, "add json kv 'default_value' failed", K(ret));
+  } else if (OB_FAIL(j_obj.add(k_range, v_range))) {
+    OB_LOG(WARN, "add json kv 'range' failed", K(ret));
+  } else if (OB_FAIL(j_obj.add(k_scope, v_scope))) {
+    OB_LOG(WARN, "add json kv 'scope' failed", K(ret));
+  } else if (OB_FAIL(j_obj.add(k_section, v_section))) {
+    OB_LOG(WARN, "add json kv 'section' failed", K(ret));
+  } else if (OB_FAIL(j_obj.add(k_edit_level, v_edit_level))) {
+    OB_LOG(WARN, "add json kv 'edit_level' failed", K(ret));
+  } else if (OB_FAIL(j_obj.add(k_description_en, v_description_en))) {
+    OB_LOG(WARN, "add json kv 'description_en' failed", K(ret));
+  } else {
+    if (nullptr != optional_configuration_values()) {
+      if (nullptr == (v_optional_values = OB_NEWx(ObJsonString, &allocator, ObString(optional_configuration_values())))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        OB_LOG(WARN, "create json value 'optional_values' failed", K(ret));
+      } else if (OB_FAIL(j_obj.add(k_optional_values, v_optional_values))) {
+        OB_LOG(WARN, "add json kv 'optional_values' failed", K(ret));
+      }
+   }
+  }
+  return ret;
+}
+
 // ObConfigIntListItem
 ObConfigIntListItem::ObConfigIntListItem(ObConfigContainer *container,
                                          Scope::ScopeInfo scope_info,
@@ -273,7 +349,7 @@ bool ObConfigIntListItem::set(const char *str)
   value_.size_ = 0;
   int ret = OB_SUCCESS;
   SMART_VAR(char[OB_MAX_CONFIG_VALUE_LEN], tmp_value_str) {
-    MEMCPY(tmp_value_str, value_str_, sizeof (tmp_value_str));
+    MEMCPY(tmp_value_str, value_str_, std::min(sizeof(value_str_), sizeof(tmp_value_str)));
     s = STRTOK_R(tmp_value_str, ";", &saveptr);
     if (OB_LIKELY(NULL != s)) {
       do {
@@ -451,7 +527,7 @@ void ObConfigIntegralItem::init(Scope::ScopeInfo scope_info,
   if (OB_ISNULL(range)) {
     OB_LOG_RET(ERROR, common::OB_INVALID_ARGUMENT, "Range is NULL");
   } else if (!parse_range(range)) {
-    OB_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "Parse check range fail", K(range));
+    OB_LOG_RET(ERROR, common::OB_INVALID_CONFIG, "Parse check range fail", K(range));
   }
 }
 
@@ -589,7 +665,7 @@ void ObConfigDoubleItem::init(Scope::ScopeInfo scope_info,
   if (OB_ISNULL(range)) {
     OB_LOG_RET(ERROR, common::OB_INVALID_ARGUMENT, "Range is NULL");
   } else if (!parse_range(range)) {
-    OB_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "Parse check range fail", K(range));
+    OB_LOG_RET(ERROR, common::OB_INVALID_CONFIG, "Parse check range fail", K(range));
   }
 }
 
@@ -724,7 +800,7 @@ int64_t ObConfigCapacityItem::parse(const char *str, bool &valid) const
 {
   int64_t value = ObConfigCapacityParser::get(str, valid, false);
   if (!valid) {
-      OB_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "set capacity error", "name", name(), K(str), K(valid));
+      OB_LOG_RET(ERROR, OB_INVALID_CONFIG, "set capacity error", "name", name(), K(str), K(valid));
   }
   return value;
 }
@@ -765,7 +841,7 @@ int64_t ObConfigTimeItem::parse(const char *str, bool &valid) const
 {
   int64_t value = ObConfigTimeParser::get(str, valid);
   if (!valid) {
-      OB_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "set time error", "name", name(), K(str), K(valid));
+      OB_LOG_RET(ERROR, common::OB_INVALID_CONFIG, "set time error", "name", name(), K(str), K(valid));
   }
   return value;
 }
@@ -806,7 +882,7 @@ int64_t ObConfigIntItem::parse(const char *str, bool &valid) const
 {
   int64_t value = ObConfigIntParser::get(str, valid);
   if (!valid) {
-    OB_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "set int error", "name", name(), K(str), K(valid));
+    OB_LOG_RET(ERROR, OB_INVALID_CONFIG, "set int error", "name", name(), K(str), K(valid));
   }
   return value;
 }
@@ -835,14 +911,23 @@ bool ObConfigMomentItem::set(const char *str)
   memset(&tm_value, 0, sizeof(struct tm));
   if (0 == STRCASECMP(str, "disable")) {
     value_.disable_ = true;
-  } else if (OB_ISNULL(strptime(str, "%H:%M", &tm_value))) {
-    value_.disable_ = true;
-    ret = false;
-    OB_LOG(ERROR, "Not well-formed moment item value", K(str));
   } else {
-    value_.disable_ = false;
-    value_.hour_ = tm_value.tm_hour;
-    value_.minute_ = tm_value.tm_min;
+    const char *end_ptr = strptime(str, "%H:%M", &tm_value);
+    if (OB_ISNULL(end_ptr)) {
+      value_.disable_ = true;
+      ret = false;
+      OB_LOG(ERROR, "Not well-formed moment item value", K(str));
+    } else if (*end_ptr != '\0') {
+      // Check if there are extra characters after %H:%M format
+      value_.disable_ = true;
+      ret = false;
+      OB_LOG(ERROR, "Moment item value should be exactly in %H:%M format, extra characters found",
+             K(str), "extra_char_pos", end_ptr);
+    } else {
+      value_.disable_ = false;
+      value_.hour_ = tm_value.tm_hour;
+      value_.minute_ = tm_value.tm_min;
+    }
   }
   return ret;
 }
@@ -885,7 +970,7 @@ bool ObConfigBoolItem::parse(const char *str, bool &valid) const
   } else {
     value = ObConfigBoolParser::get(str, valid);
     if (!valid) {
-      OB_LOG_RET(WARN, common::OB_ERR_UNEXPECTED, "Get bool config item fail", K(valid), K(str));
+      OB_LOG_RET(WARN, common::OB_INVALID_CONFIG, "Get bool config item fail", K(valid), K(str));
     }
   }
   return value;
@@ -897,7 +982,8 @@ ObConfigStringItem::ObConfigStringItem(ObConfigContainer *container,
                                        const char *name,
                                        const char *def,
                                        const char *info,
-                                       const ObParameterAttr attr)
+                                       const ObParameterAttr attr,
+                                       const char *optional_values)
 {
   MEMSET(value_str_, 0, sizeof(value_str_));
   MEMSET(value_reboot_str_, 0, sizeof(value_reboot_str_));
@@ -905,6 +991,7 @@ ObConfigStringItem::ObConfigStringItem(ObConfigContainer *container,
     container->set_refactored(ObConfigStringKey(name), this, 1);
   }
   init(scope_info, name, def, info, attr);
+  optional_values_ = optional_values;
 }
 
 int ObConfigStringItem::copy(char *buf, const int64_t buf_len)

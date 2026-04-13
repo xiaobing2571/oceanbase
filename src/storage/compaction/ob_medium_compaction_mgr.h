@@ -77,9 +77,11 @@ private:
   {
     free_allocated_info();
   }
+  virtual int reset_for_retry_in_lock() override;
   void free_allocated_info();
   OB_INLINE int submit_trans_on_mds_table(const bool is_commit);
-
+private:
+  static const int64_t MAX_RETRY_TIMES = 3;
 private:
   bool is_inited_;
   bool ignore_medium_;
@@ -89,6 +91,7 @@ private:
   ObMediumCompactionInfo *medium_info_;
   common::ObIAllocator *allocator_;
   mds::MdsCtx *mds_ctx_;
+  int64_t retry_times_;
 };
 
 class ObMediumCompactionInfoList final
@@ -135,10 +138,11 @@ public:
   int get_next_schedule_info(
     const int64_t last_major_snapshot,
     const int64_t major_frozen_snapshot,
-    const bool is_mv_refresh_tablet,
+    const bool is_mv_refresh_or_restore_remote_tablet,
     ObMediumCompactionInfo::ObCompactionType &compaction_type,
     int64_t &schedule_scn,
-    ObCOMajorMergePolicy::ObCOMajorMergeType &co_major_merge_type) const;
+    ObCOMajorMergeStrategy &co_major_merge_strategy,
+    ObAdaptiveMergePolicy::AdaptiveMergeReason &merge_reason) const;
   OB_INLINE ObMediumCompactionInfo::ObCompactionType get_last_compaction_type() const
   {
     return static_cast<ObMediumCompactionInfo::ObCompactionType>(extra_info_.last_compaction_type_);

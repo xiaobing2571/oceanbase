@@ -52,6 +52,7 @@ public:
     wrapper_(0),
     empty_type_(0),
     error_type_(0),
+    pick_(T_NULL),
     is_empty_default_const_(false),
     is_error_default_const_(false),
     is_asis_(false),
@@ -76,6 +77,7 @@ public:
   int8_t wrapper_;
   int8_t empty_type_;
   int8_t error_type_;
+  ObItemType pick_;
   bool is_empty_default_const_;
   bool is_error_default_const_;
   bool is_asis_;
@@ -313,9 +315,10 @@ public:
   static int json_base_replace(ObIJsonBase *json_old, ObIJsonBase *json_new,
                                ObIJsonBase *&json_doc);
 
-  static int find_and_add_cache(ObJsonPathCache* path_cache, ObJsonPath*& res_path,
+  static int find_and_add_cache(ObIAllocator &allocator,
+                                ObJsonPathCache* path_cache, ObJsonPath*& res_path,
                                 ObString& path_str, int arg_idx, bool enable_wildcard,
-                                bool is_const = false);
+                                bool is_const);
   static int find_and_add_schema_cache(ObJsonSchemaCache* schema_cache, ObIJsonBase*& j_schema,
                                       ObString& schema_str, int arg_idx, const ObJsonInType& in_type);
 
@@ -383,7 +386,7 @@ public:
                                               const ObTimeZoneInfo *tz_info,
                                               ObJsonBuffer &j_buf);
 
-  static bool is_convertible_to_json(ObObjType &type);
+  static bool is_convertible_to_json(const ObObjType type);
   static int is_valid_for_json(ObExprResType* types_stack, uint32_t index, const char* func_name);
   static int is_valid_for_json(ObExprResType& type, uint32_t index, const char* func_name);
   static int is_valid_for_path(ObExprResType* types_stack, uint32_t index);
@@ -483,6 +486,7 @@ public:
   static int get_clause_opt(ObExpr *expr,
                             ObEvalCtx &ctx,
                             int8_t &type);
+  static bool check_pick_type_match(ObJsonNodeType json_type, ObItemType pick_type);
   static bool is_json_depth_exceed_limit(uint32_t depth)
   {
     return depth > JSON_DOCUMENT_MAX_DEPTH && depth > get_json_max_depth_config();
@@ -511,10 +515,17 @@ public:
       ObExpr &rt_expr);
 
   static int get_session_query_timeout_ts(ObEvalCtx &ctx, int64_t &timeout_ts);
-
+  static bool is_json_special_same_as_expr(ObItemType type, int64_t index);
+  static bool check_json_inner_same_as(const ObSysFunRawExpr *expr1,
+                                       const ObSysFunRawExpr *expr2,
+                                       int64_t index,
+                                       ObExprEqualCheckContext *check_context);
   static bool check_json_path_can_pushdown(const ObRawExpr &path_expr);
   static bool check_json_expr_can_pushdown(const ObRawExpr &json_expr);
   static int get_sub_column_path_from_json_expr(ObIAllocator& allocator, const ObRawExpr &json_expr, share::ObSubColumnPath& sub_col_path);
+
+public:
+  uint64_t tenant_id;
 
 private:
   const static uint32_t RESERVE_MIN_BUFF_SIZE = 32;

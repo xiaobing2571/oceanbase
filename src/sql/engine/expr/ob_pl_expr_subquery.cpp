@@ -140,7 +140,8 @@ int ObExprOpSubQueryInPl::eval_subquery(const ObExpr &expr,
   ObSQLSessionInfo *session = nullptr;
   ObObj result;
 
-  ObIAllocator &alloc = ctx.exec_ctx_.get_allocator();
+  ObEvalCtx::TempAllocGuard memory_guard(ctx);
+  ObArenaAllocator &alloc = memory_guard.get_allocator();
   const ObExprPlSubQueryInfo *info = static_cast<ObExprPlSubQueryInfo *>(expr.extra_info_);
   ObObj *objs = nullptr;
   CK(0 == expr.arg_cnt_ ||
@@ -178,7 +179,7 @@ int ObExprOpSubQueryInPl::eval_subquery(const ObExpr &expr,
   } else if (OB_FAIL(fill_param_store(objs, expr.arg_cnt_, *params))) {
     LOG_WARN("failed to process in params", K(ret));
   } else {
-    pl::ObPLExecCtx pl_exec_ctx(&alloc, &ctx.exec_ctx_, params, nullptr, &ret, nullptr);
+    pl::ObPLExecCtx pl_exec_ctx(&alloc, &alloc, &ctx.exec_ctx_, params, nullptr, &ret, nullptr);
 
     SMART_VAR(ObSPIResultSet, spi_result) {
       OZ (spi_result.init(*session));

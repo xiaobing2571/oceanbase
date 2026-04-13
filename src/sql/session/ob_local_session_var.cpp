@@ -171,8 +171,6 @@ int ObLocalSessionVar::get_different_vars_from_session(const sql::ObBasicSession
       if (OB_ISNULL(local_session_vars_.at(i))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected null", K(ret), K(i));
-      } else if (SYS_VAR_SQL_MODE == local_session_vars_.at(i)->type_) {
-        /* just ignore sql mode now */
       } else if (OB_FAIL(check_var_same_with_session(*session, local_session_vars_.at(i), is_same, &session_val))) {
         LOG_WARN("fail to check var same with session", K(ret));
       } else if (is_same) {
@@ -266,31 +264,8 @@ int ObLocalSessionVar::deep_copy(const ObLocalSessionVar &other)
   local_session_vars_.reset();
   if (this == &other) {
     //do nothing
-  } else if (NULL != other.alloc_) {
-    if (NULL == alloc_) {
-      alloc_ = other.alloc_;
-      local_session_vars_.set_allocator(other.alloc_);
-    }
-  }
-  if (OB_FAIL(set_local_vars(other.local_session_vars_))) {
+  } else if (OB_FAIL(set_local_vars(other.local_session_vars_))) {
     LOG_WARN("fail to add session var", K(ret));
-  }
-  return ret;
-}
-
-int ObLocalSessionVar::deep_copy_self()
-{
-  int ret = OB_SUCCESS;
-  if (OB_ISNULL(alloc_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null allocator", K(ret));
-  } else {
-    ObSEArray<const ObSessionSysVar*, 4> var_array;
-    if (OB_FAIL(get_local_vars(var_array))) {
-      LOG_WARN("get local vars failed", K(ret));
-    } else if (OB_FAIL(set_local_vars(var_array))) {
-      LOG_WARN("set local vars failed", K(ret));
-    }
   }
   return ret;
 }
@@ -438,7 +413,8 @@ const ObSysVarClassType ObLocalSessionVar::ALL_LOCAL_VARS[] = {
   SYS_VAR_NLS_TIMESTAMP_FORMAT,
   SYS_VAR_NLS_TIMESTAMP_TZ_FORMAT,
   SYS_VAR_COLLATION_CONNECTION,
-  SYS_VAR_MAX_ALLOWED_PACKET
+  SYS_VAR_MAX_ALLOWED_PACKET,
+  SYS_VAR_OB_COMPATIBILITY_VERSION
 };
 
 //add all vars that can be solidified

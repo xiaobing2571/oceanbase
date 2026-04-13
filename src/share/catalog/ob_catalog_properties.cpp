@@ -21,6 +21,7 @@
 #include "share/ob_encryption_util.h"
 #include "share/rc/ob_tenant_base.h"
 #include "src/share/ob_define.h"
+#include "src/sql/resolver/ob_resolver_utils.h"
 
 namespace oceanbase
 {
@@ -28,9 +29,15 @@ using namespace common;
 using namespace sql;
 namespace share
 {
-const char *ObCatalogProperties::CATALOG_TYPE_STR[] = {"ODPS"};
+const char *ObCatalogProperties::CATALOG_TYPE_STR[] = {
+    "ODPS",
+    "FILESYSTEM",
+    "HMS",
+    "REST",
+};
 static_assert(array_elements(ObCatalogProperties::CATALOG_TYPE_STR) == static_cast<size_t>(ObCatalogProperties::CatalogType::MAX_TYPE), "Not enough initializer for ObCatalogProperties");
 static_assert(array_elements(ObODPSCatalogProperties::OPTION_NAMES) == static_cast<size_t>(ObODPSCatalogProperties::ObOdpsCatalogOptions::MAX_OPTIONS), "Not enough initializer for ObODPSCatalogProperties");
+static_assert(array_elements(ObFilesystemCatalogProperties::OPTION_NAMES) == static_cast<size_t>(ObFilesystemCatalogProperties::ObFilesystemCatalogOptions::MAX_OPTIONS), "Not enough initializer for ObFilesystemCatalogProperties");
 
 int ObCatalogProperties::to_string_with_alloc(ObString &str, ObIAllocator &allocator) const
 {
@@ -40,6 +47,7 @@ int ObCatalogProperties::to_string_with_alloc(ObString &str, ObIAllocator &alloc
   int64_t pos = 0;
   do {
     buf_len *= 2;
+    pos = 0;
     ret = OB_SUCCESS;
     if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(buf_len)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -153,16 +161,28 @@ int ObCatalogProperties::encrypt_str(ObString &src, ObString &dst, ObIAllocator 
   if (src.empty()) {
     dst = src;
   } else {
-    char encrypted_string[OB_MAX_ENCRYPTED_EXTERNAL_TABLE_PROPERTIES_ITEM_LENGTH] = {0};
-    char hex_buff[OB_MAX_ENCRYPTED_EXTERNAL_TABLE_PROPERTIES_ITEM_LENGTH + 1] = {0};
+    ObArenaAllocator tmp_allocator; // avoid big stack
     int64_t encrypt_len = -1;
-    if (OB_FAIL(ObEncryptionUtil::encrypt_sys_data(tenant_id,
-                                                   src.ptr(),
-                                                   src.length(),
-                                                   encrypted_string,
-                                                   OB_MAX_ENCRYPTED_EXTERNAL_TABLE_PROPERTIES_ITEM_LENGTH,
-                                                   encrypt_len))) {
-
+    char *encrypted_string = static_cast<char *>(
+        tmp_allocator.alloc(OB_MAX_ENCRYPTED_EXTERNAL_TABLE_PROPERTIES_ITEM_LENGTH));
+    char *hex_buff = static_cast<char *>(
+        tmp_allocator.alloc(OB_MAX_ENCRYPTED_EXTERNAL_TABLE_PROPERTIES_ITEM_LENGTH + 1));
+    if (OB_ISNULL(encrypted_string) || OB_ISNULL(hex_buff)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate memory failed", K(ret));
+    } else if (OB_FALSE_IT(memset(encrypted_string,
+                                  0,
+                                  OB_MAX_ENCRYPTED_EXTERNAL_TABLE_PROPERTIES_ITEM_LENGTH))) {
+    } else if (OB_FALSE_IT(memset(hex_buff,
+                                  0,
+                                  OB_MAX_ENCRYPTED_EXTERNAL_TABLE_PROPERTIES_ITEM_LENGTH + 1))) {
+    } else if (OB_FAIL(ObEncryptionUtil::encrypt_sys_data(
+                   tenant_id,
+                   src.ptr(),
+                   src.length(),
+                   encrypted_string,
+                   OB_MAX_ENCRYPTED_EXTERNAL_TABLE_PROPERTIES_ITEM_LENGTH,
+                   encrypt_len))) {
       LOG_WARN("failed to encrypt_sys_data", KR(ret), K(src));
     } else if (0 >= encrypt_len || OB_MAX_ENCRYPTED_EXTERNAL_TABLE_PROPERTIES_ITEM_LENGTH < encrypt_len * 2) {
       ret = OB_ERR_UNEXPECTED;
@@ -222,6 +242,7 @@ int ObCatalogProperties::decrypt_str(ObString &src, ObString &dst, ObIAllocator 
   return ret;
 }
 
+/*---------------------Start of ObODPSCatalogProperties----------------------*/
 int ObODPSCatalogProperties::encrypt(ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
@@ -249,11 +270,11 @@ int ObODPSCatalogProperties::decrypt(ObIAllocator &allocator)
   ObString decrypted_access_key;
   ObString decrypted_sts_token;
   if (OB_FAIL(decrypt_str(access_id_, decrypted_access_id, allocator))) {
-    LOG_WARN("failed to encrypt", K(ret));
+    LOG_WARN("failed to decrypt", K(ret));
   } else if (OB_FAIL(decrypt_str(access_key_, decrypted_access_key, allocator))) {
-    LOG_WARN("failed to encrypt", K(ret));
+    LOG_WARN("failed to decrypt", K(ret));
   } else if (OB_FAIL(decrypt_str(sts_token_, decrypted_sts_token, allocator))) {
-    LOG_WARN("failed to encrypt", K(ret));
+    LOG_WARN("failed to decrypt", K(ret));
   } else {
     access_id_ = decrypted_access_id;
     access_key_ = decrypted_access_key;
@@ -265,78 +286,84 @@ int ObODPSCatalogProperties::decrypt(ObIAllocator &allocator)
 int ObODPSCatalogProperties::to_json_kv_string(char *buf, const int64_t buf_len, int64_t &pos) const
 {
   int ret = OB_SUCCESS;
-
+  ObCStringHelper helper;
   OZ(J_COMMA());
   OZ(databuff_printf(buf,
                      buf_len,
                      pos,
                      R"("%s":"%s")",
                      OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::ACCESSTYPE)],
-                     to_cstring(ObHexStringWrap(access_type_))));
+                     helper.convert(ObHexStringWrap(access_type_))));
   OZ(J_COMMA());
   OZ(databuff_printf(buf,
                      buf_len,
                      pos,
                      R"("%s":"%s")",
                      OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::ACCESSID)],
-                     to_cstring(ObHexStringWrap(access_id_))));
+                     helper.convert(ObHexStringWrap(access_id_))));
   OZ(J_COMMA());
   OZ(databuff_printf(buf,
                      buf_len,
                      pos,
                      R"("%s":"%s")",
                      OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::ACCESSKEY)],
-                     to_cstring(ObHexStringWrap(access_key_))));
+                     helper.convert(ObHexStringWrap(access_key_))));
   OZ(J_COMMA());
   OZ(databuff_printf(buf,
                      buf_len,
                      pos,
                      R"("%s":"%s")",
                      OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::STSTOKEN)],
-                     to_cstring(ObHexStringWrap(sts_token_))));
+                     helper.convert(ObHexStringWrap(sts_token_))));
   OZ(J_COMMA());
   OZ(databuff_printf(buf,
                      buf_len,
                      pos,
                      R"("%s":"%s")",
                      OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::ENDPOINT)],
-                     to_cstring(ObHexStringWrap(endpoint_))));
+                     helper.convert(ObHexStringWrap(endpoint_))));
   OZ(J_COMMA());
   OZ(databuff_printf(buf,
                      buf_len,
                      pos,
                      R"("%s":"%s")",
                      OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::TUNNEL_ENDPOINT)],
-                     to_cstring(ObHexStringWrap(tunnel_endpoint_))));
+                     helper.convert(ObHexStringWrap(tunnel_endpoint_))));
   OZ(J_COMMA());
   OZ(databuff_printf(buf,
                      buf_len,
                      pos,
                      R"("%s":"%s")",
                      OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::PROJECT_NAME)],
-                     to_cstring(ObHexStringWrap(project_))));
+                     helper.convert(ObHexStringWrap(project_))));
   OZ(J_COMMA());
   OZ(databuff_printf(buf,
                      buf_len,
                      pos,
                      R"("%s":"%s")",
                      OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::QUOTA_NAME)],
-                     to_cstring(ObHexStringWrap(quota_))));
+                     helper.convert(ObHexStringWrap(quota_))));
   OZ(J_COMMA());
   OZ(databuff_printf(buf,
                      buf_len,
                      pos,
                      R"("%s":"%s")",
                      OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::COMPRESSION_CODE)],
-                     to_cstring(ObHexStringWrap(compression_code_))));
+                     helper.convert(ObHexStringWrap(compression_code_))));
   OZ(J_COMMA());
   OZ(databuff_printf(buf,
                      buf_len,
                      pos,
                      R"("%s":"%s")",
                      OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::REGION)],
-                     to_cstring(ObHexStringWrap(region_))));
-
+                     helper.convert(ObHexStringWrap(region_))));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":%d)",
+                     OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::API_MODE)],
+                     static_cast<int>(api_mode_)));
   return ret;
 }
 
@@ -450,6 +477,17 @@ int ObODPSCatalogProperties::load_from_string(const ObString &str, ObIAllocator 
       }
       node = node->get_next();
     }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[static_cast<size_t>(ObOdpsCatalogOptions::API_MODE)])
+        && json::JT_NUMBER == node->value_->get_type()) {
+      api_mode_ = static_cast<ObODPSGeneralFormat::ApiMode>(node->value_->get_number());
+      if (api_mode_ != ObODPSGeneralFormat::ApiMode::TUNNEL_API
+        && api_mode_ != ObODPSGeneralFormat::ApiMode::BYTE
+        && api_mode_ != ObODPSGeneralFormat::ApiMode::ROW) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid split mode", K(ret), K(api_mode_));
+      }
+      node = node->get_next();
+    }
   }
   return ret;
 }
@@ -459,6 +497,8 @@ int ObODPSCatalogProperties::resolve_catalog_properties(const ParseNode &node)
   int ret = OB_SUCCESS;
   const ParseNode *child = NULL;
   const ParseNode *child_value = NULL;
+  ObResolverUtils::FileFormatContext ff_ctx;
+  api_mode_ = sql::ObODPSGeneralFormat::ApiMode::TUNNEL_API;
   for (int32_t i = 0; OB_SUCC(ret) && i < node.num_child_; ++i) {
     if (OB_ISNULL(child = node.children_[i]) || child->num_child_ != 1
         || OB_ISNULL(child_value = child->children_[0])) {
@@ -510,6 +550,69 @@ int ObODPSCatalogProperties::resolve_catalog_properties(const ParseNode &node)
           region_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
           break;
         }
+        case ObItemType::T_TABLE_MODE:
+        case ObItemType::T_SPLIT_ACTION: {
+          if (child->type_ == T_TABLE_MODE) {
+            ObString temp_table_mode = ObString(child->children_[0]->str_len_, child->children_[0]->str_value_).trim_space_only();
+            if (temp_table_mode.empty()) {
+              // do nothing
+            } else if (0 == temp_table_mode.case_compare(ObODPSGeneralFormatParam::TUNNEL_API)) {
+              if (api_mode_ != ObODPSGeneralFormat::ApiMode::TUNNEL_API) {
+                ret = OB_INVALID_ARGUMENT;
+                LOG_WARN("already set the the storage api", K(ret));
+              } else {
+                ff_ctx.is_tunnel_set = true;
+              }
+            } else if (!GCONF._use_odps_jni_connector) {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_WARN("must use storage api in jni connector", K(ret));
+            } else if (0 == temp_table_mode.case_compare(ObODPSGeneralFormatParam::STORAGE_API)) {
+              if (api_mode_ != ObODPSGeneralFormat::ApiMode::TUNNEL_API) {
+                // do nothing keep row or byte
+              } else {
+                api_mode_ = ObODPSGeneralFormat::ApiMode::ROW;
+              }
+            } else if (0 == temp_table_mode.case_compare(ObODPSGeneralFormatParam::ROW)) {
+              if (api_mode_ != ObODPSGeneralFormat::ApiMode::TUNNEL_API) {
+                ret = OB_INVALID_ARGUMENT;
+                LOG_WARN("already set the the storage api", K(ret));
+              } else {
+                api_mode_ = ObODPSGeneralFormat::ApiMode::ROW;
+                ff_ctx.is_tunnel_set = true;
+              }
+            } else if (0 == temp_table_mode.case_compare(ObODPSGeneralFormatParam::BYTE)) {
+              if (api_mode_ != ObODPSGeneralFormat::ApiMode::TUNNEL_API) {
+                ret = OB_INVALID_ARGUMENT;
+                LOG_WARN("already set the the storage api", K(ret));
+              } else {
+                api_mode_ = ObODPSGeneralFormat::ApiMode::BYTE;
+                ff_ctx.is_tunnel_set = true;
+              }
+            } else {
+              ret = OB_INVALID_ARGUMENT;
+            }
+          } else if (child->type_ == T_SPLIT_ACTION) {
+            if (!GCONF._use_odps_jni_connector) {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_WARN("jni was not allow to use", K(ret));
+            } else if (ff_ctx.is_tunnel_set) {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_WARN("already use tunnel api", K(ret));
+            } else {
+              ObString temp_split_mode = ObString(child->children_[0]->str_len_, child->children_[0]->str_value_).trim_space_only();
+              if (temp_split_mode.empty()) {
+                // do nothing
+              } else if (0 == temp_split_mode.case_compare(ObODPSGeneralFormatParam::BYTE)) {
+                api_mode_ = ObODPSGeneralFormat::ApiMode::BYTE;
+              } else if (0 == temp_split_mode.case_compare(ObODPSGeneralFormatParam::ROW)) {
+                api_mode_ = ObODPSGeneralFormat::ApiMode::ROW;
+              } else {
+                ret = OB_INVALID_ARGUMENT;
+              }
+            }
+          }
+          break;
+        }
         default: {
           ret = OB_INVALID_ARGUMENT;
           LOG_WARN("invalid catalog option", K(ret), K(child->type_));
@@ -520,5 +623,750 @@ int ObODPSCatalogProperties::resolve_catalog_properties(const ParseNode &node)
   return ret;
 }
 
-} // namespace share
-} // namespace oceanbase
+int ObFilesystemCatalogProperties::to_json_kv_string(char *buf,
+                                                     const int64_t buf_len,
+                                                     int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+  ObCStringHelper helper;
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":"%s")",
+                     OPTION_NAMES[static_cast<size_t>(ObFilesystemCatalogOptions::WAREHOUSE)],
+                     helper.convert(ObHexStringWrap(warehouse_))));
+  return ret;
+}
+
+int ObFilesystemCatalogProperties::load_from_string(const common::ObString &str,
+                                                    common::ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  json::Value *data = NULL;
+  json::Parser parser;
+  ObArenaAllocator temp_allocator;
+  if (OB_UNLIKELY(str.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("format string is empty", K(ret), K(str));
+  } else if (OB_FAIL(parser.init(&temp_allocator))) {
+    LOG_WARN("parser init failed", K(ret));
+  } else if (OB_FAIL(parser.parse(str.ptr(), str.length(), data))) {
+    LOG_WARN("parse json failed", K(ret), K(str));
+  } else if (NULL == data || json::JT_OBJECT != data->get_type()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("error json value", K(ret), KPC(data));
+  } else {
+    DLIST_FOREACH_X(it, data->get_object(), OB_SUCC(ret))
+    {
+      if (0 == it->name_.case_compare(OPTION_NAMES[static_cast<size_t>(ObFilesystemCatalogOptions::WAREHOUSE)])
+          && json::JT_STRING == it->value_->get_type()) {
+        ObObj obj;
+        OZ(ObHexUtilsBase::unhex(it->value_->get_string(), allocator, obj));
+        if (OB_SUCC(ret) && !obj.is_null()) {
+          warehouse_ = obj.get_string();
+        }
+      }
+
+    }
+  }
+  return ret;
+}
+
+int ObFilesystemCatalogProperties::resolve_catalog_properties(const ParseNode &node)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *child = NULL;
+  const ParseNode *child_value = NULL;
+  for (int32_t i = 0; OB_SUCC(ret) && i < node.num_child_; ++i) {
+    if (OB_ISNULL(child = node.children_[i]) || child->num_child_ != 1
+        || OB_ISNULL(child_value = child->children_[0])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid parse node", K(ret));
+    } else {
+      switch (child->type_) {
+        case T_EXTERNAL_FILE_FORMAT_TYPE: {
+          // do nothing
+          break;
+        }
+        case T_WAREHOUSE: {
+          warehouse_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          break;
+        }
+        default: {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("invalid catalog option", K(ret), K(child->type_));
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (warehouse_.empty()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "can't use empty warehouse location");
+    }
+  }
+
+  return ret;
+}
+
+int ObFilesystemCatalogProperties::encrypt(ObIAllocator &allocator)
+{
+  return OB_SUCCESS;
+}
+
+int ObFilesystemCatalogProperties::decrypt(ObIAllocator &allocator)
+{
+  return OB_SUCCESS;
+}
+
+/*---------------------End of ObODPSCatalogProperties----------------------*/
+/*---------------------Start of ObHMSCatalogProperties----------------------*/
+int ObHMSCatalogProperties::to_json_kv_string(char *buf, const int64_t buf_len, int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf, buf_len, pos, R"("%s":")", OPTION_NAMES[URI]));
+  OZ(hex_print(uri_.ptr(), uri_.length(), buf, buf_len, pos));
+  OZ(databuff_printf(buf, buf_len, pos, R"(")"));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf, buf_len, pos, R"("%s":")", OPTION_NAMES[PRINCIPAL]));
+  OZ(hex_print(principal_.ptr(), principal_.length(), buf, buf_len, pos));
+  OZ(databuff_printf(buf, buf_len, pos, R"(")"));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf, buf_len, pos, R"("%s":")", OPTION_NAMES[KEYTAB]));
+  OZ(hex_print(keytab_.ptr(), keytab_.length(), buf, buf_len, pos));
+  OZ(databuff_printf(buf, buf_len, pos, R"(")"));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf, buf_len, pos, R"("%s":")", OPTION_NAMES[KRB5CONF]));
+  OZ(hex_print(krb5conf_.ptr(), krb5conf_.length(), buf, buf_len, pos));
+  OZ(databuff_printf(buf, buf_len, pos, R"(")"));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":%ld)",
+                     OPTION_NAMES[MAX_CLIENT_POOL_SIZE],
+                     max_client_pool_size_));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":%ld)",
+                     OPTION_NAMES[SOCKET_TIMEOUT],
+                     socket_timeout_));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":%ld)",
+                     OPTION_NAMES[CACHE_REFRESH_INTERVAL_SEC],
+                     cache_refresh_interval_sec_));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf, buf_len, pos, R"("%s":")", OPTION_NAMES[HMS_CATALOG_NAME]));
+  OZ(hex_print(hms_catalog_name_.ptr(), hms_catalog_name_.length(), buf, buf_len, pos));
+  OZ(databuff_printf(buf, buf_len, pos, R"(")"));
+  return ret;
+}
+
+int ObHMSCatalogProperties::load_from_string(const ObString &str, ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  json::Value *data = NULL;
+  json::Parser parser;
+  ObArenaAllocator temp_allocator;
+  json::Pair *node = NULL;
+  if (OB_UNLIKELY(str.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("format string is empty", K(ret), K(str));
+  } else if (OB_FAIL(parser.init(&temp_allocator))) {
+    LOG_WARN("parser init failed", K(ret));
+  } else if (OB_FAIL(parser.parse(str.ptr(), str.length(), data))) {
+    LOG_WARN("parse json failed", K(ret), K(str));
+  } else if (NULL == data || json::JT_OBJECT != data->get_type()
+             || OB_ISNULL(node = data->get_object().get_first())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("error json value", K(ret), KPC(data));
+  } else {
+    node = node->get_next();
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[URI])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        uri_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[PRINCIPAL])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        principal_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[KEYTAB])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        keytab_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[KRB5CONF])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        krb5conf_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[MAX_CLIENT_POOL_SIZE])
+        && json::JT_NUMBER == node->value_->get_type()) {
+      max_client_pool_size_ = node->value_->get_number();
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[SOCKET_TIMEOUT])
+        && json::JT_NUMBER == node->value_->get_type()) {
+      socket_timeout_ = node->value_->get_number();
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[CACHE_REFRESH_INTERVAL_SEC])
+        && json::JT_NUMBER == node->value_->get_type()) {
+      cache_refresh_interval_sec_ = node->value_->get_number();
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[HMS_CATALOG_NAME])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        hms_catalog_name_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+  }
+  return ret;
+}
+
+int ObHMSCatalogProperties::resolve_catalog_properties(const ParseNode &node)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *child = NULL;
+  const ParseNode *child_value = NULL;
+  for (int32_t i = 0; OB_SUCC(ret) && i < node.num_child_; ++i) {
+    if (OB_ISNULL(child = node.children_[i]) || child->num_child_ != 1
+        || OB_ISNULL(child_value = child->children_[0])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid parse node", K(ret));
+    } else {
+      switch (child->type_) {
+        case T_EXTERNAL_FILE_FORMAT_TYPE: {
+          // do nothing
+          break;
+        }
+        case T_URI: {
+          uri_
+              = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          if (uri_.length() > OB_MAX_URI_LENGTH) {
+            ret = OB_ERR_TOO_LONG_IDENT;
+            LOG_WARN("hms catalog's uri is too long", K(ret), K(uri_));
+          }
+          break;
+        }
+        case T_PRINCIPAL: {
+          principal_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          break;
+        }
+        case T_KEYTAB: {
+          keytab_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          break;
+        }
+        case T_KRB5CONF: {
+          krb5conf_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          break;
+        }
+        case T_MAX_CLIENT_POOL_SIZE: {
+          max_client_pool_size_ = child_value->value_;
+          break;
+        }
+        case T_SOCKET_TIMEOUT: {
+          socket_timeout_ = child_value->value_;
+          break;
+        }
+        case T_CACHE_REFRESH_INTERVAL_SEC: {
+          cache_refresh_interval_sec_ = child_value->value_;
+          break;
+        }
+        case T_HMS_CATALOG_NAME: {
+          hms_catalog_name_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          break;
+        }
+        default: {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("invalid catalog option", K(ret), K(child->type_));
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (uri_.empty()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "hms catalog's uri can't be empty");
+    }
+  }
+  return ret;
+}
+
+int ObHMSCatalogProperties::encrypt(ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  return ret;
+}
+
+int ObHMSCatalogProperties::decrypt(ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  return ret;
+}
+
+bool ObHMSCatalogProperties::is_set_cache_refresh_interval_sec() const
+{
+  return cache_refresh_interval_sec_ != INVALID_CACHE_REFRESH_INTERVAL_SEC;
+}
+
+int64_t ObHMSCatalogProperties::get_cache_refresh_interval_sec() const
+{
+  int64_t sec = 0;
+  if (cache_refresh_interval_sec_ != INVALID_CACHE_REFRESH_INTERVAL_SEC) {
+    sec = cache_refresh_interval_sec_;
+  } else {
+    sec = DEFAULT_CACHE_REFRESH_INTERVAL_SEC;
+  }
+  return sec;
+}
+
+/*---------------------End of ObHMSCatalogProperties----------------------*/
+/*---------------------Start of ObRestCatalogProperties----------------------*/
+int ObRestCatalogProperties::to_json_kv_string(char *buf, const int64_t buf_len, int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+  ObCStringHelper helper;
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":"%s")",
+                     OPTION_NAMES[URI],
+                     helper.convert(ObHexStringWrap(uri_))));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":"%s")",
+                     OPTION_NAMES[PREFIX],
+                     helper.convert(ObHexStringWrap(prefix_))));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":%d)",
+                     OPTION_NAMES[AUTH_TYPE],
+                     static_cast<int>(auth_type_)));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":"%s")",
+                     OPTION_NAMES[ACCESSID],
+                     helper.convert(ObHexStringWrap(accessid_))));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":"%s")",
+                     OPTION_NAMES[ACCESSKEY],
+                     helper.convert(ObHexStringWrap(accesskey_))));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":"%s")",
+                     OPTION_NAMES[SCOPE],
+                     helper.convert(ObHexStringWrap(scope_))));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":"%s")",
+                     OPTION_NAMES[OAUTH2_SVR_URI],
+                     helper.convert(ObHexStringWrap(oauth2_svr_uri_))));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":"%s")",
+                     OPTION_NAMES[SIGN_NAME],
+                     helper.convert(ObHexStringWrap(sign_name_))));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":"%s")",
+                     OPTION_NAMES[SIGN_REGION],
+                     helper.convert(ObHexStringWrap(sign_region_))));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":"%.*s")",
+                     OPTION_NAMES[TOKEN],
+                     token_.length(),
+                     token_.ptr()));  // ObHexStringWrap内部的buf长度不够, 所以没转
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":%d)",
+                     OPTION_NAMES[VENDED_CREDENTAIL_ENABLED],
+                     static_cast<int>(vended_credential_enabled_)));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":%d)",
+                     OPTION_NAMES[MAX_CLIENT_POOL_SIZE],
+                     static_cast<int>(max_client_pool_size_)));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":%d)",
+                     OPTION_NAMES[HTTP_TIMEOUT],
+                     static_cast<int>(http_timeout_)));
+  OZ(J_COMMA());
+  OZ(databuff_printf(buf,
+                     buf_len,
+                     pos,
+                     R"("%s":%d)",
+                     OPTION_NAMES[HTTP_KEEPALIVE_TIME],
+                     static_cast<int>(http_keep_alive_time_)));
+  return ret;
+}
+
+int ObRestCatalogProperties::load_from_string(const ObString &str, ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  json::Value *data = NULL;
+  json::Parser parser;
+  ObArenaAllocator temp_allocator;
+  json::Pair *node = NULL;
+  if (OB_UNLIKELY(str.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("format string is empty", K(ret), K(str));
+  } else if (OB_FAIL(parser.init(&temp_allocator))) {
+    LOG_WARN("parser init failed", K(ret));
+  } else if (OB_FAIL(parser.parse(str.ptr(), str.length(), data))) {
+    LOG_WARN("parse json failed", K(ret), K(str));
+  } else if (NULL == data || json::JT_OBJECT != data->get_type()
+             || OB_ISNULL(node = data->get_object().get_first())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("error json value", K(ret), KPC(data));
+  } else {
+    node = node->get_next();
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[URI])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        uri_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[PREFIX])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        prefix_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[AUTH_TYPE])
+        && json::JT_NUMBER == node->value_->get_type()) {
+      auth_type_ = static_cast<ObRestAuthType>(node->value_->get_number());
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[ACCESSID])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        accessid_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[ACCESSKEY])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        accesskey_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[SCOPE])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        scope_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[OAUTH2_SVR_URI])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        oauth2_svr_uri_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[SIGN_NAME])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        sign_name_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[SIGN_REGION])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObObj obj;
+      OZ(ObHexUtilsBase::unhex(node->value_->get_string(), allocator, obj));
+      if (OB_SUCC(ret) && !obj.is_null()) {
+        sign_region_ = obj.get_string();
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[TOKEN])
+        && json::JT_STRING == node->value_->get_type()) {
+      ObString tmp_value = ObString(node->value_->get_string().length(), node->value_->get_string().ptr());
+      if (OB_FAIL(ob_write_string(allocator, tmp_value, token_, true /*c_style*/))) {
+        LOG_WARN("failed to copy token", K(tmp_value), K(ret));
+      }
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[VENDED_CREDENTAIL_ENABLED])
+        && json::JT_NUMBER == node->value_->get_type()) {
+      vended_credential_enabled_ = (node->value_->get_number() != 0);
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[MAX_CLIENT_POOL_SIZE])
+        && json::JT_NUMBER == node->value_->get_type()) {
+      max_client_pool_size_ = node->value_->get_number();
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[HTTP_TIMEOUT])
+        && json::JT_NUMBER == node->value_->get_type()) {
+      http_timeout_ = node->value_->get_number();
+      node = node->get_next();
+    }
+    if (OB_NOT_NULL(node) && 0 == node->name_.case_compare(OPTION_NAMES[HTTP_KEEPALIVE_TIME])
+        && json::JT_NUMBER == node->value_->get_type()) {
+      http_keep_alive_time_ = node->value_->get_number();
+      node = node->get_next();
+    }
+  }
+  return ret;
+}
+int ObRestCatalogProperties::resolve_catalog_properties(const ParseNode &node)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *child = NULL;
+  const ParseNode *child_value = NULL;
+  for (int32_t i = 0; OB_SUCC(ret) && i < node.num_child_; ++i) {
+    if (OB_ISNULL(child = node.children_[i]) || child->num_child_ != 1
+        || OB_ISNULL(child_value = child->children_[0])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid parse node", K(ret));
+    } else {
+      switch (child->type_) {
+        case T_EXTERNAL_FILE_FORMAT_TYPE: {
+          // do nothing
+          break;
+        }
+        case T_URI: {
+          uri_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          if (uri_.prefix_match(HTTPS_PREFIX) != 0 && uri_.prefix_match(HTTP_PREFIX) != 0) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid uri", K(ret), K(uri_));
+          } else if (uri_.length() > OB_MAX_URI_LENGTH) {
+            ret = OB_ERR_TOO_LONG_IDENT;
+            LOG_WARN("uri is too long", K(ret), K(uri_));
+          }
+          break;
+        }
+        case T_PREFIX: {
+          prefix_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          break;
+        }
+        case T_AUTH_TYPE: {
+          ObString tmp_value = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          bool found = false;
+          for (int i = 0; i < static_cast<int>(ObRestAuthType::MAX_TYPE) && !found; ++i) {
+            if (tmp_value.case_compare(AUTH_TYPE_NAMES[i]) == 0) {
+              auth_type_ = static_cast<ObRestAuthType>(i);
+              found = true;
+            }
+          }
+          if (!found) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid auth type", K(ret), K(tmp_value));
+          }
+          break;
+        }
+        case T_ACCESSID: {
+          accessid_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          if (accessid_.length() > OB_MAX_ACCESSID_LENGTH) {
+            ret = OB_ERR_TOO_LONG_IDENT;
+            LOG_WARN("accessid is too long", K(ret), K(accessid_));
+          }
+          break;
+        }
+        case T_ACCESSKEY: {
+          accesskey_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          if (accesskey_.length() > OB_MAX_ACCESSKEY_LENGTH) {
+            ret = OB_ERR_TOO_LONG_IDENT;
+            LOG_WARN("accesskey is too long", K(ret), K(accesskey_));
+          }
+          break;
+        }
+        case T_SCOPE: {
+          scope_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          if (scope_.length() > OB_MAX_SCOPE_LENGTH) {
+            ret = OB_ERR_TOO_LONG_IDENT;
+            LOG_WARN("scope is too long", K(ret), K(scope_));
+          }
+          break;
+        }
+        case T_OAUTH2_SVR_URI: {
+          oauth2_svr_uri_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          if (oauth2_svr_uri_.prefix_match(HTTPS_PREFIX) != 0 && oauth2_svr_uri_.prefix_match(HTTP_PREFIX) != 0) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid oauth2 svr uri", K(ret), K(oauth2_svr_uri_));
+          } else if (oauth2_svr_uri_.length() > OB_MAX_URI_LENGTH) {
+            ret = OB_ERR_TOO_LONG_IDENT;
+            LOG_WARN("oauth2 svr uri is too long", K(ret), K(oauth2_svr_uri_));
+          }
+          break;
+        }
+        case T_SIGN_NAME: {
+          sign_name_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          break;
+        }
+        case T_SIGN_REGION: {
+          sign_region_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          break;
+        }
+        case T_TOKEN: {
+          token_ = ObString(child_value->str_len_, child_value->str_value_).trim_space_only();
+          break;
+        }
+        case T_VENDED_CREDENTAIL_ENABLED: {
+          vended_credential_enabled_ = child_value->value_;
+          break;
+        }
+        case T_MAX_CLIENT_POOL_SIZE: {
+          max_client_pool_size_ = child_value->value_;
+          break;
+        }
+        case T_HTTP_TIMEOUT: {
+          http_timeout_ = child_value->value_;
+          break;
+        }
+        case T_HTTP_KEEPLIVE_TIME: {
+          http_keep_alive_time_ = child_value->value_;
+          break;
+        }
+        default: {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("invalid catalog option", K(ret), K(child->type_));
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (uri_.empty()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "rest catalog's uri can't be empty");
+    }
+  }
+  return ret;
+}
+
+int ObRestCatalogProperties::encrypt(ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  ObString encrypted_accessid;
+  ObString encrypted_accesskey;
+  ObString encrypted_token;
+  if (OB_FAIL(encrypt_str(accessid_, encrypted_accessid, allocator))) {
+    LOG_WARN("failed to encrypt", K(ret));
+  } else if (OB_FAIL(encrypt_str(accesskey_, encrypted_accesskey, allocator))) {
+    LOG_WARN("failed to encrypt", K(ret));
+  } else if (OB_FAIL(encrypt_str(token_, encrypted_token, allocator))) {
+    LOG_WARN("failed to encrypt", K(ret));
+  } else {
+    accessid_ = encrypted_accessid;
+    accesskey_ = encrypted_accesskey;
+    token_ = encrypted_token;
+  }
+  return ret;
+}
+
+int ObRestCatalogProperties::decrypt(ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  ObString decrypted_accessid;
+  ObString decrypted_accesskey;
+  ObString decrypted_token;
+  if (OB_FAIL(decrypt_str(accessid_, decrypted_accessid, allocator))) {
+    LOG_WARN("failed to decrypt", K(ret));
+  } else if (OB_FAIL(decrypt_str(accesskey_, decrypted_accesskey, allocator))) {
+    LOG_WARN("failed to decrypt", K(ret));
+  } else if (OB_FAIL(decrypt_str(token_, decrypted_token, allocator))) {
+    LOG_WARN("failed to decrypt", K(ret));
+  } else {
+    accessid_ = decrypted_accessid;
+    accesskey_ = decrypted_accesskey;
+    token_ = decrypted_token;
+  }
+  return ret;
+}
+
+int ObRestCatalogProperties::get_auth_type_str(common::ObString &auth_type_str) const
+{
+  int ret = OB_SUCCESS;
+  auth_type_str.reset();
+  int type_idx = static_cast<int>(auth_type_);
+  if (type_idx < 0 || type_idx >= static_cast<int>(ObRestAuthType::MAX_TYPE)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid auth type", K(ret), K(auth_type_));
+  } else {
+    auth_type_str.assign_ptr(AUTH_TYPE_NAMES[type_idx], strlen(AUTH_TYPE_NAMES[type_idx]));
+  }
+  return ret;
+}
+/*---------------------End of ObRestCatalogProperties----------------------*/
+
+}
+}

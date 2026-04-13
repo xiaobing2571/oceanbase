@@ -17,6 +17,8 @@
 #include "parse_node.h"
 #include "ob_sql_parser.h"
 #include "pl/parser/ob_pl_parser.h"
+#include "observer/omt/ob_tenant_config_mgr.h"
+#include "share/ob_define.h"
 using namespace oceanbase::pl;
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -585,7 +587,13 @@ int ObParser::split_start_with_pl(const ObString &stmt,
         int64_t success_len = 0;
         OX(success_len = parse_result.result_tree_->children_[parse_result.result_tree_->num_child_ - 1]->str_len_ +
           parse_result.result_tree_->children_[parse_result.result_tree_->num_child_ - 1]->pos_);
-        if(OB_SUCC(ret) && ';' == stmt[success_len]) success_len++;
+        if(OB_SUCC(ret)) {
+          if (';' == stmt[success_len]) {
+            success_len++;
+          } else {
+            ret = OB_ERR_PARSE_SQL;
+          }
+        }
         CK(success_len < remain);
         ObString error_part(remain - success_len, stmt.ptr() + success_len);
         OZ(queries.push_back(error_part));
@@ -599,14 +607,18 @@ int ObParser::split_start_with_pl(const ObString &stmt,
       }
       LOG_WARN("fail parse multi part", K(part), K(stmt), K(tmp_ret));
     } else {
-      CK(remain == parse_result.end_col_);
-      CK(nullptr != bak_allocator);
-      CK(nullptr != parse_result.result_tree_);
-      for (int64_t i = 0; OB_SUCC(ret) && i < parse_result.result_tree_->num_child_; ++i) {
-        int64_t str_len = parse_result.result_tree_->children_[i]->str_len_;
-        int64_t offset = parse_result.result_tree_->children_[i]->pos_;
-        ObString query(str_len, stmt.ptr() + offset);
-        OZ(queries.push_back(query));
+      if (remain != parse_result.end_col_) {
+        ret = OB_ERR_PARSE_SQL;
+        LOG_WARN("parse sql failed in split_start_with_pl, end_col mismatch", K(ret), K(part), K(remain), K(parse_result.end_col_));
+      } else {
+        CK(nullptr != bak_allocator);
+        CK(nullptr != parse_result.result_tree_);
+        for (int64_t i = 0; OB_SUCC(ret) && i < parse_result.result_tree_->num_child_; ++i) {
+          int64_t str_len = parse_result.result_tree_->children_[i]->str_len_;
+          int64_t offset = parse_result.result_tree_->children_[i]->pos_;
+          ObString query(str_len, stmt.ptr() + offset);
+          OZ(queries.push_back(query));
+        }
       }
     }
     allocator_ = bak_allocator;
@@ -667,6 +679,11 @@ int ObParser::split_multiple_stmt(const ObString &stmt,
     }
     //留下最多一个分号
     remain = max(remain, semicolon_offset + 1);
+
+    if (lib::is_mysql_mode() && stmt.suffix_match("--;")) {
+      remain--;
+    }
+
     // 对于空语句的特殊处理
     if (OB_UNLIKELY(0 >= remain)) {
       ObString part; // 空串
@@ -690,6 +707,10 @@ int ObParser::split_multiple_stmt(const ObString &stmt,
       str_len = str_len == remain ? str_len : str_len + 1;
       ObString part(str_len, stmt.ptr() + offset);
       ObString remain_part(remain, stmt.ptr() + offset);
+      bool end_with_comment = false;
+      if (lib::is_mysql_mode() && part.length() >= 2 && part.suffix_match("--")) {
+        end_with_comment = true;
+      }
       //first try parse part str, because it's have less length and need less memory
       if (OB_FAIL(tmp_ret = parse(part, parse_result, parse_mode, false, true))) {
         //if parser part str failed, then try parse all remain part, avoid parse many times
@@ -699,6 +720,9 @@ int ObParser::split_multiple_stmt(const ObString &stmt,
       }
       if (OB_SUCC(tmp_ret)) {
         int32_t single_stmt_length = parse_result.end_col_;
+        if (end_with_comment) {
+          single_stmt_length--;
+        }
         if (is_ret_first_stmt) {
           ObString first_query(single_stmt_length, stmt.ptr());
           ret = queries.push_back(first_query);
@@ -714,8 +738,8 @@ int ObParser::split_multiple_stmt(const ObString &stmt,
             ret = queries.push_back(query);
           }
         }
-        remain -= parse_result.end_col_;
-        offset += parse_result.end_col_;
+        remain -= single_stmt_length;
+        offset += single_stmt_length;
         if (remain < 0 || offset > stmt.length()) {
           LOG_ERROR("split_multiple_stmt data error",
                     K(remain), K(offset), K(stmt.length()), K(ret));
@@ -1012,6 +1036,7 @@ int ObParser::parse_sql(const ObString &stmt,
              K(sql_mode_),
              K(parse_result.sql_mode_),
              K(parse_result.may_bool_value_),
+             K(parse_result.clickhouse_func_exposed_),
              K(ret));
 
     int32_t error_offset = parse_result.start_col_ > 0 ? (parse_result.start_col_ - 1) : 0;
@@ -1061,7 +1086,6 @@ int ObParser::parse(const ObString &query,
       --len;
     }
   }
-
   ObString stmt(len, query.ptr());
   memset(&parse_result, 0, sizeof(ParseResult));
   parse_result.is_multi_values_parser_ = (INS_MULTI_VALUES == parse_mode);
@@ -1073,6 +1097,13 @@ int ObParser::parse(const ObString &query,
                                   || FP_NO_PARAMERIZE_AND_FILTER_HINT_MODE == parse_mode);
   parse_result.is_for_trigger_ = (TRIGGER_MODE == parse_mode);
   parse_result.is_dynamic_sql_ = (DYNAMIC_SQL_MODE == parse_mode);
+  if (is_mysql_mode()) {
+    omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+    if (tenant_config.is_valid()) {
+      const ObString tmp_str(tenant_config->sql_func_extension_mode.str());
+      parse_result.clickhouse_func_exposed_ = (0 == tmp_str.case_compare("ClickHouse"));
+    }
+  }
   parse_result.is_dbms_sql_ = (DBMS_SQL_MODE == parse_mode) || is_dbms_sql;
   parse_result.is_for_udr_ = (UDR_SQL_MODE == parse_mode);
   parse_result.is_batched_multi_enabled_split_ = is_batched_multi_stmt_split_on;
@@ -1130,15 +1161,16 @@ int ObParser::parse(const ObString &query,
     }
   }
   //compatible mysql, mysql allow use the "--"
-  if (OB_SUCC(ret) && lib::is_mysql_mode() && stmt.case_compare("--") == 0) {
-    const char *line_str = "-- ";
-    char *buf = (char *)parse_malloc(strlen(line_str), parse_result.malloc_pool_);
+  if (OB_SUCC(ret) && lib::is_mysql_mode() && stmt.length() >= 2 && stmt.suffix_match("--")) {
+    char *buf = (char *)parse_malloc(len + 1, parse_result.malloc_pool_);
     if (OB_UNLIKELY(NULL == buf)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_ERROR("no memory for parser");
     } else {
-      MEMCPY(buf, line_str, strlen(line_str));
-      stmt.assign_ptr(buf, strlen(line_str));
+      MEMCPY(buf, stmt.ptr(), len);
+      buf[len] = ' ';
+      stmt.assign_ptr(buf, len + 1);
+      len++;
     }
   }
   if (OB_SUCC(ret) && OB_ISNULL(parse_result.charset_info_)) {

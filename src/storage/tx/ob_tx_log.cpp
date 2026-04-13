@@ -30,8 +30,7 @@ ObTxLogTypeChecker::need_replay_barrier(const ObTxLogType log_type,
 
   // multi data source trans's redo log
   if (ObTxLogType::TX_MULTI_DATA_SOURCE_LOG == log_type) {
-    if (data_source_type == ObTxDataSourceType::CREATE_TABLET_NEW_MDS
-        || data_source_type == ObTxDataSourceType::DELETE_TABLET_NEW_MDS
+    if (data_source_type == ObTxDataSourceType::DELETE_TABLET_NEW_MDS
         || data_source_type == ObTxDataSourceType::UNBIND_TABLET_NEW_MDS
         || data_source_type == ObTxDataSourceType::START_TRANSFER_OUT
         || data_source_type == ObTxDataSourceType::START_TRANSFER_OUT_PREPARE
@@ -39,7 +38,9 @@ ObTxLogTypeChecker::need_replay_barrier(const ObTxLogType log_type,
         || data_source_type == ObTxDataSourceType::TABLET_SPLIT
         || data_source_type == ObTxDataSourceType::TABLET_BINDING
         || data_source_type == ObTxDataSourceType::MV_NOTICE_SAFE
-        || data_source_type == ObTxDataSourceType::UNBIND_LOB_TABLET) {
+        || data_source_type == ObTxDataSourceType::UNBIND_LOB_TABLET
+        || data_source_type == ObTxDataSourceType::DDL_COMPLETE_MDS
+        || data_source_type == ObTxDataSourceType::TABLET_SPLIT_INFO) {
       barrier_flag = logservice::ObReplayBarrierType::PRE_BARRIER;
 
     } else if (data_source_type == ObTxDataSourceType::FINISH_TRANSFER_IN
@@ -647,6 +648,7 @@ const ObTxLogType ObTxStartWorkingLog::LOG_TYPE = ObTxLogType::TX_START_WORKING_
 const ObTxLogType ObTxRollbackToLog::LOG_TYPE = ObTxLogType::TX_ROLLBACK_TO_LOG;
 const ObTxLogType ObTxMultiDataSourceLog::LOG_TYPE = ObTxLogType::TX_MULTI_DATA_SOURCE_LOG;
 const ObTxLogType ObTxDirectLoadIncLog::LOG_TYPE = ObTxLogType::TX_DIRECT_LOAD_INC_LOG;
+const ObTxLogType ObTxDirectLoadIncMajorLog::LOG_TYPE = ObTxLogType::TX_DIRECT_LOAD_INC_MAJOR_LOG;
 
 int ObTxRedoLog::set_mutator_buf(char *buf)
 {
@@ -902,7 +904,7 @@ int ObTxRedoLog::format_row_data_(const memtable::ObRowData &row_data, ObAdminMu
   int ret = OB_SUCCESS;
 
   blocksstable::ObDatumRow datum_row;
-  blocksstable::ObRowReader row_reader;
+  blocksstable::ObCompatRowReader row_reader;
   const blocksstable::ObRowHeader *row_header = nullptr;
   if (row_data.size_ > 0) {
     if (OB_FAIL(row_reader.read_row(row_data.data_, row_data.size_, nullptr, datum_row))) {
@@ -913,7 +915,11 @@ int ObTxRedoLog::format_row_data_(const memtable::ObRowData &row_data, ObAdminMu
       if (nullptr != arg.writer_ptr_) {
         sprintf(arg.buf_ + arg.pos_, "%lu", i);
         arg.writer_ptr_->dump_key(arg.buf_ + arg.pos_);
-        pos = datum_row.storage_datums_[i].storage_to_string(arg.buf_ + arg.pos_, arg.buf_len_ - arg.pos_);
+        const int64_t effective_hex_len = (arg.hex_length_ > 0 ? arg.hex_length_ : OB_ADMIN_DEFAULT_DUMP_HEX_LENGTH);
+        const int64_t hex_len_cap = std::max(0L, (arg.buf_len_ - arg.pos_ - 256) / 2);
+        const int64_t hex_len = std::min(effective_hex_len, hex_len_cap);
+        pos = datum_row.storage_datums_[i].storage_to_string(
+            arg.buf_ + arg.pos_, arg.buf_len_ - arg.pos_, true, hex_len);
         arg.writer_ptr_->dump_string(arg.buf_ + arg.pos_);
       }
     }
@@ -1176,6 +1182,56 @@ int ObTxRollbackToLog::ob_admin_dump(ObAdminMutatorStringArg &arg)
   return ret;
 }
 
+int ObTxDirectLoadIncLog::ob_admin_dump_macro_block(share::ObAdminMutatorStringArg &arg,
+                                                    int64_t scn_val)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(arg.writer_ptr_) || OB_ISNULL(arg.dir_path_) || strlen(arg.dir_path_) == 0) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "invalid arg writer is NULL or dir_path is NULL", K(ret), KP(arg.writer_ptr_), KP(arg.dir_path_));
+  } else if (ObTxDirectLoadIncLog::DirectLoadIncLogType::DLI_REDO == ddl_log_type_) {
+    storage::ObDDLRedoLog ddl_redo_log;
+    if (OB_FAIL(log_buf_.deserialize_log_object(&ddl_redo_log))) {
+      TRANS_LOG(WARN, "deserialize ddl redo log failed", K(ret), KPC(this));
+    } else if (arg.filter_.is_tablet_id_valid() &&
+               arg.filter_.get_tablet_id() != ddl_redo_log.get_redo_info().table_key_.tablet_id_) {
+      // filter by tablet_id
+    } else {
+      ObCStringHelper helper;
+      arg.writer_ptr_->dump_key("<TxDirectLoadIncLog>");
+      arg.writer_ptr_->start_object();
+      arg.writer_ptr_->dump_key("dli_log_type");
+      arg.writer_ptr_->dump_int64(static_cast<int64_t>(ddl_log_type_));
+      arg.writer_ptr_->dump_key("dli_buf_size");
+      arg.writer_ptr_->dump_int64(log_buf_.get_buf_size());
+      arg.writer_ptr_->dump_key("dli_batch_key");
+      arg.writer_ptr_->dump_string(helper.convert(batch_key_));
+      arg.writer_ptr_->dump_key("dli_redo_log");
+      arg.writer_ptr_->dump_string(helper.convert(ddl_redo_log));
+      arg.writer_ptr_->end_object();
+
+      storage::ObDDLMacroBlockRedoInfo redo_info = ddl_redo_log.get_redo_info();
+      char dump_dir_path[common::MAX_PATH_SIZE] = {0};
+      // 目录结构dir_path_ / tablet_id / trans_id / seq_no
+      if (OB_FAIL(ObAdminLogDumpBlockHelper::generate_dump_dir(
+            arg.dir_path_, redo_info.table_key_.tablet_id_.id(), redo_info.trans_id_.get_id(),
+            redo_info.seq_no_.get_seq(), dump_dir_path))) {
+        TRANS_LOG(WARN, "failed to generate dump directory", K(ret), K(redo_info));
+      } else if (OB_FAIL(ObAdminLogDumpBlockHelper::create_dir_if_not_exist(dump_dir_path))) {
+        TRANS_LOG(WARN, "failed to create dump directory", K(ret), K(redo_info));
+        // 文件名 {slice_idx}_{column_group_idx}_{data_seq}.{scn}.macro
+      } else if (OB_FAIL(ObAdminLogDumpBlockHelper::write_macro_block_file(
+                   dump_dir_path, redo_info.table_key_.slice_range_.start_slice_idx_,
+                   redo_info.table_key_.column_group_idx_,
+                   redo_info.logic_id_.data_seq_.get_data_seq(), scn_val,
+                   redo_info.data_buffer_.ptr(), redo_info.data_buffer_.length()))) {
+        TRANS_LOG(WARN, "failed to write macro block file", K(ret), K(redo_info));
+      }
+    }
+  }
+  return ret;
+}
+
 int  ObTxDirectLoadIncLog::ob_admin_dump(share::ObAdminMutatorStringArg &arg)
 {
   int ret = OB_SUCCESS;
@@ -1194,6 +1250,33 @@ int  ObTxDirectLoadIncLog::ob_admin_dump(share::ObAdminMutatorStringArg &arg)
     arg.writer_ptr_->dump_string(helper.convert(batch_key_));
     //TODO direct_load_inc
     //dump direct_load_inc log_buf as a string in ob_admin log_tool
+    if (ddl_log_type_ == ObTxDirectLoadIncLog::DirectLoadIncLogType::DLI_START) {
+      storage::ObDDLIncStartLog ddl_start_log;
+      if (OB_FAIL(log_buf_.deserialize_log_object(&ddl_start_log))) {
+        TRANS_LOG(WARN, "deserialize ddl start log failed", K(ret), KPC(this));
+      } else {
+        arg.writer_ptr_->dump_key("dli_start_log");
+        arg.writer_ptr_->dump_string(helper.convert(ddl_start_log));
+      }
+    } else if (ddl_log_type_ == ObTxDirectLoadIncLog::DirectLoadIncLogType::DLI_REDO) {
+      storage::ObDDLRedoLog ddl_redo_log;
+      if (OB_FAIL(log_buf_.deserialize_log_object(&ddl_redo_log))) {
+        TRANS_LOG(WARN, "deserialize ddl redo log failed", K(ret), KPC(this));
+      } else {
+        arg.writer_ptr_->dump_key("dli_redo_log");
+        arg.writer_ptr_->dump_string(helper.convert(ddl_redo_log));
+      }
+    } else if (ddl_log_type_ == ObTxDirectLoadIncLog::DirectLoadIncLogType::DLI_END) {
+      storage::ObDDLIncCommitLog ddl_commit_log;
+      if (OB_FAIL(log_buf_.deserialize_log_object(&ddl_commit_log))) {
+        TRANS_LOG(WARN, "deserialize ddl commit log failed", K(ret), KPC(this));
+      } else {
+        arg.writer_ptr_->dump_key("dli_commit_log");
+        arg.writer_ptr_->dump_string(helper.convert(ddl_commit_log));
+      }
+    } else {
+      TRANS_LOG(WARN, "invalid ddl log type", K(ddl_log_type_));
+    }
     arg.writer_ptr_->end_object();
   }
   return ret;

@@ -99,6 +99,9 @@ public:
   int create_tenant_without_unit(const uint64_t tenant_id, const double min_cpu, const double max_cpu);
   int create_tenant(const ObTenantMeta &meta, bool write_slog, const int64_t abs_timeout_us = INT64_MAX);
   int update_tenant_unit(const share::ObUnitInfoGetter::ObTenantConfig &unit);
+  // Only update actual data disk size field of tenant unit and persist meta.
+  int update_tenant_actual_disk_size(
+      const uint64_t tenant_id, const int64_t actual_data_disk_size);
 
   int get_tenant_unit(const uint64_t tenant_id, share::ObUnitInfoGetter::ObTenantConfig &unit);
   int get_unit_id(const uint64_t tenant_id, uint64_t &unit_id);
@@ -118,9 +121,6 @@ public:
                                   const int64_t new_log_disk_size,
                                   int64_t &allowed_log_disk_size);
 #ifdef OB_BUILD_SHARED_STORAGE
-  int update_tenant_data_disk_size(const uint64_t tenant_id,
-                                    const int64_t new_data_disk_size);
-  int update_safe_time_config();
   int update_ss_garbage_collection_service_config();
 #endif
   int modify_tenant_io(const uint64_t tenant_id, const share::ObUnitConfig &unit_config);
@@ -131,6 +131,7 @@ public:
   int update_checkpoint_diagnose_config();
   int update_tenant_audit_log_config();
   int update_tenant_query_response_time_flush_config();
+  int get_tenant_unsafe(const uint64_t tenant_id, ObTenant *&tenant) const;
   int get_tenant(const uint64_t tenant_id, ObTenant *&tenant) const;
   int get_tenant_with_tenant_lock(const uint64_t tenant_id, common::ObLDHandle &handle, ObTenant *&tenant) const;
   int get_active_tenant_with_tenant_lock(const uint64_t tenant_id, common::ObLDHandle &handle, ObTenant *&tenant) const;
@@ -155,6 +156,7 @@ public:
   int get_tenant_cpu_usage(const uint64_t tenant_id, double &usage) const;
   int get_tenant_worker_time(const uint64_t tenant_id, int64_t &worker_time) const;
   int get_tenant_cpu_time(const uint64_t tenant_id, int64_t &rusage_time) const;
+  int get_tenant_group_cpu_time(const uint64_t tenant_id, uint64_t group_id, int64_t &cpu_time);
   int get_tenant_cpu(
       const uint64_t tenant_id,
       double &min_cpu, double &max_cpu) const;
@@ -173,10 +175,13 @@ public:
 
   void set_workers_per_cpu(int64_t v);
   int check_if_unit_id_exist(const uint64_t unit_id, bool &exist);
+  int inc_tenant_ddl_count(const uint64_t tenant_id, const int64_t cpu_quota_concurrency);
+  int dec_tenant_ddl_count(const uint64_t tenant_id);
+  bool is_async_proc_cpu_mode() const;
+  void update_tenants_cpu_time();
 
 protected:
   void run1();
-  int get_tenant_unsafe(const uint64_t tenant_id, ObTenant *&tenant) const;
   int construct_meta_for_hidden_sys(ObTenantMeta &meta);
   int construct_meta_for_virtual_tenant(const uint64_t tenant_id,
                                         const double min_cpu,
@@ -233,6 +238,15 @@ protected:
 private:
   lib::ObShareTenantLimiter *tenant_limiter_head_;
   lib::ObMutex limiter_mutex_;
+  int64_t async_proc_cpu_sampler_started_;
+  static const int64_t ASYNC_PROC_CPU_MODE_TRIGGER_TENANT_CNT = 20;
+  class ObAsyncProcCpuSampler : public lib::TGRunnable
+  {
+  public:
+    void run1() override;
+  };
+  ObAsyncProcCpuSampler async_proc_cpu_sampler_;
+  int try_start_async_proc_cpu_sampler_();
   DISALLOW_COPY_AND_ASSIGN(ObMultiTenant);
 }; // end of class ObMultiTenant
 

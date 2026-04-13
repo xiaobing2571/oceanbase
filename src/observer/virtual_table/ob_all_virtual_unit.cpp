@@ -256,7 +256,7 @@ int ObAllVirtualUnit::inner_get_next_row(ObNewRow *&row)
         }
         case DATA_DISK_SIZE: {
           if (GCTX.is_shared_storage_mode()) {
-            cur_row_.cells_[i].set_int(tenant_meta.unit_.get_effective_actual_data_disk_size());
+            cur_row_.cells_[i].set_int(tenant_meta.unit_.config_.data_disk_size());
           } else {
             cur_row_.cells_[i].set_null();
           }
@@ -293,6 +293,14 @@ int ObAllVirtualUnit::inner_get_next_row(ObNewRow *&row)
           }
           break;
         }
+        case DATA_DISK_ALLOCATED: {
+          if (GCTX.is_shared_storage_mode()) {
+            cur_row_.cells_[i].set_int(tenant_meta.unit_.get_actual_data_disk_size());
+          } else {
+            cur_row_.cells_[i].set_null();
+          }
+          break;
+        }
         case MAX_NET_BANDWIDTH: {
           if (is_meta_tnt) {
             cur_row_.cells_[i].set_null();
@@ -317,6 +325,9 @@ int ObAllVirtualUnit::inner_get_next_row(ObNewRow *&row)
         }
         case CREATE_TIME:
           cur_row_.cells_[i].set_int(tenant_meta.unit_.create_timestamp_);
+          break;
+        case REPLICA_TYPE:
+          cur_row_.cells_[i].set_int(tenant_meta.unit_.replica_type_);
           break;
         default: {
           ret = OB_ERR_UNEXPECTED;
@@ -352,5 +363,3 @@ int ObAllVirtualUnit::get_clog_disk_used_size_(const uint64_t tenant_id,
   // return OB_SUCCESS whatever.
   return OB_SUCCESS;
 }
-
-

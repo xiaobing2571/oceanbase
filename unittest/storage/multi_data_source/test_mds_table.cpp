@@ -20,6 +20,7 @@
 #include "storage/tablet/ob_mds_schema_helper.h"
 #include "src/share/scn.h"
 #include "storage/meta_mem/ob_tablet_pointer.h"
+#include "storage/ls/ob_ls.h"
 
 namespace oceanbase {
 using namespace share;
@@ -57,6 +58,11 @@ using namespace storage;
 using namespace mds;
 using namespace transaction;
 
+storage::ObLS FAKE_LS;
+storage::mds::ObMdsTableMgr FAKE_MDS_TABLE_MGR;
+ObMdsTableHandler mds_table_hanlder;
+MdsTableHandle &mds_table_ = mds_table_hanlder.mds_table_handle_;
+
 class TestMdsTable: public ::testing::Test
 {
 public:
@@ -64,10 +70,8 @@ public:
     ObMdsSchemaHelper::get_instance().init();
   }
   virtual ~TestMdsTable() {}
-  virtual void SetUp() {
-  }
-  virtual void TearDown() {
-  }
+  virtual void SetUp() {}
+  virtual void TearDown() {}
   static void compare_binary_key();
   static void set();
   static void replay();
@@ -89,12 +93,13 @@ private:
   DISALLOW_COPY_AND_ASSIGN(TestMdsTable);
 };
 
-ObMdsTableHandler mds_table_hanlder;
-MdsTableHandle &mds_table_ = mds_table_hanlder.mds_table_handle_;
 
 /***********************************************Single Row*************************************************************/
 struct A { ObSpinLock lock_; };
-struct B { MdsLock lock_; };
+struct B {
+  B() : lock_(common::ObLatchIds::OB_TEST_MDS_TABLE_LOCK) {}
+  MdsLock lock_;
+};
 
 #define GET_REAL_MDS_TABLE(mds_table) (*((MdsTableImpl<UnitTestMdsTable>*)(static_cast<guard::LightDataBlock<MdsTableImpl<UnitTestMdsTable>>*>((mds_table.p_mds_table_base_.ctrl_ptr_->p_data_block_))->data_)))
 
@@ -168,6 +173,9 @@ void TestMdsTable::set() {
   MdsCtx ctx2(mds::MdsWriter(ObTransID(2)));// abort by RAII finally
   ASSERT_EQ(OB_SUCCESS, mds_table_.set(data1, ctx2));
   ctx2.on_abort(mock_scn(8));
+
+  FAKE_MDS_TABLE_MGR.ls_ = &FAKE_LS;
+  mds_table_.get_mds_table_ptr()->mgr_handle_.mgr_ = &FAKE_MDS_TABLE_MGR;
 }
 // <DummyKey, ExampleUserData1>: (data:1, writer:1, ver:10)
 // <DummyKey, ExampleUserData2>: (data:2, writer:1, ver:10)
@@ -636,6 +644,9 @@ TEST_F(TestMdsTable, test_recalculate_flush_scn_op) {
   ASSERT_EQ(OB_SUCCESS, mds_table.set(ExampleUserData1(3), ctx3));
   ctx3.on_redo(mock_scn(9));
   ctx3.on_commit(mock_scn(11), mock_scn(11));
+
+  FAKE_MDS_TABLE_MGR.ls_ = &FAKE_LS;
+  mds_table.get_mds_table_ptr()->mgr_handle_.mgr_ = &FAKE_MDS_TABLE_MGR;
   ASSERT_EQ(OB_SUCCESS, mds_table.flush(mock_scn(4), mock_scn(4)));
   ASSERT_EQ(mock_scn(4), mds_table.p_mds_table_base_->flushing_scn_);
   mds_table.on_flush(mock_scn(4), OB_SUCCESS);
@@ -665,7 +676,7 @@ TEST_F(TestMdsTable, test_recalculate_flush_scn_op) {
 // }
 
 TEST_F(TestMdsTable, test_rw_lock_rrlock) {
-  MdsLock lock;
+  MdsLock lock(common::ObLatchIds::OB_TEST_MDS_TABLE_LOCK);
   std::thread t1([&lock]() {
     MdsRLockGuard lg(lock);
     ob_usleep(1_s);
@@ -679,7 +690,7 @@ TEST_F(TestMdsTable, test_rw_lock_rrlock) {
 }
 
 TEST_F(TestMdsTable, test_rw_lock_wrlock) {
-  MdsLock lock;
+  MdsLock lock(common::ObLatchIds::OB_TEST_MDS_TABLE_LOCK);
   std::thread t1([&lock]() {
     MdsWLockGuard lg(lock);
     ob_usleep(1_s);
@@ -694,7 +705,7 @@ TEST_F(TestMdsTable, test_rw_lock_wrlock) {
 }
 
 TEST_F(TestMdsTable, test_rw_lock_rwlock) {
-  MdsLock lock;
+  MdsLock lock(common::ObLatchIds::OB_TEST_MDS_TABLE_LOCK);
   std::thread t1([&lock]() {
     ob_usleep(200_ms);
     MdsWLockGuard lg(lock);
@@ -709,7 +720,7 @@ TEST_F(TestMdsTable, test_rw_lock_rwlock) {
 }
 
 TEST_F(TestMdsTable, test_rw_lock_wwlock) {
-  MdsLock lock;
+  MdsLock lock(common::ObLatchIds::OB_TEST_MDS_TABLE_LOCK);
   std::thread t1([&lock]() {
     MdsWLockGuard lg(lock);
     ob_usleep(1_s);

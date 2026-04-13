@@ -30,6 +30,7 @@ const char *const KRB5CONF = "krb5conf=";
 const char *const PRINCIPAL = "principal=";
 const char *const KEYTAB = "keytab=";
 const char *const TICKET_CACHE_PATH = "ticiket_cache_path=";
+const char *const HADOOP_USERNAME = "username=";
 const char *const HDFS_CONFIGS = "configs=";
 
 class ObHDFSStorageInfo : public common::ObObjectStorageInfo
@@ -46,6 +47,9 @@ public:
 
   // Override methods
   virtual int assign(const ObObjectStorageInfo &storage_info) override;
+  virtual int clone(
+      common::ObIAllocator &allocator,
+      common::ObObjectStorageInfo *&storage_info) const override;
   virtual void reset() override;
   // virtual int get_storage_info_str(char *storage_info, const int64_t info_len) const override;
 

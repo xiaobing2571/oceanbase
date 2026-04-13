@@ -17,6 +17,9 @@
 #include "share/ob_io_device_helper.h"
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/shared_storage/ob_ss_object_access_util.h"
+#include "storage/blocksstable/ob_ss_obj_util.h"
+#include "storage/shared_storage/ob_ss_local_cache_service.h"
+#include "storage/shared_storage/ob_file_manager.h"
 #endif
 
 namespace oceanbase
@@ -151,7 +154,12 @@ int ObStorageObjectHandle::async_read(const ObStorageObjectReadInfo &read_info)
     LOG_WARN("invalid io argument", K(ret), K(read_info), KCSTRING(lbt()));
   } else {
     if (read_info.macro_block_id_.is_id_mode_local()) {
-      if (OB_FAIL(sn_async_read(read_info))) {
+      // Since read_info is valid, offset and size are already validated,
+      // so we only need to check if the read range is within bounds
+      if (OB_UNLIKELY(read_info.offset_ + read_info.size_ > OB_STORAGE_OBJECT_MGR.get_macro_block_size())) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid read range", KR(ret), K(read_info));
+      } else if (OB_FAIL(sn_async_read(read_info))) {
         LOG_WARN("fail to sn_async_read", K(ret), K(read_info));
       }
     } else if (read_info.macro_block_id_.is_id_mode_backup()) {
@@ -243,8 +251,6 @@ int ObStorageObjectHandle::sn_async_read(const ObStorageObjectReadInfo &read_inf
                                                                   backup_device,
                                                                   io_info.fd_))) {
         LOG_WARN("failed to get backup device and fd", K(ret), K(read_info));
-      } else {
-        io_info.flag_.set_sync();
       }
     }
 
@@ -314,26 +320,123 @@ int ObStorageObjectHandle::ss_async_read(const ObStorageObjectReadInfo &read_inf
   if (OB_UNLIKELY(!read_info.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid io argument", K(ret), K(read_info), KCSTRING(lbt()));
-  } else if (OB_FAIL(ObSSObjectAccessUtil::async_pread_file(read_info, *this))) {
-    LOG_WARN("fail to async pread file", KR(ret), K(read_info), KPC(this));
+  } else {
+    if (read_info.macro_block_id_.is_shared_tablet_meta()) {
+      CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_TIERED_METADATA);
+      if (OB_FAIL(ObSSObjectAccessUtil::async_pread_file(read_info, *this))) {
+        LOG_WARN("fail to async pread file", KR(ret), K(read_info), KPC(this));
+      }
+    } else {
+      if (OB_FAIL(ObSSObjectAccessUtil::async_pread_file(read_info, *this))) {
+        LOG_WARN("fail to async pread file", KR(ret), K(read_info), KPC(this));
+      }
+    }
   }
+
   return ret;
 }
 
 int ObStorageObjectHandle::ss_async_write(const ObStorageObjectWriteInfo &write_info)
 {
   int ret = OB_SUCCESS;
-  ObStorageObjectType object_type = macro_id_.storage_object_type();
   if (OB_UNLIKELY(!write_info.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Invalid argument", K(ret), K(write_info));
-  } else if (ObStorageObjectType::TMP_FILE == object_type) {
+  } else if (SSObjUtil::is_tmp_file(macro_id_)) {
     if (OB_FAIL(ObSSObjectAccessUtil::async_append_file(write_info, *this))) {
       LOG_WARN("fail to async append file", KR(ret), K(write_info), KPC(this));
     }
   } else {
-    if (OB_FAIL(ObSSObjectAccessUtil::async_write_file(write_info, *this))) {
-      LOG_WARN("fail to async write file", KR(ret), K(write_info), KPC(this));
+    if (macro_id_.is_shared_tablet_meta()) {
+      CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_TIERED_METADATA);
+      if (OB_FAIL(ObSSObjectAccessUtil::async_write_file(write_info, *this))) {
+        LOG_WARN("fail to async write file", KR(ret), K(write_info), KPC(this));
+      }
+    } else {
+      if (OB_FAIL(ObSSObjectAccessUtil::async_write_file(write_info, *this))) {
+        LOG_WARN("fail to async write file", KR(ret), K(write_info), KPC(this));
+      }
+    }
+
+  }
+  return ret;
+}
+
+int ObStorageObjectHandle::ss_update_object_type_rw_stat(const blocksstable::ObStorageObjectType &object_type,
+    const int result, const int64_t delta_cnt)
+{
+  int ret = OB_SUCCESS;
+  // 500 tenant not have local cache service
+  if (!GCTX.is_shared_storage_mode()) {
+  } else if ((is_meta_tenant(MTL_ID()) || is_sys_tenant(MTL_ID()) || is_user_tenant(MTL_ID())) && macro_id_.is_id_mode_share()) {
+    ObSSLocalCacheService *local_cache_service = nullptr;
+    if (OB_ISNULL(local_cache_service = MTL(ObSSLocalCacheService *))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("local cache service is null", KR(ret), K(MTL_ID()));
+    } else {
+      ObIOFlag io_flag;
+      int64_t io_time_us = 0;
+      if (OB_FAIL(io_handle_.get_io_flag(io_flag))) {
+        LOG_WARN("fail to get io flag", KR(ret));
+      } else if (OB_TIMEOUT == result) {
+        int64_t tmp_real_wait_timeout_ms = 0;
+        io_handle_.get_remained_io_timeout_ms(tmp_real_wait_timeout_ms);
+        io_time_us = tmp_real_wait_timeout_ms * 1000L;
+      } else if (OB_FAIL(io_handle_.get_io_time_us(io_time_us))) {
+        LOG_WARN("fail to get io time", KR(ret));
+      }
+      if (OB_FAIL(ret)) {
+      } else {
+        ObIOMode mode = io_flag.get_mode();
+        if (mode == ObIOMode::READ) {
+          IGNORE_RETURN local_cache_service->update_object_type_stat(object_type, ObSSObjectTypeStatType::READ,
+            io_handle_.is_limit_net_bandwidth_req(), result, delta_cnt, get_data_size(), io_time_us/*delta_time_us*/);
+        } else if (mode == ObIOMode::WRITE) {
+          IGNORE_RETURN local_cache_service->update_object_type_stat(object_type, ObSSObjectTypeStatType::WRITE,
+            io_handle_.is_limit_net_bandwidth_req(), result, delta_cnt, get_data_size(), io_time_us/*delta_time_us*/);
+        } else {
+          LOG_WARN("unexpected io mode", KR(ret), K(mode));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObStorageObjectHandle::update_atomic_write_file(int result)
+{
+  int ret = OB_SUCCESS;
+  ObTenantFileManager *file_manager = nullptr;
+  ObAtomicWriteFileInfo atomic_write_file;
+  ObIOFlag io_flag;
+  if (!GCTX.is_shared_storage_mode()) {
+  } else if (OB_FAIL(io_handle_.get_io_flag(io_flag))) {
+    LOG_WARN("fail to get io flag", KR(ret));
+  } else {
+    ObIOMode mode = io_flag.get_mode();
+    if (mode == ObIOMode::WRITE && (is_meta_tenant(MTL_ID()) || is_sys_tenant(MTL_ID()) || is_user_tenant(MTL_ID())) && macro_id_.is_id_mode_share()) {
+      if (OB_ISNULL(file_manager = MTL(ObTenantFileManager*))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("file manager is null", KR(ret));
+      } else if (OB_FAIL(file_manager->get_from_atomic_write_file_map(false/*is_clean*/, macro_id_, atomic_write_file))) {
+        if (OB_HASH_NOT_EXIST != ret) {
+          LOG_WARN("fail to get from atomic write file map", KR(ret), K(macro_id_), K(atomic_write_file));
+        } else {
+          // macro id is not atomic write file, do nothing
+          ret = OB_SUCCESS;
+        }
+      } else {
+        if (result != OB_SUCCESS) {
+          if (OB_FAIL(file_manager->push_to_atomic_write_file_map(true/*is_clean*/, macro_id_, atomic_write_file))) {
+            LOG_WARN("fail to push to atomic write file map", KR(ret), K(macro_id_), K(atomic_write_file));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          if (OB_FAIL(file_manager->erase_from_atomic_write_file_map(false/*is_clean*/, macro_id_))) {
+            LOG_WARN("fail to erase from atomic write file map", KR(ret), K(macro_id_));
+          }
+        }
+      }
     }
   }
   return ret;
@@ -347,13 +450,75 @@ int ObStorageObjectHandle::wait()
     // do nothing
   } else if (OB_FAIL(io_handle_.wait())) {
     LOG_WARN("fail to wait block io, may be retry", K(macro_id_), K(ret));
+#ifdef OB_BUILD_SHARED_STORAGE
+    IGNORE_RETURN update_atomic_write_file(ret);
+#endif
     int tmp_ret = OB_SUCCESS;
     if (OB_SUCCESS != (tmp_ret = report_bad_block())) {
       LOG_WARN("fail to report bad block", K(tmp_ret), K(ret));
     }
-    io_handle_.reset();
+    if ((macro_id_.is_id_mode_share()) &&
+        (ObStorageObjectType::PRIVATE_SLOG_FILE == macro_id_.storage_object_type()) &&
+        (OB_DATA_OUT_OF_RANGE == ret)) {
+      // cannot reset io_handle_ for slog, cuz io_handle_.get_data_size() will be called
+    } else {
+#ifdef OB_BUILD_SHARED_STORAGE
+      IGNORE_RETURN ss_update_object_type_rw_stat(macro_id_.storage_object_type(), ret, 1/*delta_cnt*/);
+#endif
+      io_handle_.reset();
+    }
+  } else if ((macro_id_.is_id_mode_share()) &&
+            (ObStorageObjectType::PRIVATE_SLOG_FILE == macro_id_.storage_object_type()) &&
+            (get_data_size() < get_user_io_size())) {
+    ret = OB_DATA_OUT_OF_RANGE;
+    LOG_WARN("real read size is smaller than expected read size", KR(ret), "real_read_size",
+             get_data_size(), "expected_read_size", get_user_io_size());
+  } else {
+#ifdef OB_BUILD_SHARED_STORAGE
+    IGNORE_RETURN update_atomic_write_file(ret);
+#endif
   }
+
+  print_slow_io_info(ret);
+#ifdef OB_BUILD_SHARED_STORAGE
+  IGNORE_RETURN ss_update_object_type_rw_stat(macro_id_.storage_object_type(), ret, 1/*delta_cnt*/);
+#endif
   return ret;
+}
+
+void ObStorageObjectHandle::print_slow_io_info(int ret_code) const
+{
+  int ret = OB_SUCCESS;
+  if ((OB_SUCCESS == ret_code) && (!io_handle_.is_empty())) {
+    static const int64_t MID_REMOTE_IO_TIME_US = 500 * 1000L; // 500ms
+    static const int64_t SLOW_REMOTE_IO_TIME_US = 1 * 1000L * 1000L; // 1s
+    static const int64_t MID_LOCAL_IO_TIME_US = 5 * 1000L; // 5ms
+    static const int64_t SLOW_LOCAL_IO_TIME_US = 10 * 1000L; // 10ms
+    static const int64_t SLOW_CALLBACK_TIME_US = 10 * 1000L; // 10ms
+    int64_t io_time_us = 0;
+    int64_t io_callback_time_us = 0;
+    bool has_slow_callback = false;
+    if (OB_FAIL(io_handle_.get_io_time_us(io_time_us))) {
+      LOG_WARN("fail to get io time", KR(ret));
+    } else if (OB_FAIL(io_handle_.get_io_callback_time_us(io_callback_time_us))) {
+      LOG_WARN("fail to get io callback time", KR(ret));
+    } else if (FALSE_IT(has_slow_callback = (io_callback_time_us > SLOW_CALLBACK_TIME_US))) {
+    } else if ((io_handle_.is_limit_net_bandwidth_req())) { // 1. remote io
+      if (io_time_us > SLOW_REMOTE_IO_TIME_US) {
+        LOG_INFO("slow remote io", K(io_time_us), K(has_slow_callback), KPC(this));
+      } else if (io_time_us > MID_REMOTE_IO_TIME_US) {
+        LOG_TRACE("slow remote io", K(io_time_us), K(has_slow_callback), KPC(this));
+      } else if (has_slow_callback) {
+        LOG_INFO("remote io has slow callback", K(io_time_us), K(has_slow_callback), KPC(this));
+      }
+    } else { // 2. local io
+      if (io_time_us > SLOW_LOCAL_IO_TIME_US) {
+        LOG_INFO("slow local io", K(io_time_us), K(has_slow_callback), KPC(this));
+      } else if (io_time_us > MID_LOCAL_IO_TIME_US) {
+        LOG_TRACE("slow local io", K(io_time_us), K(has_slow_callback), KPC(this));
+      }
+    }
+  }
 }
 
 int ObStorageObjectHandle::get_io_ret() const
@@ -403,6 +568,11 @@ int ObStorageObjectHandle::set_macro_block_id(const MacroBlockId &macro_block_id
     }
   }
   return ret;
+}
+
+void ObStorageObjectHandle::cancel()
+{
+  io_handle_.cancel();
 }
 
 } // namespace blocksstable

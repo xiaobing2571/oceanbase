@@ -58,8 +58,8 @@ OB_INLINE static int pad_on_local_buf(const ObString &space_pattern,
   int ret = OB_SUCCESS;
   char *buf = nullptr;
   const int32_t pad_len = length + pad_whitespace_length * space_pattern.length();
-  const int64_t buf_len = lib::is_oracle_mode() ? MIN(pad_len, OB_MAX_ORACLE_CHAR_LENGTH_BYTE) : pad_len;
-  if (OB_ISNULL((buf = (char*) padding_alloc.alloc(buf_len)))) {
+  const int32_t buf_len = lib::is_oracle_mode() ? MIN(pad_len, OB_MAX_ORACLE_CHAR_LENGTH_BYTE) : pad_len;
+  if (OB_ISNULL((buf = (char*) padding_alloc.alloc(static_cast<int64_t>(buf_len))))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     STORAGE_LOG(WARN, "no memory", K(ret));
   } else {
@@ -143,8 +143,8 @@ int pad_column(const common::ObAccuracy accuracy, sql::ObEvalCtx &ctx, sql::ObEx
     if (cur_len < length) {
       char *ptr = nullptr;
       const int32_t pad_len = datum.pack_ + (length - cur_len) * space_pattern.length();
-      const int64_t buf_len = lib::is_oracle_mode() ? MIN(pad_len, OB_MAX_ORACLE_CHAR_LENGTH_BYTE) : pad_len;
-      if (OB_ISNULL(ptr = expr.get_str_res_mem(ctx, buf_len))) {
+      const int32_t buf_len = lib::is_oracle_mode() ? MIN(pad_len, OB_MAX_ORACLE_CHAR_LENGTH_BYTE) : pad_len;
+      if (OB_ISNULL(ptr = expr.get_str_res_mem(ctx, static_cast<int64_t>(buf_len)))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         STORAGE_LOG(WARN, "no memory", K(ret));
       } else {
@@ -476,9 +476,12 @@ int fill_exprs_lob_locator(
 int check_skip_by_monotonicity(
     sql::ObBlackFilterExecutor &filter,
     blocksstable::ObStorageDatum &min_datum,
+    const bool is_min_prefix,
     blocksstable::ObStorageDatum &max_datum,
+    const bool is_max_prefix,
     const sql::ObBitVector &skip_bit,
     const bool has_null,
+    const bool is_pad_coll,
     ObBitmap *result_bitmap,
     sql::ObBoolMask &bool_mask)
 {
@@ -497,11 +500,18 @@ int check_skip_by_monotonicity(
         bool filtered = false;
         ObStorageDatum &false_datum = is_asc ? max_datum : min_datum;
         ObStorageDatum &true_datum = is_asc ? min_datum : max_datum;
-        if (OB_FAIL(filter.filter(false_datum, skip_bit, filtered))) {
-          STORAGE_LOG(WARN, "Failed to compare with false_datum", K(ret), K(false_datum), K(is_asc));
-        } else if (filtered) {
-          bool_mask.set_always_false();
-        } else if (!has_null) {
+        const bool is_false_prefix = is_asc ? is_max_prefix : is_min_prefix;
+        const bool is_true_prefix = is_asc ? is_min_prefix : is_max_prefix;
+        // prefix less is not true less.
+        if (!is_false_prefix) {
+          if (OB_FAIL(filter.filter(false_datum, skip_bit, filtered))) {
+            STORAGE_LOG(WARN, "Failed to compare with false_datum", K(ret), K(false_datum), K(is_asc));
+          } else if (filtered) {
+            bool_mask.set_always_false();
+          }
+        }
+        // prefix greater is true greater.
+        if (OB_SUCC(ret) && bool_mask.is_uncertain() && !has_null && (!is_true_prefix || !is_pad_coll)) {
           if (OB_FAIL(filter.filter(true_datum, skip_bit, filtered))) {
             STORAGE_LOG(WARN, "Failed to compare with true_datum", K(ret), K(true_datum), K(is_asc));
           } else if (!filtered) {
@@ -516,15 +526,23 @@ int check_skip_by_monotonicity(
       case sql::PushdownFilterMonotonicity::MON_EQ_DESC: {
         bool min_cmp_res = false;
         bool max_cmp_res = false;
-        if (OB_FAIL(filter.judge_greater_or_less(min_datum, skip_bit, is_asc, min_cmp_res))) {
-          STORAGE_LOG(WARN, "Failed to judge min_datum", K(ret), K(min_datum));
-        } else if (min_cmp_res) {
-          bool_mask.set_always_false();
-        } else if (OB_FAIL(filter.judge_greater_or_less(max_datum, skip_bit, !is_asc, max_cmp_res))) {
-          STORAGE_LOG(WARN, "Failed to judge max_datum", K(ret), K(max_datum));
-        } else if (max_cmp_res) {
-          bool_mask.set_always_false();
-        } else if (!has_null) {
+        // prefix less is not true less, prefix greater is true greater.
+        if (!is_max_prefix || (!is_asc && !is_pad_coll)) {
+          if (OB_FAIL(filter.judge_greater_or_less(max_datum, skip_bit, !is_asc, max_cmp_res))) {
+            STORAGE_LOG(WARN, "Failed to judge max_datum", K(ret), K(max_datum));
+          } else if (max_cmp_res) {
+            bool_mask.set_always_false();
+          }
+        }
+        if (OB_SUCC(ret) && bool_mask.is_uncertain() && (!is_min_prefix || (is_asc && !is_pad_coll))) {
+          if (OB_FAIL(filter.judge_greater_or_less(min_datum, skip_bit, is_asc, min_cmp_res))) {
+            STORAGE_LOG(WARN, "Failed to judge min_datum", K(ret), K(min_datum));
+          } else if (min_cmp_res) {
+            bool_mask.set_always_false();
+          }
+        }
+        // prefix equal is not true equal.
+        if (OB_SUCC(ret) && bool_mask.is_uncertain() && !has_null && !is_min_prefix && !is_max_prefix) {
           if (OB_FAIL(filter.filter(min_datum, skip_bit, min_cmp_res))) {
             STORAGE_LOG(WARN, "Failed to compare with min_datum", K(ret), K(min_datum));
           } else if (min_cmp_res) {
@@ -574,7 +592,7 @@ int reverse_trans_version_val(common::ObDatum *datums, const int64_t count)
   return ret;
 }
 
-int reverse_trans_version_val(ObIVector *vector, const int64_t count)
+int reverse_trans_version_val(ObIVector *vector, const int64_t count, const int64_t vec_offset)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(nullptr == vector || count < 0)) {
@@ -590,7 +608,7 @@ int reverse_trans_version_val(ObIVector *vector, const int64_t count)
       STORAGE_LOG(WARN, "Unexpected vector", K(ret), K(fixed_length_base->has_null()), K(fixed_length_base->get_length()));
     } else {
       int64_t *ver_ptr = reinterpret_cast<int64_t *>(fixed_length_base->get_data());
-      for (int64_t i = 0; i < count; ++i) {
+      for (int64_t i = vec_offset; i < vec_offset + count; ++i) {
         ver_ptr[i] = -ver_ptr[i];
       }
     }
@@ -672,6 +690,7 @@ int get_query_begin_version_for_mlog(
   int64_t end_version = -1;
   ObEvalCtx::BatchInfoScopeGuard batch_info_guard(eval_ctx);
   batch_info_guard.set_batch_size(1);
+  batch_info_guard.set_batch_idx(0);
   for (int64_t i = 0; OB_SUCC(ret) && i < op_filters.count(); ++i) {
     if (OB_ISNULL(e = op_filters.at(i))) {
       ret = OB_ERR_UNEXPECTED;
@@ -735,6 +754,7 @@ int build_mview_scan_info_if_need(
     ObDatum *datum = NULL;
     ObEvalCtx::BatchInfoScopeGuard batch_info_guard(eval_ctx);
     batch_info_guard.set_batch_size(1);
+    batch_info_guard.set_batch_idx(0);
     for (int64_t i = 0; OB_SUCC(ret) && i < op_filters->count(); ++i) {
       if (OB_ISNULL(e = op_filters->at(i))) {
         ret = OB_ERR_UNEXPECTED;

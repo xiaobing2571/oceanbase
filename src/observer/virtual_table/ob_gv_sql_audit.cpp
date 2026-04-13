@@ -36,7 +36,11 @@ ObGvSqlAudit::ObGvSqlAudit() :
     is_use_index_(false),
     tenant_id_array_(),
     tenant_id_array_idx_(-1),
-    with_tenant_ctx_(nullptr)
+    with_tenant_ctx_(nullptr),
+    is_sys_tenant_(false),
+    enable_sql_audit_query_sql_(false),
+    enable_filter_pushdown_(false),
+    cur_record_(nullptr)
 {
 }
 
@@ -66,6 +70,10 @@ void ObGvSqlAudit::reset()
   addr_ = nullptr;
   port_ = 0;
   ipstr_.reset();
+  is_sys_tenant_ = false;
+  enable_sql_audit_query_sql_ = false;
+  enable_filter_pushdown_ = false;
+  cur_record_ = nullptr;
 }
 
 int ObGvSqlAudit::inner_open()
@@ -76,12 +84,23 @@ int ObGvSqlAudit::inner_open()
   if (is_sys_tenant(effective_tenant_id_)) {
     if (OB_FAIL(extract_tenant_ids())) {
       SERVER_LOG(WARN, "failed to extract tenant ids", KR(ret), K(effective_tenant_id_));
+    } else {
+      is_sys_tenant_ = true;
     }
   } else {
     // user tenant show self tenant sql audit
     if (OB_FAIL(tenant_id_array_.push_back(effective_tenant_id_))) {
       SERVER_LOG(WARN, "failed to push back tenant", KR(ret), K(effective_tenant_id_));
     }
+  }
+
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+  if (OB_UNLIKELY(!tenant_config.is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    SERVER_LOG(WARN, "fail to get tenant config", K(ret));
+  } else {
+    enable_sql_audit_query_sql_ = tenant_config->_enable_sql_audit_query_sql;
+    enable_filter_pushdown_ = !is_use_index_ && tenant_config->_enable_sql_audit_filter_pushdown;
   }
 
   SERVER_LOG(DEBUG, "tenant ids", K(effective_tenant_id_), K(tenant_id_array_));
@@ -158,6 +177,21 @@ int ObGvSqlAudit::check_ip_and_port(bool &is_valid)
 
   return ret;
 }
+
+int ObGvSqlAudit::fill_full_columns(common::ObNewRow *&row)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(cur_record_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SERVER_LOG(WARN, "is null", K(ret));
+  } else if (OB_FAIL(fill_cells(*cur_record_))) {
+    SERVER_LOG(WARN, "failed to fill cells", K(ret));
+  } else {
+    row = &cur_row_;
+  }
+  return ret;
+}
+
 int ObGvSqlAudit::inner_get_next_row(common::ObNewRow *&row)
 {
   int ret = OB_SUCCESS;
@@ -277,6 +311,7 @@ int ObGvSqlAudit::inner_get_next_row(common::ObNewRow *&row)
   }
 
   if (OB_SUCC(ret)) {
+    cur_record_ = NULL;
     void *rec = NULL;
     if (ref_.is_not_null()) {
       cur_mysql_req_mgr_->revert(&ref_);
@@ -294,9 +329,9 @@ int ObGvSqlAudit::inner_get_next_row(common::ObNewRow *&row)
 
     if (OB_SUCC(ret)) {
       if (NULL != rec) {
-        ObMySQLRequestRecord *record = static_cast<ObMySQLRequestRecord*> (rec);
+        cur_record_ = static_cast<ObMySQLRequestRecord*> (rec);
 
-        if (OB_FAIL(fill_cells(*record))) {
+        if (OB_FAIL(fill_cells(*cur_record_))) {
           SERVER_LOG(WARN, "failed to fill cells", K(ret));
         } else {
           //finish fetch one row
@@ -537,7 +572,10 @@ bool ObGvSqlAudit::is_perf_event_dep_field(uint64_t col_id) {
     case BLOCKSCAN_BLOCK_CNT:
     case BLOCKSCAN_ROW_CNT:
     case PUSHDOWN_STORAGE_FILTER_ROW_CNT:
-    case NETWORK_WAIT_TIME: {
+    case NETWORK_WAIT_TIME:
+    case TX_TABLE_READ_CNT:
+    case OUTROW_LOB_CNT:
+    case SS_OBJECT_STORAGE_READS: {
       is_contain = true;
       break;
     }
@@ -549,20 +587,19 @@ bool ObGvSqlAudit::is_perf_event_dep_field(uint64_t col_id) {
   return is_contain;
 }
 
-
 int ObGvSqlAudit::fill_cells(obmysql::ObMySQLRequestRecord &record)
 {
   int ret = OB_SUCCESS;
-  const int64_t col_count = output_column_ids_.count();
   ObObj *cells = cur_row_.cells_;
   const bool is_perf_event_closed = record.data_.is_perf_event_closed_;
 
-  if (OB_ISNULL(cells) || OB_ISNULL(allocator_)) {
+  if (OB_ISNULL(cells) || OB_ISNULL(allocator_) || OB_ISNULL(fill_column_ids_)) {
     ret = OB_INVALID_ARGUMENT;
     SERVER_LOG(WARN, "invalid argument", K(cells));
   } else {
+    const int64_t col_count = fill_column_ids_->count();
     for (int64_t cell_idx = 0; OB_SUCC(ret) && cell_idx < col_count; cell_idx++) {
-      uint64_t col_id = output_column_ids_.at(cell_idx);
+      uint64_t col_id = fill_column_ids_->at(cell_idx);
       if (is_perf_event_closed && is_perf_event_dep_field(col_id)) {
         cells[cell_idx].set_null();
       } else {
@@ -628,7 +665,7 @@ int ObGvSqlAudit::fill_cells(obmysql::ObMySQLRequestRecord &record)
           break;
         }
         case USER_CLIENT_PORT: {
-          cells[cell_idx].set_int(0);
+          cells[cell_idx].set_int(record.data_.user_client_addr_.get_port());
         } break;
         case TENANT_ID: {
           cells[cell_idx].set_int(record.data_.tenant_id_);
@@ -679,26 +716,44 @@ int ObGvSqlAudit::fill_cells(obmysql::ObMySQLRequestRecord &record)
                                               ObCharset::get_default_charset()));
         } break;
         case QUERY_SQL: {
-          ObCollationType src_cs_type = ObCharset::is_valid_collation(record.data_.sql_cs_type_) ?
-                record.data_.sql_cs_type_ : ObCharset::get_system_collation();
-          ObString src_string(static_cast<int64_t>(record.data_.sql_len_), record.data_.sql_);
-          ObString dst_string;
-          if (OB_FAIL(ObCharset::charset_convert(row_calc_buf_,
-                                                        src_string,
-                                                        src_cs_type,
-                                                        ObCharset::get_system_collation(),
-                                                        dst_string,
-                                                        ObCharset::REPLACE_UNKNOWN_CHARACTER))) {
-            SERVER_LOG(WARN, "fail to convert sql string", K(ret));
+          if (is_sys_tenant_ || enable_sql_audit_query_sql_) {
+            ObCollationType src_cs_type = ObCharset::is_valid_collation(record.data_.sql_cs_type_) ?
+            record.data_.sql_cs_type_ : ObCharset::get_system_collation();
+            ObString src_string(static_cast<int64_t>(record.data_.sql_len_), record.data_.sql_);
+            ObString dst_string;
+            if (OB_FAIL(ObCharset::charset_convert(row_calc_buf_,
+                                                          src_string,
+                                                          src_cs_type,
+                                                          ObCharset::get_system_collation(),
+                                                          dst_string,
+                                                          ObCharset::REPLACE_UNKNOWN_CHARACTER))) {
+              SERVER_LOG(WARN, "fail to convert sql string", K(ret));
+            } else {
+              cells[cell_idx].set_lob_value(ObLongTextType, dst_string.ptr(),
+                                            min(dst_string.length(), OB_MAX_PACKET_LENGTH));
+              cells[cell_idx].set_collation_type(ObCharset::get_default_collation(
+                                                  ObCharset::get_default_charset()));
+            }
           } else {
-            cells[cell_idx].set_lob_value(ObLongTextType, dst_string.ptr(),
-                                          min(dst_string.length(), OB_MAX_PACKET_LENGTH));
+            cells[cell_idx].set_lob_value(ObLongTextType, "", 0);
             cells[cell_idx].set_collation_type(ObCharset::get_default_collation(
-                                                ObCharset::get_default_charset()));
+                                              ObCharset::get_default_charset()));
           }
         } break;
         case TRANS_STATUS: {
-          cells[cell_idx].set_null();
+          if (record.data_.trans_status_ == 1) {
+            cells[cell_idx].set_varchar("Transaction not opened");
+            cells[cell_idx].set_default_collation_type();
+          } else if (record.data_.trans_status_ == 2) {
+            cells[cell_idx].set_varchar("Enable implicit transactions");
+            cells[cell_idx].set_default_collation_type();
+          } else if (record.data_.trans_status_ == 3) {
+            cells[cell_idx].set_varchar("Enable committable transaction");
+            cells[cell_idx].set_default_collation_type();
+          } else {
+            cells[cell_idx].set_varchar("Unknown status");
+            cells[cell_idx].set_default_collation_type();
+          }
         } break;
         case PLAN_ID: {
           cells[cell_idx].set_int(record.data_.plan_id_);
@@ -961,6 +1016,7 @@ int ObGvSqlAudit::fill_cells(obmysql::ObMySQLRequestRecord &record)
         } break;
         case SCHED_INFO: {
           //
+          cells[cell_idx].set_null();
           cells[cell_idx].set_default_collation_type();
         } break;
         case PS_CLIENT_STMT_ID: {
@@ -995,6 +1051,7 @@ int ObGvSqlAudit::fill_cells(obmysql::ObMySQLRequestRecord &record)
           break;
         }
         case OB_TRACE_INFO: {
+          cells[cell_idx].set_null();
           cells[cell_idx].set_default_collation_type();
         } break;
         case PLAN_HASH: {
@@ -1051,6 +1108,17 @@ int ObGvSqlAudit::fill_cells(obmysql::ObMySQLRequestRecord &record)
           } else {
             int64_t len = pl_trace_id.to_string(pl_trace_id_, sizeof(pl_trace_id_));
             cells[cell_idx].set_varchar(pl_trace_id_, len);
+            cells[cell_idx].set_collation_type(ObCharset::get_default_collation(
+                ObCharset::get_default_charset()));
+          }
+        } break;
+        case PARENT_TRACE_ID: {
+          const ObCurTraceId::TraceId &parent_trace_id = record.data_.parent_trace_id_;
+          if (parent_trace_id.is_invalid()) {
+            cells[cell_idx].set_null();
+          } else {
+            int64_t len = parent_trace_id.to_string(parent_trace_id_, sizeof(parent_trace_id_));
+            cells[cell_idx].set_varchar(parent_trace_id_, len);
             cells[cell_idx].set_collation_type(ObCharset::get_default_collation(
                 ObCharset::get_default_charset()));
           }
@@ -1118,13 +1186,25 @@ int ObGvSqlAudit::fill_cells(obmysql::ObMySQLRequestRecord &record)
           cells[cell_idx].set_int(record.data_.plsql_compile_time_);
         } break;
         case CCL_RULE_ID: {
-          cells[cell_idx].set_int(0);
+          cells[cell_idx].set_int(record.data_.ccl_rule_id_);
         } break;
         case CCL_MATCH_TIME: {
-          cells[cell_idx].set_int(0);
+          cells[cell_idx].set_int(record.data_.ccl_match_time_);
         } break;
         case INSERT_DUPLICATE_ROW_COUNT: {
           cells[cell_idx].set_int(record.data_.insert_update_or_replace_duplicate_row_count_);
+        } break;
+        case COMMIT_TIME: {
+          cells[cell_idx].set_int(record.data_.exec_timestamp_.commit_t_);
+        } break;
+        case TX_TABLE_READ_CNT: {
+          cells[cell_idx].set_int(record.data_.exec_record_.tx_table_read_cnt_);
+        } break;
+        case OUTROW_LOB_CNT: {
+          cells[cell_idx].set_int(record.data_.exec_record_.outrow_lob_cnt_);
+        } break;
+        case SS_OBJECT_STORAGE_READS: {
+          cells[cell_idx].set_int(record.data_.exec_record_.ss_read_object_storage_count_);
         } break;
         default: {
           ret = OB_ERR_UNEXPECTED;

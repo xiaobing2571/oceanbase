@@ -33,7 +33,7 @@ public:
   static void set_whole_range(ObNewRange &scan_range, common::ObTableID table_id);
   static int get_distance_expr_type(ObExpr &expr, ObEvalCtx &ctx, ObExprVectorDistance::ObVecDisType &dis_type);
   static int get_real_search_vec(common::ObIAllocator &allocator,
-                                 ObDASSortRtDef *sort_rtdef,
+                                 ObEvalCtx *eval_ctx,
                                  ObExpr *origin_vec,
                                  ObString &real_search_vec);
   static int init_limit(const ObDASVecAuxScanCtDef *ir_ctdef,
@@ -48,6 +48,12 @@ public:
                        const common::ObLimitParam &limit_param,
                        ObExpr *&search_vec,
                        ObExpr *&distance_calc);
+  static int init_sort_of_hybrid_index(ObIAllocator &allocator,
+                                       const ObDASVecAuxScanCtDef *ir_ctdef,
+                                       const ObDASSortCtDef *sort_ctdef,
+                                       ObDASSortRtDef *sort_rtdef,
+                                       ObString &hybrid_search_vec,
+                                       ObExpr *&distance_calc);
   static int reuse_iter(const share::ObLSID &ls_id,
                         ObDASScanIter *iter,
                         ObTableScanParam &scan_param,
@@ -59,7 +65,8 @@ public:
                              transaction::ObTxDesc *tx_desc,
                              transaction::ObTxReadSnapshot *snapshot,
                              ObTableScanParam &scan_param,
-                             bool is_get = true);
+                             bool is_get = true,
+                             ObIAllocator *allocator = nullptr);
   static int init_vec_aux_scan_param(const share::ObLSID &ls_id,
                                       const common::ObTabletID &tablet_id,
                                       const sql::ObDASScanCtDef *ctdef,
@@ -67,7 +74,8 @@ public:
                                       transaction::ObTxDesc *tx_desc,
                                       transaction::ObTxReadSnapshot *snapshot,
                                       ObTableScanParam &scan_param,
-                                      bool is_get = false);
+                                      bool is_get = false,
+                                      ObIAllocator *scan_allocator = nullptr);
   static int get_rowkey(ObIAllocator &allocator, const ObDASScanCtDef * ctdef, ObDASScanRtDef *rtdef, ObRowkey *&rowkey);
 
   static int get_rowkey_pre_filter(ObIAllocator &allocator,
@@ -76,6 +84,10 @@ public:
                                    const ObDASScanCtDef *ctdef,
                                    ObDASScanRtDef *rtdef,
                                    ObIArray<ObRowkey *> &rowkeys);
+  static int get_distance_threshold_hnsw(ObExpr &expr,
+                                         float &similarity_threshold,
+                                         float &distance_threshold);
+  static int check_ivf_support_similarity_threshold(ObExpr &expr);
 };
 
 }  // namespace sql

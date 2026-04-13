@@ -102,19 +102,13 @@ int ObSSTableRebuildMicroBlockIter::open_next_macro_block()
 
 int ObSSTableRebuildMicroBlockIter::get_next_micro_block(
     ObMicroBlockDesc &micro_block_desc,
-    ObMicroIndexInfo &micro_index_info)
+    ObMicroIndexData &micro_index_data)
 {
   int ret = OB_SUCCESS;
   allocator_.reuse();
-  if (OB_FAIL(mirco_block_iter_.get_next_micro_block_desc(micro_block_desc, micro_index_info, allocator_))) {
+  if (OB_FAIL(mirco_block_iter_.get_next_micro_block_desc(micro_block_desc, micro_index_data, allocator_))) {
     if (OB_ITER_END != ret) {
       LOG_WARN("failed to get next micro block desc", K(ret));
-    }
-  } else {
-    micro_index_info.parent_macro_id_ = get_curr_macro_handle().get_macro_id();
-    if (OB_UNLIKELY(!micro_index_info.is_valid())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected iterated invalid micro index info", K(ret));
     }
   }
   return ret;
@@ -188,8 +182,11 @@ int ObSSTableBuilder::build_sstable_merge_res(
   const int64_t input_macro_seq = macro_start_seq;
   const ObMergeType merge_type = data_store_desc_.get_desc().get_merge_type();
   if (GCTX.is_shared_storage_mode()
-      && is_output_exec_mode(data_store_desc_.get_desc().get_exec_mode())
-      && (is_major_merge_type(merge_type) || is_minor_merge_type(merge_type))) {
+      && !is_local_with_private_block_mode(data_store_desc_.get_desc().get_exec_mode())
+      && (is_major_merge_type(merge_type)
+      || is_minor_merge_type(merge_type)
+      || is_mds_minor_merge(merge_type)
+      || is_mini_merge(merge_type))) {
 #ifdef OB_BUILD_SHARED_STORAGE
     // no need to rebuild sstable in shared storage mode
     if (OB_FAIL(index_builder_.close_with_macro_seq(
@@ -204,6 +201,12 @@ int ObSSTableBuilder::build_sstable_merge_res(
     ret = OB_NOT_SUPPORTED;
 #endif
   } else {
+    if (OB_NOT_NULL(rebuilder_ptr_)) {
+      rebuilder_ptr_->~ObSSTableRebuilder();
+      allocator_.free(rebuilder_ptr_);
+      rebuilder_ptr_ = nullptr;
+      LOG_INFO("reset rebuilder ptr", K(rebuilder_ptr_));
+    }
     // TODO temp solution, use different sstable builder in different mode
     void *buf = NULL;
     if (OB_ISNULL(buf = allocator_.alloc(sizeof(ObSSTableRebuilder)))) {
@@ -307,10 +310,13 @@ int ObSSTableRebuilder::open_macro_writer(const share::ObPreWarmerParam &pre_war
   ObMacroSeqParam macro_seq_param;
   macro_seq_param.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC;
   macro_seq_param.start_ = macro_start_seq.macro_data_seq_;
-
-  if (OB_FAIL(macro_writer_.open(
+  ObISSTableObjectCleaner *object_cleaner = rebuild_index_builder_.get_object_cleaner();
+  if (OB_ISNULL(object_cleaner)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("object cleaner is nullptr", K(ret));
+  } else if (OB_FAIL(macro_writer_.open(
           data_store_desc_.get_desc(), 0 /*parallel_idx*/, macro_seq_param,
-          pre_warm_param, rebuild_index_builder_.get_private_object_cleaner()))) {
+          pre_warm_param, *object_cleaner))) {
     STORAGE_LOG(WARN, "failed to open macro writer", K(ret), K(data_store_desc_));
   }
 
@@ -340,7 +346,7 @@ int ObSSTableRebuilder::check_need_rebuild(const ObStaticMergeParam &merge_param
   int ret = OB_SUCCESS;
   macro_id_array.reset();
   multiplexed_macro_block_count = 0;
-  const int64_t snapshot_version = merge_param.scn_range_.end_scn_.get_val_for_tx();
+  const int64_t snapshot_version = merge_param.get_compaction_scn();
   blocksstable::ObDataMacroBlockMeta macro_meta;
   blocksstable::MacroBlockId last_macro_id;
   int64_t last_macro_block_sum = 0;
@@ -465,17 +471,17 @@ int ObSSTableRebuilder::rewrite_macro_block(ObSSTableRebuildMicroBlockIter &micr
 {
   int ret = OB_SUCCESS;
   ObMicroBlockDesc micro_block_desc;
-  ObMicroIndexInfo micro_index_info;
+  ObMicroIndexData micro_index_data;
 
   while (OB_SUCC(ret)) {
-    if (OB_FAIL(micro_iter.get_next_micro_block(micro_block_desc, micro_index_info))) {
+    if (OB_FAIL(micro_iter.get_next_micro_block(micro_block_desc, micro_index_data))) {
       if (ret == OB_ITER_END) {
         ret = OB_SUCCESS;
         break;
       } else {
         STORAGE_LOG(WARN, "fail to get next micro block", K(ret), K(micro_iter));
       }
-    } else if (OB_FAIL(macro_writer_.append_micro_block(micro_block_desc, micro_index_info))) {
+    } else if (OB_FAIL(macro_writer_.append_micro_block(micro_block_desc, micro_index_data))) {
       STORAGE_LOG(WARN, "fail to append micro", K(ret), K(micro_block_desc), K(macro_writer_));
     }
   }

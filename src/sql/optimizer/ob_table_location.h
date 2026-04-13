@@ -260,7 +260,8 @@ public:
   };
 
   ObPLFuncValueNode(common::ObIAllocator &allocator)
-    : ObPartLocCalcNode(allocator)
+    : ObPartLocCalcNode(allocator),
+      param_value_(allocator)
   {
     set_node_type(FUNC_VALUE);
   }
@@ -271,7 +272,7 @@ public:
                         ObPartLocCalcNode *&other) const;
   virtual int add_part_calc_node(common::ObIArray<ObPartLocCalcNode*> &calc_nodes);
   ValueItemExpr vie_;
-  common::ObSEArray<ParamValuePair, 3, common::ModulePageAllocator, false> param_value_;
+  ObSqlArray<ParamValuePair> param_value_;
 };
 
 struct ObPLColumnValueNode : public ObPartLocCalcNode
@@ -438,17 +439,17 @@ public:
     RANGE,
     LIST,
   };
-  typedef common::ObIArray<ObTempExpr *> ISeKeyExprs;
   typedef common::ObIArray<ValueItemExpr> ISeValueItemExprs;
-  typedef common::ObSEArray<ObTempExpr *, 32, common::ModulePageAllocator, false> SeKeyExprs;
-  typedef common::ObSEArray<ValueItemExpr, 32, common::ModulePageAllocator, false> SeValueItemExprs;
+  typedef ObSqlArray<ValueItemExpr> SeValueItemExprs;
 
   class PartProjector
   {
     OB_UNIS_VERSION(1);
   public:
     PartProjector(common::ObIAllocator &allocator)
-      : allocator_(allocator)
+      : se_virtual_column_exprs_(allocator),
+        virtual_column_result_idx_(allocator),
+        allocator_(allocator)
     {
       reset();
     }
@@ -494,16 +495,11 @@ public:
     int64_t part_projector_size_;
     int32_t *subpart_projector_;
     int64_t subpart_projector_size_;
-    common::ObSEArray<ObTempExpr *, 2> se_virtual_column_exprs_;
-    common::ObSEArray<int64_t, 2> virtual_column_result_idx_;
+    ObSqlArray<ObTempExpr *> se_virtual_column_exprs_;
+    ObSqlArray<int64_t> virtual_column_result_idx_;
 
     common::ObIAllocator &allocator_;
   };
-
-  int get_location_type(
-      const common::ObAddr &server,
-      const ObCandiTabletLocIArray &phy_part_loc_info_list,
-      ObTableLocationType &location_type) const;
 
   //get virtual talbe partition ids or fake id. ref_table_id should be partitioned virtual table
   //@param [in] ref_table_id partitioned virtual table
@@ -532,12 +528,15 @@ public:
     table_type_(share::schema::MAX_TABLE_TYPE),
     inner_allocator_(common::ObModIds::OB_SQL_TABLE_LOCATION),
     allocator_(inner_allocator_),
-    loc_meta_(inner_allocator_),
+    loc_meta_(allocator_),
     calc_node_(NULL),
     gen_col_node_(NULL),
     subcalc_node_(NULL),
     sub_gen_col_node_(NULL),
+    calc_nodes_(allocator_),
     stmt_type_(stmt::T_NONE),
+    vies_(allocator_),
+    sub_vies_(allocator_),
     se_part_expr_(NULL),
     se_gen_col_expr_(NULL),
     se_subpart_expr_(NULL),
@@ -585,10 +584,10 @@ public:
     gen_col_node_(NULL),
     subcalc_node_(NULL),
     sub_gen_col_node_(NULL),
-    calc_nodes_(common::OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(allocator_)),
+    calc_nodes_(allocator_),
     stmt_type_(stmt::T_NONE),
-    vies_(common::OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(allocator_)),
-    sub_vies_(common::OB_MALLOC_NORMAL_BLOCK_SIZE, common::ModulePageAllocator(allocator_)),
+    vies_(allocator_),
+    sub_vies_(allocator_),
     se_part_expr_(NULL),
     se_gen_col_expr_(NULL),
     se_subpart_expr_(NULL),
@@ -617,10 +616,6 @@ public:
   {
   }
   virtual ~ObTableLocation() { reset(); }
-
-  ObTableLocation(const ObTableLocation &other);
-
-  ObTableLocation &operator=(const ObTableLocation &other);
 
   int assign(const ObTableLocation &other);
 
@@ -657,7 +652,8 @@ public:
            const common::ObDataTypeCastParams &dtc_params,
            const bool is_dml_table,
            common::ObIArray<ObRawExpr*> *sort_exprs = NULL);
-  int init(const share::schema::ObTableSchema *table_schema,
+  int init(ObSchemaGetterGuard &schema_guard,
+           const share::schema::ObTableSchema *table_schema,
            const ObDMLStmt &stmt,
            ObExecContext *exec_ctx,
            const common::ObIArray<ObRawExpr*> &filter_exprs,
@@ -778,6 +774,8 @@ public:
   bool is_non_partition_optimized() const { return is_non_partition_optimized_; }
 
   share::schema::ObPartitionLevel get_part_level() const { return part_level_; }
+  share::schema::ObPartitionFuncType get_part_func_type() const { return part_type_; }
+  share::schema::ObPartitionFuncType get_subpart_func_type() const { return subpart_type_; }
 
   const stmt::StmtType &get_stmt_type() const { return stmt_type_; }
   int replace_ref_table_id(const uint64_t index_table_id, ObExecContext &exec_ctx);
@@ -787,6 +785,7 @@ public:
   bool has_generated_column() const { return NULL != se_gen_col_expr_ || NULL != se_sub_gen_col_expr_ ||
                                              NULL != gen_col_node_ || NULL != sub_gen_col_node_; }
   static int get_full_leader_table_loc(ObDASLocationRouter &loc_router,
+                                       ObSQLSessionInfo &session_info,
                                        ObIAllocator &allocator,
                                        uint64_t tenant_id,
                                        uint64_t table_id,
@@ -874,12 +873,19 @@ public:
   {
     check_no_partition_ = check;
   }
+
+  static bool can_use_table_location(share::ObLakeTableFormat format);
   TO_STRING_KV(K_(loc_meta),
                K_(part_projector),
                K_(has_dynamic_exec_param),
                K_(part_hint_ids),
                K_(related_list));
 private:
+  static int get_tablet_id_for_temp_table(
+      ObSQLSessionInfo &session_info,
+      ObSchemaGetterGuard &schema_guard,
+      const share::schema::ObTableSchema &table_schema,
+      common::ObTabletID &tablet_id);
   int init_table_location(ObExecContext &exec_ctx,
                           ObSqlSchemaGuard &schema_guard,
                           uint64_t table_id,
@@ -1073,7 +1079,8 @@ private:
                              ObExecContext *exec_ctx,
                              ObQueryCtx *query_ctx,
                              const bool is_in_range_optimization_enabled,
-                             const bool use_new_query_range);
+                             const bool use_new_query_range,
+                             const ObTableSchema *table_schema);
 
   int analyze_filter(const common::ObIArray<ColumnItem> &partition_columns,
                      const ObRawExpr *partition_expr,
@@ -1100,7 +1107,8 @@ private:
                                const ObIArray<ObRawExpr*> &filter_exprs,
                                bool &always_true,
                                ObPartLocCalcNode *&calc_node,
-                               ObExecContext *exec_ctx);
+                               ObExecContext *exec_ctx,
+                               const ObTableSchema* table_schema);
 
   int extract_eq_op(ObExecContext *exec_ctx,
                     const ObRawExpr *l_expr,
@@ -1190,7 +1198,8 @@ private:
                              bool &get_all,
                              bool &is_range_get,
                              const bool is_in_range_optimization_enabled,
-                             const bool use_new_query_range);
+                             const bool use_new_query_range,
+                             const ObTableSchema *table_schema);
 
   int calc_partition_ids_by_in_expr(
                    ObExecContext &exec_ctx,
@@ -1277,6 +1286,8 @@ public:
     return part_hint_ids_;
   }
 private:
+  DISALLOW_COPY_AND_ASSIGN(ObTableLocation);
+private:
   bool inited_;
   bool is_partitioned_;
   share::schema::ObPartitionLevel part_level_;
@@ -1297,7 +1308,7 @@ private:
   ObPartLocCalcNode *subcalc_node_;//二级分区分区计算Node
   ObPartLocCalcNode *sub_gen_col_node_;//query range node of column dependented by sub partition generated column
 
-  common::ObSEArray<ObPartLocCalcNode *, 5, common::ModulePageAllocator, false> calc_nodes_;
+  ObSqlArray<ObPartLocCalcNode *> calc_nodes_;
   stmt::StmtType stmt_type_;
 
   SeValueItemExprs vies_;

@@ -130,6 +130,23 @@ public:
   TO_STRING_KV(K(package_id_), K(state_version_), K(var_type_), K(var_idx_));
 };
 
+class ObPLPackageVarMetaInfo
+{
+public:
+  ObPLType type_;
+  bool is_not_null_;
+  bool is_run_status_; // for profile and codecoverage
+
+  ObPLPackageVarMetaInfo()
+      : type_(PL_INVALID_TYPE), is_not_null_(false), is_run_status_(false) {}
+
+  ObPLPackageVarMetaInfo(ObPLType type, bool is_not_null, bool is_run_status)
+      : type_(type), is_not_null_(is_not_null), is_run_status_(is_run_status) {}
+  virtual ~ObPLPackageVarMetaInfo() {}
+
+  TO_STRING_KV(K(type_), K(is_not_null_), K(is_run_status_));
+};
+
 class ObPLPackageState
 {
 public:
@@ -143,31 +160,36 @@ public:
         state_version_(state_version),
         serially_reusable_(serially_reusable),
         changed_vars_(),
-        types_(),
+        meta_infos_(),
         vars_(),
-        has_instantiated_(false) {
-        types_.set_attr(SET_IGNORE_MEM_VERSION(lib::ObMemAttr(MTL_ID(), "PLPkgTypes")));
+        has_instantiated_(false),
+        tenant_schema_version_(OB_INVALID_VERSION),
+        is_dbms_profiler_(false),
+        is_dbms_plsql_code_coverage_(false) {
+        meta_infos_.set_attr(SET_IGNORE_MEM_VERSION(lib::ObMemAttr(MTL_ID(), "PLPkgMetaInfos")));
         vars_.set_attr(SET_IGNORE_MEM_VERSION(lib::ObMemAttr(MTL_ID(), "PLPkgVars")));
         }
   virtual ~ObPLPackageState()
   {
     package_id_ = common::OB_INVALID_ID;
     changed_vars_.reset();
-    types_.reset();
+    meta_infos_.reset();
     vars_.reset();
     inner_allocator_.reset();
     cursor_allocator_.reset();
     has_instantiated_ = false;
+    is_dbms_profiler_ = false;
+    is_dbms_plsql_code_coverage_ = false;
   }
   int init();
   void reset(sql::ObSQLSessionInfo *session_info);
   common::ObIAllocator &get_pkg_allocator() { return inner_allocator_; }
   common::ObIAllocator &get_pkg_cursor_allocator() { return cursor_allocator_; }
-  int add_package_var_val(const common::ObObj &value, ObPLType type);
-  int set_package_var_val(int64_t var_idx, const common::ObObj &value,
-                          const ObPLResolveCtx &resolve_ctx, bool deep_copy_complex = true);
+  int add_package_var_val(const common::ObObj &value, ObPLPackageVarMetaInfo &meta_info);
+  int set_package_var_val(int64_t var_idx, const common::ObObj &value, bool deep_copy_complex = true);
   int get_package_var_val(int64_t var_idx, common::ObObj &value);
   int update_changed_vars(int64_t var_idx);
+  int get_package_var_meta_info(int64_t var_idx, ObPLPackageVarMetaInfo &meta_info);
   inline bool is_package_info_changed()
   {
     return (!changed_vars_.is_empty() && !serially_reusable_) ? true : false;
@@ -188,32 +210,29 @@ public:
                             const ObPLPackage *body,
                             bool &match);
 
-  int convert_changed_info_to_string_kvs(ObPLExecCtx &pl_ctx,
+  int convert_changed_info_to_string_kvs(ObSQLSessionInfo &session,
+                                         ObIAllocator &allocator,
                                          common::ObIArray<common::ObString> &key,
                                          common::ObIArray<common::ObObj> &value);
   int make_pkg_var_kv_key(common::ObIAllocator &alloc,
                           int64_t var_idx,
                           PackageVarType var_type,
                           common::ObString &key);
-  int make_pkg_var_kv_value(ObPLExecCtx &pl_ctx,
-                          ObPLResolveCtx &resolve_ctx,
+  int make_pkg_var_kv_value(ObPLResolveCtx &resolve_ctx,
                           common::ObObj &var_val,
                           int64_t var_idx,
                           common::ObObj &value);
   int encode_pkg_var_key(ObIAllocator &alloc, ObString &key);
-  int encode_pkg_var_value(ObPLExecCtx &pl_ctx,
-                           ObPLResolveCtx &resolve_ctx,
+  int encode_pkg_var_value(ObPLResolveCtx &resolve_ctx,
                            common::ObString &key,
                            common::ObObj &value,
                            ObIArray<ObString> &old_keys);
-  int convert_info_to_string_kv(ObPLExecCtx &pl_ctx,
-                                ObPLResolveCtx &resolve_ctx,
+  int convert_info_to_string_kv(ObPLResolveCtx &resolve_ctx,
                                 int64_t var_idx,
                                 PackageVarType var_type,
                                 common::ObString &key,
                                 common::ObObj &value);
-  int encode_info_to_string_kvs(ObPLExecCtx &pl_ctx,
-                                ObPLResolveCtx &resolve_ctx,
+  int encode_info_to_string_kvs(ObPLResolveCtx &resolve_ctx,
                                 common::ObString &key,
                                 common::ObObj &value,
                                 ObIArray<ObString> &old_keys);
@@ -222,7 +241,7 @@ public:
                                   hash::ObHashMap<int64_t, ObPackageVarEncodeInfo> &value_map);
   inline bool get_serially_reusable() const { return serially_reusable_; }
   int remove_user_variables_for_package_state(sql::ObSQLSessionInfo &session);
-  int check_package_state_valid(sql::ObExecContext &exec_ctx, ObPLResolveCtx &resolve_ctx, bool &valid);
+  int check_package_state_valid(ObPLResolveCtx &resolve_ctx, bool &valid);
   uint64_t get_package_id() { return package_id_; }
 
   ObIArray<ObObj> &get_vars() { return vars_; }
@@ -238,6 +257,13 @@ public:
   void set_has_instantiated(bool init) { has_instantiated_ = true; }
   bool has_instantiated() const { return has_instantiated_; }
 
+  int64_t get_tenant_schema_version() const { return tenant_schema_version_; }
+  void set_tenant_schema_version(int64_t tenant_schema_version) { tenant_schema_version_ = tenant_schema_version; }
+  void set_is_dbms_profiler(bool is_dbms_profiler) { is_dbms_profiler_ = is_dbms_profiler; }
+  void set_is_dbms_plsql_code_coverage(bool is_dbms_plsql_code_coverage) { is_dbms_plsql_code_coverage_ = is_dbms_plsql_code_coverage; }
+  bool is_dbms_profiler() const { return is_dbms_profiler_; }
+  bool is_dbms_plsql_code_coverage() const { return is_dbms_plsql_code_coverage_; }
+
   TO_STRING_KV(K(package_id_), K(serially_reusable_), K(state_version_));
 
 private:
@@ -249,9 +275,12 @@ private:
   ObPackageStateVersion state_version_;
   bool serially_reusable_;
   common::ObBitSet<> changed_vars_;
-  common::ObSEArray<ObPLType, 64> types_;
+  common::ObSEArray<ObPLPackageVarMetaInfo, 64> meta_infos_;
   common::ObSEArray<ObObj, 64> vars_;
   bool has_instantiated_;
+  int64_t tenant_schema_version_;
+  bool is_dbms_profiler_;
+  bool is_dbms_plsql_code_coverage_;
 };
 } //end namespace pl
 } //end namespace oceanbase

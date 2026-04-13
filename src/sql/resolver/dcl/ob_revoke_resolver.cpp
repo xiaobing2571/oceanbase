@@ -352,6 +352,7 @@ int ObRevokeResolver::resolve_mysql(const ParseNode &parse_tree)
             ObString db = ObString::make_string("");
             ObString table = ObString::make_string("");
             ObString catalog = ObString::make_string("");
+            ObString sensitive_rule = ObString::make_string("");
             if (priv_object_node != NULL
                 && OB_FAIL(ObGrantResolver::resolve_priv_level_with_object_type(session_info_,
                                                                                 priv_object_node,
@@ -366,13 +367,16 @@ int ObRevokeResolver::resolve_mysql(const ParseNode &parse_tree)
                         table,
                         grant_level,
                         *allocator_,
-                        catalog))) {
+                        catalog,
+                        sensitive_rule))) {
               LOG_WARN("Resolve priv_level node error", K(ret));
             } else {
               revoke_stmt->set_grant_level(grant_level);
             }
 
-            if (OB_SUCC(ret) && grant_level != OB_PRIV_CATALOG_LEVEL) {
+            if (OB_SUCC(ret)
+                && grant_level != OB_PRIV_CATALOG_LEVEL
+                && grant_level != OB_PRIV_SENSITIVE_RULE_LEVEL) {
               if (OB_FAIL(check_and_convert_name(db, table))) {
                 LOG_WARN("Check and convert name error", K(db), K(table), K(ret));
               } else if (OB_FAIL(revoke_stmt->set_database_name(db))) {
@@ -381,13 +385,13 @@ int ObRevokeResolver::resolve_mysql(const ParseNode &parse_tree)
                 LOG_WARN("Failed to set table_name to revoke_stmt", K(ret));
               }
             }
-
             if (OB_SUCC(ret) && OB_FAIL(ObGrantResolver::resolve_priv_object(priv_object_node,
                                                                              revoke_stmt,
                                                                              params_.schema_checker_,
                                                                              db,
                                                                              table,
                                                                              catalog,
+                                                                             sensitive_rule,
                                                                              tenant_id,
                                                                              allocator_,
                                                                              false))) {
@@ -465,7 +469,7 @@ int ObRevokeResolver::resolve_mysql(const ParseNode &parse_tree)
                      && ((priv_set & OB_PRIV_ENCRYPT) != 0 || (priv_set & OB_PRIV_DECRYPT) != 0)) {
             ret = OB_NOT_SUPPORTED;
             LOG_WARN("grammar is not support when MIN_DATA_VERSION is below DATA_VERSION_4_2_5_1 or 4_3_5_1", K(ret));
-            LOG_USER_ERROR(OB_NOT_SUPPORTED, "grant encrypt/decrypt privilege");
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "revoke encrypt/decrypt privilege");
           } else if (!((MOCK_DATA_VERSION_4_2_5_2 <= compat_version && compat_version < DATA_VERSION_4_3_0_0) || compat_version >= DATA_VERSION_4_3_5_2)
                      && ((priv_set & OB_PRIV_EVENT) != 0)) {
             ret = OB_NOT_SUPPORTED;
@@ -476,7 +480,28 @@ int ObRevokeResolver::resolve_mysql(const ParseNode &parse_tree)
                          (priv_set & OB_PRIV_USE_CATALOG) != 0)) {
             ret = OB_NOT_SUPPORTED;
             LOG_WARN("grammar is not support when MIN_DATA_VERSION is below DATA_VERSION_4_3_5_2", K(ret));
-            LOG_USER_ERROR(OB_NOT_SUPPORTED, "grant create catalog/use catalog privilege");
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "revoke create catalog/use catalog privilege");
+          } else if (compat_version < DATA_VERSION_4_4_0_0
+                     && ((priv_set & OB_PRIV_CREATE_LOCATION) != 0)) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_WARN("grammar is not support when MIN_DATA_VERSION is below DATA_VERSION_4_4_0_0", K(ret));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "grant create location privilege");
+          } else if (compat_version < DATA_VERSION_4_4_1_0
+                     && ((priv_set & OB_PRIV_CREATE_AI_MODEL) != 0 ||
+                         (priv_set & OB_PRIV_ALTER_AI_MODEL) != 0 ||
+                         (priv_set & OB_PRIV_DROP_AI_MODEL) != 0 ||
+                         (priv_set & OB_PRIV_ACCESS_AI_MODEL) != 0)) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_WARN("grammar is not support when MIN_DATA_VERSION is below DATA_VERSION_4_4_1_0", K(ret));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "revoke create/alter/drop/access ai model privilege");
+          } else if (!((compat_version >= MOCK_DATA_VERSION_4_3_5_3 && compat_version < DATA_VERSION_4_4_0_0) ||
+                       (compat_version >= MOCK_DATA_VERSION_4_4_2_0 && compat_version < DATA_VERSION_4_5_0_0) ||
+                       (compat_version >= DATA_VERSION_4_5_1_0))
+                     && ((priv_set & OB_PRIV_CREATE_SENSITIVE_RULE) != 0
+                         || (priv_set & OB_PRIV_PLAINACCESS) != 0)) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_WARN("grammar is not support when MIN_DATA_VERSION is below MOCK_DATA_VERSION_4_3_5_3 or MOCK_DATA_VERSION_4_4_2_0 or DATA_VERSION_4_5_1_0", K(ret));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "revoke create sensitive rule/plainaccess privilege");
           }
           if (OB_FAIL(ret)) {
           } else {
@@ -842,6 +867,8 @@ int ObRevokeResolver::resolve_revoke_obj_priv_inner(const ParseNode *node,
   bool is_directory = false;
   bool is_catalog = false;
   bool explicit_db = false;
+  bool is_location = false;
+  bool is_sensitive_rule = false;
   CK (OB_NOT_NULL(node) && OB_NOT_NULL(revoke_stmt));
   CK (OB_NOT_NULL(params_.schema_checker_) && OB_NOT_NULL(params_.session_info_));
   CK (3 == node->num_child_
@@ -864,7 +891,9 @@ int ObRevokeResolver::resolve_revoke_obj_priv_inner(const ParseNode *node,
                                                    grant_level,
                                                    is_directory,
                                                    explicit_db,
-                                                   is_catalog))) {
+                                                   is_catalog,
+                                                   is_location,
+                                                   is_sensitive_rule))) {
         LOG_WARN("Resolve priv_level node error", K(ret));
       }  else if (OB_FAIL(check_and_convert_name(db, table))) {
         LOG_WARN("Check and convert name error", K(db), K(table), K(ret));
@@ -885,7 +914,7 @@ int ObRevokeResolver::resolve_revoke_obj_priv_inner(const ParseNode *node,
             OZ (params_.schema_checker_->get_object_type(
                 tenant_id, db, table,
                 object_type, object_id, obj_db_name, is_directory, 
-                explicit_db, ObString(""), synonym_checker, is_catalog));
+                explicit_db, ObString(""), synonym_checker, is_catalog, is_location, is_sensitive_rule));
             OZ (revoke_stmt->set_database_name(obj_db_name));
           }
           revoke_stmt->set_object_type(object_type);

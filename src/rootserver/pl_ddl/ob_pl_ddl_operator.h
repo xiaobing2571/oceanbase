@@ -14,6 +14,7 @@
 #define OCEANBASE_ROOTSERVER_OB_DDL_PL_OPERATOR_H_
 
 #include "rootserver/ob_ddl_operator.h"
+#include "share/ob_external_resource_rpc_struct.h"
 
 namespace oceanbase
 {
@@ -71,6 +72,23 @@ public:
                common::ObMySQLTransaction &trans,
                share::schema::ObSchemaGetterGuard &schema_guard,
                const common::ObString *ddl_stmt_str/*=NULL*/);
+
+  int alter_udt_compile(share::schema::ObUDTTypeInfo &udt_info,
+                        const share::schema::ObUDTTypeInfo *old_udt_info,
+                        int16_t compile_unit,
+                        common::ObMySQLTransaction &trans,
+                        share::schema::ObErrorInfo &error_info,
+                        common::ObIArray<share::schema::ObDependencyInfo> &dep_infos,
+                        const common::ObString *ddl_stmt_str/*=NULL*/);
+
+  int alter_udt_alter(share::schema::ObUDTTypeInfo &udt_info,
+                      const share::schema::ObUDTTypeInfo *old_udt_info,
+                      common::ObMySQLTransaction &trans,
+                      share::schema::ObErrorInfo &error_info,
+                      common::ObIArray<share::schema::ObRoutineInfo> &public_routine_infos,
+                      share::schema::ObSchemaGetterGuard &schema_guard,
+                      common::ObIArray<share::schema::ObDependencyInfo> &dep_infos,
+                      const common::ObString *ddl_stmt_str/*=NULL*/);
   //----End of functions for managing udt----
 
   //----Functions for managing package----
@@ -94,7 +112,8 @@ public:
                    share::schema::ObErrorInfo &error_info,
                    const common::ObString *ddl_stmt_str/*=NULL*/);
   //----End of functions for managing package----
-  int create_trigger(share::schema::ObTriggerInfo &trigger_info,
+  int create_trigger(share::schema::ObSchemaGetterGuard &schema_guard,
+                     share::schema::ObTriggerInfo &trigger_info,
                      common::ObMySQLTransaction &trans,
                      share::schema::ObErrorInfo &error_info,
                      ObIArray<ObDependencyInfo> &dep_infos,
@@ -140,6 +159,16 @@ public:
   //----Functions for managing trigger----
 
   //----End of functions for managing trigger----
+
+
+//----Functions for managing external resource----
+  int create_external_resource(const obrpc::ObCreateExternalResourceArg &arg,
+                               ObSimpleExternalResourceSchema &new_schema,
+                               ObMySQLTransaction &trans);
+  int drop_external_resource(ObSimpleExternalResourceSchema &new_schema,
+                             const ObString &ddl_stmt,
+                             ObMySQLTransaction &trans);
+//----End of functions for managing external resource----
 private:
   int del_routines_in_package(const share::schema::ObPackageInfo &package_info,
                               common::ObMySQLTransaction &trans,

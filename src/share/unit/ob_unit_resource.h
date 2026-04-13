@@ -19,6 +19,7 @@
 
 namespace oceanbase
 {
+
 namespace share
 {
 
@@ -97,12 +98,12 @@ public:
   static const int64_t META_TENANT_DATA_DISK_SIZE_PERCENTAGE = 10;
   static const int64_t HIDDEN_SYS_TENANT_MIN_DATA_DISK_SIZE = 2LL * GB;  // 2G
   static const int64_t META_TENANT_MIN_DATA_DISK_SIZE = 1LL * GB;  // 1G
-  static const int64_t META_TENANT_MAX_DATA_DISK_SIZE = 4LL * GB;  // 4G
   static const int64_t USER_TENANT_MIN_DATA_DISK_SIZE = 1LL * GB;  // 1G
   static const int64_t UNIT_MIN_DATA_DISK_SIZE = META_TENANT_MIN_DATA_DISK_SIZE + USER_TENANT_MIN_DATA_DISK_SIZE;  // 2G
-  // default factor of mapping MEMORY_SIZE to DATA_DISK_SIZE
-  // MEMORY_SIZE * FACTOR = DATA_DISK_SIZE
+  // default factor of mapping MEMORY_SIZE and CPU to DATA_DISK_SIZE
+  // MAX(MIN_CPU * CPU_TO_DATA_DISK_FACTOR, MEMORY_SIZE * MEMORY_TO_DATA_DISK_FACTOR)
   static const int64_t MEMORY_TO_DATA_DISK_FACTOR = 2;
+  static const int64_t CPU_TO_DATA_DISK_FACTOR = 2;
   // 0 is the default value in ObUnitResource and __all_unit table.
   // In SN mode, 0 means not effective;
   // In SS mode, 0 means no restriction by tenant. or no data_disk_size for virtual tenant.
@@ -327,7 +328,8 @@ public:
   // 2. after divide_meta_tenant, self become user tenant resource,
   //    is valid for user tenant, but may not be valid for unit
   //    ex. MEMORY 1G, after divide, meta MEMORY is 512M, self MEMORY is 512M
-  int divide_meta_tenant(ObUnitResource &meta_resource);
+  // 3. tenant_id is used to check for injected meta memory ratio via trace point
+  int divide_meta_tenant(ObUnitResource &meta_resource, const uint64_t tenant_id = OB_INVALID_TENANT_ID);
 
   // generate sys tenant default unit resource based on configuration
   int gen_sys_tenant_default_unit_resource(const bool is_hidden_sys = false);
@@ -338,9 +340,11 @@ public:
   static int64_t get_default_log_disk_size(const int64_t memory_size);
 
   // get default DATA_DISK_SIZE based on MEMORY_SIZE
-  static int64_t get_default_data_disk_size(const int64_t memory_size)
+  static int64_t get_default_data_disk_size(const int64_t memory_size, const double min_cpu)
   {
-    return memory_size * MEMORY_TO_DATA_DISK_FACTOR;
+    const int64_t cpu_based_size = static_cast<int64_t>(min_cpu) * (CPU_TO_DATA_DISK_FACTOR * 1LL * GB);
+    const int64_t memory_based_size = memory_size * MEMORY_TO_DATA_DISK_FACTOR;
+    return max(cpu_based_size, memory_based_size);
   }
 
   // default IOPS = INT64_MAX
@@ -377,17 +381,8 @@ public:
     return meta_cpu;
   }
   // generate meta tenant memory by unit memory
-  static int64_t gen_meta_tenant_memory(const int64_t unit_memory)
-  {
-    int64_t meta_tenant_memory = 0;
-    if (unit_memory < UNIT_SAFE_MIN_MEMORY) {
-      meta_tenant_memory = META_TENANT_MIN_MEMORY;
-    } else {
-      const int64_t meta_memory_by_percent = unit_memory * META_TENANT_MEMORY_PERCENTAGE / 100;
-      meta_tenant_memory = max(meta_memory_by_percent, META_TENANT_SAFE_MIN_MEMORY);
-    }
-    return meta_tenant_memory;
-  }
+  // Implementation is in .cpp file to allow trace point usage
+  static int64_t gen_meta_tenant_memory(const int64_t unit_memory, const uint64_t tenant_id = OB_INVALID_TENANT_ID);
   // generate meta tenant log disk by unit log disk
   static int64_t gen_meta_tenant_log_disk_size(const int64_t unit_log_disk)
   {
@@ -402,8 +397,7 @@ public:
       meta_data_disk = 0;
     } else {
       meta_data_disk = unit_data_disk * META_TENANT_DATA_DISK_SIZE_PERCENTAGE / 100;
-      meta_data_disk = min(max(meta_data_disk, META_TENANT_MIN_DATA_DISK_SIZE),
-               META_TENANT_MAX_DATA_DISK_SIZE);
+      meta_data_disk = max(meta_data_disk, META_TENANT_MIN_DATA_DISK_SIZE); // remove the 16G limit for meta tenants in shared-storage mode
     }
     return meta_data_disk;
   }

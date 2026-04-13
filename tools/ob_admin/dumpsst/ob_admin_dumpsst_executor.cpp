@@ -15,6 +15,7 @@
 #ifdef OB_BUILD_TDE_SECURITY
 #include "share/ob_master_key_getter.h"
 #endif
+#include "common/ob_file_common_header.h"
 #include "share/ob_tenant_mem_limit_getter.h"
 #include "storage/blocksstable/ob_storage_cache_suite.h"
 #include "storage/tablet/ob_tablet.h"
@@ -126,7 +127,6 @@ int ObAdminDumpsstExecutor::execute(int argc, char *argv[])
       }
     }
   }
-
   return ret;
 }
 
@@ -164,7 +164,7 @@ int ObAdminDumpsstExecutor::parse_cmd(int argc, char *argv[])
   int ret = OB_SUCCESS;
 
   int opt = 0;
-  const char* opt_string = "d:hf:a:i:n:qxk:m:t:o:s:p:";
+  const char* opt_string = "d:hf:a:i:n:qxk:m:t:o:s:p:l:";
 
   struct option longopts[] = {
     // commands
@@ -185,6 +185,7 @@ int ObAdminDumpsstExecutor::parse_cmd(int argc, char *argv[])
     { "offset", 1, NULL, 'p'},
     // long options
     { "prewarm_index", 1, NULL, 1000},
+    { "hex_length", 1, NULL, 'l'},
     { 0, 0, 0, 0}, // end of array, don't change
   };
 
@@ -277,6 +278,10 @@ int ObAdminDumpsstExecutor::parse_cmd(int argc, char *argv[])
       dump_macro_context_.scn_ = strtoll(optarg, NULL, 10);
       break;
     }
+    case 'l': {
+      dump_macro_context_.hex_length_ = strtoll(optarg, NULL, 10);
+      break;
+    }
     case 1000: {
       STRCPY(dump_macro_context_.prewarm_index_, optarg);
       break;
@@ -315,7 +320,7 @@ void ObAdminDumpsstExecutor::dump_macro_block(const ObDumpMacroBlockContext &mac
   read_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_COMPACT_READ);
   read_info.offset_ = 0;
   read_info.size_ = OB_DEFAULT_MACRO_BLOCK_SIZE;
-  read_info.io_timeout_ms_ = DEFAULT_IO_WAIT_TIME_MS;
+  read_info.io_timeout_ms_ = std::max(GCONF._data_storage_io_timeout / 1000, DEFAULT_IO_WAIT_TIME_MS);
 
   STORAGE_LOG(INFO, "begin dump macro block", K(macro_block_context));
   if (OB_UNLIKELY(!macro_block_context.is_valid())) {
@@ -353,18 +358,19 @@ void ObAdminDumpsstExecutor::dump_macro_block(const ObDumpMacroBlockContext &mac
         buf_size = macro_handle.get_data_size();
       }
     }
+    const ObDumpMacroBlockParam param(dump_macro_context_, hex_print_);
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(common_header.deserialize(macro_buf, buf_size, pos))) {
       STORAGE_LOG(ERROR, "deserialize common header fail", K(ret), K(pos));
     } else if (OB_FAIL(common_header.check_integrity())) {
       STORAGE_LOG(ERROR, "invalid common header", K(ret), K(common_header));
     } else if (ObMacroBlockCommonHeader::SharedSSTableData == common_header.get_type()) {
-      if (OB_FAIL(ObAdminCommonUtils::dump_shared_macro_block(dump_macro_context_, macro_buf, buf_size))) {
-        STORAGE_LOG(ERROR, "dump shared block fail", K(ret));
+      if (OB_FAIL(ObAdminCommonUtils::dump_shared_macro_block(param, macro_buf, buf_size))) {
+        STORAGE_LOG(ERROR, "dump shared block fail", K(ret), K(param));
       }
     } else {
-      if (OB_FAIL(ObAdminCommonUtils::dump_single_macro_block(dump_macro_context_, macro_buf, buf_size))) {
-        STORAGE_LOG(ERROR, "dump single block fail", K(ret));
+      if (OB_FAIL(ObAdminCommonUtils::dump_single_macro_block(param, macro_buf, buf_size))) {
+        STORAGE_LOG(ERROR, "dump single block fail", K(ret), K(param));
       }
     }
   }
@@ -376,54 +382,8 @@ void ObAdminDumpsstExecutor::dump_macro_block(const ObDumpMacroBlockContext &mac
 
 void ObAdminDumpsstExecutor::dump_tablet_meta(const ObDumpMacroBlockContext &macro_block_context)
 {
-  int ret = OB_SUCCESS;
-  if (STRLEN(macro_block_context.object_file_path_) <= 0) {
-    ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(ERROR, "object path is null", K(ret), KP(macro_block_context.object_file_path_));
-  } else {
-    int64_t pos = 0;
-    io_allocator_.reuse();
-    char *macro_buf = nullptr;
-    int64_t read_size = 0;
-    ObIOFd fd;
-    const int64_t offset = 0;
-    const int64_t size = OB_DEFAULT_MACRO_BLOCK_SIZE;
-    ObTablet tablet;
-    ObArenaAllocator arena_allocator;
-    MacroBlockId tablet_meta_obj_id;
-    tablet_meta_obj_id.set_version_v2();
-    tablet_meta_obj_id.set_id_mode((uint64_t)ObMacroBlockIdMode::ID_MODE_SHARE);
-    tablet_meta_obj_id.set_storage_object_type((uint64_t)ObStorageObjectType::SHARED_MAJOR_TABLET_META);
-    tablet_meta_obj_id.set_incarnation_id(0);
-    tablet_meta_obj_id.set_column_group_id(0);
-    tablet_meta_obj_id.set_second_id(88888888); // mock tablet id
-    tablet_meta_obj_id.set_third_id(88888888); // mock major snapshot version
-
-    ObMetaDiskAddr disk_addr;
-
-    if (OB_ISNULL(macro_buf = reinterpret_cast<char*>(io_allocator_.alloc(size)))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      STORAGE_LOG(WARN, "failed to alloc macro read info buffer", K(ret), K(size));
-    } else if (OB_FAIL(LOCAL_DEVICE_INSTANCE.open(macro_block_context.object_file_path_, O_RDONLY, 0, fd))) {
-      STORAGE_LOG(ERROR, "open file failed", K(macro_block_context));
-    } else if (OB_FAIL(LOCAL_DEVICE_INSTANCE.pread(fd, offset, size, macro_buf, read_size))) {
-      STORAGE_LOG(ERROR, "read block failed", K(macro_block_context));
-    } else if (FALSE_IT(disk_addr.set_block_addr(tablet_meta_obj_id, 0/*offset*/, size, ObMetaDiskAddr::DiskType::RAW_BLOCK))) {
-    } else if (FALSE_IT(tablet.set_tablet_addr(disk_addr))) {
-    } else if (OB_FAIL(tablet.deserialize_for_replay(arena_allocator, macro_buf, size, pos))) {
-      STORAGE_LOG(ERROR, "fail to deserialize tablet", K(ret), KP(macro_buf), K(size));
-    } else {
-      ObCStringHelper helper;
-      fprintf(stdout, "TabletMeta: %s\n", helper.convert(tablet));
-    }
-
-    if (fd.is_valid()) {
-      (void) LOCAL_DEVICE_INSTANCE.close(fd);
-    }
-  }
-  if (OB_FAIL(ret)) {
-    fprintf(stderr, "fail to dump_tablet_meta, ret=%s\n", ob_error_name(ret));
-  }
+  int ret = OB_NOT_SUPPORTED;
+  STORAGE_LOG(ERROR, "not implemented yet", K(ret));
 }
 
 void ObAdminDumpsstExecutor::dump_table_store(const ObDumpMacroBlockContext &macro_block_context)
@@ -539,7 +499,8 @@ int ObAdminDumpsstExecutor::do_dump_prewarm_index(
       STORAGE_LOG(ERROR, "fail to open file", KR(ret), K(path));
     } else if (OB_FAIL(LOCAL_DEVICE_INSTANCE.pread(fd, offset, size, macro_buf, read_size))) {
       STORAGE_LOG(ERROR, "fail to read file", KR(ret), K(fd), K(offset), K(size), KP(macro_buf));
-    } else if (OB_FAIL(index.deserialize(macro_buf, read_size, pos))) {
+    } else if (OB_FAIL(ObFileCommonHeaderUtil::deserialize<ObHotTabletInfoIndex>(macro_buf,
+                       read_size, pos, index))) {
       STORAGE_LOG(ERROR, "fail to deserialize prewarm index", KR(ret), K(read_size), K(pos), KP(macro_buf));
     }
 
@@ -586,6 +547,8 @@ void ObAdminDumpsstExecutor::dump_prewarm_data(const ObDumpMacroBlockContext &ma
     fprintf(stdout, "ObHotTabletInfoIndex: %s\n\n", helper.convert(index));
     const int64_t cnt = index.sizes_.count();
     int64_t cur_offset = 0;
+    int64_t total_macro_cnt = 0;
+    int64_t total_micro_cnt = 0;
     for (int64_t i = 0; (i < cnt) && OB_SUCC(ret); ++i) {
       io_allocator_.reuse();
       char *buf = nullptr;
@@ -601,14 +564,25 @@ void ObAdminDumpsstExecutor::dump_prewarm_data(const ObDumpMacroBlockContext &ma
       } else if (OB_UNLIKELY(size != read_size)) {
         ret = OB_ERR_UNEXPECTED;
         STORAGE_LOG(ERROR, "read size is wrong", KR(ret), K(size), K(read_size));
-      } else if (OB_FAIL(hot_tablet_info.deserialize(buf, size, pos))) {
-        STORAGE_LOG(ERROR, "fail to serialize", KR(ret), K(size), K(pos));
+      } else if (OB_FAIL(ObFileCommonHeaderUtil::deserialize<ObHotTabletInfo>(buf, size, pos, hot_tablet_info))) {
+        STORAGE_LOG(ERROR, "fail to deserialize hot tablet info", KR(ret), K(size), K(pos), KP(buf));
       } else {
-        ObCStringHelper helper;
-        fprintf(stdout, "i=%ld\n ObHotTabletInfo=%s\n", i, helper.convert(hot_tablet_info));
+        const int64_t macro_cnt = hot_tablet_info.hot_macro_infos_.count();
+        for (int64_t j = 0; (j < macro_cnt) && OB_SUCC(ret); ++j) {
+          const ObHotMacroInfo &hot_macro_info = hot_tablet_info.hot_macro_infos_.at(j);
+          total_macro_cnt++;
+          fprintf(stdout, "macro_idx=%ld, macro_id=%s\n", total_macro_cnt, helper.convert(hot_macro_info.macro_id_));
+          const int64_t micro_cnt = hot_macro_info.hot_micro_infos_.count();
+          for (int64_t k = 0; (k < micro_cnt) && OB_SUCC(ret); ++k) {
+            const ObHotMicroInfo &hot_micro_info = hot_macro_info.hot_micro_infos_.at(k);
+            total_micro_cnt++;
+            fprintf(stdout, "micro_idx=%ld, micro_info=%s\n", total_micro_cnt, helper.convert(hot_micro_info));
+          }
+        }
       }
       cur_offset += size;
     }
+    fprintf(stdout, "total_macro_cnt=%ld, total_micro_cnt=%ld\n", total_macro_cnt, total_micro_cnt);
   }
   if (fd.is_valid()) {
     (void)LOCAL_DEVICE_INSTANCE.close(fd);
@@ -743,6 +717,7 @@ void ObAdminDumpsstExecutor::print_usage()
   printf(HELP_FMT, "-s,--scn", "macro block logical version");
   printf(HELP_FMT, "-o,--object_file", "object file path");
   printf(HELP_FMT, "-p,--offset", "data offset in object file");
+  printf(HELP_FMT, "-l,--hex_length", "max length of hex string");
 
   printf("SN mode commands:\n");
   printf("  dump all rows in data macro block: \n");

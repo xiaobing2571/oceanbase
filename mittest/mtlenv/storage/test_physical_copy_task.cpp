@@ -109,7 +109,7 @@ void TestRootBlockInfo::prepare_tablet_read_info()
 void TestRootBlockInfo::prepare_block_root()
 {
   const int64_t block_size = 2L * 1024 * 1024L;
-  ObMicroBlockWriter writer;
+  ObMicroBlockWriter<> writer;
   ASSERT_EQ(OB_SUCCESS, writer.init(block_size, ROWKEY_COL_CNT, COLUMN_CNT));
   ObDatumRow row;
   ASSERT_EQ(OB_SUCCESS, row.init(allocator_, COLUMN_CNT));
@@ -122,7 +122,7 @@ void TestRootBlockInfo::prepare_block_root()
   row.count_ = COLUMN_CNT;
   ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
   ObMicroBlockDesc micro_desc;
-  ASSERT_EQ(OB_SUCCESS, writer.build_micro_block_desc(micro_desc));
+  ASSERT_EQ(OB_SUCCESS, writer.build_micro_block_desc_in_unittest(micro_desc));
 
   ObMicroBlockHeader *header = const_cast<ObMicroBlockHeader *>(micro_desc.header_);
   ASSERT_NE(nullptr, header);

@@ -47,6 +47,9 @@ void print_usage()
          "       ob_admin ss_tool\n"
 #endif
          "       ob_admin log_tool ## './ob_admin log_tool' for more detail\n"
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+         "       ob_admin log_service_log_tool ## './ob_admin log_service_log_tool' for more detail\n"
+#endif
          "       ob_admin -h127.0.0.1 -p2883 xxx\n"
          "       ob_admin -h127.0.0.1 -p2883 (-sintl/-ssm -mbkmi/-mlocal) [command]\n"
          "              ## The options in parentheses take effect when ssl enabled.\n"
@@ -115,6 +118,7 @@ int get_log_base_directory(char *log_file_name, const int64_t log_file_name_len,
 int main(int argc, char *argv[])
 {
   init_malloc_hook();
+  enable_malloc_v2(true);
   int ret = 0;
   char log_file_name[OB_MAX_FILE_NAME_LENGTH] = {'\0'};
   char log_file_rs_name[OB_MAX_FILE_NAME_LENGTH] = {'\0'};
@@ -132,6 +136,9 @@ int main(int argc, char *argv[])
   _OB_LOG(INFO, "cmd: [%s]", ss.str().c_str());
 
   ObAdminExecutor *executor = NULL;
+  oceanbase::ObClusterVersion::get_instance().update_data_version(DATA_CURRENT_VERSION);
+  oceanbase::ObClusterVersion::get_instance().update_cluster_version(CLUSTER_CURRENT_VERSION);
+
   if (argc < 2) {
     print_usage();
   } else {
@@ -150,7 +157,11 @@ int main(int argc, char *argv[])
       executor = new ObAdminSSToolExecutor();
 #endif
     } else if (0 == strcmp("log_tool", argv[1])) {
-      executor = new ObAdminLogExecutor();
+      executor = new ObAdminLogExecutor(false);
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+    } else if (0 == strcmp("log_service_log_tool", argv[1])) {
+      executor = new ObAdminLogExecutor(true);
+#endif
     } else if (0 == strcmp("dump_backup", argv[1])) {
       executor = new ObAdminDumpBackupDataExecutor();
     } else if (0 == strcmp("slog_tool", argv[1])) {

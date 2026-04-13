@@ -132,6 +132,13 @@ int ObExprMinus::calc_result_type2(ObExprResType &type,
                                             + CARRY_OFFSET + scale);
         precision = MIN(OB_MAX_DECIMAL_POSSIBLE_PRECISION, precision);
       }
+      const ObObjTypeClass result_tc = type.get_type_class();
+      if (lib::is_mysql_mode() && ObNumberTC == result_tc) {
+        scale1 = static_cast<ObScale>(MAX(type1.get_calc_scale(), scale1));
+        scale2 = static_cast<ObScale>(MAX(type2.get_calc_scale(), scale2));
+        ObScale calc_scale = MAX(scale1, scale2);
+        type.set_calc_scale(calc_scale);
+      }
     }
     type.set_scale(scale);
 
@@ -1200,7 +1207,6 @@ int ObExprMinus::minus_number_number_batch(BATCH_EVAL_FUNC_ARG_DECL)
       }
       if (l_datums.at(i)->is_null() || r_datums.at(i)->is_null()) {
         results.at(i)->set_null();
-        eval_flags.set(i);
         continue;
       }
       ObNumber l_num(l_datums.at(i)->get_number());
@@ -1214,7 +1220,6 @@ int ObExprMinus::minus_number_number_batch(BATCH_EVAL_FUNC_ARG_DECL)
       if (ObNumber::try_fast_minus(l_num, r_num, res_digits, *res_desc)) {
         results.at(i)->set_pack(sizeof(number::ObCompactNumber) +
                                 res_desc->len_ * sizeof(*res_digits));
-        eval_flags.set(i);
         // LOG_INFO("mul speedup done", K(l_num.format()), K(r_num.format()));
       } else {
         // normal path: no speedup
@@ -1223,7 +1228,6 @@ int ObExprMinus::minus_number_number_batch(BATCH_EVAL_FUNC_ARG_DECL)
           LOG_WARN("mul num failed", K(ret), K(l_num), K(r_num));
         } else {
           results.at(i)->set_number(res_num);
-          eval_flags.set(i);
         }
         local_alloc.free();
       }

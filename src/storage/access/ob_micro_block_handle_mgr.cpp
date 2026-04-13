@@ -11,6 +11,7 @@
  */
 #include "lib/time/ob_time_utility.h"
 #include "share/io/ob_io_define.h"
+#include "observer/ob_server.h"
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_micro_block_handle_mgr.h"
@@ -30,6 +31,7 @@ namespace storage {
 ObMicroBlockDataHandle::ObMicroBlockDataHandle()
   : tenant_id_(OB_INVALID_TENANT_ID),
     macro_block_id_(),
+    effective_tablet_id_(ObTabletID::INVALID_TABLET_ID),
     block_state_(ObSSTableMicroBlockState::UNKNOWN_STATE),
     block_index_(-1),
     micro_info_(),
@@ -63,6 +65,9 @@ void ObMicroBlockDataHandle::init(
   macro_block_id_ = macro_id;
   micro_info_.set(offset, size, logic_micro_id, data_checksum);
   handle_mgr_ = handle_mgr;
+  if (OB_NOT_NULL(handle_mgr)) {
+    effective_tablet_id_ = handle_mgr->get_effective_tablet_id();
+  }
 }
 
 void ObMicroBlockDataHandle::reset()
@@ -74,6 +79,7 @@ void ObMicroBlockDataHandle::reset()
   block_state_ = ObSSTableMicroBlockState::UNKNOWN_STATE;
   tenant_id_ = OB_INVALID_TENANT_ID;
   macro_block_id_.reset();
+  effective_tablet_id_ = ObTabletID::INVALID_TABLET_ID;
   block_index_ = -1;
   micro_info_.reset();
   cache_handle_.reset();
@@ -88,6 +94,7 @@ void ObMicroBlockDataHandle::move_from(ObMicroBlockDataHandle& other)
 
   this->tenant_id_ = other.tenant_id_;
   this->macro_block_id_ = other.macro_block_id_;
+  this->effective_tablet_id_ = other.effective_tablet_id_;
   this->block_state_ = other.block_state_;
   this->block_index_ = other.block_index_;
   this->micro_info_ = other.micro_info_;
@@ -119,6 +126,7 @@ int ObMicroBlockDataHandle::assign(const ObMicroBlockDataHandle& other)
     } else {
       this->tenant_id_ = other.tenant_id_;
       this->macro_block_id_ = other.macro_block_id_;
+      this->effective_tablet_id_ = other.effective_tablet_id_;
       this->block_state_ = other.block_state_;
       this->block_index_ = other.block_index_;
       this->micro_info_ = other.micro_info_;
@@ -164,6 +172,7 @@ int ObMicroBlockDataHandle::get_micro_block_data(
         LOG_INFO("get data block data already timeout", K(ret), K(THIS_WORKER.get_timeout_remain()));
       } else {
         //try sync io
+        int64_t start_time = rdtsc();
         ObMicroBlockId micro_block_id;
         micro_block_id.macro_id_ = macro_block_id_;
         micro_block_id.offset_ = micro_info_.offset_;
@@ -174,12 +183,17 @@ int ObMicroBlockDataHandle::get_micro_block_data(
                     des_meta_,
                     micro_info_.logic_micro_id_,
                     micro_info_.data_checksum_,
+                    effective_tablet_id_,
                     macro_reader,
                     loaded_block_data_,
                     allocator_))) {
           LOG_WARN("Fail to load micro block", K(ret), K_(tenant_id), K_(macro_block_id), K_(micro_info));
           try_release_loaded_block();
         } else {
+          if (OB_NOT_NULL(handle_mgr_)) {
+            int64_t finish_time = rdtsc();
+            handle_mgr_->add_block_io_wait_time(finish_time - start_time);
+          }
           io_handle_.reset();
           block_state_ = ObSSTableMicroBlockState::NEED_SYNC_IO;
           block_data = loaded_block_data_;
@@ -234,12 +248,12 @@ int ObMicroBlockDataHandle::get_loaded_block_data(ObMicroBlockData &block_data)
       block_data = *pblock;
     }
   } else if (ObSSTableMicroBlockState::IN_BLOCK_IO == block_state_) {
-    int64_t start_time_us = ObTimeUtility::current_time_us();
+    int64_t start_time = rdtsc();
     if (OB_FAIL(io_handle_.wait())) {
       LOG_WARN("Fail to wait micro block io", K(ret));
     } else if (OB_NOT_NULL(handle_mgr_)) {
-      int64_t finish_time_us = ObTimeUtility::current_time_us();
-      handle_mgr_->add_block_io_wait_time_us(get_io_interval(finish_time_us, start_time_us));
+      int64_t finish_time = rdtsc();
+      handle_mgr_->add_block_io_wait_time(finish_time - start_time);
     }
     if (OB_FAIL(ret)) {
     } else if (NULL == (io_buf = io_handle_.get_buffer())) {
@@ -412,6 +426,7 @@ void ObMicroBlockHandleMgr::reset()
     block_io_allocator_.reset();
     cache_mem_ctrl_.reset();
   }
+  effective_tablet_id_ = ObTabletID::INVALID_TABLET_ID;
   data_block_cache_ = nullptr;
   index_block_cache_ = nullptr;
   table_store_stat_ = nullptr;
@@ -419,8 +434,12 @@ void ObMicroBlockHandleMgr::reset()
   query_flag_ = nullptr;
 }
 
-int ObMicroBlockHandleMgr::init(const bool enable_prefetch_limiting, ObTableScanStoreStat& store_stat, ObTableScanStatistic* scan_stat,
-      ObQueryFlag& query_flag)
+int ObMicroBlockHandleMgr::init(
+    const bool enable_prefetch_limiting,
+    const ObTabletID &effective_tablet_id,
+    ObTableScanStoreStat &store_stat,
+    ObTableScanStatistic *scan_stat,
+    ObQueryFlag &query_flag)
 {
   int ret = OB_SUCCESS;
   lib::ObMemAttr mem_attr(MTL_ID(), "MicroBlockIO");
@@ -436,6 +455,7 @@ int ObMicroBlockHandleMgr::init(const bool enable_prefetch_limiting, ObTableScan
     table_scan_stat_ = scan_stat;
     query_flag_ = &query_flag;
     cache_mem_ctrl_.init(enable_prefetch_limiting);
+    effective_tablet_id_ = effective_tablet_id;
     is_inited_ = true;
   }
   return ret;
@@ -527,13 +547,14 @@ int ObMicroBlockHandleMgr::prefetch_multi_data_block(
     LOG_WARN("Unexpected io params", K(ret), K(multi_io_params));
   } else {
     const MacroBlockId &macro_id = micro_data_infos[multi_io_params.prefetch_idx_[0] % max_micro_handle_cnt].get_macro_id();
-    const bool is_major_macro_preread = GCTX.is_shared_storage_mode();
+    const bool is_preread = GCTX.is_shared_storage_mode();
     if (1 == multi_io_params.count()) {
       for (int64_t i = 0; OB_SUCC(ret) && i < multi_io_params.count(); i++) {
         const ObMicroIndexInfo &index_info = micro_data_infos[multi_io_params.prefetch_idx_[i] % max_micro_handle_cnt];
-        if (OB_FAIL(data_block_cache_->prefetch(tenant_id, macro_id, index_info, true,
-                                                macro_handle, &block_io_allocator_, is_major_macro_preread))) {
-          LOG_WARN("Fail to prefetch micro block", K(ret), K(index_info), K(macro_handle));
+        if (OB_FAIL(data_block_cache_->prefetch(tenant_id, macro_id, index_info, true, effective_tablet_id_,
+                                                macro_handle, &block_io_allocator_, is_preread))) {
+          LOG_WARN("Fail to prefetch micro block", K(ret), K(tenant_id), K(macro_id),
+                   K_(effective_tablet_id), K(index_info), K(macro_handle));
         } else {
           ObMicroBlockDataHandle &micro_handle = micro_data_handles[multi_io_params.prefetch_idx_[i] % max_micro_handle_cnt];
           micro_handle.block_state_ = ObSSTableMicroBlockState::IN_BLOCK_IO;
@@ -549,8 +570,10 @@ int ObMicroBlockHandleMgr::prefetch_multi_data_block(
                 macro_id,
                 multi_io_params,
                 true, /* use_cache */
+                effective_tablet_id_,
                 macro_handle))) {
-      LOG_WARN("Fail to prefetch multi blocks", K(ret), K(multi_io_params));
+      LOG_WARN("Fail to prefetch multi blocks", K(ret), K(tenant_id), K(macro_id),
+               K(multi_io_params), K_(effective_tablet_id));
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && i < multi_io_params.count(); i++) {
         if (multi_io_params.prefetch_idx_[i] >= max_prefetch_idx) {
@@ -595,9 +618,9 @@ int ObMicroBlockHandleMgr::submit_async_io(
     ret = OB_SUCCESS;
     // continue and use prefetch in batch later
   } else if (OB_FAIL(cache->prefetch(tenant_id, macro_id, index_block_info, use_cache,
-                                     macro_handle, &block_io_allocator_))) {
-    LOG_WARN("Fail to prefetch micro block", K(ret), K(index_block_info), K(macro_handle),
-                                              K(micro_block_handle));
+                                     effective_tablet_id_, macro_handle, &block_io_allocator_))) {
+    LOG_WARN("Fail to prefetch micro block", K(ret), K(tenant_id), K(macro_id), K(index_block_info),
+             K(use_cache), K_(effective_tablet_id), K(macro_handle), K(micro_block_handle));
   } else {
     micro_block_handle.block_state_ = ObSSTableMicroBlockState::IN_BLOCK_IO;
     cache_mem_ctrl_.add_hold_size(micro_block_handle.get_handle_size());
@@ -617,10 +640,14 @@ bool ObMicroBlockHandleMgr::reach_hold_limit() const
   return cache_mem_ctrl_.reach_hold_limit();
 }
 
-void ObMicroBlockHandleMgr::add_block_io_wait_time_us(const uint64_t block_io_wait_time_us)
+void ObMicroBlockHandleMgr::add_block_io_wait_time(const int64_t block_io_wait_time)
 {
   if (OB_NOT_NULL(table_scan_stat_) && OB_NOT_NULL(table_scan_stat_->tsc_monitor_info_)) {
-    table_scan_stat_->tsc_monitor_info_->add_block_io_wait_time_us(block_io_wait_time_us);
+    // Convert 600 seconds to CPU cycles: 600s * cpu_frequency_khz * 1000
+    static const int64_t max_io_time = 600LL * OBSERVER_FREQUENCE.get_cpu_frequency_khz() * 1000LL; // 600s in CPU cycles
+    int64_t adjusted_block_io_wait_time = max(block_io_wait_time, 0);
+    adjusted_block_io_wait_time = min(adjusted_block_io_wait_time, max_io_time);
+    table_scan_stat_->tsc_monitor_info_->add_block_io_wait_time(adjusted_block_io_wait_time);
   }
 }
 

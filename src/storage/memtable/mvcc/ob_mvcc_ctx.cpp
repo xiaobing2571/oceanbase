@@ -11,11 +11,14 @@
  */
 
 #include "ob_mvcc_ctx.h"
+#include "share/deadlock/ob_deadlock_detector_mgr.h"
 #include "storage/tx/ob_trans_part_ctx.h"
 #include "share/inner_table/ob_sslog_table_schema.h"
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "close_modules/shared_storage/storage/incremental/sslog/notify/ob_sslog_notify_adapter.h"
 #endif
+
+#include "storage/lock_wait_mgr/ob_lock_wait_mgr.h"
 
 namespace oceanbase
 {
@@ -24,6 +27,7 @@ using namespace share;
 using namespace storage;
 using namespace transaction::tablelock;
 using namespace blocksstable;
+using namespace lockwaitmgr;
 namespace memtable
 {
 
@@ -48,7 +52,6 @@ int ObIMvccCtx::register_row_commit_cb(const storage::ObTableIterParam &param,
                                        ObMemtable *memtable)
 {
   int ret = OB_SUCCESS;
-  const bool is_replay = false;
   const bool is_non_unique_local_index = param.is_non_unique_local_index_;
 
   if (!res.has_insert()) {
@@ -84,7 +87,6 @@ int ObIMvccCtx::register_row_commit_cb(const storage::ObTableIterParam &param,
               node,
               data_size,
               old_row,
-              is_replay,
               seq_no,
               column_cnt,
               is_non_unique_local_index);
@@ -92,20 +94,44 @@ int ObIMvccCtx::register_row_commit_cb(const storage::ObTableIterParam &param,
 
 #ifdef OB_BUILD_SHARED_STORAGE
       if (GCTX.is_shared_storage_mode() && OB_UNLIKELY(memtable->get_key().get_tablet_id().id() == OB_ALL_SSLOG_TABLE_TID)) {
-        if (OB_FAIL(sslog::ObSSLogNotifyAdapter::generate_notify_task_on_trans_ctx(node, dynamic_cast<ObMemtableCtx *>(this)))) {
+        if (OB_FAIL(sslog::ObSSLogNotifyAdapter::generate_notify_task_on_trans_ctx(sslog::NotifyPath::MVCC_WRITE,
+                                                                                   node,
+                                                                                   dynamic_cast<ObMemtableCtx *>(this)))) {
           TRANS_LOG(ERROR, "register notify task failed", K(*this), K(ret));
         }
       }
 #endif
 
-      if (OB_FAIL(ret)) {
-      } else if (OB_FAIL(append_callback(cb))) {
-        TRANS_LOG(ERROR, "register callback failed", K(*this), K(ret));
+      if (OB_LIKELY(ObDeadLockDetectorMgr::is_deadlock_enabled()) && !is_non_unique_local_index) {
+        ACTIVE_SESSION_FLAG_SETTER_GUARD(in_deadlock_row_register);
+        MTL(ObLockWaitMgr*)->insert_hash_holder(
+          LockHashHelper::hash_rowkey(memtable->get_tablet_id(), *stored_key),
+          cb->get_hash_holder_linker(),
+          false);
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(append_callback(cb))) {
+          if (OB_MVCC_WRITE_CALLBACK_FREEZE_CLOCK_ORDER_DESCENDING != ret) {
+            TRANS_LOG(ERROR, "register callback failed", K(*this), K(ret));
+          }
+          MTL(ObLockWaitMgr*)->erase_hash_holder_record(
+            LockHashHelper::hash_rowkey(memtable->get_tablet_id(), *stored_key),
+            cb->get_hash_holder_linker(),
+            false);
+        }
+      } else {
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(append_callback(cb))) {
+          if (OB_MVCC_WRITE_CALLBACK_FREEZE_CLOCK_ORDER_DESCENDING != ret) {
+            TRANS_LOG(ERROR, "register callback failed", K(*this), K(ret));
+          }
+        }
       }
 
       if (OB_FAIL(ret)) {
         free_mvcc_row_callback(cb);
         TRANS_LOG(WARN, "append callback failed", K(ret));
+      } else {
+
       }
     }
   }
@@ -118,7 +144,6 @@ int ObIMvccCtx::register_row_commit_cb(const storage::ObTableIterParam &param,
                                        ObMemtable *memtable)
 {
   int ret = OB_SUCCESS;
-  const bool is_replay = false;
   const bool is_non_unique_local_index = param.is_non_unique_local_index_;
   ObMvccRowCallback *head = NULL;
   ObMvccRowCallback *tail = NULL;
@@ -159,7 +184,6 @@ int ObIMvccCtx::register_row_commit_cb(const storage::ObTableIterParam &param,
                 node,
                 data_size,
                 old_row,
-                is_replay,
                 seq_no,
                 column_cnt,
                 is_non_unique_local_index);
@@ -173,11 +197,14 @@ int ObIMvccCtx::register_row_commit_cb(const storage::ObTableIterParam &param,
           tail->set_next(cb);
           tail = cb;
         }
+        res.tx_callback_ = cb;
         length++;
 
 #ifdef OB_BUILD_SHARED_STORAGE
       if (GCTX.is_shared_storage_mode() && OB_UNLIKELY(memtable->get_key().get_tablet_id().id() == OB_ALL_SSLOG_TABLE_TID)) {
-        if (OB_FAIL(sslog::ObSSLogNotifyAdapter::generate_notify_task_on_trans_ctx(node, dynamic_cast<ObMemtableCtx *>(this)))) {
+        if (OB_FAIL(sslog::ObSSLogNotifyAdapter::generate_notify_task_on_trans_ctx(sslog::NotifyPath::MVCC_WRITE,
+                                                                                   node,
+                                                                                   dynamic_cast<ObMemtableCtx *>(this)))) {
           TRANS_LOG(ERROR, "register notify task failed", K(*this), K(ret));
         }
       }
@@ -187,11 +214,47 @@ int ObIMvccCtx::register_row_commit_cb(const storage::ObTableIterParam &param,
   }
 
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(append_callback(head, tail, length))) {
-      TRANS_LOG(ERROR, "register callback failed", K(*this), K(ret));
+    if (OB_LIKELY(ObDeadLockDetectorMgr::is_deadlock_enabled()) && !is_non_unique_local_index) {
+      ACTIVE_SESSION_FLAG_SETTER_GUARD(in_deadlock_row_register);
+      for (int64_t i = 0; i < mvcc_results.count(); ++i) {
+        ObMvccWriteResult &res = mvcc_results[i];
+        if (res.has_insert()) {
+          const ObMemtableKey *stored_key = &res.mtk_;
+          ObMvccTransNode *node = res.tx_node_;
+          MTL(ObLockWaitMgr*)->insert_hash_holder(
+            LockHashHelper::hash_rowkey(memtable->get_tablet_id(), *stored_key),
+            res.tx_callback_->get_hash_holder_linker(),
+            false);
+        }
+      }
+      if (OB_FAIL(append_callback(head, tail, length))) {
+        if (OB_MVCC_WRITE_CALLBACK_FREEZE_CLOCK_ORDER_DESCENDING != ret) {
+          TRANS_LOG(ERROR, "register callback failed", K(*this), K(ret));
+        }
+        for (int64_t i = 0; i < mvcc_results.count(); ++i) {
+          ObMvccWriteResult &res = mvcc_results[i];
+          if (res.has_insert()) {
+            const ObMemtableKey *stored_key = &res.mtk_;
+            ObMvccTransNode *node = res.tx_node_;
+            MTL(ObLockWaitMgr*)->erase_hash_holder_record(
+              LockHashHelper::hash_rowkey(memtable->get_tablet_id(), *stored_key),
+              res.tx_callback_->get_hash_holder_linker(),
+              false);
+          }
+        }
+      } else {
+        TRANS_LOG(DEBUG, "register callback succeed", K(*this), K(ret),
+                  KPC(head), KPC(tail), K(length), K(mvcc_results));
+      }
     } else {
-      TRANS_LOG(DEBUG, "register callback succeed", K(*this), K(ret),
-                KPC(head), KPC(tail), K(length), K(mvcc_results));
+      if (OB_FAIL(append_callback(head, tail, length))) {
+        if (OB_MVCC_WRITE_CALLBACK_FREEZE_CLOCK_ORDER_DESCENDING != ret) {
+          TRANS_LOG(ERROR, "register callback failed", K(*this), K(ret));
+        }
+      } else {
+        TRANS_LOG(DEBUG, "register callback succeed", K(*this), K(ret),
+                  KPC(head), KPC(tail), K(length), K(mvcc_results));
+      }
     }
   }
 
@@ -201,7 +264,9 @@ int ObIMvccCtx::register_row_commit_cb(const storage::ObTableIterParam &param,
       ObITransCallback *next = remove_cb->get_next();
       free_mvcc_row_callback(remove_cb);
       remove_cb = next;
-      TRANS_LOG(WARN, "free failed mvcc row callback succeed", K(ret), KPC(remove_cb));
+      if (OB_MVCC_WRITE_CALLBACK_FREEZE_CLOCK_ORDER_DESCENDING != ret) {
+        TRANS_LOG(WARN, "free failed mvcc row callback succeed", K(ret), KPC(remove_cb));
+      }
     }
     head = nullptr;
     tail = nullptr;
@@ -221,7 +286,6 @@ int ObIMvccCtx::register_row_replay_cb(
     const int64_t column_cnt)
 {
   int ret = OB_SUCCESS;
-  const bool is_replay = true;
   ObMvccRowCallback *cb = NULL;
   if (OB_ISNULL(key) || OB_ISNULL(value) || OB_ISNULL(node)
       || data_size <= 0 || OB_ISNULL(memtable)) {
@@ -236,7 +300,6 @@ int ObIMvccCtx::register_row_replay_cb(
             node,
             data_size,
             empty_old_row,
-            is_replay,
             seq_no,
             column_cnt,
             false/*is_non_unique_local_index_cb, not setted correctly now, fix later*/);
@@ -249,24 +312,49 @@ int ObIMvccCtx::register_row_replay_cb(
 
 #ifdef OB_BUILD_SHARED_STORAGE
     if (GCTX.is_shared_storage_mode() && OB_UNLIKELY(memtable->get_key().get_tablet_id().id() == OB_ALL_SSLOG_TABLE_TID)) {
-      if (OB_FAIL(sslog::ObSSLogNotifyAdapter::generate_notify_task_on_trans_ctx(node, dynamic_cast<ObMemtableCtx *>(this)))) {
-        TRANS_LOG(ERROR, "register notify task failed", K(*this), K(ret));
+      if (OB_FAIL(sslog::ObSSLogNotifyAdapter::generate_notify_task_on_trans_ctx(sslog::NotifyPath::MVCC_REPLAY,
+                                                                                 node,
+                                                                                 dynamic_cast<ObMemtableCtx *>(this)))) {
+        if (OB_TENANT_NOT_IN_SERVER == ret) {
+          // if user tenant not exist, ignore it
+          TRANS_LOG(INFO, "user tenant not exist", K(ret));
+          ret = OB_SUCCESS;
+        } else {
+          TRANS_LOG(ERROR, "register notify task failed", K(*this), K(ret));
+        }
       }
     }
 #endif
-
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(append_callback(cb))) {
-      {
-        ObRowLatchGuard guard(value->latch_);
-        cb->unlink_trans_node();
+    if (OB_LIKELY(ObDeadLockDetectorMgr::is_deadlock_enabled()) && OB_NOT_NULL(MTL(ObLockWaitMgr*))) {
+      MTL(ObLockWaitMgr*)->insert_hash_holder(LockHashHelper::hash_rowkey(memtable->get_tablet_id(), *key),
+                                              cb->get_hash_holder_linker(),
+                                              false);
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(append_callback(cb))) {
+        {
+          ObRowLatchGuard guard(value->latch_);
+          cb->unlink_trans_node();
+        }
+        TRANS_LOG(WARN, "append callback failed", K(ret));
+        MTL(ObLockWaitMgr*)->erase_hash_holder_record(LockHashHelper::hash_rowkey(memtable->get_tablet_id(), *key),
+                                                      cb->get_hash_holder_linker(),
+                                                      false);
       }
-      TRANS_LOG(WARN, "append callback failed", K(ret));
+    } else {
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(append_callback(cb))) {
+        {
+          ObRowLatchGuard guard(value->latch_);
+          cb->unlink_trans_node();
+        }
+        TRANS_LOG(WARN, "append callback failed", K(ret));
+      }
     }
 
     if (OB_FAIL(ret)) {
+      ObRowLatchGuard guard(value->latch_);
+      cb->unlink_trans_node();
       free_mvcc_row_callback(cb);
-      TRANS_LOG(WARN, "append callback failed", K(ret));
     }
   }
   return ret;
@@ -362,22 +450,6 @@ ObMvccRowCallback *ObIMvccCtx::alloc_row_callback(ObIMvccCtx &ctx, ObMvccRow &va
   return cb;
 }
 
-ObMvccRowCallback *ObIMvccCtx::alloc_row_callback(ObMvccRowCallback &cb, ObMemtable *memtable)
-{
-  int ret = OB_SUCCESS;
-  void *cb_buffer = NULL;
-  ObMvccRowCallback *new_cb = NULL;
-  if (NULL == (cb_buffer = alloc_mvcc_row_callback())) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    TRANS_LOG(WARN, "alloc ObRowCB cb_buffer fail", K(ret));
-  } else if (NULL == (new_cb = new(cb_buffer) ObMvccRowCallback(cb, memtable))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    TRANS_LOG(WARN, "construct ObRowCB object fail", K(ret), "cb_buffer", cb_buffer);
-  }
-  return new_cb;
-}
-
-
 void ObIMvccCtx::check_row_callback_registration_between_stmt_()
 {
   ObIMemtableCtx *i_mem_ctx = (ObIMemtableCtx *)(this);
@@ -389,18 +461,22 @@ void ObIMvccCtx::check_row_callback_registration_between_stmt_()
 }
 
 int ObIMvccCtx::register_ext_info_commit_cb(
+    storage::ObStoreCtx &store_ctx,
     const int64_t timeout,
     const blocksstable::ObDmlFlag dml_flag,
     const transaction::ObTxSEQ &seq_no_st,
     const int64_t seq_no_cnt,
     const ObString &index_data,
     const ObObjType index_data_type,
+    const transaction::ObTxReadSnapshot &snapshot,
     const ObExtInfoLogHeader &header,
+    const ObTabletID &tabelt_id,
     ObObj &ext_info_data)
 {
   int ret = OB_SUCCESS;
   storage::ObExtInfoCbRegister cb_register;
-  if (OB_FAIL(cb_register.register_cb(this, timeout, dml_flag, seq_no_st, seq_no_cnt, index_data, index_data_type, header, ext_info_data))) {
+  if (OB_FAIL(cb_register.register_cb(this, store_ctx, timeout, dml_flag, seq_no_st, seq_no_cnt,
+      index_data, index_data_type, snapshot, header, tabelt_id, ext_info_data))) {
     TRANS_LOG(WARN, "register ext info callback failed", K(ret), K(cb_register), K(*this));
   }
   return ret;
@@ -443,6 +519,12 @@ ObMvccWriteGuard::~ObMvccWriteGuard()
         }
         if (is_freeze && OB_BLOCK_FROZEN != ret) {
           memtable_->get_freezer()->set_need_resubmit_log(true);
+        }
+      }
+    } else if (is_lob_ext_info_log_) {
+      if (OB_FAIL(tx_ctx->submit_redo_after_write(false/*force*/, write_seq_no_))) {
+        if (REACH_TIME_INTERVAL(100 * 1000)) {
+          TRANS_LOG(WARN, "failed to submit ext info log if neccesary", K(ret), KPC(tx_ctx));
         }
       }
     }

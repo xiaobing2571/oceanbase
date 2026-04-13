@@ -81,6 +81,8 @@
 #include "sql/optimizer/ob_log_err_log.h"
 #include "sql/optimizer/ob_log_stat_collector.h"
 #include "sql/optimizer/ob_log_expand.h"
+#include "sql/optimizer/ob_log_hybrid_fusion.h"
+#include "sql/engine/basic/ob_hybrid_fusion_op.h"
 #include "sql/engine/aggregate/ob_merge_distinct_op.h"
 #include "sql/engine/aggregate/ob_merge_distinct_vec_op.h"
 #include "sql/engine/aggregate/ob_hash_distinct_op.h"
@@ -93,7 +95,8 @@
 #include "sql/engine/set/ob_hash_intersect_op.h"
 #include "sql/engine/set/ob_hash_except_op.h"
 #include "sql/engine/set/ob_merge_union_op.h"
-#include "sql/engine/recursive_cte/ob_recursive_union_all_op.h"
+#include "sql/engine/recursive_cte/ob_recursive_union_op.h"
+#include "sql/engine/recursive_cte/ob_fake_cte_table_op.h"
 #include "sql/engine/set/ob_merge_intersect_op.h"
 #include "sql/engine/set/ob_merge_except_op.h"
 #include "sql/engine/basic/ob_expr_values_op.h"
@@ -168,6 +171,9 @@
 #include "sql/engine/join/ob_nested_loop_join_vec_op.h"
 #include "sql/engine/subquery/ob_subplan_filter_vec_op.h"
 #include "sql/engine/direct_load/ob_table_direct_insert_op.h"
+#include "sql/optimizer/ob_log_rescan.h"
+#include "sql/engine/basic/ob_rescan_op.h"
+#include "sql/engine/table/ob_ddl_block_sample_scan_op.h"
 
 namespace oceanbase
 {
@@ -276,22 +282,27 @@ struct AllocOpHelper
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid argument", K(ret), LITERAL_K(TYPE), K(child_cnt));
     } else {
-      const int64_t alloc_size = child_cnt * sizeof(OpType *) + sizeof(OpType);
-      ObOperator **mem = static_cast<ObOperator **>(alloc.alloc(alloc_size));
-      if (OB_ISNULL(mem)) {
+      const int64_t alloc_size1 = child_cnt * sizeof(OpType *);
+      const int64_t alloc_size2 = sizeof(OpType);
+      ObOperator **mem1 = static_cast<ObOperator **>(alloc.alloc(alloc_size1));
+      void *mem2 = alloc.alloc(alloc_size2);
+      if ((child_cnt > 0 && OB_ISNULL(mem1)) || OB_ISNULL(mem2)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("alloc memory failed", K(ret), K(alloc_size));
+        LOG_WARN("alloc memory failed", K(ret), K(alloc_size1), K(alloc_size2));
       } else {
         if (child_cnt > 0) {
-          memset(mem, 0, sizeof(OpType *) * child_cnt);
+          memset(mem1, 0, sizeof(OpType *) * child_cnt);
         }
-        op = new (&mem[child_cnt]) OpType(exec_ctx, spec, input);
-        if (OB_FAIL(op->set_children_pointer(mem, child_cnt))
+        op = new (mem2) OpType(exec_ctx, spec, input);
+        if (OB_FAIL(op->set_children_pointer(mem1, child_cnt))
             || OB_FAIL(op->init())) {
           LOG_WARN("set children pointer or init failed", K(ret));
           op->~ObOperator();
           op = NULL;
-          alloc.free(mem);
+          if (child_cnt > 0) {
+            alloc.free(mem1);
+          }
+          alloc.free(mem2);
         }
       }
     }

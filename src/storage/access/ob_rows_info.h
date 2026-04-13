@@ -91,6 +91,7 @@ public:
       const common::ObIArray<uint64_t> *dup_row_column_ids,
       blocksstable::ObDatumRowIterator **dup_row_iter);
   int sort_keys();
+  const blocksstable::ObStorageDatumUtils *get_datum_utils() const { return datum_utils_; }
   blocksstable::ObDatumRowkey& get_conflict_rowkey()
   {
     const int64_t conflict_rowkey_idx = 1 == rowkeys_.count() ? 0 : conflict_rowkey_idx_;
@@ -248,7 +249,6 @@ public:
   void return_exist_iter(ObStoreRowIterator *exist_iter);
   void reuse_scan_mem_allocator() { scan_mem_allocator_.reuse(); }
   ObTableAccessContext &get_access_context() { return exist_helper_.table_access_context_; }
-  ObTruncatePartitionFilter *get_truncate_part_filter() { return exist_helper_.table_access_context_.get_truncate_part_filter(); }
   TO_STRING_KV(K_(rowkeys), K_(permutation), K_(delete_count), K_(conflict_rowkey_idx), K_(error_code),
                K_(exist_helper), K_(need_find_all_duplicate_key), K_(is_sorted));
 public:
@@ -262,8 +262,7 @@ public:
         ObStoreCtx &store_ctx,
         const ObITableReadInfo &rowkey_read_info,
         ObStorageReserveAllocator &stmt_allocator,
-        ObStorageReserveAllocator &allocator,
-        ObTruncatePartitionFilter *truncate_part_filter);
+        ObStorageReserveAllocator &allocator);
     OB_INLINE bool is_valid() const { return is_inited_; }
     TO_STRING_KV(K_(table_iter_param), K_(table_access_context));
     ObTableIterParam table_iter_param_;

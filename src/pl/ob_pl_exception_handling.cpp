@@ -153,7 +153,7 @@ ObUnwindException *ObPLEH::eh_create_exception(int64_t pl_context,
     CK (pl_ctx->get_exec_stack().count() > 0);
     CK (OB_NOT_NULL(frame = pl_ctx->get_exec_stack().at(0)));
     CK (frame->is_top_call());
-    CK (OB_NOT_NULL(pl_allocator = &(frame->get_exec_ctx().expr_alloc_)));
+    CK (OB_NOT_NULL(pl_allocator = frame->get_exec_ctx().get_top_expr_allocator()));
     if (OB_FAIL(ret)) {
     } else if (OB_ALLOCATE_MEMORY_FAILED == value->error_code_) {
       unwind = &pre_reserved_e.body_;
@@ -167,6 +167,7 @@ ObUnwindException *ObPLEH::eh_create_exception(int64_t pl_context,
         unwind->exception_cleanup = NULL;
         exception->type_.type_ = value->type_;
         exception->type_.error_code_ = value->error_code_;
+        exception->type_.ob_error_code_ = value->ob_error_code_;
         if (NULL == value->sql_state_ || 0 == value->str_len_) {
           exception->type_.sql_state_ = value->sql_state_;
         } else {
@@ -433,7 +434,7 @@ int ObPLEH::match_action_value(const ObPLConditionValue *action, const ObPLCondi
       break;
     }
     case SQL_EXCEPTION: {
-      precedence = (eh_classify_exception(exception->sql_state_) == SQL_EXCEPTION) && !is_internal_error(exception->error_code_) ? SQL_EXCEPTION : INVALID_TYPE;
+      precedence = (eh_classify_exception(exception->sql_state_) == SQL_EXCEPTION) && !is_internal_error(exception->ob_error_code_) ? SQL_EXCEPTION : INVALID_TYPE;
       break;
     }
     case SQL_WARNING: {
@@ -446,7 +447,7 @@ int ObPLEH::match_action_value(const ObPLConditionValue *action, const ObPLCondi
     }
     case OTHERS: {
       if (ERROR_CODE == exception->type_) {
-        precedence = is_internal_error(exception->error_code_) ? INVALID_TYPE : OTHERS;
+        precedence = is_internal_error(exception->ob_error_code_) ? INVALID_TYPE : OTHERS;
       } else {
         precedence = OTHERS;
       }
@@ -469,16 +470,23 @@ bool ObPLEH::is_internal_error(int error_code)
     || OB_ERR_UNEXPECTED == error_code
     || OB_ALLOCATE_MEMORY_FAILED == error_code
     || OB_ERR_DEFENSIVE_CHECK == error_code
-    || OB_TRANS_XA_BRANCH_FAIL == error_code
     || OB_TRANS_SQL_SEQUENCE_ILLEGAL == error_code
     || OB_ERR_SESSION_INTERRUPTED == error_code
     || OB_ERR_QUERY_INTERRUPTED == error_code
     || OB_TIMEOUT == error_code
-    || OB_TRANS_TIMEOUT == error_code
     || OB_TRANS_STMT_TIMEOUT == error_code
     || OB_EAGAIN == error_code
     || OB_NOT_MASTER == error_code
-    || OB_SNAPSHOT_DISCARDED == error_code;
+    || OB_SNAPSHOT_DISCARDED == error_code
+    // transaction relative
+    || OB_TRANS_ROLLBACKED == error_code
+    || OB_TRANS_NEED_ROLLBACK == error_code
+    || OB_TRANS_HAS_DECIDED == error_code
+    || OB_TRANS_TIMEOUT == error_code
+    || OB_TRANS_KILLED == error_code
+    || OB_TRANS_CTX_NOT_EXIST == error_code
+    || OB_TRANS_IS_EXITING == error_code
+    || OB_TRANS_XA_BRANCH_FAIL == error_code;
 }
 
 ObPLConditionType ObPLEH::eh_classify_exception(const char *sql_state)

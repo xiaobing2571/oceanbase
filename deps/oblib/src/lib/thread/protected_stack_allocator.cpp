@@ -93,7 +93,7 @@ void *ProtectedStackAllocator::__alloc(const uint64_t tenant_id,
   void *ptr = nullptr;
 
   const ssize_t ps = page_size();
-  const ObMemAttr attr(tenant_id, "CoStack", ctx_id, OB_HIGH_ALLOC);
+  const ObMemAttr attr(tenant_id, "CoStack", ctx_id);
   // page at bottom will be used as guard-page
   char *buffer = (char *)ob_malloc(size, attr);
   if (OB_ISNULL(buffer)) {
@@ -151,7 +151,7 @@ void StackMgr::insert(ObStackHeader *header)
 {
   if (header != nullptr) {
     abort_unless(header->check_magic());
-    rwlock_.wrlock(common::ObLatchIds::DEFAULT_SPIN_RWLOCK);
+    rwlock_.wrlock(common::ObLatchIds::STACK_MGR_LOCK);
     header->prev_ = &dummy_;
     header->next_ = dummy_.next_;
     dummy_.next_->prev_ = header;
@@ -164,7 +164,7 @@ void StackMgr::erase(ObStackHeader *header)
 {
   if (header != nullptr) {
     abort_unless(header->check_magic());
-    rwlock_.wrlock(common::ObLatchIds::DEFAULT_SPIN_RWLOCK);
+    rwlock_.wrlock(common::ObLatchIds::STACK_MGR_LOCK);
     header->prev_->next_ = header->next_;
     header->next_->prev_ = header->prev_;
     header->prev_ = header->next_ = header;

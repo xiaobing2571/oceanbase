@@ -171,7 +171,7 @@ public:
       ObBalanceJob job;
       if (OB_FAIL(b_svr->gather_stat_())) {
         TRANS_LOG(WARN, "failed to gather stat", KR(ret));
-      } else if (OB_FAIL(b_svr->gather_ls_status_stat(tenant_id, b_svr->ls_array_))) {
+      } else if (OB_FAIL(b_svr->gather_ls_status_stat(tenant_id, b_svr->ls_array_, true))) {
         TRANS_LOG(WARN, "failed to gather ls stat", KR(ret));
       } else if (OB_FAIL(ObBalanceJobTableOperator::get_balance_job(
                            tenant_id, false, *GCTX.sql_proxy_, job, start_time, finish_time))) {
@@ -323,7 +323,7 @@ TEST_F(ObTransferWithSmallerStartSCN, smaller_start_scn)
   ASSERT_EQ(0, SSH::submit_redo(tenant_id, loc1));
 
   ObTxLoopWorker *worker = MTL(ObTxLoopWorker *);
-  worker->scan_all_ls_(true, true, false, false);
+  worker->scan_all_ls_(true, true, false, false, false);
   usleep(1 * 1000 * 1000);
 
   // Step4: let the tx data table update upper info
@@ -401,7 +401,7 @@ TEST_F(ObTransferWithSmallerStartSCN, smaller_start_scn)
   }
   ASSERT_EQ(loc1, loc2);
 
-  worker->scan_all_ls_(true, true, false, false);
+  worker->scan_all_ls_(true, true, false, false, false);
   usleep(1 * 1000 * 1000);
 
   fprintf(stdout, "start update upper info the second time\n");

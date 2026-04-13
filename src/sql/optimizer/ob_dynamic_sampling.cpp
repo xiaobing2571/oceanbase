@@ -226,8 +226,11 @@ int ObDynamicSampling::add_ds_stat_items_by_dml_info(const ObDSTableParam &param
     bool hit_cache = ds_result_items.at(i).stat_handle_.stat_ != NULL;
     bool is_basic_stat = ds_result_items.at(i).type_ == ObDSResultItemType::OB_DS_BASIC_STAT;
     bool need_process_col = is_basic_stat;
+    bool from_kvcache = !allow_cache_ds_result_to_sql_ctx() ||
+                        is_basic_stat ||
+                        ds_result_items.at(i).exprs_.empty();
     bool need_add = false;
-    if (hit_cache && is_basic_stat) {
+    if (hit_cache && from_kvcache) {
       int64_t origin_modified_count = ds_result_items.at(i).stat_handle_.stat_->get_dml_cnt();
       int64_t inc_modified_cnt = cur_modified_dml_cnt - origin_modified_count;
       origin_modified_count = origin_modified_count < 1 ? 1 : origin_modified_count;
@@ -313,6 +316,7 @@ int ObDynamicSampling::do_add_ds_stat_item(const ObDSTableParam &param,
     }
     case ObDSResultItemType::OB_DS_OUTPUT_STAT:
     case ObDSResultItemType::OB_DS_INDEX_SCAN_STAT:
+    case ObDSResultItemType::OB_DS_INDEX_SKIP_SCAN_STAT:
     case ObDSResultItemType::OB_DS_INDEX_BACK_STAT: {
       ObString tmp_str;
       if (OB_ISNULL(ctx_->get_sql_schema_guard())) {
@@ -479,7 +483,8 @@ int ObDynamicSampling::construct_ds_stat_key(const ObDSTableParam &param,
     LOG_WARN("get unexpected null", K(ret));
   } else if (OB_FAIL(print_filter_exprs(ctx_->get_session_info(),
                                         ctx_->get_sql_schema_guard()->get_schema_guard(),
-                                        allow_cache_ds_result_to_sql_ctx() ? ctx_->get_params() : NULL,
+                                        (allow_cache_ds_result_to_sql_ctx() || force_use_kv_cache_) ?
+                                        ctx_->get_params() : NULL,
                                         type == ObDSResultItemType::OB_DS_BASIC_STAT ? empty_exprs : filter_exprs,
                                         true,
                                         expr_str))) {
@@ -514,6 +519,7 @@ int ObDynamicSampling::do_estimate_table_rowcount(const ObDSTableParam &param, b
   ObString tmp_str;
   ObSEArray<ObRawExpr*, 4> tmp_filters;
   throw_ds_error = false;
+  force_use_kv_cache_ = param.force_use_kv_cache_;
   LOG_TRACE("begin estimate table rowcount", K(param));
   if (OB_FAIL(add_table_info(param.db_name_,
                              param.table_name_,
@@ -528,30 +534,25 @@ int ObDynamicSampling::do_estimate_table_rowcount(const ObDSTableParam &param, b
     LOG_WARN("failed to calc sample block ratio", K(ret));
   } else if (OB_FAIL(add_block_info_for_stat_items())) {
     LOG_WARN("failed to add block info for stat items", K(ret));
-  } else if (OB_FAIL(estimte_rowcount(param.max_ds_timeout_, param.degree_, throw_ds_error))) {
+  } else if (OB_FAIL(estimate_rowcount(param.max_ds_timeout_, param.degree_, throw_ds_error))) {
     LOG_WARN("failed to estimate rowcount", K(ret));
   }
   return ret;
 }
 
-int ObDynamicSampling::estimte_rowcount(int64_t max_ds_timeout,
-                                        int64_t degree,
-                                        bool &throw_ds_error)
+int ObDynamicSampling::estimate_rowcount(int64_t max_ds_timeout,
+                                         int64_t degree,
+                                         bool &throw_ds_error)
 {
   int ret = OB_SUCCESS;
   ObSqlString raw_sql_str;
   ObSqlString sample_str;
   ObSqlString basic_hint_str;
   ObSqlString table_str;
-  bool is_no_backslash_escapes = false;
-  int64_t nested_count = -1;
-  sql::ObSQLSessionInfo::StmtSavedValue *session_value = NULL;
+  ObDSSessionSavedData saved_data;
   int64_t start_time = ObTimeUtility::current_time();
   ObSQLSessionInfo *session_info = ctx_->get_session_info();
   bool need_restore_session = false;
-  transaction::ObTxDesc *tx_desc = NULL;
-  bool is_sess_in_retry = false;
-  int last_query_retry_err = OB_SUCCESS;
   if (!is_big_table_ && OB_FAIL(add_block_sample_info(sample_block_ratio_, seed_, sample_str))) {
     LOG_WARN("failed to add block sample info", K(ret));
   } else if (OB_FAIL(add_basic_hint_info(basic_hint_str, max_ds_timeout, is_big_table_ ? 1 : degree))) {
@@ -560,10 +561,7 @@ int ObDynamicSampling::estimte_rowcount(int64_t max_ds_timeout,
     LOG_WARN("failed to add table clause", K(ret));
   } else if (OB_FAIL(pack(raw_sql_str))) {
     LOG_WARN("failed to pack dynamic sampling", K(ret));
-  } else if (OB_FAIL(prepare_and_store_session(session_info, session_value,
-                                               nested_count, is_no_backslash_escapes, tx_desc,
-                                               is_sess_in_retry,
-                                               last_query_retry_err))) {
+  } else if (OB_FAIL(prepare_and_store_session(session_info, max_ds_timeout, saved_data))) {
     throw_ds_error = true;//here we must throw error, because the session may be unavailable.
     LOG_WARN("failed to prepare and store session", K(ret));
   } else {
@@ -580,16 +578,13 @@ int ObDynamicSampling::estimte_rowcount(int64_t max_ds_timeout,
   //regardless of whether the above behavior is successful or not, we need to restore session.
   if (need_restore_session) {
     int tmp_ret = OB_SUCCESS;
-    if (OB_SUCCESS != (tmp_ret = restore_session(session_info, session_value,
-                                                 nested_count, is_no_backslash_escapes, tx_desc,
-                                                 is_sess_in_retry,
-                                                 last_query_retry_err))) {
+    if (OB_SUCCESS != (tmp_ret = restore_session(session_info, saved_data))) {
       throw_ds_error = true;//here we must throw error, because the session may be unavailable.
       ret = COVER_SUCC(tmp_ret);
       LOG_WARN("failed to restore session", K(tmp_ret));
     }
-    if (OB_NOT_NULL(session_value)) {
-      session_value->reset();
+    if (OB_NOT_NULL(saved_data.session_value_)) {
+      saved_data.session_value_->reset();
     }
   }
   LOG_TRACE("go to dynamic sample one time", K(sample_block_ratio_), K(ret),
@@ -599,69 +594,83 @@ int ObDynamicSampling::estimte_rowcount(int64_t max_ds_timeout,
   return ret;
 }
 
-int ObDSStatItem::gen_expr(common::ObIAllocator &allocator, char *buf, const int64_t buf_len, int64_t &pos)
+int ObDSStatItem::gen_expr(common::ObIAllocator &allocator,
+                           ObSQLSessionInfo *session_info,
+                           char *buf,
+                           const int64_t buf_len,
+                           int64_t &pos)
 {
   int ret = OB_SUCCESS;
   ObSqlString expr_str;
   ObString new_filter_string;
   ObString new_col_name;
-  switch (type_) {
-      case OB_DS_ROWCOUNT:
-      case OB_DS_OUTPUT_COUNT:
-      case OB_DS_FILTER_OUTPUT: {
-      if (filter_string_.empty()) {
-        if (OB_FAIL(databuff_printf(buf, buf_len, pos, "COUNT(*)"))) {
+  ObCollationType collation_connection = CS_TYPE_UTF8MB4_GENERAL_CI;
+  if (OB_ISNULL(session_info) || OB_ISNULL(buf)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(session_info), K(buf), K(ret));
+  } else if (OB_FAIL(session_info->get_collation_connection(collation_connection))) {
+    LOG_WARN("failed to get_collation_connection", K(ret));
+  } else {
+    switch (type_) {
+        case OB_DS_ROWCOUNT:
+        case OB_DS_OUTPUT_COUNT:
+        case OB_DS_FILTER_OUTPUT: {
+        if (filter_string_.empty()) {
+          if (OB_FAIL(databuff_printf(buf, buf_len, pos, "COUNT(*)"))) {
+            LOG_WARN("failed to print buf", K(ret));
+          } else {/*do nothing*/}
+        } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "SUM(CASE WHEN %.*s THEN 1 ELSE 0 END)",
+                                          filter_string_.length(),
+                                          filter_string_.ptr()))) {
           LOG_WARN("failed to print buf", K(ret));
-        } else {/*do nothing*/}
-      } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "SUM(CASE WHEN %.*s THEN 1 ELSE 0 END)",
-                                         filter_string_.length(),
-                                         filter_string_.ptr()))) {
-        LOG_WARN("failed to print buf", K(ret));
+        }
+        break;
       }
-      break;
-    }
-    case OB_DS_COLUMN_NUM_DISTINCT: {
-      if (OB_ISNULL(column_expr_)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("get unexpected null", K(ret), K(column_expr_));
-      } else if (OB_FAIL(sql::ObSQLUtils::generate_new_name_with_escape_character(
-                                                          allocator,
-                                                          column_expr_->get_column_name(),
-                                                          new_col_name,
-                                                          lib::is_oracle_mode()))) {
-        LOG_WARN("fail to generate new name with escape character", K(ret), K(column_expr_->get_column_name()));
-      } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
-                                         lib::is_oracle_mode() ? "APPROX_COUNT_DISTINCT(\"%.*s\")" :
-                                                                 "APPROX_COUNT_DISTINCT(`%.*s`)",
-                                         new_col_name.length(),
-                                         new_col_name.ptr()))) {
-        LOG_WARN("failed to print buf", K(ret));
-      }
-      break;
-    }
-    case OB_DS_COLUMN_NUM_NULL: {
-      if (OB_ISNULL(column_expr_)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("get unexpected null", K(ret), K(column_expr_));
-      } else if (OB_FAIL(sql::ObSQLUtils::generate_new_name_with_escape_character(
-                                                          allocator,
-                                                          column_expr_->get_column_name(),
-                                                          new_col_name,
-                                                          lib::is_oracle_mode()))) {
-        LOG_WARN("fail to generate new name with escape character", K(ret), K(column_expr_->get_column_name()));
-      } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
-                                         lib::is_oracle_mode() ? "SUM(CASE WHEN \"%.*s\" IS NULL THEN 1 ELSE 0 END)" :
-                                                                 "SUM(CASE WHEN `%.*s` IS NULL THEN 1 ELSE 0 END)",
+      case OB_DS_COLUMN_NUM_DISTINCT: {
+        if (OB_ISNULL(column_expr_)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected null", K(ret), K(column_expr_));
+        } else if (OB_FAIL(ObDynamicSamplingUtils::print_identifier(allocator,
+                                                                    column_expr_->get_column_name(),
+                                                                    new_col_name,
+                                                                    collation_connection,
+                                                                    lib::is_oracle_mode()))) {
+          LOG_WARN("fail to print_identifier", K(ret), K(column_expr_->get_column_name()),
+                                               K(new_col_name), K(collation_connection));
+        } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                                          lib::is_oracle_mode() ? "APPROX_COUNT_DISTINCT(\"%.*s\")" :
+                                                                  "APPROX_COUNT_DISTINCT(`%.*s`)",
                                           new_col_name.length(),
                                           new_col_name.ptr()))) {
-        LOG_WARN("failed to print buf", K(ret));
+          LOG_WARN("failed to print buf", K(ret));
+        }
+        break;
       }
-      break;
-    }
-    default: {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("get unexpected error", K(type_), K(ret));
-      break;
+      case OB_DS_COLUMN_NUM_NULL: {
+        if (OB_ISNULL(column_expr_)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected null", K(ret), K(column_expr_));
+        } else if (OB_FAIL(ObDynamicSamplingUtils::print_identifier(allocator,
+                                                                    column_expr_->get_column_name(),
+                                                                    new_col_name,
+                                                                    collation_connection,
+                                                                    lib::is_oracle_mode()))) {
+          LOG_WARN("fail to print_identifier", K(ret), K(column_expr_->get_column_name()),
+                                               K(new_col_name), K(collation_connection));
+        } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+                                           lib::is_oracle_mode() ? "SUM(CASE WHEN \"%.*s\" IS NULL THEN 1 ELSE 0 END)" :
+                                                                   "SUM(CASE WHEN `%.*s` IS NULL THEN 1 ELSE 0 END)",
+                                           new_col_name.length(),
+                                           new_col_name.ptr()))) {
+          LOG_WARN("failed to print buf", K(ret));
+        }
+        break;
+      }
+      default: {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected error", K(type_), K(ret));
+        break;
+      }
     }
   }
   return ret;
@@ -676,7 +685,7 @@ int ObDynamicSampling::pack(ObSqlString &raw_sql_str)
 {
   int ret = OB_SUCCESS;
   ObSqlString select_fields;
-  if (OB_FAIL(gen_select_filed(select_fields))) {
+  if (OB_FAIL(gen_select_field(select_fields))) {
     LOG_WARN("failed to generate select filed", K(ret));
   } else if (OB_FAIL(raw_sql_str.append_fmt(lib::is_oracle_mode() ?
                                             "SELECT %.*s %.*s FROM %.*s %s %.*s" :
@@ -698,15 +707,20 @@ int ObDynamicSampling::pack(ObSqlString &raw_sql_str)
   return ret;
 }
 
-int ObDynamicSampling::gen_select_filed(ObSqlString &select_fields)
+int ObDynamicSampling::gen_select_field(ObSqlString &select_fields)
 {
   int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session_info = ctx_->get_session_info();
+  if (OB_ISNULL(session_info)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  }
   for (int64_t i = 0; OB_SUCC(ret) && i < ds_stat_items_.count(); ++i) {
     int64_t pos = 0;
     SMART_VAR(char[OB_MAX_SQL_LENGTH], buf) {
       if (i != 0 && OB_FAIL(select_fields.append(", "))) {
         LOG_WARN("failed to append delimiter", K(ret));
-      } else if (OB_FAIL(ds_stat_items_.at(i)->gen_expr(allocator_, buf, OB_MAX_SQL_LENGTH, pos))) {
+      } else if (OB_FAIL(ds_stat_items_.at(i)->gen_expr(allocator_, session_info, buf, OB_MAX_SQL_LENGTH, pos))) {
         LOG_WARN("failed to gen select expr", K(ret));
       } else if (OB_FAIL(select_fields.append(buf, pos))) {
         LOG_WARN("failed to append stat item expr", K(ret));
@@ -724,24 +738,28 @@ int ObDynamicSampling::add_table_info(const ObString &db_name,
   ObString new_db_name;
   ObString new_tbl_name;
   ObString new_alias_name;
-  if (OB_FAIL(sql::ObSQLUtils::generate_new_name_with_escape_character(
-              allocator_,
-              db_name,
-              new_db_name,
-              lib::is_oracle_mode()))) {
-    LOG_WARN("fail to generate new name with escape character", K(ret), K(db_name));
-  } else if (OB_FAIL(sql::ObSQLUtils::generate_new_name_with_escape_character(
-                    allocator_,
-                    table_name,
-                    new_tbl_name,
-                    lib::is_oracle_mode()))) {
-    LOG_WARN("fail to generate new name with escape character", K(ret), K(table_name));
-  } else if (OB_FAIL(sql::ObSQLUtils::generate_new_name_with_escape_character(
-                    allocator_,
-                    alias_name,
-                    new_alias_name,
-                    lib::is_oracle_mode()))) {
-    LOG_WARN("fail to generate new name with escape character", K(ret), K(alias_name));
+  ObSQLSessionInfo *session_info = ctx_->get_session_info();
+  ObCollationType collation_connection = CS_TYPE_UTF8MB4_GENERAL_CI;
+  if (OB_ISNULL(session_info)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else if (OB_FAIL(session_info->get_collation_connection(collation_connection))) {
+    LOG_WARN("failed to update sys var", K(ret));
+  } else if (OB_FAIL(ObDynamicSamplingUtils::print_identifier(allocator_,
+                                                              db_name,
+                                                              new_db_name,
+                                                              collation_connection,
+                                                              lib::is_oracle_mode()))) {
+  } else if (OB_FAIL(ObDynamicSamplingUtils::print_identifier(allocator_,
+                                                              table_name,
+                                                              new_tbl_name,
+                                                              collation_connection,
+                                                              lib::is_oracle_mode()))) {
+  } else if (OB_FAIL(ObDynamicSamplingUtils::print_identifier(allocator_,
+                                                              alias_name,
+                                                              new_alias_name,
+                                                              collation_connection,
+                                                              lib::is_oracle_mode()))) {
   } else {
     db_name_ = new_db_name;
     table_name_ = new_tbl_name;
@@ -755,7 +773,11 @@ int ObDynamicSampling::add_basic_hint_info(ObSqlString &basic_hint_str,
                                            int64_t degree)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(basic_hint_str.append("/*+ NO_REWRITE"))) {//hint begin
+  const ObSQLSessionInfo *session_info = nullptr;
+  if (OB_ISNULL(ctx_) || OB_ISNULL(session_info = ctx_->get_session_info())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null", K(ctx_), K(session_info));
+  } else if (OB_FAIL(basic_hint_str.append("/*+ NO_REWRITE"))) {//hint begin
     LOG_WARN("failed to append", K(ret));
   //add suite degree
   } else if (degree <= 1 && OB_FAIL(basic_hint_str.append(" NO_PARALLEL "))) {
@@ -767,11 +789,19 @@ int ObDynamicSampling::add_basic_hint_info(ObSqlString &basic_hint_str,
     LOG_WARN("failed to append", K(ret));
   } else if (OB_FAIL(basic_hint_str.append(" DBMS_STATS "))) {
     LOG_WARN("failed to append", K(ret));
-  //add query timeout control Dynamic Sampling SQL execute time.
-  } else if (OB_FAIL(basic_hint_str.append_fmt(" QUERY_TIMEOUT(%ld) ", query_timeout))) {
-    LOG_WARN("failed to append", K(ret));
   //use defualt stat
   } else if (OB_FAIL(basic_hint_str.append(" OPT_PARAM(\'USE_DEFAULT_OPT_STAT\',\'TRUE\') "))) {
+    LOG_WARN("failed to append", K(ret));
+  } else if (OB_FAIL(basic_hint_str.append(" OPT_PARAM('APPROX_COUNT_DISTINCT_PRECISION', 10) "))) {
+    LOG_WARN("failed to append", K(ret));
+  } else if (ctx_->get_is_weak_read() && WEAK != session_info->get_consistency_level() &&
+             OB_FAIL(basic_hint_str.append(" READ_CONSISTENCY(WEAK) "))) {
+    LOG_WARN("failed to append", K(ret));
+  } else if (!ctx_->get_is_weak_read() && STRONG != session_info->get_consistency_level() &&
+             OB_FAIL(basic_hint_str.append(" READ_CONSISTENCY(STRONG) "))) {
+    LOG_WARN("failed to append", K(ret));
+  } else if (session_info->get_route_to_column_replica() &&
+             OB_FAIL(basic_hint_str.append(" OPT_PARAM('AP_QUERY_ROUTE_POLICY', 'FORCE') "))) {
     LOG_WARN("failed to append", K(ret));
   } else if (OB_FAIL(basic_hint_str.append("*/"))) {//hint end
     LOG_WARN("failed to append", K(ret));
@@ -822,7 +852,7 @@ int ObDynamicSampling::print_filter_exprs(const ObSQLSessionInfo *session_info,
         ObRawExprPrinter expr_printer(expr_str_buf,
                                       OB_MAX_DEFAULT_VALUE_LENGTH, &pos,
                                       schema_guard,
-                                      TZ_INFO(session_info),
+                                      CREATE_OBJ_PRINT_PARAM(session_info),
                                       param_store);
         if (OB_FAIL(expr_printer.do_print(new_expr, T_WHERE_SCOPE, only_column_namespace))) {
           LOG_WARN("failed to print expr", KPC(new_expr), K(ret));
@@ -1146,12 +1176,8 @@ int ObDynamicSampling::do_estimate_rowcount(ObSQLSessionInfo *session_info,
 }
 
 int ObDynamicSampling::prepare_and_store_session(ObSQLSessionInfo *session,
-                                                 sql::ObSQLSessionInfo::StmtSavedValue *&session_value,
-                                                 int64_t &nested_count,
-                                                 bool &is_no_backslash_escapes,
-                                                 transaction::ObTxDesc *&tx_desc,
-                                                 bool &is_sess_in_retry,
-                                                 int &last_query_retry_err)
+                                                 int64_t ds_query_timeout,
+                                                 ObDSSessionSavedData &saved_data)
 {
   int ret = OB_SUCCESS;
   void *ptr = NULL;
@@ -1162,28 +1188,38 @@ int ObDynamicSampling::prepare_and_store_session(ObSQLSessionInfo *session,
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to alloc memory for saved session value", K(ret));
   } else {
-    session_value = new(ptr)sql::ObSQLSessionInfo::StmtSavedValue();
-    if (OB_FAIL(session->save_session(*session_value))) {
+    saved_data.session_value_ = new(ptr)sql::ObSQLSessionInfo::StmtSavedValue();
+    if (OB_FAIL(session->save_session(*saved_data.session_value_))) {
       LOG_WARN("failed to save session", K(ret));
     } else if (session->is_in_external_catalog()
                && OB_FAIL(session->set_internal_catalog_db())) {
       LOG_WARN("failed to set catalog", K(ret));
     } else {
       ObSQLSessionInfo::LockGuard data_lock_guard(session->get_thread_data_lock());
-      is_sess_in_retry = session->get_is_in_retry();
-      last_query_retry_err = session->get_retry_info().get_last_query_retry_err();
-      nested_count = session->get_nested_count();
-      IS_NO_BACKSLASH_ESCAPES(session->get_sql_mode(), is_no_backslash_escapes);
+      saved_data.is_sess_in_retry_ = session->get_is_in_retry();
+      saved_data.last_query_retry_err_ = session->get_retry_info().get_last_query_retry_err();
+      saved_data.nested_count_ = session->get_nested_count();
+      saved_data.route_to_column_replica_ = session->get_route_to_column_replica();
+      IS_NO_BACKSLASH_ESCAPES(session->get_sql_mode(), saved_data.is_no_backslash_escapes_);
       session->set_sql_mode(session->get_sql_mode() & ~SMO_NO_BACKSLASH_ESCAPES);
       session->set_query_start_time(ObTimeUtility::current_time());
       session->set_inner_session();
       session->set_nested_count(-1);
       //bug:
-      session->set_autocommit(session_value->inc_autocommit_);
+      session->set_autocommit(saved_data.session_value_->inc_autocommit_);
       //ac is true, dynamic sampling select query no need tx desc.
-      if (session_value->inc_autocommit_ && session->get_tx_desc() != NULL) {
-        tx_desc = session->get_tx_desc();
+      if (saved_data.session_value_->inc_autocommit_ && session->get_tx_desc() != NULL) {
+        saved_data.tx_desc_ = session->get_tx_desc();
         session->get_tx_desc() = NULL;
+      }
+      if (OB_FAIL(session->get_query_timeout(saved_data.session_query_timeout_))) {
+        LOG_WARN("failed to get query timeout", K(ret));
+      } else {
+        ObObj val;
+        val.set_int(ds_query_timeout);
+        if (OB_FAIL(session->update_sys_variable(SYS_VAR_OB_QUERY_TIMEOUT, val))) {
+          LOG_WARN("set sys variable failed", K(ret), K(OB_SV_QUERY_TIMEOUT), K(val));
+        }
       }
     }
   }
@@ -1191,27 +1227,23 @@ int ObDynamicSampling::prepare_and_store_session(ObSQLSessionInfo *session,
 }
 
 int ObDynamicSampling::restore_session(ObSQLSessionInfo *session,
-                                       sql::ObSQLSessionInfo::StmtSavedValue *session_value,
-                                       int64_t nested_count,
-                                       bool is_no_backslash_escapes,
-                                       transaction::ObTxDesc *tx_desc,
-                                       bool &is_sess_in_retry,
-                                       int &last_query_retry_err)
+                                       ObDSSessionSavedData &saved_data)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(session) || OB_ISNULL(session_value)) {
+  if (OB_ISNULL(session) || OB_ISNULL(saved_data.session_value_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get unexpected error", K(ret), K(session), K(session_value));
-  } else if (OB_FAIL(session->restore_session(*session_value))) {
+    LOG_WARN("get unexpected error", K(ret), K(session), K(saved_data.session_value_));
+  } else if (OB_FAIL(session->restore_session(*saved_data.session_value_))) {
     LOG_WARN("failed to restore session", K(ret));
-  } else if (OB_FALSE_IT(session->set_session_in_retry(is_sess_in_retry, last_query_retry_err))) {
+  } else if (OB_FALSE_IT(session->set_session_in_retry(saved_data.is_sess_in_retry_, saved_data.last_query_retry_err_))) {
   } else {
     ObSQLSessionInfo::LockGuard data_lock_guard(session->get_thread_data_lock());
-    session->set_nested_count(nested_count);
-    if (is_no_backslash_escapes) {
+    session->set_nested_count(saved_data.nested_count_);
+    session->set_route_to_column_replica(saved_data.route_to_column_replica_);
+    if (saved_data.is_no_backslash_escapes_) {
       session->set_sql_mode(session->get_sql_mode() | SMO_NO_BACKSLASH_ESCAPES);
     }
-    if (tx_desc != NULL) {//reset origin tx desc.
+    if (saved_data.tx_desc_ != NULL) {//reset origin tx desc.
       // release curr
       if (OB_NOT_NULL(session->get_tx_desc())) {
         auto txs = MTL(transaction::ObTransService*);
@@ -1223,7 +1255,14 @@ int ObDynamicSampling::restore_session(ObSQLSessionInfo *session,
           txs->release_tx(*session->get_tx_desc());
         }
       }
-      session->get_tx_desc() = tx_desc;
+      session->get_tx_desc() = saved_data.tx_desc_;
+    }
+    if (OB_SUCC(ret)) {
+      ObObj val;
+      val.set_int(saved_data.session_query_timeout_);
+      if (OB_FAIL(session->update_sys_variable(SYS_VAR_OB_QUERY_TIMEOUT, val))) {
+        LOG_WARN("set sys variable failed", K(ret), K(OB_SV_QUERY_TIMEOUT), K(val));
+      }
     }
   }
   return ret;
@@ -1316,9 +1355,16 @@ int ObDynamicSampling::gen_partition_str(const ObIArray<PartInfo> &partition_inf
 {
   int ret = OB_SUCCESS;
   ObArenaAllocator allocator("ObOptDS");
+  ObSQLSessionInfo *session_info = ctx_->get_session_info();
+  ObCollationType collation_connection = CS_TYPE_UTF8MB4_GENERAL_CI;
   if (OB_UNLIKELY(partition_infos.empty())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected error", K(ret), K(partition_infos));
+  } else if (OB_ISNULL(session_info)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else if (OB_FAIL(session_info->get_collation_connection(collation_connection))) {
+    LOG_WARN("failed to update sys var", K(ret));
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < partition_infos.count(); ++i) {
       const char *quot = lib::is_mysql_mode() ? "`" : "\"";
@@ -1327,11 +1373,14 @@ int ObDynamicSampling::gen_partition_str(const ObIArray<PartInfo> &partition_inf
         LOG_WARN("failed to append", K(ret));
       } else if (OB_FAIL(partition_str.append(quot))) {
         LOG_WARN("failed to append", K(ret));
-      } else if (OB_FAIL(ObSQLUtils::generate_new_name_with_escape_character(allocator,
-                                                                             partition_infos.at(i).part_name_,
-                                                                             print_name,
-                                                                             lib::is_oracle_mode()))) {
-        LOG_WARN("failed to generate new name with escape character", K(ret));
+      } else if (OB_FAIL(ObDynamicSamplingUtils::print_identifier(
+                                                 allocator,
+                                                 partition_infos.at(i).part_name_,
+                                                 print_name,
+                                                 collation_connection,
+                                                 lib::is_oracle_mode()))) {
+        LOG_WARN("fail to print_identifier", K(ret), K(partition_infos.at(i).part_name_),
+                                             K(print_name), K(collation_connection));
       } else if (OB_FAIL(partition_str.append(print_name))) {
         LOG_WARN("failed to append", K(ret));
       } else if (OB_FAIL(partition_str.append(quot))) {
@@ -1417,12 +1466,14 @@ int ObDynamicSampling::add_table_clause(ObSqlString &table_str)
 
 bool ObDynamicSampling::allow_cache_ds_result_to_sql_ctx() const {
   return OB_NOT_NULL(ctx_) && OB_NOT_NULL(ctx_->get_query_ctx()) &&
-         ctx_->get_query_ctx()->check_opt_compat_version(COMPAT_VERSION_4_3_5_BP2);
+         ctx_->get_query_ctx()->check_opt_compat_version(COMPAT_VERSION_4_3_5_BP2) &&
+         !force_use_kv_cache_;
 }
 
 int ObDynamicSamplingUtils::get_valid_dynamic_sampling_level(const ObSQLSessionInfo *session_info,
                                                              const ObTableDynamicSamplingHint *table_ds_hint,
                                                              const int64_t global_ds_level,
+                                                             const ObTableType table_type,
                                                              int64_t &ds_level,
                                                              int64_t &sample_block_cnt,
                                                              bool &specify_ds)
@@ -1442,11 +1493,16 @@ int ObDynamicSamplingUtils::get_valid_dynamic_sampling_level(const ObSQLSessionI
   } else if (global_ds_level != ObGlobalHint::UNSET_DYNAMIC_SAMPLING) {
     ds_level = global_ds_level;
     specify_ds = true;
+  //force use dynamic sampling for mlog in mview refreshing
+  } else if (!session_info->is_user_session() && table_type == MATERIALIZED_VIEW_LOG) {
+    ds_level = ObDynamicSamplingLevel::BASIC_DYNAMIC_SAMPLING;
+    specify_ds = true;
   //last see user session variable.
   } else if (OB_ISNULL(session_info)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(ret), K(session_info));
-  } else if (session_info->is_user_session() && OB_FAIL(session_info->get_opt_dynamic_sampling(session_ds_level))) {
+  } else if ((session_info->is_user_session() || session_info->get_ddl_info().is_refreshing_mview())
+             && OB_FAIL(session_info->get_opt_dynamic_sampling(session_ds_level))) {
     LOG_WARN("failed to get opt dynamic sampling level", K(ret));
   } else if (session_ds_level == ObDynamicSamplingLevel::BASIC_DYNAMIC_SAMPLING) {
     ds_level = session_ds_level;
@@ -1467,8 +1523,11 @@ int ObDynamicSamplingUtils::get_ds_table_param(ObOptimizerContext &ctx,
   bool is_valid = true;
   int64_t ds_level = ObDynamicSamplingLevel::NO_DYNAMIC_SAMPLING;
   int64_t sample_block_cnt = 0;
-  if (OB_ISNULL(log_plan) || OB_ISNULL(table_meta) ||
-      OB_ISNULL(table_item = log_plan->get_stmt()->get_table_item_by_id(table_meta->get_table_id()))) {
+  ObSQLSessionInfo *session_info = NULL;
+  ObTableType table_type = MAX_TABLE_TYPE;
+  if (OB_ISNULL(log_plan) || OB_ISNULL(table_meta) || OB_ISNULL(table_meta->get_base_meta_info()) ||
+      OB_ISNULL(table_item = log_plan->get_stmt()->get_table_item_by_id(table_meta->get_table_id()))
+      || OB_ISNULL(session_info = ctx.get_session_info())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(ret), K(log_plan), KPC(table_meta), KPC(table_item));
   } else if (OB_UNLIKELY(!log_plan->get_stmt()->is_select_stmt()) ||
@@ -1477,9 +1536,11 @@ int ObDynamicSamplingUtils::get_ds_table_param(ObOptimizerContext &ctx,
              OB_UNLIKELY(is_external_object_id(table_meta->get_ref_table_id()))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected param", K(ret), K(log_plan), KPC(table_meta), KPC(table_item));
-  } else if (OB_FAIL(get_valid_dynamic_sampling_level(ctx.get_session_info(),
+  } else if (OB_FALSE_IT(table_type = table_meta->get_base_meta_info()->table_type_)) {
+  } else if (OB_FAIL(get_valid_dynamic_sampling_level(session_info,
                                                       log_plan->get_log_plan_hint().get_dynamic_sampling_hint(table_meta->get_table_id()),
                                                       ctx.get_global_hint().get_dynamic_sampling(),
+                                                      table_type,
                                                       ds_level,
                                                       sample_block_cnt,
                                                       specify_ds))) {
@@ -1509,6 +1570,9 @@ int ObDynamicSamplingUtils::get_ds_table_param(ObOptimizerContext &ctx,
       ds_table_param.db_name_ = table_item->database_name_;
       ds_table_param.table_name_ = table_item->table_name_;
       ds_table_param.alias_name_ = table_item->alias_name_;
+      if (!session_info->is_user_session() && table_type == MATERIALIZED_VIEW_LOG) {
+        ds_table_param.force_use_kv_cache_ = true;
+      }
     }
   } else {
     ret = OB_ERR_UNEXPECTED;
@@ -1572,8 +1636,14 @@ int ObDynamicSamplingUtils::check_ds_can_be_applied_to_filter(const ObRawExpr *f
   } else if (filter->is_column_ref_expr()) {
     //Dynamic Sampling of columns with LOB-related types is prohibited, as projecting such type columns is particularly slow.
     //bug:
+    const ObColumnRefRawExpr *column_ref = static_cast<const ObColumnRefRawExpr *>(filter);
     if (!ObDynamicSamplingUtils::is_valid_ds_col_type(filter->get_data_type())) {
       no_use = true;
+    } else if (column_ref->is_generated_column() && column_ref->is_hidden_column()
+              && OB_NOT_NULL(column_ref->get_dependant_expr())) {
+      if (OB_FAIL(SMART_CALL(check_ds_can_be_applied_to_filter(column_ref->get_dependant_expr(), no_use, total_expr_cnt)))) {
+        LOG_WARN("failed to check ds can use filter", K(ret));
+      }
     }
   } else {/*do nothing*/}
   if (OB_SUCC(ret) && !no_use) {
@@ -1805,6 +1875,32 @@ bool ObDynamicSamplingUtils::is_valid_ds_col_type(const ObObjType type)
   return bret;
 }
 
+
+int ObDynamicSamplingUtils::print_identifier(ObIAllocator& allocator,
+                                             const ObString &src,
+                                             ObString &dest,
+                                             ObCollationType connection_collation,
+                                             bool is_oracle_mode)
+{
+  int ret = OB_SUCCESS;
+  ObString print_name;
+  if (OB_FAIL(ObSQLUtils::generate_new_name_with_escape_character(allocator,
+                                                                  src,
+                                                                  print_name,
+                                                                  is_oracle_mode))) {
+    LOG_WARN("failed to generate new name with escape character", K(ret));
+  } else if (connection_collation == ObCharset::get_system_collation()) {
+    dest = print_name;
+  } else if (OB_FAIL(ObCharset::charset_convert(allocator,
+                                                print_name,
+                                                ObCharset::get_system_collation(),
+                                                connection_collation,
+                                                dest))) {
+    LOG_WARN("charset conversion failed", K(ret), K(connection_collation), K(src), K(print_name));
+  }
+  return ret;
+}
+
 //following function used to dynamic sampling join in the future.
 
 // int ObDynamicSampling::estimate_join_rowcount(const ObOptDSJoinParam &param,
@@ -1890,7 +1986,7 @@ bool ObDynamicSamplingUtils::is_valid_ds_col_type(const ObObjType type)
 //     LOG_WARN("failed to add where condition", K(ret));
 //   } else if (OB_FAIL(calc_join_sample_block_ratio(param))) {
 //     LOG_WARN("failed to calc sample block ratio", K(ret));
-//   } else if (OB_FAIL(estimte_rowcount(get_result, ObDynamicSamplingLevel::ADS_DYNAMIC_SAMPLING))) {
+//   } else if (OB_FAIL(estimate_rowcount(get_result, ObDynamicSamplingLevel::ADS_DYNAMIC_SAMPLING))) {
 //     LOG_WARN("failed to estimate rowcount", K(ret));
 //   } else if (get_result) {
 //     ds_stat.set_stat_expired_time(ObTimeUtility::current_time() + ObOptStatMonitorCheckTask::CHECK_INTERVAL);
@@ -1903,7 +1999,7 @@ bool ObDynamicSamplingUtils::is_valid_ds_col_type(const ObObjType type)
 // {
 //   int ret = OB_SUCCESS;
 //   ObSqlString select_fields;
-//   if (OB_FAIL(gen_select_filed(select_fields))) {
+//   if (OB_FAIL(gen_select_field(select_fields))) {
 //     LOG_WARN("failed to generate select filed", K(ret));
 //   } else if (OB_FAIL(raw_sql_str.append_fmt(lib::is_oracle_mode() ?
 //                                             "SELECT %.*s %.*s FROM \"%.*s\".\"%.*s\" %.*s %.*s %.*s %.*s \"%.*s\".\"%.*s\" %.*s %.*s %.*s %s %.*s %s %.*s" :

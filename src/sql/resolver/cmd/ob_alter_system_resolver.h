@@ -58,9 +58,10 @@ public:
   static int resolve_server_or_zone(const ParseNode *parse_tree, RPC_ARG &arg);
   // resolve opt_backup_tenant_list
   static int get_tenant_ids(const ParseNode &t_node, common::ObIArray<uint64_t> &tenant_ids);
-
+  // resolve opt_backup_id_list
 
   static int resolve_tablet_id(const ParseNode *opt_tablet_id, ObTabletID &tablet_id);
+  static int resolve_table_id(const ParseNode *opt_table_id, uint64_t &table_id);
   static int resolve_tenant(const ParseNode &tenants_node, 
                             const uint64_t tenant_id,
                             common::ObSArray<uint64_t> &tenant_ids,
@@ -70,6 +71,12 @@ public:
   static int get_and_verify_tenant_name(const ParseNode* tenant_name_node,
                                         const uint64_t exec_tenant_id,
                                         uint64_t &target_tenant_id);
+  static int get_and_verify_tenant_name(
+      const ParseNode *parse_node,
+      const bool allow_sys_meta_tenant,
+      const uint64_t exec_tenant_id,
+      uint64_t &target_tenant_id,
+      const char * const op_str);
   static int check_and_get_data_source(const ParseNode* data_source_node,
                                        common::ObAddr& data_source);
   static int check_and_get_server_addr(const ParseNode* server_addr_node,
@@ -77,10 +84,18 @@ public:
   static int check_and_get_paxos_replica_num(const ParseNode* paxos_replica_num_node,
                                              int64_t& paxos_replica_num);
   static int check_compatibility_for_alter_ls_replica(const uint64_t cur_tenant_id);
+  static int check_compatibility_for_replace_ls(const uint64_t cur_tenant_id);
   static int do_check_for_alter_ls_replica(const ParseNode *tenant_name_node,
                                            ObSchemaChecker *schema_checker,
                                            ObSQLSessionInfo *session_info,
-                                           uint64_t &target_tenant_id);
+                                           uint64_t &target_tenant_id,
+                                           const bool is_replace_task = false);
+  static int resolve_logservice_access_point(const ParseNode *parse_tree,
+                                             ObString &logservice_access_point);
+  static int resolve_shared_storage_info(const ParseNode *parse_tree,
+                                         ObString &shared_storage_info);
+  static int check_tablet_id_effective(const uint64_t tenant_id, const ObTabletID &tablet_id);
+  static int check_table_id_effective(const uint64_t tenant_id, const uint64_t table_id);
 };
 
 typedef common::ObFixedLengthString<common::OB_MAX_TRACE_ID_BUFFER_SIZE + 1> Task_Id;
@@ -99,6 +114,8 @@ DEF_SIMPLE_CMD_RESOLVER(ObFlushCacheResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObFlushKVCacheResolver);
 
 DEF_SIMPLE_CMD_RESOLVER(ObFlushSSMicroCacheResolver);
+DEF_SIMPLE_CMD_RESOLVER(ObFlushSSLocalCacheResolver);
+DEF_SIMPLE_CMD_RESOLVER(ObPrewarmSSLocalCacheResolver);
 
 DEF_SIMPLE_CMD_RESOLVER(ObFlushIlogCacheResolver);
 
@@ -149,12 +166,15 @@ DEF_SIMPLE_CMD_RESOLVER(ObReplaceArbitrationServiceResolver);
 
 DEF_SIMPLE_CMD_RESOLVER(ObMigrateUnitResolver);
 
+DEF_SIMPLE_CMD_RESOLVER(ObReplaceTenantResolver);
+
 DEF_SIMPLE_CMD_RESOLVER(ObAddLSReplicaResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObRemoveLSReplicaResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObMigrateLSReplicaResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObModifyLSReplicaResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObModifyLSPaxosReplicaNumResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObCancelLSReplicaTaskResolver);
+DEF_SIMPLE_CMD_RESOLVER(ObReplaceLSResolver);
 
 DEF_SIMPLE_CMD_RESOLVER(ObUpgradeVirtualSchemaResolver);
 
@@ -166,6 +186,7 @@ DEF_SIMPLE_CMD_RESOLVER(ObSwitchRSRoleResolver);
 
 DEF_SIMPLE_CMD_RESOLVER(ObAdminUpgradeCmdResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObAdminRollingUpgradeCmdResolver);
+
 
 DEF_SIMPLE_CMD_RESOLVER(ObCancelTaskResolver);
 
@@ -187,7 +208,8 @@ DEF_SIMPLE_CMD_RESOLVER(ObBackupSetDecryptionResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObAddRestoreSourceResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObClearRestoreSourceResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObCheckpointSlogResolver);
-DEF_SIMPLE_CMD_RESOLVER(ObServiceNameResolver);
+DEF_SIMPLE_CMD_RESOLVER(ObLoadLicenseResolver);
+
 int resolve_restore_until(const ParseNode &time_node,
                           const ObSQLSessionInfo *session_info,
                           share::SCN &recovery_until_scn,
@@ -251,17 +273,7 @@ private:
       const common::ObString &name_node, const common::ObString &value_node);
   int convert_param_value(obrpc::ObAdminSetConfigItem &item);
 };
-class ObTransferPartitionResolver : public ObSystemCmdResolver
-{
-public:
-  ObTransferPartitionResolver(ObResolverParams &params) : ObSystemCmdResolver(params) {}
-  virtual ~ObTransferPartitionResolver() {}
-  virtual int resolve(const ParseNode &parse_tree);
-private:
-  int resolve_transfer_partition_(const ParseNode &parse_tree);
-  int resolve_cancel_transfer_partition_(const ParseNode &parse_tree);
-  int resolve_cancel_balance_job_(const ParseNode &parse_tree);
-};
+
 class ObFreezeResolver : public ObSystemCmdResolver {
 public:
   ObFreezeResolver(ObResolverParams &params) : ObSystemCmdResolver(params) {}
@@ -274,7 +286,7 @@ private:
                             ParseNode *opt_server_list,
                             ParseNode *opt_zone_desc);
 
-  int resolve_tenant_ls_tablet_(ObFreezeStmt *freeze_stmt, ParseNode *opt_tenant_list_or_ls_or_tablet_id);
+  int resolve_tenant_ls_tablet_or_table_(ObFreezeStmt *freeze_stmt, ParseNode *opt_tenant_list_or_ls_or_tablet_id);
   int resolve_server_list_(ObFreezeStmt *freeze_stmt, ParseNode *opt_server_list);
 
 };
@@ -302,7 +314,6 @@ private:
 
 DEF_SIMPLE_CMD_RESOLVER(ObBackupDatabaseResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObBackupManageResolver);
-DEF_SIMPLE_CMD_RESOLVER(ObBackupCleanResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObDeletePolicyResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObBackupKeyResolver);
 DEF_SIMPLE_CMD_RESOLVER(ObBackupClusterParamResolver);

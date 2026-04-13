@@ -162,7 +162,7 @@ int MockSSTableGenerator::mock_sstable(
   ObStorageSchema storage_schema;
   if (OB_FAIL(storage_schema.init(allocator, table_schema, lib::Worker::CompatMode::MYSQL))) {
     LOG_WARN("failed to init storage schema", K(ret));
-  } else if (OB_FAIL(param.init_for_empty_major_sstable(tablet_id, storage_schema, 100, -1, false))) {
+  } else if (OB_FAIL(param.init_for_empty_major_sstable(tablet_id, storage_schema, 100, -1, false, false))) {
     LOG_WARN("failed to build create sstable param", K(ret), K(table_key));
   } else {
     param.table_key_ = table_key;
@@ -219,7 +219,6 @@ int TestSSMetaService::build_update_table_store_param_(ObArenaAllocator &allocat
     }
 
     param.rebuild_seq_ = ls_handle.get_ls()->get_rebuild_seq();
-    const bool need_check_sstable = true;
     param.ddl_info_.update_with_major_flag_ = false;
 
     param.sstable_ = sstable;
@@ -227,7 +226,6 @@ int TestSSMetaService::build_update_table_store_param_(ObArenaAllocator &allocat
 
     if (FAILEDx(param.init_with_ha_info(ObHATableStoreParam(
             tablet_handle.get_obj()->get_tablet_meta().transfer_info_.transfer_seq_,
-            need_check_sstable,
             true /*need_check_transfer_seq*/)))) {
       LOG_WARN("failed to init with ha info", KR(ret));
     } else if (OB_FAIL(param.init_with_compaction_info(ObCompactionTableStoreParam(

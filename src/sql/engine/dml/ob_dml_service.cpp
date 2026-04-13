@@ -640,7 +640,7 @@ int ObDMLService::process_before_stmt_trigger(const ObDMLBaseCtDef &dml_ctdef,
 {
   int ret = OB_SUCCESS;
   dml_rtctx.get_exec_ctx().set_dml_event(dml_event);
-  if (dml_ctdef.is_primary_index_ && !dml_ctdef.trig_ctdef_.tg_args_.empty()) {
+  if (dml_ctdef.is_primary_index_ && dml_ctdef.trig_ctdef_.all_tm_points_.has_before_stmt()) {
     if (!dml_rtctx.op_.get_spec().use_dist_das()
         || dml_rtctx.get_exec_ctx().get_my_session()->is_remote_session()) {
       ret = OB_NOT_SUPPORTED;
@@ -689,17 +689,38 @@ int ObDMLService::init_heap_table_pk_for_ins(const ObInsCtDef &ins_ctdef, ObEval
 {
   int ret = OB_SUCCESS;
   if (ins_ctdef.is_primary_index_ && ins_ctdef.is_table_without_pk_ && !ins_ctdef.has_instead_of_trigger_) {
+    // Heap table without pk: hidden pk is at position 0
     ObExpr *auto_inc_expr = ins_ctdef.new_row_.at(0);
     if (OB_ISNULL(auto_inc_expr)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("expr is null", K(ret));
     } else if (auto_inc_expr->type_ != T_TABLET_AUTOINC_NEXTVAL) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("auto_inc_expr type unexpected", K(ret), KPC(auto_inc_expr));
+      LOG_WARN("auto_inc_expr type unexpected for heap table", K(ret), KPC(auto_inc_expr));
     } else {
       ObDatum &datum = auto_inc_expr->locate_datum_for_write(eval_ctx);
       datum.set_null();
-      auto_inc_expr->get_eval_info(eval_ctx).evaluated_ = true;
+      auto_inc_expr->get_eval_info(eval_ctx).set_evaluated(true);
+    }
+  } else if (ins_ctdef.is_primary_index_ && ins_ctdef.is_table_with_clustering_key_ && !ins_ctdef.has_instead_of_trigger_) {
+    // Clustering key table: hidden clustering key is at rowkey_cnt_ - 1
+    int64_t hidden_pk_idx = ins_ctdef.das_base_ctdef_.rowkey_cnt_ - 1;
+    if (OB_UNLIKELY(hidden_pk_idx < 0 || hidden_pk_idx >= ins_ctdef.new_row_.count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid hidden pk index", K(ret), K(hidden_pk_idx), K(ins_ctdef.das_base_ctdef_.rowkey_cnt_), K(ins_ctdef.new_row_.count()));
+    } else {
+      ObExpr *auto_inc_expr = ins_ctdef.new_row_.at(hidden_pk_idx);
+      if (OB_ISNULL(auto_inc_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("expr is null", K(ret));
+      } else if (auto_inc_expr->type_ != T_PSEUDO_HIDDEN_CLUSTERING_KEY) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("auto_inc_expr type unexpected for clustering key table", K(ret), KPC(auto_inc_expr));
+      } else {
+        ObDatum &datum = auto_inc_expr->locate_datum_for_write(eval_ctx);
+        datum.set_null();
+        auto_inc_expr->get_eval_info(eval_ctx).set_evaluated(true);
+      }
     }
   }
   return ret;
@@ -793,17 +814,30 @@ int ObDMLService::check_column_type_batch(
   const ExprFixedArray &dml_expr_array = ins_ctdef.new_row_;
   const ObIArray<ColumnContent> &column_infos = ins_ctdef.column_infos_;
   const int64_t column_offset = ins_ctdef.is_table_without_pk_ ? 1: 0;
-  // todo@lanyi check column_offset for the order by table
+  const int64_t hidden_ck_idx = ins_ctdef.is_table_with_clustering_key_ ?
+                                 ins_ctdef.das_base_ctdef_.rowkey_cnt_ - 1 : -1;
   const int64_t row_num = 0; // no sense
   ObUserLoggingCtx::Guard logging_ctx_guard(*(exec_ctx.get_user_logging_ctx()));
   exec_ctx.set_cur_rownum(row_num);
-  CK (dml_expr_array.count() == column_infos.count() + column_offset);
+  const int64_t expected_offset = (ins_ctdef.is_table_without_pk_ || ins_ctdef.is_table_with_clustering_key_) ? 1 : 0;
+  CK (dml_expr_array.count() == column_infos.count() + expected_offset);
 
   for (int64_t i = 0; OB_SUCC(ret) && (i < dml_expr_array.count()); ++i) {
     if (ins_ctdef.is_table_without_pk_ && (0 == i)) {
       continue; // skip hidden table pk column
+    } else if (ins_ctdef.is_table_with_clustering_key_ && (hidden_ck_idx == i)) {
+      continue; // skip hidden clustering key column
     } else {
-      const ColumnContent &column_info = column_infos.at(i - column_offset);
+      // Calculate column_info index
+      int64_t column_info_idx;
+      if (ins_ctdef.is_table_without_pk_) {
+        column_info_idx = i - 1; // hidden pk is at position 0
+      } else if (ins_ctdef.is_table_with_clustering_key_) {
+        column_info_idx = (i < hidden_ck_idx) ? i : (i - 1); // hidden clustering key in the middle
+      } else {
+        column_info_idx = i; // no hidden column
+      }
+      const ColumnContent &column_info = column_infos.at(column_info_idx);
       common::ObString column_name = column_info.column_name_;
       exec_ctx.set_cur_column_name(&column_name);
       ObExpr *expr = dml_expr_array.at(column_info.projector_index_);
@@ -1007,14 +1041,61 @@ int ObDMLService::check_filter_row(
     //check column constraint expr
     LOG_WARN("filter row for check cst failed", K(ret));
   } else if (OB_UNLIKELY(is_filtered)) {
-    ret = OB_ERR_CHECK_OPTION_VIOLATED;
-    LOG_WARN("view check option violated", K(ret));
+    if (is_mysql_mode() && ins_ctdef.das_ctdef_.is_ignore_) {
+      is_skipped = true;
+      LOG_WARN("view check option violated, skip this row", K(ret));
+      ObString empty_string;
+      LOG_MYSQL_USER_WARN(OB_ERR_CHECK_OPTION_VIOLATED,empty_string.length(),empty_string.ptr(),
+                          empty_string.length(),empty_string.ptr());
+    } else {
+      ret = OB_ERR_CHECK_OPTION_VIOLATED;
+      LOG_WARN("view check option violated", K(ret));
+    }
   } else if (OB_FAIL(filter_row_for_check_cst(ins_ctdef.check_cst_exprs_,
                                               eval_ctx, is_filtered))) {
     //check column constraint expr
     LOG_WARN("filter row for check cst failed", K(ret));
   } else if (OB_UNLIKELY(is_filtered)) {
     if (is_mysql_mode() && ins_ctdef.das_ctdef_.is_ignore_) {
+      is_skipped = true;
+      LOG_USER_WARN(OB_ERR_CHECK_CONSTRAINT_VIOLATED);
+      LOG_WARN("check constraint violated, skip this row", K(ret));
+    } else {
+      ret = OB_ERR_CHECK_CONSTRAINT_VIOLATED;
+      LOG_WARN("column constraint check failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObDMLService::check_filter_row(
+    const ObUpdCtDef &upd_ctdef,
+    ObEvalCtx &eval_ctx,
+    bool &is_skipped)
+{
+  int ret = OB_SUCCESS;
+  bool is_filtered = false;
+  if (OB_FAIL(filter_row_for_view_check(upd_ctdef.view_check_exprs_,
+                                        eval_ctx, is_filtered))) {
+    //check column constraint expr
+    LOG_WARN("filter row for check cst failed", K(ret));
+  } else if (OB_UNLIKELY(is_filtered)) {
+    if (is_mysql_mode() && upd_ctdef.dupd_ctdef_.is_ignore_) {
+      is_skipped = true;
+      LOG_WARN("view check option violated, skip this row", K(ret));
+      ObString empty_string;
+      LOG_MYSQL_USER_WARN(OB_ERR_CHECK_OPTION_VIOLATED,empty_string.length(),empty_string.ptr(),
+                          empty_string.length(),empty_string.ptr());
+    } else {
+      ret = OB_ERR_CHECK_OPTION_VIOLATED;
+      LOG_WARN("view check option violated", K(ret));
+    }
+  } else if (OB_FAIL(filter_row_for_check_cst(upd_ctdef.check_cst_exprs_,
+                                              eval_ctx, is_filtered))) {
+    //check column constraint expr
+    LOG_WARN("filter row for check cst failed", K(ret));
+  } else if (OB_UNLIKELY(is_filtered)) {
+    if (is_mysql_mode() && upd_ctdef.dupd_ctdef_.is_ignore_) {
       is_skipped = true;
       LOG_USER_WARN(OB_ERR_CHECK_CONSTRAINT_VIOLATED);
       LOG_WARN("check constraint violated, skip this row", K(ret));
@@ -1174,7 +1255,7 @@ int ObDMLService::process_update_row(const ObUpdCtDef &upd_ctdef,
     }
 
     if (OB_SUCC(ret) && !is_skipped) {
-      if (upd_ctdef.is_table_without_pk_ &&
+      if ((upd_ctdef.is_table_without_pk_ || upd_ctdef.is_table_with_clustering_key_) &&
           OB_FAIL(copy_heap_table_hidden_pk(dml_op.get_eval_ctx(), upd_ctdef))) {
         LOG_WARN("fail to copy heap table hidden pk", K(ret), K(upd_ctdef));
       }
@@ -1196,7 +1277,6 @@ int ObDMLService::process_update_row(const ObUpdCtDef &upd_ctdef,
       }
     }
     if (OB_SUCC(ret) && !is_skipped) {
-      bool is_filtered = false;
       //first, check assignment column whether matched column type
       if (OB_FAIL(check_column_type(upd_ctdef.new_row_,
                                     upd_rtdef.cur_row_num_,
@@ -1230,22 +1310,8 @@ int ObDMLService::process_update_row(const ObUpdCtDef &upd_ctdef,
         LOG_WARN("check row whether changed failed", K(ret), K(upd_ctdef), K(upd_rtdef));
       } else if (OB_UNLIKELY(!upd_rtdef.is_row_changed_)) {
         //do nothing
-      } else if (OB_FAIL(filter_row_for_view_check(upd_ctdef.view_check_exprs_, dml_op.get_eval_ctx(), is_filtered))) {
-        LOG_WARN("filter row for view check exprs failed", K(ret));
-      } else if (OB_UNLIKELY(is_filtered)) {
-        ret = OB_ERR_CHECK_OPTION_VIOLATED;
-        LOG_WARN("view check option violated", K(ret));
-      } else if (OB_FAIL(filter_row_for_check_cst(upd_ctdef.check_cst_exprs_, dml_op.get_eval_ctx(), is_filtered))) {
-        LOG_WARN("filter row for check cst failed", K(ret));
-      } else if (OB_UNLIKELY(is_filtered)) {
-        if (is_mysql_mode() && upd_ctdef.dupd_ctdef_.is_ignore_) {
-          is_skipped = true;
-          LOG_USER_WARN(OB_ERR_CHECK_CONSTRAINT_VIOLATED);
-          LOG_WARN("check constraint violated, skip this row", K(ret));
-        } else {
-          ret = OB_ERR_CHECK_CONSTRAINT_VIOLATED;
-          LOG_WARN("row is filtered by check filters, running is stopped", K(ret));
-        }
+      } else if (OB_FAIL(check_filter_row(upd_ctdef, dml_op.get_eval_ctx(), is_skipped))) {
+        LOG_WARN("failed to check filter row", KR(ret));
       }
     }
   } else {
@@ -1403,6 +1469,9 @@ int ObDMLService::split_upd_to_del_and_ins(const ObUpdCtDef &upd_ctdef,
                                            ObChunkDatumStore::StoredRow *&new_row)
 {
   int ret = OB_SUCCESS;
+  if (dml_rtctx.das_ref_.get_parallel_type() == DAS_STREAMING_PARALLEL) {
+    dml_rtctx.das_ref_.get_das_parallel_ctx().set_das_parallel_type(DAS_BLOCKING_PARALLEL);
+  }
   if (OB_LIKELY(old_tablet_loc != new_tablet_loc && !upd_ctdef.multi_ctdef_->is_enable_row_movement_)) {
     ret = OB_ERR_UPD_CAUSE_PART_CHANGE;
     LOG_WARN("the updated row is moved across partitions", K(ret),
@@ -1428,8 +1497,8 @@ int ObDMLService::split_upd_to_del_and_ins(const ObUpdCtDef &upd_ctdef,
                                                          upd_ctdef.trans_info_expr_,
                                                          old_row))) {
       LOG_WARN("delete row to das op failed", K(ret), K(upd_ctdef), K(upd_rtdef));
-    } else if (upd_ctdef.is_table_without_pk_ &&
-        old_tablet_loc != new_tablet_loc &&
+    } else if (((upd_ctdef.is_table_without_pk_ && old_tablet_loc != new_tablet_loc) || (upd_ctdef.is_vec_hnsw_index_vid_opt_)
+             || (upd_ctdef.is_table_with_clustering_key_ && old_tablet_loc != new_tablet_loc)) &&
         OB_FAIL(set_update_hidden_pk(dml_rtctx.get_eval_ctx(),
                                      upd_ctdef,
                                      new_tablet_loc->tablet_id_))) {
@@ -1506,7 +1575,8 @@ int ObDMLService::update_row(const ObUpdCtDef &upd_ctdef,
         new_row = old_row;
       }
     }
-  } else if (upd_ctdef.das_base_ctdef_.is_update_pk_) {
+  } else if (upd_ctdef.das_base_ctdef_.is_update_pk_ || (upd_ctdef.das_base_ctdef_.is_update_partition_key_
+          && upd_ctdef.is_table_with_clustering_key_)) {
     if (!upd_rtdef.dupd_rtdef_.is_immediate_row_conflict_check_ && !upd_ctdef.dupd_ctdef_.is_ignore_) {
       if (OB_FAIL(split_upd_to_del_and_ins(upd_ctdef,
                                            upd_rtdef,
@@ -1606,7 +1676,8 @@ int ObDMLService::init_dml_param(const ObDASDMLBaseCtDef &base_ctdef,
                                  const int16_t write_branch_id,
                                  ObIAllocator &das_alloc,
                                  storage::ObStoreCtxGuard &store_ctx_gurad,
-                                 storage::ObDMLBaseParam &dml_param)
+                                 storage::ObDMLBaseParam &dml_param,
+                                 bool is_insert_up_gts_opt)
 {
   int ret = OB_SUCCESS;
   dml_param.timeout_ = base_rtdef.timeout_ts_;
@@ -1620,18 +1691,20 @@ int ObDMLService::init_dml_param(const ObDASDMLBaseCtDef &base_ctdef,
   dml_param.prelock_ = base_rtdef.prelock_;
   dml_param.is_batch_stmt_ = base_ctdef.is_batch_stmt_;
   dml_param.dml_allocator_ = &das_alloc;
+  dml_param.is_main_table_in_fts_ddl_ = base_ctdef.is_main_table_in_fts_ddl_;
   if (OB_FAIL(dml_param.snapshot_.assign(snapshot))) {
     LOG_WARN("assign snapshot fail", K(ret));
   }
   dml_param.branch_id_ = write_branch_id;
   dml_param.store_ctx_guard_ = &store_ctx_gurad;
-  init_dml_write_flag(base_ctdef, base_rtdef, dml_param.write_flag_);
+  init_dml_write_flag(base_ctdef, base_rtdef, dml_param.write_flag_, is_insert_up_gts_opt);
   return ret;
 }
 
 void ObDMLService::init_dml_write_flag(const ObDASDMLBaseCtDef &base_ctdef,
                                        ObDASDMLBaseRtDef &base_rtdef,
-                                       concurrent_control::ObWriteFlag &write_flag)
+                                       concurrent_control::ObWriteFlag &write_flag,
+                                       bool is_insert_up_gts_opt)
 {
   if (base_ctdef.is_batch_stmt_) {
     write_flag.set_is_dml_batch_opt();
@@ -1660,6 +1733,9 @@ void ObDMLService::init_dml_write_flag(const ObDASDMLBaseCtDef &base_ctdef,
   }
   if (base_rtdef.is_immediate_row_conflict_check_ && base_ctdef.is_update_pk_) {
     write_flag.set_immediate_row_check();
+  }
+  if (is_insert_up_gts_opt) {
+    write_flag.set_plain_insert_gts_opt();
   }
 }
 
@@ -1756,7 +1832,7 @@ int ObDMLService::init_fk_checker_array(ObDMLRtCtx &dml_rtctx,
           int64_t estimate_row = dml_rtctx.op_.get_spec().rows_;
           ObIAllocator *allocator = &dml_rtctx.op_.get_exec_ctx().get_allocator();
           if (OB_FAIL(fk_checker->init_foreign_key_checker(estimate_row, expr_frame_info, *fk_arg.fk_ctdef_,
-                                                           dml_ctdef.new_row_, allocator))) {
+                                                           dml_ctdef.new_row_, fk_arg.foreign_key_database_name_, fk_arg.foreign_key_name_, allocator))) {
             LOG_WARN("failed to init foreign key checker", K(ret));
           }
         }
@@ -2414,29 +2490,65 @@ int ObDMLService::copy_heap_table_hidden_pk(ObEvalCtx &eval_ctx,
                                             const ObUpdCtDef &upd_ctdef)
 {
   int ret = OB_SUCCESS;
-  ObExpr *old_hidden_pk = upd_ctdef.old_row_.at(0);
-  ObExpr *new_hidden_pk = upd_ctdef.new_row_.at(0);
-  ObDatum *hidden_pk_datum = NULL;
-  if (OB_ISNULL(old_hidden_pk) || OB_ISNULL(new_hidden_pk)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("expr is unexpected null", K(ret), KPC(old_hidden_pk), KPC(new_hidden_pk));
-  } else if (!upd_ctdef.is_table_without_pk_) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("is not heap_table", K(ret), K(upd_ctdef));
-  } else if (new_hidden_pk->type_ != T_TABLET_AUTOINC_NEXTVAL) {
-    LOG_TRACE("heap table not update the part_key", K(ret));
-  } else if (OB_FAIL(old_hidden_pk->eval(eval_ctx, hidden_pk_datum))) {
-    LOG_WARN("eval old_hidden_pk failed", K(ret), KPC(old_hidden_pk));
-  } else if (OB_ISNULL(hidden_pk_datum)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("hidden_pk_datum is null", K(ret), KPC(old_hidden_pk));
-  } else if (!old_hidden_pk->obj_meta_.is_uint64()) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("hidden_pk must be uint64 type", K(ret), KPC(old_hidden_pk));
-  } else {
-    ObDatum &datum = new_hidden_pk->locate_datum_for_write(eval_ctx);
-    datum.set_uint(hidden_pk_datum->get_uint());
-    new_hidden_pk->get_eval_info(eval_ctx).evaluated_ = true;
+  ObExpr *old_hidden_pk = nullptr;
+  ObExpr *new_hidden_pk = nullptr;
+  ObDatum *hidden_pk_datum = nullptr;
+  if (upd_ctdef.is_table_without_pk_) {
+    // Heap table without pk: hidden pk is at position 0
+    old_hidden_pk = upd_ctdef.old_row_.at(0);
+    new_hidden_pk = upd_ctdef.new_row_.at(0);
+    if (OB_ISNULL(old_hidden_pk) || OB_ISNULL(new_hidden_pk)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("expr is unexpected null", K(ret), KPC(old_hidden_pk), KPC(new_hidden_pk));
+    } else if (new_hidden_pk->type_ != T_TABLET_AUTOINC_NEXTVAL) {
+      LOG_TRACE("heap table not update the part_key", K(ret));
+    } else if (OB_FAIL(old_hidden_pk->eval(eval_ctx, hidden_pk_datum))) {
+      LOG_WARN("eval old_hidden_pk failed", K(ret), KPC(old_hidden_pk));
+    } else if (OB_ISNULL(hidden_pk_datum)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("hidden_pk_datum is null", K(ret), KPC(old_hidden_pk));
+    } else if (!old_hidden_pk->obj_meta_.is_uint64()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("hidden_pk must be uint64 type", K(ret), KPC(old_hidden_pk));
+    } else {
+      ObDatum &datum = new_hidden_pk->locate_datum_for_write(eval_ctx);
+      datum.set_uint(hidden_pk_datum->get_uint());
+      new_hidden_pk->get_eval_info(eval_ctx).set_evaluated(true);
+    }
+  } else if (upd_ctdef.is_table_with_clustering_key_) {
+    // Clustering key table: hidden clustering key is at rowkey_cnt_ - 1
+    int64_t hidden_pk_idx = upd_ctdef.das_base_ctdef_.rowkey_cnt_ - 1;
+    if (OB_UNLIKELY(hidden_pk_idx < 0 || hidden_pk_idx >= upd_ctdef.old_row_.count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid hidden pk index for old_row", K(ret), K(hidden_pk_idx),
+               K(upd_ctdef.das_base_ctdef_.rowkey_cnt_), K(upd_ctdef.old_row_.count()));
+    } else if (OB_UNLIKELY(hidden_pk_idx >= upd_ctdef.new_row_.count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid hidden pk index for new_row", K(ret), K(hidden_pk_idx),
+               K(upd_ctdef.das_base_ctdef_.rowkey_cnt_), K(upd_ctdef.new_row_.count()));
+    } else {
+      old_hidden_pk = upd_ctdef.old_row_.at(hidden_pk_idx);
+      new_hidden_pk = upd_ctdef.new_row_.at(hidden_pk_idx);
+      if (OB_ISNULL(old_hidden_pk) || OB_ISNULL(new_hidden_pk)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("expr is unexpected null", K(ret), KPC(old_hidden_pk), KPC(new_hidden_pk));
+      } else if (new_hidden_pk->type_ != T_PSEUDO_HIDDEN_CLUSTERING_KEY) {
+        LOG_TRACE("clustering key table not update the part_key", K(ret));
+      } else if (OB_FAIL(old_hidden_pk->eval(eval_ctx, hidden_pk_datum))) {
+        LOG_WARN("eval old_hidden_pk failed", K(ret), KPC(old_hidden_pk));
+      } else if (OB_ISNULL(hidden_pk_datum)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("hidden_pk_datum is null", K(ret), KPC(old_hidden_pk));
+      } else if (!old_hidden_pk->obj_meta_.is_varbinary()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("hidden clustering key must be varchar/varbinary type", K(ret), KPC(old_hidden_pk));
+      } else {
+        // Copy the hidden clustering key string from old row to new row
+        ObDatum &datum = new_hidden_pk->locate_datum_for_write(eval_ctx);
+        datum.set_string(hidden_pk_datum->get_string());
+        new_hidden_pk->get_eval_info(eval_ctx).set_evaluated(true);
+      }
+    }
   }
   return ret;
 }
@@ -2447,12 +2559,13 @@ int ObDMLService::set_update_hidden_pk(ObEvalCtx &eval_ctx,
 {
   int ret = OB_SUCCESS;
   uint64_t autoinc_seq = 0;
+  ObSQLSessionInfo *my_session = eval_ctx.exec_ctx_.get_my_session();
+  uint64_t tenant_id = my_session->get_effective_tenant_id();
   if (upd_ctdef.is_table_without_pk_ && upd_ctdef.is_primary_index_) {
+    // Heap table without pk: hidden pk is at position 0
     ObExpr *auto_inc_expr = upd_ctdef.new_row_.at(0);
-    ObSQLSessionInfo *my_session = eval_ctx.exec_ctx_.get_my_session();
-    uint64_t tenant_id = my_session->get_effective_tenant_id();
     if (OB_FAIL(get_heap_table_hidden_pk(tenant_id, tablet_id, autoinc_seq))) {
-      LOG_WARN("fail to het hidden pk", K(ret), K(tablet_id), K(tenant_id));
+      LOG_WARN("fail to get hidden pk", K(ret), K(tablet_id), K(tenant_id));
     } else if (OB_ISNULL(auto_inc_expr)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("new_hidden_pk_expr is null", K(ret), K(upd_ctdef));
@@ -2462,7 +2575,42 @@ int ObDMLService::set_update_hidden_pk(ObEvalCtx &eval_ctx,
     } else {
       ObDatum &datum = auto_inc_expr->locate_datum_for_write(eval_ctx);
       datum.set_uint(autoinc_seq);
-      auto_inc_expr->get_eval_info(eval_ctx).evaluated_ = true;
+      auto_inc_expr->get_eval_info(eval_ctx).set_evaluated(true);
+    }
+  } else if (upd_ctdef.is_table_with_clustering_key_ && upd_ctdef.is_primary_index_) {
+    // Clustering key table: hidden clustering key is at rowkey_cnt_ - 1
+    int64_t hidden_pk_idx = upd_ctdef.das_base_ctdef_.rowkey_cnt_ - 1;
+    if (OB_UNLIKELY(hidden_pk_idx < 0 || hidden_pk_idx >= upd_ctdef.new_row_.count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid hidden pk index", K(ret), K(hidden_pk_idx), K(upd_ctdef.das_base_ctdef_.rowkey_cnt_), K(upd_ctdef.new_row_.count()));
+    } else if (OB_FAIL(get_heap_table_hidden_pk(tenant_id, tablet_id, autoinc_seq))) {
+      LOG_WARN("fail to get hidden pk", K(ret), K(tablet_id), K(tenant_id));
+    } else {
+      ObExpr *auto_inc_expr = upd_ctdef.new_row_.at(hidden_pk_idx);
+      if (OB_ISNULL(auto_inc_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("new_hidden_pk_expr is null", K(ret), K(upd_ctdef));
+      } else if (auto_inc_expr->type_ != T_PSEUDO_HIDDEN_CLUSTERING_KEY) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("auto_inc_expr type unexpected for clustering key table", K(ret), KPC(auto_inc_expr));
+      } else {
+        ObDatum &datum = auto_inc_expr->locate_datum_for_write(eval_ctx);
+        uint64_t buf_len = sizeof(ObHiddenClusteringKey);
+        char *buf = auto_inc_expr->get_str_res_mem(eval_ctx, buf_len);
+        ObString hidden_clustering_key_str(buf_len, 0, buf);
+        if (OB_ISNULL(buf)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("fail to allocate memory", K(ret), KP(buf));
+        } else {
+          ObHiddenClusteringKey hidden_clustering_key(tablet_id.id(), autoinc_seq);
+          if (OB_FAIL(ObHiddenClusteringKey::set_hidden_clustering_key_to_string(hidden_clustering_key, hidden_clustering_key_str))) {
+            LOG_WARN("failed to set hidden clustering key to string", KR(ret), K(hidden_clustering_key), K(hidden_clustering_key_str));
+          } else {
+            datum.set_string(hidden_clustering_key_str);
+            auto_inc_expr->get_eval_info(eval_ctx).set_evaluated(true);
+          }
+        }
+      }
     }
   }
   return ret;
@@ -2490,22 +2638,62 @@ int ObDMLService::set_heap_table_hidden_pk(const ObInsCtDef &ins_ctdef,
 {
   int ret = OB_SUCCESS;
   uint64_t autoinc_seq = 0;
+  ObSQLSessionInfo *my_session = eval_ctx.exec_ctx_.get_my_session();
+  uint64_t tenant_id = my_session->get_effective_tenant_id();
+
   if (ins_ctdef.is_table_without_pk_ && ins_ctdef.is_primary_index_) {
-    ObSQLSessionInfo *my_session = eval_ctx.exec_ctx_.get_my_session();
-    uint64_t tenant_id = my_session->get_effective_tenant_id();
+    // Heap table without pk: hidden pk is at position 0
+    ObExpr *auto_inc_expr = ins_ctdef.new_row_.at(0);
     if (OB_FAIL(ObDMLService::get_heap_table_hidden_pk(tenant_id,
                                                        tablet_id,
                                                        autoinc_seq))) {
-      LOG_WARN("fail to het hidden pk", K(ret), K(tablet_id), K(tenant_id));
+      LOG_WARN("fail to get hidden pk", K(ret), K(tablet_id), K(tenant_id));
+    } else if (OB_ISNULL(auto_inc_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("auto_inc_expr is null", K(ret));
+    } else if (auto_inc_expr->type_ != T_TABLET_AUTOINC_NEXTVAL) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("auto_inc_expr type unexpected for heap table", K(ret), KPC(auto_inc_expr));
     } else {
-      ObExpr *auto_inc_expr = ins_ctdef.new_row_.at(0);
-      if (auto_inc_expr->type_ != T_TABLET_AUTOINC_NEXTVAL) {
+      ObDatum &datum = auto_inc_expr->locate_datum_for_write(eval_ctx);
+      datum.set_uint(autoinc_seq);
+      auto_inc_expr->get_eval_info(eval_ctx).set_evaluated(true);
+    }
+  } else if (ins_ctdef.is_table_with_clustering_key_ && ins_ctdef.is_primary_index_) {
+    // Clustering key table: hidden clustering key is at rowkey_cnt_ - 1
+    int64_t hidden_pk_idx = ins_ctdef.das_base_ctdef_.rowkey_cnt_ - 1;
+    if (OB_UNLIKELY(hidden_pk_idx < 0 || hidden_pk_idx >= ins_ctdef.new_row_.count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid hidden pk index", K(ret), K(hidden_pk_idx), K(ins_ctdef.das_base_ctdef_.rowkey_cnt_), K(ins_ctdef.new_row_.count()));
+    } else if (OB_FAIL(ObDMLService::get_heap_table_hidden_pk(tenant_id,
+                                                              tablet_id,
+                                                              autoinc_seq))) {
+      LOG_WARN("fail to get hidden pk", K(ret), K(tablet_id), K(tenant_id));
+    } else {
+      ObExpr *auto_inc_expr = ins_ctdef.new_row_.at(hidden_pk_idx);
+      if (OB_ISNULL(auto_inc_expr)) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("the first expr is not tablet_auto_inc column", K(ret), KPC(auto_inc_expr));
+        LOG_WARN("auto_inc_expr is null", K(ret));
+      } else if (auto_inc_expr->type_ != T_PSEUDO_HIDDEN_CLUSTERING_KEY) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("auto_inc_expr type unexpected for clustering key table", K(ret), KPC(auto_inc_expr));
       } else {
         ObDatum &datum = auto_inc_expr->locate_datum_for_write(eval_ctx);
-        datum.set_uint(autoinc_seq);
-        auto_inc_expr->get_eval_info(eval_ctx).evaluated_ = true;
+        uint64_t buf_len = sizeof(ObHiddenClusteringKey);
+        char *buf = auto_inc_expr->get_str_res_mem(eval_ctx, buf_len);
+        ObString hidden_clustering_key_str(buf_len, 0, buf);
+        if (OB_ISNULL(buf)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("fail to allocate memory", K(ret), KP(buf));
+        } else {
+          ObHiddenClusteringKey hidden_clustering_key(tablet_id.id(), autoinc_seq);
+          if (OB_FAIL(ObHiddenClusteringKey::set_hidden_clustering_key_to_string(hidden_clustering_key, hidden_clustering_key_str))) {
+            LOG_WARN("failed to set hidden clustering key to string", KR(ret), K(hidden_clustering_key), K(hidden_clustering_key_str));
+          } else {
+            datum.set_string(hidden_clustering_key_str);
+            auto_inc_expr->get_eval_info(eval_ctx).set_evaluated(true);
+          }
+        }
       }
     }
   }
@@ -2535,10 +2723,10 @@ int ObDMLService::check_nested_sql_legality(ObExecContext &ctx, common::ObTableI
   return ret;
 }
 
-int ObDMLService::create_anonymous_savepoint(ObTxDesc &tx_desc, transaction::ObTxSEQ &savepoint)
+int ObDMLService::create_anonymous_savepoint(ObTxDesc &tx_desc, transaction::ObTxSEQ &savepoint, int16_t branch_id)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ObSqlTransControl::create_anonymous_savepoint(tx_desc, savepoint))) {
+  if (OB_FAIL(ObSqlTransControl::create_anonymous_savepoint(tx_desc, savepoint, branch_id))) {
     LOG_WARN("create savepoint failed", K(ret));
   }
   return ret;
@@ -3011,8 +3199,8 @@ int ObDMLService::log_user_error_inner(
         CS_TYPE_UTF8MB4_BIN,
         ctx.get_my_session()->get_local_collation_connection());
     LOG_USER_ERROR(OB_ERR_WARN_DATA_OUT_OF_RANGE, column_name.length(), column_name.ptr(), row_num);
-  } else if ((OB_ERR_DATA_TRUNCATED == ret || OB_ERR_DOUBLE_TRUNCATED == ret)
-      && lib::is_mysql_mode()) {
+  } else if ((OB_ERR_DATA_TRUNCATED == ret ||
+      OB_ERR_DOUBLE_TRUNCATED == ret) && lib::is_mysql_mode()) {
     ret = OB_ERR_DATA_TRUNCATED;
     ob_reset_tsi_warning_buffer();
     ObSQLUtils::copy_and_convert_string_charset(
@@ -3022,8 +3210,16 @@ int ObDMLService::log_user_error_inner(
         CS_TYPE_UTF8MB4_BIN,
         ctx.get_my_session()->get_local_collation_connection());
     LOG_USER_ERROR(OB_ERR_DATA_TRUNCATED, column_name.length(), column_name.ptr(), row_num);
+  } else if (OB_ERR_INCORRECT_STRING_VALUE == ret && lib::is_mysql_mode()) {
+    ObSQLUtils::copy_and_convert_string_charset(
+        ctx.get_allocator(),
+        column_name,
+        column_name,
+        CS_TYPE_UTF8MB4_BIN,
+        ctx.get_my_session()->get_local_collation_connection());
+    LOG_USER_ERROR(OB_ERR_INCORRECT_STRING_VALUE, column_name.length(), column_name.ptr(), row_num);
   } else {
-    LOG_WARN("fail to operate row", K(ret));
+    LOG_WARN("fail to operate row", K(ret), K(column_name), K(row_num));
   }
   return ret;
 }

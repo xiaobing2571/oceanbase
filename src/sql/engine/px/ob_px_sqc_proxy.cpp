@@ -79,6 +79,7 @@ ObPxSQCProxy::ObPxSQCProxy(ObSqcCtx &sqc_ctx,
   : sqc_ctx_(sqc_ctx),
     sqc_arg_(arg),
     leader_token_lock_(common::ObLatchIds::PX_WORKER_LEADER_LOCK),
+    dtl_lock_(common::ObLatchIds::OB_PX_SQC_PROXY_DTL_LOCK),
     bf_send_ctx_array_(),
     sample_msg_(),
     init_channel_msg_(),
@@ -138,7 +139,7 @@ int ObPxSQCProxy::link_sqc_qc_channel(ObPxRpcInitSqcArgs &sqc_arg)
 int ObPxSQCProxy::setup_loop_proc(ObSqcCtx &sqc_ctx)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(msg_ready_cond_.init(ObWaitEventIds::DEFAULT_COND_WAIT))) {
+  if (OB_FAIL(msg_ready_cond_.init(ObWaitEventIds::WAIT_SQC_PROXY))) {
     LOG_WARN("fail init cond", K(ret));
   } else if (OB_FAIL(sqc_ctx.receive_data_ch_provider_.init())) {
     LOG_WARN("fail init receive ch provider", K(ret));
@@ -454,9 +455,19 @@ int ObPxSQCProxy::report(int end_ret) const
       transaction::ObTxExecResult &task_tx_result = tasks.at(i).get_tx_result();
       if (OB_NOT_NULL(task_tx_desc)) {
         if (OB_NOT_NULL(sqc_tx_desc)) {
-          OZ(MTL(transaction::ObTransService*)->merge_tx_state(*sqc_tx_desc, *task_tx_desc));
-          OZ(finish_msg.get_trans_result().merge_result(task_tx_result));
-          OZ(MTL(transaction::ObTransService*)->release_tx(*task_tx_desc));
+          int tmp_ret = OB_SUCCESS;
+          if (OB_TMP_FAIL(MTL(transaction::ObTransService*)->merge_tx_state(*sqc_tx_desc, *task_tx_desc))) {
+            LOG_WARN("merge tx state fail", K(tmp_ret));
+          }
+          ret = tmp_ret;
+          if (OB_TMP_FAIL(finish_msg.get_trans_result().merge_result(task_tx_result))) {
+            LOG_WARN("merge tx result fail", K(tmp_ret));
+          }
+          ret = COVER_SUCC(tmp_ret);
+          if (OB_TMP_FAIL(MTL(transaction::ObTransService*)->release_tx(*task_tx_desc))) {
+            LOG_ERROR("release tx fail", K(tmp_ret), KP(task_tx_desc));
+          }
+          ret = COVER_SUCC(tmp_ret);
         } else {
           sql::ObSQLSessionInfo::LockGuard guard(session->get_thread_data_lock());
           sqc_tx_desc = task_tx_desc;
@@ -482,6 +493,7 @@ int ObPxSQCProxy::report(int end_ret) const
   finish_msg.sqc_id_ = sqc.get_sqc_id();
   finish_msg.dfo_id_ = sqc.get_dfo_id();
   finish_msg.rc_ = sqc_ret;
+  OZ(finish_msg.set_sqc_iceberg_data_files(sqc_ctx));
   // 重写错误码，使得scheduler端能等待远端schema刷新并重试
   if (OB_SUCCESS != sqc_ret && is_schema_error(sqc_ret)) {
     ObInterruptUtil::update_schema_error_code(sqc_arg.exec_ctx_, finish_msg.rc_);

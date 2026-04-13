@@ -273,7 +273,7 @@ int fast_compare_normal(const unsigned char *s, const unsigned char *t,
 
 CompareByteFunc get_fast_compare_func()
 {
-  return blocksstable::is_avx512_valid()
+  return common::is_arch_supported(ObTargetArch::AVX512)
       ? fast_compare_simd
       : fast_compare_normal;
 }
@@ -447,7 +447,7 @@ bool ObSortOpImpl::Compare::operator()(
     ObDatum *other_datum = nullptr;
     int cmp = 0;
     const int64_t cnt = sort_cmp_funs_->count();
-    for (int64_t i = 0; 0 == cmp && i < cnt && OB_SUCC(ret); i++) {
+    for (int64_t i = cmp_start_; 0 == cmp && i < cmp_end_ && OB_SUCC(ret); i++) {
       const int64_t idx = sort_collations_->at(i).field_idx_;
       if (OB_FAIL(l->at(idx)->eval(eval_ctx, other_datum))) {
         LOG_WARN("failed to eval expr", K(ret));
@@ -481,7 +481,7 @@ int ObSortOpImpl::Compare::with_ties_cmp(const common::ObIArray<ObExpr*> *l,
     const ObDatum *rcells = r->cells();
     ObDatum *other_datum = nullptr;
     const int64_t cnt = sort_cmp_funs_->count();
-    for (int64_t i = 0; 0 == cmp && i < cnt && OB_SUCC(ret); i++) {
+    for (int64_t i = cmp_start_; 0 == cmp && i < cmp_end_ && OB_SUCC(ret); i++) {
       const int64_t idx = sort_collations_->at(i).field_idx_;
       if (OB_FAIL(l->at(idx)->eval(eval_ctx, other_datum))) {
         LOG_WARN("failed to eval expr", K(ret));
@@ -509,7 +509,7 @@ int ObSortOpImpl::Compare::with_ties_cmp(const ObChunkDatumStore::StoredRow *l,
     const ObDatum *rcells = r->cells();
     const ObDatum *lcells = l->cells();
     const int64_t cnt = sort_cmp_funs_->count();
-    for (int64_t i = 0; 0 == cmp && i < cnt && OB_SUCC(ret); i++) {
+    for (int64_t i = cmp_start_; 0 == cmp && i < cmp_end_ && OB_SUCC(ret); i++) {
       const int64_t idx = sort_collations_->at(i).field_idx_;
       if (OB_FAIL(sort_cmp_funs_->at(i).cmp_func_(lcells[idx], rcells[idx], cmp))) {
         LOG_WARN("failed to compare", K(ret));
@@ -602,7 +602,7 @@ ObSortOpImpl::ObSortOpImpl(ObMonitorNode &op_monitor_info)
 
 ObSortOpImpl::~ObSortOpImpl()
 {
-  reset();
+  destroy();
 }
 
 int ObSortOpImpl::init_topn()
@@ -639,6 +639,7 @@ int ObSortOpImpl::init_partition_topn(const int64_t est_rows)
   } else {
     MEMSET(pt_buckets_, 0, sizeof(PartHeapNode*) * bucket_cnt);
   }
+  pt_row_cnt_ = 0;
   return ret;
 }
 
@@ -793,21 +794,30 @@ int ObSortOpImpl::init(
       op_monitor_info_->otherstat_10_value_ = static_cast<int64_t>(compress_type_);
       ObPhysicalPlanCtx *plan_ctx = NULL;
       const ObPhysicalPlan *phy_plan = nullptr;
-      if (!exec_ctx->get_my_session()->get_ddl_info().is_ddl()) {
+      const ObSQLSessionInfo *session = exec_ctx->get_my_session();
+      if (nullptr != session && !session->get_ddl_info().is_ddl()) {
         // not ddl
-      } else if (OB_ISNULL(plan_ctx = GET_PHY_PLAN_CTX(*exec_ctx))) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("deserialized exec ctx without phy plan ctx set. Unexpected", K(ret));
-      } else if (OB_ISNULL(phy_plan = plan_ctx->get_phy_plan())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("error unexpected, phy plan must not be nullptr", K(ret));
-      } else if (phy_plan->get_ddl_task_id() > 0) {
+      } else if (OB_NOT_NULL(plan_ctx = GET_PHY_PLAN_CTX(*exec_ctx)) &&
+                 OB_NOT_NULL(phy_plan = plan_ctx->get_phy_plan()) &&
+                 phy_plan->get_ddl_task_id() > 0) {
         op_monitor_info_->otherstat_5_id_ = ObSqlMonitorStatIds::DDL_TASK_ID;
         op_monitor_info_->otherstat_5_value_ = phy_plan->get_ddl_task_id();
       }
     }
     if (OB_SUCC(ret)) {
       inited_ = true;
+      // heap sort will extend rowsize twice to reuse the space
+      int64_t size = OB_INVALID_ID == input_rows_ ? 0 : input_rows_ * input_width_ * (use_heap_sort_ ? 2 : 1);
+      if (OB_FAIL(sql_mem_processor_.init(
+                  &mem_context_->get_malloc_allocator(),
+                  tenant_id_,
+                  size, op_monitor_info_->op_type_, op_monitor_info_->op_id_, exec_ctx_))) {
+        LOG_WARN("failed to init sql mem processor", K(ret));
+      } else {
+        datum_store_.set_dir_id(sql_mem_processor_.get_dir_id());
+        datum_store_.set_callback(&sql_mem_processor_);
+        datum_store_.set_io_event_observer(io_event_observer_);
+      }
       if (use_partition_topn_sort_) {
         //rows_ will be set to heap data of current heap after adding the first row
         rows_ = &quick_sort_array_;
@@ -855,6 +865,7 @@ void ObSortOpImpl::reuse()
     cur_heap_idx_ = 0;
     part_group_cnt_ = 0;
     topn_heap_ = NULL;
+    pt_row_cnt_ = 0;
   } else if (NULL != topn_heap_) {
     reuse_topn_heap(topn_heap_);
   }
@@ -872,7 +883,6 @@ void ObSortOpImpl::unregister_profile_if_necessary()
 
 void ObSortOpImpl::reset()
 {
-  sql_mem_processor_.unregister_profile();
   iter_.reset();
   reuse();
   quick_sort_array_.reset();
@@ -1010,7 +1020,8 @@ int ObSortOpImpl::build_chunk(const int64_t level, Input &input, int64_t extra_s
           "rows", chunk->datum_store_.get_row_cnt(),
           "file_size", chunk->datum_store_.get_file_size(),
           "memory_hold", chunk->datum_store_.get_mem_hold(),
-          "mem_used", mem_context_->used());
+          "mem_used", mem_context_->used(),
+          "ht_bucket_size", get_ht_bucket_size());
 
     }
   }
@@ -1055,9 +1066,8 @@ int ObSortOpImpl::preprocess_dump(bool &dumped)
   if (OB_FAIL(sql_mem_processor_.get_max_available_mem_size(
       &mem_context_->get_malloc_allocator()))) {
     LOG_WARN("failed to get max available memory size", K(ret));
-  } else if (OB_FAIL(sql_mem_processor_.update_used_mem_size(mem_context_->used()))) {
-    LOG_WARN("failed to update used memory size", K(ret));
   } else {
+    sql_mem_processor_.update_used_mem_size(get_total_used_size());
     dumped = need_dump();
     if (dumped) {
       if (!sql_mem_processor_.is_auto_mgr()) {
@@ -1068,7 +1078,7 @@ int ObSortOpImpl::preprocess_dump(bool &dumped)
               UNUSED(max_memory_size);
               return need_dump();
             },
-            dumped, mem_context_->used()))) {
+            dumped, get_total_used_size()))) {
           LOG_WARN("failed to extend memory size", K(ret));
         }
       } else if (profile_.get_cache_size() < profile_.get_global_bound_size()) {
@@ -1079,10 +1089,10 @@ int ObSortOpImpl::preprocess_dump(bool &dumped)
               UNUSED(max_memory_size);
               return need_dump();
             },
-            dumped, mem_context_->used()))) {
+            dumped, get_total_used_size()))) {
           LOG_WARN("failed to extend memory size", K(ret));
         }
-        LOG_TRACE("trace sort need dump", K(dumped), K(mem_context_->used()),
+        LOG_TRACE("trace sort need dump", K(dumped), K(mem_context_->used()), K(get_ht_bucket_size()),
           K(get_memory_limit()), K(profile_.get_cache_size()), K(profile_.get_expect_size()));
       } else {
         // one-pass
@@ -1097,9 +1107,10 @@ int ObSortOpImpl::preprocess_dump(bool &dumped)
           }
         } else { }
       }
-      LOG_INFO("trace sort need dump", K(dumped), K(mem_context_->used()), K(get_memory_limit()),
+      LOG_INFO("trace sort need dump", K(dumped), K(mem_context_->used()),
+        K(get_ht_bucket_size()), K(get_memory_limit()),
         K(profile_.get_cache_size()), K(profile_.get_expect_size()),
-        K(sql_mem_processor_.get_data_size()));
+        K(sql_mem_processor_.get_data_size()), K(sql_mem_processor_.is_auto_mgr()));
     }
   }
   return ret;
@@ -1119,17 +1130,6 @@ int ObSortOpImpl::before_add_row()
       LOG_WARN("init compare failed", K(ret));
     } else {
       got_first_row_ = true;
-      int64_t size = OB_INVALID_ID == input_rows_ ? 0 : input_rows_ * input_width_;
-      if (OB_FAIL(sql_mem_processor_.init(
-                  &mem_context_->get_malloc_allocator(),
-                  tenant_id_,
-                  size, op_monitor_info_->op_type_, op_monitor_info_->op_id_, exec_ctx_))) {
-        LOG_WARN("failed to init sql mem processor", K(ret));
-      } else {
-        datum_store_.set_dir_id(sql_mem_processor_.get_dir_id());
-        datum_store_.set_callback(&sql_mem_processor_);
-        datum_store_.set_io_event_observer(io_event_observer_);
-      }
     }
   }
 
@@ -1146,8 +1146,7 @@ int ObSortOpImpl::before_add_row()
       [&](int64_t cur_cnt){ return rows_->count() > cur_cnt; },
       updated))) {
       LOG_WARN("failed to update max available mem size periodically", K(ret));
-    } else if (updated && OB_FAIL(sql_mem_processor_.update_used_mem_size(mem_context_->used()))) {
-      LOG_WARN("failed to update used memory size", K(ret));
+    } else if (updated && FALSE_IT(sql_mem_processor_.update_used_mem_size(get_total_used_size()))) {
     } else if (GCONF.is_sql_operator_dump_enabled()) {
       if (rows_->count() >= MAX_ROW_CNT) {
         // 最大2G，超过2G会扩容到4G，4G申请会失败
@@ -1264,6 +1263,9 @@ int ObSortOpImpl::add_part_heap_sort_row(const common::ObIArray<ObExpr*> &exprs,
   } else if (OB_UNLIKELY(part_group_cnt_ > max_bucket_cnt_) &&
              OB_FAIL(enlarge_partition_topn_buckets())) {
     LOG_WARN("failed to enlarge partition topn buckets");
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(store_row)) {
+    pt_row_cnt_++;
   }
   return ret;
 }
@@ -1695,6 +1697,7 @@ int ObSortOpImpl::do_dump()
       topn_heap_ = NULL;
       got_first_row_ = false;
       rows_ = &quick_sort_array_;
+      pt_row_cnt_ = 0;
     }
 
     if (OB_SUCC(ret)) {
@@ -1798,7 +1801,7 @@ int ObSortOpImpl::build_ems_heap(int64_t &merge_ways)
             [&](int64_t max_memory_size) {
               return max_memory_size < need_size;
             },
-            dumped, mem_context_->used()))) {
+            dumped, get_total_used_size()))) {
           LOG_WARN("failed to extend memory size", K(ret));
         }
         merge_ways = std::max(merge_ways, get_memory_limit() / ObChunkDatumStore::BLOCK_SIZE);
@@ -2396,13 +2399,6 @@ int ObSortOpImpl::add_heap_sort_row(const common::ObIArray<ObExpr*> &exprs,
     LOG_WARN("mem_context or heap is not initialized", K(ret));
   } else if (!got_first_row_) {
     got_first_row_ = true;
-    // heap sort will extend rowsize twice to reuse the space
-    int64_t size = OB_INVALID_ID == input_rows_ ? 0 : input_rows_ * input_width_ * 2;
-    if (OB_FAIL(sql_mem_processor_.init(
-               &mem_context_->get_malloc_allocator(),
-               tenant_id_, size, op_monitor_info_->op_type_, op_monitor_info_->op_id_, &eval_ctx_->exec_ctx_))) {
-      LOG_WARN("failed to init sql mem processor", K(ret));
-    }
   } else {
     bool updated = false;
     if (OB_FAIL(sql_mem_processor_.update_max_available_mem_size_periodically(
@@ -2410,8 +2406,8 @@ int ObSortOpImpl::add_heap_sort_row(const common::ObIArray<ObExpr*> &exprs,
                                 [&](int64_t cur_cnt){ return topn_heap_->heap_.count() > cur_cnt; },
                                 updated))) {
         LOG_WARN("failed to get max available memory size", K(ret));
-    } else if (updated && OB_FAIL(sql_mem_processor_.update_used_mem_size(mem_context_->used()))) {
-      LOG_WARN("failed to update used memory size", K(ret));
+    } else if (updated) {
+      sql_mem_processor_.update_used_mem_size(get_total_used_size());
     }
   }
 
@@ -3233,7 +3229,7 @@ int ObPrefixSortImpl::fetch_rows_batch(const common::ObIArray<ObExpr *> &all_exp
         if (OB_FAIL(e->eval_batch(*eval_ctx_, *brs_->skip_, brs_->size_))) {
           LOG_WARN("eval batch failed", K(ret));
         } else {
-          e->get_eval_info(*eval_ctx_).projected_ = true;
+          e->get_eval_info(*eval_ctx_).set_projected(true);
         }
       }
       selector_size_ = 0;

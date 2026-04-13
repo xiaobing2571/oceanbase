@@ -80,8 +80,10 @@ public:
   common::ObString get_masked_sql() const { return masked_sql_; }
   void set_insert_mode(uint64_t mode) { insert_mode_ = mode; }
   uint64_t get_insert_mode() const { return insert_mode_; }
-
+  void set_is_sub_select_empty_set(bool is_empty) { is_sub_select_empty_set_ = is_empty; }
+  bool is_sub_select_empty_set() const { return is_sub_select_empty_set_; }
   ObTableType get_table_type() const { return create_table_arg_.schema_.get_table_type(); }
+  uint64_t get_external_location_id() const { return create_table_arg_.schema_.get_external_location_id(); }
   INHERIT_TO_STRING_KV("ObTableStmt", ObTableStmt, K_(stmt_type), K_(create_table_arg), K_(index_arg_list));
 private:
   int set_table_id(ObStmtResolver &ctx, const uint64_t table_id);
@@ -91,15 +93,6 @@ private:
   share::schema::ObStmtNeedPrivs::NeedPrivs view_need_privs_;
   common::ObSArray<obrpc::ObCreateIndexArg> index_arg_list_;
   common::ObString masked_sql_;
-  //common::ObSEArray<ObRawExpr *, OB_DEFAULT_ARRAY_SIZE, common::ModulePageAllocator, true> partition_fun_expr_; // for range fun expr
-  //common::ObSEArray<ObRawExpr *, OB_DEFAULT_ARRAY_SIZE, common::ModulePageAllocator, true> range_values_exprs_; //range partition expr
-  // for future use: create table xxx as select ......
-  //ObSelectStmt                *select_clause;inline int64_t ObCreateTableStmt::get_block_size() const
-  //{
-  //  return create_table_arg_.schema_.get_block_size();
-  //  }
-  //
-  // create table xxx as already_exist_table, pay attention to whether data are need
 protected:
   ObSelectStmt *sub_select_stmt_; //create table  ... as select...
   ObSelectStmt *view_define_;
@@ -114,6 +107,7 @@ protected:
    3. rename ctas_t1 as t1
    */
   uint64_t insert_mode_;
+  bool is_sub_select_empty_set_;
 };
 
 inline obrpc::ObCreateTableArg &ObCreateTableStmt::get_create_table_arg()

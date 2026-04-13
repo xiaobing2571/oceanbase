@@ -38,7 +38,7 @@ OB_SERIALIZE_MEMBER(ObParamInfo,
                     flag_,
                     scale_,
                     type_,
-                    ext_real_type_,
+                    ext_real_type_,  // FARM COMPAT WHITELIST
                     is_oracle_null_value_,  // FARM COMPAT WHITELIST
                     col_type_,
                     precision_);
@@ -94,7 +94,7 @@ int ObPlanCacheObject::set_params_info(const ParamStore &params)
     } else if (params.at(i).get_param_meta().is_ext() || params.at(i).is_user_defined_sql_type() || params.at(i).is_collection_sql_type()) {
       param_info.scale_ = 0;
       uint64_t udt_id = params.at(i).get_accuracy().get_accuracy();
-      *(reinterpret_cast<uint32 *>(&param_info.ext_real_type_)) = (udt_id >> 32) & UINT_MAX32;
+      param_info.ext_real_type_ = (udt_id >> 32) & UINT_MAX32;
       *(reinterpret_cast<uint32 *>(&param_info.col_type_)) = (udt_id) & UINT_MAX32;
     } else {
       param_info.scale_ = params.at(i).get_scale();
@@ -170,10 +170,18 @@ int ObPlanCacheObject::check_pre_calc_cons(const bool is_ignore_stmt,
     is_match = false;
     ret = OB_SUCCESS;
   } else {
+    const ObIArray<ObConstraintExtra> &cons_extras = pre_calc_con.cons_extras_;
     for (int64_t i = 0; OB_SUCC(ret) && is_match && i < datum_params.count(); ++i) {
-      if (OB_FAIL(pre_calc_con.check_is_match(datum_params.at(i), exec_ctx, is_match))) {
-        LOG_WARN("failed to check is match", K(ret));
-      } // else end
+      if (cons_extras.empty()) {
+        if (OB_FAIL(pre_calc_con.check_is_match(datum_params.at(i), exec_ctx, nullptr, is_match))) {
+          LOG_WARN("failed to check is match", K(ret));
+        }
+      } else {
+        ObConstraintExtra extra = cons_extras.at(i);
+        if (OB_FAIL(pre_calc_con.check_is_match(datum_params.at(i), exec_ctx, &extra, is_match))) {
+          LOG_WARN("failed to check is match", K(ret));
+        }
+      }
     } // for end
   }
   return ret;

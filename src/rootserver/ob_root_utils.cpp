@@ -15,8 +15,13 @@
 #include "ob_root_utils.h"
 #include "logservice/ob_log_service.h"
 #include "share/ob_primary_zone_util.h"           // ObPrimaryZoneUtil
+#include "share/ob_rpc_struct.h"
 #include "share/ob_zone_table_operation.h"
 #include "rootserver/ob_tenant_balance_service.h"    // for ObTenantBalanceService
+#include "rootserver/ob_table_creator.h"                    // for ObTableCreator
+#include "share/inner_table/ob_sslog_table_schema.h"        // for ObSSlogTableSchema
+#include "share/inner_table/ob_tiered_metadata_store_schema.h" // for ObTieredMetadataStoreTableSchema
+#include "rootserver/ob_server_zone_op_service.h"
 
 using namespace oceanbase::rootserver;
 using namespace oceanbase::share;
@@ -585,18 +590,22 @@ int ObLocalityCheckHelp::check_alter_locality(
     bool &non_paxos_locality_modified,
     int64_t &pre_paxos_num,
     int64_t &cur_paxos_num,
-    const share::ObArbitrationServiceStatus &arb_service_status)
+    const share::ObArbitrationServiceStatus &arb_service_status,
+    const uint64_t tenant_id)
 {
   int ret = OB_SUCCESS;
   pre_paxos_num = 0;
   cur_paxos_num = 0;
   alter_paxos_tasks.reset();
   bool replace_locality = false;
-  if (OB_UNLIKELY(pre_zone_locality.count() <= 0 || cur_zone_locality.count() <= 0)) {
+  if (OB_UNLIKELY(pre_zone_locality.count() <= 0
+               || cur_zone_locality.count() <= 0
+               || !is_valid_tenant_id(tenant_id))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret),
              "pre_cnt", pre_zone_locality.count(),
-             "cur_cnt", cur_zone_locality.count());
+             "cur_cnt", cur_zone_locality.count(),
+             K(tenant_id));
   } else if (OB_FAIL(get_alter_paxos_replica_number_replica_task(pre_zone_locality, cur_zone_locality,
                      alter_paxos_tasks, non_paxos_locality_modified))) {
     LOG_WARN("fail to get alter paxos replica task", K(ret));
@@ -1311,7 +1320,7 @@ int ObLocalityCheckHelp::check_replace_locality_valid(
   } else if (pre_zone == cur_zone) {
     // skip, same zone
     LOG_INFO("the zones are not different", K(pre_zone), K(cur_zone));
-  } else if (!ObRootUtils::if_deployment_mode_match()) {
+  } else if (!ObRootUtils::is_dr_replace_deployment_mode_match()) {
     ret = OB_OP_NOT_ALLOW;
     LOG_USER_ERROR(OB_OP_NOT_ALLOW, "Not in shared storage and log service mode, single zone locality replacement is");
     FLOG_WARN("not in logservice or ss mode", KR(ret));
@@ -1428,6 +1437,9 @@ int ObLocalityCheckHelp::check_alter_locality_valid(
           } else {
             passed = false;
           }
+        } else if (2 == pre_paxos_num && 1 == remove_task_num) {
+          // special process: enable locality's paxos member 2 -> 1
+          LOG_INFO("support locality from 2F to 1F", KR(ret));
         } else if (cur_paxos_num >= majority(pre_paxos_num)) {
           // passed
         } else  if (OB_FAIL(message_to_user.assign("violate locality principal"))) {
@@ -1481,41 +1493,14 @@ int ObLocalityCheckHelp::check_alter_single_zone_locality_valid(
       non_paxos_locality_modified = true;
     }
   }
-  // 2. check whether alter locality is legal.
+
+  // check L-replica
   if (!is_legal) {
-  } else if (new_locality.get_logonly_replica_num() < orig_locality.get_logonly_replica_num()) {
-    // L-replica must not transfrom to other replica type.
-    if (new_locality.get_full_replica_num() > orig_locality.get_full_replica_num()) {
-      is_legal = false; // maybe L->F
-    } else if (ObLocalityDistribution::ALL_SERVER_CNT == new_locality.get_readonly_replica_num()
-        || ObLocalityDistribution::ALL_SERVER_CNT == orig_locality.get_readonly_replica_num()
-        || new_locality.get_readonly_replica_num() > orig_locality.get_readonly_replica_num()) {
-      if (0 != new_locality.get_readonly_replica_num()) {
-        is_legal = false; // maybe L->R
-      }
-    } else {} // good
-  } else if (new_locality.get_logonly_replica_num() > orig_locality.get_logonly_replica_num()) {
-    // only enable F transform to L
-    if (new_locality.get_full_replica_num() < orig_locality.get_full_replica_num()) {
-      if (ObLocalityDistribution::ALL_SERVER_CNT == new_locality.get_readonly_replica_num()
-          && ObLocalityDistribution::ALL_SERVER_CNT != orig_locality.get_readonly_replica_num()) {
-        if (0 != orig_locality.get_readonly_replica_num()) {
-          is_legal = false; // maybe R->L
-        }
-      } else if (ObLocalityDistribution::ALL_SERVER_CNT != new_locality.get_readonly_replica_num()
-          && ObLocalityDistribution::ALL_SERVER_CNT == orig_locality.get_readonly_replica_num()) {
-        is_legal = false; // maybe R->L
-      } else if (new_locality.get_readonly_replica_num() < orig_locality.get_readonly_replica_num()) {
-        is_legal = false; // maybe R->L
-      }
-    } else {
-      if (ObLocalityDistribution::ALL_SERVER_CNT == new_locality.get_readonly_replica_num()
-          || ObLocalityDistribution::ALL_SERVER_CNT == orig_locality.get_readonly_replica_num()
-          || new_locality.get_readonly_replica_num() < orig_locality.get_readonly_replica_num()) {
-        if (0 != orig_locality.get_readonly_replica_num()) {
-          is_legal = false; // maybe R->L
-        }
-      } else {} // good
+  } else if (new_locality.get_logonly_replica_num() != orig_locality.get_logonly_replica_num()) {
+    if (new_locality.get_full_replica_num() != orig_locality.get_full_replica_num()
+        || new_locality.get_readonly_replica_num() != orig_locality.get_readonly_replica_num()) {
+      // transform between R/F and L is illegal
+      is_legal = false;
     }
   }
   if (!is_legal) {
@@ -1526,8 +1511,108 @@ int ObLocalityCheckHelp::check_alter_single_zone_locality_valid(
   return ret;
 }
 
+int ObRootUtils::check_tiered_metadata_tablet_exist(
+    const ObAddr &server,
+    const uint64_t tenant_id,
+    bool &exist)
+{
+  int ret = OB_SUCCESS;
+  exist = false;
+  ObCheckTabletExistArg arg;
+  LOG_INFO("check tiered metadata tablet exist", K(server), K(tenant_id));
+  obrpc::Bool is_tiered_metadata_tablet_exist(false);
+  if (OB_UNLIKELY(!server.is_valid() || !is_meta_tenant(tenant_id))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(server), K(tenant_id));
+  } else if (OB_ISNULL(GCTX.srv_rpc_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("srv_rpc_proxy_ is NULL", KR(ret), KP(GCTX.srv_rpc_proxy_));
+  } else if (OB_FAIL(arg.init(tenant_id, METADATA_LS, ObTabletID(OB_ALL_TIERED_METADATA_STORE_TID)))) {
+    LOG_WARN("failed to init arg", KR(ret));
+  } else if (OB_FAIL(GCTX.srv_rpc_proxy_->to(server)
+                                         .by(tenant_id)
+                                         .timeout(GCONF.rpc_timeout)
+                                         .check_tablet_exist(arg, is_tiered_metadata_tablet_exist))) {
+    LOG_WARN("failed to check tiered metadata tablet exist", KR(ret));
+  } else if (is_tiered_metadata_tablet_exist) {
+    exist = true;
+  } else {
+    exist = false;
+  }
+  LOG_INFO("check tiered metadata tablet exist finished", KR(ret), K(server), K(tenant_id), K(arg), K(exist));
+  return ret;
+}
+
+ERRSIM_POINT_DEF(ERRSIM_ERROR_CREATE_SS_SPECIAL_TABLET)
+int ObRootUtils::create_ss_special_tablet(
+    const uint64_t tenant_id,
+    const uint64_t table_id)
+{
+  int ret = OB_SUCCESS;
+  FLOG_INFO("start creating ss special tablet", K(tenant_id), K(table_id));
+  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id));
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql_proxy_ is NULL", KR(ret), KP(GCTX.sql_proxy_));
+  } else {
+    ObMySQLTransaction trans;
+    ObTableSchema table_schema;
+    ObTableCreator table_creator(tenant_id, SCN::base_scn(), trans);
+    common::ObArray<const share::schema::ObTableSchema*> table_schema_ptrs;
+    common::ObArray<share::ObLSID> ls_id_array;
+    common::ObArray<bool> need_create_empty_majors;
+    if (OB_FAIL(trans.start(GCTX.sql_proxy_, tenant_id))) {
+      LOG_WARN("fail to start trans", KR(ret));
+    } else if (OB_FAIL(table_creator.init(false))) {
+      LOG_WARN("fail to init tablet creator", KR(ret));
+    } else if (share::OB_ALL_SSLOG_TABLE_TID == table_id) {
+      if (OB_FAIL(ObSSlogTableSchema::all_sslog_table_schema(table_schema))) {
+        LOG_WARN("fail to get schema", KR(ret));
+      } else if (OB_FAIL(ls_id_array.push_back(SSLOG_LS))) {
+        LOG_WARN("fail to push back", KR(ret));
+      }
+    } else if (share::OB_ALL_TIERED_METADATA_STORE_TID == table_id) {
+      if (OB_FAIL(ObTieredMetadataStoreTableSchema::all_tiered_metadata_store_schema(table_schema))) {
+        LOG_WARN("fail to get schema", KR(ret));
+      } else if (OB_FAIL(ls_id_array.push_back(METADATA_LS))) {
+        LOG_WARN("fail to push back", KR(ret));
+      }
+    }
+    if (FAILEDx(ObSchemaUtils::construct_tenant_space_full_table(tenant_id, table_schema))) {
+      LOG_WARN("fail to construct tenant space table", KR(ret), K(tenant_id));
+    } else if (OB_FAIL(table_schema_ptrs.push_back(&table_schema))) {
+      LOG_WARN("fail to push back", KR(ret));
+    } else if (OB_FAIL(need_create_empty_majors.push_back(true))) {
+      LOG_WARN("fail to push back", KR(ret));
+    } else if (OB_FAIL(table_creator.add_create_tablets_of_tables_arg(
+                                table_schema_ptrs,
+                                ls_id_array,
+                                DATA_CURRENT_VERSION,
+                                need_create_empty_majors/*need_create_empty_major_sstable*/))) {
+      LOG_WARN("fail to add create tablet arg", KR(ret));
+    } else if (OB_FAIL(table_creator.execute())) {
+      LOG_WARN("execute create partition failed", K(ret));
+    } else if (OB_UNLIKELY(ERRSIM_ERROR_CREATE_SS_SPECIAL_TABLET)) {
+      ret = ERRSIM_ERROR_CREATE_SS_SPECIAL_TABLET;
+      LOG_WARN("errsim error create ss special tablet", KR(ret));
+    }
+    if (trans.is_started()) {
+      int temp_ret = OB_SUCCESS;
+      bool commit = OB_SUCC(ret);
+      if (OB_SUCCESS != (temp_ret = trans.end(commit))) {
+        ret = (OB_SUCC(ret)) ? temp_ret : ret;
+        LOG_WARN("trans end failed", K(commit), K(temp_ret));
+      }
+    }
+  }
+  FLOG_INFO("finish creating ss special tablet", KR(ret), K(tenant_id), K(table_id));
+  return ret;
+}
+
 ERRSIM_POINT_DEF(ERRSIM_SKIP_CHECK_SHARED_STORAGE_AND_LOG_SERVICE_MODE);
-bool ObRootUtils::if_deployment_mode_match()
+bool ObRootUtils::is_dr_replace_deployment_mode_match()
 {
   bool deployment_mode_match = true;
   if (OB_UNLIKELY(ERRSIM_SKIP_CHECK_SHARED_STORAGE_AND_LOG_SERVICE_MODE)) {
@@ -2317,4 +2402,45 @@ const char *oceanbase::rootserver::resource_type_to_str(const ObResourceType &t)
   else if (RES_DATA_DISK == t) { str = "DATA_DISK"; }
   else { str = "NONE"; }
   return str;
+}
+
+int ObRootUtils::notify_tenant_service(
+    const uint64_t tenant_id,
+    const obrpc::ObNotifyTenantThreadArg::TenantThreadType type)
+{
+  int ret = OB_SUCCESS;
+  ObNotifyTenantThreadArg arg;
+  ObAddr leader;
+  const uint64_t meta_tenant_id = gen_meta_tenant_id(tenant_id);
+  if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id)
+      || OB_UNLIKELY(!(is_user_tenant(tenant_id) || is_sys_tenant(tenant_id)))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(arg.init(meta_tenant_id, type))) {
+    LOG_WARN("fail to init notify tenant thread arg", KR(ret), K(meta_tenant_id), K(type));
+  } else if (OB_ISNULL(GCTX.srv_rpc_proxy_) || OB_ISNULL(GCTX.location_service_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("srv_rpc_proxy_ is NULL", KR(ret), KP(GCTX.srv_rpc_proxy_), KP(GCTX.location_service_));
+  } else if (OB_FAIL(GCTX.location_service_->get_leader(GCONF.cluster_id,
+                     meta_tenant_id, SYS_LS, false/*force_renew*/, leader))) {
+    LOG_WARN("failed to get ls leader", KR(ret), K(meta_tenant_id));
+  } else if (OB_FAIL(GCTX.srv_rpc_proxy_->to(leader).by(tenant_id)
+                        .timeout(GCONF.rpc_timeout).notify_tenant_thread(arg))) {
+    LOG_WARN("fail to send rpc", KR(ret), K(arg), K(leader));
+    int tmp_ret = OB_SUCCESS;
+    leader.reset();
+    if (OB_TMP_FAIL(GCTX.location_service_->get_leader(GCONF.cluster_id,
+                        meta_tenant_id, SYS_LS, true/*force_renew*/, leader))) {
+      LOG_WARN("failed to get ls leader after renew", KR(ret), KR(tmp_ret), K(meta_tenant_id));
+    } else if (OB_TMP_FAIL(GCTX.srv_rpc_proxy_->to(leader).by(tenant_id)
+                          .timeout(GCONF.rpc_timeout).notify_tenant_thread(arg))) {
+      LOG_WARN("fail to send rpc after retry", KR(ret), KR(tmp_ret), K(arg), K(leader));
+    } else {
+      ret = OB_SUCCESS;
+      LOG_INFO("success to wakeup tenant service after retry", KR(ret), K(meta_tenant_id), K(type), K(leader));
+    }
+  } else {
+    LOG_INFO("success to wakeup tenant service", KR(ret), K(meta_tenant_id), K(type));
+  }
+  return ret;
 }

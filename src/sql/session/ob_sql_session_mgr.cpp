@@ -18,6 +18,7 @@
 #include "sql/audit/ob_audit_log_utils.h"
 #endif
 #include "sql/monitor/flt/ob_flt_control_info_mgr.h"
+#include "storage/lock_wait_mgr/ob_lock_wait_mgr.h"
 #include "storage/concurrency_control/ob_multi_version_garbage_collector.h"
 #include "lib/ash/ob_active_session_guard.h"
 #include "sql/engine/dml/ob_trigger_handler.h"
@@ -30,15 +31,15 @@ using namespace oceanbase::observer;
 ObTenantSQLSessionMgr::SessionPool::SessionPool()
   : session_pool_()
 {
-  MEMSET(session_array_, 0, POOL_CAPACIPY * sizeof(ObSQLSessionInfo *));
+  MEMSET(session_array_, 0, MAX_POOL_CAPACIPY * sizeof(ObSQLSessionInfo *));
 }
 
 int ObTenantSQLSessionMgr::SessionPool::init(const int64_t capacity)
 {
   int ret = OB_SUCCESS;
   int64_t real_cap = capacity;
-  if (real_cap > POOL_CAPACIPY) {
-    real_cap = POOL_CAPACIPY;
+  if (real_cap > MAX_POOL_CAPACIPY) {
+    real_cap = MAX_POOL_CAPACIPY;
   }
   char *session_buf = reinterpret_cast<char *>(session_array_);
   OZ (session_pool_.init(real_cap, session_buf));
@@ -98,8 +99,14 @@ ObTenantSQLSessionMgr::~ObTenantSQLSessionMgr()
 int ObTenantSQLSessionMgr::init()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(session_pool_.init(SessionPool::POOL_CAPACIPY))) {
-    LOG_WARN("fail to init session pool", K(tenant_id_), K(ret));
+  int64_t pool_cap = 0;
+  if (MTL_MEM_SIZE() <= (4ULL << 30)) { // 4G
+    pool_cap = SessionPool::MIN_POOL_CAPACIPY;
+  } else {
+    pool_cap = MIN(SessionPool::MAX_POOL_CAPACIPY, (MTL_MEM_SIZE() / (4ULL << 30)) * 2 * SessionPool::MIN_POOL_CAPACIPY);
+  }
+  if (OB_FAIL(session_pool_.init(pool_cap))) {
+    LOG_WARN("fail to init session pool", K(tenant_id_), K(pool_cap), K(ret));
   }
   return ret;
 }
@@ -137,7 +144,7 @@ void ObTenantSQLSessionMgr::mtl_wait(ObTenantSQLSessionMgr *&t_session_mgr)
     while (t_session_mgr->count() != 0) {
       LOG_WARN_RET(OB_NEED_RETRY, "tenant session mgr should be empty",
                    K(t_session_mgr->count()));
-      usleep(1000 * 1000);
+      ob_usleep(1000 * 1000);
     }
   }
   LOG_INFO("success to wait tenant session mgr");
@@ -733,6 +740,7 @@ int ObSQLSessionMgr::kill_session(ObSQLSessionInfo &session)
   ObSQLSessionInfo::LockGuard data_lock_guard(session.get_thread_data_lock());
   bool need_disconnect = false;
   session.set_query_start_time(ObTimeUtility::current_time());
+  session.set_mark_killed(true);
   if (session.is_in_transaction()) {
     if (OB_SUCCESS != (tmp_ret = ObSqlTransControl::kill_tx_on_session_killed(&session))) {
       LOG_WARN("fail to rollback transaction", K(session.get_server_sid()),
@@ -740,6 +748,17 @@ int ObSQLSessionMgr::kill_session(ObSQLSessionInfo &session)
                K(tmp_ret), KPC(session.get_tx_desc()),
                "query_str", session.get_current_query_string(),
                K(need_disconnect));
+    }
+  }
+
+  {
+    lockwaitmgr::ObLockWaitMgr *mgr = nullptr;
+    if (OB_ISNULL(mgr = MTL(lockwaitmgr::ObLockWaitMgr *))) {
+      tmp_ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("can't get lock wait mgr", K(session.get_server_sid()));
+    } else {
+      LOG_INFO("notify lockwaitmgr killed session", K(session.get_server_sid()));
+      mgr->notify_killed_session(session.get_server_sid());
     }
   }
 
@@ -753,7 +772,8 @@ int ObSQLSessionMgr::kill_session(ObSQLSessionInfo &session)
              "proxy", session.get_proxy_addr(),
              "peer", session.get_peer_addr(),
              "real_client_ip", session.get_client_ip(),
-             "sessid", session.get_server_sid(),
+             "server_sid", session.get_server_sid(),
+             "client_sid", session.get_client_sid(),
              "proxy_sessid", session.get_proxy_sessid(),
              "query_str", session.get_current_query_string());
   } else {

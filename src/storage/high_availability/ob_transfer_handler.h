@@ -29,6 +29,9 @@
 #include "observer/ob_inner_sql_connection.h"
 #include "ob_transfer_struct.h"
 #include "ob_transfer_backfill_tx.h"
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "storage/high_availability/ob_ss_transfer_backfill_tx.h"
+#endif
 #include "lib/thread/thread_mgr_interface.h"
 #include "logservice/ob_log_base_type.h"
 #include "share/ob_storage_ha_diagnose_struct.h"
@@ -129,34 +132,34 @@ private:
   int do_with_start_status_(const share::ObTransferTaskInfo &task_info);
   int do_with_doing_status_(const share::ObTransferTaskInfo &task_info);
   int do_with_aborted_status_(const share::ObTransferTaskInfo &task_info);
+  int init_transfer_ls_info_(const share::ObTransferTaskInfo &task_info);
   int check_self_is_leader_(bool &is_leader);
-  int lock_src_and_dest_ls_member_list_(
+  int lock_src_and_dest_ls_member_and_learner_list_(
       const share::ObTransferTaskInfo &task_info,
       const share::ObLSID &src_ls_id,
       const share::ObLSID &dest_ls);
-  int unlock_src_and_dest_ls_member_list_(
-      const share::ObTransferTaskInfo &task_info);
-  int reset_timeout_for_trans_(ObTimeoutCtx &timeout_ctx);
-  int inner_lock_ls_member_list_(
+  int unlock_src_and_dest_ls_member_and_learner_list_(
+      const share::ObTransferTaskInfo &task_info,
+      const bool need_check_palf_leader,
+      const share::ObLSID &need_check_palf_leader_ls_id);
+  int reset_timeout_for_trans_(ObTimeoutCtx &timeout_ctx, ObMySQLTransaction &trans);
+  int inner_unlock_ls_member_and_learner_list_(
       const share::ObTransferTaskInfo &task_info,
       const share::ObLSID &ls_id,
       const common::ObMemberList &member_list,
-      const ObTransferLockStatus &status);
-  int inner_unlock_ls_member_list_(
-      const share::ObTransferTaskInfo &task_info,
-      const share::ObLSID &ls_id,
-      const common::ObMemberList &member_list,
-      const ObTransferLockStatus &status);
+      const common::GlobalLearnerList &learner_list,
+      const ObTransferLockStatus &status,
+      const bool need_check_palf_leader,
+      const share::ObLSID &need_check_palf_leader_ls_id);
   int insert_lock_info_(const share::ObTransferTaskInfo &task_info);
-  int check_ls_member_list_same_(
+  int check_ls_member_list_and_learner_list_same_(
       const share::ObLSID &src_ls_id,
       const share::ObLSID &dest_ls,
       common::ObMemberList &member_list,
+      common::GlobalLearnerList &learner_list,
+      const bool need_check_learner_list,
       bool &is_same);
-  int get_ls_member_list_(
-      const share::ObLSID &ls_id,
-      common::ObMemberList &member_list);
-  int check_src_ls_has_active_trans_(
+ int check_src_ls_has_active_trans_(
       const share::ObLSID &src_ls_id,
       const int64_t expected_active_trans_count = 0);
   int get_ls_active_trans_count_(
@@ -164,19 +167,19 @@ private:
       int64_t &active_trans_count);
   int check_start_status_transfer_tablets_(
       const share::ObTransferTaskInfo &task_info,
+      const common::ObIArray<ObAddr> &addr_list,
       ObTimeoutCtx &timeout_ctx);
   int get_dest_ls_mv_merge_scn_(
       const share::ObTransferTaskInfo &task_info,
       share::SCN &new_mv_merge_scn);
-  int get_ls_leader_(
-      const share::ObLSID &ls_id,
-      common::ObAddr &addr);
   int do_trans_transfer_start_(
       const share::ObTransferTaskInfo &task_info,
       const palf::LogConfigVersion &config_version,
       const share::SCN &dest_max_desided_scn,
+      const common::ObIArray<ObAddr> &addr_list,
       ObTimeoutCtx &timeout_ctx,
-      ObMySQLTransaction &trans);
+      ObMySQLTransaction &trans,
+      bool &is_update_transfer_meta);
   int do_trans_transfer_start_prepare_(
       const share::ObTransferTaskInfo &task_info,
       ObTimeoutCtx &timeout_ctx,
@@ -188,8 +191,10 @@ private:
   int do_trans_transfer_start_v2_(
       const share::ObTransferTaskInfo &task_info,
       const share::SCN &dest_max_desided_scn,
+      const common::ObIArray<ObAddr> &addr_list,
       ObTimeoutCtx &timeout_ctx,
-      ObMySQLTransaction &trans);
+      ObMySQLTransaction &trans,
+      bool &is_update_transfer_meta);
   int do_trans_transfer_dest_prepare_(
       const share::ObTransferTaskInfo &task_info,
       ObMySQLTransaction &trans);
@@ -240,12 +245,13 @@ private:
   int wait_ls_replay_event_(
       const share::ObLSID &ls_id,
       const share::ObTransferTaskInfo &task_info,
-      const common::ObArray<ObAddr> &member_addr_list,
+      const common::ObIArray<ObAddr> &member_addr_list,
       const share::SCN &check_scn,
       const int32_t group_id,
       ObTimeoutCtx &timeout_ctx);
   int precheck_ls_replay_scn_(
-      const share::ObTransferTaskInfo &task_info);
+      const share::ObTransferTaskInfo &task_info,
+      const common::ObIArray<ObAddr> &addr_list);
   int get_max_decided_scn_(
       const uint64_t tenant_id,
       const share::ObLSID &ls_id,
@@ -254,6 +260,7 @@ private:
   int wait_src_ls_replay_to_start_scn_(
       const share::ObTransferTaskInfo &task_info,
       const share::SCN &start_scn,
+      const common::ObIArray<ObAddr> &addr_list,
       ObTimeoutCtx &timeout_ctx);
   int do_tx_start_transfer_in_(
       const share::ObTransferTaskInfo &task_info,
@@ -265,6 +272,9 @@ private:
       const ObTXStartTransferInInfo &start_transfer_in_info,
       common::ObMySQLTransaction &trans);
   int update_all_tablet_to_ls_(
+      const share::ObTransferTaskInfo &task_info,
+      common::ObISQLClient &trans);
+  int update_all_session_tablet_to_temporary_table_(
       const share::ObTransferTaskInfo &task_info,
       common::ObISQLClient &trans);
   int lock_tablet_on_dest_ls_for_table_lock_(
@@ -341,7 +351,9 @@ private:
   int update_transfer_meta_info_(
       const share::ObTransferTaskInfo &task_info,
       const share::SCN &start_scn,
-      ObTimeoutCtx &timeout_ctx);
+      const common::ObIArray<ObAddr> &addr_list,
+      ObTimeoutCtx &timeout_ctx,
+      bool &is_update_transfer_meta);
   int build_transfer_meta_info_(
       const share::ObTransferTaskInfo &task_info,
       const share::SCN &start_scn,
@@ -355,8 +367,9 @@ private:
       ObTimeoutCtx &timeout_ctx,
       share::SCN &ls_decided_scn);
 
-  int get_local_ls_member_list_(
-      common::ObMemberList &member_list);
+  int get_local_ls_member_list_and_learner_list_(
+      common::ObMemberList &member_list,
+      common::GlobalLearnerList &learner_list);
   int check_transfer_in_tablet_abort_(
       const share::ObTransferTaskInfo &task_info,
       const common::ObIArray<ObAddr> &member_addr_list,
@@ -389,7 +402,8 @@ private:
       const share::ObTransferTaskInfo &task_info,
       ObTimeoutCtx &timeout_ctx);
   int generate_parallel_tablet_info_dag_(
-      const share::ObTransferTaskInfo &task_info);
+      const share::ObTransferTaskInfo &task_info,
+      ObTimeoutCtx &timeout_ctx);
   int do_build_tablet_info_(
       const share::ObTransferTaskInfo &task_info,
       ObTimeoutCtx &timeout_ctx);
@@ -398,16 +412,18 @@ private:
       ObTimeoutCtx &timeout_ctx,
       int32_t &result);
   int wait_parallel_tablet_info_dag_finish_(
-      const share::ObTransferTaskInfo &task_info);
+      const share::ObTransferTaskInfo &task_info,
+      ObTimeoutCtx &timeout_ctx);
   void finish_parallel_tablet_info_dag_(
-      const share::ObTransferTaskInfo &task_info);
+      const share::ObTransferTaskInfo &task_info,
+      ObTimeoutCtx &timeout_ctx);
 
 #ifdef OB_BUILD_SHARED_STORAGE
-  int set_member_table_(
+  int set_reorg_info_table_(
       const share::ObTransferTaskInfo &task_info,
       const share::SCN &start_scn,
       common::ObMySQLTransaction &trans);
-  int set_member_table_data_(
+  int set_reorg_info_table_data_(
       const share::ObTransferTaskInfo &task_info,
       const share::SCN &start_scn,
       const ObTabletStatus &tablet_status,
@@ -427,7 +443,11 @@ private:
   common::ObMySQLProxy *sql_proxy_;
 
   int64_t retry_count_;
+  // TODO(jyx441808): use one base transfer worker mgr class
   ObTransferWorkerMgr transfer_worker_mgr_;
+#ifdef OB_BUILD_SHARED_STORAGE
+  ObSSTransferWorkerMgr ss_transfer_worker_mgr_;
+#endif
   int64_t round_;
   share::SCN gts_seq_;
   ObTransferRelatedInfo related_info_;
@@ -437,6 +457,7 @@ private:
   bool transfer_handler_enabled_;
   ObTransferBuildTabletInfoCtx ctx_;
   common::ObThreadCond cond_;
+  ObTransferLSInfo ls_transfer_info_;
 
   DISALLOW_COPY_AND_ASSIGN(ObTransferHandler);
 };

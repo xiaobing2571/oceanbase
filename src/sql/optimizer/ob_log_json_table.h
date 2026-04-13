@@ -14,23 +14,31 @@
 #ifndef _OB_LOG_JSON_TABLE_H
 #define _OB_LOG_JSON_TABLE_H
 #include "sql/optimizer/ob_logical_operator.h"
+#include "sql/optimizer/ob_log_plan.h"
 
 namespace oceanbase
 {
 namespace sql
 {
+template<typename R, typename C>
+class PlanVisitor;
 class ObLogJsonTable : public ObLogicalOperator
 {
 public:
   ObLogJsonTable(ObLogPlan &plan)
       : ObLogicalOperator(plan),
         table_id_(OB_INVALID_ID),
-        value_exprs_(),
+        value_exprs_(plan.get_allocator()),
         table_name_(),
-        access_exprs_(),
-        all_cols_def_(),
+        access_exprs_(plan.get_allocator()),
+        all_cols_def_(plan.get_allocator()),
         table_type_(MulModeTableType::INVALID_TABLE_TYPE),
-        namespace_arr_() {}
+        namespace_arr_(plan.get_allocator()),
+        column_param_default_exprs_(plan.get_allocator()),
+        data_index_id_(OB_INVALID_ID),
+        index_column_cnt_(0),
+        inc_pk_proj_(0),
+        data_table_col_ids_() {}
 
   virtual ~ObLogJsonTable() {}
   int add_values_expr(ObIArray<ObRawExpr*> &exprs) { return append(value_exprs_, exprs); }
@@ -60,19 +68,32 @@ public:
   int set_column_param_default_arr(ObIArray<ObColumnDefault> &column_param_default_exprs);
   int get_column_param_default_arr(ObIArray<ObColumnDefault> &column_param_default_exprs);
   ObColumnDefault* get_column_param_default_val(int64_t index);
+  inline void set_data_index_id(uint64_t index_id) { data_index_id_ = index_id; }
+  inline uint64_t get_data_index_id() const { return data_index_id_; }
+  inline void set_index_column_cnt(uint64_t col_cnt) { index_column_cnt_ = col_cnt; }
+  inline uint64_t get_index_column_cnt() const { return index_column_cnt_; }
+  int gen_data_table_col_ids(const ObJsonTableDef &tbl_def);
+  const ObIArray<uint64_t> &get_data_table_col_ids() const { return data_table_col_ids_; }
+  int generate_inc_pk_proj(const ObIArray<ObRawExpr*> &exprs);
+  int64_t get_inc_pk_proj() const { return inc_pk_proj_; }
+
 private:
   uint64_t table_id_;
-  common::ObSEArray<ObRawExpr*, 1, common::ModulePageAllocator, true> value_exprs_;
+  ObSqlArray<ObRawExpr*> value_exprs_;
   common::ObString table_name_;
-  common::ObSEArray<ObRawExpr*, 4, common::ModulePageAllocator, true> access_exprs_;
+  ObSqlArray<ObRawExpr*> access_exprs_;
 
-  common::ObSEArray<ObJtColBaseInfo*, 4, common::ModulePageAllocator, true> all_cols_def_;
+  ObSqlArray<ObJtColBaseInfo*> all_cols_def_;
   // table func type
   MulModeTableType table_type_;
   // xml table param
-  common::ObSEArray<ObString, 16, common::ModulePageAllocator, true> namespace_arr_;
+  ObSqlArray<ObString> namespace_arr_;
   // default value array
-  common::ObSEArray<ObColumnDefault, 1, common::ModulePageAllocator, true> column_param_default_exprs_;
+  ObSqlArray<ObColumnDefault> column_param_default_exprs_;
+  uint64_t data_index_id_;
+  int64_t index_column_cnt_;
+  int64_t inc_pk_proj_;
+  common::ObSEArray<uint64_t, 16, common::ModulePageAllocator, true> data_table_col_ids_;
 
   DISALLOW_COPY_AND_ASSIGN(ObLogJsonTable);
 };

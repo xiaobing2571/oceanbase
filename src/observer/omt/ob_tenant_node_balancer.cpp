@@ -123,7 +123,11 @@ void ObTenantNodeBalancer::run1()
 
     {
       common::ObBKGDSessInActiveGuard inactive_guard;
-      USLEEP(refresh_interval_);  // sleep 10s
+      if (GCTX.in_bootstrap_) {
+        USLEEP(1_s);  // sleep 1s
+      } else {
+        USLEEP(refresh_interval_);  // sleep 10s
+      }
     }
   }
 }
@@ -191,6 +195,12 @@ int ObTenantNodeBalancer::notify_create_tenant(const obrpc::TenantServerUnitConf
     if (create_tenant_timeout_ts < create_timestamp) {
       ret = OB_TIMEOUT;
       LOG_WARN("notify_create_tenant has timeout", K(ret), K(create_timestamp), K(create_tenant_timeout_ts));
+    } else if (0 != unit.data_version_
+        && OB_FAIL(ODV_MGR.set(unit.tenant_id_, unit.data_version_))) {
+      LOG_WARN("fail to set tenant data version", KR(ret), K(unit));
+    } else if (0 != unit.meta_tenant_data_version_
+        && OB_FAIL(ODV_MGR.set(gen_meta_tenant_id(unit.tenant_id_), unit.meta_tenant_data_version_))) {
+      LOG_WARN("fail to set meta tenant data version", KR(ret), K(unit));
     } else if (OB_FAIL(basic_tenant_unit.init(tenant_id,
                                        unit.unit_id_,
                                        ObUnitInfoGetter::ObUnitStatus::UNIT_NORMAL,
@@ -200,7 +210,8 @@ int ObTenantNodeBalancer::notify_create_tenant(const obrpc::TenantServerUnitConf
                                        has_memstore,
                                        false /*is_removed*/,
                                        hidden_sys_data_disk_config_size,
-                                       basic_tenant_unit.gen_init_actual_data_disk_size(unit.unit_config_)))) {
+                                       basic_tenant_unit.gen_init_actual_data_disk_size(unit.unit_config_),
+                                       unit.replica_type_))) {
       LOG_WARN("fail to init user tenant config", KR(ret), K(unit));
     } else if (is_user_tenant(tenant_id)
         && OB_FAIL(basic_tenant_unit.divide_meta_tenant(meta_tenant_unit))) {
@@ -222,8 +233,26 @@ int ObTenantNodeBalancer::notify_create_tenant(const obrpc::TenantServerUnitConf
       } else {
         const obrpc::ObRootKeyResult &root_key = unit.root_key_;
         if (obrpc::RootKeyType::INVALID == root_key.key_type_) {
+#ifdef OB_BUILD_SHARED_STORAGE
+          if (!GCTX.is_shared_storage_mode()) {
+            // do nothing
+            LOG_INFO("root_key got from RS is INVALID, won't set now");
+          } else if (is_sys_tenant(tenant_id)) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("sys tenant root_key should not be INVALID", KR(ret));
+          } else {
+            MTL_SWITCH(tenant_id) {
+              if (OB_FAIL(ObMasterKeyUtil::ss_get_root_key(tenant_id))) {
+                LOG_WARN("failed to get root_key from ss", K(ret), K(tenant_id));
+              } else {
+                LOG_INFO("got root_key from ss", K(tenant_id));
+              }
+            }
+          }
+#else
           // do nothing
-          LOG_INFO("root_key got from RS is INVALID, won't set now", KR(ret));
+          LOG_INFO("root_key got from RS is INVALID, won't set now");
+#endif
         } else if (OB_FAIL(ObMasterKeyGetter::instance().set_root_key(
                             tenant_id, root_key.key_type_, root_key.root_key_))) {
           LOG_WARN("failed to set root_key", KR(ret));
@@ -295,7 +324,7 @@ int ObTenantNodeBalancer::get_server_allocated_resource(ServerResource &server_r
       server_resource.memory_size_ += max(ObMallocAllocator::get_instance()->get_tenant_limit(tenant_units.at(i).tenant_id_) - extra_memory,
                                           tenant_units.at(i).config_.memory_size());
       server_resource.log_disk_size_ += tenant_units.at(i).config_.log_disk_size();
-      server_resource.data_disk_size_ += tenant_units.at(i).get_effective_actual_data_disk_size();
+      server_resource.data_disk_size_ += tenant_units.at(i).get_actual_data_disk_size();
     }
   }
   return ret;
@@ -423,20 +452,6 @@ int ObTenantNodeBalancer::check_new_tenant(
     if (OB_SUCC(ret) && OB_FAIL(omt_->update_tenant_memory(unit, extra_memory))) {
       LOG_ERROR("fail to update tenant memory", K(ret), K(tenant_id));
     }
-#ifdef OB_BUILD_SHARED_STORAGE
-    if (OB_FAIL(ret)) {
-    } else if (!GCTX.is_shared_storage_mode() || unit.config_.data_disk_size() == 0) {
-      // do nothing
-    } else {
-      int64_t data_disk_size = unit.config_.data_disk_size();
-      if (is_sys_tenant(tenant_id)) { // real_sys_tenant's data_disk_size = sys_unit_config + hidden_sys_data_disk_size
-        data_disk_size += OB_SERVER_DISK_SPACE_MGR.get_hidden_sys_data_disk_config_size();
-      }
-      if (OB_FAIL(omt_->update_tenant_data_disk_size(tenant_id, data_disk_size))) {
-        LOG_WARN("fail to update tenant data disk size", K(ret), K(tenant_id), K(data_disk_size));
-      }
-    }
-#endif
     if (OB_SUCC(ret) && !is_virtual_tenant_id(tenant_id)) {
       if (OB_FAIL(omt_->modify_tenant_io(tenant_id, unit.config_))) {
         LOG_WARN("modify tenant io config failed", K(ret), K(tenant_id), K(unit.config_));

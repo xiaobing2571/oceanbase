@@ -41,7 +41,7 @@ int ObFlyingTabletPointerMap::init(const uint64_t tenant_id)
     LOG_WARN("invalid argument", K(ret), K(tenant_id));
   } else if (OB_FAIL(map_.create(bucket_num, "FlyTabletPtrMap", "FlyTabletPtrMap", tenant_id))) {
     LOG_WARN("fail to initialize external tablet cnt map");
-  } else if (OB_FAIL(bucket_lock_.init(bucket_num, ObLatchIds::DEFAULT_BUCKET_LOCK, ObMemAttr(tenant_id, "FlyTabletMapLk")))) {
+  } else if (OB_FAIL(bucket_lock_.init(bucket_num, ObLatchIds::FLYING_TABLET_POINTER_MAP_LOCK, ObMemAttr(tenant_id, "FlyTabletMapLk")))) {
     LOG_WARN("fail to init bucket lock", K(ret), K(bucket_num));
   } else {
     is_inited_ = true;
@@ -134,14 +134,17 @@ int ObFlyingTabletPointerMap::inner_erase_(const ObDieingTabletMapKey &key)
     ret = common::OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(key));
   } else {
+    ObTabletPointer *tablet_ptr = nullptr;
     common::ObBucketHashWLockGuard lock_guard(bucket_lock_, key.hash());
     if (OB_ISNULL(handle_ptr = map_.get(key))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("fail to get from map", K(ret), K(key));
-    } else if (!handle_ptr->get_resource_ptr()->need_remove_from_flying_()) {
+    } else if (OB_ISNULL(tablet_ptr = handle_ptr->get_tablet_pointer())) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("tablet_pointer should not be erased when tablet has been referred",
-        K(ret), KP(handle_ptr->get_resource_ptr()), KPC(handle_ptr->get_resource_ptr()) );
+      LOG_WARN("unexpected error, tablet pointer is nullptr", K(ret), KPC(handle_ptr));
+    } else if (!tablet_ptr->need_remove_from_flying()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("tablet_pointer should not be erased when tablet has been referred", K(ret), KPC(tablet_ptr));
     } else if (OB_FAIL(map_.erase_refactored(key))) {
       LOG_WARN("fail to erase from map", K(ret));
     }

@@ -30,7 +30,8 @@ class ObMember
 public:
   ObMember();
   ObMember(const common::ObAddr &server,
-           const int64_t timestamp);
+           const int64_t timestamp,
+           const int64_t flag = 0);
   virtual ~ObMember() = default;
 public:
   const common::ObAddr &get_server() const;
@@ -53,12 +54,17 @@ public:
   void set_columnstore();
   void reset_columnstore();
 
+  bool is_logonly() const;
+  void set_logonly();
+  void reset_logonly();
+
   TO_STRING_KV(K_(server), K_(timestamp), K_(flag));
   TO_YSON_KV(OB_Y_(server), OB_ID(t), timestamp_, OB_Y_(flag));
   OB_UNIS_VERSION(1);
 protected:
-  static const int64_t MIGRATING_FLAG_BIT = 1;
   static const int64_t COLUMNSTORE_FLAG_BIT = 0;
+  static const int64_t MIGRATING_FLAG_BIT = 1;
+  static const int64_t LOGONLY_FLAG_BIT = 2;
   common::ObAddr server_;
   int64_t timestamp_;
   int64_t flag_;
@@ -111,21 +117,26 @@ public:
   {}
   // construct with server, timestamp and replica_type,
   //   this func will set columnstore flag if replica_type is C.
+  //   this func will set logonly flag if replica_type is L.
   ObReplicaMember(const common::ObAddr &server,
                   const int64_t timestamp,
                   const common::ObReplicaType replica_type,
-                  const int64_t memstore_percent = 100)
-    : ObMember(ObMember(server, timestamp)),
+                  const int64_t memstore_percent = 100,
+                  const int64_t flag = 0)
+    : ObMember(ObMember(server, timestamp, flag)),
       replica_type_(replica_type),
       memstore_percent_(memstore_percent)
   {
     if (REPLICA_TYPE_COLUMNSTORE == replica_type) {
       ObMember::set_columnstore();
+    } else if (REPLICA_TYPE_LOGONLY == replica_type) {
+      ObMember::set_logonly();
     }
   }
 public:
   // init with server, timestamp, replica_type.
   //   this func will set columnstore flag if replica_type is C.
+  //   this func will set logonly flag if replica_type is L.
   int init(const common::ObAddr &server,
            const int64_t timestamp,
            const common::ObReplicaType replica_type);

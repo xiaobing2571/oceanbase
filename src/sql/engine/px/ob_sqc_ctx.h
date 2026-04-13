@@ -35,8 +35,16 @@
 
 namespace oceanbase
 {
+namespace storage
+{
+  class ObTabletDirectLoadMgrHandle;
+}
 namespace sql
 {
+namespace iceberg
+{
+class DataFile;
+}
 
 // SQC 状态
 class ObSqcCtx
@@ -75,6 +83,14 @@ public:
         whole_msg_provider_list_.at(i)->reset();
       }
     }
+
+    if (nullptr != direct_load_mgr_handles_) {
+      direct_load_mgr_handles_->reset();
+      direct_load_mgr_handles_ = nullptr;
+      lob_direct_load_mgr_handles_->reset();
+      lob_direct_load_mgr_handles_ = nullptr;
+    }
+    arena_allocator_.reset();
   }
 
 public:
@@ -103,7 +119,7 @@ public:
   ObPxTransmitChProvider transmit_data_ch_provider_;
   bool all_tasks_finish_;
   bool interrupted_; // 标记当前 SQC 是否被 QC 中断
-  common::ObSEArray<ObPxTabletInfo, 8> partitions_info_;
+  common::ObSEArray<ObPxTabletInfo, 8> px_tablets_info_;
   ObPxBloomfilterChProvider bf_ch_provider_;
   ObPxCreateBloomFilterChannelMsgP px_bloom_filter_msg_proc_;
   ObOptStatsGatherWholeMsgP opt_stats_gather_whole_msg_proc_;
@@ -114,6 +130,12 @@ public:
   ObSPWinFuncPXWholeMsgP sp_winfunc_whole_msg_proc_;
   ObRDWinFuncPXWholeMsgP rd_winfunc_whole_msg_proc_;
   ObJoinFilterCountRowWholeMsgP join_filter_count_row_whole_msg_proc_;
+  /* for ddl */
+  ObArenaAllocator arena_allocator_;
+  ObIArray<ObTabletDirectLoadMgrHandle>* direct_load_mgr_handles_;
+  ObIArray<ObTabletDirectLoadMgrHandle>* lob_direct_load_mgr_handles_;
+  common::ObArray<iceberg::DataFile*> iceberg_data_files_;
+  common::ObSpinLock iceberg_data_file_lock_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSqcCtx);
 };

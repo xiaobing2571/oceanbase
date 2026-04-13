@@ -67,7 +67,7 @@ private:
     mutable ObArenaAllocator allocator_;
     ObString parser_name_;
     ObString properties_;
-    ObCollationType cs_type_;
+    ObObjMeta meta_;
     ObString fulltext_;
     enum OUTPUT_MODE
     {
@@ -82,7 +82,10 @@ private:
                          common::ObArenaAllocator &allocator,
                          TokenizeParam &param);
 
-  static int parse_fulltext(const ObExpr &expr, ObEvalCtx &ctx, TokenizeParam &param);
+  static int parse_fulltext(const ObExpr &expr,
+                            ObEvalCtx &ctx,
+                            common::ObArenaAllocator &allocator,
+                            TokenizeParam &param);
   static int parse_parser_name(const ObExpr &expr, ObEvalCtx &ctx, TokenizeParam &param);
   static int parse_parser_properties(const ObExpr &expr,
                                      ObEvalCtx &ctx,

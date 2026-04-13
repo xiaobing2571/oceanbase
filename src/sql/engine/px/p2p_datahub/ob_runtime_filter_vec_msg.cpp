@@ -103,7 +103,8 @@ OB_DEF_DESERIALIZE(ObRFRangeFilterVecMsg)
               build_row_cmp_info_,
               probe_row_cmp_info_,
               query_range_info_);
-  if (OB_FAIL(adjust_cell_size())) {
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(adjust_cell_size())) {
     LOG_WARN("fail do adjust cell size", K(ret));
   }
   return ret;
@@ -412,7 +413,7 @@ int ObRFRangeFilterVecMsg::dynamic_copy_cell(const ObDatum &src, ObDatum &target
   int ret = OB_SUCCESS;
   int64_t need_size = src.len_;
   if (src.is_null()) {
-    target.null_ = 1;
+    target.set_null();
   } else {
     if (need_size > cell_size) {
       need_size = need_size * 2;

@@ -375,6 +375,8 @@ ObSimpleTablegroupSchema &ObSimpleTablegroupSchema::operator =(const ObSimpleTab
       LOG_WARN("Fail to deep copy tablegroup_name", K(ret));
     } else if (OB_FAIL(deep_copy_str(other.sharding_, sharding_))) {
       LOG_WARN("Fail to deep copy sharding", K(ret));
+    } else if (OB_FAIL(deep_copy_str(other.scope_, scope_))) {
+      LOG_WARN("Fail to deep copy scope", KR(ret));
     }
     if (OB_FAIL(ret)) {
       error_ret_ = ret;
@@ -394,7 +396,8 @@ bool ObSimpleTablegroupSchema::operator ==(const ObSimpleTablegroupSchema &other
       && tablegroup_name_ == other.tablegroup_name_
       && partition_status_ == other.partition_status_
       && partition_schema_version_ == other.partition_schema_version_
-      && sharding_ == other.sharding_) {
+      && sharding_ == other.sharding_
+      && scope_ == other.scope_) {
     ret = true;
   }
 
@@ -411,6 +414,7 @@ void ObSimpleTablegroupSchema::reset()
   partition_status_ = PARTITION_STATUS_ACTIVE;
   partition_schema_version_ = 0;// Issues left over from history, set to 0
   sharding_.reset();
+  scope_.reset();
 }
 
 bool ObSimpleTablegroupSchema::is_valid() const
@@ -432,6 +436,7 @@ int64_t ObSimpleTablegroupSchema::get_convert_size() const
   convert_size += sizeof(ObSimpleTablegroupSchema);
   convert_size += tablegroup_name_.length() + 1;
   convert_size += sharding_.length() + 1;
+  convert_size += scope_.length() + 1;
 
   return convert_size;
 }
@@ -468,6 +473,7 @@ ObSchemaMgr::ObSchemaMgr()
       tablegroup_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_TABLEG_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
       table_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_TABLE_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
       index_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_INDEX_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
+      vec_index_infos_(0, NULL, SET_USE_500("ScheVecInfoVec", ObCtxIds::SCHEMA_SERVICE)),
       aux_vp_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_AUX_VP_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
       lob_meta_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_LOB_META_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
       lob_piece_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_LOB_PIECE_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
@@ -500,15 +506,20 @@ ObSchemaMgr::ObSchemaMgr()
       built_in_index_name_map_(SET_USE_500("BuiltInIdxNames", ObCtxIds::SCHEMA_SERVICE)),
       dblink_mgr_(allocator_),
       directory_mgr_(allocator_),
+      location_mgr_(allocator_),
       context_mgr_(allocator_),
       mock_fk_parent_table_mgr_(allocator_),
       rls_policy_mgr_(allocator_),
       rls_group_mgr_(allocator_),
       rls_context_mgr_(allocator_),
       catalog_mgr_(allocator_),
+      ccl_rule_mgr_(allocator_),
+      sensitive_rule_mgr_(allocator_),
       timestamp_in_slot_(0),
       allocator_idx_(OB_INVALID_INDEX),
-      mlog_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_MLOG_INFO_VEC, ObCtxIds::SCHEMA_SERVICE))
+      mlog_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_MLOG_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
+      external_resource_mgr_(allocator_),
+      ai_model_mgr_(allocator_)
 {
 }
 
@@ -525,6 +536,7 @@ ObSchemaMgr::ObSchemaMgr(ObIAllocator &allocator)
       tablegroup_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_TABLEG_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
       table_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_TABLE_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
       index_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_INDEX_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
+      vec_index_infos_(0, NULL, SET_USE_500("ScheVecInfoVec", ObCtxIds::SCHEMA_SERVICE)),
       aux_vp_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_AUX_VP_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
       lob_meta_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_LOB_META_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
       lob_piece_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_LOB_PIECE_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
@@ -557,15 +569,20 @@ ObSchemaMgr::ObSchemaMgr(ObIAllocator &allocator)
       built_in_index_name_map_(SET_USE_500("BuiltInIdxNames", ObCtxIds::SCHEMA_SERVICE)),
       dblink_mgr_(allocator_),
       directory_mgr_(allocator_),
+      location_mgr_(allocator_),
       context_mgr_(allocator_),
       mock_fk_parent_table_mgr_(allocator_),
       rls_policy_mgr_(allocator_),
       rls_group_mgr_(allocator_),
       rls_context_mgr_(allocator_),
       catalog_mgr_(allocator_),
+      ccl_rule_mgr_(allocator_),
+      sensitive_rule_mgr_(allocator_),
       timestamp_in_slot_(0),
       allocator_idx_(OB_INVALID_INDEX),
-      mlog_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_MLOG_INFO_VEC, ObCtxIds::SCHEMA_SERVICE))
+      mlog_infos_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_MLOG_INFO_VEC, ObCtxIds::SCHEMA_SERVICE)),
+      external_resource_mgr_(allocator_),
+      ai_model_mgr_(allocator_)
 {
 }
 
@@ -630,6 +647,8 @@ int ObSchemaMgr::init(const uint64_t tenant_id)
     LOG_WARN("init dblink mgr failed", K(ret));
   } else if (OB_FAIL(directory_mgr_.init())) {
     LOG_WARN("init directory mgr failed", K(ret));
+  } else if (OB_FAIL(location_mgr_.init())) {
+    LOG_WARN("init location mgr failed", K(ret));
   } else if (OB_FAIL(rls_policy_mgr_.init())) {
     LOG_WARN("init rls_policy mgr failed", K(ret));
   } else if (OB_FAIL(rls_group_mgr_.init())) {
@@ -638,6 +657,8 @@ int ObSchemaMgr::init(const uint64_t tenant_id)
     LOG_WARN("init rls_context mgr failed", K(ret));
   } else if (OB_FAIL(catalog_mgr_.init())) {
     LOG_WARN("init catalog mgr failed", K(ret));
+  } else if (OB_FAIL(sensitive_rule_mgr_.init())) {
+    LOG_WARN("init sensitive_rule mgr failed", K(ret));
   } else if (OB_FAIL(hidden_table_name_map_.init())) {
     LOG_WARN("init hidden table name map failed", K(ret));
   } else if (OB_FAIL(built_in_index_name_map_.init())) {
@@ -646,6 +667,12 @@ int ObSchemaMgr::init(const uint64_t tenant_id)
     LOG_WARN("init context mgr failed", K(ret));
   } else if (OB_FAIL(mock_fk_parent_table_mgr_.init())) {
     LOG_WARN("init mock_fk_parent_table_mgr_ failed", K(ret));
+  } else if (OB_FAIL(external_resource_mgr_.init())) {
+    LOG_WARN("init external_resource_mgr_ failed", K(ret));
+  } else if (OB_FAIL(ai_model_mgr_.init())) {
+    LOG_WARN("init ai_model_mgr_ failed", K(ret));
+  } else if (OB_FAIL(ccl_rule_mgr_.init())) {
+    LOG_WARN("init ccl_rule mgr failed", K(ret));
   } else {
     tenant_id_ = tenant_id;
   }
@@ -672,6 +699,7 @@ void ObSchemaMgr::reset()
     tablegroup_infos_.clear();
     table_infos_.clear();
     index_infos_.clear();
+    vec_index_infos_.clear();
     aux_vp_infos_.clear();
     lob_meta_infos_.clear();
     lob_piece_infos_.clear();
@@ -704,16 +732,21 @@ void ObSchemaMgr::reset()
     tablespace_mgr_.reset();
     dblink_mgr_.reset();
     directory_mgr_.reset();
+    location_mgr_.reset();
     rls_policy_mgr_.reset();
     rls_group_mgr_.reset();
     rls_context_mgr_.reset();
     catalog_mgr_.reset();
+    ccl_rule_mgr_.reset();
+    sensitive_rule_mgr_.reset();
     tenant_id_ = OB_INVALID_TENANT_ID;
     hidden_table_name_map_.clear();
     built_in_index_name_map_.clear();
     context_mgr_.reset();
     mock_fk_parent_table_mgr_.reset();
     mlog_infos_.clear();
+    external_resource_mgr_.reset();
+    ai_model_mgr_.reset();
   }
 }
 
@@ -764,6 +797,7 @@ int ObSchemaMgr::assign(const ObSchemaMgr &other)
     ASSIGN_FIELD(tablegroup_infos_);
     ASSIGN_FIELD(table_infos_);
     ASSIGN_FIELD(index_infos_);
+    ASSIGN_FIELD(vec_index_infos_);
     ASSIGN_FIELD(aux_vp_infos_);
     ASSIGN_FIELD(lob_meta_infos_);
     ASSIGN_FIELD(lob_piece_infos_);
@@ -817,6 +851,8 @@ int ObSchemaMgr::assign(const ObSchemaMgr &other)
         LOG_WARN("assign dblink mgr failed", K(ret));
       } else if (OB_FAIL(directory_mgr_.assign(other.directory_mgr_))) {
         LOG_WARN("assign directory mgr failed", K(ret));
+      } else if (OB_FAIL(location_mgr_.assign(other.location_mgr_))) {
+        LOG_WARN("assign location mgr failed", K(ret));
       } else if (OB_FAIL(context_mgr_.assign(other.context_mgr_))) {
         LOG_WARN("assign context mgr failed", K(ret));
       } else if (OB_FAIL(mock_fk_parent_table_mgr_.assign(other.mock_fk_parent_table_mgr_))) {
@@ -829,6 +865,14 @@ int ObSchemaMgr::assign(const ObSchemaMgr &other)
         LOG_WARN("assign rls_context mgr failed", K(ret));
       } else if (OB_FAIL(catalog_mgr_.assign(other.catalog_mgr_))) {
         LOG_WARN("assign catalog mgr failed", K(ret));
+      } else if (OB_FAIL(external_resource_mgr_.assign(other.external_resource_mgr_))) {
+        LOG_WARN("assign external_resource_mgr_ failed", K(ret));
+      } else if (OB_FAIL(ai_model_mgr_.assign(other.ai_model_mgr_))) {
+        LOG_WARN("assign ai_model_mgr_ failed", K(ret));
+      } else if (OB_FAIL(ccl_rule_mgr_.assign(other.ccl_rule_mgr_))) {
+        LOG_WARN("assign ccl_rule mgr failed", K(ret));
+      } else if (OB_FAIL(sensitive_rule_mgr_.assign(other.sensitive_rule_mgr_))) {
+        LOG_WARN("assign sensitive_rule mgr failed", K(ret));
       }
     }
   }
@@ -916,6 +960,8 @@ int ObSchemaMgr::deep_copy(const ObSchemaMgr &other)
         LOG_WARN("deep copy dblink mgr failed", K(ret));
       } else if (OB_FAIL(directory_mgr_.deep_copy(other.directory_mgr_))) {
         LOG_WARN("deep copy directory mgr failed", K(ret));
+      } else if (OB_FAIL(location_mgr_.deep_copy(other.location_mgr_))) {
+        LOG_WARN("deep copy location mgr failed", K(ret));
       } else if (OB_FAIL(context_mgr_.deep_copy(other.context_mgr_))) {
         LOG_WARN("deep copy context mgr failed", K(ret));
       } else if (OB_FAIL(mock_fk_parent_table_mgr_.deep_copy(other.mock_fk_parent_table_mgr_))) {
@@ -928,6 +974,14 @@ int ObSchemaMgr::deep_copy(const ObSchemaMgr &other)
         LOG_WARN("deep copy rls_context mgr failed", K(ret));
       } else if (OB_FAIL(catalog_mgr_.deep_copy(other.catalog_mgr_))) {
         LOG_WARN("deep copy catalog mgr failed", K(ret));
+      } else if (OB_FAIL(external_resource_mgr_.deep_copy(other.external_resource_mgr_))) {
+        LOG_WARN("deep copy external_resource mgr failed", K(ret));
+      } else if (OB_FAIL(ai_model_mgr_.deep_copy(other.ai_model_mgr_))) {
+        LOG_WARN("deep copy ai_model mgr failed", K(ret));
+      } else if (OB_FAIL(ccl_rule_mgr_.deep_copy(other.ccl_rule_mgr_))) {
+        LOG_WARN("deep copy ccl_rule mgr failed", K(ret));
+      } else if (OB_FAIL(sensitive_rule_mgr_.deep_copy(other.sensitive_rule_mgr_))) {
+        LOG_WARN("deep copy sensitive_rule mgr failed", K(ret));
       }
     }
     if (OB_SUCC(ret)) {
@@ -1536,6 +1590,20 @@ int ObSchemaMgr::get_directory_schema(
     LOG_WARN("tenant_id not matched", K(ret), K(tenant_id), K_(tenant_id));
   } else {
     ret = directory_mgr_.get_directory_schema_by_id(schema_id, schema);
+  }
+  return ret;
+}
+int ObSchemaMgr::get_location_schema(
+    const uint64_t tenant_id,
+    const uint64_t schema_id,
+    const ObLocationSchema *&schema) const
+{
+  int ret = OB_SUCCESS;
+  if (tenant_id_ != tenant_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("tenant_id not matched", K(ret), K(tenant_id), K_(tenant_id));
+  } else {
+    ret = location_mgr_.get_location_schema_by_id(schema_id, schema);
   }
   return ret;
 }
@@ -2172,6 +2240,114 @@ int ObSchemaMgr::del_catalog(const ObTenantCatalogId &id)
   return ret;
 }
 
+int ObSchemaMgr::add_locations(const common::ObIArray<ObLocationSchema> &location_schemas)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; i < location_schemas.count() && OB_SUCC(ret); ++i) {
+    if (OB_FAIL(add_location(location_schemas.at(i)))) {
+      LOG_WARN("push schema failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObSchemaMgr::add_location(const ObLocationSchema &catalog_schema)
+{
+  int ret = OB_SUCCESS;
+  ObNameCaseMode mode = OB_NAME_CASE_INVALID;
+  if (is_sys_tenant(tenant_id_)) {
+    mode = OB_ORIGIN_AND_INSENSITIVE;
+  } else if (OB_FAIL(get_tenant_name_case_mode(catalog_schema.get_tenant_id(), mode))) {
+    LOG_WARN("fail to get_tenant_name_case_mode", K(ret), "tenant_id", catalog_schema.get_tenant_id());
+  } else if (OB_NAME_CASE_INVALID == mode) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid case mode", K(ret), K(mode));
+  }
+  if (OB_SUCC(ret) && OB_FAIL(location_mgr_.add_location(catalog_schema, mode))) {
+    LOG_WARN("failed to add location", K(ret));
+  }
+  return ret;
+}
+
+int ObSchemaMgr::del_location(const ObTenantLocationId &id)
+{
+  int ret = OB_SUCCESS;
+  OZ(location_mgr_.del_location(id));
+  return ret;
+}
+
+int ObSchemaMgr::add_ccl_rules(const common::ObIArray<ObSimpleCCLRuleSchema> &ccl_schemas)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; i < ccl_schemas.count() && OB_SUCC(ret); ++i) {
+    if (OB_FAIL(add_ccl_rule(ccl_schemas.at(i)))) {
+      LOG_WARN("push schema failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObSchemaMgr::add_ccl_rule(const ObSimpleCCLRuleSchema &ccl_schema)
+{
+  int ret = OB_SUCCESS;
+  ObNameCaseMode mode = OB_NAME_CASE_INVALID;
+  if (is_sys_tenant(tenant_id_)) {
+    mode = OB_ORIGIN_AND_INSENSITIVE;
+  } else if (OB_FAIL(get_tenant_name_case_mode(ccl_schema.get_tenant_id(), mode))) {
+    LOG_WARN("fail to get_tenant_name_case_mode", K(ret), "tenant_id", ccl_schema.get_tenant_id());
+  } else if (OB_NAME_CASE_INVALID == mode) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid case mode", K(ret), K(mode));
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ccl_rule_mgr_.add_ccl_rule(ccl_schema, mode))) {
+    LOG_WARN("failed to add catalog", K(ret));
+  }
+  return ret;
+}
+
+int ObSchemaMgr::del_ccl_rule(const ObTenantCCLRuleId &id)
+{
+  int ret = OB_SUCCESS;
+  OZ(ccl_rule_mgr_.del_ccl_rule(id));
+  return ret;
+}
+
+int ObSchemaMgr::add_sensitive_rules(const common::ObIArray<ObSensitiveRuleSchema> &sensitive_rule_schemas)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < sensitive_rule_schemas.count(); ++i) {
+    if (OB_FAIL(add_sensitive_rule(sensitive_rule_schemas.at(i)))) {
+      LOG_WARN("push schema failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObSchemaMgr::add_sensitive_rule(const ObSensitiveRuleSchema &sensitive_rule_schema)
+{
+  int ret = OB_SUCCESS;
+  ObNameCaseMode mode = OB_NAME_CASE_INVALID;
+  if (is_sys_tenant(tenant_id_)) {
+    mode = OB_ORIGIN_AND_INSENSITIVE;
+  } else if (OB_FAIL(get_tenant_name_case_mode(sensitive_rule_schema.get_tenant_id(), mode))) {
+    LOG_WARN("fail to get_tenant_name_case_mode", K(ret), "tenant_id", sensitive_rule_schema.get_tenant_id());
+  } else if (OB_NAME_CASE_INVALID == mode) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid case mode", K(ret), K(mode));
+  }
+  if (OB_SUCC(ret) && OB_FAIL(sensitive_rule_mgr_.add_sensitive_rule(sensitive_rule_schema, mode))) {
+    LOG_WARN("failed to add sensitive rule", K(ret));
+  }
+  return ret;
+}
+
+int ObSchemaMgr::del_sensitive_rule(const ObTenantSensitiveRuleId &id)
+{
+  int ret = OB_SUCCESS;
+  OZ(sensitive_rule_mgr_.del_sensitive_rule(id));
+  return ret;
+}
+
 int ObSchemaMgr::add_tablegroups(const ObIArray<ObSimpleTablegroupSchema> &tablegroup_schemas)
 {
   int ret = OB_SUCCESS;
@@ -2443,6 +2619,7 @@ int ObSchemaMgr::reserved_mem_for_tables_(
   int64_t other_table_cnt = 0;
   int64_t fk_cnt = 0;
   int64_t cst_cnt = 0;
+  int64_t vec_index_cnt = 0;
   const int64_t OBJECT_SIZE = sizeof(void*);
   if (!check_inner_stat()) {
     ret = OB_NOT_INIT;
@@ -2459,7 +2636,11 @@ int ObSchemaMgr::reserved_mem_for_tables_(
         LOG_WARN("table is null", KR(ret), K(i));
       } else {
         if (table->is_index_table()) {
-          index_cnt++;
+          if (table->is_vec_index()) {
+            vec_index_cnt++;
+          } else {
+            index_cnt++;
+          }
         } else if (table->is_aux_vp_table()) {
           vp_cnt++;
         } else if (table->is_aux_lob_meta_table()) {
@@ -2533,12 +2714,18 @@ int ObSchemaMgr::reserved_mem_for_tables_(
       //(void) constraint_name_map_.set_sub_map_mem_size(cst_cnt * OBJECT_SIZE);
     }
 
+    if (OB_SUCC(ret) && vec_index_cnt > 0) {
+      if (OB_FAIL(vec_index_infos_.reserve(vec_index_cnt))) {
+        LOG_WARN("fail to reserved array", KR(ret), K(vec_index_cnt));
+      }
+    }
+
   }
   FLOG_INFO("reserve mem", KR(ret),
             K(table_cnt), K(index_cnt), K(vp_cnt),
             K(lob_meta_cnt), K(lob_piece_cnt),
             K(hidden_table_cnt), K(mlog_cnt),
-            K(other_table_cnt), K(fk_cnt), K(cst_cnt),
+            K(other_table_cnt), K(fk_cnt), K(cst_cnt), K(vec_index_cnt),
             "cost", ObTimeUtility::current_time() - start_time);
   return ret;
 }
@@ -2633,11 +2820,19 @@ int ObSchemaMgr::add_table(
     LOG_WARN("failed to add table schema", K(ret));
   } else if (new_table_schema->is_index_table()) {
     ObSimpleTableSchemaV2 *replaced_index_table = NULL;
-    if (OB_FAIL(index_infos_.replace(new_table_schema,
-                                     iter,
-                                     compare_aux_table,
-                                     equal_table,
-                                     replaced_index_table))) {
+    if (new_table_schema->is_vec_index()) {
+      if (OB_FAIL(vec_index_infos_.replace(new_table_schema,
+                                           iter,
+                                           compare_aux_table,
+                                           equal_table,
+                                           replaced_index_table))) {
+        LOG_WARN("failed to add vec index schema", K(ret));
+      }
+    } else if (OB_FAIL(index_infos_.replace(new_table_schema,
+                                            iter,
+                                            compare_aux_table,
+                                            equal_table,
+                                            replaced_index_table))) {
       LOG_WARN("failed to add index schema", K(ret));
     }
   } else if (new_table_schema->is_aux_vp_table()) {
@@ -2812,7 +3007,7 @@ int ObSchemaMgr::add_table(
           }
         }
       }
-      if (OB_SUCC(ret) && (new_table_schema->is_table() || new_table_schema->is_oracle_tmp_table())) {
+      if (OB_SUCC(ret) && (new_table_schema->is_table() || new_table_schema->is_oracle_tmp_table() || new_table_schema->is_oracle_tmp_table_v2())) {
         // In mysql mode, check constraints in non-temporary tables don't share namespace with constraints in temporary tables
         if (NULL != replaced_table) {
           if (!replaced_table->is_user_hidden_table()
@@ -2863,9 +3058,9 @@ int ObSchemaMgr::add_foreign_keys_in_table(
       int hash_ret = foreign_key_name_map_.set_refactored(foreign_key_name_wrapper,
                                                           const_cast<ObSimpleForeignKeyInfo*> (simple_foreign_key_info),
                                                           over_write);
-      if (OB_SUCCESS != hash_ret) {
-        ret = OB_HASH_EXIST == hash_ret ? OB_SUCCESS : OB_ERR_UNEXPECTED;
-        LOG_ERROR("build fk name hashmap failed", K(ret), K(hash_ret),
+      if (OB_SUCCESS != hash_ret && OB_HASH_EXIST != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("build fk name hashmap failed", KR(ret), K(hash_ret),
                   "fk_id", simple_foreign_key_info->foreign_key_id_,
                   "fk_name", simple_foreign_key_info->foreign_key_name_);
       }
@@ -3604,7 +3799,7 @@ int ObSchemaMgr::remove_aux_table(const ObSimpleTableSchemaV2 &schema_to_del)
                                        schema_to_del.get_data_table_id());
   TableInfos *infos = nullptr;
   if (schema_to_del.is_index_table()) {
-    infos = &index_infos_;
+    infos = schema_to_del.is_vec_index() ? &vec_index_infos_ : &index_infos_;
   } else if (schema_to_del.is_aux_vp_table()) {
     infos = &aux_vp_infos_;
   } else if (schema_to_del.is_aux_lob_meta_table()) {
@@ -3696,7 +3891,7 @@ int ObSchemaMgr::get_table_schema(
 int ObSchemaMgr::get_table_schema(
   const uint64_t tenant_id,
   const uint64_t database_id,
-  // ObSchemaGetterGuard session_id, default value=0, initialized in ObSql::generate_stmt, if=OB_INVALID_ID is internal session
+  // ObSchemaGetterGuard session_id, default value=0, initialized in ObSql::generate_stmt
   const uint64_t session_id,
   const ObString &table_name,
   const ObSimpleTableSchemaV2 *&table_schema) const
@@ -3738,7 +3933,7 @@ int ObSchemaMgr::get_table_schema(
         } else {
           table_schema = tmp_schema;
         }
-      } else if (OB_HASH_NOT_EXIST == hash_ret && 0 != session_id && OB_INVALID_ID != session_id) {
+      } else if (OB_HASH_NOT_EXIST == hash_ret && 0 != session_id) {
         // If session_id != 0, the search just now is based on the possible match of the temporary table.
         // If it is not found, then it will be searched according to session_id = 0, which is the normal table.
         const ObTableSchemaHashWrapper table_name_wrapper1(tenant_id, database_id, 0, mode, table_name);
@@ -3785,6 +3980,7 @@ int ObSchemaMgr::get_table_schema(
 int ObSchemaMgr::get_hidden_table_schema(
     const uint64_t tenant_id,
     const uint64_t database_id,
+    const uint64_t session_id,
     const ObString &table_name,
     const ObSimpleTableSchemaV2 *&table_schema) const
 {
@@ -3813,7 +4009,7 @@ int ObSchemaMgr::get_hidden_table_schema(
       LOG_WARN("invalid case mode", K(ret), K(mode));
     }
     if (OB_SUCC(ret)) {
-      const ObTableSchemaHashWrapper table_name_wrapper(tenant_id, database_id, 0, mode, table_name);
+      const ObTableSchemaHashWrapper table_name_wrapper(tenant_id, database_id, session_id, mode, table_name);
       int hash_ret = hidden_table_name_map_.get_refactored(table_name_wrapper, tmp_schema);
       if (OB_SUCCESS == hash_ret) {
         if (OB_ISNULL(tmp_schema)) {
@@ -3821,6 +4017,22 @@ int ObSchemaMgr::get_hidden_table_schema(
           LOG_WARN("NULL ptr", K(ret), K(tmp_schema));
         } else {
           table_schema = tmp_schema;
+        }
+      } else if (OB_HASH_NOT_EXIST == hash_ret && 0 != session_id) {
+        // If session_id != 0, the search just now is based on the possible match of the temporary table.
+        // If it is not found, then it will be searched according to session_id = 0, which is the normal table.
+        // ex. ctas table with index do direct load will create hidden table with a valid session id and hidden index with session id 0
+        //     in this case, it needs the second search to get the index table
+        // since the hidden table name is specially encoded, it doesn't have the same name problem
+        const ObTableSchemaHashWrapper table_name_wrapper1(tenant_id, database_id, 0, mode, table_name);
+        hash_ret = hidden_table_name_map_.get_refactored(table_name_wrapper1, tmp_schema);
+        if (OB_SUCCESS == hash_ret) {
+          if (OB_ISNULL(tmp_schema)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("NULL ptr", KR(ret), K(table_name_wrapper1));
+          } else {
+            table_schema = tmp_schema;
+          }
         }
       }
     }
@@ -3995,7 +4207,7 @@ int ObSchemaMgr::get_table_schema(const uint64_t tenant_id,
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(with_hidden_flag)) {
-    ret = get_hidden_table_schema(tenant_id, database_id, table_name, table_schema);
+    ret = get_hidden_table_schema(tenant_id, database_id, session_id, table_name, table_schema);
   } else {
     if (!is_index) {
       ret = get_table_schema(tenant_id, database_id, session_id, table_name, table_schema);
@@ -4308,6 +4520,38 @@ int ObSchemaMgr::get_table_schemas_in_tenant(
   return ret;
 }
 
+int ObSchemaMgr::get_vector_index_schemas_in_tenant(
+    const uint64_t tenant_id,
+    ObIArray<const ObSimpleTableSchemaV2*> &schema_array) const
+{
+  int ret = OB_SUCCESS;
+  schema_array.reset();
+  if (!check_inner_stat()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not init", K(ret));
+  } else if (OB_INVALID_ID == tenant_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(tenant_id));
+  } else {
+    const ObSimpleTableSchemaV2 *schema = NULL;
+    ObTenantTableId tenant_index_schema_id_lower(tenant_id, OB_MIN_ID);
+    ConstTableIterator iter = vec_index_infos_.lower_bound(tenant_index_schema_id_lower,
+        compare_with_tenant_table_id);
+    bool is_stop = false;
+    for (; OB_SUCC(ret) && iter != vec_index_infos_.end() && !is_stop; iter++) {
+      if (OB_ISNULL(schema = *iter)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("NULL ptr",  K(ret), KP(schema));
+      } else if (tenant_id != schema->get_tenant_id()) {
+        is_stop = true;
+      } else if (OB_FAIL(schema_array.push_back(schema))) {
+        LOG_WARN("failed to push back SCHEMA schema", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObSchemaMgr::check_database_exists_in_tablegroup(
     const uint64_t tenant_id,
     const uint64_t tablegroup_id,
@@ -4351,6 +4595,29 @@ int ObSchemaMgr::check_database_exists_in_tablegroup(
   return ret;
 }
 
+int ObSchemaMgr::collect_aux_schemas_by_data_table_id(const TableInfos &infos,
+                                                      const ObTenantTableId &tenant_data_table_id,
+                                                      common::ObIArray<const ObSimpleTableSchemaV2 *> &aux_schemas) const
+{
+  // TODO: make aux_vp_infos_ added for mv
+  int ret = OB_SUCCESS;
+  aux_schemas.reset();
+  ConstTableIterator iter = infos.lower_bound(tenant_data_table_id, compare_with_tenant_data_table_id);
+  const ObSimpleTableSchemaV2 *aux_schema = NULL;
+  bool is_stop = false;
+  for (; OB_SUCC(ret) && iter != infos.end() && !is_stop; ++iter) {
+    if (OB_ISNULL(aux_schema = *iter)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("NULL ptr", K(aux_schema), K(ret));
+    } else if (!(aux_schema->get_tenant_data_table_id() == tenant_data_table_id)) {
+      is_stop = true;
+    } else if (OB_FAIL(aux_schemas.push_back(aux_schema))) {
+      LOG_WARN("push back aux schema failed", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObSchemaMgr::get_aux_schemas(
     const uint64_t tenant_id,
     const uint64_t data_table_id,
@@ -4373,8 +4640,23 @@ int ObSchemaMgr::get_aux_schemas(
     LOG_WARN("tenant_id not matched", K(ret), K(tenant_id), K(tenant_id_), K(data_table_id));
   } else {
     const TableInfos *infos = nullptr;
+    ObTenantTableId tenant_data_table_id(tenant_id, data_table_id);
     if (table_type == USER_INDEX) {
-      infos = &index_infos_;
+      ObSEArray<const ObSimpleTableSchemaV2 *, 8> vec_aux_schemas;
+      if (OB_FAIL(collect_aux_schemas_by_data_table_id(index_infos_, tenant_data_table_id, aux_schemas))) {
+        LOG_WARN("collect index schemas failed", K(ret));
+      } else if (OB_FAIL(collect_aux_schemas_by_data_table_id(vec_index_infos_, tenant_data_table_id, vec_aux_schemas))) {
+        LOG_WARN("collect vec index schemas failed", K(ret));
+      } else if (!vec_aux_schemas.empty()) {
+        FOREACH_CNT_X(vec_aux_schema, vec_aux_schemas, OB_SUCC(ret)) {
+          if (OB_FAIL(aux_schemas.push_back(*vec_aux_schema))) {
+            LOG_WARN("push back aux schema failed", K(ret));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          lib::ob_sort(aux_schemas.get_data(), aux_schemas.get_data() + aux_schemas.count(), compare_table);
+        }
+      }
     } else if (table_type == AUX_VERTIAL_PARTITION_TABLE) {
       infos = &aux_vp_infos_;
     } else if (table_type == AUX_LOB_META) {
@@ -4387,21 +4669,9 @@ int ObSchemaMgr::get_aux_schemas(
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("Invalid table type.", K(ret), K(table_type));
     }
-    if (OB_SUCC(ret)) {
-      // TODO: make aux_vp_infos_ added for mv
-      ObTenantTableId tenant_data_table_id(tenant_id, data_table_id);
-      TableIterator iter = infos->lower_bound(tenant_data_table_id, compare_with_tenant_data_table_id);
-      const ObSimpleTableSchemaV2 *aux_schema = NULL;
-      bool will_break = false;
-      for (; iter != (infos->end()) && OB_SUCC(ret) && !will_break; ++iter) {
-        if (OB_ISNULL(aux_schema = *iter)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("NULL ptr", K(aux_schema), K(ret));
-        } else if (!(aux_schema->get_tenant_data_table_id() == tenant_data_table_id)) {
-          will_break = true;
-        } else if (OB_FAIL(aux_schemas.push_back(aux_schema))) {
-          LOG_WARN("push back aux_vp schema failed", K(ret));
-        }
+    if (OB_SUCC(ret) && table_type != USER_INDEX) {
+      if (OB_FAIL(collect_aux_schemas_by_data_table_id(*infos, tenant_data_table_id, aux_schemas))) {
+        LOG_WARN("collect aux schemas failed", K(ret));
       }
     }
   }
@@ -4531,6 +4801,8 @@ int ObSchemaMgr::del_schemas_in_tenant(const uint64_t tenant_id)
         LOG_WARN("del dblink in tenant failed", K(ret), K(tenant_id));
       } else if (OB_FAIL(directory_mgr_.del_directory_schemas_in_tenant(tenant_id))) {
         LOG_WARN("del directory in tenant failed", K(ret), K(tenant_id));
+      } else if (OB_FAIL(location_mgr_.del_location_schemas_in_tenant(tenant_id))) {
+        LOG_WARN("del location in tenant failed", K(ret), K(tenant_id));
       } else if (OB_FAIL(context_mgr_.del_schemas_in_tenant(tenant_id))) {
         LOG_WARN("del context in tenant failed", K(ret), K(tenant_id));
       } else if (OB_FAIL(mock_fk_parent_table_mgr_.del_schemas_in_tenant(tenant_id))) {
@@ -4543,6 +4815,14 @@ int ObSchemaMgr::del_schemas_in_tenant(const uint64_t tenant_id)
         LOG_WARN("del rls_context in tenant failed", K(ret), K(tenant_id));
       } else if (OB_FAIL(catalog_mgr_.del_schemas_in_tenant(tenant_id))) {
         LOG_WARN("del catalog in tenant failed", K(ret), K(tenant_id));
+      } else if (OB_FAIL(external_resource_mgr_.del_schemas_in_tenant(tenant_id))) {
+        LOG_WARN("del external_resource in tenant failed", K(ret), K(tenant_id));
+      } else if (OB_FAIL(ai_model_mgr_.del_schemas_in_tenant(tenant_id))) {
+        LOG_WARN("del ai_model in tenant failed", K(ret), K(tenant_id));
+      } else if (OB_FAIL(ccl_rule_mgr_.del_schemas_in_tenant(tenant_id))) {
+        LOG_WARN("del ccl_rule in tenant failed", K(ret), K(tenant_id));
+      } else if (OB_FAIL(sensitive_rule_mgr_.del_schemas_in_tenant(tenant_id))) {
+        LOG_WARN("del sensitive_rule in tenant failed", K(ret), K(tenant_id));
       }
     }
   }
@@ -4559,7 +4839,8 @@ int ObSchemaMgr::get_schema_count(int64_t &schema_count) const
   } else {
     int64_t tenant_schema_count = tenant_infos_.size();
     schema_count = tenant_schema_count + user_infos_.size() + database_infos_.size()
-                   + tablegroup_infos_.size() + table_infos_.size() + index_infos_.size()
+                   + tablegroup_infos_.size() + table_infos_.size()
+                   + index_infos_.size() + vec_index_infos_.size()
                    + aux_vp_infos_.size() + lob_meta_infos_.size() + lob_piece_infos_.size()
                    + mlog_infos_.size();
     int64_t outline_schema_count = 0;
@@ -4582,12 +4863,17 @@ int ObSchemaMgr::get_schema_count(int64_t &schema_count) const
     int64_t audit_schema_count = 0;
     int64_t dblink_schema_count = 0;
     int64_t directory_schema_count = 0;
+    int64_t location_schema_count = 0;
     int64_t context_schema_count = 0;
     int64_t mock_fk_parent_table_schema_count = 0;
     int64_t rls_policy_schema_count = 0;
     int64_t rls_group_schema_count = 0;
     int64_t rls_context_schema_count = 0;
     int64_t catalog_schema_count = 0;
+    int64_t external_resource_schema_count = 0;
+    int64_t ai_model_schema_count = 0;
+    int64_t ccl_rule_schema_count = 0;
+    int64_t sensitive_rule_schema_count = 0;
     if (OB_FAIL(outline_mgr_.get_outline_schema_count(outline_schema_count))) {
       LOG_WARN("get_outline_schema_count failed", K(ret));
     } else if (OB_FAIL(routine_mgr_.get_routine_schema_count(routine_schema_count))) {
@@ -4628,6 +4914,8 @@ int ObSchemaMgr::get_schema_count(int64_t &schema_count) const
       LOG_WARN("get dblink schema count failed", K(ret));
     } else if (OB_FAIL(directory_mgr_.get_directory_schema_count(directory_schema_count))) {
       LOG_WARN("get directory schema count failed", K(ret));
+    } else if (OB_FAIL(location_mgr_.get_location_schema_count(location_schema_count))) {
+      LOG_WARN("get location schema count failed", K(ret));
     } else if (OB_FAIL(context_mgr_.get_context_schema_count(context_schema_count))) {
       LOG_WARN("get context schema count failed", K(ret));
     } else if (OB_FAIL(mock_fk_parent_table_mgr_.get_mock_fk_parent_table_schema_count(mock_fk_parent_table_schema_count))) {
@@ -4640,6 +4928,14 @@ int ObSchemaMgr::get_schema_count(int64_t &schema_count) const
       LOG_WARN("get rls_context schema count failed", K(ret));
     } else if (OB_FAIL(catalog_mgr_.get_schema_count(catalog_schema_count))) {
       LOG_WARN("get catalog schema count failed", K(ret));
+    } else if (OB_FAIL(external_resource_mgr_.get_external_resource_schema_count(external_resource_schema_count))) {
+      LOG_WARN("get external_resource schema count failed", K(ret));
+    } else if (OB_FAIL(ai_model_mgr_.get_ai_model_schema_count(ai_model_schema_count))) {
+      LOG_WARN("get ai_model schema count failed", K(ret));
+    } else if (OB_FAIL(ccl_rule_mgr_.get_schema_count(ccl_rule_schema_count))) {
+      LOG_WARN("get ccl_rule schema count failed", K(ret));
+    } else if (OB_FAIL(sensitive_rule_mgr_.get_schema_count(sensitive_rule_schema_count))) {
+      LOG_WARN("get sensitive_rule schema count failed", K(ret));
     } else {
       schema_count += (outline_schema_count + routine_schema_count + priv_schema_count
                        + synonym_schema_count + package_schema_count
@@ -4653,13 +4949,18 @@ int ObSchemaMgr::get_schema_count(int64_t &schema_count) const
                        + audit_schema_count
                        + dblink_schema_count
                        + directory_schema_count
+                       + location_schema_count
                        + rls_policy_schema_count
                        + rls_group_schema_count
                        + rls_context_schema_count
                        + catalog_schema_count
+                       + ccl_rule_schema_count
+                       + sensitive_rule_schema_count
                        + sys_variable_schema_count
                        + context_schema_count
                        + mock_fk_parent_table_schema_count
+                       + external_resource_schema_count
+                       + ai_model_schema_count
                       );
     }
   }
@@ -5426,6 +5727,8 @@ int ObSchemaMgr::get_schema_statistics(common::ObIArray<ObSchemaStatisticsInfo> 
     LOG_WARN("fail to push back schema statistics", K(ret), K(schema_info));
   } else if (OB_FAIL(directory_mgr_.get_schema_statistics(schema_info))) {
     LOG_WARN("fail to get directory statistics", K(ret));
+  } else if (OB_FAIL(location_mgr_.get_schema_statistics(schema_info))) {
+    LOG_WARN("fail to get location statistics", K(ret));
   } else if (OB_FAIL(rls_policy_mgr_.get_schema_statistics(schema_info))) {
     LOG_WARN("fail to get rls_policy statistics", K(ret));
   } else if (OB_FAIL(rls_group_mgr_.get_schema_statistics(schema_info))) {
@@ -5444,6 +5747,26 @@ int ObSchemaMgr::get_schema_statistics(common::ObIArray<ObSchemaStatisticsInfo> 
     LOG_WARN("fail to get mock_fk_parent_table statistics", K(ret));
   } else if (OB_FAIL(schema_infos.push_back(schema_info))) {
     LOG_WARN("fail to push back schema statistics", K(ret), K(schema_info));
+  } else if (OB_FAIL(ccl_rule_mgr_.get_schema_statistics(schema_info))) {
+    LOG_WARN("fail to get ccl_rule statistics", K(ret));
+  } else if (OB_FAIL(schema_infos.push_back(schema_info))) {
+    LOG_WARN("fail to push back schema statistics", K(ret), K(schema_info));
+  } else if (OB_FAIL(sensitive_rule_mgr_.get_schema_statistics(schema_info))) {
+    LOG_WARN("fail to get sensitive_rule statistics", K(ret));
+  } else if (OB_FAIL(schema_infos.push_back(schema_info))) {
+    LOG_WARN("fail to push back schema statistics", K(ret), K(schema_info));
+  } else if (OB_FAIL(sensitive_rule_mgr_.get_schema_statistics(schema_info))) {
+    LOG_WARN("fail to get sensitive_rule statistics", K(ret));
+  } else if (OB_FAIL(schema_infos.push_back(schema_info))) {
+    LOG_WARN("fail to push back schema statistics", K(ret), K(schema_info));
+  } else if (OB_FAIL(external_resource_mgr_.get_schema_statistics(schema_info))) {
+    LOG_WARN("failed to get external_resource statistics", K(ret));
+  } else if (OB_FAIL(schema_infos.push_back(schema_info))) {
+    LOG_WARN("failed to push back schema statistics", K(ret), K(schema_info));
+  } else if (OB_FAIL(ai_model_mgr_.get_schema_statistics(schema_info))) {
+    LOG_WARN("failed to get ai_model statistics", K(ret));
+  } else if (OB_FAIL(schema_infos.push_back(schema_info))) {
+    LOG_WARN("failed to push back schema statistics", K(ret), K(schema_info));
   }
   return ret;
 }
@@ -5690,7 +6013,8 @@ int ObSchemaMgr::get_table_statistics(ObSchemaStatisticsInfo &schema_info) const
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
   } else {
-    schema_info.count_ = table_infos_.size() + index_infos_.size() + aux_vp_infos_.size() + lob_meta_infos_.size() + lob_piece_infos_.size() + mlog_infos_.size();
+    schema_info.count_ = table_infos_.size() + index_infos_.size() + vec_index_infos_.size()
+        + aux_vp_infos_.size() + lob_meta_infos_.size() + lob_piece_infos_.size() + mlog_infos_.size();
     for (ConstTableIterator it = table_infos_.begin(); OB_SUCC(ret) && it != table_infos_.end(); it++) {
       if (OB_ISNULL(*it)) {
         ret = OB_ERR_UNEXPECTED;
@@ -5700,6 +6024,14 @@ int ObSchemaMgr::get_table_statistics(ObSchemaStatisticsInfo &schema_info) const
       }
     }
     for (ConstTableIterator it = index_infos_.begin(); OB_SUCC(ret) && it != index_infos_.end(); it++) {
+      if (OB_ISNULL(*it)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("schema is null", K(ret));
+      } else {
+        schema_info.size_ += (*it)->get_convert_size();
+      }
+    }
+    for (ConstTableIterator it = vec_index_infos_.begin(); OB_SUCC(ret) && it != vec_index_infos_.end(); it++) {
       if (OB_ISNULL(*it)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("schema is null", K(ret));
@@ -5740,6 +6072,115 @@ int ObSchemaMgr::get_table_statistics(ObSchemaStatisticsInfo &schema_info) const
       }
     }
   }
+  return ret;
+}
+
+int ObSchemaMgr::get_external_resource_schema(
+  const uint64_t &tenant_id,
+  const uint64_t &external_resource_id,
+  const ObSimpleExternalResourceSchema *&external_resource_schema) const
+{
+  int ret = OB_SUCCESS;
+
+  if (tenant_id_ != tenant_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("tenant_id not matched", K(ret), K(tenant_id), K_(tenant_id));
+  } else {
+    ret = external_resource_mgr_.get_external_resource_schema(external_resource_id, external_resource_schema);
+  }
+
+  return ret;
+}
+
+int ObSchemaMgr::get_external_resource_schema(
+  const uint64_t &tenant_id,
+  const uint64_t &database_id,
+  const ObString &external_resource_name,
+  const ObSimpleExternalResourceSchema *&external_resource_schema) const
+{
+  int ret = OB_SUCCESS;
+
+  if (tenant_id_ != tenant_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("tenant_id not matched", K(ret), K(tenant_id), K_(tenant_id));
+  } else {
+    ret = external_resource_mgr_.get_external_resource_schema(tenant_id, database_id, external_resource_name, external_resource_schema);
+  }
+
+  return ret;
+}
+
+int ObSchemaMgr::get_ai_model_schema(
+  const uint64_t &tenant_id,
+  const uint64_t &ai_model_id,
+  const ObAiModelSchema *&ai_model_schema) const
+{
+  int ret = OB_SUCCESS;
+
+  if (tenant_id_ != tenant_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("tenant_id not matched", K(ret), K(tenant_id), K_(tenant_id));
+  } else {
+    ret = ai_model_mgr_.get_ai_model_schema(ai_model_id, ai_model_schema);
+  }
+
+  return ret;
+}
+
+int ObSchemaMgr::add_ai_models(const common::ObIArray<ObAiModelSchema> &ai_model_schemas)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; i < ai_model_schemas.count() && OB_SUCC(ret); ++i) {
+    if (OB_FAIL(add_ai_model(ai_model_schemas.at(i)))) {
+      LOG_WARN("push schema failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObSchemaMgr::add_ai_model(const ObAiModelSchema &ai_model_schema)
+{
+  int ret = OB_SUCCESS;
+  ObNameCaseMode mode = OB_NAME_CASE_INVALID;
+  if (is_sys_tenant(tenant_id_)) {
+    mode = OB_ORIGIN_AND_INSENSITIVE;
+  } else if (OB_FAIL(get_tenant_name_case_mode(ai_model_schema.get_tenant_id(), mode))) {
+    LOG_WARN("fail to get_tenant_name_case_mode", K(ret), "tenant_id", ai_model_schema.get_tenant_id());
+  } else if (OB_NAME_CASE_INVALID == mode) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid case mode", K(ret), K(mode));
+  }
+
+  if (OB_SUCC(ret) && OB_FAIL(ai_model_mgr_.add_ai_model(ai_model_schema, mode))) {
+    LOG_WARN("fail to add ai model", K(ret));
+  }
+  return ret;
+}
+
+int ObSchemaMgr::del_ai_model(const ObTenantAiModelId &tenant_ai_model_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ai_model_mgr_.del_ai_model(tenant_ai_model_id))) {
+    LOG_WARN("fail to del ai model", K(ret));
+  }
+  return ret;
+}
+
+int ObSchemaMgr::get_ai_model_schema(
+  const uint64_t &tenant_id,
+  const ObString &ai_model_name,
+  const common::ObNameCaseMode &case_mode,
+  const ObAiModelSchema *&ai_model_schema) const
+{
+  int ret = OB_SUCCESS;
+
+  if (tenant_id_ != tenant_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("tenant_id not matched", K(ret), K(tenant_id), K_(tenant_id));
+  } else {
+    ret = ai_model_mgr_.get_ai_model_schema(tenant_id, ai_model_name, case_mode, ai_model_schema);
+  }
+
   return ret;
 }
 

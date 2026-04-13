@@ -139,6 +139,10 @@ int ObTransformerImpl::set_transformation_parameters(ObQueryCtx *query_ctx)
     ctx_->cbqt_policy_ = TransPolicy::ENABLE_TRANS;
   } else if (OB_FAIL(session_info->get_optimizer_cost_based_transformation(opt_param_val))) {
     LOG_WARN("failed to get optimizer cost based transformation", K(ret));
+  } else if (session_info->get_ddl_info().is_refreshing_mview()
+             && !session_info->get_ddl_info().is_mview_complete_refresh()
+             && OB_FALSE_IT(opt_param_val = TransPolicy::DISABLE_TRANS)) {
+    // disable the cost-based transform for mview fast refresh by covering the session variable
   } else if (OB_FAIL(query_ctx->get_global_hint().opt_params_.get_integer_opt_param(
                             ObOptParamHint::OPTIMIZER_COST_BASED_TRANSFORMATION, opt_param_val))) {
     LOG_WARN("failed to get integer opt param", K(ret));
@@ -150,6 +154,12 @@ int ObTransformerImpl::set_transformation_parameters(ObQueryCtx *query_ctx)
     omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
     if (tenant_config.is_valid()) {
       ctx_->complex_cbqt_table_num_ = tenant_config->_complex_cbqt_table_num;
+      ctx_->force_subquery_unnest_ = tenant_config->_force_subquery_unnest;
+      ctx_->nested_loop_join_enabled_ = tenant_config->_nested_loop_join_enabled;
+      if (OB_FAIL(query_ctx->get_global_hint().opt_params_.get_bool_opt_param(ObOptParamHint::NESTED_LOOP_JOIN_ENABLED,
+                                                                              ctx_->nested_loop_join_enabled_))) {
+        LOG_WARN("fail to get bool opt param", K(ret));
+      }
     }
   }
   return ret;
@@ -463,6 +473,10 @@ int ObTransformerImpl::transform_rule_set(ObDMLStmt *&stmt,
   if (0 != (needed_types & needed_transform_types_)) {
     bool need_next_iteration = true;
     int64_t i = 0;
+    ObSEArray<int32_t, 64> cur_enable_types_array;
+    if (OB_FAIL(init_enable_types_cnt_array(needed_types, cur_enable_types_array))) {
+      LOG_WARN("failed to init enable types cnt array", K(ret));
+    }
     for (i = 0; OB_SUCC(ret) && need_next_iteration && i < iteration_count; ++i) {
       bool trans_happened_in_iteration = false;
       ctx_->iteration_level_ = i;
@@ -470,6 +484,7 @@ int ObTransformerImpl::transform_rule_set(ObDMLStmt *&stmt,
       OPT_TRACE("-- begin ", i, " iteration");
       if (OB_FAIL(transform_rule_set_in_one_iteration(stmt,
                                                       needed_types,
+                                                      cur_enable_types_array,
                                                       trans_happened_in_iteration))) {
         LOG_WARN("failed to do transformation one iteration", K(i), K(ret));
       } else if (!trans_happened_in_iteration) {
@@ -491,6 +506,7 @@ int ObTransformerImpl::transform_rule_set(ObDMLStmt *&stmt,
       ret = OB_E(EventTable::EN_CHECK_REWRITE_ITER_CONVERGE) OB_SUCCESS;
       if (OB_FAIL(ret)) {
         LOG_WARN("transformer ends without convergence", K(ret), K(max_iteration_count_), K(ctx_->outline_trans_hints_));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "transformer ends without convergence");
       } else {
         LOG_INFO("transformer ends without convergence", K(max_iteration_count_));
       }
@@ -499,16 +515,99 @@ int ObTransformerImpl::transform_rule_set(ObDMLStmt *&stmt,
   return ret;
 }
 
+int ObTransformerImpl::init_enable_types_cnt_array(uint64_t needed_types,
+                                                   ObIArray<int32_t> &enable_cnt_array)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(enable_cnt_array.prepare_allocate(TRANSFORM_TYPE_COUNT_PLUS_ONE))) {
+    LOG_WARN("failed to prepare allocate enable types array", K(ret));
+  } else {
+    for (int64_t idx = 0; OB_SUCC(ret) && idx < enable_cnt_array.count(); ++idx) {
+      int32_t init_cnt = 0;
+      if (0 != (needed_types & (1L << idx))) {
+        // For most rules, enable count starts from 1 (enabled).
+        // For PREDICATE_MOVE_AROUND, we start from 2 so it can happen at most twice
+        // before being temporarily disabled (see update_enable_types()).
+        init_cnt = (PREDICATE_MOVE_AROUND == idx)
+                       ? PREDICATE_MOVE_AROUND_RESET_CNT
+                       : DEFAULT_ENABLE_TYPE_CNT;
+      }
+      enable_cnt_array.at(idx) = init_cnt;
+    }
+  }
+  return ret;
+}
+
+void ObTransformerImpl::enable_cnt_array_to_bitset(const ObIArray<int32_t> &arr, uint64_t &bitset)
+{
+  bitset = 0;
+  const int64_t cnt = arr.count();
+  for (int64_t idx = 0; idx < cnt; ++idx) {
+    if (arr.at(idx) > 0) {
+      bitset |= (1L << idx);
+    }
+  }
+}
+
+int ObTransformerImpl::update_enable_types(TRANSFORM_TYPE type,
+                                           uint64_t &enable_types,
+                                           ObIArray<int32_t> &enable_cnt_array)
+{
+  int ret = OB_SUCCESS;
+  int32_t cnt = 0;
+  if (OB_UNLIKELY(type >= enable_cnt_array.count())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(type), K(TRANSFORM_TYPE_COUNT_PLUS_ONE));
+  } else {
+    int32_t &cnt = enable_cnt_array.at(type);
+    if (PREDICATE_MOVE_AROUND == type) {
+      // Non-convergence guard:
+      // Predicate deduction (a.k.a. predicate move around) may oscillate with
+      // constant propagation and expression simplification. To avoid rewrite
+      // ping-pong within one iteration sequence, we only allow it to happen a
+      // limited number of times (PREDICATE_MOVE_AROUND_RESET_CNT). After that,
+      // we temporarily disable it until it is reset by other rewrite rules.
+      cnt--;
+      if (cnt <= 0) {
+        enable_types &= ~(1L << type);
+      }
+    } else if (CONST_PROPAGATE == type || SIMPLIFY_EXPR == type) {
+      // These rules are considered part of the "oscillation group" with predicate
+      // deduction. If only these rules happen, we do NOT reset predicate deduction.
+      /*do nothing*/
+    } else {
+      // Any other rewrite rule indicates progress in a different direction, so we
+      // re-enable predicate deduction and reset its budget.
+      ObTransformRule::add_trans_type(enable_types, PREDICATE_MOVE_AROUND);
+      enable_cnt_array.at(PREDICATE_MOVE_AROUND) = PREDICATE_MOVE_AROUND_RESET_CNT;
+    }
+  }
+  return ret;
+}
+
 int ObTransformerImpl::transform_rule_set_in_one_iteration(ObDMLStmt *&stmt,
                                                            uint64_t needed_types,
+                                                           ObIArray<int32_t> &cur_enable_types_array,
                                                            bool &trans_happened)
 {
   int ret = OB_SUCCESS;
   trans_happened = false;
-  if (OB_ISNULL(stmt)) {
+  if (OB_ISNULL(stmt) || OB_ISNULL(stmt->get_query_ctx())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("stmt is NULL", K(ret));
   } else {
+    uint64_t cur_enable_types = 0;
+    enable_cnt_array_to_bitset(cur_enable_types_array, cur_enable_types);
+    const ObQueryCtx *query_ctx = stmt->get_query_ctx();
+    // Version gate for the dynamic "disable list" mechanism:
+    // Enable on [4.4.2.1, 4.5.0) and [4.6.0, +inf), disable on [4.5.0, 4.6.0).
+    const bool enable_dynamic_disable_list =
+      query_ctx->check_opt_compat_version(COMPAT_VERSION_4_4_2_BP1,
+                                          COMPAT_VERSION_4_5_0,
+                                          COMPAT_VERSION_4_6_0);
+    // cur_enable_types is dynamic only when enable_dynamic_disable_list is true.
+    // When enabled, it may be updated after each rule happens to avoid rewrite
+    // ping-pong (PREDICATE_MOVE_AROUND vs CONST_PROPAGATE / SIMPLIFY_EXPR).
     /*
      * The ordering to apply the following rules is important,
      * think carefully when new rules are added
@@ -603,9 +702,29 @@ int ObTransformerImpl::choose_rewrite_rules(ObDMLStmt *stmt, uint64_t &need_type
     LOG_WARN("failed to check stmt functions", K(ret));
   } else {
     //TODO::unpivot open @xifeng
-    if (func.contain_unpivot_query_ || func.contain_geometry_values_ ||
-        func.contain_fulltext_search_ || func.contain_vec_index_approx_) {
+    if (func.contain_geometry_values_ || func.contain_vec_index_approx_ || func.contain_hybrid_search_) {
       disable_list = ObTransformRule::ALL_TRANSFORM_RULES;
+    }
+    if (func.contain_unpivot_query_) {
+      uint64_t unpivot_enable_list = 0;
+      ObTransformRule::add_trans_type(unpivot_enable_list, VIEW_MERGE);
+      ObTransformRule::add_trans_type(unpivot_enable_list, WHERE_SQ_PULL_UP);
+      ObTransformRule::add_trans_type(unpivot_enable_list, AGGR_SUBQUERY);
+      ObTransformRule::add_trans_type(unpivot_enable_list, QUERY_PUSH_DOWN);
+      disable_list |= (~unpivot_enable_list);
+    }
+    if (func.contain_fulltext_search_) {
+      ObTransformRule::add_trans_type(disable_list, WHERE_SQ_PULL_UP);
+      ObTransformRule::add_trans_type(disable_list, AGGR_SUBQUERY);
+      ObTransformRule::add_trans_type(disable_list, WIN_MAGIC);
+      ObTransformRule::add_trans_type(disable_list, OR_EXPANSION);
+      ObTransformRule::add_trans_type(disable_list, GROUPBY_PUSHDOWN);
+      ObTransformRule::add_trans_type(disable_list, GROUPBY_PULLUP);
+      ObTransformRule::add_trans_type(disable_list, SUBQUERY_COALESCE);
+      ObTransformRule::add_trans_type(disable_list, TEMP_TABLE_OPTIMIZATION);
+      ObTransformRule::add_trans_type(disable_list, CONST_PROPAGATE);
+      ObTransformRule::add_trans_type(disable_list, SELECT_EXPR_PULLUP);
+      ObTransformRule::add_trans_type(disable_list, LATE_MATERIALIZATION);
     }
     if (func.contain_enum_set_values_) {
       uint64_t enum_set_enable_list = 0;
@@ -729,6 +848,7 @@ int ObTransformerImpl::check_stmt_functions(const ObDMLStmt *stmt, StmtFunc &fun
     func.contain_unpivot_query_ = func.contain_unpivot_query_ || stmt->is_unpivot_select();
     func.contain_fulltext_search_ = func.contain_fulltext_search_ || (stmt->get_match_exprs().count() != 0);
     func.contain_vec_index_approx_ = func.contain_vec_index_approx_ || stmt->has_vec_approx();
+    func.contain_hybrid_search_ = func.contain_hybrid_search_ || stmt->is_hybrid_search();
   }
   for (int64_t i = 0; OB_SUCC(ret)
                       && (!func.contain_enum_set_values_ || !func.contain_geometry_values_)

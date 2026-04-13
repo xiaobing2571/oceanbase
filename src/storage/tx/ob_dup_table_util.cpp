@@ -310,7 +310,7 @@ int ObDupTableLSHandler::init(bool is_dup_table)
     if (is_inited()) {
       ret = OB_INIT_TWICE;
     } else {
-      SpinWLockGuard init_w_guard(init_rw_lock_);
+      TCRWLock::WLockGuard init_w_guard(init_rw_lock_);
       // init by dup_tablet_scan_task_.
 
       ObDupTableLogOperator *tmp_log_operator = static_cast<ObDupTableLogOperator *>(
@@ -451,7 +451,7 @@ int ObDupTableLSHandler::offline()
       ret = OB_SUCCESS;
     }
   } else {
-    SpinRLockGuard r_init_guard(init_rw_lock_);
+    TCRWLock::RLockGuard r_init_guard(init_rw_lock_);
     if (is_inited_) {
       if (OB_NOT_NULL(log_operator_) && log_operator_->is_busy()) {
         ret = OB_EAGAIN;
@@ -526,7 +526,7 @@ void ObDupTableLSHandler::destroy() { reset(); }
 void ObDupTableLSHandler::reset()
 {
   // ATOMIC_STORE(&is_inited_, false);
-  SpinWLockGuard w_init_guard(init_rw_lock_);
+  TCRWLock::WLockGuard w_init_guard(init_rw_lock_);
   ls_state_helper_.reset();
 
   dup_ls_ckpt_.reset();
@@ -568,7 +568,7 @@ void ObDupTableLSHandler::reset()
 
 bool ObDupTableLSHandler::is_inited()
 {
-  SpinRLockGuard r_init_guard(init_rw_lock_);
+  TCRWLock::RLockGuard r_init_guard(init_rw_lock_);
   return is_inited_;
 }
 
@@ -1259,7 +1259,7 @@ void ObDupTableLSHandler::switch_to_follower_forcedly()
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
 
-  SpinRLockGuard r_init_guard(init_rw_lock_);
+  TCRWLock::RLockGuard r_init_guard(init_rw_lock_);
 
   ObDupTableLSRoleStateContainer restore_state_container;
   if (OB_FAIL(ls_state_helper_.prepare_state_change(ObDupTableLSRoleState::LS_REVOKE_SUCC,
@@ -1285,7 +1285,7 @@ int ObDupTableLSHandler::switch_to_follower_gracefully()
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
 
-  SpinRLockGuard r_init_guard(init_rw_lock_);
+  TCRWLock::RLockGuard r_init_guard(init_rw_lock_);
 
   ObDupTableLSRoleStateContainer restore_state_container;
   if (OB_FAIL(ls_state_helper_.prepare_state_change(ObDupTableLSRoleState::LS_REVOKE_SUCC,
@@ -1328,7 +1328,7 @@ int ObDupTableLSHandler::resume_leader()
 
   const bool is_resume = true;
 
-  SpinRLockGuard r_init_guard(init_rw_lock_);
+  TCRWLock::RLockGuard r_init_guard(init_rw_lock_);
 
   ObDupTableLSRoleStateContainer restore_state_container;
   if (OB_FAIL(ls_state_helper_.prepare_state_change(ObDupTableLSRoleState::LS_TAKEOVER_SUCC,
@@ -1366,7 +1366,7 @@ int ObDupTableLSHandler::switch_to_leader()
 
   const bool is_resume = false;
 
-  SpinRLockGuard r_init_guard(init_rw_lock_);
+  TCRWLock::RLockGuard r_init_guard(init_rw_lock_);
 
   ObDupTableLSRoleStateContainer restore_state_container;
   if (OB_FAIL(ls_state_helper_.prepare_state_change(ObDupTableLSRoleState::LS_TAKEOVER_SUCC,
@@ -1574,7 +1574,7 @@ int ObDupTableLSHandler::check_and_update_max_replayed_scn(const share::SCN &max
 
 int64_t ObDupTableLSHandler::get_committing_dup_trx_cnt()
 {
-  ObSpinLockGuard guard(committing_dup_trx_lock_);
+  SpinRLockGuard guard(committing_dup_trx_lock_);
   int64_t cnt = committing_dup_trx_set_.size();
   if (cnt > 0) {
     if (REACH_TIME_INTERVAL(60 * 1000 * 1000)) {
@@ -1587,7 +1587,7 @@ int64_t ObDupTableLSHandler::get_committing_dup_trx_cnt()
 int ObDupTableLSHandler::add_commiting_dup_trx(const ObTransID &tx_id)
 {
   int ret = OB_SUCCESS;
-  ObSpinLockGuard guard(committing_dup_trx_lock_);
+  SpinWLockGuard guard(committing_dup_trx_lock_);
   if (!committing_dup_trx_set_.created()) {
     if (OB_FAIL(committing_dup_trx_set_.create(128, "DupTrxBucket", "DupTrxCnt", MTL_ID()))) {
       TRANS_LOG(WARN, "create dup trx set failed", K(ret), K(ls_id_), K(tx_id));
@@ -1605,7 +1605,7 @@ int ObDupTableLSHandler::add_commiting_dup_trx(const ObTransID &tx_id)
 int ObDupTableLSHandler::remove_commiting_dup_trx(const ObTransID &tx_id)
 {
   int ret = OB_SUCCESS;
-  ObSpinLockGuard guard(committing_dup_trx_lock_);
+  SpinWLockGuard guard(committing_dup_trx_lock_);
 
   if (OB_SUCC(ret)) {
     if (!committing_dup_trx_set_.created()) {
@@ -1850,7 +1850,7 @@ void ObDupTableLoopWorker::run1()
       time_used = ObTimeUtility::current_time() - start_time;
       if (time_used < LOOP_INTERVAL) {
         ObBKGDSessInActiveGuard inactive_guard;
-        usleep(LOOP_INTERVAL - time_used);
+        ob_usleep(LOOP_INTERVAL - time_used);
       }
     }
   }

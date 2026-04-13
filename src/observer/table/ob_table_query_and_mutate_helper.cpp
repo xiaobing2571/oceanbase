@@ -46,7 +46,7 @@ int QueryAndMutateHelper::init_tb_ctx(ObTableCtx &ctx,
     } else {
       switch (op_type) {
         case ObTableOperationType::GET: {
-          if (OB_FAIL(ctx.init_get())) {
+          if (OB_FAIL(ctx.init_get(false/* is_weak_read */))) {
             LOG_WARN("fail to init get ctx", K(ret), K(ctx));
           }
           break;
@@ -141,9 +141,10 @@ int QueryAndMutateHelper::init_scan_tb_ctx(ObTableApiCacheGuard &cache_guard)
     LOG_WARN("fail to alloc expr memory", K(ret));
   } else if (OB_FAIL(tb_ctx_.init_exec_ctx())) {
     LOG_WARN("fail to init exec ctx", K(ret), K(tb_ctx_));
+  } else if (OB_FAIL(tb_ctx_.init_expr_frame_info(expr_frame_info))) {
+    LOG_WARN("fail to init expr frame info", K(ret));
   } else {
     tb_ctx_.set_init_flag(true);
-    tb_ctx_.set_expr_info(expr_frame_info);
   }
 
   return ret;
@@ -188,6 +189,9 @@ int QueryAndMutateHelper::execute_htable_delete(const ObTableOperation &table_op
           LOG_WARN("fail to open htable delete executor", K(ret));
         } else if (OB_FAIL(delete_executor.get_next_row_by_entity())) {
           LOG_WARN("fail to call htable delete get_next_row", K(ret));
+        } else {
+          // record hbase row count
+          stat_row_count_ += delete_executor.get_affected_rows();
         }
 
         int tmp_ret = OB_SUCCESS;
@@ -493,14 +497,14 @@ int QueryAndMutateHelper::execute_htable_inc_or_append(ObTableQueryResult *resul
   int ret = OB_SUCCESS;
   const ObTableBatchOperation &mutations = query_and_mutate_.get_mutations();
   int64_t N = mutations.count();
-  ObSEArray<ObITableEntity*, 8> entities;
+  ObSEArray<const ObITableEntity*, 8> entities;
   ObSEArray<ColumnIdx, OB_DEFAULT_SE_ARRAY_COUNT> columns;
   if (OB_FAIL(sort_qualifier(columns, mutations))) {
     LOG_WARN("fail to sort qualifier", K(ret), K(mutations));
   } else if (OB_FAIL(result->get_htable_all_entity(entities))) {
     LOG_WARN("fail to get all entity", K(ret));
   }
-  ObITableEntity *old_entity = nullptr;
+  const ObITableEntity *old_entity = nullptr;
   for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); i++) {
     old_entity = nullptr;
     ObTableEntity new_entity;
@@ -589,6 +593,8 @@ int QueryAndMutateHelper::execute_htable_mutation(ObTableQueryResultIterator *re
         LOG_WARN("fail to execute hatable increment", K(ret));
       } else {
         set_result_affected_rows(1);
+        // record hbase row count
+        stat_row_count_ += 1;
       }
     } else {
       one_result = &one_result_;  // empty result is OK for APPEND and INCREMENT
@@ -623,6 +629,9 @@ int QueryAndMutateHelper::execute_htable_mutation(ObTableQueryResultIterator *re
             case ObTableOperationType::INSERT_OR_UPDATE: {  // checkAndPut
               if (OB_FAIL(execute_htable_put(op, put_tb_ctx))) {
                 LOG_WARN("fail to execute hatable insert", K(ret), K(op), K(del_tb_ctx));
+              } else {
+                // record hbase cell count
+                stat_row_count_ += 1;
               }
               break;
             }
@@ -753,6 +762,7 @@ int QueryAndMutateHelper::execute_one_mutation(ObIAllocator &allocator,
       } else if (OB_FAIL(new_entity->deep_copy_properties(allocator_, mutate_entity))) {
         LOG_WARN("fail to deep copy property", K(ret));
       } else {
+        new_entity->set_allocator(&allocator_);
         for (int64_t i = 0; OB_SUCC(ret) && i < N; i++) {
           ObObj key;
           if (OB_FAIL(query_res_entity->get_property(rk_names.at(i), key))) {
@@ -938,7 +948,7 @@ int QueryAndMutateHelper::execute_query_and_mutate()
 
     if (OB_NOT_NULL(scan_spec)) {
       scan_spec->destroy_executor(executor);
-      tb_ctx_.set_expr_info(nullptr);
+      tb_ctx_.reset_expr_frame_info();
     }
     ObTableQueryUtils::destroy_result_iterator(result_iterator);
   }

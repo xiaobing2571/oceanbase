@@ -20,6 +20,7 @@ using namespace oceanbase::share::schema;
 using namespace oceanbase::omt;
 using namespace oceanbase::share;
 
+#define META_TENANT_ID(tenant_id) (tenant_id - 1)
 ObVirtualASH::ObVirtualASH() :
     ObVirtualTableScannerIterator(),
     reverse_iterator_(),
@@ -84,7 +85,7 @@ int ObVirtualASH::inner_get_next_row(common::ObNewRow *&row)
   do {
     if (iterator_->has_next()) {
       const ObActiveSessionStatItem &node = iterator_->next();
-      if (OB_SYS_TENANT_ID == effective_tenant_id_ || node.tenant_id_ == effective_tenant_id_) {
+      if (OB_SYS_TENANT_ID == effective_tenant_id_ || node.tenant_id_ == effective_tenant_id_ || node.tenant_id_ == META_TENANT_ID(effective_tenant_id_)) {
         if (OB_FAIL(convert_node_to_row(node, row))) {
           LOG_WARN("fail convert row", K(ret));
         }
@@ -138,7 +139,7 @@ int ObVirtualASH::convert_node_to_row(const ObActiveSessionStatItem &node, ObNew
         break;
       }
       case SESSION_ID: {
-        if (node.session_type_ == 0) {
+        if (node.session_type_ == 0 && node.client_sid_ != INVALID_SESSID) {
           cells[cell_idx].set_int(node.client_sid_);
         } else {
           cells[cell_idx].set_int(node.session_id_);
@@ -414,6 +415,11 @@ int ObVirtualASH::convert_node_to_row(const ObActiveSessionStatItem &node, ObNew
         } else {
           cells[cell_idx].set_null();
         }
+        if (node.block_sessid_ != 0) {
+          cells[cell_idx].set_int(node.block_sessid_);
+        } else {
+          cells[cell_idx].set_null();
+        }
         break;
       }
       case PLAN_HASH: {
@@ -468,6 +474,14 @@ int ObVirtualASH::convert_node_to_row(const ObActiveSessionStatItem &node, ObNew
         cells[cell_idx].set_int(node.delta_write_.size_);
         break;
       }
+      case WEIGHT: {
+        cells[cell_idx].set_int(node.weight_);
+        break;
+      }
+      case IS_WR_WEIGHT_SAMPLE: {
+        cells[cell_idx].set_bool(node.is_wr_weight_sample_);
+        break;
+      }
       default: {
         ret = OB_ERR_UNEXPECTED;
         SERVER_LOG(WARN, "invalid column id", K(column_id), K(cell_idx),
@@ -488,7 +502,7 @@ int ObVirtualASHI1::inner_get_next_row(common::ObNewRow *&row)
   do {
     if (iterator_->has_next()) {
       const ObActiveSessionStatItem &node = iterator_->next();
-      if (OB_SYS_TENANT_ID == effective_tenant_id_ || node.tenant_id_ == effective_tenant_id_) {
+      if (OB_SYS_TENANT_ID == effective_tenant_id_ || node.tenant_id_ == effective_tenant_id_ || node.tenant_id_ == META_TENANT_ID(effective_tenant_id_)) {
         if (OB_FAIL(convert_node_to_row(node, row))) {
           LOG_WARN("fail convert row", K(ret));
         }
@@ -530,6 +544,10 @@ int ObVirtualASHI1::init_next_query_range()
       }
       if (cur_range.end_key_.is_max_row()) {
         right = INT64_MAX;  // maximum sample time is INT64_MAX
+      }
+      if (lib::is_oracle_mode() && cur_range.end_key_.get_obj_ptr()->is_null()) {
+        // oracle null last
+        right = INT64_MAX;  // sample time cannot be null.
       }
       if (OB_UNLIKELY(cur_range.end_key_.is_min_row() || cur_range.start_key_.is_max_row())) {
         left = INT64_MAX;

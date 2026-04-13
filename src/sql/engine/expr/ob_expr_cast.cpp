@@ -10,6 +10,7 @@
  * See the Mulan PubL v2 for more details.
  */
 
+#include "ob_expr_cast.h"
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/expr/ob_expr_cast.h"
 #include "lib/geo/ob_geometry_cast.h"
@@ -70,7 +71,6 @@ int ObExprCast::get_cast_inttc_len(ObExprResType &type1,
   }
   return ret;
 }
-
 
 // @res_len: the result length of any type be cast to string
 // for column type
@@ -434,7 +434,12 @@ int ObExprCast::calc_result_type2(ObExprResType &type,
     }
     if (OB_SUCC(ret)) {
       ObCompatibilityMode compatibility_mode = get_compatibility_mode();
-      ObCollationType collation_connection = type_ctx.get_coll_type();
+      /* Why return the collation of the parameters for the Oracle system view instead of the tenant collation here?
+       * Because the character set of the data dictionary queried by the
+       * system view does not change with the tenant character set,
+       * so to avoid lossy casting, the collation parameter must be returned here.*/
+      ObCollationType coll_type = (lib::is_oracle_mode() && CM_IS_ORA_SYS_VIEW_CAST(cast_raw_expr->get_cast_mode()))
+                                              ? type1.get_collation_type() : type_ctx.get_coll_type();
       ObCollationType collation_nation = session->get_nls_collation_nation();
       type1.set_calc_type(get_calc_cast_type(type1.get_type(), dst_type.get_type()));
       int32_t length = 0;
@@ -453,7 +458,7 @@ int ObExprCast::calc_result_type2(ObExprResType &type,
         if (len > 0) { // cast(1 as char(10))
           type.set_full_length(len, length_semantics);
         } else if (OB_FAIL(get_cast_string_len(type1, dst_type, type_ctx, len, length_semantics,
-                                               collation_connection,
+                                               coll_type,
                                                cast_raw_expr->get_cast_mode()))) { // cast (1 as char)
           LOG_WARN("fail to get cast string length", K(ret));
         } else if (len < 0 && !is_called_in_sql() && lib::is_oracle_mode()) {
@@ -471,7 +476,7 @@ int ObExprCast::calc_result_type2(ObExprResType &type,
         } else {
           // use collation of current session
           type.set_collation_type(ob_is_nstring_type(dst_type.get_type()) ?
-                                  collation_nation : collation_connection);
+                                  collation_nation : coll_type);
         }
       } else if (ob_is_extend(dst_type.get_type())
                  || dst_type.is_user_defined_sql_type()
@@ -490,7 +495,7 @@ int ObExprCast::calc_result_type2(ObExprResType &type,
           int32_t len = 0;
           int16_t length_semantics = LS_BYTE;//unused
           if (OB_FAIL(get_cast_inttc_len(type1, dst_type, type_ctx, len, length_semantics,
-                                         collation_connection, cast_raw_expr->get_cast_mode()))) {
+                                         coll_type, cast_raw_expr->get_cast_mode()))) {
             LOG_WARN("fail to get cast inttc length", K(ret));
           } else {
             len = len > OB_LITERAL_MAX_INT_LEN ? OB_LITERAL_MAX_INT_LEN : len;
@@ -616,6 +621,18 @@ int ObExprCast::calc_result_type2(ObExprResType &type,
       type1.set_calc_collation_level(type.get_collation_level());
       type1.set_calc_accuracy(type.get_accuracy());
     }
+  }
+  if (OB_SUCC(ret)) {
+    bool implicit_first_century_year = false;
+    ObCastMode cast_mode = cast_raw_expr->get_cast_mode();
+    if (OB_FAIL(ObCompatControl::check_feature_enable(
+                type_ctx.get_compat_version(), ObCompatFeatureType::IMPLICIT_FIRST_CENTURY_YEAR,
+                implicit_first_century_year))) {
+      LOG_WARN("failed to check feature enable", K(ret));
+    } else if (implicit_first_century_year) {
+      cast_mode |= CM_IMPLICIT_FIRST_CENTURY_YEAR;
+    }
+    cast_raw_expr->set_cast_mode(cast_mode);
   }
   LOG_DEBUG("calc result type", K(type1), K(type2), K(type), K(dst_type),
             K(type1.get_calc_accuracy()));
@@ -1138,13 +1155,11 @@ int ObExprCast::fill_element(const sql::ObExpr &expr,
     //Collection constructed here must be recorded and destructed at last
     if (OB_FAIL(res_datum.from_obj(result, expr.obj_datum_map_))) {
       LOG_WARN("failed to from obj", K(ret));
-    } else if (OB_ISNULL(exec_ctx.get_pl_ctx()) && OB_FAIL(exec_ctx.init_pl_ctx())) {
-      LOG_WARN("failed to init pl ctx", K(ret));
-    } else if (OB_ISNULL(exec_ctx.get_pl_ctx())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected null", K(ret));
-    } else if (OB_FAIL(exec_ctx.get_pl_ctx()->add(result))) {
-      LOG_WARN("failed to add result", K(ret));
+    } else {
+      sql::ObPLComplexTypeMgr *pl_complex_type_mgr = exec_ctx.get_pl_complex_type_lazy_mgr().get_pl_complex_type_mgr();
+      if (OB_FAIL(pl_complex_type_mgr->complex_type_objects_.push_back(result))) {
+        LOG_WARN("failed to push back result", K(ret));
+      }
     }
   }
 #endif
@@ -1403,8 +1418,9 @@ DEF_SET_LOCAL_SESSION_VARS(ObExprCast, raw_expr) {
     ObObjType src = raw_expr->get_param_expr(0)->get_result_type().get_type();
     ObObjType dst = raw_expr->get_result_type().get_type();
     if (is_mysql_mode()) {
-      SET_LOCAL_SYSVAR_CAPACITY(3);
+      SET_LOCAL_SYSVAR_CAPACITY(4);
       EXPR_ADD_LOCAL_SYSVAR(SYS_VAR_SQL_MODE);
+      EXPR_ADD_LOCAL_SYSVAR(SYS_VAR_OB_COMPATIBILITY_VERSION);
     } else {
       SET_LOCAL_SYSVAR_CAPACITY(5);
     }

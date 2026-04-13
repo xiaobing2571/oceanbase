@@ -131,7 +131,8 @@ int ObTransformSimplifyOrderby::remove_order_by_for_view_stmt(ObDMLStmt *stmt, b
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected null", K(ret), K(aggr_items));
       } else if (T_FUN_WM_CONCAT == aggr_items.at(i)->get_expr_type()
-                || T_FUN_GROUP_CONCAT == aggr_items.at(i)->get_expr_type()) {
+                || T_FUN_GROUP_CONCAT == aggr_items.at(i)->get_expr_type()
+                || T_FUN_CK_GROUPCONCAT == aggr_items.at(i)->get_expr_type()) {
         can_remove = false;
       }
     }
@@ -225,8 +226,10 @@ int ObTransformSimplifyOrderby::remove_order_by_duplicates(ObDMLStmt *stmt,
   if (OB_ISNULL(stmt)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("null pointer passed to transform", K(ret));
-  } else if (!stmt->is_sel_del_upd() ||
-             (stmt->is_select_stmt() && (static_cast<ObSelectStmt*>(stmt)->has_rollup()))) {
+  } else if (!stmt->is_sel_del_upd()
+             || (stmt->is_select_stmt()
+                 && (static_cast<ObSelectStmt *>(stmt)->has_rollup()
+                     || static_cast<ObSelectStmt *>(stmt)->has_grouping_sets()))) {
     //do nothing
   } else {
     ObIArray<OrderItem> &order_items = stmt->get_order_items();

@@ -46,6 +46,7 @@
 #include "sql/ob_optimizer_trace_impl.h"
 #include "sql/monitor/flt/ob_flt_span_mgr.h"
 #include "storage/tx/ob_tx_free_route.h"
+#include "storage/tablet/ob_session_tablet_info_map.h"
 #include "share/ob_service_name_proxy.h"
 #include "observer/dbms_scheduler/ob_dbms_sched_job_utils.h"
 #include "sql/plan_cache/ob_plan_cache_util.h"
@@ -60,6 +61,7 @@ class ObPieceCache;
 }
 namespace pl
 {
+class ObUtlHttp;
 class ObPLPackageState;
 class ObPL;
 struct ObPLExecRecursionCtx;
@@ -75,7 +77,7 @@ class ObPLDebugger;
 #endif // OB_BUILD_ORACLE_PL
 
 class ObPLProfiler;
-
+class ObPLCodeCoverage;
 } // namespace pl
 
 namespace obmysql
@@ -237,6 +239,7 @@ enum SessionSyncInfoType {
   SESSION_SYNC_SEQUENCE_CURRVAL = 9, // for sequence currval
   SESSION_SYNC_ERROR_SYS_VAR = 10, // for error scene need sync sysvar info
   SESSION_SYNC_QUERY_INFO = 11, // for query level session info
+  SESSION_SYNC_TRANS_GTT_V2_SEQUENCE = 12, // for trans gtt v2 sequence
   SESSION_SYNC_MAX_TYPE,
 };
 
@@ -272,7 +275,7 @@ public:
   // include fetch, compare, and error display.
   virtual int fetch_sess_info(ObSQLSessionInfo &sess, char *buf,
                               const int64_t length, int64_t &pos) = 0;
-  virtual int64_t get_fetch_sess_info_size(ObSQLSessionInfo& sess)= 0;
+  virtual int get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size)= 0;
   virtual int compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
                                 int64_t current_sess_length, const char *last_sess_buf,
                                 int64_t last_sess_length) = 0;
@@ -289,7 +292,7 @@ public:
   int deserialize(ObSQLSessionInfo &sess, const char *buf, const int64_t length, int64_t &pos);
   int get_serialize_size(ObSQLSessionInfo& sess, int64_t &length) const;
   int fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const int64_t length, int64_t &pos);
-  int64_t get_fetch_sess_info_size(ObSQLSessionInfo& sess);
+  int get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size);
   int compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
                         int64_t current_sess_length, const char *last_sess_buf,
                         int64_t last_sess_length);
@@ -305,7 +308,7 @@ public:
   int deserialize(ObSQLSessionInfo &sess, const char *buf, const int64_t length, int64_t &pos);
   int get_serialize_size(ObSQLSessionInfo& sess, int64_t &length) const;
   int fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const int64_t length, int64_t &pos);
-  int64_t get_fetch_sess_info_size(ObSQLSessionInfo& sess);
+  int get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size);
   int compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
                         int64_t current_sess_length, const char *last_sess_buf,
                         int64_t last_sess_length);
@@ -335,7 +338,7 @@ public:
   virtual int get_serialize_size(ObSQLSessionInfo& sess, int64_t &length) const override;
   virtual int fetch_sess_info(ObSQLSessionInfo &sess, char *buf,
                               const int64_t length, int64_t &pos);
-  virtual int64_t get_fetch_sess_info_size(ObSQLSessionInfo& sess);
+  virtual int get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size);
   virtual int compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
                                 int64_t current_sess_length, const char *last_sess_buf,
                                 int64_t last_sess_length);
@@ -351,7 +354,7 @@ public:
   virtual int get_serialize_size(ObSQLSessionInfo &sess, int64_t &length) const override;
   virtual int fetch_sess_info(ObSQLSessionInfo &sess, char *buf,
                               const int64_t length, int64_t &pos);
-  virtual int64_t get_fetch_sess_info_size(ObSQLSessionInfo& sess);
+  virtual int get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size);
   virtual int compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
                                 int64_t current_sess_length, const char *last_sess_buf,
                                 int64_t last_sess_length);
@@ -367,7 +370,7 @@ public:
   virtual int deserialize(ObSQLSessionInfo &sess, const char *buf, const int64_t length, int64_t &pos) override;
   virtual int get_serialize_size(ObSQLSessionInfo &sess, int64_t &length) const override;
   virtual int fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const int64_t length, int64_t &pos) override;
-  virtual int64_t get_fetch_sess_info_size(ObSQLSessionInfo& sess) override;
+  virtual int get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size) override;
   virtual int compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
                                 int64_t current_sess_length, const char *last_sess_buf,
                                 int64_t last_sess_length) override;
@@ -388,7 +391,7 @@ public:
   virtual int get_serialize_size(ObSQLSessionInfo &sess, int64_t &length) const override;
   virtual int fetch_sess_info(ObSQLSessionInfo &sess, char *buf,
                               const int64_t length, int64_t &pos);
-  virtual int64_t get_fetch_sess_info_size(ObSQLSessionInfo& sess);
+  virtual int get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size);
   virtual int compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
                                 int64_t current_sess_length, const char *last_sess_buf,
                                 int64_t last_sess_length);
@@ -408,7 +411,7 @@ public:
   virtual int deserialize(ObSQLSessionInfo &sess, const char *buf, const int64_t length, int64_t &pos) override;
   virtual int get_serialize_size(ObSQLSessionInfo &sess, int64_t &length) const override;
   virtual int fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const int64_t length, int64_t &pos) override;
-  virtual int64_t get_fetch_sess_info_size(ObSQLSessionInfo& sess) override;
+  virtual int get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size) override;
   virtual int compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
                                 int64_t current_sess_length, const char *last_sess_buf,
                                 int64_t last_sess_length) override;
@@ -424,7 +427,23 @@ public:
   virtual int deserialize(ObSQLSessionInfo &sess, const char *buf, const int64_t length, int64_t &pos) override;
   virtual int get_serialize_size(ObSQLSessionInfo &sess, int64_t &length) const override;
   virtual int fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const int64_t length, int64_t &pos) override;
-  virtual int64_t get_fetch_sess_info_size(ObSQLSessionInfo& sess) override;
+  virtual int get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size) override;
+  virtual int compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
+                                int64_t current_sess_length, const char *last_sess_buf,
+                                int64_t last_sess_length) override;
+  virtual int display_sess_info(ObSQLSessionInfo &sess, const char* current_sess_buf,
+                                int64_t current_sess_length, const char* last_sess_buf, int64_t last_sess_length) override;
+};
+
+class ObTransGttV2SequenceEncoder : public ObSessInfoEncoder {
+public:
+  ObTransGttV2SequenceEncoder() : ObSessInfoEncoder() {}
+  virtual ~ObTransGttV2SequenceEncoder() {}
+  virtual int serialize(ObSQLSessionInfo &sess, char *buf, const int64_t length, int64_t &pos) override;
+  virtual int deserialize(ObSQLSessionInfo &sess, const char *buf, const int64_t length, int64_t &pos) override;
+  virtual int get_serialize_size(ObSQLSessionInfo &sess, int64_t &length) const override;
+  virtual int fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const int64_t length, int64_t &pos) override;
+  virtual int get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size) override;
   virtual int compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
                                 int64_t current_sess_length, const char *last_sess_buf,
                                 int64_t last_sess_length) override;
@@ -439,7 +458,7 @@ public:                                                                 \
   int deserialize(ObSQLSessionInfo &sess, const char *buf, const int64_t length, int64_t &pos) override; \
   int get_serialize_size(ObSQLSessionInfo &sess, int64_t &length) const override;    \
   int fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const int64_t length, int64_t &pos) override; \
-  int64_t get_fetch_sess_info_size(ObSQLSessionInfo& sess) override; \
+  int get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size) override; \
   int compare_sess_info(ObSQLSessionInfo &sess, const char* current_sess_buf, int64_t current_sess_length, const char* last_sess_buf, int64_t last_sess_length) override; \
   int display_sess_info(ObSQLSessionInfo &sess, const char* current_sess_buf, int64_t current_sess_length, const char* last_sess_buf, int64_t last_sess_length) override; \
   int display_diagnosis_sess_info(ObSQLSessionInfo &sess, const int16_t type, int64_t index); \
@@ -586,7 +605,10 @@ typedef common::LinkHashValue<SessionInfoKey> SessionInfoHashValue;
 // ObSQLSessionInfo存储其他执行时状态信息，远程执行SQL执行计划时，**不需要**序列化到远端
 class ObSQLSessionInfo: public common::ObVersionProvider, public ObBasicSessionInfo, public SessionInfoHashValue
 {
-  OB_UNIS_VERSION(1);
+  // master version is 3, 42x version is 2.
+  // compatibility handling based on the version number during deserialization.
+  // notice: Do not modify the version number arbitrarily.
+  OB_UNIS_VERSION(3);
 public:
   friend class LinkExecCtxGuard;
   // notice!!! register exec ctx to session for later access
@@ -595,9 +617,9 @@ public:
   class ExecCtxSessionRegister
   {
   public:
-    ExecCtxSessionRegister(ObSQLSessionInfo &session, ObExecContext &exec_ctx)
+    ExecCtxSessionRegister(ObSQLSessionInfo &session, ObExecContext *exec_ctx)
     {
-      session.set_cur_exec_ctx(&exec_ctx);
+      session.set_cur_exec_ctx(exec_ctx);
     }
   };
   friend class ExecCtxSessionRegister;
@@ -702,7 +724,7 @@ public:
               SQL_ENG_LOG(ERROR, "failed to erase hash map", K(ret), K(iter->first));
               break;
             }
-          } else if (OB_FAIL(session.close_cursor(cursor->get_id()))) {
+          } else if (OB_FAIL(session.close_cursor(cursor->get_id(), false))) {
             SQL_ENG_LOG(WARN, "failed to close session cursor", K(ret), K(cursor->get_id()));
           } else {
             SQL_ENG_LOG(INFO, "clsoe session cursor implicit successed!", K(cursor->get_id()));
@@ -777,6 +799,14 @@ public:
                                  pc_adaptive_min_exec_time_threshold_(0),
                                  pc_adaptive_effectiveness_ratio_threshold_(0),
                                  enable_adaptive_plan_cache_(false),
+                                 enable_ps_parameterize_(true),
+                                 enable_seq_wrap_around_flush_cache_(false),
+                                 enable_sql_ccl_rule_(true),
+                                 enable_streaming_cursor_prefetch_(true),
+                                 force_unstreaming_cursor_(false),
+                                 conf_enable_sql_audit_(false),
+                                 extend_sql_plan_monitor_metrics_(false),
+                                 enable_pl_sql_parameterize_(false),
                                  session_(session)
     {
     }
@@ -806,6 +836,7 @@ public:
     bool enable_enhanced_cursor_validation() const { return enable_enhanced_cursor_validation_; }
     bool get_enable_mysql_compatible_dates() const { return enable_mysql_compatible_dates_; }
     bool enable_enum_set_subschema() const { return enable_enum_set_subschema_; }
+    bool enable_seq_wrap_around_flush_cache() const { return enable_seq_wrap_around_flush_cache_; }
     bool get_ob_sqlstat_enable() const { return _ob_sqlstat_enable_; }
     bool enable_immediate_row_conflict_check() const { return ATOMIC_LOAD(&enable_immediate_row_conflict_check_); }
     bool force_enable_plan_tracing() const
@@ -824,7 +855,17 @@ public:
     {
       return enable_adaptive_plan_cache_;
     }
+    bool enable_sql_ccl_rule() const
+    {
+      return enable_sql_ccl_rule_;
+    }
 
+    bool enable_ps_parameterize() const { return enable_ps_parameterize_; }
+    bool enable_streaming_cursor_prefetch() const { return enable_streaming_cursor_prefetch_; }
+    bool force_unstreaming_cursor() const { return force_unstreaming_cursor_; }
+    bool conf_enable_sql_audit() const { return conf_enable_sql_audit_; }
+    bool extend_sql_plan_monitor_metrics() const { return extend_sql_plan_monitor_metrics_; }
+    bool enable_pl_sql_parameterize() const { return enable_pl_sql_parameterize_; }
   private:
     //租户级别配置项缓存session 上，避免每次获取都需要刷新
     bool is_external_consistent_;
@@ -860,6 +901,14 @@ public:
     int64_t pc_adaptive_min_exec_time_threshold_;
     int64_t pc_adaptive_effectiveness_ratio_threshold_;
     bool enable_adaptive_plan_cache_;
+    bool enable_ps_parameterize_;
+    bool enable_seq_wrap_around_flush_cache_;
+    bool enable_sql_ccl_rule_;
+    bool enable_streaming_cursor_prefetch_;
+    bool force_unstreaming_cursor_;
+    bool conf_enable_sql_audit_;
+    bool extend_sql_plan_monitor_metrics_;
+    bool enable_pl_sql_parameterize_;
     ObSQLSessionInfo *session_;
   };
 
@@ -987,12 +1036,23 @@ public:
                        const bool is_reset_connection = false);
   void refresh_temp_tables_sess_active_time(); //更新临时表的sess active time
   int delete_from_oracle_temp_tables(const obrpc::ObDropTableArg &const_drop_table_arg);
+  int delete_from_oracle_temp_table_v2(
+      share::schema::ObSchemaGetterGuard &schema_guard,
+      const share::schema::ObTableSchema &table_schema,
+      const int64_t sequence,
+      const uint64_t session_id,
+      const bool is_index_table,
+      common::ObMySQLTransaction &trans);
 
   //To generate an unique key for Oracle Global Temporary Table
   int64_t get_gtt_session_scope_unique_id() const { return gtt_session_scope_unique_id_; }
   int64_t get_gtt_trans_scope_unique_id() const { return gtt_trans_scope_unique_id_; }
+  storage::ObSessionTabletInfoMap &get_gtt_tablet_info_map() { return gtt_tablet_info_map_; }
   void gen_gtt_session_scope_unique_id();
   void gen_gtt_trans_scope_unique_id();
+  void set_trans_gtt_v2_sequence(const int64_t sequence) { trans_gtt_v2_sequence_ = sequence;  }
+  int64_t get_trans_gtt_v2_sequence() const { return trans_gtt_v2_sequence_; }
+  void update_trans_gtt_v2_sequence();
   common::ObIArray<uint64_t> &get_gtt_session_scope_ids() { return gtt_session_scope_ids_; }
   common::ObIArray<uint64_t> &get_gtt_trans_scope_ids() { return gtt_trans_scope_ids_; }
   int add_dblink_sequence_schema(ObSequenceSchema *schema);
@@ -1080,6 +1140,7 @@ public:
   void set_pl_debugger (pl::debugger::ObPLDebugger *pl_debugger) {pl_debugger_ = pl_debugger; };
 
   int alloc_pl_profiler(int32_t run_id);
+  int alloc_pl_code_coverage(int32_t run_id);
 #endif
   bool is_pl_debug_on();
   inline pl::ObPLProfiler *get_pl_profiler() const
@@ -1092,7 +1153,16 @@ public:
 
     return profiler;
   }
+  inline pl::ObPLCodeCoverage *get_pl_code_coverage() const
+  {
+    pl::ObPLCodeCoverage *code_coverage_ = nullptr;
 
+#ifdef OB_BUILD_ORACLE_PL
+    code_coverage_ = pl_code_coverage_;
+#endif // OB_BUILD_ORACLE_PL
+
+    return code_coverage_;
+  }
   inline void set_pl_attached_id(uint32_t id) { pl_attach_session_id_ = id; }
   inline uint32_t get_pl_attached_id() const { return pl_attach_session_id_; }
 
@@ -1143,9 +1213,9 @@ public:
   pl::ObPLCursorInfo *get_cursor(int64_t cursor_id);
   pl::ObDbmsCursorInfo *get_dbms_cursor(int64_t cursor_id);
   int add_cursor(pl::ObPLCursorInfo *cursor);
-  int close_cursor(pl::ObPLCursorInfo *&cursor);
-  int close_cursor(int64_t cursor_id);
-  inline void inc_session_cursor() {
+  int close_cursor(pl::ObPLCursorInfo *&cursor, bool close_by_open_thread = false);
+  int close_cursor(int64_t cursor_id, bool close_by_open_thread = false);
+    inline void inc_session_cursor() {
     if (lib::is_diagnose_info_enabled()) {
       EVENT_INC(SQL_OPEN_CURSORS_CURRENT);
       EVENT_INC(SQL_OPEN_CURSORS_CUMULATIVE);
@@ -1163,6 +1233,10 @@ public:
   int make_dbms_cursor(pl::ObDbmsCursorInfo *&cursor,
                        uint64_t id = OB_INVALID_ID);
   int close_dbms_cursor(int64_t cursor_id);
+  int make_ps_cursor(pl::ObPsCursorInfo *&cursor,
+                     ParamStore &exec_params,
+                     ObString &sql,
+                     uint64_t id);
   int print_all_cursor();
 
   inline void *get_inner_conn() { return inner_conn_; }
@@ -1180,11 +1254,13 @@ public:
   {
     return end_trans_cb_.get_mysql_end_trans_cb();
   }
+  observer::ObPLEndTransCb &get_pl_end_trans_cb() { return end_trans_cb_.get_pl_end_trans_cb(); }
   int get_collation_type_of_names(const ObNameTypeClass type_class, common::ObCollationType &cs_type) const;
   int name_case_cmp(const common::ObString &name, const common::ObString &name_other,
                     const ObNameTypeClass type_class, bool &is_equal) const;
   int kill_query();
   int set_query_deadlocked();
+  inline void set_inner_flag(bool inner_flag) { inner_flag_ = inner_flag; }
 
   inline void set_inner_session()
   {
@@ -1270,13 +1346,15 @@ public:
   }
   void reset_pl_debugger_resource();
   void reset_pl_profiler_resource();
+  int collect_pl_code_coverage_info();
+  void reset_pl_code_coverage_resource();
   void reset_all_package_changed_info();
   void reset_all_package_state();
   int reset_all_package_state_by_dbms_session(bool need_set_sync_var);
   int reset_all_serially_package_state();
   bool is_package_state_changed() const;
   bool get_changed_package_state_num() const;
-  int add_changed_package_info(ObExecContext &exec_ctx);
+  int add_changed_package_info();
 
   // 当前 session 上发生的 sequence.nextval 读取 sequence 值，
   // 都会由 ObSequence 算子将读取结果保存在当前 session 上
@@ -1414,7 +1492,24 @@ public:
   int get_spm_mode(int64_t &spm_mode);
   bool is_enable_new_query_range() const;
   bool is_sqlstat_enabled();
-
+  // To avoid frequent ObSchemaMgr access in check_lazy_guard,
+  // refresh ccl_cnt every 5s
+  int has_ccl_rules(share::schema::ObSchemaGetterGuard *&schema_guard,
+    bool &has_ccl_rules)
+  {
+    int ret = OB_SUCCESS;
+    int64_t cur_time = ObTimeUtility::fast_current_time();
+    if (-1 == last_update_ccl_cnt_time_ || 5 * 1000 * 1000LL < (cur_time - last_update_ccl_cnt_time_)) {
+      uint64_t ccl_cnt = 0;
+      last_update_ccl_cnt_time_ = cur_time;
+      if (OB_FAIL(schema_guard->get_ccl_rule_count(get_effective_tenant_id(), ccl_cnt))) {
+        SQL_SESSION_LOG(WARN, "fail to get ccl rule count", K(ret));
+      }
+      has_ccl_rule_ = (ccl_cnt > 0);
+    }
+    has_ccl_rules = has_ccl_rule_;
+    return ret;
+  }
   ObSessionDDLInfo &get_ddl_info() { return ddl_info_; }
   const ObSessionDDLInfo &get_ddl_info() const { return ddl_info_; }
   void set_ddl_info(const ObSessionDDLInfo &ddl_info) { ddl_info_ = ddl_info; }
@@ -1568,10 +1663,25 @@ public:
     cached_tenant_config_info_.refresh();
     return cached_tenant_config_info_.enable_enhanced_cursor_validation();
   }
+  bool enable_streaming_cursor_prefetch()
+  {
+    cached_tenant_config_info_.refresh();
+    return cached_tenant_config_info_.enable_streaming_cursor_prefetch();
+  }
+  bool force_unstreaming_cursor()
+  {
+    cached_tenant_config_info_.refresh();
+    return cached_tenant_config_info_.force_unstreaming_cursor();
+  }
   bool is_enable_enum_set_with_subschema()
   {
     cached_tenant_config_info_.refresh();
     return cached_tenant_config_info_.enable_enum_set_subschema();
+  }
+  bool is_enable_seq_wrap_around_flush_cache()
+  {
+    cached_tenant_config_info_.refresh();
+    return cached_tenant_config_info_.enable_seq_wrap_around_flush_cache();
   }
   bool get_tenant_ob_sqlstat_enable()
   {
@@ -1599,6 +1709,29 @@ public:
     cached_tenant_config_info_.refresh();
     return cached_tenant_config_info_.enable_plan_cache_adaptive();
   }
+  bool is_enable_ps_parameterize()
+  {
+    cached_tenant_config_info_.refresh();
+    return cached_tenant_config_info_.enable_ps_parameterize();
+  }
+  bool is_enable_sql_ccl_rule()
+  {
+    cached_tenant_config_info_.refresh();
+    return cached_tenant_config_info_.enable_sql_ccl_rule();
+  }
+  bool is_enable_pl_sql_parameterize()
+  {
+    cached_tenant_config_info_.refresh();
+    return cached_tenant_config_info_.enable_pl_sql_parameterize();
+  }
+
+  bool enable_monitor_profile() {
+    cached_tenant_config_info_.refresh();
+    return get_local_ob_enable_sql_audit() &&
+           cached_tenant_config_info_.conf_enable_sql_audit() &&
+           cached_tenant_config_info_.extend_sql_plan_monitor_metrics();
+  }
+
   int get_tmp_table_size(uint64_t &size);
   int ps_use_stream_result_set(bool &use_stream);
   void set_proxy_version(uint64_t v) { proxy_version_ = v; }
@@ -1649,6 +1782,7 @@ public:
   bool get_failover_mode() const { return failover_mode_; }
   void set_failover_mode(const bool failover_mode) { failover_mode_ = failover_mode; }
   void reset_service_name() { service_name_.reset(); }
+  bool has_ccl_rule_checked() const { return has_ccl_rule_; }
   int set_service_name(const ObString& service_name);
   int check_service_name_and_failover_mode() const;
   int check_service_name_and_failover_mode(const uint64_t tenant_id) const;
@@ -1702,15 +1836,17 @@ public:
     //             K(ret));
     return ret;
   }
+  int64_t &get_curr_request_id() { return curr_request_id_; }
 public:
   bool has_tx_level_temp_table() const { return tx_desc_ && tx_desc_->with_temporary_table(); }
   void set_affected_rows_is_changed(int64_t affected_rows);
   int close_all_ps_stmt();
   void destory_mem_context();
+  void set_cur_exec_ctx(ObExecContext *cur_exec_ctx) { cur_exec_ctx_ = cur_exec_ctx; }
 private:
   void destroy_contexts_map(ObContextsMap &map, common::ObIAllocator &alloc);
   inline int init_mem_context(uint64_t tenant_id);
-  void set_cur_exec_ctx(ObExecContext *cur_exec_ctx) { cur_exec_ctx_ = cur_exec_ctx; }
+  inline int64_t get_truncated_sql_len(const ObString &stmt) override;
 
   static const int64_t MAX_STORED_PLANS_COUNT = 10240;
   static const int64_t MAX_IPADDR_LENGTH = 64;
@@ -1823,6 +1959,7 @@ private:
 #ifdef OB_BUILD_ORACLE_PL
   pl::debugger::ObPLDebugger *pl_debugger_; // 如果开启了debug, 该字段不为null
   pl::ObPLProfiler *pl_profiler_;
+  pl::ObPLCodeCoverage *pl_code_coverage_;
 #endif
 #ifdef OB_BUILD_SPM
   ObSpmCacheCtx::SpmSelectPlanType select_plan_type_;
@@ -1904,6 +2041,7 @@ private:
                             &sequence_currval_encoder_,
                             &error_sync_sys_var_encoder_,
                             &query_info_encoder_,
+                            &trans_gtt_v2_sequence_encoder_,
                             };
   ObSysVarEncoder sys_var_encoder_;
   //ObUserVarEncoder usr_var_encoder_;
@@ -1918,6 +2056,7 @@ private:
   ObSequenceCurrvalEncoder sequence_currval_encoder_;
   ObErrorSyncSysVarEncoder error_sync_sys_var_encoder_;
   ObQueryInfoEncoder query_info_encoder_;
+  ObTransGttV2SequenceEncoder trans_gtt_v2_sequence_encoder_;
 public:
   void post_sync_session_info();
   void prep_txn_free_route_baseline(bool reset_audit = true);
@@ -1940,9 +2079,14 @@ public:
   inline void inc_out_bytes(int64_t out_bytes) { IGNORE_RETURN ATOMIC_FAA(&out_bytes_, out_bytes); }
   bool is_pl_prepare_stage() const;
   inline ObExecutingSqlStatRecord& get_executing_sql_stat_record() {return executing_sql_stat_record_; }
+  inline const ObExecutingSqlStatRecord& get_executing_sql_stat_record() const {return executing_sql_stat_record_; }
   int sql_sess_record_sql_stat_start_value(ObExecutingSqlStatRecord& executing_sqlstat);
   dbms_scheduler::ObDBMSSchedJobInfo *get_job_info() const { return job_info_; }
   void set_job_info(dbms_scheduler::ObDBMSSchedJobInfo *job_info) { job_info_ = job_info; }
+  void *get_external_resource_schema_cache() { return external_resource_schema_cache_; }
+  void set_external_resource_schema_cache(void *cache) { external_resource_schema_cache_ = cache; }
+  void set_retry_wait_event_begin_time();
+
 private:
   transaction::ObTxnFreeRouteCtx txn_free_route_ctx_;
   //save the current sql exec context in session
@@ -1962,6 +2106,8 @@ private:
   //unique key: obs_id(16bit) + timestamp(48bit)
   int64_t gtt_session_scope_unique_id_;
   int64_t gtt_trans_scope_unique_id_;
+  //For Oracle Global Temporary Table, storing tablet info map for each session or transaction
+  storage::ObSessionTabletInfoMap gtt_tablet_info_map_;
   //storing table ids of accessed gtts in the session
   common::ObSEArray<uint64_t, 1> gtt_session_scope_ids_;
   common::ObSEArray<uint64_t, 1> gtt_trans_scope_ids_;
@@ -1981,6 +2127,24 @@ private:
   common::ObString audit_filter_name_;
   ObExecutingSqlStatRecord executing_sql_stat_record_;
   uint64_t unit_gc_min_sup_proxy_version_;
+  void *external_resource_schema_cache_;
+  bool has_ccl_rule_;
+  int64_t last_update_ccl_cnt_time_;
+  int64_t curr_request_id_;  // mark current request id in sql audit
+  int64_t trans_gtt_v2_sequence_;
+  // The minimal data version at session creation.
+  uint64_t min_data_version_of_init_sess_;
+
+  private:
+  pl::ObUtlHttp* ob_utl_http_info_ = NULL;
+
+  public:
+  pl::ObUtlHttp* get_ob_utl_http_info() {return ob_utl_http_info_;}
+  void set_ob_utl_http_info(pl::ObUtlHttp* ob_utl_http_info_ptr) { ob_utl_http_info_ = ob_utl_http_info_ptr;}
+  void set_is_pl_async_commit(bool is_pl_async_commit) { end_trans_cb_.set_is_pl_async_commit(is_pl_async_commit); }
+  bool is_pl_async_commit() { return end_trans_cb_.is_pl_async_commit(); }
+  void set_has_async_query_sender(bool has_async_query_sender) { end_trans_cb_.set_has_async_query_sender(has_async_query_sender); }
+  bool has_async_query_sender() { return end_trans_cb_.has_async_query_sender(); }
 };
 
 

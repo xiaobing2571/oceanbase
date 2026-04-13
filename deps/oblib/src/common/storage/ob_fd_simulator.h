@@ -27,7 +27,7 @@ public:
   ObFdSimulator();
   virtual ~ObFdSimulator(){};
 
-  const static int DEFAULT_ARRAY_SIZE = 100;
+  const static int DEFAULT_ARRAY_SIZE = 300;
   const static int INVALID_SLOT_ID = -1;
   /*pointerid is a union, 
     when the slot is free, it is a id, which point next free slot
@@ -49,12 +49,12 @@ public:
   };
 
   int init();
-  int get_fd(void* ctx, const int device_type, const int flag, ObIOFd &fd);
+  int get_fd(void* ctx, const int device_type, const ObStorageAccessType op_type, ObIOFd &fd);
   int fd_to_ctx(const ObIOFd& fd, void*& ctx);  //called when query ctx 
   int release_fd(const ObIOFd& fd);           //called when close
   void get_fd_slot_id(const ObIOFd& fd, int64_t& first_id, int64_t& second_id);
   static void get_fd_device_type(const ObIOFd& fd, int &device_type);
-  static void get_fd_flag(const ObIOFd& fd, int &flag);
+  static void get_fd_op_type(const ObIOFd& fd, ObStorageAccessType &op_type);
 
   bool validate_fd(const ObIOFd& fd,  bool expect);
 
@@ -68,7 +68,7 @@ public:
 private:
   int extend_second_array();
   void set_fd_device_type(ObIOFd& fd, int device_type);
-  void set_fd_flag(ObIOFd& fd, int flag);
+  void set_fd_op_type(ObIOFd& fd, ObStorageAccessType op_type);
   
   int init_manager_array(FdSlot* second_array);
   
@@ -81,6 +81,8 @@ private:
   common::ObSpinLock lock_;
   int32_t used_fd_cnt_;
   int32_t total_fd_cnt_;
+  int64_t alloc_fd_cnt_;   // just for stat in log
+  int64_t release_fd_cnt_; // just for stat in log
   bool is_init_;
 };
 

@@ -1816,6 +1816,20 @@ bool ObCharset::is_valid_charset(int64_t cs_type_int)
   return charset_type > CHARSET_INVALID && charset_type < CHARSET_MAX;
 }
 
+int ObCharset::is_pad_charset(ObCollationType collation_type, bool &is_pad)
+{
+  int ret = OB_SUCCESS;
+  is_pad = false;
+  if (OB_UNLIKELY(!is_valid_collation(collation_type))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid collation type", K(ret), K(collation_type));
+  } else {
+    ObCharsetInfo *cs = static_cast<ObCharsetInfo *>(ObCharset::charset_arr[collation_type]);
+    is_pad = ObCharsetPadAttr::PAD_SPACE == cs->pad_attribute;
+  }
+  return ret;
+}
+
 static ObCollationType non_bin_coll_marks[NLS_COLLATION_MAX] = {
   CS_TYPE_INVALID,
   CS_TYPE_PINYIN_BEGIN_MARK,
@@ -2987,7 +3001,7 @@ size_t ObCharset::casedn(const ObCollationType collation_type, ObString &src)
   size_t size = 0;
   if (!src.empty()) {
     size = casedn(collation_type, src.ptr(), src.length(), src.ptr(), src.length());
-    src.set_length(static_cast<int32_t>(size));
+    src = ObString(src.size(), static_cast<int32_t>(size), src.ptr());
   }
   return size;
 }
@@ -2997,7 +3011,7 @@ size_t ObCharset::caseup(const ObCollationType collation_type, ObString &src)
   size_t size = 0;
   if (!src.empty()) {
     size = caseup(collation_type, src.ptr(), src.length(), src.ptr(), src.length());
-    src.set_length(static_cast<int32_t>(size));
+    src = ObString(src.size(), static_cast<int32_t>(size), src.ptr());
   }
   return size;
 }
@@ -3517,7 +3531,7 @@ int ObCharset::charset_convert(ObIAllocator &alloc,
         char *res_buf = static_cast<char *>(alloc.alloc(res_buf_len));
         if (OB_ISNULL(res_buf)) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
-          LOG_WARN("alloc memory failed", K(ret), K(lbt()));
+          LOG_WARN("alloc memory failed", K(ret), K(res_buf_len), K(lbt()));
         } else  {
           if (OB_SUCC(charset_convert(src_cs_type, in.ptr(), in.length(),
                                       dst_cs_type, res_buf, res_buf_len, res_len))) {

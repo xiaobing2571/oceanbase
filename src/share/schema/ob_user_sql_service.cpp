@@ -619,10 +619,13 @@ int ObUserSqlService::set_passwd_impl(
   const uint64_t exec_tenant_id = ObSchemaUtils::get_exec_tenant_id(tenant_id);
   const uint64_t user_id = user_info.get_user_id();
   ObSqlString sql_string;
+  uint64_t compat_version = 0;
   if (OB_INVALID_ID == tenant_id
      || OB_INVALID_ID == user_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid id", K(tenant_id), K(user_id), K(ret));
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, compat_version))) {
+    LOG_WARN("fail to get data version", KR(ret), K(tenant_id));
   } else {
     int64_t affected_rows = 0;
     ObDMLExecHelper exec(sql_client, exec_tenant_id);
@@ -631,11 +634,19 @@ int ObUserSqlService::set_passwd_impl(
                                                exec_tenant_id, tenant_id)))
         || OB_FAIL(dml.add_pk_column("user_id", ObSchemaUtils::get_extract_schema_id(
                                                 exec_tenant_id, user_id)))
-        || OB_FAIL(dml.add_column("passwd", user_info.get_passwd()))
+        || OB_FAIL(dml.add_column("passwd", ObHexEscapeSqlStr(user_info.get_passwd())))
         || OB_FAIL(dml.add_time_column("password_last_changed",
                                       user_info.get_password_last_changed()))
         || OB_FAIL(dml.add_gmt_modified())) {
       LOG_WARN("add column failed", K(ret));
+    }
+
+    if (OB_SUCC(ret)
+        && ((compat_version >= MOCK_DATA_VERSION_4_4_2_0 && compat_version < DATA_VERSION_4_5_0_0)
+            || compat_version >= DATA_VERSION_4_5_1_0)) {
+      if (OB_FAIL(dml.add_column("plugin", ObHexEscapeSqlStr(user_info.get_plugin())))) {
+        LOG_WARN("add plugin column failed", K(user_info.get_plugin()), K(ret));
+      }
     }
 
     // udpate __all_user table
@@ -1010,7 +1021,7 @@ int ObUserSqlService::gen_user_dml(
                                               exec_tenant_id,user.get_user_id())))
       || OB_FAIL(dml.add_column("user_name", ObHexEscapeSqlStr(user.get_user_name())))
       || OB_FAIL(dml.add_column("host", ObHexEscapeSqlStr(user.get_host_name())))
-      || OB_FAIL(dml.add_column("passwd", user.get_passwd()))
+      || OB_FAIL(dml.add_column("passwd", ObHexEscapeSqlStr(user.get_passwd())))
       || OB_FAIL(dml.add_column("info", user.get_info()))
       || OB_FAIL(dml.add_column("PRIV_ALTER", user.get_priv(OB_PRIV_ALTER) ? 1 : 0))
       || OB_FAIL(dml.add_column("PRIV_CREATE", user.get_priv(OB_PRIV_CREATE) ? 1 : 0))
@@ -1079,6 +1090,13 @@ int ObUserSqlService::gen_user_dml(
     if ((user.get_priv_set() & OB_PRIV_EVENT) != 0) { priv_others |= OB_PRIV_OTHERS_EVENT; }
     if ((user.get_priv_set() & OB_PRIV_CREATE_CATALOG) != 0) { priv_others |= OB_PRIV_OTHERS_CREATE_CATALOG; }
     if ((user.get_priv_set() & OB_PRIV_USE_CATALOG) != 0) { priv_others |= OB_PRIV_OTHERS_USE_CATALOG; }
+    if ((user.get_priv_set() & OB_PRIV_CREATE_LOCATION) != 0) {priv_others |= OB_PRIV_OTHERS_CREATE_LOCATION; }
+    if ((user.get_priv_set() & OB_PRIV_CREATE_AI_MODEL) != 0) { priv_others |= OB_PRIV_OTHERS_CREATE_AI_MODEL; }
+    if ((user.get_priv_set() & OB_PRIV_ALTER_AI_MODEL) != 0) { priv_others |= OB_PRIV_OTHERS_ALTER_AI_MODEL; }
+    if ((user.get_priv_set() & OB_PRIV_DROP_AI_MODEL) != 0) { priv_others |= OB_PRIV_OTHERS_DROP_AI_MODEL; }
+    if ((user.get_priv_set() & OB_PRIV_ACCESS_AI_MODEL) != 0) { priv_others |= OB_PRIV_OTHERS_ACCESS_AI_MODEL; }
+    if ((user.get_priv_set() & OB_PRIV_CREATE_SENSITIVE_RULE) != 0) { priv_others |= OB_PRIV_OTHERS_CREATE_SENSITIVE_RULE; }
+    if ((user.get_priv_set() & OB_PRIV_PLAINACCESS) != 0) { priv_others |= OB_PRIV_OTHERS_PLAINACCESS; }
   }
   if (OB_FAIL(ret)) {
   } else if (!sql::ObSQLUtils::is_data_version_ge_422_or_431(compat_version)) {
@@ -1086,16 +1104,21 @@ int ObUserSqlService::gen_user_dml(
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("some column of user info is not empty when MIN_DATA_VERSION is below DATA_VERSION_4_3_1_0 or DATA_VERSION_4_2_2_0", K(ret), K(user.get_priv(OB_PRIV_EXECUTE)), K(user.get_priv(OB_PRIV_ALTER_ROUTINE)), K(user.get_priv(OB_PRIV_CREATE_ROUTINE)));
     }
-  } else if (!((MOCK_DATA_VERSION_4_2_5_1 <= compat_version && compat_version < DATA_VERSION_4_3_0_0) || compat_version >= DATA_VERSION_4_3_5_1)) {
-    if ((priv_others & OB_PRIV_OTHERS_ENCRYPT) != 0 || (priv_others & OB_PRIV_OTHERS_DECRYPT) != 0) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_WARN("some column of user info is not empty when MIN_DATA_VERSION is below MOCK_DATA_VERSION_4_2_5_1 or DATA_VERSION_4_3_5_1", K(ret), K(user.get_priv(OB_PRIV_ENCRYPT)), K(user.get_priv(OB_PRIV_DECRYPT)));
-    }
-  } else if (!((MOCK_DATA_VERSION_4_2_5_2 <= compat_version && compat_version < DATA_VERSION_4_3_0_0) || compat_version >= DATA_VERSION_4_3_5_2)) {
-    if ((priv_others & OB_PRIV_EVENT) != 0) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_WARN("some column of user info is not empty when MIN_DATA_VERSION is below DATA_VERSION_4_2_5_2 or 4_3_5_2", K(ret), K(user.get_priv(OB_PRIV_EVENT)));
-    }
+  } else if (!((MOCK_DATA_VERSION_4_2_5_1 <= compat_version && compat_version < DATA_VERSION_4_3_0_0) || compat_version >= DATA_VERSION_4_3_5_1)
+             && ((priv_others & OB_PRIV_OTHERS_ENCRYPT) != 0 || (priv_others & OB_PRIV_OTHERS_DECRYPT) != 0)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("some column of user info is not empty when MIN_DATA_VERSION is below MOCK_DATA_VERSION_4_2_5_1 or DATA_VERSION_4_3_5_1", K(ret), K(user.get_priv(OB_PRIV_ENCRYPT)), K(user.get_priv(OB_PRIV_DECRYPT)));
+  } else if (!((MOCK_DATA_VERSION_4_2_5_2 <= compat_version && compat_version < DATA_VERSION_4_3_0_0) || compat_version >= DATA_VERSION_4_3_5_2)
+             && (priv_others & OB_PRIV_EVENT) != 0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("some column of user info is not empty when MIN_DATA_VERSION is below DATA_VERSION_4_2_5_2 or 4_3_5_2", K(ret), K(user.get_priv(OB_PRIV_EVENT)));
+  } else if (!((compat_version >= MOCK_DATA_VERSION_4_3_5_3 && compat_version < DATA_VERSION_4_4_0_0) ||
+               (compat_version >= MOCK_DATA_VERSION_4_4_2_0 && compat_version < DATA_VERSION_4_5_0_0) ||
+               (compat_version >= DATA_VERSION_4_5_1_0))
+             && ((priv_others & OB_PRIV_OTHERS_CREATE_SENSITIVE_RULE) != 0 || (priv_others & OB_PRIV_OTHERS_PLAINACCESS) != 0)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("some column of user info is not empty when MIN_DATA_VERSION is below MOCK_DATA_VERSION_4_3_5_3 or MOCK_DATA_VERSION_4_4_2_0 or DATA_VERSION_4_5_1_0",
+             K(ret), K(user.get_priv(OB_PRIV_CREATE_SENSITIVE_RULE)), K(user.get_priv(OB_PRIV_PLAINACCESS)));
   } else if (OB_FAIL(dml.add_column("PRIV_OTHERS", priv_others))) {
     LOG_WARN("add PRIV_OTHERS column failed", K(priv_others), K(ret));
   }
@@ -1108,6 +1131,14 @@ int ObUserSqlService::gen_user_dml(
     }
   } else if (OB_FAIL(dml.add_column("flags", user.get_flags()))) {
     LOG_WARN("add flags column failed", K(user.get_flags()), K(ret));
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (!((compat_version >= MOCK_DATA_VERSION_4_4_2_0 && compat_version < DATA_VERSION_4_5_0_0)
+               || compat_version >= DATA_VERSION_4_5_1_0)) {
+    // do nothing
+  } else if (OB_FAIL(dml.add_column("plugin", ObHexEscapeSqlStr(user.get_plugin())))) {
+    LOG_WARN("add plugin column failed", K(user.get_plugin()), K(ret));
   }
   return ret;
 }

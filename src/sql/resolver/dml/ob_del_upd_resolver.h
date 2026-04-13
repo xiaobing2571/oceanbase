@@ -56,7 +56,8 @@ protected:
 
   int resolve_assignments(const ParseNode &parse_node,
                           common::ObIArray<ObTableAssignment> &table_assigns,
-                          ObStmtScope scope);
+                          ObStmtScope scope,
+                          const bool is_insert_into_set = false);
 
   int resolve_column_and_values(const ParseNode &assign_list,
                                 ObIArray<ObColumnRefRawExpr *> &target_list,
@@ -79,6 +80,7 @@ protected:
                              ObAssignment &assign);
   int check_need_assignment(const common::ObIArray<ObAssignment> &assigns,
                             uint64_t table_id,
+                            uint64_t ref_table_id,
                             bool before_update_row_trigger_exist,
                             const share::schema::ObColumnSchemaV2 &column,
                             bool &need_assign);
@@ -134,8 +136,9 @@ protected:
   virtual int process_values_function(ObRawExpr *&expr);
   virtual int recursive_values_expr(ObRawExpr *&expr);
 
-  bool need_all_columns(const share::schema::ObTableSchema &table_schema,
-                        const int64_t binlog_row_image);
+  int need_all_columns(const share::schema::ObTableSchema &table_schema,
+                       const int64_t binlog_row_image,
+                       bool &need_all_columns);
 
   int add_all_columns_to_stmt(const TableItem &table_item,
                               common::ObIArray<ObColumnRefRawExpr*> &column_exprs);
@@ -143,6 +146,8 @@ protected:
                                           common::ObIArray<ObColumnRefRawExpr*> &column_exprs);
   int add_all_rowkey_columns_to_stmt(const TableItem &table_item,
                                      common::ObIArray<ObColumnRefRawExpr*> &column_exprs);
+  int add_all_part_columns_to_stmt(const TableItem &table_item,
+                                   common::ObIArray<ObColumnRefRawExpr*> &column_exprs);
   int add_index_related_columns_to_stmt(const TableItem &table_item,
                                         const uint64_t column_id,
                                         common::ObIArray<ObColumnRefRawExpr*> &column_exprs);
@@ -155,6 +160,13 @@ protected:
   int add_all_partition_key_columns_to_stmt(const TableItem &table_item,
                                              common::ObIArray<ObColumnRefRawExpr*> &column_ids,
                                              ObDMLStmt *stmt = NULL);
+  int add_all_unique_key_columns_to_stmt(const TableItem &table_item,
+                                         common::ObIArray<ObColumnRefRawExpr*> &column_exprs);
+  int add_all_time_columns_to_stmt(const TableItem &table_item,
+                                   common::ObIArray<ObColumnRefRawExpr*> &column_exprs);
+  int add_all_mlog_columns_to_stmt(const TableItem &table_item,
+                                   common::ObIArray<ObColumnRefRawExpr*> &column_exprs);
+
   // check the update view is key preserved
   int uv_check_key_preserved(const TableItem &table_item, bool &key_preserved);
 
@@ -168,7 +180,7 @@ protected:
   int resolve_check_constraints(const TableItem* table_item,
                                 common::ObIArray<ObRawExpr*> &check_exprs);
   int resolve_view_check_exprs(uint64_t table_id,
-                               const TableItem* table_item,
+                               TableItem* table_item,
                                const bool cascaded,
                                common::ObIArray<ObRawExpr*> &check_exprs);
   int get_pullup_column_map(ObDMLStmt &stmt,
@@ -176,7 +188,10 @@ protected:
                             uint64_t table_id,
                             ObIArray<ObRawExpr *> &view_columns,
                             ObIArray<ObRawExpr *> &base_columns);
-  
+  int replace_ref_query_stmt(ObIArray<ObRawExpr *> &exprs,
+                             ObRawExprCopier &copier);
+  int recursive_replace_ref_query_stmt(ObRawExpr *&expr,
+                                       ObRawExprCopier &copier);
   int view_pullup_column_ref_exprs_recursively(ObRawExpr *&expr,
                                                uint64_t view_table_id,
                                                uint64_t base_table_id,
@@ -210,7 +225,9 @@ protected:
                               bool& is_all_default);
   int build_row_for_empty_brackets(common::ObArray<ObRawExpr*> &value_row,
                                    ObInsertTableInfo& table_info);
-
+  int check_vec_hnsw_index_vid_opt(const ObTableAssignment &ta,
+                                   const ObTableSchema *table_schema,
+                                   bool &is_vec_hnsw_index_vid_opt);
   int check_update_part_key(const ObTableAssignment &ta,
                             uint64_t ref_table_id,
                             bool &is_updated,
@@ -266,6 +283,7 @@ protected:
                                                     ObIArray<uint64_t>& the_missing_label_se_columns,
                                                     ObIArray<ObRawExpr*> &value_row);
   virtual int resolve_insert_update_assignment(const ParseNode *node, ObInsertTableInfo& table_info);
+  int check_insertup_assignment_need_calc(const ObRawExpr *raw_expr, bool &need_calc);
   int add_relation_columns(ObIArray<ObTableAssignment> &table_assigns);
   virtual int replace_column_ref(common::ObArray<ObRawExpr*> *value_row,
                                  ObRawExpr *&expr,
@@ -273,7 +291,6 @@ protected:
   int get_label_se_columns(ObInsertTableInfo& table_info, ObIArray<uint64_t>& label_se_columns);
   int prune_columns_for_ddl(const TableItem &table_item,
                             ObIArray<ObColumnRefRawExpr*> &column_exprs);
-  int replace_column_ref_for_check_constraint(ObInsertTableInfo& table_info, ObRawExpr *&expr);
   int add_default_sequence_id_to_stmt(const uint64_t table_id);
   int check_need_match_all_params(const common::ObIArray<ObColumnRefRawExpr*> &value_desc, bool &need_match);
   int build_autoinc_param(
@@ -294,6 +311,7 @@ protected:
   int is_external_table_partition_column(const TableItem &table_item,
                                          uint64_t column_id,
                                          bool &is_part_column);
+  int check_value_row_all_simple_const(const ObIArray<ObRawExpr*> &value_row, bool &all_const);
 
 private:
   common::hash::ObPlacementHashSet<uint64_t, 4229> insert_column_ids_;

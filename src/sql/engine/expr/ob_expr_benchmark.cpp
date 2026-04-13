@@ -102,7 +102,6 @@ int ObExprBenchmark::eval_benchmark_batch(const ObExpr &expr,
       if (skip.at(j) || eval_flags.at(j)) {
         continue;
       }
-      eval_flags.set(j);
       result[j].set_null();
     }
     if (!loop_count->is_null() && loop_count->get_int() < 0) {
@@ -124,7 +123,6 @@ int ObExprBenchmark::eval_benchmark_batch(const ObExpr &expr,
           OZ (clear_all_flags(exprs_to_clear, ctx));
           OZ (expr.args_[1]->eval_batch(ctx, skip, batch_size));
         }
-        OX (eval_flags.set(j));
         OX (result[j].set_int32(0));
       }
     }
@@ -139,7 +137,7 @@ int ObExprBenchmark::collect_exprs(common::ObIArray<ObExpr *> &exprs,
   int ret = OB_SUCCESS;
   for (int64_t i = 0; OB_SUCC(ret) && i < root_expr.arg_cnt_; ++i) {
     ObEvalInfo &eval_flag = root_expr.args_[i]->get_eval_info(ctx);
-    if (!eval_flag.evaluated_) {
+    if (!eval_flag.is_evaluated(ctx)) {
       OZ (exprs.push_back(root_expr.args_[i]));
       OZ (SMART_CALL(collect_exprs(exprs, *root_expr.args_[i], ctx)));
     }

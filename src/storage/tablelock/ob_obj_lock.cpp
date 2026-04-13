@@ -13,7 +13,7 @@
 #define USING_LOG_PREFIX TABLELOCK
 
 #include "ob_obj_lock.h"
-#include "storage/memtable/ob_lock_wait_mgr.h"
+#include "storage/lock_wait_mgr/ob_lock_wait_mgr.h"
 #include "storage/tx/ob_trans_service.h"
 #include "storage/tablelock/ob_lock_memtable.h"
 #include "storage/tablelock/ob_table_lock_deadlock.h"
@@ -25,6 +25,7 @@ namespace oceanbase
 using namespace common;
 using namespace storage;
 using namespace memtable;
+using namespace lockwaitmgr;
 using namespace share;
 using namespace palf;
 
@@ -85,7 +86,7 @@ int ObTableLockOpLinkNode::get_table_lock_store_info(ObTableLockOp &info)
   return ret;
 }
 
-ObOBJLock::ObOBJLock(const ObLockID &lock_id) : lock_id_(lock_id), priority_queue_()
+ObOBJLock::ObOBJLock(const ObLockID &lock_id) : rwlock_(common::ObLatchIds::OB_OBJ_LOCK_RWLOCK), lock_id_(lock_id), priority_queue_()
 {
   is_deleted_ = false;
   row_share_ = 0;
@@ -163,15 +164,15 @@ int ObOBJLock::slow_lock(
   bool conflict_with_dml_lock = false;
   const bool is_two_phase_lock = param.is_two_phase_lock_;
   const int64_t trans_id_value = lock_op.create_trans_id_;
-  bool enable_lock_priority = false;
+  bool enable_lock_priority = true;
   const ObTableLockPriority priority = param.lock_priority_;
   omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
-  if (!tenant_config.is_valid()) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("tenant config is invalid", K(ret), K(lock_op));
-  } else {
-    enable_lock_priority = tenant_config->enable_lock_priority;
-  }
+  // if (!tenant_config.is_valid()) {
+  //   ret = OB_ERR_UNEXPECTED;
+  //   LOG_WARN("tenant config is invalid", K(ret), K(lock_op));
+  // } else {
+  //   enable_lock_priority = tenant_config->enable_lock_priority;
+  // }
   // case 1, if it is two phase lock, must check first
   // case 2, if enable_lock_priority is true, must check first (for dml)
   // NOTE that we set enable_lock_priority to false to avoid unexpected cases
@@ -563,14 +564,14 @@ int ObOBJLock::fast_lock(
   const bool is_two_phase_lock = param.is_two_phase_lock_;
   const int64_t trans_id_value = lock_op.create_trans_id_;
   const ObTableLockPriority priority = param.lock_priority_;
-  bool enable_lock_priority = false;
+  bool enable_lock_priority = true;
   int64_t abs_timeout_us = ObTimeUtility::current_time() + DEFAULT_RWLOCK_TIMEOUT_US;
   if (param.expired_time_ != 0) {
     abs_timeout_us = std::min(param.expired_time_, abs_timeout_us);
   }
-  if (OB_FAIL(check_enable_lock_priority_(enable_lock_priority))) {
-    LOG_WARN("check enable lock priority failed", K(ret), K(lock_op));
-  }
+  // if (OB_FAIL(check_enable_lock_priority_(enable_lock_priority))) {
+  //   LOG_WARN("check enable lock priority failed", K(ret), K(lock_op));
+  // }
   // case 1, if it is two phase lock, must check first
   // case 2, if enable_lock_priority is true, must check first (for dml)
   // NOTE that we set enable_lock_priority to false to avoid unexpected cases
@@ -2362,14 +2363,15 @@ int ObOBJLock::register_into_deadlock_detector_(const ObStoreCtx &ctx,
   ObAddr parent_addr;
   const ObLSID &ls_id = ctx.ls_id_;
   const int64_t priority = ~(ctx.mvcc_acc_ctx_.tx_desc_->get_active_ts());
+  transaction::SessionIDPair sess_id_pair;
   tx_lock_part_id.lock_id_ = lock_op.lock_id_;
   tx_lock_part_id.trans_id_ = lock_op.create_trans_id_;
   if (OB_FAIL(ObTableLockDeadlockDetectorHelper::register_trans_lock_part(
       tx_lock_part_id, ls_id, priority))) {
     LOG_WARN("register trans lock part failed", K(ret), K(tx_lock_part_id),
              K(ls_id));
-  } else if (OB_FAIL(ObTransDeadlockDetectorAdapter::get_trans_scheduler_info_on_participant(
-      tx_lock_part_id.trans_id_, ls_id, parent_addr))) {
+  } else if (OB_FAIL(ObTransDeadlockDetectorAdapter::get_trans_info_on_participant(
+      tx_lock_part_id.trans_id_, ls_id, parent_addr, sess_id_pair))) {
     LOG_WARN("get scheduler address failed", K(tx_lock_part_id), K(ls_id));
   } else if (OB_FAIL(ObTableLockDeadlockDetectorHelper::add_parent(
       tx_lock_part_id, parent_addr, lock_op.create_trans_id_))) {

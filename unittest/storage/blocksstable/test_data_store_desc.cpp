@@ -80,11 +80,11 @@ TEST_F(TestObDataStoreDesc, test_static_desc)
   ASSERT_EQ(OB_INVALID_ARGUMENT,
             static_desc.init(false/*is_ddl*/, table_schema, mock_ls_id_, mock_tablet_id_, 0 /*transfer_seq*/,
                              MINI_MERGE, snapshot, share::SCN::invalid_scn(),
-                             1 /*cluster_version*/, EXEC_MODE_LOCAL, false /* micro_index_clustered */, share::SCN::min_scn()/*reorganization_scn*/));
+                             1 /*cluster_version*/, EXEC_MODE_LOCAL, false /* micro_index_clustered */, 0/* concurrent_cnt */, share::SCN::min_scn()/*reorganization_scn*/));
   ASSERT_EQ(OB_SUCCESS,
             static_desc.init(false/*is_ddl*/, table_schema, mock_ls_id_, mock_tablet_id_, 0 /*transfer_seq*/,
                              MINI_MERGE, snapshot, scn, 1 /*cluster_version*/,
-                             EXEC_MODE_LOCAL, false /* micro_index_clustered */, share::SCN::min_scn()/*reorganization_scn*/));
+                             EXEC_MODE_LOCAL, false /* micro_index_clustered */, 0/*concurrent_cnt*/, share::SCN::min_scn()/*reorganization_scn*/));
   ASSERT_TRUE(static_desc.is_valid());
 
   ASSERT_EQ(static_desc.is_ddl_, false);
@@ -102,7 +102,8 @@ TEST_F(TestObDataStoreDesc, test_static_desc)
   ObStaticDataStoreDesc static_desc2;
   ASSERT_EQ(OB_SUCCESS,
             static_desc2.init(true/*is_ddl*/, table_schema, mock_ls_id_, mock_tablet_id_, 0 /*transfer_seq*/,
-                             MAJOR_MERGE, snapshot, scn, DATA_VERSION_4_2_0_0, EXEC_MODE_LOCAL, false /* micro_index_clustered */, share::SCN::min_scn()/*reorganization_scn*/));
+                             MAJOR_MERGE, snapshot, scn, DATA_VERSION_4_2_0_0, EXEC_MODE_LOCAL, false /* micro_index_clustered */,
+                             0 /*concurrent_cnt*/, share::SCN::min_scn()/*reorganization_scn*/));
   ASSERT_TRUE(static_desc2.is_valid());
 
   ASSERT_EQ(static_desc2.is_ddl_, true);
@@ -136,8 +137,12 @@ TEST_F(TestObDataStoreDesc, test_col_desc)
   ObTableSchema table_schema;
   TestSchemaPrepare::prepare_schema(table_schema, rowkey_cnt, col_cnt);
 
+  ObStaticDataStoreDesc static_desc;
+  static_desc.major_working_cluster_version_ = DATA_VERSION_4_3_2_0;
+  static_desc.merge_engine_type_ = ObMergeEngineType::OB_MERGE_ENGINE_PARTIAL_UPDATE;
+  static_desc.merge_type_ = MAJOR_MERGE;
   ASSERT_FALSE(col_desc.is_valid());
-  ASSERT_EQ(OB_SUCCESS, col_desc.init(true/*is_major*/, table_schema, 0/*table_cg_idx*/, DATA_VERSION_4_3_2_0));
+  ASSERT_EQ(OB_SUCCESS, col_desc.init(table_schema, 0/*table_cg_idx*/, static_desc));
   ASSERT_TRUE(col_desc.is_valid());
 
   ASSERT_EQ(true, col_desc.is_row_store_);
@@ -162,6 +167,7 @@ TEST_F(TestObDataStoreDesc, test_whole_data_desc)
                             MAJOR_MERGE, snapshot, DATA_VERSION_4_2_0_0,
                             table_schema.get_micro_index_clustered(),
                             0 /*transfer_seq*/,
+                            0 /*concurrent_cnt*/,
                             share::SCN::min_scn()/*reorganization_scn*/,
                             share::SCN::invalid_scn()));
   ASSERT_TRUE(whole_desc.is_valid());
@@ -172,11 +178,13 @@ TEST_F(TestObDataStoreDesc, test_whole_data_desc)
             static_desc.init(false/*is_ddl*/, table_schema, mock_ls_id_, mock_tablet_id_, 0 /*transfer_seq*/,
                              MINI_MERGE, snapshot,
                              share::SCN::invalid_scn(), 0/*cluster_version*/, EXEC_MODE_LOCAL, false /* micro_index_clustered */,
+                             0 /*concurrent_cnt*/,
                              share::SCN::min_scn()/*reorganization_scn*/));
   ASSERT_EQ(OB_SUCCESS,
             static_desc.init(false/*is_ddl*/, table_schema, mock_ls_id_, mock_tablet_id_, 0 /*transfer_seq*/,
                              MAJOR_MERGE, snapshot,
                              share::SCN::invalid_scn(), DATA_VERSION_4_2_0_0, EXEC_MODE_LOCAL, false /* micro_index_clustered */,
+                             0 /*concurrent_cnt*/,
                              share::SCN::min_scn()/*reorganization_scn*/));
   whole_desc.desc_.static_desc_ = &static_desc;
   ASSERT_FALSE(whole_desc.is_valid());
@@ -196,7 +204,7 @@ TEST_F(TestObDataStoreDesc, gen_index_desc)
             data_desc.init(false/*is_ddl*/, table_schema, mock_ls_id_, mock_tablet_id_,
                              MAJOR_MERGE, snapshot, 1/*clsuter_version*/,
                              table_schema.get_micro_index_clustered(),
-                             0 /*transfer_seq*/, share::SCN::min_scn()/*reorganization_scn*/));
+                             0 /*transfer_seq*/, 0/*concurrent_cnt*/, share::SCN::min_scn()/*reorganization_scn*/));
   ASSERT_TRUE(data_desc.is_valid());
   const ObDataStoreDesc &data_store_desc = data_desc.get_desc();
 
@@ -230,7 +238,7 @@ TEST_F(TestObDataStoreDesc, test_cg)
             static_desc.init(false/*is_ddl*/, table_schema, mock_ls_id_, mock_tablet_id_, 0 /*transfer_seq*/,
                              MAJOR_MERGE, snapshot, share::SCN::invalid_scn(),
                              DATA_VERSION_4_3_2_0/*cluster_version*/, EXEC_MODE_LOCAL, false /* micro_index_clustered */,
-                             share::SCN::min_scn()/*reorganization_scn*/));
+                             0 /*concurrent_cnt*/, share::SCN::min_scn()/*reorganization_scn*/));
   ASSERT_TRUE(static_desc.is_valid());
 
   const ObIArray<ObStorageColumnGroupSchema> &column_groups = storage_schema.get_column_groups();

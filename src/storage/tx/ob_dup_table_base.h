@@ -546,16 +546,27 @@ struct DupTableDurableLease
 {
   int64_t request_ts_;
   int64_t lease_interval_us_;
+  union  LeaseFlag {
+    int64_t flag_val_;
+    struct {
+      bool is_new_lease_;
+
+      TO_STRING_KV(K(is_new_lease_));
+    } flag_bit_;
+  } flag_;
 
   void reset()
   {
     request_ts_ = -1;
     lease_interval_us_ = -1;
+    memset(&flag_.flag_val_, 0, sizeof(flag_.flag_val_));
   }
+
+  bool is_valid() { return request_ts_ >= 0 && lease_interval_us_ >= 0; }
 
   DupTableDurableLease() { reset(); }
 
-  TO_STRING_KV(K(request_ts_), K(lease_interval_us_));
+  TO_STRING_KV(K(request_ts_), K(lease_interval_us_), K(flag_.flag_bit_));
 
   OB_UNIS_VERSION(1);
 };
@@ -866,11 +877,11 @@ public:
     OB_UNIS_VERSION(1);
   };
 
-  TO_STRING_KV(K(dup_ls_meta_), K(lease_log_rec_scn_), K(start_replay_scn_),
+  TO_STRING_KV(K(dup_ls_meta_), K(lease_log_rec_scn_), K(tablet_log_rec_scn_), K(start_replay_scn_),
                K(readable_ckpt_base_scn_is_accurate_));
 
 public:
-  ObDupTableLSCheckpoint() { reset(); }
+  ObDupTableLSCheckpoint() : ckpt_rw_lock_(common::ObLatchIds::OB_DUP_TABLE_CKPT_RW_LOCK) { reset(); }
   void default_init(const share::ObLSID &ls_id) { dup_ls_meta_.ls_id_ = ls_id; }
 
   bool is_useful_meta() const;
@@ -895,6 +906,7 @@ public:
   {
     dup_ls_meta_.reset();
     lease_log_rec_scn_.reset();
+    tablet_log_rec_scn_.reset();
     start_replay_scn_.reset();
     readable_ckpt_base_scn_is_accurate_ = true;
   }
@@ -903,6 +915,7 @@ private:
   SpinRWLock ckpt_rw_lock_;
   ObLSDupTableMeta dup_ls_meta_;
   share::SCN lease_log_rec_scn_;
+  share::SCN tablet_log_rec_scn_;
   share::SCN start_replay_scn_;
   // ckpt_base_scn means, when replay dup log with base_scn,
   // this node cotain all readable set the same with leader.
@@ -993,7 +1006,8 @@ public:
                         ObDupTableLSLeaseMgr *lease_mgr,
                         ObLSDupTabletsMgr *tablets_mgr,
                         DupTableInterfaceStat *interface_stat)
-      : ls_id_(ls_id), block_buf_(nullptr), log_handler_(log_handler), dup_ls_ckpt_(dup_ls_ckpt),
+      : log_lock_(common::ObLatchIds::OB_DUP_TABLE_LOG_LOCK),
+        ls_id_(ls_id), block_buf_(nullptr), log_handler_(log_handler), dup_ls_ckpt_(dup_ls_ckpt),
         lease_mgr_ptr_(lease_mgr), tablet_mgr_ptr_(tablets_mgr), interface_stat_ptr_(interface_stat)
   {
     reset();

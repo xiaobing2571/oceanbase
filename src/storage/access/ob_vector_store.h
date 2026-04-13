@@ -41,6 +41,7 @@ public:
   virtual ~ObVectorStore();
   virtual int init(const ObTableAccessParam &param, common::hash::ObHashSet<int32_t> *agg_col_mask = nullptr) override;
   virtual void reset() override;
+  virtual void reuse() override;
   // shallow copy
   virtual int fill_rows(
       const int64_t group_idx,
@@ -57,10 +58,15 @@ public:
       eval_ctx_.set_batch_idx(0);
     }
   }
+  OB_INLINE bool can_refresh() const override
+  {
+    return !is_aggregated_in_prefetch_ && (nullptr == group_by_cell_ || group_by_cell_->can_refresh());
+  }
   OB_INLINE int64_t get_row_count() { return count_; }
   OB_INLINE ObGroupByCellBase *get_group_by_cell() { return group_by_cell_; }
   virtual int reuse_capacity(const int64_t capacity) override;
   virtual bool is_empty() const override final { return 0 == count_; }
+  int reuse_for_refresh_table() override;
   DECLARE_VIRTUAL_TO_STRING;
 protected:
   int fill_group_idx(const int64_t group_idx);
@@ -69,9 +75,7 @@ protected:
       blocksstable::ObIMicroBlockRowScanner &scanner,
       int64_t &begin_index,
       const int64_t end_index,
-      const ObFilterResult &res,
-      const bool need_set_end = true,
-      const bool need_init_vector = true);
+      const ObFilterResult &res);
   int fill_group_by_rows(
       const int64_t group_idx,
       blocksstable::ObIMicroBlockReader *reader,
@@ -96,6 +100,7 @@ protected:
       bool &is_agg_mask) const;
   int alloc_group_by_cell(const ObTableAccessParam &param);
   int check_need_group_by(const ObTableAccessParam &param);
+  int fill_group_by_col_lob_locator(const bool has_lob_out_row);
 
   int64_t count_;
   // exprs needed fill in

@@ -35,11 +35,14 @@ int SET_GROUP_ID(uint64_t group_id, bool is_background)
 
   // to do switch group
 
+  if (GET_ORIGIN_TENANT_ID() != MTL_ID()) {
+    LOG_TRACE("thread maybe change to other tenant dir", K(group_id), K(GET_GROUP_ID()), K(MTL_ID()), K(GET_ORIGIN_TENANT_ID()), K(lbt()));
+  }
   THIS_WORKER.set_group_id_(group_id);
   int tmp_ret = OB_SUCCESS;
   if (OB_NOT_NULL(GCTX.cgroup_ctrl_) &&
-      OB_TMP_FAIL(GCTX.cgroup_ctrl_->add_self_to_cgroup_(MTL_ID(), group_id, is_background))) {
-    LOG_WARN("add self to cgroup fail", K(ret), K(MTL_ID()), K(group_id));
+      OB_TMP_FAIL(GCTX.cgroup_ctrl_->add_self_to_cgroup_(GET_ORIGIN_TENANT_ID(), group_id, is_background))) {
+    LOG_WARN("add self to cgroup fail", K(ret), K(GET_ORIGIN_TENANT_ID()), K(MTL_ID()), K(group_id));
   }
   return ret;
 }
@@ -47,6 +50,12 @@ int SET_GROUP_ID(uint64_t group_id, bool is_background)
 int CONVERT_FUNCTION_TYPE_TO_GROUP_ID(const uint8_t function_type, uint64_t &group_id)
 {
   return G_RES_MGR.get_mapping_rule_mgr().get_group_id_by_function_type(MTL_ID(), function_type, group_id);
+}
+
+bool is_global_background_resource_isolation_enabled()
+{
+  // Check the GCONF configuration
+  return GCONF.enable_global_background_resource_isolation;
 }
 
 }  // namespace lib
@@ -166,6 +175,9 @@ bool ObCgroupCtrl::check_cgroup_status()
     if (OB_TMP_FAIL(check_cgroup_root_dir())) {
       LOG_WARN_RET(tmp_ret, "check cgroup root dir failed", K(tmp_ret));
       valid_ = false;
+    } else if (OB_TMP_FAIL(check_pid_in_procs())) { // In case pid is moved out of other/procs
+      LOG_WARN_RET(tmp_ret, "check pid in other/procs failed", K(tmp_ret));
+      valid_ = false;
     }
   } else if (GCONF.enable_cgroup == false && is_valid() == true) {
     valid_ = false;
@@ -217,6 +229,26 @@ int ObCgroupCtrl::check_cgroup_root_dir()
     // access denied
     ret = OB_ERR_SYS;
     LOG_WARN("no permission to access", K(OBSERVER_ROOT_CGROUP_DIR), K(ret));
+  }
+  return ret;
+}
+
+int ObCgroupCtrl::check_pid_in_procs()
+{
+  int ret = OB_SUCCESS;
+  int64_t pid = getpid();
+  int64_t pid_value = 0;
+  char pid_value_str[VALUE_BUFSIZE + 1];
+
+  if (OB_FAIL(get_cgroup_config_(OTHER_CGROUP_DIR, CGROUP_PROCS_FILE, pid_value_str))) {
+    LOG_WARN("get pid from procs failed", K(ret), K(OTHER_CGROUP_DIR));
+  } else {
+    pid_value_str[VALUE_BUFSIZE] = '\0';
+    pid_value = atoi(pid_value_str);
+    if (pid_value != pid) {
+      ret = OB_ERR_SYS;
+      LOG_WARN("pid not exist in other/procs", K(pid), K(pid_value), K(ret));
+    }
   }
   return ret;
 }
@@ -291,6 +323,18 @@ int ObCgroupCtrl::remove_dir_(const char *curr_dir)
   if (OB_SUCCESS != ret) {
   } else if (OB_FAIL(FileDirectoryUtils::delete_directory(curr_dir))) {
     LOG_WARN("remove group directory failed", K(ret), K(curr_dir));
+    if (ret == OB_IO_ERROR && errno == EBUSY) {
+      int tmp_ret = OB_SUCCESS;
+      char task_file_path[PATH_BUFSIZE];
+      char task_buf[TASKS_BUFSIZE + 1];
+      snprintf(task_file_path, PATH_BUFSIZE, "%s/%s", curr_dir, TASKS_FILE);
+      if (OB_TMP_FAIL(get_string_from_file_(task_file_path, task_buf))) {
+        LOG_WARN("dump cgroup task file failed", K(tmp_ret), K(task_file_path));
+      } else {
+        task_buf[TASKS_BUFSIZE] = '\0';
+        LOG_WARN("cgroup task file content", K(curr_dir), K(task_file_path), K(task_buf));
+      }
+    }
   } else {
     LOG_INFO("remove group directory success", K(curr_dir));
   }
@@ -563,6 +607,7 @@ int ObCgroupCtrl::set_cgroup_config_(const char *group_path, const char *config_
 {
   int ret = OB_SUCCESS;
   char config_path[PATH_BUFSIZE];
+  const int64_t start_ts = ObTimeUtility::fast_current_time();
   snprintf(config_path, PATH_BUFSIZE, "%s/%s", group_path, config_name);
   bool exist_cgroup = false;
   if (OB_FAIL(check_cgroup_root_dir())) {
@@ -573,6 +618,11 @@ int ObCgroupCtrl::set_cgroup_config_(const char *group_path, const char *config_
     LOG_WARN("init tenant cgroup dir failed", K(ret), K(group_path));
   } else if (OB_FAIL(write_string_to_file_(config_path, config_value))) {
     LOG_WARN("set cgroup config failed", K(ret), K(config_path), K(config_value));
+  }
+  const int64_t used_ts = ObTimeUtility::fast_current_time() - start_ts;
+  if (used_ts > 100 * 1000) {
+    LOG_WARN("set cgroup config cost too much time", K(ret),
+        K(used_ts), KP(group_path), KP(config_name), KP(config_value));
   }
   return ret;
 }
@@ -785,7 +835,10 @@ int ObCgroupCtrl::set_cpu_cfs_quota_by_path_(const char *group_path, const doubl
             K(cfs_period_us_new));
       } else {
         cfs_period_us = cfs_period_us_new;
-        if (-1 == cpu || cpu >= INT32_MAX / cfs_period_us) {
+        if (cfs_period_us <= 0) {
+          cfs_quota_us = -1;
+          LOG_WARN("get wrong cfs_period_us, use no limit", K(cfs_quota_us), K(cfs_period_us), K(group_path));
+        } else if (-1 == cpu || cpu >= INT32_MAX / cfs_period_us) {
           cfs_quota_us = -1;
         } else {
           cfs_quota_us = static_cast<int32_t>(cfs_period_us * cpu);
@@ -831,7 +884,12 @@ int ObCgroupCtrl::get_cpu_cfs_quota_by_path_(const char *group_path, double &cpu
     } else {
       cfs_period_value[VALUE_BUFSIZE] = '\0';
       int32_t cfs_period_us = atoi(cfs_period_value);
-      cpu = 1.0 * cfs_quota_us / cfs_period_us;
+      if (cfs_period_us > 0) {
+        cpu = 1.0 * cfs_quota_us / cfs_period_us;
+      } else {
+        cpu = -1;
+        LOG_WARN("get wrong cfs_period_us, use no limit", K(cpu), K(cfs_period_us), K(group_path));
+      }
     }
   }
   return ret;

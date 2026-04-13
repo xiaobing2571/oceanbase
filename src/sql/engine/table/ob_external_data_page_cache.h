@@ -27,13 +27,18 @@ class ObExternalReadInfo;
 class ObExternalDataPageCacheKey : public common::ObIKVCacheKey
 {
 public:
-  ObExternalDataPageCacheKey(const common::ObIOFd &fd, int64_t modify_time, int64_t offset, uint64_t tenant_id):
-    fd_(fd), modify_time_(modify_time), offset_(offset), tenant_id_(tenant_id)
-    {}
+  ObExternalDataPageCacheKey(const char *url, const int64_t url_size, const char *content_digest,
+                             const int64_t content_digest_size, const int64_t modify_time,
+                             const int64_t page_size, const int64_t offset,
+                             const uint64_t tenant_id) :
+    url_(url),
+    url_size_(url_size), content_digest_(content_digest), content_digest_size_(content_digest_size),
+    modify_time_(modify_time), page_size_(page_size), offset_(offset), tenant_id_(tenant_id)
+  {}
   ~ObExternalDataPageCacheKey() = default;
-  TO_STRING_KV(K_(fd), K_(modify_time), K_(offset), K_(tenant_id));
-  bool is_valid(const int64_t page_size) const;
+  bool is_valid() const;
 
+  DECLARE_TO_STRING;
 public: // override
   bool operator== (const ObIKVCacheKey &other) const override;
   uint64_t get_tenant_id() const override;
@@ -44,11 +49,16 @@ public: // override
       const int64_t buf_len,
       ObIKVCacheKey *&key) const override;
   void advance_offset(const int64_t inc_count) { offset_ += inc_count; }
+  int64_t get_page_size() const { return page_size_; }
 private:
   bool is_valid_() const;
 private:
-  common::ObIOFd fd_;
+  const char *url_;
+  const int64_t url_size_;
+  const char *content_digest_;
+  const int64_t content_digest_size_;
   int64_t modify_time_;
+  int64_t page_size_;
   int64_t offset_;
   uint64_t tenant_id_;
 };
@@ -67,11 +77,10 @@ public:
   char *get_buffer() { return buf_; }
   int64_t get_valid_data_size() const { return valid_data_size_; }
   void set_buffer(char *buf, const int64_t valid_data_size) { buf_ = buf; valid_data_size_ = valid_data_size; }
-  TO_STRING_KV(KP(buf_), K(page_size_));
+  TO_STRING_KV(KP(buf_), K(valid_data_size_));
 
 private:
   char *buf_;
-  const int64_t page_size_;
   int64_t valid_data_size_;
   DISALLOW_COPY_AND_ASSIGN(ObExternalDataPageCacheValue);
 };
@@ -99,7 +108,9 @@ class ObExternalDataPageCache : public common::ObKVCache<ObExternalDataPageCache
   ObExternalDataPageCache() {}
   ~ObExternalDataPageCache() {}
 public:
-  const static int64_t PAGE_SIZE = 64 * 1024;
+  const static int64_t MIN_PAGE_SIZE = 4 * 1024; // 4KB
+  const static int64_t MAX_PAGE_SIZE = 2 * 1024 * 1024; // 2MB
+  const static int64_t DEFAULT_PAGE_SIZE = 512 * 1024; // 512KB
   int init(
       const char *cache_name,
       const int64_t priority);
@@ -111,68 +122,13 @@ public:
       const ObExternalDataPageCacheKey &key,
       const ObExternalDataPageCacheValue &value);
   void destroy();
-private: // Icallback
-  class ObIExPageIOCallback : public common::ObIOCallback
-  {
-  public:
-    ObIExPageIOCallback(
-        const common::ObIOCallbackType type,
-        char *user_buf,
-        const int64_t user_buf_start_offset,
-        const int64_t user_buf_len,
-        ObExternalDataPageCache *cache);
-    virtual ~ObIExPageIOCallback();
-    int alloc_data_buf(
-        const char *io_data_buffer,
-        const int64_t data_size) override;
-    const char *get_data() override { return data_buf_; }
-    int set_allocator(ObIAllocator *alloc);
-  protected:
-    friend class ObExternalDataPageCache;
-    int process_kv_(
-        const ObExternalDataPageCacheKey &key,
-        const ObExternalDataPageCacheValue &value);
-    ObIAllocator *get_allocator() { return allocator_; }
-    VIRTUAL_TO_STRING_KV(KP_(cache), KP_(allocator), KP_(data_buf));
-  protected:
-    ObExternalDataPageCache *cache_;
-    common::ObIAllocator *allocator_; // self_allocator
-    char *data_buf_; // user buffer pointer of this callback
-    int64_t data_offset_; // user_buffer start offset
-    int64_t data_length_; // user_buffer length
-  };
-public: // public callback
-  class ObExCachedReadPageIOCallback final : public ObIExPageIOCallback
-  {
-  public:
-    ObExCachedReadPageIOCallback(
-        const ObExternalDataPageCacheKey &key,
-        char *user_buffer,
-        const int64_t user_buf_offset,
-        const int64_t user_data_len,
-        ObExternalDataPageCache *cache);
-    ~ObExCachedReadPageIOCallback() = default;
-    int64_t size() const override { return sizeof(*this); }
-    int inner_process(const char *data_buffer, const int64_t size) override;
-    const char *get_cb_name() const { return "ObExCachedReadPageIOCallback"; }
-    INHERIT_TO_STRING_KV("ObIExPageIOCallback", ObIExPageIOCallback, "callback_type:", "ObExCachedReadPageIOCallback", K_(page_key));
-    DISALLOW_COPY_AND_ASSIGN(ObExCachedReadPageIOCallback);
-  private:
-    int inner_process_cache_pages_(
-        const char *data_buffer,
-        const int64_t size);
-    int inner_process_user_bufer_(
-        const char *data_buffer,
-        const int64_t size);
-  private:
-    ObExternalDataPageCacheKey page_key_;
-  };
-
+  static int64_t get_page_size();
 private:
   DISALLOW_COPY_AND_ASSIGN(ObExternalDataPageCache);
 };
 
-class ObExtCacheMissSegment final {
+class ObExtCacheMissSegment final
+{
 public:
   ObExtCacheMissSegment():buf_(nullptr), offset_(-1), len_(-1) {}
   ~ObExtCacheMissSegment() { reset(); }
@@ -188,13 +144,74 @@ public:
   const char* get_buf() const { return buf_; }
   int64_t get_rd_offset() const { return  offset_; }
   int64_t get_rd_len() const { return len_; }
-  int64_t get_page_count() const;
-  int64_t get_page_offset() const;
+  int64_t get_page_count(const int64_t page_size) const;
+  int64_t get_page_offset(const int64_t page_size) const;
 private:
   char *buf_;
   int64_t offset_;
   int64_t len_;
 };
+
+class ObExCachedReadPageIOCallback final : public common::ObIOCallback
+{
+public:
+  /// @brief: safe construct interface.
+  /// @param self_buffer[out]: buffer of ObExternalReadInfo.
+  /// @param callback[out]: result callback
+  static int safe_construct(
+    const ObExternalDataPageCacheKey &page_key,
+    char *user_buffer,
+    const int64_t user_buf_offset,
+    const int64_t user_data_len,
+    const int64_t self_buffer_len,
+    ObExternalDataPageCache &cache,
+    ObIAllocator &allocator,
+    /*output*/void *&self_buffer,
+    /*output*/common::ObIOCallback *&callback);
+
+  ~ObExCachedReadPageIOCallback();
+  int64_t size() const override { return sizeof(*this); }
+  int inner_process(const char *data_buffer, const int64_t size) override;
+  const char *get_cb_name() const { return "ObExCachedReadPageIOCallback"; }
+  int alloc_data_buf(
+      const char *io_data_buffer,
+      const int64_t data_size) override;
+  const char *get_data() override { return data_buf_; }
+  int set_allocator(ObIAllocator *alloc);
+  ObIAllocator *get_allocator() { return allocator_; }
+
+  TO_STRING_KV(KP_(cache), KP_(allocator), KP_(data_buf), KP_(self_buf), K_(page_key));
+  DISALLOW_COPY_AND_ASSIGN(ObExCachedReadPageIOCallback);
+private:
+  ObExCachedReadPageIOCallback(
+      ObExternalDataPageCacheKey *key,
+      char *user_buffer,
+      void *self_buffer,
+      const int64_t user_buf_offset,
+      const int64_t user_data_len,
+      ObExternalDataPageCache *cache,
+      ObIAllocator *alloc);
+  bool is_valid_() const;
+  int inner_process_cache_pages_(
+      const char *data_buffer,
+      const int64_t size,
+      const int64_t page_size);
+  int inner_process_user_bufer_(
+      const char *data_buffer,
+      const int64_t size);
+  int process_kv_(
+      const ObExternalDataPageCacheKey &key,
+      const ObExternalDataPageCacheValue &value);
+private:
+  ObExternalDataPageCacheKey *page_key_;
+  ObExternalDataPageCache *cache_; // kv_cache
+  common::ObIAllocator *allocator_; // self_allocator, not user_buf allocator
+  void *self_buf_; // alloc for page_cache_read, useless in the whole process but notify io_manager how long the buffer should be allocate
+  char *data_buf_; // user buffer pointer
+  int64_t data_offset_; // user_buffer start offset
+  int64_t data_length_; // user_buffer length
+};
+
 
 } // namespace sql
 } // namespace oceanbase

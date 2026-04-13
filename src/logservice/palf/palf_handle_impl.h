@@ -81,6 +81,7 @@ public:
   LogConfigVersion config_version_;
   int64_t mode_version_;
   AccessMode access_mode_;
+  SyncMode sync_mode_;
   ObMemberList paxos_member_list_;
   int64_t paxos_replica_num_;
   common::ObMember arbitration_member_;
@@ -100,7 +101,7 @@ public:
   TO_STRING_KV(K_(self), K_(palf_id), K_(role), K_(log_proposal_id), K_(config_version), K_(mode_version),
       K_(access_mode), K_(paxos_member_list), K_(paxos_replica_num), K_(learner_list), K_(allow_vote), K_(replica_type),
       K_(begin_lsn), K_(begin_scn), K_(base_lsn), K_(end_lsn), K_(end_scn), K_(max_lsn), K_(max_scn),
-      K_(is_in_sync), K_(is_need_rebuild));
+      K_(is_in_sync), K_(is_need_rebuild), K_(sync_mode));
 };
 
 struct PalfDiagnoseInfo {
@@ -306,6 +307,13 @@ public:
   //  OB_NOT_MASTER : 本副本当前不是leader，无法接受切主请求
   virtual int change_leader_to(const common::ObAddr &dest_addr) = 0;
 
+  virtual int get_global_learner_list(common::GlobalLearnerList &learner_list) const = 0;
+  virtual int get_paxos_member_list(common::ObMemberList &member_list, int64_t &paxos_replica_num, const bool &filter_logonly_replica = false) const = 0;
+  virtual int get_config_version(LogConfigVersion &config_version) const = 0;
+  virtual int get_paxos_member_list_and_learner_list(common::ObMemberList &member_list,
+                                                     int64_t &paxos_replica_num,
+                                                     common::GlobalLearnerList &learner_list,
+                                                     const bool &filter_logonly_replica = false) const = 0;
   virtual int get_election_leader(common::ObAddr &addr) const = 0;
   virtual int get_parent(common::ObAddr &parent) const = 0;
 
@@ -639,6 +647,11 @@ public:
                        LogIOContext &io_ctx) = 0;
   virtual int try_handle_next_submit_log() = 0;
   virtual int fill_cache_when_slide(const LSN &read_begin_lsn, const int64_t in_read_size) = 0;
+  virtual int get_io_statistic_info(int64_t &last_working_time,
+                                    int64_t &last_write_size,
+                                    int64_t &accum_write_size,
+                                    int64_t &accum_write_count,
+                                    int64_t &accum_write_rt) const = 0;
   DECLARE_PURE_VIRTUAL_TO_STRING;
 };
 
@@ -711,15 +724,17 @@ public:
   int get_palf_id(int64_t &palf_id) const override final;
   int change_leader_to(const common::ObAddr &dest_addr) override final;
   int get_global_learner_list(common::GlobalLearnerList &learner_list) const override final;
-  int get_paxos_member_list(common::ObMemberList &member_list, int64_t &paxos_replica_num) const override final;
+  int get_paxos_member_list(common::ObMemberList &member_list, int64_t &paxos_replica_num, const bool &filter_logonly_member = false) const override final;
   int get_config_version(LogConfigVersion &config_version) const;
   int get_paxos_member_list_and_learner_list(common::ObMemberList &member_list,
                                              int64_t &paxos_replica_num,
-                                             common::GlobalLearnerList &learner_list) const override final;
+                                             common::GlobalLearnerList &learner_list,
+                                             const bool &filter_logonly_member = false) const override final;
   int get_stable_membership(LogConfigVersion &config_version,
                             common::ObMemberList &member_list,
                             int64_t &paxos_replica_num,
-                            common::GlobalLearnerList &learner_list) const override final;
+                            common::GlobalLearnerList &learner_list,
+                            const bool &filter_logonly_member = false) const override final;
   int get_election_leader(common::ObAddr &addr) const;
   int get_parent(common::ObAddr &parent) const;
   int force_set_as_single_replica() override final;
@@ -1005,6 +1020,11 @@ public:
 
   int diagnose(PalfDiagnoseInfo &diagnose_info) const;
   int update_palf_stat() override final;
+  int get_io_statistic_info(int64_t &last_working_time,
+                            int64_t &last_write_size,
+                            int64_t &accum_write_size,
+                            int64_t &accum_write_count,
+                            int64_t &accum_write_rt) const override final;
   TO_STRING_KV(K_(palf_id), K_(self), K_(has_set_deleted));
 
 private:
@@ -1129,6 +1149,8 @@ private:
   int get_election_leader_without_lock_(ObAddr &addr) const;
   int update_self_region_();
   int force_set_member_list_(const common::ObMemberList &new_member_list, const int64_t new_replica_num);
+  int inc_config_version(int64_t timeout_us) override final;
+
   // ========================= flashback ==============================
   int can_do_flashback_(const int64_t mode_version,
                         const share::SCN &flashback_scn,

@@ -57,4 +57,20 @@ DEF_COMPAT_CONTROL_FEATURE(OUT_ANONYMOUS_COLLECTION_IS_ALLOW,
     "type which is not empty for inout anonymous array which used in anonymous block",
     MOCK_CLUSTER_VERSION_4_2_5_5, CLUSTER_VERSION_4_3_0_0,
     MOCK_CLUSTER_VERSION_4_3_5_3)
+
+DEF_COMPAT_CONTROL_FEATURE(IMPLICIT_FIRST_CENTURY_YEAR,
+    "The result of cast('x-xx-xx', date) is different in ob and MySQL",
+    MOCK_CLUSTER_VERSION_4_2_5_5, CLUSTER_VERSION_4_3_0_0,
+    MOCK_CLUSTER_VERSION_4_3_5_4)
+
+DEF_COMPAT_CONTROL_FEATURE(PLSQL_CAN_TRANSFORM_SQL_TO_ASSIGN,
+    "Whether can transform the PL/SQL select into from dual statement to an assignment statement",
+    MOCK_CLUSTER_VERSION_4_4_2_0)
+
+DEF_COMPAT_CONTROL_FEATURE(EXTERNAL_COLUMN_NAME_CASE_INSENSITIVE,
+    "Whether column name mapping in Parquet/ORC file is case insensitive",
+    CLUSTER_VERSION_4_5_0_0)
+DEF_COMPAT_CONTROL_FEATURE(DEFAULT_CSV_ESCAPE_CHAR_IS_NONE,
+    "Whether the default CSV escape character is none",
+    CLUSTER_VERSION_4_5_1_0)
 #endif

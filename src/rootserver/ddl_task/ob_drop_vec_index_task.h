@@ -36,6 +36,7 @@ public:
       const ObVecIndexDDLChildTaskInfo &domain_index,
       const ObVecIndexDDLChildTaskInfo &vec_delta_buffer,
       const ObVecIndexDDLChildTaskInfo &vec_index_snapshot_data,
+      const ObVecIndexDDLChildTaskInfo &hybrid_embedded_vec,
       const int64_t schema_version,
       const int64_t consumer_group_id,
       const uint64_t tenant_data_version,
@@ -61,7 +62,7 @@ public:
                                         const ObDDLTaskInfo &addition_info);
 
   INHERIT_TO_STRING_KV("ObDDLTask", ObDDLTask, K_(rowkey_vid), K_(vid_rowkey), K_(domain_index), K_(vec_index_id),
-                      K_(vec_index_snapshot_data), K(wait_trans_ctx_));
+                      K_(vec_index_snapshot_data), K_(hybrid_embedded_vec), K(wait_trans_ctx_));
 private:
   static const int64_t OB_DROP_VEC_INDEX_TASK_VERSION = 1;
   int deep_copy_index_arg(common::ObIAllocator &allocator,
@@ -69,7 +70,6 @@ private:
                           obrpc::ObDropIndexArg &dst_index_arg);
   int check_switch_succ();
   int prepare(const share::ObDDLTaskStatus &status);
-  int check_and_wait_finish(const share::ObDDLTaskStatus &status);
   int release_snapshot(const int64_t snapshot_version);
   int wait_trans_end(const share::ObDDLTaskStatus next_task_status);
   int obtain_snapshot(const share::ObDDLTaskStatus next_task_status);
@@ -87,14 +87,14 @@ private:
       const common::ObIArray<ObVecIndexDDLChildTaskInfo> &child_task_ids,
       bool &has_finished);
   int wait_none_share_index_child_task_finish(bool &has_finished);
-  int wait_share_index_child_task_finish(bool &has_finished);
+  int wait_vid_rowkey_task_finish(const share::ObDDLTaskStatus &next_task_status);
+  int wait_rowkey_vid_task_finish(const share::ObDDLTaskStatus &next_task_status);
   int create_drop_index_task(
       share::schema::ObSchemaGetterGuard &guard,
       const uint64_t index_tid,
       const common::ObString &index_name,
       int64_t &task_id,
       const bool is_domain_index = false);
-  int create_drop_share_index_task();
   int update_task_message();
   int succ();
   int fail();
@@ -114,6 +114,7 @@ private:
   ObVecIndexDDLChildTaskInfo domain_index_;
   ObVecIndexDDLChildTaskInfo vec_index_id_;
   ObVecIndexDDLChildTaskInfo vec_index_snapshot_data_;
+  ObVecIndexDDLChildTaskInfo hybrid_embedded_vec_;
   obrpc::ObDropIndexArg drop_index_arg_;
   ObDDLReplicaBuildExecutor replica_builder_;
   common::hash::ObHashMap<common::ObTabletID, common::ObTabletID> check_dag_exit_tablets_map_; // for delete lob meta row data ddl only.

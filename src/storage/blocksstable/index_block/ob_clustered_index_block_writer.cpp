@@ -28,6 +28,7 @@ ObClusteredIndexBlockWriter::ObClusteredIndexBlockWriter()
       root_ctx_(nullptr),
       macro_writer_(nullptr),
       micro_writer_(nullptr),
+      data_aggregator_(nullptr),
       task_allocator_(nullptr),
       row_allocator_("ClusteredIdxRow"),
       macro_block_io_allocator_("clusteredIdxIO"),
@@ -54,6 +55,7 @@ void ObClusteredIndexBlockWriter::reset()
     task_allocator_->free(macro_writer_);
     macro_writer_ = nullptr;
   }
+  release_pre_agg_util();
   leaf_block_desc_ = nullptr;
   root_ctx_ = nullptr;
   task_allocator_ = nullptr;
@@ -99,13 +101,13 @@ int ObClusteredIndexBlockWriter::init(const ObDataStoreDesc &data_store_desc,
     task_allocator_ = &task_allocator;
   }
   // Build macro writer.
-  ObSSTablePrivateObjectCleaner *object_cleaner = nullptr;
+  ObISSTableObjectCleaner *object_cleaner = nullptr;
   if (OB_SUCC(ret)) {
     abort_unless(macro_writer_ == nullptr);
     if (OB_ISNULL(macro_writer_ = OB_NEWx(ObMacroBlockWriter, task_allocator_, true /* use double buffer */))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("fail to allocate and construct macro writer in clustered index block writer", K(ret));
-    } else if (OB_FAIL(ObSSTablePrivateObjectCleaner::get_cleaner_from_data_store_desc(leaf_block_desc,
+    } else if (OB_FAIL(ObISSTableObjectCleaner::get_cleaner_from_data_store_desc(leaf_block_desc,
                                                                                        object_cleaner))) {
       LOG_WARN("fail to get cleaner from data store desc", K(ret), K(leaf_block_desc), KP(object_cleaner));
     } else if (OB_FAIL(macro_writer_->open(clustered_index_store_desc_,
@@ -116,6 +118,8 @@ int ObClusteredIndexBlockWriter::init(const ObDataStoreDesc &data_store_desc,
                                            ddl_callback))) {
       LOG_WARN("fail to open macro writer in clustered index block writer",
                K(ret), K(leaf_block_desc), KPC(object_cleaner));
+    } else if (OB_FAIL(init_pre_agg_util(data_store_desc))) {
+      LOG_WARN("fail to init pre agg util", K(ret));
     }
   }
   // Build clustered row builder.
@@ -143,6 +147,70 @@ int ObClusteredIndexBlockWriter::init(const ObDataStoreDesc &data_store_desc,
              K(leaf_block_desc.get_row_store_type()),
              K(data_store_desc.get_row_store_type()),
              K(clustered_index_store_desc_.get_row_store_type()));
+  }
+  return ret;
+}
+
+int ObClusteredIndexBlockWriter::init_pre_agg_util(const ObDataStoreDesc &data_store_desc)
+{
+  int ret = OB_SUCCESS;
+  const ObIArray<ObSkipIndexColMeta> &full_agg_metas = data_store_desc.get_agg_meta_array();
+  const bool need_pre_aggregation =
+      nullptr != data_store_desc.sstable_index_builder_
+      && full_agg_metas.count() > 0;
+
+  if (!need_pre_aggregation) {
+    // Skip
+  } else if (OB_ISNULL(task_allocator_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("task allocator is null", K(ret));
+  } else {
+    char *aggregator_buf = nullptr;
+    if (OB_ISNULL(aggregator_buf = static_cast<char *>(
+        task_allocator_->alloc(sizeof(ObSkipIndexDataAggregator))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("Fail to allocate memory for aggrgator", K(ret));
+    } else {
+      data_aggregator_ = new (aggregator_buf) ObSkipIndexDataAggregator();
+      if (OB_FAIL(data_aggregator_->init(
+          data_store_desc.is_major_or_meta_merge_type(),
+          full_agg_metas,
+          data_store_desc.get_col_desc_array(),
+          data_store_desc.get_major_working_cluster_version(),
+          *task_allocator_))) {
+        LOG_WARN("Fail to init aggregator", K(ret), K(data_store_desc));
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+      release_pre_agg_util();
+    }
+  }
+  return ret;
+}
+
+void ObClusteredIndexBlockWriter::release_pre_agg_util()
+{
+  if (nullptr != data_aggregator_) {
+    data_aggregator_->~ObSkipIndexDataAggregator();
+    task_allocator_->free(data_aggregator_);
+    data_aggregator_ = nullptr;
+  }
+}
+
+int ObClusteredIndexBlockWriter::process_micro_block_aggregation(const ObMicroIndexData &micro_index_data, ObMicroBlockDesc &micro_block_desc)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr == data_aggregator_) {
+    // skip
+  } else if (FALSE_IT(data_aggregator_->reuse())) {
+  } else if (micro_index_data.is_pre_aggregated() &&
+              OB_FAIL(data_aggregator_->ObISkipIndexAggregator::eval(micro_index_data.agg_row_buf_,
+                                                                      micro_index_data.agg_buf_size_,
+                                                                      micro_index_data.get_row_count()))) {
+    LOG_WARN("Fail to evaluate by micro block", K(ret), K(micro_index_data));
+  } else if (OB_FAIL(data_aggregator_->get_aggregated_row(micro_block_desc.aggregated_row_))) {
+    LOG_WARN("Fail to get aggregated row", K(ret), KPC(data_aggregator_));
   }
   return ret;
 }
@@ -447,14 +515,16 @@ int ObClusteredIndexBlockWriter::make_clustered_index_micro_block_with_rewrite(
   compaction::ObLocalArena temp_allocator("MakeClusterMic");
   ObMicroBlockReaderHelper micro_reader_helper;
   ObIMicroBlockReader *micro_block_reader = nullptr;
-  const ObMicroBlockHeader *micro_block_header =
-      reinterpret_cast<const ObMicroBlockHeader *>(micro_block_data.get_buf());
-  const int64_t rowkey_column_count = micro_block_header->rowkey_column_count_;
-  if (OB_FAIL(micro_reader_helper.init(temp_allocator))) {
+  const ObMicroBlockHeader *micro_block_header = micro_block_data.get_micro_header();
+  int64_t rowkey_column_count = 0;
+  if (OB_ISNULL(micro_block_header)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid micro block header", KR(ret), K(micro_block_data));
+  } else if (FALSE_IT(rowkey_column_count = micro_block_header->rowkey_column_count_)) {
+  } else if (OB_FAIL(micro_reader_helper.init(temp_allocator))) {
     LOG_WARN("fail to init micro reader helper", K(ret));
-  } else if (OB_FAIL(micro_reader_helper.get_reader(
-                 micro_block_data.get_store_type(), micro_block_reader))) {
-    LOG_WARN("fail to get micro reader", K(ret), K(micro_block_data.get_store_type()));
+  } else if (OB_FAIL(micro_reader_helper.get_reader(*micro_block_data.get_micro_header(), micro_block_reader))) {
+    LOG_WARN("fail to get micro reader", K(ret), "header", *micro_block_data.get_micro_header());
   } else if (OB_FAIL(micro_block_reader->init(micro_block_data, nullptr))) {
     LOG_WARN("fail to init micro block reader", K(ret));
   }
@@ -485,13 +555,14 @@ int ObClusteredIndexBlockWriter::make_clustered_index_micro_block_with_rewrite(
       } else {
         ObIndexBlockRowDesc clustered_row_desc;
         clustered_row_desc.set_merge_type(data_store_desc_->get_merge_type());
+        clustered_row_desc.set_major_working_cluster_version(data_store_desc_->get_major_working_cluster_version());
         // The following code needs to consider compatibility.
         int64_t agg_row_size = 0;
         const ObIndexBlockRowHeader *idx_row_header = nullptr;
         if (OB_FAIL(ret)) {
         } else if (OB_FAIL(idx_row_parser.get_header(idx_row_header))) {
           LOG_WARN("fail to get idx row header", K(ret));
-        } else if (!idx_row_header->is_major_node() || !idx_row_header->is_pre_aggregated()) {
+        } else if (!idx_row_header->is_pre_aggregated()) {
           clustered_row_desc.serialized_agg_row_buf_ = nullptr;
         } else if (OB_FAIL(idx_row_parser.get_agg_row(
                        clustered_row_desc.serialized_agg_row_buf_,
@@ -543,17 +614,20 @@ int ObClusteredIndexBlockWriter::make_clustered_index_micro_block_with_reuse(
 {
   int ret = OB_SUCCESS;
   compaction::ObLocalArena temp_allocator("MakeClusterMic");
-  const ObMicroBlockHeader *micro_block_header =
-      reinterpret_cast<const ObMicroBlockHeader *>(micro_block_data.get_buf());
-  int64_t rowkey_column_count = micro_block_header->rowkey_column_count_;
-  const ObStorageDatumUtils *datum_utils;
+  const ObMicroBlockHeader *micro_block_header = micro_block_data.get_micro_header();
+  int64_t rowkey_column_count = 0;
+  const ObStorageDatumUtils *datum_utils = nullptr;
   ObIndexBlockRowScanner index_block_row_scanner;
   // Init and open index block row scanner for reused clustered micro block
   // (maybe transformed in micro block cache).
   common::ObQueryFlag mock_query_flag;
   mock_query_flag.multi_version_minor_merge_ = compaction::is_mini_merge(clustered_index_store_desc_.get_merge_type());
-  if (clustered_index_store_desc_.is_cg()) {  // Fetch datum utils for index row scanner
-    const ObITableReadInfo *index_read_info;
+  if (OB_ISNULL(micro_block_header)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid micro block header", KR(ret), K(micro_block_data));
+  } else if (FALSE_IT(rowkey_column_count = micro_block_header->rowkey_column_count_)) {
+  } else if (clustered_index_store_desc_.is_cg()) {  // Fetch datum utils for index row scanner
+    const ObITableReadInfo *index_read_info = nullptr;
     if (OB_FAIL(MTL(ObTenantCGReadInfoMgr *)->get_index_read_info(index_read_info))) {
       LOG_WARN("fail to get index read info for cg sstable", K(ret), K(clustered_index_store_desc_));
     } else if (OB_UNLIKELY(!index_read_info->get_datum_utils().is_valid())) {
@@ -593,6 +667,7 @@ int ObClusteredIndexBlockWriter::make_clustered_index_micro_block_with_reuse(
     row_key_allocator.reuse();
     ObIndexBlockRowDesc clustered_row_desc;
     clustered_row_desc.set_merge_type(data_store_desc_->get_merge_type());
+    clustered_row_desc.set_major_working_cluster_version(data_store_desc_->get_major_working_cluster_version());
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(index_block_row_scanner.get_next(index_info,
                                                         false /* is_multi_check */,
@@ -607,7 +682,7 @@ int ObClusteredIndexBlockWriter::make_clustered_index_micro_block_with_reuse(
       LOG_WARN("fail to assign last rowkey", K(ret), K(index_info), K(rowkey_column_count));
     } else {
       const ObIndexBlockRowHeader * idx_row_header = index_info.row_header_;
-      if (!idx_row_header->is_major_node() || !idx_row_header->is_pre_aggregated()) {
+      if (!idx_row_header->is_pre_aggregated()) {
         clustered_row_desc.serialized_agg_row_buf_ = nullptr;
       } else {
         clustered_row_desc.serialized_agg_row_buf_ = index_info.agg_row_buf_;
@@ -624,9 +699,9 @@ int ObClusteredIndexBlockWriter::make_clustered_index_micro_block_with_reuse(
       clustered_row_desc.macro_id_ = idx_row_header->get_macro_id();
       clustered_row_desc.row_offset_ = index_info.cs_row_range_.end_row_id_;
       clustered_row_desc.max_merged_trans_version_ =
-          idx_row_header->is_major_node() ? 0 : index_info.minor_meta_info_->max_merged_trans_version_;
+          nullptr == index_info.minor_meta_info_ ? 0 : index_info.minor_meta_info_->max_merged_trans_version_;
       clustered_row_desc.row_count_delta_ =
-          idx_row_header->is_major_node() ? 0 : index_info.minor_meta_info_->row_count_delta_;
+          nullptr == index_info.minor_meta_info_ ? 0 : index_info.minor_meta_info_->row_count_delta_;
 
       // Append clustered row to clustered writer.
       clustered_row_desc.set_for_clustered_index();
@@ -701,7 +776,7 @@ int ObClusteredIndexBlockWriter::decompress_micro_block_data(
     LOG_WARN("fail to deserialize and check header", K(ret));
   } else if (OB_FAIL(macro_reader.do_decrypt_and_decompress_data(
                  header, block_des_meta, micro_block_buf, micro_block_size,
-                 micro_block_data.get_buf(), micro_block_data.get_buf_size(),
+                 micro_block_data,
                  is_compressed, true /* need deep copy */,
                  &decompress_allocator_ /* allocator */))) {
     LOG_WARN("Fail to decrypt and decompress data", K(ret));

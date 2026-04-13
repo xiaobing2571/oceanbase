@@ -41,24 +41,30 @@ public:
       IVFFLAT_CID = 2,
       IVFSQ_CID = 3,
       IVFPQ_CID = 4,
+      EMB_VEC = 5, //FARM COMPAT WHITELIST
       MAX
   };
 public:
   typedef common::ObSEArray<ObString, 2> DomainIds;
   /* DML Resolver Begin */
   static bool is_domain_id_index_col(const void *col_schema);
-  static bool check_table_need_column_ref_in_ddl(const void *table_schema);
+  static bool check_table_no_need_column_ref_in_ddl(share::schema::ObSchemaGetterGuard &schema_guard,
+                                                 const void *data_table_schema, const void *table_schema,
+                                                 const ObColumnSchemaV2 *col_schema);
   /* DML Resolver End */
 
   /* ObLogTableScan Begin */
   const static char* get_domain_str_by_id(ObDomainIDType type) { return ObDomainIDStrArray[type]; }
   static bool is_domain_id_index_table(const void *table_schema);
-  static int check_table_need_domain_id_merge(ObDomainIDType type, const void *table_schema, bool &res);
+  static int check_table_need_domain_id_merge(ObDomainIDType type, ObSchemaGetterGuard &schema_guard,
+                                              const ObTableSchema &data_table_schema, const void *table_schema,
+                                              bool &res);
   static int check_column_need_domain_id_merge(
       const share::schema::ObTableSchema &table_schema,
       const ObDomainIDType type,
       const void *col_expr,
       const ObIndexType index_type,
+      sql::ObSqlSchemaGuard &schema_guard,
       bool &res);
   static int get_domain_tid_table_by_type(ObDomainIDType type, const void *data_table_schema, uint64_t &domain_id_table_id);
   static int get_domain_tid_table_by_cid(
@@ -106,7 +112,8 @@ public:
     "vid",
     "ivfflat_cid",
     "ivfsq_cid",
-    "ivfpq_cid"
+    "ivfpq_cid",
+    "emb_vec"
   };
 };
 

@@ -15,6 +15,7 @@
 #include "ob_plan_set.h"
 #include "sql/plan_cache/ob_pcv_set.h"
 #include "sql/privilege_check/ob_ora_priv_check.h"
+#include "sql/privilege_check/ob_privilege_check.h"
 
 using namespace oceanbase;
 using namespace common;
@@ -73,6 +74,7 @@ int ObPlanSet::match_params_info(const ParamStore *params,
                                  int64_t outline_param_idx,
                                  bool &is_same)
 {
+  MATCH_GUARD(id_, pc_ctx);
   int ret = OB_SUCCESS;
   is_same = true;
   ObExecContext &exec_ctx = pc_ctx.exec_ctx_;
@@ -80,16 +82,24 @@ int ObPlanSet::match_params_info(const ParamStore *params,
   bool is_sql = is_sql_planset();
   if (false == is_match_outline_param(outline_param_idx)) {
     is_same = false;
+    RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx, "outline param not match", K(outline_param_idx));
   } else if (OB_ISNULL(params)) {
     is_same = true;
   } else if (params->count() > params_info_.count()) {
+    is_same = false;
+    RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                      "params count not equal",
+                      K(params->count()), K(params_info_.count()));
+  } else if (route_to_column_replica_ && OB_NOT_NULL(exec_ctx.get_my_session()) &&
+             exec_ctx.get_my_session()->is_in_transaction()) {
     is_same = false;
   } else {
     //匹配原始的参数
     int64_t N = params->count();
     LOG_TRACE("params info", K(params_info_), K(*params), K(this));
     for (int64_t i = 0; OB_SUCC(ret) && is_same && i < N; ++i) {
-      if (OB_FAIL(match_param_info(params_info_.at(i),
+      if (OB_FAIL(match_param_info(pc_ctx,
+                                   params_info_.at(i),
                                    params->at(i),
                                    is_same,
                                    is_sql))) {
@@ -132,8 +142,12 @@ int ObPlanSet::match_params_info(const ParamStore *params,
                 related_user_var_names_.at(i), tmp_meta))) {
             LOG_WARN("failed to get user variable meta", K(ret),
               K(related_user_var_names_.at(i)), K(i));
-          } else {
-            is_same = (related_user_sess_var_metas_.at(i) == tmp_meta);
+          } else if (related_user_sess_var_metas_.at(i) != tmp_meta) {
+            is_same = false;
+            RECORD_CACHE_MISS(USER_VARIABLE_NOT_MATCH, pc_ctx,
+                              "user variable not match",
+                              K(i), K(related_user_sess_var_metas_.at(i)), K(tmp_meta));
+
           }
         }
       }
@@ -147,7 +161,12 @@ int ObPlanSet::match_params_info(const ParamStore *params,
     }
 
     if (OB_SUCC(ret) && OB_NOT_NULL(pc_ctx.sql_ctx_.session_info_) && is_same) {
-      is_same = (is_cli_return_rowid_ == pc_ctx.sql_ctx_.session_info_->is_client_return_rowid());
+      if (is_cli_return_rowid_ != pc_ctx.sql_ctx_.session_info_->is_client_return_rowid()) {
+        is_same = false;
+        RECORD_CACHE_MISS(CAP_FLAGS_NOT_MATCH, pc_ctx,
+                          "OB_CLIENT_RETURN_HIDDEN_ROWID flag not match",
+                          K(is_cli_return_rowid_), K(pc_ctx.sql_ctx_.session_info_->is_client_return_rowid()));
+      }
     }
 
     //pre calculate
@@ -177,6 +196,8 @@ int ObPlanSet::match_params_info(const ParamStore *params,
                                                              exec_ctx))) {
             LOG_WARN("failed to pre calculate expression", K(ret));
           } else if (!is_same) {
+            RECORD_CACHE_MISS(PRE_CALC_CONSTR_NOT_MATCH, pc_ctx,
+                              "Pre-calc constraint not match", KPC(pre_calc_con));
             break;
           }
         }
@@ -189,16 +210,31 @@ int ObPlanSet::match_params_info(const ParamStore *params,
                                          params->at(i),
                                          is_same))) {
         LOG_WARN("failed to match param bool value", K(ret), K(params_info_), K(*params));
+      } else if (!is_same) {
+        RECORD_CACHE_MISS(BOOL_PARAM_VALUE_NOT_MATCH, pc_ctx,
+                          "Bool param constraint not match",
+                          K(i), K(params_info_.at(i)), K(params->at(i)));
       }
     } //for end
 
     // check const constraint
     if (OB_SUCC(ret) && is_same) {
-      OC( (match_constraint)(*params, is_same) );
+      OC( (match_constraint)(pc_ctx, *params, is_same) );
+    }
+
+    for (int i = 0; OB_SUCC(ret) && is_same && i < params_constraint_.count(); ++i) {
+      if (OB_FAIL(params_constraint_.at(i)->match(*params, NULL, is_same))) {
+        LOG_WARN("failed to match param constraint", K(ret), KPC(params_constraint_.at(i)), K(*params));
+      } else if (!is_same) {
+        RECORD_CACHE_MISS(PARAM_CONSTR_NOT_MATCH, pc_ctx,
+                          "param constraint not match",
+                          K(i), KPC(params_constraint_.at(i)),
+                          K(params->at(params_constraint_.at(i)->param_idx_)));
+      }
     }
 
     if (OB_SUCC(ret) && is_same) {
-      if (OB_FAIL(match_multi_stmt_info(*params, multi_stmt_rowkey_pos_, is_same))) {
+      if (OB_FAIL(match_multi_stmt_info(pc_ctx, *params, multi_stmt_rowkey_pos_, is_same))) {
         LOG_WARN("failed to match multi stmt info", K(ret));
       } else if (!is_same) {
         ret = OB_BATCHED_MULTI_STMT_ROLLBACK;
@@ -210,7 +246,7 @@ int ObPlanSet::match_params_info(const ParamStore *params,
       LOG_TRACE("after match param result", K(ret), K(is_same), K(params_info_));
     }
   }
-  LOG_DEBUG("after match param result", K(ret), K(is_same), K(params_info_));
+  LOG_DEBUG("after match param result", K(ret), K(is_same), K(params_info_), K(params_constraint_));
   return ret;
 }
 
@@ -231,7 +267,8 @@ int ObPlanSet::copy_param_flag_from_param_info(ParamStore *params)
 }
 
 //匹配参数类型信息
-int ObPlanSet::match_param_info(const ObParamInfo &param_info,
+int ObPlanSet::match_param_info(ObPlanCacheCtx &pc_ctx,
+                                const ObParamInfo &param_info,
                                 const ObObjParam &param,
                                 bool &is_same,
                                 bool is_sql_planset) const
@@ -261,18 +298,35 @@ int ObPlanSet::match_param_info(const ObParamInfo &param_info,
     if (param.get_collation_type() != param_info.col_type_
         && !(param.get_param_meta().is_ext() || param.is_user_defined_sql_type() || param.is_collection_sql_type())) {
       is_same = false;
+      RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "Collation not match",
+                        K(param), K(param_info));
     } else if (param.get_param_meta().get_type() != param_info.type_) {
       is_same = false;
+      RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "Param type not match",
+                        K(param.get_param_meta().get_type()), K(param_info.type_));
     } else if (ob_is_enumset_inner_tc(param.get_param_meta().get_type())) { // since enunset_inner type param will mock expr use current param, can not resue plan
       is_same = false;
+      RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "Enunset_inner type param will mock expr use current param, can not share plan",
+                        K(param.get_param_meta().get_type()));
     } else if (param.is_user_defined_sql_type() || param.is_collection_sql_type()) {
       if (param_info.is_oracle_null_value_) {
         is_same = false;
+        RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "Null value in oracle mode can not share plan with other value",
+                        K(param));
       } else {
         uint64_t udt_id_param = param.get_accuracy().get_accuracy();
         uint64_t udt_id_info = static_cast<uint64_t>(param_info.ext_real_type_) << 32
                              | static_cast<uint32_t>(param_info.col_type_);
-        is_same = (udt_id_info == udt_id_param) ? true : false;
+        if (udt_id_info != udt_id_param) {
+          is_same = false;
+          RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "UDT info not match",
+                        K(udt_id_param), K(udt_id_info));
+        }
       }
     } else if (param.is_ext_sql_array()) {
       ObDataType data_type;
@@ -284,12 +338,21 @@ int ObPlanSet::match_param_info(const ObParamInfo &param_info,
         is_same = param_info.ext_real_type_ == ObDecimalIntType
                   && data_type.get_scale() == param_info.scale_
                   && match_decint_precision(param_info, data_type.get_precision());
+        if (!is_same) {
+          RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "SQL array type info not match",
+                        K(param_info.ext_real_type_), K(param_info.scale_), K(param_info.precision_),
+                        K(data_type.get_obj_type()), K(data_type.get_scale()), K(data_type.get_precision()));
+        }
       } else if (data_type.get_scale() == param_info.scale_ &&
                  data_type.get_obj_type() == param_info.ext_real_type_) {
         is_same = true;
       } else {
         is_same = false;
         LOG_TRACE("ext match param info", K(data_type), K(param_info), K(is_same), K(ret));
+        RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "SQL array type info not match",
+                        K(param_info), K(data_type));
       }
       LOG_DEBUG("ext match param info", K(data_type), K(param_info), K(is_same), K(ret));
     } else if (param.get_param_meta().is_ext()) {
@@ -299,16 +362,30 @@ int ObPlanSet::match_param_info(const ObParamInfo &param_info,
         uint64_t udt_id_param = param.get_accuracy().get_accuracy();
         uint64_t udt_id_info = static_cast<uint64_t>(param_info.ext_real_type_) << 32
                              | static_cast<uint32_t>(param_info.col_type_);
-        is_same = (udt_id_info == udt_id_param) ? true : false;
+        if (udt_id_info != udt_id_param) {
+          is_same = false;
+          RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "SQL array of extend type not match",
+                        K(udt_id_param), K(udt_id_info), K(param_info.precision_));
+        }
       }
       LOG_DEBUG("ext match param info", K(param.get_accuracy()), K(param_info), K(is_same), K(ret));
     } else if (param_info.is_oracle_null_value_ && !param.is_null()) {
       is_same = false;
+      RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "Null value can not share plan with Non-null param",
+                        K(param_info.is_oracle_null_value_), K(param));
     } else if (ObSQLUtils::is_oracle_null_with_normal_type(param)
                &&!param_info.is_oracle_null_value_) { //Typed nulls can only match plans with the same type of nulls.
       is_same = false;
+      RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "Null value can not share plan with Non-null param",
+                        K(param_info.is_oracle_null_value_), K(param));
     } else if (param_info.flag_.is_boolean_ != param.is_boolean()) { //bool type not match int type
       is_same = false;
+      RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "Bool type can not share plan with int type",
+                        K(param_info.flag_.is_boolean_), K(param));
     } else {
       // number params in point and st_point can ignore scale check to share plancache
       // please refrer to ObSqlParameterization::is_ignore_scale_check
@@ -316,6 +393,11 @@ int ObPlanSet::match_param_info(const ObParamInfo &param_info,
                 ? true
                 : (param.get_scale() == param_info.scale_);
       is_same = is_same && match_decint_precision(param_info, param.get_precision());
+      if (!is_same) {
+        RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                        "Precision of decimal not match",
+                        K(param_info), K(param));
+      }
     }
   }
   return ret;
@@ -342,7 +424,7 @@ int ObPlanSet::match_param_bool_value(const ObParamInfo &param_info,
   return ret;
 }
 
-int ObPlanSet::match_multi_stmt_info(const ParamStore &params,
+int ObPlanSet::match_multi_stmt_info(ObPlanCacheCtx &pc_ctx, const ParamStore &params,
                                      const ObIArray<int64_t> &multi_stmt_rowkey_pos,
                                      bool &is_match)
 {
@@ -395,6 +477,9 @@ int ObPlanSet::match_multi_stmt_info(const ParamStore &params,
             if (OB_HASH_EXIST == ret) {
               ret = OB_SUCCESS;
               is_match = false;
+              RECORD_CACHE_MISS(MULTI_STMT_INFO_NOT_MATCH, pc_ctx,
+                                "batched multi-stmt does not have the same rowkey",
+                                K(stmt_count), K(i), K(hash_key));
               if (REACH_TIME_INTERVAL(10000000)) {
                 LOG_INFO("batched multi-stmt does not have the same rowkey", K(i),
                     K(hash_key));
@@ -413,6 +498,7 @@ int ObPlanSet::match_multi_stmt_info(const ParamStore &params,
   }
   return ret;
 }
+
 int ObPlanSet::match_priv_cons(ObPlanCacheCtx &pc_ctx, bool &is_matched)
 {
   int ret = OB_SUCCESS;
@@ -427,23 +513,56 @@ int ObPlanSet::match_priv_cons(ObPlanCacheCtx &pc_ctx, bool &is_matched)
   for (int64_t i = 0; OB_SUCC(ret) && is_matched && i < all_priv_constraints_.count(); ++i) {
     const ObPCPrivInfo &priv_info = all_priv_constraints_.at(i);
     bool has_priv = false;
-    if (OB_FAIL(ObOraSysChecker::check_ora_user_sys_priv(*schema_guard,
-                                                         session_info->get_effective_tenant_id(),
-                                                         session_info->get_priv_user_id(),
-                                                         session_info->get_database_name(),
-                                                         priv_info.sys_priv_,
-                                                         session_info->get_enable_role_array()))) {
-      if (OB_ERR_NO_PRIVILEGE == ret) {
-        ret = OB_SUCCESS;
-        LOG_DEBUG("lack sys privilege", "priv_type", all_priv_constraints_.at(i).sys_priv_);
+    // check sys privilege for rls policies
+    if (OB_UNLIKELY(priv_info.priv_type_ == ObPCPrivInfo::INVALID_TYPE)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid priv type", K(priv_info), K(ret));
+    } else if (lib::is_oracle_mode() && priv_info.priv_type_ == ObPCPrivInfo::SYS_PRIV) {
+      if (OB_FAIL(ObOraSysChecker::check_ora_user_sys_priv(*schema_guard,
+                                                           session_info->get_effective_tenant_id(),
+                                                           session_info->get_priv_user_id(),
+                                                           session_info->get_database_name(),
+                                                           priv_info.sys_priv_,
+                                                           session_info->get_enable_role_array()))) {
+        if (OB_ERR_NO_PRIVILEGE == ret) {
+          ret = OB_SUCCESS;
+          LOG_DEBUG("lack sys privilege", "priv_type", all_priv_constraints_.at(i).sys_priv_);
+        } else {
+          LOG_WARN("failed to check ora user sys priv", K(ret));
+        }
       } else {
-        LOG_WARN("failed to check ora user sys priv", K(ret));
+        has_priv = true;
       }
-    } else {
-      has_priv = true;
+    } else if (priv_info.priv_type_ == ObPCPrivInfo::SENSITIVE_RULE_PRIV) {
+      // check sensitive rule plainaccess privilege
+      uint64_t tenant_id = session_info->get_effective_tenant_id();
+      const share::schema::ObSensitiveRuleSchema *rule_schema = NULL;
+      if (OB_FAIL(schema_guard->get_sensitive_rule_schema_by_id(tenant_id,
+                                                                priv_info.sensitive_rule_id_,
+                                                                rule_schema))) {
+        LOG_WARN("fail to get sensitive rule schema", K(ret), K(tenant_id), K(priv_info.sensitive_rule_id_));
+      } else if (OB_ISNULL(rule_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("rule schema is null", K(ret));
+      } else if (OB_FAIL(ObPrivilegeCheck::check_sensitive_rule_plainaccess_priv(rule_schema, *session_info))) {
+        if (OB_ERR_NO_PRIVILEGE == ret) {
+          has_priv = false;
+          ret = OB_SUCCESS;
+          LOG_DEBUG("lack plainaccess privilege", K(priv_info.sensitive_rule_id_));
+        } else {
+          LOG_WARN("failed to check plainaccess priv", K(ret));
+        }
+      } else {
+        has_priv = true;
+      }
     }
     if (OB_SUCC(ret)) {
-      is_matched = priv_info.has_privilege_ == has_priv;
+      is_matched = (priv_info.has_privilege_ == has_priv);
+      if (!is_matched) {
+        RECORD_CACHE_MISS(PRIVILEGE_CONSTR_NOT_MATCH, pc_ctx,
+                          "privilege constraint not match",
+                          K(i), K(has_priv), K(priv_info.has_privilege_));
+      }
     }
   }
   return ret;
@@ -515,7 +634,8 @@ int ObPlanSet::match_params_info(const Ob2DArray<ObParamInfo,
                                          OB_MALLOC_BIG_BLOCK_SIZE,
                                          ObWrapperAllocator, false> &infos,
                                  int64_t outline_param_idx,
-                                 const ObPlanCacheCtx &pc_ctx,
+                                 ObPlanCacheCtx &pc_ctx,
+                                 const bool need_match_cons,
                                  bool &is_same)
 {
   int ret = OB_SUCCESS;
@@ -528,6 +648,8 @@ int ObPlanSet::match_params_info(const Ob2DArray<ObParamInfo,
     is_same = false;
   } else if (infos.count() != params_info_.count()) {
     is_same = false;
+  } else if (route_to_column_replica_ && session_info->is_in_transaction()) {
+    is_same = false;
   } else {
     int64_t N = infos.count();
     for (int64_t i = 0; is_same && i < N; ++i) {
@@ -539,7 +661,8 @@ int ObPlanSet::match_params_info(const Ob2DArray<ObParamInfo,
             || (params_info_.at(i).flag_.need_to_check_extend_type_
                 && infos.at(i).ext_real_type_ != params_info_.at(i).ext_real_type_)
             || (params_info_.at(i).flag_.is_boolean_ != infos.at(i).flag_.is_boolean_)
-            || !match_decint_precision(params_info_.at(i), infos.at(i).precision_)) {
+            || !match_decint_precision(params_info_.at(i), infos.at(i).precision_)
+            || (params_info_.at(i).is_oracle_null_value_ != infos.at(i).is_oracle_null_value_)) {
           is_same = false;
         }
       }
@@ -573,7 +696,7 @@ int ObPlanSet::match_params_info(const Ob2DArray<ObParamInfo,
     if (OB_SUCC(ret) && OB_NOT_NULL(pc_ctx.sql_ctx_.session_info_) && is_same) {
       is_same = (is_cli_return_rowid_ == pc_ctx.sql_ctx_.session_info_->is_client_return_rowid());
     }
-    if (OB_SUCC(ret) && is_same) {
+    if (OB_SUCC(ret) && is_same && need_match_cons) {
       if (OB_FAIL(ObPlanCacheObject::match_pre_calc_cons(all_pre_calc_constraints_, pc_ctx,
                                                          is_ignore_stmt_, is_same))) {
         LOG_WARN("failed to match pre calc cons", K(ret));
@@ -586,8 +709,14 @@ int ObPlanSet::match_params_info(const Ob2DArray<ObParamInfo,
       CK( OB_NOT_NULL(pc_ctx.exec_ctx_.get_physical_plan_ctx()) );
       if (OB_SUCC(ret)) {
         const ParamStore &params = pc_ctx.exec_ctx_.get_physical_plan_ctx()->get_param_store();
-        OC( (match_constraint)(params, is_same));
-        OC( (match_cons)(pc_ctx, is_same));
+        if (OB_FAIL(match_constraint(pc_ctx, params, is_same))) {
+          LOG_WARN("failed to match constraint");
+        } else if (need_match_cons && OB_FAIL(match_cons(pc_ctx, is_same))) {
+          LOG_WARN("failed to match cons");
+        }
+        for (int i = 0; OB_SUCC(ret) && is_same && i < params_constraint_.count(); ++i) {
+          OZ((params_constraint_.at(i)->match(params, NULL, is_same)));
+        }
       }
     }
   }
@@ -607,12 +736,10 @@ bool ObPlanSet::can_skip_params_match()
   }
   if (can_skip) {
     if (!all_plan_const_param_constraints_.empty() ||
-        !all_possible_const_param_constraints_.empty() ||
         !all_equal_param_constraints_.empty() ||
         all_pre_calc_constraints_.get_size() != 0) {
       can_skip = false;
       LOG_DEBUG("print can't skip", K(can_skip), K(all_plan_const_param_constraints_.empty()),
-      K(all_possible_const_param_constraints_.empty()),
       K(all_equal_param_constraints_.empty()),
       K(all_pre_calc_constraints_.get_size()));
     }
@@ -631,6 +758,7 @@ bool ObPlanSet::can_delay_init_datum_store()
 
 void ObPlanSet::reset()
 {
+  id_ = OB_INVALID_ID;
   ObDLinkBase<ObPlanSet>::reset();
   plan_cache_value_ = NULL;
   params_info_.reset();
@@ -644,14 +772,15 @@ void ObPlanSet::reset()
   related_user_sess_var_metas_.reset();
 
   is_cli_return_rowid_ = false;
-  all_possible_const_param_constraints_.reset();
   all_plan_const_param_constraints_.reset();
   all_equal_param_constraints_.reset();
   all_pre_calc_constraints_.reset();
   all_priv_constraints_.reset();
   can_skip_params_match_ = false;
   can_delay_init_datum_store_ = false;
+  params_constraint_.reset();
   alloc_.reset();
+  route_to_column_replica_ = false;
 }
 
 ObPlanCache *ObPlanSet::get_plan_cache() const
@@ -775,7 +904,6 @@ int ObPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
     ObPlanSetType ps_t = get_plan_set_type_by_cache_obj_type(plan.get_ns());
     if (PST_PRCD == ps_t) {
         // pl does not have any const param constraint
-        all_possible_const_param_constraints_.reset();
         all_plan_const_param_constraints_.reset();
         all_equal_param_constraints_.reset();
         all_pre_calc_constraints_.reset();
@@ -783,12 +911,10 @@ int ObPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
     } else if (PST_SQL_CRSR == ps_t) {
       // otherwise it should not be empty
       CK( OB_NOT_NULL(sql_ctx.all_plan_const_param_constraints_),
-          OB_NOT_NULL(sql_ctx.all_possible_const_param_constraints_),
           OB_NOT_NULL(sql_ctx.all_equal_param_constraints_),
           OB_NOT_NULL(sql_ctx.all_pre_calc_constraints_),
           OB_NOT_NULL(sql_ctx.all_priv_constraints_));
-      OZ( (set_const_param_constraint)(*sql_ctx.all_plan_const_param_constraints_, false) );
-      OZ( (set_const_param_constraint)(*sql_ctx.all_possible_const_param_constraints_, true) );
+      OZ( (set_const_param_constraint)(*sql_ctx.all_plan_const_param_constraints_) );
       OZ( (set_equal_param_constraint)(*sql_ctx.all_equal_param_constraints_) );
       OZ( (set_pre_calc_constraint(*sql_ctx.all_pre_calc_constraints_)));
       OZ( (set_priv_constraint(*sql_ctx.all_priv_constraints_)));
@@ -810,17 +936,24 @@ int ObPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
       can_skip_params_match_ = can_skip_params_match();
       can_delay_init_datum_store_ = can_delay_init_datum_store();
     }
+
+    if (OB_SUCC(ret) && pc_ctx.params_constraint_.count() > 0) {
+      OZ(params_constraint_.reserve(pc_ctx.params_constraint_.count()));
+      for (int i = 0; OB_SUCC(ret) && i < pc_ctx.params_constraint_.count(); ++i) {
+        ObPCParamConstraint *constraint = nullptr;
+        OZ(pc_ctx.params_constraint_.at(i)->deep_copy(alloc_, constraint));
+        OZ(params_constraint_.push_back(constraint));
+      }
+    }
   }
 
  return ret;
 }
 
-int ObPlanSet::set_const_param_constraint(ObIArray<ObPCConstParamInfo> &const_param_constraint,
-                                          const bool is_all_constraint)
+int ObPlanSet::set_const_param_constraint(ObIArray<ObPCConstParamInfo> &const_param_constraint)
 {
   int ret = OB_SUCCESS;
-  ConstParamConstraint &cons_array = (is_all_constraint ?
-                                      all_possible_const_param_constraints_ : all_plan_const_param_constraints_);
+  ConstParamConstraint &cons_array = all_plan_const_param_constraints_;
   cons_array.reset();
   cons_array.set_allocator(&alloc_);
 
@@ -898,29 +1031,45 @@ int ObPlanSet::set_pre_calc_constraint(common::ObDList<ObPreCalcExprConstraint> 
 {
   int ret = OB_SUCCESS;
   ObPreCalcExprConstraint *pre_calc_constraint = NULL;
-  void *cons_buf = NULL;
   DLIST_FOREACH(cur_cons, pre_calc_cons) {
-    if (PRE_CALC_ROWID == cur_cons->expect_result_) {
-      if (OB_ISNULL(cons_buf = alloc_.alloc(sizeof(ObRowidConstraint)))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("failed to allocate memory", K(ret));
-      } else {
-        pre_calc_constraint = new(cons_buf)ObRowidConstraint(alloc_);
-      }
-    } else {
-      if (OB_ISNULL(cons_buf = alloc_.alloc(sizeof(ObPreCalcExprConstraint)))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("failed to allocate memory", K(ret));
-      } else {
-        pre_calc_constraint = new(cons_buf)ObPreCalcExprConstraint(alloc_);
-      }
-    }
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(pre_calc_constraint->assign(*cur_cons, alloc_))) {
-      LOG_WARN("failed to deep copy pre calculable expression constriants", K(*cur_cons), K(ret));
+    if (OB_FAIL(deep_copy_pre_calc_constraint(alloc_, cur_cons, pre_calc_constraint))) {
+      LOG_WARN("failed to deep copy pre calc constrint");
     } else if (OB_UNLIKELY(!all_pre_calc_constraints_.add_last(pre_calc_constraint))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("failed to add element to dlist", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObPlanSet::deep_copy_pre_calc_constraint(ObIAllocator &allocator,
+                                             ObPreCalcExprConstraint* src,
+                                             ObPreCalcExprConstraint*& dst)
+{
+  int ret = OB_SUCCESS;
+  void *cons_buf = NULL;
+  dst = NULL;
+  if (OB_ISNULL(src)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get null pre calc constraint");
+  } else if (PRE_CALC_ROWID == src->expect_result_) {
+    if (OB_ISNULL(cons_buf = allocator.alloc(sizeof(ObRowidConstraint)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate memory", K(ret));
+    } else {
+      dst = new(cons_buf)ObRowidConstraint(allocator);
+    }
+  } else {
+    if (OB_ISNULL(cons_buf = allocator.alloc(sizeof(ObPreCalcExprConstraint)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate memory", K(ret));
+    } else {
+      dst = new(cons_buf)ObPreCalcExprConstraint(allocator);
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(dst->assign(*src, allocator))) {
+      LOG_WARN("failed to deep copy pre calculable expression constriants", K(*src), K(ret));
     }
   }
   return ret;
@@ -939,9 +1088,17 @@ int ObPlanSet::set_priv_constraint(common::ObIArray<ObPCPrivInfo> &priv_constrai
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < priv_constraint.count(); ++i) {
     const ObPCPrivInfo &priv_info = priv_constraint.at(i);
-    if (OB_UNLIKELY(!(priv_info.sys_priv_ > PRIV_ID_NONE && priv_info.sys_priv_ < PRIV_ID_MAX))) {
+    if (OB_UNLIKELY(priv_info.priv_type_ == ObPCPrivInfo::INVALID_TYPE)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid priv type", K(priv_info), K(ret));
+    } else if (priv_info.priv_type_ == ObPCPrivInfo::SYS_PRIV
+               && OB_UNLIKELY(!(priv_info.sys_priv_ > PRIV_ID_NONE && priv_info.sys_priv_ < PRIV_ID_MAX))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid sys priv", K(priv_info), K(ret));
+    } else if (priv_info.priv_type_ == ObPCPrivInfo::SENSITIVE_RULE_PRIV
+               && OB_UNLIKELY(!is_valid_id(priv_info.sensitive_rule_id_))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid sensitive rule id", K(priv_info), K(ret));
     } else if (OB_FAIL(all_priv_constraints_.push_back(priv_info))) {
       LOG_WARN("failed to push back priv info");
     }
@@ -954,29 +1111,21 @@ int ObPlanSet::match_cons(const ObPlanCacheCtx &pc_ctx, bool &is_matched)
 {
   int ret = OB_SUCCESS;
   ObIArray<ObPCConstParamInfo> *param_cons = pc_ctx.sql_ctx_.all_plan_const_param_constraints_;
-  ObIArray<ObPCConstParamInfo> *possible_param_cons =
-                                        pc_ctx.sql_ctx_.all_possible_const_param_constraints_;
   ObIArray<ObPCParamEqualInfo> *equal_cons = pc_ctx.sql_ctx_.all_equal_param_constraints_;
   ObIArray<ObPCPrivInfo> *priv_cons = pc_ctx.sql_ctx_.all_priv_constraints_;
   is_matched = true;
 
-  if (OB_ISNULL(param_cons) ||
-      OB_ISNULL(possible_param_cons) ||
-      OB_ISNULL(equal_cons)) {
+  if (OB_ISNULL(param_cons) || OB_ISNULL(equal_cons) || OB_ISNULL(priv_cons)) {
     is_matched = false;
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(param_cons), K(possible_param_cons), K(equal_cons));
+    LOG_WARN("invalid argument", K(param_cons), K(equal_cons), K(priv_cons));
   } else if (param_cons->count() != all_plan_const_param_constraints_.count() ||
-             possible_param_cons->count() != all_possible_const_param_constraints_.count() ||
              equal_cons->count() != all_equal_param_constraints_.count() ||
              priv_cons->count() != all_priv_constraints_.count()) {
     is_matched = false;
   } else {
     for (int64_t i=0; is_matched && i < all_plan_const_param_constraints_.count(); i++) {
       is_matched = (all_plan_const_param_constraints_.at(i)==param_cons->at(i));
-    }
-    for (int64_t i=0; is_matched && i < all_possible_const_param_constraints_.count(); i++) {
-      is_matched = (all_possible_const_param_constraints_.at(i)==possible_param_cons->at(i));
     }
     for (int64_t i=0; is_matched && i < all_equal_param_constraints_.count(); i++) {
       is_matched = (all_equal_param_constraints_.at(i)==equal_cons->at(i));
@@ -994,7 +1143,7 @@ int ObPlanSet::match_cons(const ObPlanCacheCtx &pc_ctx, bool &is_matched)
 //    满足则命中plan_set，否则不命中;
 // 2. 否则，检查所有可能的常量约束，如果某一个约束被满足，那么需要生成新的计划，也即不命中，否则命中
 // 3. 检查要求相等的参数约束是否被满足
-int ObPlanSet::match_constraint(const ParamStore &params, bool &is_matched)
+int ObPlanSet::match_constraint(ObPlanCacheCtx &pc_ctx, const ParamStore &params, bool &is_matched)
 {
   int ret = OB_SUCCESS;
   is_matched = true;
@@ -1021,44 +1170,14 @@ int ObPlanSet::match_constraint(const ParamStore &params, bool &is_matched)
                    0 != const_param.compare(params.at(param_idx))) {
           LOG_TRACE("not matched const param", K(const_param), K(params.at(param_idx)));
           is_matched = false;
+          RECORD_CACHE_MISS(CONST_PRARM_CONSTR_NOT_MATCH, pc_ctx,
+                            "Const param constraint not match",
+                            K(const_param), K(param_idx), K(params.at(param_idx)));
         } else {
           // do nothing
         }
       }
     }
-  } else if (all_possible_const_param_constraints_.count() > 0) {
-    // check if possible generated column exists
-    for (int64_t i = 0; is_matched && OB_SUCC(ret) && i < all_possible_const_param_constraints_.count(); i++) {
-      bool match_const = true;
-      const ObPCConstParamInfo &const_param_info = all_possible_const_param_constraints_.at(i);
-      CK( const_param_info.const_idx_.count() > 0,
-          const_param_info.const_params_.count() > 0,
-          const_param_info.const_idx_.count() == const_param_info.const_params_.count() );
-      for (int64_t j = 0; match_const && OB_SUCC(ret) && j < const_param_info.const_idx_.count(); j++) {
-        const int64_t param_idx = const_param_info.const_idx_.at(j);
-        const ObObj &const_param = const_param_info.const_params_.at(j);
-        if (param_idx >= params.count()) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("get an unexpected param index", K(ret), K(param_idx), K(params.count()));
-        } else if (const_param.is_invalid_type() ||
-                   params.at(param_idx).is_invalid_type()) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("get unexpected invalid type",
-                   K(ret), K(const_param.get_type()), K(params.at(param_idx).get_type()));
-        } else if (!const_param.can_compare(params.at(param_idx)) ||
-                   0 != const_param.compare(params.at(param_idx))) {
-          match_const = false;
-        } else {
-          // do nothing
-        }
-      }
-      if (match_const) {
-        LOG_TRACE("matched const param constraint", K(params), K(all_possible_const_param_constraints_.at(i)));
-        is_matched = false; // matching one of the constraint, need to generated new plan
-      }
-    }
-  } else {
-    // do nothing
   }
 
   for (int64_t i = 0; is_matched && OB_SUCC(ret) && i < all_equal_param_constraints_.count(); ++i) {
@@ -1077,6 +1196,10 @@ int ObPlanSet::match_constraint(const ParamStore &params, bool &is_matched)
                param1.can_compare(param2) &&
                param1.get_collation_type() == param2.get_collation_type()) {
       is_matched = (0 == param1.compare(param2));
+      if (!is_matched) {
+        RECORD_CACHE_MISS(CONST_PRARM_CONSTR_NOT_MATCH, pc_ctx,
+                          "Const param constraint not match", K(param1), K(param2));
+      }
     } else if (all_equal_param_constraints_.at(i).use_abs_cmp_) {
       /*
        * for plan like: select ? from t1 group by grouping sets (c1, ?);
@@ -1088,17 +1211,40 @@ int ObPlanSet::match_constraint(const ParamStore &params, bool &is_matched)
        */
       if (param1.is_number() && param2.is_number()) {
         is_matched = (0 == param1.get_number().abs_compare(param2.get_number()));
+        if (!is_matched) {
+          RECORD_CACHE_MISS(CONST_PRARM_CONSTR_NOT_MATCH, pc_ctx,
+                            "Const param constraint not match",
+                            K(param1.get_number()), K(param2.get_number()));
+        }
       } else if (param1.is_double() && param2.is_double()) {
         is_matched = (0 == param1.get_double() + param2.get_double()) ||
                      (param1.get_double() == param2.get_double());
+        if (!is_matched) {
+          RECORD_CACHE_MISS(CONST_PRARM_CONSTR_NOT_MATCH, pc_ctx,
+                            "Const param constraint not match",
+                            K(param1.get_double()), K(param2.get_double()));
+        }
       } else if (param1.is_float() && param2.is_float()) {
         is_matched = (0 == param1.get_float() + param2.get_float()) ||
                      (param1.get_float() == param2.get_float());
+        if (!is_matched) {
+          RECORD_CACHE_MISS(CONST_PRARM_CONSTR_NOT_MATCH, pc_ctx,
+                            "Const param constraint not match",
+                            K(param1.get_float()), K(param2.get_float()));
+        }
       } else if (param1.is_decimal_int() && param2.is_decimal_int()) {
         is_matched = wide::abs_equal(param1, param2);
+        if (!is_matched) {
+          RECORD_CACHE_MISS(CONST_PRARM_CONSTR_NOT_MATCH, pc_ctx,
+                            "Const param constraint not match", K(param1), K(param2));
+        }
       } else if (param1.can_compare(param2) &&
                  param1.get_collation_type() == param2.get_collation_type()) {
         is_matched = (0 == param1.compare(param2));
+        if (!is_matched) {
+          RECORD_CACHE_MISS(CONST_PRARM_CONSTR_NOT_MATCH, pc_ctx,
+                            "Const param constraint not match", K(param1), K(param2));
+        }
       }
     }
     if (OB_SUCC(ret) && !is_matched) {
@@ -1215,6 +1361,16 @@ int ObSqlPlanSet::add_cache_obj(ObPlanCacheObject &cache_object,
   } else {
     cache_object.set_pre_calc_expr_handler(pre_cal_expr_handler_);
     cache_object.inc_pre_expr_ref_count();
+#ifdef OB_BUILD_SPM
+    if (pc_ctx.sql_ctx_.spm_ctx_.evolution_plan_ != nullptr) {
+      ObPhysicalPlan *plan = pc_ctx.sql_ctx_.spm_ctx_.evolution_plan_->get_evolving_plan_for_update();
+      if (OB_NOT_NULL(plan)) {
+        plan->dec_pre_expr_ref_count();
+        plan->set_pre_calc_expr_handler(pre_cal_expr_handler_);
+        plan->inc_pre_expr_ref_count();
+      }
+    }
+#endif
     // planset, handle, plan, ref_cnt(val)
     LOG_INFO("add pre calculable expression.", KP(this),
                                                KP(cache_object.get_pre_calc_expr_handler()),
@@ -1230,9 +1386,11 @@ int ObSqlPlanSet::add_plan(ObPhysicalPlan &plan,
                            int64_t outline_param_idx)
 {
   int ret = OB_SUCCESS;
+  plan.plan_set_id_ = id_;
   ObSqlCtx &sql_ctx = pc_ctx.sql_ctx_;
   //DASTableLocList table_locs(pc_ctx.exec_ctx_.get_allocator());
-  ObArray<ObCandiTableLoc> candi_table_locs;
+  ObArenaAllocator allocator(ObModIds::OB_SQL_COMPILE);
+  ObSqlArray<ObCandiTableLoc, true> candi_table_locs(allocator);
   ObPhyPlanType plan_type = OB_PHY_PLAN_UNINITIALIZED;
   if (OB_ISNULL(plan_cache_value_) ||
       OB_ISNULL(pc_ctx.exec_ctx_.get_physical_plan_ctx())) {
@@ -1243,31 +1401,8 @@ int ObSqlPlanSet::add_plan(ObPhysicalPlan &plan,
                                        candi_table_locs))) {
     LOG_WARN("fail to get physical locations", K(ret));
   } else if (OB_FAIL(set_concurrent_degree(outline_param_idx, plan))) {
-    if (OB_REACH_MAX_CONCURRENT_NUM == ret && 0 == plan.get_max_concurrent_num()) {
-      pc_ctx.is_max_curr_limit_ = true;
-      ret = OB_SUCCESS;
-    } else {
-      LOG_WARN("fail to check concurrent degree", K(ret));
-    }
+    LOG_WARN("fail to check concurrent degree", K(ret));
   } else {
-    // do nothing
-  }
-
-  if (OB_FAIL(ret)) {
-    // do nothing
-  } else {
-    if (pc_ctx.exec_ctx_.get_physical_plan_ctx()->get_or_expand_transformed()) {
-      need_try_plan_ |= TRY_PLAN_OR_EXPAND;
-    }
-    if (plan.get_is_late_materialized()) {
-      need_try_plan_ |= TRY_PLAN_LATE_MAT;
-    }
-    if (plan.has_uncertain_local_operator()) {
-      need_try_plan_ |= TRY_PLAN_UNCERTAIN;
-    }
-    if (plan.contain_index_location()) {
-      need_try_plan_ |= TRY_PLAN_INDEX;
-    }
     plan_type = plan.get_plan_type();
     if (OB_SUCC(ret)) {
       switch(plan_type) {
@@ -1367,7 +1502,6 @@ int ObSqlPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
   const ObSqlCtx &sql_ctx = pc_ctx.sql_ctx_;
   // set outline_param_idx
   outline_param_idx_ = outline_param_idx;
-  need_try_plan_ = 0;
   has_duplicate_table_ = false;
   const ObSQLSessionInfo *session_info = sql_ctx.session_info_;
   if (OB_ISNULL(session_info)) {
@@ -1378,9 +1512,6 @@ int ObSqlPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
     LOG_WARN("pc_allocator has not been initialized.", K(ret));
   } else if (OB_FAIL(ObPlanSet::init_new_set(pc_ctx, plan, outline_param_idx, pc_malloc_))) {
     LOG_WARN("init new set failed", K(ret));
-  } else if (OB_FAIL(table_locations_.prepare_allocate_and_keep_count(sql_ctx.partition_infos_.count(),
-                                                        *plan_cache_value_->get_pcv_set()->get_allocator()))) {
-    LOG_WARN("fail to init table location count", K(ret));
 #ifdef OB_BUILD_SPM
   } else if (OB_FAIL(local_evolution_plan_.init(this))) {
     SQL_PC_LOG(WARN, "failed to init local evolution plan", K(ret));
@@ -1424,24 +1555,9 @@ int ObSqlPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
     const ObPhysicalPlan &sql_plan = dynamic_cast<const ObPhysicalPlan &>(plan);
     enable_inner_part_parallel_exec_ = sql_plan.get_px_dop() > 1;
     contain_index_location = sql_plan.contain_index_location();
+    route_to_column_replica_ = sql_plan.is_route_to_column_replica();
     LOG_DEBUG("using px", K(enable_inner_part_parallel_exec_));
     plan.get_pre_expr_ref_count();
-  }
-  if (OB_SUCC(ret) && (!contain_index_location || is_multi_stmt_plan())) {
-    const ObTablePartitionInfoArray &partition_infos = sql_ctx.partition_infos_;
-    int64_t N = partition_infos.count();
-    //copy table location
-    for (int64_t i = 0; OB_SUCC(ret) && i < N; ++i) {
-      if (NULL == partition_infos.at(i)) {
-        ret = OB_ERR_UNEXPECTED;
-        SQL_PC_LOG(TRACE, "invalid partition info");
-      } else if (OB_FAIL(table_locations_.push_back(partition_infos.at(i)->get_table_location()))) {
-        SQL_PC_LOG(WARN, "fail to push table location", K(ret));
-      } else if (is_all_non_partition_
-                 && partition_infos.at(i)->get_table_location().is_partitioned()) {
-        is_all_non_partition_ = false;
-      }
-    } // for end
   }
 
  return ret;
@@ -1449,6 +1565,7 @@ int ObSqlPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
 
 int ObSqlPlanSet::select_plan(ObPlanCacheCtx &pc_ctx, ObPlanCacheObject *&cache_obj)
 {
+  MATCH_GUARD(id_, pc_ctx)
   int ret = OB_SUCCESS;
   ObPhysicalPlan *plan = NULL;
   if (OB_ISNULL(plan_cache_value_)) {
@@ -1653,13 +1770,19 @@ int ObSqlPlanSet::add_physical_plan(const ObPhyPlanType plan_type,
       if (OB_PHY_PLAN_LOCAL == spm_ctx.evolution_plan_type_) {
         // if local plan start evolving, clear local_plan_ which is added between adding
         // evolving plan and baseline plan.
-        if (OB_FAIL(local_evolution_plan_.add_plan(pc_ctx, &plan))) {
+        if (spm_ctx.evolution_plan_ != nullptr &&
+            OB_FAIL(local_evolution_plan_.swap_evolution_plan(pc_ctx, *spm_ctx.evolution_plan_))) {
+          LOG_WARN("failed to swap evolution plan");
+        } else if (OB_FAIL(local_evolution_plan_.add_plan(pc_ctx, &plan))) {
           LOG_WARN("failed to add local baseline plan");
         } else if (local_evolution_plan_.get_is_evolving_flag()) {
           remove_all_local_plan();
         }
       } else {
-        if (OB_FAIL(dist_evolution_plan_.add_plan(pc_ctx, &plan))) {
+        if (spm_ctx.evolution_plan_ != nullptr &&
+            OB_FAIL(dist_evolution_plan_.swap_evolution_plan(pc_ctx, *spm_ctx.evolution_plan_))) {
+          LOG_WARN("failed to swap evolution plan");
+        } else if (OB_FAIL(dist_evolution_plan_.add_plan(pc_ctx, &plan))) {
           LOG_WARN("failed to add dist baseline plan");
         } else if (dist_evolution_plan_.get_is_evolving_flag() &&
                    OB_FAIL(dist_plans_.remove_plan_stat())) {
@@ -1927,20 +2050,27 @@ int ObSqlPlanSet::try_get_local_plan(ObPlanCacheCtx &pc_ctx,
   get_next = false;
   ObExecContext &exec_ctx = pc_ctx.exec_ctx_;
   ObPhyPlanType real_type = OB_PHY_PLAN_UNINITIALIZED;
-  ObSEArray<ObCandiTableLoc, 2> candi_table_locs;
   ObPhysicalPlan *local_plan = get_local_plan(pc_ctx);
   if (OB_ISNULL(local_plan)) {
     LOG_DEBUG("local plan is null");
     get_next = true;
+    RECORD_CACHE_MISS(LOCAL_PLAN_NOT_EXISTS, pc_ctx, "Not exists local plan", K(local_plan));
   } else {
+    MATCH_GUARD(local_plan->get_plan_id(), pc_ctx);
     pc_ctx.exist_local_plan_ = true;
     if (FALSE_IT(plan = local_plan)) {
     } else if (OB_FAIL(get_plan_type(plan->get_table_locations(),
-                                     plan->has_uncertain_local_operator(), pc_ctx, candi_table_locs,
+                                     plan->has_uncertain_local_operator(), pc_ctx,
                                      real_type))) {
-      LOG_WARN("fail to get plan type", K(ret));
+      if (OB_SUCC(process_replica_error(ret, plan, pc_ctx.sql_ctx_.session_info_))) {
+        plan = NULL;
+        get_next = true;
+      } else {
+        LOG_WARN("fail to get plan type", K(ret));
+      }
     } else if (OB_PHY_PLAN_LOCAL != real_type) {
       LOG_DEBUG("not local plan", K(real_type));
+      RECORD_CACHE_MISS(LOCATION_CONSTR_NOT_MATCH, pc_ctx, "Location constraint not match", K(real_type));
       plan = NULL;
       get_next = true;
     } else if (GCONF._enable_adaptive_auto_dop && plan->get_is_use_auto_dop() && is_single_table_
@@ -1954,6 +2084,7 @@ int ObSqlPlanSet::try_get_local_plan(ObPlanCacheCtx &pc_ctx,
       } else if (OB_FAIL(auto_dop_map.get_refactored(0, dop))) {
         LOG_WARN("failed to get refactored", K(ret));
       } else if (dop > 1) {
+        RECORD_CACHE_MISS(LOCAL_PLAN_DOP_NOT_MATCH, pc_ctx, "Dop > 1, local plan not match", K(dop));
         plan = NULL;
         get_next = true;
       }
@@ -1973,22 +2104,29 @@ int ObSqlPlanSet::try_get_remote_plan(ObPlanCacheCtx &pc_ctx,
                                       ObPhysicalPlan *&plan,
                                       bool &get_next)
 {
+  MATCH_GUARD(id_, pc_ctx);
   int ret = OB_SUCCESS;
   plan = NULL;
   get_next = false;
   ObPhyPlanType real_type = OB_PHY_PLAN_UNINITIALIZED;
-  ObSEArray<ObCandiTableLoc, 2> candi_table_locs;
   if (OB_ISNULL(remote_plan_)) {
     LOG_DEBUG("remote plan is null");
+    RECORD_CACHE_MISS(REMOTE_PLAN_NOT_EXISTS, pc_ctx, "There is no remote plan", K(remote_plan_));
     get_next = true;
   } else if (OB_FAIL(get_plan_type(remote_plan_->get_table_locations(),
                                   remote_plan_->has_uncertain_local_operator(),
                                   pc_ctx,
-                                  candi_table_locs,
                                   real_type))) {
-    LOG_WARN("fail to get plan type", K(ret));
+    if (OB_SUCC(process_replica_error(ret, remote_plan_, pc_ctx.sql_ctx_.session_info_))) {
+      remote_plan_ = NULL;
+      get_next = true;
+    } else {
+      LOG_WARN("fail to get plan type", K(ret));
+    }
   } else if (OB_PHY_PLAN_REMOTE != real_type) {
     LOG_DEBUG("remote type is not match", K(real_type));
+    RECORD_CACHE_MISS(LOCATION_CONSTR_NOT_MATCH, pc_ctx, "Location constraint not match with remote plan",
+                      K(real_type));
     plan = NULL;
     get_next = true;
   } else {
@@ -2010,6 +2148,7 @@ int ObSqlPlanSet::try_get_dist_plan(ObPlanCacheCtx &pc_ctx,
   if (OB_FAIL(dist_plans_.get_plan(pc_ctx, plan))) {
     LOG_TRACE("failed to get dist plan", K(ret));
   } else if (plan != NULL) {
+    MATCH_GUARD(plan->get_plan_id(), pc_ctx);
     LOG_TRACE("succeed to get dist plan", K(*plan));
     if (GCONF._enable_adaptive_auto_dop && plan->get_is_use_auto_dop() && is_single_table_
         && !is_contain_inner_table_ && !plan->stat_.is_inner_) {
@@ -2022,6 +2161,7 @@ int ObSqlPlanSet::try_get_dist_plan(ObPlanCacheCtx &pc_ctx,
       } else if (OB_FAIL(auto_dop_map.get_refactored(0, dop))) {
         LOG_WARN("failed to get refactored", K(ret));
       } else if (is_single_part && !pc_ctx.exist_local_plan_ && dop <= 1) {
+        RECORD_CACHE_MISS(DIST_PLAN_DOP_NOT_MATCH, pc_ctx, "Distributed plan dop not match", K(dop));
         plan = NULL;
         exec_ctx.set_force_gen_local_plan();
       }
@@ -2041,12 +2181,11 @@ int ObSqlPlanSet::try_get_dist_plan(ObPlanCacheCtx &pc_ctx,
 int ObSqlPlanSet::get_plan_special(ObPlanCacheCtx &pc_ctx,
                                    ObPhysicalPlan *&plan)
 {
-  LOG_DEBUG("get plan special", K(need_try_plan_));
+  LOG_DEBUG("get plan special");
   int ret = OB_SUCCESS;
   plan = NULL;
   bool get_next = true;
   ObPhyPlanType real_type = OB_PHY_PLAN_UNINITIALIZED;
-  ObSEArray<ObCandiTableLoc, 2> candi_table_locs;
 #ifdef OB_BUILD_SPM
   if (OB_FAIL(try_get_evolution_plan(pc_ctx, plan, get_next))) {
     SQL_PC_LOG(TRACE, "get evolution plan failed", K(ret));
@@ -2093,14 +2232,11 @@ int64_t ObSqlPlanSet::get_mem_size()
 
 void ObSqlPlanSet::reset()
 {
-  is_all_non_partition_ = true;
-  need_try_plan_ = 0;
   has_duplicate_table_ = false;
   //has_array_binding_ = false;
   is_contain_virtual_table_ = false;
   is_contain_inner_table_ = false;
   enable_inner_part_parallel_exec_ = false;
-  table_locations_.reset();
   if (OB_ISNULL(plan_cache_value_)
       || OB_ISNULL(plan_cache_value_->get_pc_alloc())) {
     //do nothing
@@ -2129,15 +2265,19 @@ int ObSqlPlanSet::get_phy_locations(const ObIArray<ObTableLocation> &table_locat
   int ret = OB_SUCCESS;
   if (!pc_ctx.try_get_plan_) {
     DAS_CTX(pc_ctx.exec_ctx_).clear_all_location_info();
-  }
-  if (OB_FAIL(ObPhyLocationGetter::get_phy_locations(table_locations, pc_ctx, candi_table_locs))) {
-    LOG_WARN("failed to get phy locations", K(ret), K(table_locations));
-  } else if (candi_table_locs.empty()) {
-    // do nothing.
-  } else if (!pc_ctx.try_get_plan_
-             && OB_FAIL(ObPhyLocationGetter::build_candi_table_locs(
-                  pc_ctx.exec_ctx_.get_das_ctx(), table_locations, candi_table_locs))) {
-    LOG_WARN("fail to init table locs", K(ret));
+    if (OB_FAIL(ObPhyLocationGetter::get_phy_locations_and_add_to_das_ctx(table_locations,
+                                                                          pc_ctx,
+                                                                          candi_table_locs))) {
+      LOG_WARN("failed to get phy locations", K(ret), K(table_locations));
+    }
+  } else {
+    bool need_check_on_same_server = true;
+    if (OB_FAIL(ObPhyLocationGetter::get_phy_locations(table_locations,
+                                                       pc_ctx,
+                                                       candi_table_locs,
+                                                       need_check_on_same_server))) {
+      LOG_WARN("failed to get phy locations", K(ret), K(table_locations));
+    }
   }
   return ret;
 }
@@ -2408,11 +2548,11 @@ int ObSqlPlanSet::extend_param_store(const ParamStore &params,
 int ObSqlPlanSet::get_plan_type(const ObIArray<ObTableLocation> &table_locations,
                                 const bool is_contain_uncertain_op,
                                 ObPlanCacheCtx &pc_ctx,
-                                ObIArray<ObCandiTableLoc> &candi_table_locs,
                                 ObPhyPlanType &plan_type)
 {
   int ret = OB_SUCCESS;
-  candi_table_locs.reuse();
+  ObArenaAllocator allocator(ObModIds::OB_SQL_COMPILE);
+  ObSqlArray<ObCandiTableLoc, true> candi_table_locs(allocator);
 
   if (OB_FAIL(get_phy_locations(table_locations,
                                 pc_ctx,
@@ -2546,6 +2686,23 @@ bool ObSqlPlanSet::is_sql_planset()
   return true;
 }
 
+bool ObSqlPlanSet::has_any_plan()
+{
+  bool has_plan = false;
+  if (array_binding_plan_ != nullptr ||
+      !local_plans_.empty() ||
+      remote_plan_ != nullptr ||
+      direct_local_plan_ != nullptr ||
+#ifdef OB_BUILD_SPM
+      local_evolution_plan_.has_any_plan() ||
+      dist_evolution_plan_.has_any_plan() ||
+#endif
+      dist_plans_.count() > 0) {
+    has_plan = true;
+  }
+  return has_plan;
+}
+
 #ifdef OB_BUILD_SPM
 int ObSqlPlanSet::get_evolving_evolution_task(EvolutionPlanList &evo_task_list)
 {
@@ -2559,16 +2716,44 @@ int ObSqlPlanSet::get_evolving_evolution_task(EvolutionPlanList &evo_task_list)
   }
   return ret;
 }
-#endif
 
+int ObSqlPlanSet::alloc_evolution_records(ObEvolutionRecords *&evolution_records)
+{
+  int ret = OB_SUCCESS;
+  evolution_records = NULL;
+  void *buf = NULL;
+  if (OB_ISNULL(buf = alloc_.alloc(sizeof(ObEvolutionRecords)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate memory", K(ret));
+  } else {
+    evolution_records = new(buf)ObEvolutionRecords();
+  }
+  return ret;
 }
+
+void ObSqlPlanSet::free_evolution_records(ObEvolutionRecords *&evolution_records)
+{
+  if (NULL != evolution_records) {
+    // Wait for all references to be released before freeing memory.
+    // Note: The caller must have already set the records_ pointer to NULL
+    // (via reset_evolution_stat) before calling this function, so that
+    // new references cannot be acquired.
+    while (evolution_records->is_referenced()) {
+      PAUSE();
+    }
+    alloc_.free(evolution_records);
+    evolution_records = NULL;
+  }
+}
+
+#endif
 
 bool ObPlanSet::match_decint_precision(const ObParamInfo &param_info, ObPrecision other_prec) const
 {
   bool ret = false;
   if (ob_is_decimal_int(param_info.type_) || ob_is_integer_type(param_info.type_)) {
     ret = (param_info.precision_ == other_prec);
-  } else if (ob_is_extend(param_info.type_) && ob_is_decimal_int(param_info.ext_real_type_)) {
+  } else if (ob_is_extend(param_info.type_) && ob_is_decimal_int(static_cast<common::ObObjType>(param_info.ext_real_type_))) {
     ret = wide::ObDecimalIntConstValue::get_int_bytes_by_precision(param_info.precision_)
           == wide::ObDecimalIntConstValue::get_int_bytes_by_precision(other_prec);
   } else {
@@ -2578,4 +2763,150 @@ bool ObPlanSet::match_decint_precision(const ObParamInfo &param_info, ObPrecisio
   return ret;
 }
 
+// match actually constraint
+int ObPlanSet::match_and_merge_plan_cons(const ObPlanCacheCtx &pc_ctx, bool &is_matched)
+{
+  int ret = OB_SUCCESS;
+  ObIArray<ObPCConstParamInfo> *param_cons = pc_ctx.sql_ctx_.all_plan_const_param_constraints_;
+  ObIArray<ObPCParamEqualInfo> *equal_cons = pc_ctx.sql_ctx_.all_equal_param_constraints_;
+  ObIArray<ObPCPrivInfo> *priv_cons = pc_ctx.sql_ctx_.all_priv_constraints_;
+  ObDList<ObPreCalcExprConstraint> *pre_calc_cons = pc_ctx.sql_ctx_.all_pre_calc_constraints_;
+  ObSqlBitSet<> param_cons_set;
+  ObSqlBitSet<> equal_cons_set;
+  ObSqlBitSet<> priv_cons_set;
+  ObSqlBitSet<> pre_calc_cons_set;
+  is_matched = true;
+
+  if (OB_ISNULL(param_cons) || OB_ISNULL(equal_cons) ||
+      OB_ISNULL(priv_cons) || OB_ISNULL(pre_calc_cons)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(param_cons), K(equal_cons), K(pre_calc_cons));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < param_cons->count(); ++i) {
+      bool find = false;
+      for (int64_t j = 0; OB_SUCC(ret) && !find && j < all_plan_const_param_constraints_.count(); ++j) {
+        if (param_cons_set.has_member(j) ||
+            !(all_plan_const_param_constraints_.at(j) == param_cons->at(i))) {
+          // do nothing
+        } else if (OB_FAIL(param_cons_set.add_member(j))) {
+          LOG_WARN("failed to add member");
+        } else {
+          find = true;
+        }
+      }
+      is_matched &= find;
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < equal_cons->count(); ++i) {
+      bool find = false;
+      for (int64_t j = 0; OB_SUCC(ret) && !find && j < all_equal_param_constraints_.count(); ++j) {
+        if (equal_cons_set.has_member(j) ||
+            !(all_equal_param_constraints_.at(j) == equal_cons->at(i))) {
+          // do nothing
+        } else if (OB_FAIL(equal_cons_set.add_member(j))) {
+          LOG_WARN("failed to add member");
+        } else {
+          find = true;
+        }
+      }
+      is_matched &= find;
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < priv_cons->count(); ++i) {
+      bool find = false;
+      for (int64_t j = 0; OB_SUCC(ret) && !find && j < all_priv_constraints_.count(); ++j) {
+        if (priv_cons_set.has_member(j) ||
+            !(all_priv_constraints_.at(j) == priv_cons->at(i))) {
+          // do nothing
+        } else if (OB_FAIL(priv_cons_set.add_member(j))) {
+          LOG_WARN("failed to add member");
+        } else {
+          find = true;
+        }
+      }
+      is_matched &= find;
+    }
+    for (ObPreCalcExprConstraint *cur_con = pre_calc_cons->get_first();
+         OB_SUCC(ret) && pre_calc_cons->get_header() != cur_con;
+         cur_con = cur_con->get_next()) {
+      bool find = false;
+      int64_t j = 0;
+      for (ObPreCalcExprConstraint *cached_con = all_pre_calc_constraints_.get_first();
+           OB_SUCC(ret) && !find && all_pre_calc_constraints_.get_header() != cached_con;
+           cached_con = cached_con->get_next(), ++j) {
+        if (OB_ISNULL(cached_con) || OB_ISNULL(cur_con)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get null constraint", KP(cur_con), KP(cached_con));
+        } else if (pre_calc_cons_set.has_member(j)) {
+          // do nothing
+        } else if (OB_FAIL(ObPlanCacheObject::is_same_pre_calc_cons(*cached_con, *cur_con, find))) {
+          LOG_WARN("failed to check is same pre calc cons", K(ret));
+        } else if (find && OB_FAIL(pre_calc_cons_set.add_member(j))) {
+          LOG_WARN("failed to add member");
+        }
+      }
+      is_matched &= find;
+    }
+
+    // merge unmatched constraints in current plan set
+    if (OB_SUCC(ret) && !is_matched) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < all_plan_const_param_constraints_.count(); ++i) {
+        if (param_cons_set.has_member(i)) {
+          // do nothing
+        } else if (OB_FAIL(param_cons->push_back(all_plan_const_param_constraints_.at(i)))) {
+          LOG_WARN("failed to push back param cons");
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < all_equal_param_constraints_.count(); ++i) {
+        if (equal_cons_set.has_member(i)) {
+          // do nothing
+        } else if (OB_FAIL(equal_cons->push_back(all_equal_param_constraints_.at(i)))) {
+          LOG_WARN("failed to push back equal cons");
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < all_priv_constraints_.count(); ++i) {
+        if (priv_cons_set.has_member(i)) {
+          // do nothing
+        } else if (OB_FAIL(priv_cons->push_back(all_priv_constraints_.at(i)))) {
+          LOG_WARN("failed to push back priv param cons");
+        }
+      }
+      int64_t i = 0;
+      ObPreCalcExprConstraint *copy_cons = nullptr;
+      for (ObPreCalcExprConstraint *cached_con = all_pre_calc_constraints_.get_first();
+            OB_SUCC(ret) && all_pre_calc_constraints_.get_header() != cached_con;
+            cached_con = cached_con->get_next(), ++i) {
+        if (pre_calc_cons_set.has_member(i)) {
+          // do nothing
+        } else if (OB_FAIL(deep_copy_pre_calc_constraint(pc_ctx.exec_ctx_.get_allocator(), cached_con, copy_cons))) {
+          LOG_WARN("failed to deep copy pre calc constrint");
+        } else if (OB_UNLIKELY(!pre_calc_cons->add_last(copy_cons))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("failed to push back pre calc param cons");
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObPlanSet::process_replica_error(const int error_code,
+                                     const ObPhysicalPlan *plan,
+                                     ObBasicSessionInfo *session_info)
+{
+  int ret = OB_SUCCESS;
+  if (OB_NO_REPLICA_VALID == error_code && OB_NOT_NULL(session_info) &&
+      OB_NOT_NULL(plan) && plan->is_route_to_column_replica()) {
+    bool ap_query_replica_fallback = true;
+    if (OB_FAIL(session_info->get_sys_variable(share::SYS_VAR_AP_QUERY_REPLICA_FALLBACK,
+                                               ap_query_replica_fallback))) {
+      LOG_WARN("failed to get ap_query_replica_fallback", K(ret));
+    } else if (!ap_query_replica_fallback) {
+      ret = error_code;
+    }
+  } else {
+    ret = error_code;
+  }
+  return ret;
+}
+
+}
 }

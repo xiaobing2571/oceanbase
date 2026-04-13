@@ -89,7 +89,7 @@ public:
    * @param[in] server: target server
    * @param[in] timeout: Timeout period
    * */
-  int check_can_add_member(const ObAddr &server, const int64_t timeout);
+  int check_can_add_member(const ObMember &member, const int64_t timeout);
   /*
    * @description: Within the timeout period, determine whether the new member list can ensure that the readable_SCN does not regress.
    * @param[in] new_member_list : new_member_list
@@ -98,6 +98,7 @@ public:
    * **/
   int check_can_change_member(const ObMemberList &new_member_list,
                               const int64_t paxos_replica_num,
+                              const palf::LogConfigVersion &config_version,
                               const int64_t timeout);
   friend class TestLSRecoveryGuard;
 private:
@@ -117,7 +118,7 @@ private:
 class ObLSRecoveryStatHandler
 {
 public:
-  ObLSRecoveryStatHandler() { reset(true); }
+  ObLSRecoveryStatHandler() : ref_cond_(ObCond::SPIN_WAIT_NUM, common::ObWaitEventIds::OB_LS_RECOVERY_STAT_HANDLER_REF_COND), lock_(common::ObLatchIds::OB_LS_RECOVERY_STAT_HANDLER_LOCK) { reset(true); }
   ~ObLSRecoveryStatHandler() { reset(false); }
   void reset(const bool is_init = false);
   int init(const uint64_t tenant_id, ObLS *ls);
@@ -193,7 +194,8 @@ public:
    * @return:
   */
   int wait_can_change_member_list(const ObMemberList &new_member_list,
-      const int64_t paxos_replica_num, const int64_t timeout);
+      const int64_t paxos_replica_num, const palf::LogConfigVersion &config_version, const int64_t timeout);
+  int64_t get_ref_cnt();
   TO_STRING_KV(K_(tenant_id), K_(ls), K(ref_cnt_));
   friend class TestLSRecoveryGuard;
   friend class ObLSRecoveryGuard;
@@ -246,11 +248,20 @@ private:
       const share::SCN &leader_readable_scn,
       const int64_t need_query_member_cnt,
       share::SCN &majority_min_readable_scn);
-  int do_get_majority_readable_scn_V2_(
+  int do_get_readable_scn_(
       const ObIArray<common::ObAddr> &ob_member_list,
-      const int64_t need_query_member_cnt,
+      const int64_t paxos_replica_num,
       const palf::LogConfigVersion &config_version,
+      const int64_t full_replica_num,
       share::SCN &majority_min_readable_scn);
+  int do_get_member_readable_scn_(
+      const ObIArray<common::ObAddr> &ob_member_list,
+      const palf::LogConfigVersion &config_version,
+      ObIArray<SCN> &replica_readble_scn);
+  int do_get_max_readable_scn_(
+      const ObIArray<common::ObAddr> &new_member_list,
+      const palf::PalfStat &palf_stat,
+      share::SCN &readable_scn);
   int calc_majority_min_readable_scn_(
       const share::SCN &leader_readable_scn,
       const int64_t majority_cnt,
@@ -266,7 +277,8 @@ private:
       const common::GlobalLearnerList &degraded_list,
       const int64_t paxos_replica_number_ori,
       ObIArray<common::ObAddr> &member_list_new,
-      int64_t &paxos_replica_number_new);
+      int64_t &paxos_replica_number_new,
+      int64_t &full_replica_num);
   int check_can_use_new_version_(bool &vaild_to_use);
   int construct_addr_list_(const palf::PalfStat &palf_stat,
       ObIArray<common::ObAddr> &addr_list);
@@ -278,7 +290,7 @@ private:
   int wait_func_with_timeout_(const int64_t timeout, Args &&... args);
   int check_member_change_valid_(const common::ObAddr &server, bool &is_valid);
   int check_member_change_valid_(const ObMemberList &new_member_list,
-      const int64_t paxos_replica_num, bool &is_valid);
+      const int64_t paxos_replica_num, const palf::LogConfigVersion &config_version, bool &is_valid);
   DISALLOW_COPY_AND_ASSIGN(ObLSRecoveryStatHandler);
 
 private:
@@ -319,9 +331,18 @@ inline int ObLSRecoveryStatHandler::wait_func_with_timeout_(
     do {
       if (OB_FAIL(check_member_change_valid_(std::forward<Args>(args)..., is_finish))) {
         RS_LOG(WARN, "failed to check", KR(ret));
+        if (OB_NEED_RETRY == ret) {
+          // if check_member_change_valid return OB_NEED_RETRY
+          // it means informations in ls recovery stat may not updated to latest yet
+          // try wait before timeout
+          ret = OB_SUCCESS;
+          is_finish = false;
+        }
+      }
+      if (OB_FAIL(ret)) {
       } else if (!is_finish) {
         if (current_timeout > TIME_WAIT) {
-          usleep(TIME_WAIT);
+          ob_usleep(TIME_WAIT);
           current_timeout -= TIME_WAIT;
         } else {
           ret = OB_TIMEOUT;

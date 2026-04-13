@@ -33,7 +33,7 @@ class MdsTableBase;
 class RemovedMdsTableRecorder// tablet leak will resulting mds table leak, we must prove it
 {
 public:
-  RemovedMdsTableRecorder() = default;
+  RemovedMdsTableRecorder() : lock_(common::ObLatchIds::OB_MDS_TABLE_MGR_LOCK) {}
   void record(MdsTableBase *mds_table);
   void del(MdsTableBase *mds_table);
   bool check_is_list_head(MdsTableBase *mds_table) {
@@ -104,6 +104,8 @@ public:
     OpWrapper<OP> wrapper(std::forward<OP>(op));
     return mds_table_map_.for_each(wrapper);
   }
+
+  bool can_flush();
 
 public: // derived from ObCommonCheckpoint
   share::SCN get_freezing_scn() const;

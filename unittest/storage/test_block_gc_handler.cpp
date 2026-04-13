@@ -14,8 +14,7 @@
 #define USING_LOG_PREFIX SERVER
 #define protected public
 #define private public
-
-#include "close_modules/shared_storage/storage/shared_storage/ob_public_block_gc_service.h"
+#include "close_modules/shared_storage/storage/shared_storage/ob_private_block_gc_task.h"
 #include "storage/ls/ob_ls.h"
 namespace oceanbase
 {
@@ -29,7 +28,10 @@ class TestBlockGCHandler : public ::testing::Test,
 {
 public:
   TestBlockGCHandler()
-  : storage::ObBlockGCHandler(ObTabletID(1))
+  : storage::ObBlockGCHandler(
+      ObTabletID(1),
+      is_set_stop_),
+      is_set_stop_(false)
   {}
   virtual ~TestBlockGCHandler() {}
 
@@ -44,8 +46,11 @@ public:
   }
   virtual int get_blocks_for_tablet(
     int64_t tablet_meta_version,
+    const bool is_shared,
     ObIArray<blocksstable::MacroBlockId> &block_ids)
   {
+    UNUSED(tablet_meta_version);
+    UNUSED(is_shared);
     int ret = OB_SUCCESS;
     for (int i = 0; OB_SUCC(ret) && i < 3; i++) {
       ret = block_ids.push_back(macro_block_ids_[tablet_meta_version][i]);
@@ -66,6 +71,11 @@ public:
       ObIArray<blocksstable::MacroBlockId> &block_ids)
   {
     gc_blocks_.push_back(block_ids);
+    return OB_SUCCESS;
+  }
+
+  virtual int delete_macro_cache_(const ObIArray<blocksstable::MacroBlockId> &block_ids) override
+  {
     return OB_SUCCESS;
   }
   void reset()
@@ -92,9 +102,9 @@ public:
       BlockCollectOP &collect_check_block_op)
   { return OB_SUCCESS; }
 
-
   blocksstable::MacroBlockId (*macro_block_ids_)[3];
   ObArray<blocksstable::MacroBlockId> gc_blocks_;
+  bool is_set_stop_;
 };
 
 TEST_F(TestBlockGCHandler, test_block_gc)
@@ -111,7 +121,9 @@ TEST_F(TestBlockGCHandler, test_block_gc)
   for (int i = 0; i < 3; i++) {
     ASSERT_EQ(OB_SUCCESS, tablet_versions.push_back(i));
   }
-  ASSERT_EQ(OB_SUCCESS, gc_tablet_meta_versions(tablet_versions, 2));
+  ASSERT_EQ(OB_SUCCESS, gc_tablet_meta_versions(tablet_versions,
+                                                2/*min_retain_tablet_meta_version*/,
+                                                false/*is_transfer_out_deleted*/));
   ASSERT_EQ(gc_blocks_.count(), 3);
   for (int i = 0; i < gc_blocks_.count(); i++) {
     if (1 == gc_blocks_.at(i).second_id_
@@ -123,7 +135,7 @@ TEST_F(TestBlockGCHandler, test_block_gc)
 
   reset();
   macro_block_ids_ = test_array;
-  ASSERT_EQ(OB_SUCCESS, gc_tablet(tablet_versions));
+  ASSERT_EQ(OB_SUCCESS, gc_tablet(tablet_versions, GCTabletType::DropTablet));
   ASSERT_EQ(gc_blocks_.count(), 6);
   for (int i = 0; i < gc_blocks_.count(); i++) {
     if (1 == gc_blocks_.at(i).second_id_
@@ -138,91 +150,13 @@ TEST_F(TestBlockGCHandler, test_block_gc)
   }
 }
 
-class TestPublicBlockGCHandler : public ::testing::Test,
-                                 public storage::ObPublicBlockGCHandler
-{
-public:
-  TestPublicBlockGCHandler()
-  : storage::ObPublicBlockGCHandler(ObTabletID(1))
-  {
-    for (int i = 0; i < 1000; i++) {
-      macro_block_ids_[i].third_id_ = i;
-      macro_block_ids_[i].first_id_ = 1;
-    }
-    for (int i = 0; i < 2000; i++) {
-      macro_block_ids_[i].third_id_ = i;
-      macro_block_ids_[i].first_id_ = 1;
-    }
-    for (int i = 2000; i < 3000; i++) {
-      if (0 == i % 1000) {
-        macro_block_ids_[i].third_id_ = i;
-        macro_block_ids_[i].first_id_ = 0;
-      } else {
-        macro_block_ids_[i].third_id_ = i;
-        macro_block_ids_[i].first_id_ = 1;
-      }
-    }
-    for (int i = 3000; i < 4000; i++) {
-      macro_block_ids_[i].third_id_ = i;
-      macro_block_ids_[i].first_id_ = 0;
-    }
-  }
-  virtual ~TestPublicBlockGCHandler() {}
-
-  TO_STRING_KV(K(macro_block_ids_[0]),
-      K(macro_block_ids_[500]),
-      K(macro_block_ids_[1000]),
-      K(macro_block_ids_[1500]),
-      K(macro_block_ids_[2000]),
-      K(macro_block_ids_[2500]),
-      K(macro_block_ids_[3000]),
-      K(macro_block_ids_[3500]));
-
-  int is_exist_macro_block_(
-      const blocksstable::MacroBlockId &block_id,
-      bool &is_exist)
-  {
-    is_exist = false;
-    if (1 == macro_block_ids_[block_id.third_id_].first_id_) {
-      is_exist = true;
-    }
-    return OB_SUCCESS;
-  }
-
-  int delete_macro_blocks(
-        ObIArray<blocksstable::MacroBlockId> &block_ids)
-  {
-    int ret = OB_SUCCESS;
-    for (int64_t i = 0; i < block_ids.count(); i++) {
-      macro_block_ids_[block_ids.at(i).third_id_].first_id_ = 2;
-    }
-    return ret;
-  }
-
-  blocksstable::MacroBlockId macro_block_ids_[4000];
-};
-
-TEST_F(TestPublicBlockGCHandler, test_detect_and_gc)
-{
-  LOG_INFO("test detect_and_gc start", KPC(this));
-  blocksstable::MacroBlockId block_id;
-  block_id.third_id_ = 0;
-  ASSERT_EQ(OB_SUCCESS, detect_and_gc_block_(block_id));
-  for (int i = 0; i < 3000; i++) {
-    ASSERT_EQ(2, macro_block_ids_[i].first_id_);
-  }
-  for (int i = 3000; i < 4000; i++) {
-    ASSERT_EQ(0, macro_block_ids_[i].first_id_);
-  }
-  LOG_INFO("test detect_and_gc finish", KPC(this));
-}
-
 class TestPrivateBlockGCHandler : public ::testing::Test,
                                   public storage::ObPrivateBlockGCHandler
 {
 public:
   TestPrivateBlockGCHandler()
-  : storage::ObPrivateBlockGCHandler(share::ObLSID(1), 1, ObTabletID(1), 1, 1, 10, 20)
+  : storage::ObPrivateBlockGCHandler(share::ObLSID(1), 1, ObTabletID(1), 1, -1, 1, 10, 20, 0, is_set_stop_),
+    is_set_stop_(false)
   {
     for (int i = 0; i < 30; i++) {
       macro_block_ids_[i].id_mode_ = 2; // ID_MODE_SHARE
@@ -237,8 +171,11 @@ public:
 
   int get_blocks_for_tablet(
       int64_t tablet_meta_version,
+      const bool is_shared,
       ObIArray<blocksstable::MacroBlockId> &block_ids)
   {
+    UNUSED(tablet_meta_version);
+    UNUSED(is_shared);
     for (int i = 11; i < 20; i++) {
       if (0 == i % 2) {
         block_ids.push_back(macro_block_ids_[i]);
@@ -247,11 +184,21 @@ public:
     return OB_SUCCESS;
   }
   int list_tablet_meta_version(
+      ObIArray<int64_t> &tablet_versions,
+      const bool,
+      int64_t &)
+  {
+    tablet_versions.push_back(1);
+    return OB_SUCCESS;
+  }
+
+  int list_tablet_meta_version(
       ObIArray<int64_t> &tablet_versions)
   {
     tablet_versions.push_back(1);
     return OB_SUCCESS;
   }
+
   int get_block_ids_from_dir(
     ObIArray<blocksstable::MacroBlockId> &block_ids)
   {
@@ -271,8 +218,23 @@ public:
     }
     return ret;
   }
+  virtual int delete_macro_cache_(const ObIArray<blocksstable::MacroBlockId> &block_ids) override
+  {
+    return OB_SUCCESS;
+  }
+
+  int update_tablet_last_gc_version_(const int64_t) {
+    return OB_SUCCESS;
+  }
+
+  int safe_delete_blocks_for_macro_check_(
+        ObIArray<blocksstable::MacroBlockId> &block_ids) override
+  {
+    return delete_macro_blocks(block_ids);
+  }
 
   blocksstable::MacroBlockId macro_block_ids_[30];
+  bool is_set_stop_;
 };
 
 TEST_F(TestPrivateBlockGCHandler, test_macro_check)

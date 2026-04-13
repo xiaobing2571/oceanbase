@@ -51,6 +51,7 @@ class ObLSService : public ObIResourceLimitCalculatorHandler
   static const int64_t DEFAULT_LOCK_TIMEOUT = 60_s;
   static const int64_t SMALL_TENANT_MEMORY_LIMIT = 4 * 1024 * 1024 * 1024L; // 4G
   static const int64_t TENANT_MEMORY_PER_LS_NEED = 200 * 1024 * 1024L; // 200MB
+  static const int64_t TENANT_MEMORY_PER_LOGONLY_LS_NEED = 100 * 1024 * 1024L; // 100MB
 public:
   int64_t break_point = -1; // just for test
 public:
@@ -165,7 +166,11 @@ public:
   int64_t get_ls_count() const { return ls_map_.get_ls_count(); }
   int dump_ls_info();
 
+  // online single ls
+  int online_ls(const ObLSID &ls_id);
+
 #ifdef OB_BUILD_SHARED_STORAGE
+  int check_sslog_ls_exist();
   void report_tablet_id_for_tablet_version_gc(
       const share::ObLSID &ls_id,
       const common::ObTabletID &tablet_id)
@@ -205,24 +210,27 @@ private:
     share::ObTaskId task_id_;
     bool need_create_inner_tablet_;
     storage::ObMajorMVMergeInfo major_mv_merge_info_;
+    uint64_t data_version_;
   };
 
   int create_ls_(const ObCreateLSCommonArg &arg,
                  const ObMigrationOpArg &mig_arg);
   // the tenant smaller than 5G can only create 8 ls.
   // other tenant can create 100 ls.
-  int check_tenant_ls_num_();
+  int check_tenant_ls_num_(const bool is_check_for_logonly);
   int inner_create_ls_(const share::ObLSID &lsid,
                        const ObMigrationStatus &migration_status,
                        const share::ObLSRestoreStatus &restore_status,
                        const share::SCN &create_scn,
                        const ObMajorMVMergeInfo &major_mv_merge_info,
                        const ObLSStoreFormat &store_format,
+                       const ObReplicaType &replica_type,
+                       const uint64_t data_version,
                        ObLS *&ls);
   int inner_del_ls_(ObLS *&ls);
   int add_ls_to_map_(ObLS *ls);
   int remove_ls_from_map_(const share::ObLSID &ls_id);
-  void remove_ls_(ObLS *ls, const bool remove_from_disk, const bool write_slog);
+  void remove_ls_(ObLS *ls, const bool remove_from_disk);
   int safe_remove_ls_(ObLSHandle handle, const bool remove_from_disk);
   int restore_update_ls_(const ObLSMetaPackage &meta_package);
   int replay_remove_ls_(const share::ObLSID &ls_id);
@@ -244,14 +252,17 @@ private:
   // for resource limit calculator
   int cal_min_phy_resource_needed_(const int64_t ls_cnt,
                                    ObMinPhyResourceResult &min_phy_res);
-  int get_resource_constraint_value_(ObResoureConstraintValue &constraint_value);
+  int get_resource_constraint_value_(ObResoureConstraintValue &constraint_value,
+                                     const bool is_check_for_logonly = false);
   // for get_ls_replica
   int get_replica_type_(
       const common::ObAddr &addr,
       const ObMemberList &ob_member_list,
       const GlobalLearnerList &learner_list,
       const common::ObLSStoreFormat &ls_store_format,
+      const ObLSMeta &ls_meta,
       ObReplicaType &replica_type);
+  int online_ls_(ObLS *ls);
 
 private:
   bool is_inited_;

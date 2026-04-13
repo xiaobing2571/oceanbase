@@ -27,7 +27,6 @@ namespace sql
   if (OB_FAIL(ObBitVector::flip_foreach(                                                           \
           skip, batch_size, [&](int64_t idx) __attribute__((always_inline)) {                      \
             ++join_filter_ctx->n_times_;                                                           \
-            eval_flags.set(idx);                                                                   \
             results[idx].set_int(is_match);                                                        \
             ++join_filter_ctx->total_count_;                                                       \
             join_filter_ctx->collect_sample_info(!is_match, 1);                                    \
@@ -238,8 +237,9 @@ int ObExprJoinFilter::prepare_storage_white_filter_data(const ObExpr &expr,
   ObExprJoinFilterContext *join_filter_ctx = NULL;
   // get expr ctx from exec ctx
   if (OB_ISNULL(join_filter_ctx = static_cast<ObExprJoinFilterContext *>(
-            exec_ctx.get_expr_op_ctx(op_id)))) {
-    // join filter ctx may be null in das.
+            exec_ctx.get_expr_op_ctx(op_id))) || join_filter_ctx->skip_during_rescan_) {
+    // 1. join filter ctx may be null in das.
+    // 2. for partition wise hash join rescan, disable it during table scan rescan
     is_data_prepared = true;
     dynamic_filter.set_filter_action(DynamicFilterAction::PASS_ALL);
   } else {
@@ -284,8 +284,9 @@ int ObExprJoinFilter::eval_filter_internal(const ObExpr &expr, ObEvalCtx &ctx, O
   ObExprJoinFilterContext *join_filter_ctx = NULL;
   // get expr ctx from exec ctx
   if (OB_ISNULL(join_filter_ctx = static_cast<ObExprJoinFilterContext *>(
-            exec_ctx.get_expr_op_ctx(op_id)))) {
-    // join filter ctx may be null in das.
+            exec_ctx.get_expr_op_ctx(op_id))) || join_filter_ctx->skip_during_rescan_) {
+    // 1. join filter ctx may be null in das.
+    // 2. for partition wise hash join rescan, disable it during table scan rescan
     res.set_int(1);
   } else {
     if (OB_FAIL(check_rf_ready(exec_ctx, join_filter_ctx))) {
@@ -349,13 +350,13 @@ int ObExprJoinFilter::eval_filter_batch_internal(
   ObExecContext &exec_ctx = ctx.exec_ctx_;
   ObExprJoinFilterContext *join_filter_ctx = NULL;
   ObDatum *results = expr.locate_batch_datums(ctx); // for batch
-  ObBitVector &eval_flags = expr.get_evaluated_flags(ctx); // for batch
+   // get expr_ctx from exec_ctx
   if (OB_ISNULL(join_filter_ctx = static_cast<ObExprJoinFilterContext *>(
-            exec_ctx.get_expr_op_ctx(op_id)))) { // get expr_ctx from exec_ctx
-    // join filter ctx may be null in das.
+            exec_ctx.get_expr_op_ctx(op_id))) || join_filter_ctx->skip_during_rescan_) {
+    // 1. join filter ctx may be null in das.
+    // 2. for partition wise hash join rescan, disable it during table scan rescan
     if (OB_FAIL(ObBitVector::flip_foreach(skip, batch_size,
       [&](int64_t idx) __attribute__((always_inline)) {
-        eval_flags.set(idx);
         results[idx].set_int(is_match); // all results are true when join_filter_ctx is not ready.
         return OB_SUCCESS;
       }))) { /* do nothing*/ }
@@ -411,11 +412,11 @@ int ObExprJoinFilter::eval_filter_vector_internal(
   uint64_t op_id = expr.expr_ctx_id_;
   ObExecContext &exec_ctx = ctx.exec_ctx_;
   ObExprJoinFilterContext *join_filter_ctx = NULL;
-  ObBitVector &eval_flags = expr.get_evaluated_flags(ctx); // for batch
   VectorFormat res_format = expr.get_format(ctx);
   if (OB_ISNULL(join_filter_ctx = static_cast<ObExprJoinFilterContext *>(
-            exec_ctx.get_expr_op_ctx(op_id)))) {
-    // join filter ctx may be null in das.
+            exec_ctx.get_expr_op_ctx(op_id))) || join_filter_ctx->skip_during_rescan_) {
+    // 1. join filter ctx may be null in das.
+    // 2. for partition wise hash join rescan, disable it during table scan rescan
     if (VEC_UNIFORM == res_format) {
       IntegerUniVec *res_vec = static_cast<IntegerUniVec *>(expr.get_vector(ctx));
       ret = proc_by_pass(res_vec, skip, bound, valid_cnt, false /* calc_valid_cnt */);
@@ -423,7 +424,6 @@ int ObExprJoinFilter::eval_filter_vector_internal(
       IntegerFixedVec *res_vec = static_cast<IntegerFixedVec *>(expr.get_vector(ctx));
       ret = proc_by_pass(res_vec, skip, bound, valid_cnt, false /* calc_valid_cnt */);
     }
-    eval_flags.set_all(true);
   } else {
     if (OB_FAIL(check_rf_ready(exec_ctx, join_filter_ctx))) {
       LOG_WARN("fail to check bf ready", K(ret));
@@ -453,7 +453,6 @@ int ObExprJoinFilter::eval_filter_vector_internal(
         } else {
           (void)join_filter_ctx->collect_sample_info(0, valid_cnt);
         }
-        eval_flags.set_all(true);
       }
     } else if (OB_FAIL(join_filter_ctx->rf_msg_->might_contain_vector(expr, ctx, skip, bound,
                                                                       *join_filter_ctx))) {

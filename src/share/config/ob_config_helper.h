@@ -17,6 +17,7 @@
 #include "lib/hash/ob_hashmap.h"
 #include "lib/hash_func/murmur_hash.h"
 #include "lib/hash/ob_hashutils.h"
+#include "lib/utility/ob_macro_utils.h"
 #include "share/ob_define.h"
 
 namespace oceanbase
@@ -401,6 +402,17 @@ public:
   bool check(const ObConfigItem &t) const;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigAuditLogCompressionChecker);
+};
+
+class ObConfigDiagnosisLogCompressionChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigDiagnosisLogCompressionChecker() {}
+  virtual ~ObConfigDiagnosisLogCompressionChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigDiagnosisLogCompressionChecker);
 };
 
 class ObConfigAuditLogPathChecker
@@ -994,6 +1006,16 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObParallelDDLControlParser);
 };
 
+class ObSSLocalCacheControlParser : public ObConfigParser
+{
+public:
+  ObSSLocalCacheControlParser() {}
+  virtual ~ObSSLocalCacheControlParser() {}
+  virtual bool parse(const char *str, uint8_t *arr, int64_t len) override;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObSSLocalCacheControlParser);
+};
+
 class ObConfigKvGroupCommitRWModeChecker
   : public ObConfigChecker
 {
@@ -1044,6 +1066,17 @@ public:
   bool check(const ObConfigItem &t) const;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigDegradationPolicyChecker);
+};
+
+class ObConfigServerFullSchemaRefreshParallelismChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigServerFullSchemaRefreshParallelismChecker() {}
+  virtual ~ObConfigServerFullSchemaRefreshParallelismChecker() {}
+  bool check(const ObConfigItem& t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigServerFullSchemaRefreshParallelismChecker);
 };
 
 typedef __ObConfigContainer<ObConfigStringKey,
@@ -1124,6 +1157,18 @@ public:
 private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigJavaParamsChecker);
 };
+class ObConfigJniTransDataParamsChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigJniTransDataParamsChecker() {}
+  virtual ~ObConfigJniTransDataParamsChecker() {}
+  bool check(const ObConfigItem& t) const;
+private:
+  static const ObString arrow_table_str_;
+  static const ObString off_heap_table_str_;
+  DISALLOW_COPY_AND_ASSIGN(ObConfigJniTransDataParamsChecker);
+};
 
 class ObConfigEnableAutoSplitChecker : public ObConfigChecker
 {
@@ -1155,6 +1200,126 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigGlobalIndexAutoSplitPolicyChecker);
 };
 
+class ObHNSWIterFilterScanNumChecker
+  : public ObConfigChecker
+{
+public:
+  ObHNSWIterFilterScanNumChecker() {}
+  virtual ~ObHNSWIterFilterScanNumChecker() {}
+  bool check(const ObConfigItem &t) const;
+  static constexpr int64_t MAX_HNSW_ITER_SCAN_NUMS = INT64_MAX;
+  static constexpr int64_t MIN_HNSW_ITER_SCAN_NUMS = 0;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObHNSWIterFilterScanNumChecker);
+};
+
+class ObConfigDefaultMicroBlockFormatVersionChecker : public ObConfigChecker
+{
+public:
+  ObConfigDefaultMicroBlockFormatVersionChecker() = default;
+
+  virtual ~ObConfigDefaultMicroBlockFormatVersionChecker() = default;
+
+  bool check(const ObConfigItem &t) const;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigDefaultMicroBlockFormatVersionChecker);
+};
+
+class ObConfigUseDistinctWithExpansionChecker : public ObConfigChecker
+{
+public:
+  ObConfigUseDistinctWithExpansionChecker() {}
+  virtual ~ObConfigUseDistinctWithExpansionChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigUseDistinctWithExpansionChecker);
+};
+
+class ObConfigObDALChecker: public ObConfigChecker
+{
+public:
+  ObConfigObDALChecker() {}
+  virtual ~ObConfigObDALChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigObDALChecker);
+};
+
+class ObConfigObjectStorageAsyncIOChecker: public ObConfigChecker
+{
+public:
+  ObConfigObjectStorageAsyncIOChecker() {}
+  virtual ~ObConfigObjectStorageAsyncIOChecker() {}
+  virtual bool check(const ObConfigItem &t) const override;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigObjectStorageAsyncIOChecker);
+};
+
+class ObSQLFuncExtensionChecker
+  : public ObConfigChecker
+{
+public:
+  ObSQLFuncExtensionChecker() {}
+  virtual ~ObSQLFuncExtensionChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObSQLFuncExtensionChecker);
+};
+
+class ObConfigDefaultDeltaFormatChecker : public ObConfigChecker
+{
+public:
+  ObConfigDefaultDeltaFormatChecker() = default;
+  virtual ~ObConfigDefaultDeltaFormatChecker() = default;
+  bool check(const ObConfigItem &t) const;
+  DISABLE_COPY_ASSIGN(ObConfigDefaultDeltaFormatChecker);
+
+};
+
+
+class ObConfigZoneDeployModeChecker : public ObConfigChecker
+{
+public:
+  static constexpr const char *HETERO_MODE_STR = "HETERO";
+  static constexpr const char *HOMO_MODE_STR = "HOMO";
+  ObConfigZoneDeployModeChecker() {}
+  virtual ~ObConfigZoneDeployModeChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigZoneDeployModeChecker);
+};
+
+class ObConfigAppendUpdateGlobalIndexesForDynamicPartitionChecker
+  : public ObConfigChecker
+{
+public:
+  ObConfigAppendUpdateGlobalIndexesForDynamicPartitionChecker() {}
+  virtual ~ObConfigAppendUpdateGlobalIndexesForDynamicPartitionChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigAppendUpdateGlobalIndexesForDynamicPartitionChecker);
+};
+
+class ObConfigEvictOldSSTablePolicyChecker: public ObConfigChecker
+{
+public:
+  ObConfigEvictOldSSTablePolicyChecker() {}
+  virtual ~ObConfigEvictOldSSTablePolicyChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigEvictOldSSTablePolicyChecker);
+};
+// Checker for comma-separated string list (e.g., "item1,item2,item3" or single "item")
+class ObConfigCommaSeparatedStringChecker : public ObConfigChecker
+{
+public:
+  ObConfigCommaSeparatedStringChecker() {}
+  virtual ~ObConfigCommaSeparatedStringChecker() {}
+  bool check(const ObConfigItem &t) const;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigCommaSeparatedStringChecker);
+};
 
 } // namespace common
 } // namespace oceanbase

@@ -59,6 +59,8 @@ public:
   //   - OB_TIMEOUT: timeout
   int flashback(const uint64_t tenant_id, const share::SCN &flashback_scn, const int64_t timeout_us);
   int handle_flashback_resp(const LogFlashbackMsg &resp);
+  int get_ls_list(const uint64_t tenant_id,
+                   share::ObLSStatusInfoArray &ls_array);
 private:
   class BaseLSOperator
   {
@@ -243,6 +245,7 @@ private:
   public:
     ExecuteFlashbackOperator()
         : BaseLSOperator(),
+          lock_(common::ObLatchIds::OB_LOG_EXECUTE_FLASHBACK_OPERATOR_LOCK),
           mode_version_(palf::INVALID_PROPOSAL_ID),
           has_get_member_list_(false),
           member_list_(),
@@ -252,6 +255,7 @@ private:
     ExecuteFlashbackOperator(const ChangeAccessModeOperator &op)
       : BaseLSOperator(op.tenant_id_, op.ls_id_, op.self_, op.flashback_scn_,
         op.location_adapter_, op.rpc_proxy_),
+        lock_(common::ObLatchIds::OB_LOG_EXECUTE_FLASHBACK_OPERATOR_LOCK),
         mode_version_(op.mode_version_),
         has_get_member_list_(false),
         member_list_(),
@@ -275,7 +279,8 @@ private:
       flashbacked_learnerlist_ = op.flashbacked_learnerlist_;
       return *this;
     }
-    ExecuteFlashbackOperator(const ExecuteFlashbackOperator &op)
+    ExecuteFlashbackOperator(const ExecuteFlashbackOperator &op):
+      lock_(common::ObLatchIds::OB_LOG_EXECUTE_FLASHBACK_OPERATOR_LOCK)
     {
       *this = op;
     }
@@ -334,10 +339,6 @@ private:
   typedef common::ObArray<ObLogFlashbackService::CheckLSLogSyncOperator> CheckLogOpArray;
   typedef common::ObArray<ObLogFlashbackService::ChangeAccessModeOperator> ChangeModeOpArray;
   typedef common::ObArray<ObLogFlashbackService::ExecuteFlashbackOperator> FlashbackOpArray;
-
-private:
-  int get_ls_list_(const uint64_t tenant_id,
-                   share::ObLSStatusInfoArray &ls_array);
   // @returns:
   //   - OB_TIMEOUT
   int wait_all_ls_replicas_log_sync_(const uint64_t tenant_id,

@@ -46,6 +46,34 @@ CREATE OR REPLACE PACKAGE BODY dbms_vector
     CALL do_rebuild_index(idx_name, table_name, idx_vector_col, delta_rate_threshold, idx_organization, idx_distance_metrics, idx_parameters, idx_parallel_creation);
   END;
 
+  PROCEDURE do_flush_index(
+    IN     table_name             VARCHAR(65535),
+    IN     idx_name               VARCHAR(65535)
+  );
+  PRAGMA INTERFACE(C, DBMS_VECTOR_MYSQL_FLUSH_INDEX);
+
+  PROCEDURE flush_index(
+    IN     table_name             VARCHAR(65535),
+    IN     idx_name               VARCHAR(65535))
+  BEGIN
+    COMMIT;
+    CALL do_flush_index(table_name, idx_name);
+  END;
+
+  PROCEDURE do_compact_index(
+    IN     table_name             VARCHAR(65535),
+    IN     idx_name               VARCHAR(65535)
+  );
+  PRAGMA INTERFACE(C, DBMS_VECTOR_MYSQL_COMPACT_INDEX);
+
+  PROCEDURE compact_index(
+    IN     table_name             VARCHAR(65535),
+    IN     idx_name               VARCHAR(65535))
+  BEGIN
+    COMMIT;
+    CALL do_compact_index(table_name, idx_name);
+  END;
+
   PROCEDURE do_refresh_index_inner(
     IN     idx_table_id           BIGINT,
     IN     refresh_threshold      INT DEFAULT 10000,
@@ -82,6 +110,59 @@ CREATE OR REPLACE PACKAGE BODY dbms_vector
   BEGIN
     COMMIT;
     CALL do_rebuild_index_inner(idx_table_id, delta_rate_threshold, idx_organization, idx_distance_metrics, idx_parameters, idx_parallel_creation);
+  END;
+
+  FUNCTION index_vector_memory_advisor (
+    IN     idx_type           VARCHAR(65535),
+    IN     num_vectors        BIGINT UNSIGNED,
+    IN     dim_count          INT UNSIGNED,
+    IN     dim_type           VARCHAR(65535) DEFAULT 'FLOAT32',
+    IN     idx_parameters     LONGTEXT DEFAULT NULL,
+    IN     max_tablet_vectors BIGINT UNSIGNED DEFAULT 0)
+  RETURN VARCHAR(65535);
+  PRAGMA INTERFACE(C, DBMS_VECTOR_MYSQL_INDEX_VECTOR_MEMORY_ADVISOR);
+
+  FUNCTION index_vector_memory_estimate (
+    IN     table_name        VARCHAR(65535),
+    IN     column_name       VARCHAR(65535),
+    IN     idx_type          VARCHAR(65535),
+    IN     idx_parameters    LONGTEXT DEFAULT NULL)
+  RETURN VARCHAR(65535);
+  PRAGMA INTERFACE(C, DBMS_VECTOR_MYSQL_INDEX_VECTOR_MEMORY_ESTIMATE);
+
+  FUNCTION query_recall (
+    IN     sql_query         LONGTEXT)
+  RETURN FLOAT;
+  PRAGMA INTERFACE(C, DBMS_VECTOR_MYSQL_QUERY_RECALL);
+
+  FUNCTION index_recall (
+    IN     table_name        VARCHAR(65535),
+    IN     index_name        VARCHAR(65535),
+    IN     vectors           LONGTEXT DEFAULT NULL,
+    IN     num_vectors       INT DEFAULT 25,
+    IN     top_k             INT DEFAULT 10,
+    IN     filter            LONGTEXT DEFAULT NULL,
+    IN     parallel          INT DEFAULT 1,
+    IN     parameters        VARCHAR(65535) DEFAULT NULL)
+  RETURN FLOAT;
+  PRAGMA INTERFACE(C, DBMS_VECTOR_MYSQL_INDEX_RECALL);
+
+  PROCEDURE do_set_attribute (
+    IN     idx_name                VARCHAR(65535),
+    IN     table_name              VARCHAR(65535),
+    IN     item                    VARCHAR(65535),
+    IN     value                   VARCHAR(65535)
+  );
+  PRAGMA INTERFACE(C, DBMS_VECTOR_MYSQL_SET_ATTRIBUTE);
+
+  PROCEDURE set_attribute(
+    IN     idx_name                VARCHAR(65535),
+    IN     table_name              VARCHAR(65535),
+    IN     item                    VARCHAR(65535),
+    IN     value                   VARCHAR(65535))
+  BEGIN
+    COMMIT;
+    CALL do_set_attribute(idx_name, table_name, item, value);
   END;
 
 END dbms_vector;

@@ -17,6 +17,7 @@
 #include "mittest/mtlenv/mock_tenant_module_env.h"
 #include "mittest/shared_storage/clean_residual_data.h"
 #include "storage/shared_storage/ob_ss_reader_writer.h"
+#include "mittest/shared_storage/test_ss_macro_cache_mgr_util.h"
 #undef private
 #undef protected
 
@@ -64,7 +65,7 @@ public:
       macro_id.set_id_mode((uint64_t)ObMacroBlockIdMode::ID_MODE_SHARE);
       macro_id.set_storage_object_type((uint64_t)ObStorageObjectType::PRIVATE_DATA_MACRO);
       macro_id.set_second_id(tablet_id_); // tablet_id
-      macro_id.set_macro_transfer_seq(0); // transfer_seq
+      macro_id.set_macro_private_transfer_epoch(0); // transfer_seq
       macro_id.set_tenant_seq(server_id_); // server_id
 
       for (int64_t i = 0; i < read_times_; ++i) {
@@ -107,7 +108,17 @@ public:
 void TestSSFdCache::SetUpTestCase()
 {
   GCTX.startup_mode_ = observer::ObServerMode::SHARED_STORAGE_MODE;
-  EXPECT_EQ(OB_SUCCESS, MockTenantModuleEnv::get_instance().init());
+  ASSERT_EQ(OB_SUCCESS, MockTenantModuleEnv::get_instance().init());
+  ASSERT_EQ(OB_SUCCESS, TestSSMacroCacheMgrUtil::wait_macro_cache_ckpt_replay());
+
+  omt::ObTenant *tenant = nullptr;
+  ASSERT_NE(nullptr, GCTX.omt_);
+  ASSERT_EQ(OB_SUCCESS, GCTX.omt_->get_tenant(MTL_ID(), tenant));
+  ASSERT_NE(nullptr, tenant);
+  share::ObUnitInfoGetter::ObTenantConfig new_unit;
+  ASSERT_EQ(OB_SUCCESS, new_unit.assign(tenant->get_unit()));
+  new_unit.config_.resource_.data_disk_size_ = 20L * 1024L * 1024L * 1024L;
+  ASSERT_EQ(OB_SUCCESS, GCTX.omt_->update_tenant_unit(new_unit));
 }
 
 void TestSSFdCache::TearDownTestCase()
@@ -140,13 +151,13 @@ void TestSSFdCache::prepare()
   write_info.mtl_tenant_id_ = MTL_ID();
 
   for (int64_t i = 0; i < file_num_; ++i) {
-    ASSERT_EQ(OB_SUCCESS, OB_DIR_MGR.create_tablet_data_tablet_id_transfer_seq_dir(MTL_ID(), MTL_EPOCH_ID(), tablet_id_, 0/*transfer_seq*/));
+    ASSERT_EQ(OB_SUCCESS, OB_DIR_MGR.create_tablet_data_tablet_id_private_transfer_epoch_dir(MTL_ID(), MTL_EPOCH_ID(), tablet_id_, 0/*transfer_seq*/));
     MacroBlockId macro_id;
     macro_id.set_id_mode((uint64_t)ObMacroBlockIdMode::ID_MODE_SHARE);
     macro_id.set_storage_object_type((uint64_t)ObStorageObjectType::PRIVATE_DATA_MACRO);
     macro_id.set_second_id(tablet_id_); // tablet_id
     macro_id.set_third_id(i + 1); // seq_id
-    macro_id.set_macro_transfer_seq(0); // transfer_seq
+    macro_id.set_macro_private_transfer_epoch(0); // transfer_seq
     macro_id.set_tenant_seq(server_id_); // server_id
     ASSERT_TRUE(macro_id.is_valid());
     ObStorageObjectHandle write_object_handle;
@@ -163,7 +174,8 @@ TEST_F(TestSSFdCache, cost_time)
   // adjust tenant disk space to ensure private data macro write local. incremental space: 20GB * 0.4 = 8GB
   ObTenantDiskSpaceManager *tenant_disk_space_mgr = MTL(ObTenantDiskSpaceManager *);
   int64_t total_disk_size = 20L * 1024L * 1024L * 1024L - ObDiskSpaceManager::DEFAULT_SERVER_TENANT_ID_DISK_SIZE; // 20GB
-  ASSERT_EQ(OB_SUCCESS, tenant_disk_space_mgr->resize_total_disk_size(total_disk_size));
+  bool succ_resize = false;
+  ASSERT_EQ(OB_SUCCESS, tenant_disk_space_mgr->resize_total_disk_size_(total_disk_size, succ_resize));
   ASSERT_EQ(total_disk_size, tenant_disk_space_mgr->get_total_disk_size());
 
   // prepare file

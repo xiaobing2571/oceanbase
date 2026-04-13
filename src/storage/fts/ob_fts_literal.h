@@ -13,6 +13,7 @@
 #ifndef _OCEANBASE_STORAGE_FTS_OB_FTS_LITERAL_H_
 #define _OCEANBASE_STORAGE_FTS_OB_FTS_LITERAL_H_
 
+#include "lib/utility/ob_macro_utils.h"
 #include <cstdint>
 namespace oceanbase
 {
@@ -91,6 +92,7 @@ public:
       = "the max_ngram_size must be equal to or greater than min_ngram_size";
 
   static constexpr const char *IK_MODE_SCOPE_STR = "the ik_mode should be max_word or smart";
+
 };
 
 } //  namespace storage

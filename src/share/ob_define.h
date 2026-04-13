@@ -274,6 +274,7 @@ inline bool is_schema_error(int err)
     case OB_SCHEMA_NOT_UPTODATE:
     case OB_ERR_PARALLEL_DDL_CONFLICT:
     case OB_NO_PARTITION_FOR_GIVEN_VALUE_SCHEMA_ERROR:
+    case OB_ERR_DDL_RESOURCE_NOT_ENOUGH:
       ret = true;
       break;
     default:
@@ -489,9 +490,18 @@ inline bool is_query_killed_return(const int ret)
 }
 
 OB_NOINLINE bool is_shared_storage_sslog_table(const uint64_t tid);
+OB_NOINLINE bool is_ss_tiered_metadata_store_table(const uint64_t tid);
 OB_NOINLINE bool is_sslog_table(const uint64_t tid);
+OB_NOINLINE bool is_tiered_metadata_store_table(const uint64_t tid);
+OB_NOINLINE bool is_ss_special_table(const uint64_t tid);
 OB_NOINLINE bool is_shared_storage_sslog_exist();
 OB_NOINLINE bool is_hardcode_schema_table(const uint64_t tid);
+
+bool is_tenant_metadata_ls(const uint64_t tenant_id, const share::ObLSID &ls_id);
+bool is_tenant_sslog_ls(const uint64_t tenant_id, const share::ObLSID &ls_id);
+bool is_tenant_has_sslog(const uint64_t tenant_id);
+bool is_ss_special_ls(const uint64_t tenant_id, const share::ObLSID &ls_id);
+bool need_sslog_trans_service(const uint64_t tenant_id, const share::ObLSID &ls_id);
 
 //@TODO shanyan.g Temporary settings for elr
 static const bool CAN_ELR = false;
@@ -533,6 +543,7 @@ const int64_t OB_MAX_SYNONYM_NAME_LENGTH = 128;
 const int64_t OB_MAX_PARAMETERS_NAME_LENGTH = 128;
 const int64_t OB_MAX_RESOURCE_PLAN_NAME_LENGTH = 128;
 // end for const define replace OB_MAX_TABLE_NAME_LENGTH
+const int64_t OB_MAX_JOB_INFO_JOB_CONFIG_LENGTH = 512; // resource_plan 128 + consumer_group 128 + other 256
 
 ///////////////////////////////////////////////////////
 //          Schema defination                        //
@@ -588,6 +599,9 @@ const char *const FLASHBACK_VERIFY_MODE_STR = "physical_flashback_verify";
 const char *const DISABLED_CLUSTER_MODE_STR = "disabled_cluster";
 const char *const DISABLED_WITH_READONLY_CLUSTER_MODE_STR = "disabled_with_readonly_cluster";
 const char *const SHARED_STORAGE_MODE_STR = "shared_storage";
+const char *const DAILY_MAINTENANCE_WINDOW_JOB_NAME = "DAILY_MAINTENANCE_WINDOW";
+const char *const INNER_DAILY_WINDOW_PLAN_NAME = "INNER_DAILY_WINDOW_PLAN";
+const char *const INNER_DAILY_WINDOW_COMPACTION_LOW_GROUP_NAME = "INNER_DAILY_WINDOW_COMPACTION_LOW_GROUP";
 
 static const int64_t MODIFY_GC_SNAPSHOT_INTERVAL = 2 * 1000 * 1000; //2s
 

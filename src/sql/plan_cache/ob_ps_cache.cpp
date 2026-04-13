@@ -389,6 +389,7 @@ int ObPsCache::get_or_add_stmt_info(const PsCacheInfoCtx &info_ctx,
       tmp_stmt_info.assign_sql_key(*ps_item);
       tmp_stmt_info.set_stmt_type(info_ctx.stmt_type_);
       tmp_stmt_info.set_ps_item(ps_item);
+      tmp_stmt_info.set_ps_need_parameterization(info_ctx.ps_need_parameterization_);
       // calc check_sum with normalized sql
       uint64_t ps_stmt_checksum = ob_crc64(info_ctx.normalized_sql_.ptr(),
                                            info_ctx.normalized_sql_.length()); // actual is crc32
@@ -527,6 +528,9 @@ int ObPsCache::fill_ps_stmt_info(const ObResultSet &result,
   if (OB_SUCC(ret)) {
     ps_stmt_info.set_is_prexecute(sql_ctx->is_pre_execute_);
     ps_stmt_info.set_question_mark_count(param_cnt);
+    ps_stmt_info.set_parse_question_mark_count(result.get_parse_question_mark_cnt());
+    ps_stmt_info.set_external_params_count(result.get_external_params_cnt());
+    ps_stmt_info.set_is_select_for_update(result.get_is_select_for_update());
     // only used when returning into
     ps_stmt_info.set_num_of_returning_into(returning_into_parm_num);
   }

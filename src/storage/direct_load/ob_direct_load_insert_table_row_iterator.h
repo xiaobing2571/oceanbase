@@ -15,6 +15,7 @@
 #include "storage/blocksstable/ob_datum_row.h"
 #include "storage/ddl/ob_ddl_struct.h"
 #include "storage/direct_load/ob_direct_load_insert_table_row_handler.h"
+#include "storage/direct_load/ob_direct_load_insert_table_ctx.h"
 
 namespace oceanbase
 {
@@ -39,8 +40,8 @@ public:
   virtual ~ObDirectLoadInsertTableRowIterator();
   int init(ObDirectLoadInsertTabletContext *insert_tablet_ctx,
            const ObIArray<ObDirectLoadIStoreRowIterator *> &row_iters,
-           ObDirectLoadDMLRowHandler *dml_row_handler,
-           sql::ObLoadDataStat *job_stat);
+           ObDirectLoadDMLRowHandler *dml_row_handler, sql::ObLoadDataStat *job_stat,
+           bool is_delete_full_row);
   int get_next_row(const blocksstable::ObDatumRow *&datum_row) override;
   int get_next_row(const bool skip_lob, const blocksstable::ObDatumRow *&row) override;
   int close();
@@ -55,10 +56,11 @@ protected:
   ObDirectLoadInsertTableRowHandler row_handler_;
   blocksstable::ObDatumRow insert_datum_row_;
   blocksstable::ObDatumRow delete_datum_row_;
+  bool is_delete_full_row_;
   int64_t rowkey_column_count_;
   int64_t column_count_;
   int64_t pos_;
-  int64_t row_count_;
+  ObDirectLoadInsertTableResult insert_table_result_;
   bool is_inited_;
 };
 

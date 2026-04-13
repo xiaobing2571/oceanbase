@@ -54,6 +54,7 @@ public:
   static const share::SCN INIT_CLOG_CHECKPOINT_SCN;
   static const share::SCN INVALID_CREATE_SCN;
   static const share::SCN INIT_CREATE_SCN;
+  static const share::SCN INIT_MIN_SS_TABLET_VERSION;
 
 public:
   ObTabletMeta();
@@ -77,7 +78,8 @@ public:
       const bool micro_index_clustered,
       const bool has_cs_replica,
       const bool need_generate_cs_replica_cg_array,
-      const bool has_truncate_info);
+      const bool has_merged_with_mds_info,
+      const uint64_t ddl_data_format_version);
   int init(
       const ObTabletMeta &old_tablet_meta,
       const int64_t snapshot_version,
@@ -86,7 +88,7 @@ public:
       const share::ObSplitTabletInfo &split_info,
       const share::SCN clog_checkpoint_scn = share::SCN::min_scn(),
       const ObDDLTableStoreParam &ddl_info = ObDDLTableStoreParam(),
-      const bool has_truncate_info = false);
+      const bool has_merged_with_mds_info = false);
   int init(
       const ObTabletMeta &old_tablet_meta,
       const share::SCN &flush_scn);
@@ -98,6 +100,7 @@ public:
       const ObMigrationTabletParam *tablet_meta);
 #ifdef OB_BUILD_SHARED_STORAGE
   int init_for_share_storage(const ObTabletMeta &old_tablet_meta);
+  int update_for_share_storage(const ObTabletMeta &new_tablet_meta);
   share::SCN get_acquire_scn() const;
 #endif
 
@@ -106,12 +109,12 @@ public:
   bool is_valid() const;
 
   // serialize & deserialize
-  int serialize(char *buf, const int64_t len, int64_t &pos) const;
+  int serialize(const uint64_t data_version, char *buf, const int64_t len, int64_t &pos) const;
   int deserialize(
       const char *buf,
       const int64_t len,
       int64_t &pos);
-  int64_t get_serialize_size() const;
+  int64_t get_serialize_size(const uint64_t data_version) const;
   int reset_transfer_table();
   bool has_transfer_table() const;
   share::SCN get_ddl_sstable_start_scn() const;
@@ -123,6 +126,7 @@ public:
   bool is_cs_replica_global_visible_when_ddl() const;
   bool is_cs_replica_global_visible_and_replay_row_store() const;
   bool is_cs_replica_global_visible_and_replay_column_store() const;
+  bool is_min_ss_tablet_version_initial() const;
 public:
   static int deserialize_id(
       const char *buf,
@@ -148,7 +152,6 @@ public:
                K_(tablet_id),
                K_(data_tablet_id),
                K_(ref_tablet_id),
-               K_(has_next_tablet),
                K_(create_scn),
                K_(start_scn),
                K_(clog_checkpoint_scn),
@@ -167,15 +170,19 @@ public:
                K_(ddl_data_format_version),
                K_(ddl_commit_scn),
                K_(mds_checkpoint_scn),
+               K_(min_ss_tablet_version),
+               K_(min_ss_flush_op_id),
                K_(transfer_info),
                K_(extra_medium_info),
                K_(last_persisted_committed_tablet_status),
                K_(create_schema_version),
                K_(space_usage),
+               K_(is_empty_shell),
                K_(micro_index_clustered),
                K_(ddl_replay_status),
                K_(split_info),
-               K_(has_truncate_info));
+               K_(has_merged_with_mds_info),
+               K_(inc_major_snapshot));
 
 public:
   int32_t version_; // alignment: 4B, size: 4B
@@ -205,6 +212,7 @@ public:
   int64_t max_serialized_medium_scn_; // abandon after 4.2 // alignment: 8B, size: 8B
   share::SCN ddl_commit_scn_; // alignment: 8B, size: 8B
   share::SCN mds_checkpoint_scn_; // alignment: 8B, size: 8B
+  share::SCN min_ss_tablet_version_; // alignment: 8B, size: 8B
   ObTabletTransferInfo transfer_info_; // alignment: 8B, size: 32B
   compaction::ObExtraMediumInfo extra_medium_info_;
   ObTabletCreateDeleteMdsUserData last_persisted_committed_tablet_status_; // quick access for tablet status in sstables
@@ -236,15 +244,18 @@ public:
   // and tablet meta init interface for migration.
   // yuque :
   lib::Worker::CompatMode compat_mode_; // alignment: 1B, size: 4B
-  bool has_next_tablet_; // alignment: 1B, size: 2B
+  bool has_next_tablet_; // alignment: 1B, size: 2B (abandoned, don't use this field)
   bool is_empty_shell_; // alignment: 1B, size: 2B
   bool micro_index_clustered_; // alignment: 1B, size: 2B
   share::ObSplitTabletInfo split_info_; // alignment: 8B, size: 16B
-  bool has_truncate_info_; // be True after first major with truncate info
+  bool has_merged_with_mds_info_; // be True after first major with mds info
+  int64_t inc_major_snapshot_; // recording the latest inc major merge snapshot
+  int32_t min_ss_flush_op_id_; // the min referenced flush op id in local tablet
 private:
   void update_extra_medium_info(
       const compaction::ObMergeType merge_type,
-      const int64_t finish_medium_scn);
+      const int64_t finish_medium_scn,
+      const bool need_wait_check_flag);
   void update_extra_medium_info(
       const compaction::ObExtraMediumInfo &src_addr_extra_info,
       const compaction::ObExtraMediumInfo &src_data_extra_info,
@@ -253,6 +264,10 @@ private:
       const ObTabletMeta &old_tablet_meta,
       const ObMigrationTabletParam *tablet_meta);
   inline void set_space_usage_ (const ObTabletSpaceUsage &space_usage) { space_usage_ = space_usage; }
+  inline void set_min_ss_tablet_version_(const share::SCN &min_ss_tablet_version)
+  {
+    min_ss_tablet_version_ = min_ss_tablet_version;
+  }
 private:
   static const int32_t TABLET_META_VERSION = 1;
 private:
@@ -277,6 +292,8 @@ public:
   int assign(const ObMigrationTabletParam &param);
   int build_deleted_tablet_info(const share::ObLSID &ls_id, const ObTabletID &tablet_id);
   int get_tablet_status_for_transfer(ObTabletCreateDeleteMdsUserData &user_data) const;
+  const share::ObLSID &get_transfer_src_ls_id() const { return transfer_info_.ls_id_; }
+  const share::ObLSID &get_transfer_dest_ls_id() const { return ls_id_; }
 
   // Return the max tablet checkpoint scn which is the max scn among clog_checkpoint_scn,
   // mds_checkpoint_scn and ddl_checkpoint_scn.
@@ -327,7 +344,9 @@ public:
                K_(ddl_replay_status),
                K_(is_storage_schema_cs_replica),
                K_(split_info),
-               K_(has_truncate_info));
+               K_(has_merged_with_mds_info),
+               K_(min_ss_tablet_version),
+               K_(inc_major_snapshot));
 private:
   int deserialize_v2_v3(const char *buf, const int64_t len, int64_t &pos);
   int deserialize_v1(const char *buf, const int64_t len, int64_t &pos);
@@ -384,8 +403,10 @@ public:
   share::ObSplitTabletInfo split_info_;
   // [since 4.3.5 bp2] be True after first major with truncate info
   // will never be false even after truncate info recycled
-  bool has_truncate_info_;
+  bool has_merged_with_mds_info_;
 
+  share::SCN min_ss_tablet_version_;
+  int64_t inc_major_snapshot_; // recording the latest inc major merge snapshot
   // Add new serialization member before this line, below members won't serialize
   common::ObArenaAllocator allocator_; // for storage schema
 };

@@ -76,9 +76,9 @@ int ObSkipIndexSortedness::sample_and_calc(double &sortedness)
     // micro_block_count is 0, skip data sampling and set sortedness to 0
     sortedness = 0;
   } else if (OB_FAIL(sample_data(min_max_datums, null_count))) {
-    LOG_WARN("Fail to sample data", KR(ret));
+    LOG_WARN("Fail to sample data", KR(ret), KPC(this));
   } else if (OB_FAIL(calc_sortedness(min_max_datums, null_count, sortedness))) {
-    LOG_WARN("Fail to calc sortedness", KR(ret));
+    LOG_WARN("Fail to calc sortedness", KR(ret), KPC(this));
   }
 
   return ret;
@@ -138,12 +138,13 @@ int ObSkipIndexSortedness::init_compare_func(const ObTableSchema &schema, const 
     LOG_WARN("Invalid argument", KR(ret), K(schema), K(column_id));
   } else {
     ObObjMeta col_type = column_schema->get_meta_type();
+    const ObScale scale = col_type.is_decimal_int() ? column_schema->get_accuracy().get_scale() : col_type.get_scale();
     const ObPrecision precision
-        = col_type.is_decimal_int() ? col_type.get_stored_precision() : PRECISION_UNKNOWN_YET;
+        = col_type.is_decimal_int() ? column_schema->get_accuracy().get_precision() : PRECISION_UNKNOWN_YET;
     sql::ObExprBasicFuncs *basic_func
         = ObDatumFuncs::get_basic_func(col_type.get_type(),
                                        col_type.get_collation_type(),
-                                       col_type.get_scale(),
+                                       scale,
                                        lib::is_oracle_mode(),
                                        is_lob_storage(col_type.get_type()),
                                        precision);
@@ -194,7 +195,10 @@ int ObSkipIndexSortedness::sample_min_max_datum(ObMinMaxDatum &min_max_datum)
   if (OB_FAIL(tree_cursor_.get_idx_parser(idx_row_parser))) {
     LOG_WARN("Fail to get index row parser", KR(ret));
   } else if (OB_FAIL(idx_row_parser->get_agg_row(agg_row_buf, agg_row_size))) {
-    LOG_WARN("Fail to get agg row", KR(ret));
+    LOG_WARN("Fail to get agg row", KR(ret), KPC(this));
+    ret = OB_SUCCESS;
+    min_max_datum.min_.set_null();
+    min_max_datum.max_.set_null();
   } else if (OB_FAIL(reader.init(agg_row_buf, agg_row_size))) {
     LOG_WARN("Fail to init agg row reader", KR(ret));
   } else if (OB_FAIL(reader.read(min_meta, tmp_datum))) {
@@ -268,7 +272,10 @@ int ObSkipIndexSortedness::calc_sortedness(ObArray<ObMinMaxDatum> &datums,
 {
   int ret = OB_SUCCESS;
 
-  if (datums.count() <= 1) {
+  if (datums.count() == 0) {
+    sortedness = 0;
+    LOG_INFO("All data in skip index is null", KPC(this), K(null_count));
+  } else if (datums.count() == 1) {
     sortedness = 1;
   } else {
     double ascending = 0, descending = 0;

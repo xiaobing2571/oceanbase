@@ -101,7 +101,7 @@ void ObTimerTaskThreadPool::handle(void *task_token)
     THIS_WORKER.set_timeout_ts(INT64_MAX); // reset timeout to INT64_MAX
     ObCurTraceId::reset(); // reset trace_id
     set_ext_tname(token);
-    ObDIActionGuard(typeid(*token->task_));
+    ObDIActionGuard di_action_guard(typeid(*token->task_));
     token->task_->runTimerTask();
     clear_ext_tname(); // reset ext_tname
     const int64_t end_time = ::oceanbase::common::ObTimeUtility::current_time();
@@ -169,11 +169,13 @@ ObTimerService::ObTimerService(uint64_t tenant_id /* = OB_SERVER_TENANT_ID */)
   : is_never_started_(true),
     is_stopped_(true),
     tenant_id_(tenant_id),
+    monitor_(common::ObLatchIds::OB_TIMER_SERVICE_MUTEX),
     token_alloc_(),
     priority_task_queue_(64L, nullptr, ObMemAttr(tenant_id_, "ts_queue")),
     running_task_set_(64L, nullptr, ObMemAttr(tenant_id_, "ts_run_set")),
     uncanceled_task_set_(64L, nullptr, ObMemAttr(tenant_id_, "ts_cancel_set")),
-    worker_thread_pool_(*this)
+    worker_thread_pool_(*this),
+    mutex_(common::ObLatchIds::OB_TIMER_SERVICE_MUTEX)
 {
   token_alloc_.set_attr(ObMemAttr(tenant_id, "ts_token"));
 }
@@ -470,6 +472,9 @@ bool ObTimerService::task_exist(const ObTimer *timer, const ObTimerTask &task)
     TaskToken *token = priority_task_queue_.at(idx);
     exist = has_same_task_and_timer(token, timer, &task);
   }
+  if (!exist) {
+    exist = find_task_in_set(running_task_set_, timer, &task);
+  }
   return exist;
 }
 
@@ -498,15 +503,15 @@ int ObTimerService::mtl_start(ObTimerService *&timer_service)
 
 void ObTimerService::mtl_stop(ObTimerService *&timer_service)
 {
-  if (nullptr != timer_service) {
-    timer_service->stop();
-    OB_LOG(INFO, "success to stop timer service");
-  }
+  UNUSED(timer_service);
+  OB_LOG(INFO, "delay to stop timer service");
 }
 
 void ObTimerService::mtl_wait(ObTimerService *&timer_service)
 {
   if (nullptr != timer_service) {
+    timer_service->stop();
+    OB_LOG(INFO, "success to stop timer service");
     timer_service->wait();
     OB_LOG(INFO, "success to wait timer service");
   }
@@ -583,7 +588,7 @@ void ObTimerService::run1()
   int64_t thread_id = GETTID();
   set_thread_name("TimerSvr");
   const char *module_name = ob_get_tname() != nullptr ? ob_get_tname() : "DefaultTimer";
-  ObDIActionGuard("TimerThreadPool", module_name, nullptr);
+  ObDIActionGuard di_action_guard("TimerThreadPool", module_name, nullptr);
   OB_LOG(INFO, "TimerService thread started",
       KP(this), K(thread_id), K_(tenant_id), KCSTRING(lbt()));
 

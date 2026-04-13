@@ -12,8 +12,9 @@
 
 #define USING_LOG_PREFIX SQL_REWRITE
 #include "sql/rewrite/ob_transform_mv_rewrite_prepare.h"
-#include "sql/resolver/mv/ob_mv_provider.h"
+#include "sql/rewrite/ob_transform_mv_rewrite.h"
 #include "sql/rewrite/ob_transform_pre_process.h"
+#include "sql/resolver/mv/ob_mv_provider.h"
 
 namespace oceanbase
 {
@@ -91,7 +92,7 @@ int ObTransformMVRewritePrepare::check_table_has_mv(const ObDMLStmt *stmt,
     if (OB_ISNULL(table = stmt->get_table_item(i))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("table item is null", K(ret), K(i), K(stmt->get_table_size()));
-    } else if (!table->is_basic_table()) {
+    } else if (!ObTransformMVRewrite::is_mv_rewrite_supported_table(*table)) {
       // do nothing
     } else if (OB_FAIL(ctx_->schema_checker_->get_table_schema(ctx_->session_info_->get_effective_tenant_id(),
                                                                table->ref_id_,
@@ -286,8 +287,11 @@ int ObTransformMVRewritePrepare::get_all_base_table_id(const ObDMLStmt *stmt,
     if (OB_ISNULL(table = stmt->get_table_item(i))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("get unexpected null", K(ret), K(i));
-    } else if (!table->is_basic_table()) {
+    } else if (!ObTransformMVRewrite::is_mv_rewrite_supported_table(*table)) {
       // do nothing
+    } else if (OB_UNLIKELY(common::OB_INVALID_ID == table->ref_id_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected invalid ref id", K(ret), KPC(table));
     } else if (OB_FAIL(table_ids.push_back(table->ref_id_))) {
       LOG_WARN("failed to push back table id", K(ret));
     }
@@ -383,11 +387,14 @@ int ObTransformMVRewritePrepare::quick_rewrite_check(const ObSQLSessionInfo &ses
   if (OB_FAIL(ObMVProvider::check_mview_dep_session_vars(mv_schema, session_info, false, is_valid))) {
     LOG_WARN("failed to check mview dep session vars", K(ret));
   } else if (!is_valid) {
-    /* do nothing */
+    LOG_TRACE("[MV_REWRITE] materialized view dependency session variables not matched", K(mv_schema.get_table_name()));
   } else if (!mv_schema.mv_enable_query_rewrite()) {
     is_valid = false;
-  } else if (!allow_stale && !mv_schema.mv_on_query_computation()) {
+    LOG_TRACE("[MV_REWRITE] materialized view does not enable query rewrite", K(mv_schema.get_table_name()));
+  } else if (!allow_stale && (!mv_schema.mv_on_query_computation()
+                              || mv_schema.is_mv_cnt_proctime_table())) {
     is_valid = false;
+    LOG_TRACE("[MV_REWRITE] materialized view does not enable on query computation or contain proctime table", K(mv_schema.get_table_name()));
   } else {
     is_valid = true;
   }
@@ -399,28 +406,66 @@ int ObTransformMVRewritePrepare::generate_mv_stmt(MvInfo &mv_info,
                                                   ObQueryCtx *temp_query_ctx)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(ctx) || OB_ISNULL(ctx->allocator_)
-      || OB_ISNULL(ctx->session_info_) || OB_ISNULL(mv_info.mv_schema_)) {
+  if (OB_ISNULL(ctx) || OB_ISNULL(ctx->allocator_) || OB_ISNULL(ctx->session_info_)
+      || OB_ISNULL(mv_info.mv_schema_) || OB_ISNULL(mv_info.data_table_schema_) || OB_ISNULL(mv_info.db_schema_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("mv_info is null", K(ret), K(ctx), KPC(mv_info.mv_schema_));
+    LOG_WARN("get unexpected null", K(ret), K(ctx), K(mv_info));
   } else {
+    const ObString raw_view_def = mv_info.mv_schema_->get_view_schema().get_expand_view_definition_for_mv_str().empty() ?
+                                  mv_info.mv_schema_->get_view_schema().get_view_definition_str() :
+                                  mv_info.mv_schema_->get_view_schema().get_expand_view_definition_for_mv_str();
     ObString view_definition;
-    ObSqlString mv_sql; // select * from mv;
-    if (OB_FAIL(ObSQLUtils::generate_view_definition_for_resolve(*ctx->allocator_,
-                                                                 ctx->session_info_->get_local_collation_connection(),
-                                                                 mv_info.mv_schema_->get_view_schema(),
-                                                                 view_definition))) {
-      LOG_WARN("fail to generate view definition for resolve", K(ret));
+    ObString database_name;
+    ObString mv_name;
+    ObSqlString select_mv_sql; // select * from mv;
+    if (OB_FAIL(ObSQLUtils::copy_and_convert_string_charset(*ctx->allocator_,
+                                                            raw_view_def,
+                                                            view_definition,
+                                                            CS_TYPE_UTF8MB4_GENERAL_CI,
+                                                            ctx->session_info_->get_local_collation_connection()))) {
+      LOG_WARN("failed to copy and convert string charset", K(ret));
     } else if (OB_FAIL(resolve_temp_stmt(view_definition, ctx, temp_query_ctx, mv_info.view_stmt_))) {
       LOG_WARN("failed to resolve mv define stmt", K(ret), K(view_definition));
-    } else if (OB_FAIL(mv_sql.assign_fmt(lib::is_oracle_mode() ?
-                        "SELECT * FROM \"%.*s\".\"%.*s\"" :
-                        "SELECT * FROM `%.*s`.`%.*s`",
-                        mv_info.db_schema_->get_database_name_str().length(), mv_info.db_schema_->get_database_name_str().ptr(),
-                        mv_info.mv_schema_->get_table_name_str().length(), mv_info.mv_schema_->get_table_name_str().ptr()))) {
+    } else if (OB_FAIL(select_mv_sql.assign( "SELECT "))) {
       LOG_WARN("failed to assign sql", K(ret));
-    } else if (OB_FAIL(resolve_temp_stmt(ObString::make_string(mv_sql.ptr()), ctx, temp_query_ctx, mv_info.select_mv_stmt_))) {
-      LOG_WARN("failed to resolve mv define stmt", K(ret), K(mv_sql));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < mv_info.view_stmt_->get_select_item_size(); ++i) {
+      const ObColumnSchemaV2 *col_schema = NULL;
+      ObString col_name;
+      if (OB_ISNULL(col_schema = mv_info.data_table_schema_->get_column_schema(OB_APP_MIN_COLUMN_ID + i))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to get column schema", K(ret), K(i));
+      } else if (OB_FAIL(ObSQLUtils::generate_new_name_with_escape_character(*ctx->allocator_,
+                                                                             col_schema->get_column_name_str(),
+                                                                             col_name,
+                                                                             lib::is_oracle_mode()))) {
+        LOG_WARN("failed to generate new name with escape character", K(ret), K(col_schema->get_column_name_str()), K(lib::is_oracle_mode()));
+      } else if (i > 0 && OB_FAIL(select_mv_sql.append(", "))) {
+        LOG_WARN("failed to append comma", K(ret), K(col_name), K(i));
+      } else if (OB_FAIL(select_mv_sql.append_fmt(lib::is_oracle_mode() ? "\"%.*s\"" : "`%.*s`",
+                                                  col_name.length(), col_name.ptr()))) {
+        LOG_WARN("failed to append sql", K(ret), K(col_name), K(i));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ObSQLUtils::generate_new_name_with_escape_character(*ctx->allocator_,
+                                                                           mv_info.db_schema_->get_database_name_str(),
+                                                                           database_name,
+                                                                           lib::is_oracle_mode()))) {
+      LOG_WARN("failed to generate new name with escape character", K(ret), K(mv_info.db_schema_->get_database_name_str()), K(lib::is_oracle_mode()));
+    } else if (OB_FAIL(ObSQLUtils::generate_new_name_with_escape_character(*ctx->allocator_,
+                                                                           mv_info.mv_schema_->get_table_name_str(),
+                                                                           mv_name,
+                                                                           lib::is_oracle_mode()))) {
+      LOG_WARN("failed to generate new name with escape character", K(ret), K(mv_info.mv_schema_->get_table_name_str()), K(lib::is_oracle_mode()));
+    } else if (OB_FAIL(select_mv_sql.append_fmt(lib::is_oracle_mode() ?
+                                                " FROM \"%.*s\".\"%.*s\"" :
+                                                " FROM `%.*s`.`%.*s`",
+                                                database_name.length(), database_name.ptr(),
+                                                mv_name.length(), mv_name.ptr()))) {
+      LOG_WARN("failed to append sql", K(ret), K(database_name), K(mv_name));
+    } else if (OB_FAIL(resolve_temp_stmt(ObString::make_string(select_mv_sql.ptr()), ctx, temp_query_ctx, mv_info.select_mv_stmt_))) {
+      LOG_WARN("failed to resolve mv define stmt", K(ret), K(select_mv_sql));
     } else {
       LOG_DEBUG("generate mv stmt", KPC(mv_info.view_stmt_), KPC(mv_info.select_mv_stmt_));
     }
@@ -454,6 +499,7 @@ int ObTransformMVRewritePrepare::resolve_temp_stmt(const ObString &sql_string,
       resolver_ctx.stmt_factory_ = ctx->stmt_factory_;
       resolver_ctx.sql_proxy_ = GCTX.sql_proxy_;
       resolver_ctx.query_ctx_ = query_ctx;
+      resolver_ctx.is_mview_definition_sql_ = true;
       resolver_ctx.is_for_rt_mv_ = true;
       resolver_ctx.expr_factory_->set_query_ctx(resolver_ctx.query_ctx_);
       trans_ctx = *ctx;
@@ -476,10 +522,10 @@ int ObTransformMVRewritePrepare::resolve_temp_stmt(const ObString &sql_string,
         LOG_WARN("invalid mv stmt", K(ret), K(dml_stmt));
       } else if (OB_FAIL(resolver_ctx.query_ctx_->query_hint_.init_query_hint(resolver_ctx.allocator_,
                                                                               resolver_ctx.session_info_,
+                                                                              resolver_ctx.global_hint_,
                                                                               dml_stmt))) {
         LOG_WARN("failed to init query hint.", K(ret));
-      } else if (OB_FAIL(resolver_ctx.query_ctx_->query_hint_.check_and_set_params_from_hint(resolver_ctx,
-                                                                                             *dml_stmt))) {
+      } else if (OB_FAIL(resolver_ctx.query_ctx_->query_hint_.set_params_from_hint(resolver_ctx))) {
         LOG_WARN("failed to check and set params from hint", K(ret));
       } else if (OB_FAIL(transform_pre_process.transform(dml_stmt, dummy_value))) {
         LOG_WARN("failed to do transform pre process", K(ret), KPC(dml_stmt));

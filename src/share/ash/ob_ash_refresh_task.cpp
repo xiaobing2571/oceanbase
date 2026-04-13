@@ -29,13 +29,15 @@ using namespace oceanbase::common::sqlclient;
 // refresh would consume time up to 10s
 // if refresh time is above this threshold, refresh exection is too slow
 constexpr int64_t ASH_REFESH_TIME = 10 * 1000L * 1000L;  // 10s
-// refersh task update its state and do decision making
-// every ASH_REFRESH_INTERVAL
-constexpr int64_t ASH_REFRESH_INTERVAL = 120 * 1000L * 1000L;  // 120s
 // we should snapshot ahead if current speed is SPEED_THRESHOLD times larger than expect speed
-constexpr int SPEED_THRESHOLD = 10;
+constexpr int SPEED_THRESHOLD = 3;
 // ahead snapshot will be triggered only if the time remaining until the next scheduled snapshot is greater than SNAPSHOT_THRESHOLD
 constexpr int SNAPSHOT_THRESHOLD = 180 * 1000L * 1000L;  // 180s
+// free slots threshold when snapshot cannot be triggered
+constexpr double FREE_SLOTS_THRESHOLD = 0.5;
+// free slots threshold for ash buffer must preserved
+constexpr double FREE_SLOTS_THRESHOLD_FOR_SNAPSHOT_AHEAD = 0.3;
+
 
 ObAshRefreshTask &ObAshRefreshTask::get_instance()
 {
@@ -67,7 +69,8 @@ void ObAshRefreshTask::runTimerTask()
 {
   if (0 == prev_write_pos_) {
   } else if (GCONF._ob_ash_disk_write_enable) {
-    int64_t task_timeout_ts = ObTimeUtility::current_time() + ASH_REFRESH_INTERVAL * 1000L * 1000L - ESTIMATE_PS_RESERVE_TIME;
+    int64_t task_timeout_ts = ObTimeUtility::current_time() + ASH_REFRESH_INTERVAL - ESTIMATE_PS_RESERVE_TIME;
+    THIS_WORKER.set_timeout_ts(task_timeout_ts);
     int ret = OB_SUCCESS;
     common::ObTimeGuard time_guard(__func__, ASH_REFESH_TIME);
     common::ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
@@ -139,8 +142,15 @@ void ObAshRefreshTask::runTimerTask()
       if (static_cast<ObWrSnapshotFlag>(snapshot_flag) == ObWrSnapshotFlag::LAST_SCHEDULED_SNAPSHOT) {
         last_scheduled_snapshot_time_ = last_snapshot_end_time;
       }
+      bool need_do_ash_take_ahead = require_snapshot_ahead();
+      LOG_INFO("start do ash refresh task", K(prev_write_pos_), K(prev_sched_time_),
+                                      K(ObActiveSessHistList::get_instance().write_pos()),
+                                      K(ObActiveSessHistList::get_instance().free_slots_num()),
+                                      K(last_scheduled_snapshot_time_),
+                                      K(last_snapshot_end_time),
+                                      K(need_do_ash_take_ahead));
       // send rpc
-      if (require_snapshot_ahead()) {
+      if (need_do_ash_take_ahead) {
         int64_t timeout = task_timeout_ts - ObTimeUtility::current_time();
         ObMultiVersionSchemaService *schema_service = GCTX.schema_service_;
         ObArray<uint64_t> all_tenants;
@@ -190,6 +200,7 @@ ERRSIM_POINT_DEF(EN_FORCE_ENABLE_SNAPSHOT_AHEAD);
 bool ObAshRefreshTask::require_snapshot_ahead()
 {
   bool bret = false;
+  ObActiveSessHistList::get_instance().set_pre_check_snapshot_time(ObTimeUtility::current_time());
   int64_t write_pos = ObActiveSessHistList::get_instance().write_pos();
   int64_t free_slots_num = ObActiveSessHistList::get_instance().free_slots_num();
   int64_t scheduled_snapshot_interval = GCTX.wr_service_->get_snapshot_interval(false) * 60 * 1000L * 1000L;
@@ -198,15 +209,44 @@ bool ObAshRefreshTask::require_snapshot_ahead()
     // last scheduled snapshot time update may lose or no last scheduled snapshot or this machine's clock is behind
     // cluster pressure may be heavy
     LOG_WARN_RET(OB_INVALID_TIMESTAMP, "unexpected next scheduled snapshot interval");
-    bret = false;
+    //可能由于重启或者切主导致无法实现第一次定时落盘，此时当ash buffer使用率超过FREE_SLOTS_THRESHOLD时，强制启用快照提前
+    if (free_slots_num < ObActiveSessHistList::get_instance().size() * FREE_SLOTS_THRESHOLD) {
+      bret = true;
+      LOG_INFO("force enable snapshot ahead because of free slots num is too small");
+    } else {
+      bret = false;
+    }
   } else {
     double cur_speed = 1.0 * (write_pos - prev_write_pos_) / ((ObTimeUtility::current_time() - prev_sched_time_) / 1000 / 1000);
     double expect_speed = 1.0 * free_slots_num / (next_scheduled_snapshot_interval / 1000 / 1000);
-    bret = (cur_speed >= SPEED_THRESHOLD * expect_speed) && (next_scheduled_snapshot_interval > SNAPSHOT_THRESHOLD);
+    bret = (cur_speed >= SPEED_THRESHOLD * expect_speed ||
+            free_slots_num < ObActiveSessHistList::get_instance().size() * FREE_SLOTS_THRESHOLD_FOR_SNAPSHOT_AHEAD) &&
+           (next_scheduled_snapshot_interval > SNAPSHOT_THRESHOLD);
   }
   if (EN_FORCE_ENABLE_SNAPSHOT_AHEAD) {
     bret = true;
     LOG_INFO("force enable snapshot ahead");
+  }
+  ObActiveSessHistList &ash_list = ObActiveSessHistList::get_instance();
+  const int64_t read_pos = ash_list.read_pos();
+  const int64_t size = ash_list.size();
+  if (write_pos >= read_pos &&
+      write_pos <= read_pos + size) {
+    FLOG_WARN_RET(OB_SUCCESS, "check need snapshot ahead, write pos in range", K(bret),
+                 K(prev_write_pos_), K(write_pos),
+                 K(read_pos),
+                 K(size),
+                 K(SPEED_THRESHOLD),
+                 K(next_scheduled_snapshot_interval),
+                 K(SNAPSHOT_THRESHOLD));
+  } else {
+    FLOG_WARN_RET(OB_ERR_UNEXPECTED, "check need snapshot ahead, write pos out of range", K(bret),
+                 K(prev_write_pos_), K(write_pos),
+                 K(read_pos),
+                 K(size),
+                 K(SPEED_THRESHOLD),
+                 K(next_scheduled_snapshot_interval),
+                 K(SNAPSHOT_THRESHOLD));
   }
   return bret;
 }

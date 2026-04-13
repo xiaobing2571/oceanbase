@@ -87,7 +87,9 @@ const int64_t MAXIMUM_ROWS_OF_ROW_SAMPLE_GATHER_HYBRID_HIST = 10000000;
 const int64_t MINIMUM_BLOCK_CNT_OF_BLOCK_SAMPLE_HYBRID_HIST = 16;
 const static int64_t DEFAULT_AUTO_SAMPLE_ROW_COUNT = 0;
 const static int64_t DEFAULT_ASYNC_SAMPLE_ROW_COUNT = 5000000;
-const static int64_t MAX_GATHER_COLUMN_COUNT_PER_QUERY = 128;
+const static int64_t MAX_GATHER_COLUMN_COUNT_PER_QUERY_FOR_SMALL_TENANT = 24;
+
+const static int64_t MAX_GATHER_COLUMN_COUNT_PER_QUERY_FOR_LARGE_TENANT = 96;
 const static int64_t MAX_SKIP_RATE_SAMPLE_COUNT = 100000;
 
 const static int64_t DEFAULT_SKIP_RATE_SAMPLE_COUNT = 0;
@@ -135,7 +137,9 @@ enum ColumnAttrFlag
   IS_HIDDEN_COL     = 1 << 1,
   IS_UNIQUE_COL     = 1 << 2,
   IS_NOT_NULL_COL   = 1 << 3,
-  IS_TEXT_COL       = 1 << 4
+  IS_TEXT_COL       = 1 << 4,
+  IS_VIRTUAL_COL    = 1 << 5,
+  IS_STRING_COL     = 1 << 6
 };
 
 enum ColumnGatherFlag
@@ -158,6 +162,12 @@ enum ObGranularityType
   GRANULARITY_AUTO,
   GRANULARITY_GLOBAL_AND_PARTITION,
   GRANULARITY_APPROX_GLOBAL_AND_PARTITION
+};
+
+enum ObNdvScaleAlgo {
+  NDV_SCALE_ALGO_DEFAULT = 0,
+  NDV_SCALE_ALGO_LINEAR = 1,
+  NDV_SCALE_ALGO_UNIQUE = 2,
 };
 
 struct BlockNumStat
@@ -452,12 +462,18 @@ struct ObColumnStatParam {
   inline void set_is_unique_column() { column_attribute_ |= ColumnAttrFlag::IS_UNIQUE_COL; }
   inline void set_is_not_null_column() { column_attribute_ |= ColumnAttrFlag::IS_NOT_NULL_COL; }
   inline void set_is_text_column() { column_attribute_ |= ColumnAttrFlag::IS_TEXT_COL; }
+  inline void set_is_string_column() { column_attribute_ |= ColumnAttrFlag::IS_STRING_COL; }
   inline bool is_index_column() const { return column_attribute_ & ColumnAttrFlag::IS_INDEX_COL; }
   inline bool is_hidden_column() const { return column_attribute_ & ColumnAttrFlag::IS_HIDDEN_COL; }
   inline bool is_unique_column() const { return column_attribute_ & ColumnAttrFlag::IS_UNIQUE_COL; }
+  inline bool is_virtual_column() const { return column_attribute_ & ColumnAttrFlag::IS_VIRTUAL_COL; }
+
   inline bool is_not_null_column() const { return column_attribute_ & ColumnAttrFlag::IS_NOT_NULL_COL; }
   inline bool is_text_column() const { return column_attribute_ & ColumnAttrFlag::IS_TEXT_COL; }
   inline void unset_text_column() { column_attribute_ &= ~ColumnAttrFlag::IS_TEXT_COL; }
+  inline bool is_string_column() const { return column_attribute_ & ColumnAttrFlag::IS_STRING_COL; }
+  inline void unset_string_column() { column_attribute_ &= ~ColumnAttrFlag::IS_STRING_COL; }
+  inline void set_is_virtual_col() { column_attribute_ |= ColumnAttrFlag::IS_VIRTUAL_COL; }
   inline void set_valid_opt_col() { gather_flag_ |= ColumnGatherFlag::VALID_OPT_COL; }
   inline void set_need_basic_stat() { gather_flag_ |= ColumnGatherFlag::NEED_BASIC_STAT; }
   inline void set_need_avg_len() { gather_flag_ |= ColumnGatherFlag::NEED_AVG_LEN; }
@@ -481,6 +497,7 @@ struct ObColumnStatParam {
   int64_t gather_flag_;
   ObString index_name_;
   ObObjType column_type_;
+  ObNdvScaleAlgo ndv_scale_algo_;
 
   static bool is_valid_opt_col_type(const ObObjType type, bool is_online_stat = false);
   static bool is_valid_avglen_type(const ObObjType type);
@@ -495,7 +512,8 @@ struct ObColumnStatParam {
                K_(column_attribute),
                K_(column_usage_flag),
                K_(gather_flag),
-               K_(index_name));
+               K_(index_name),
+               K_(ndv_scale_algo));
 };
 
 struct ObColumnGroupStatParam {
@@ -594,7 +612,8 @@ struct ObTableStatParam {
     min_iops_(-1),
     max_iops_(-1),
     weight_iops_(-1),
-    skip_rate_sample_cnt_(DEFAULT_SKIP_RATE_SAMPLE_COUNT)
+    skip_rate_sample_cnt_(DEFAULT_SKIP_RATE_SAMPLE_COUNT),
+    use_part_derive_global_(false)
   {}
 
   int assign(const ObTableStatParam &other);
@@ -693,6 +712,9 @@ struct ObTableStatParam {
   int64_t max_iops_;
   int64_t weight_iops_;
   int64_t skip_rate_sample_cnt_;
+
+  bool use_part_derive_global_;
+
   TO_STRING_KV(K(tenant_id_),
                K(db_name_),
                K(db_id_),
@@ -749,7 +771,9 @@ struct ObTableStatParam {
                K(min_iops_),
                K(max_iops_),
                K(weight_iops_),
-               K(skip_rate_sample_cnt_));
+               K(skip_rate_sample_cnt_),
+               K(use_part_derive_global_)
+               );
 };
 
 struct ObOptStatGatherParam {
@@ -789,7 +813,8 @@ struct ObOptStatGatherParam {
     part_level_(share::schema::ObPartitionLevel::PARTITION_LEVEL_ZERO),
     consumer_group_id_(0),
     partition_id_skip_rate_map_(NULL),
-    all_column_params_()
+    all_column_params_(),
+    use_part_derive_global_(false)
   {}
   int assign(const ObOptStatGatherParam &other);
   int64_t get_need_gather_column() const;
@@ -830,6 +855,8 @@ struct ObOptStatGatherParam {
   const PartitionIdSkipRateMap *partition_id_skip_rate_map_;
   ObSEArray<ObColumnStatParam, 4> all_column_params_;
 
+  bool use_part_derive_global_;
+
   TO_STRING_KV(K(tenant_id_),
                K(db_name_),
                K(tab_name_),
@@ -861,7 +888,8 @@ struct ObOptStatGatherParam {
                K(data_table_id_),
                K(is_global_index_),
                K(consumer_group_id_),
-               K(all_column_params_));
+               K(all_column_params_),
+               K(use_part_derive_global_));
 };
 
 struct ObOptStat

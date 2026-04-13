@@ -94,14 +94,14 @@ int ObScheduledManageDynamicPartition::set_attribute(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", KR(ret), K(session), K(job_name), K(attr_name), K(attr_val_str));
   } else if (FALSE_IT(tenant_id = session->get_effective_tenant_id())) {
+  } else if (!is_daily_job_(job_name)) {
+    is_scheduled_manage_dynamic_partition_daily_attr = false;
   } else if (!is_user_tenant(tenant_id)) {
     ret = OB_OP_NOT_ALLOW;
     LOG_WARN("not user tenant, can't set attribute for SCHEDULED_MANAGE_DYNAMIC_PARTITION_DAILY job", KR(ret), K(tenant_id));
-  } else if (!is_daily_job_(job_name)) {
-    is_scheduled_manage_dynamic_partition_daily_attr = false;
   } else if (0 == attr_name.case_compare("start_date")) {
     int64_t next_date_ts = 0;
-    if (OB_FAIL(parse_next_date_(session, attr_val_str, next_date_ts))) {
+    if (OB_FAIL(parse_next_date(session, attr_val_str, next_date_ts))) {
       LOG_WARN("parse trigger time failed", KR(ret), K(attr_val_str));
     } else if (ObTimeUtility::current_time() > next_date_ts) {
       ret = OB_INVALID_ARGUMENT;
@@ -261,7 +261,7 @@ int ObScheduledManageDynamicPartition::create_job_(
   return ret;
 }
 
-int ObScheduledManageDynamicPartition::parse_next_date_(
+int ObScheduledManageDynamicPartition::parse_next_date(
   const sql::ObSQLSessionInfo *session,
   const common::ObString &next_date_str,
   int64_t &next_date_ts)

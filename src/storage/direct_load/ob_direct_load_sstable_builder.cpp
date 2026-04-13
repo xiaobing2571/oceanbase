@@ -54,7 +54,6 @@ int ObDirectLoadSSTableBuilder::init(const ObDirectLoadSSTableBuildParam &param)
   } else {
     const uint64_t tenant_id = MTL_ID();
     param_ = param;
-    start_key_.set_min_rowkey();
     end_key_.set_min_rowkey();
     int64_t dir_id = -1;
     if (OB_ISNULL(param_.file_mgr_)) {
@@ -108,10 +107,6 @@ int ObDirectLoadSSTableBuilder::append_row(const ObTabletID &tablet_id,
       LOG_WARN("fail to from datum row", KR(ret));
     } else if (OB_FAIL(data_block_writer_.append_row(external_row))) {
       LOG_WARN("fail to append row to data block writer", KR(ret), K(external_row));
-    } else if (start_key_.is_min_rowkey()) {
-      if (OB_FAIL(key.deep_copy(start_key_, allocator_))) {
-        LOG_WARN("fail to deep copy", KR(ret));
-      }
     }
   }
   return ret;
@@ -139,10 +134,6 @@ int ObDirectLoadSSTableBuilder::append_row(const ObDirectLoadExternalRow &extern
       LOG_WARN("fail to check rowkey order", KR(ret), K(external_row));
     } else if (OB_FAIL(data_block_writer_.append_row(external_row))) {
       LOG_WARN("fail to append row to data block writer", KR(ret), K(external_row));
-    } else if (start_key_.is_min_rowkey()) {
-      if (OB_FAIL(key.deep_copy(start_key_, allocator_))) {
-        LOG_WARN("fail to deep copy", KR(ret));
-      }
     }
   }
   return ret;
@@ -184,42 +175,47 @@ int ObDirectLoadSSTableBuilder::get_tables(ObDirectLoadTableHandleArray &table_a
   } else {
     const int64_t index_item_num_per_block = ObDirectLoadIndexBlock::get_item_num_per_block(
       param_.table_data_desc_.sstable_index_block_size_);
-    ObDirectLoadSSTableCreateParam param;
-    param.tablet_id_ = param_.tablet_id_;
-    param.rowkey_column_count_ = param_.table_data_desc_.rowkey_column_num_;
-    param.column_count_ = param_.table_data_desc_.column_count_;
-    param.data_block_size_ = param_.table_data_desc_.sstable_data_block_size_;
-    param.index_block_size_ = param_.table_data_desc_.sstable_index_block_size_;
-    param.index_item_count_ = index_block_writer_.get_total_index_size();
-    param.row_count_ = data_block_writer_.get_total_row_count();
-    param.index_block_count_ =
-      (param.index_item_count_ + index_item_num_per_block - 1) / index_item_num_per_block;
-    param.start_key_ = start_key_;
-    param.end_key_ = end_key_;
-    if (param.row_count_ > 0) {
-      ObDirectLoadSSTableFragment fragment;
-      fragment.meta_.row_count_ = data_block_writer_.get_total_row_count();
-      fragment.meta_.index_item_count_ = index_block_writer_.get_total_index_size();
-      fragment.meta_.occupy_size_ = data_block_writer_.get_file_size();
-      fragment.meta_.index_block_count_ = param.index_block_count_;
-      if (OB_FAIL(fragment.data_file_handle_.assign(data_file_handle_))) {
-        LOG_WARN("fail to assign data file handle", KR(ret));
-      } else if (OB_FAIL(fragment.index_file_handle_.assign(index_file_handle_))) {
-        LOG_WARN("fail to assign index file handle", KR(ret));
-      } else if (OB_FAIL(param.fragments_.push_back(fragment))) {
-        LOG_WARN("fail to push back", KR(ret));
+    if (index_item_num_per_block <= 0) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("index item num per block is not valid", KR(ret), K(index_item_num_per_block),
+               K(param_.table_data_desc_.sstable_index_block_size_));
+    } else {
+      ObDirectLoadSSTableCreateParam param;
+      param.tablet_id_ = param_.tablet_id_;
+      param.rowkey_column_count_ = param_.table_data_desc_.rowkey_column_num_;
+      param.column_count_ = param_.table_data_desc_.column_count_;
+      param.data_block_size_ = param_.table_data_desc_.sstable_data_block_size_;
+      param.index_block_size_ = param_.table_data_desc_.sstable_index_block_size_;
+      param.index_item_count_ = index_block_writer_.get_total_index_size();
+      param.row_count_ = data_block_writer_.get_total_row_count();
+      param.index_block_count_ =
+        (param.index_item_count_ + index_item_num_per_block - 1) / index_item_num_per_block;
+      if (param.row_count_ > 0) {
+        ObDirectLoadSSTableFragment fragment;
+        fragment.meta_.row_count_ = data_block_writer_.get_total_row_count();
+        fragment.meta_.index_item_count_ = index_block_writer_.get_total_index_size();
+        fragment.meta_.occupy_size_ = data_block_writer_.get_file_size();
+        fragment.meta_.index_block_count_ = param.index_block_count_;
+        if (OB_FAIL(fragment.data_file_handle_.assign(data_file_handle_))) {
+          LOG_WARN("fail to assign data file handle", KR(ret));
+        } else if (OB_FAIL(fragment.index_file_handle_.assign(index_file_handle_))) {
+          LOG_WARN("fail to assign index file handle", KR(ret));
+        } else if (OB_FAIL(param.fragments_.push_back(fragment))) {
+          LOG_WARN("fail to push back", KR(ret));
+        }
       }
-    }
-    if (OB_SUCC(ret)) {
-      ObDirectLoadTableHandle table_handle;
-      ObDirectLoadSSTable *sstable = nullptr;
-      if (OB_FAIL(table_manager->alloc_sstable(table_handle))) {
-        LOG_WARN("fail to alloc sstable", KR(ret));
-      } else if (FALSE_IT(sstable = static_cast<ObDirectLoadSSTable *>(table_handle.get_table()))) {
-      } else if (OB_FAIL(sstable->init(param))) {
-        LOG_WARN("fail to init sstable", KR(ret));
-      } else if (OB_FAIL(table_array.add(table_handle))) {
-        LOG_WARN("fail to push back sstable", KR(ret));
+      if (OB_SUCC(ret)) {
+        ObDirectLoadTableHandle table_handle;
+        ObDirectLoadSSTable *sstable = nullptr;
+        if (OB_FAIL(table_manager->alloc_sstable(table_handle))) {
+          LOG_WARN("fail to alloc sstable", KR(ret));
+        } else if (FALSE_IT(sstable =
+                              static_cast<ObDirectLoadSSTable *>(table_handle.get_table()))) {
+        } else if (OB_FAIL(sstable->init(param))) {
+          LOG_WARN("fail to init sstable", KR(ret));
+        } else if (OB_FAIL(table_array.add(table_handle))) {
+          LOG_WARN("fail to push back sstable", KR(ret));
+        }
       }
     }
   }

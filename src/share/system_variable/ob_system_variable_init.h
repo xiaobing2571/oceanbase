@@ -87,6 +87,8 @@ public:
   static int set_base_value(const char *name, const char * new_value);
   static int set_base_value(const common::ObString &name, const common::ObString &new_value);
   static int init_default_values();
+  static int64_t get_default_value_changed_serialized_var_count();
+  static int64_t get_default_value_changed_serialized_var_idx(int64_t i);
 };
 
 class ObSysVarsToIdxMap
@@ -95,6 +97,11 @@ public:
   static int64_t get_store_idx(int64_t var_id);
   static bool has_invalid_sys_var_id();
 };
+
+// Auto-generated ESSENTIAL_SYS_VARS array for inner session initialization
+// These variables are frequently used in session initialization, tenant processing, schema setting and other critical processes
+extern const ObSysVarClassType ESSENTIAL_SYS_VARS[];
+extern const int64_t ESSENTIAL_SYS_VARS_COUNT;
 
 } // end namespace share
 } // end namespace oceanbase

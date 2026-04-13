@@ -48,7 +48,8 @@ ObTabletReplica::ObTabletReplica()
       data_size_(0),
       required_size_(0),
       report_scn_(0),
-      status_(SCN_STATUS_MAX)
+      status_(SCN_STATUS_MAX),
+      ddl_create_snapshot_(0)
 {
 }
 
@@ -68,6 +69,7 @@ void ObTabletReplica::reset()
   required_size_ = 0;
   report_scn_ = 0;
   status_ = SCN_STATUS_MAX;
+  ddl_create_snapshot_ = 0;
 }
 
 int ObTabletReplica::assign(const ObTabletReplica &other)
@@ -83,6 +85,7 @@ int ObTabletReplica::assign(const ObTabletReplica &other)
     required_size_ = other.required_size_;
     report_scn_ = other.report_scn_;
     status_ = other.status_;
+    ddl_create_snapshot_ = other.ddl_create_snapshot_;
   }
   return ret;
 }
@@ -96,7 +99,8 @@ int ObTabletReplica::init(
     const int64_t data_size,
     const int64_t required_size,
     const int64_t report_scn,
-    const ScnStatus status)
+    const ScnStatus status,
+    const int64_t ddl_create_snapshot)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(
@@ -107,10 +111,11 @@ int ObTabletReplica::init(
       || data_size < 0
       || required_size < 0
       || report_scn < 0
-      || !is_status_valid(status))) {
+      || !is_status_valid(status)
+      || ddl_create_snapshot < 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("init with invalid arguments", KR(ret), K(tenant_id), K(tablet_id), K(ls_id),
-        K(server), K(snapshot_version), K(data_size), K(required_size), K(report_scn), K(status));
+        K(server), K(snapshot_version), K(data_size), K(required_size), K(report_scn), K(status), K(ddl_create_snapshot));
   } else {
     tenant_id_ = tenant_id;
     tablet_id_ = tablet_id;
@@ -121,6 +126,7 @@ int ObTabletReplica::init(
     required_size_ = required_size;
     report_scn_ = report_scn;
     status_ = status;
+    ddl_create_snapshot_ = ddl_create_snapshot;
   }
   return ret;
 }
@@ -136,7 +142,8 @@ bool ObTabletReplica::is_equal_for_report(const ObTabletReplica &other) const
       && server_ == other.server_
       && snapshot_version_ == other.snapshot_version_
       && data_size_ == other.data_size_
-      && required_size_ == other.required_size_) {
+      && required_size_ == other.required_size_
+      && ddl_create_snapshot_ == other.ddl_create_snapshot_) {
     is_equal = true;
   }
   return is_equal;

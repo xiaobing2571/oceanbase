@@ -20,7 +20,12 @@
 #include "storage/high_availability/ob_storage_ha_utils.h"
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/shared_storage/prewarm/ob_replica_prewarm_struct.h"
+#include "storage/high_availability/ob_ss_transfer_backfill_utils.h"
+#include "storage/shared_storage/ob_ss_local_cache_service.h"
 #endif
+#include "storage/ddl/ob_direct_load_mgr_utils.h"
+#include "lib/thread/thread.h"
+#include "lib/worker.h"
 
 namespace oceanbase
 {
@@ -35,6 +40,8 @@ using namespace share::schema;
 
 namespace obrpc
 {
+ERRSIM_POINT_DEF(EN_KEEP_FETCH_MACRO_BLOCK_LOOP);
+
 static bool is_copy_ls_inner_tablet(const common::ObIArray<common::ObTabletID> &tablet_id_list)
 {
   bool is_inner = false;
@@ -160,7 +167,8 @@ ObCopyMacroBlockRangeArg::ObCopyMacroBlockRangeArg()
     backfill_tx_scn_(SCN::min_scn()),
     copy_macro_range_info_(),
     need_check_seq_(false),
-    ls_rebuild_seq_(-1)
+    ls_rebuild_seq_(-1),
+    copy_macro_block_infos_()
 {
 }
 
@@ -174,6 +182,7 @@ void ObCopyMacroBlockRangeArg::reset()
   copy_macro_range_info_.reset();
   need_check_seq_ = false;
   ls_rebuild_seq_ = -1;
+  copy_macro_block_infos_.reset();
 }
 
 bool ObCopyMacroBlockRangeArg::is_valid() const
@@ -195,6 +204,8 @@ int ObCopyMacroBlockRangeArg::assign(const ObCopyMacroBlockRangeArg &arg)
     LOG_WARN("assign copy macro block range arg get invalid argument", K(ret), K(arg));
   } else if (OB_FAIL(copy_macro_range_info_.assign(arg.copy_macro_range_info_))) {
     LOG_WARN("failed to assign copy macro range info", K(ret), K(arg));
+  } else if (OB_FAIL(copy_macro_block_infos_.assign(arg.copy_macro_block_infos_))) {
+    LOG_WARN("failed to assign copy macro block infos", K(ret), K(arg));
   } else {
     tenant_id_ = arg.tenant_id_;
     ls_id_ = arg.ls_id_;
@@ -315,7 +326,8 @@ ObCopyTabletSSTableInfoArg::ObCopyTabletSSTableInfoArg()
   : tablet_id_(),
     max_major_sstable_snapshot_(0),
     minor_sstable_scn_range_(),
-    ddl_sstable_scn_range_()
+    ddl_sstable_scn_range_(),
+    inc_major_ddl_sstable_end_scn_(SCN::min_scn())
 {
 }
 
@@ -329,6 +341,7 @@ void ObCopyTabletSSTableInfoArg::reset()
   max_major_sstable_snapshot_ = 0;
   minor_sstable_scn_range_.reset();
   ddl_sstable_scn_range_.reset();
+  inc_major_ddl_sstable_end_scn_.set_min();
 }
 
 bool ObCopyTabletSSTableInfoArg::is_valid() const
@@ -336,11 +349,13 @@ bool ObCopyTabletSSTableInfoArg::is_valid() const
   return tablet_id_.is_valid()
       && max_major_sstable_snapshot_ >= 0
       && minor_sstable_scn_range_.is_valid()
-      && ddl_sstable_scn_range_.is_valid();
+      && ddl_sstable_scn_range_.is_valid()
+      && inc_major_ddl_sstable_end_scn_.is_valid();
 }
 
 OB_SERIALIZE_MEMBER(ObCopyTabletSSTableInfoArg,
-    tablet_id_, max_major_sstable_snapshot_, minor_sstable_scn_range_, ddl_sstable_scn_range_);
+    tablet_id_, max_major_sstable_snapshot_, minor_sstable_scn_range_,
+    ddl_sstable_scn_range_, inc_major_ddl_sstable_end_scn_);
 
 ObCopyTabletsSSTableInfoArg::ObCopyTabletsSSTableInfoArg()
   : tenant_id_(OB_INVALID_ID),
@@ -656,7 +671,31 @@ bool ObCopySSTableMacroRangeInfoHeader::is_valid() const
 }
 
 OB_SERIALIZE_MEMBER(ObCopySSTableMacroRangeInfoHeader,
-    copy_table_key_, macro_range_count_);
+  copy_table_key_, macro_range_count_);
+
+ObCopySSTableMacroIdInfoHeader::ObCopySSTableMacroIdInfoHeader()
+  : block_type_(CopyMacroBlockType::BLOCK_TYPE_MAX),
+    id_type_(CopyMacroBlockIdType::BLOCK_ID_TYPE_MAX),
+    block_count_(-1)
+{
+}
+
+bool ObCopySSTableMacroIdInfoHeader::is_valid() const
+{
+  return (block_type_ >= CopyMacroBlockType::DATA_BLOCK && block_type_ < CopyMacroBlockType::BLOCK_TYPE_MAX)
+      && (id_type_ >= CopyMacroBlockIdType::LOGICAL_ID && id_type_ < CopyMacroBlockIdType::BLOCK_ID_TYPE_MAX)
+      && block_count_ >= 0;
+}
+
+void ObCopySSTableMacroIdInfoHeader::reset()
+{
+  block_type_ = CopyMacroBlockType::BLOCK_TYPE_MAX;
+  id_type_ = CopyMacroBlockIdType::BLOCK_ID_TYPE_MAX;
+  block_count_ = -1;
+}
+
+OB_SERIALIZE_MEMBER(ObCopySSTableMacroIdInfoHeader,
+  block_type_, id_type_, block_count_);
 
 ObCopyTabletSSTableHeader::ObCopyTabletSSTableHeader()
   : tablet_id_(),
@@ -1050,6 +1089,61 @@ void ObCheckTransferTabletBackfillRes::reset()
 
 OB_SERIALIZE_MEMBER(ObCheckTransferTabletBackfillRes, backfill_finished_);
 
+#ifdef OB_BUILD_SHARED_STORAGE
+ObCheckTransferOutTabletStatusArg::ObCheckTransferOutTabletStatusArg()
+  : tenant_id_(OB_INVALID_ID),
+    ls_id_(),
+    tablet_list_(),
+    transfer_scn_()
+{
+}
+
+bool ObCheckTransferOutTabletStatusArg::is_valid() const
+{
+  return OB_INVALID_ID != tenant_id_
+         && ls_id_.is_valid()
+         && !tablet_list_.empty()
+         && transfer_scn_.is_valid();
+}
+
+void ObCheckTransferOutTabletStatusArg::reset()
+{
+  tenant_id_ = OB_INVALID_ID;
+  ls_id_.reset();
+  tablet_list_.reset();
+  transfer_scn_.reset();
+}
+
+int ObCheckTransferOutTabletStatusArg::assign(const ObCheckTransferOutTabletStatusArg &other)
+{
+  int ret = OB_SUCCESS;
+  if (!other.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("get invalid arg", K(ret), K(other));
+  } else if (OB_FAIL(tablet_list_.assign(other.tablet_list_))) {
+    LOG_WARN("failed to assign tablet list", K(ret), K(other));
+  } else {
+    tenant_id_ = other.tenant_id_;
+    ls_id_ = other.ls_id_;
+    transfer_scn_ = other.transfer_scn_;
+  }
+  return ret;
+}
+
+OB_SERIALIZE_MEMBER(ObCheckTransferOutTabletStatusArg, tenant_id_, ls_id_, tablet_list_, transfer_scn_);
+
+ObCheckTransferOutTabletStatusRes::ObCheckTransferOutTabletStatusRes()
+  : is_transfer_out_deleted_(false)
+{
+}
+
+void ObCheckTransferOutTabletStatusRes::reset()
+{
+  is_transfer_out_deleted_ = false;
+}
+
+OB_SERIALIZE_MEMBER(ObCheckTransferOutTabletStatusRes, is_transfer_out_deleted_);
+#endif
 
 ObStorageChangeMemberArg::ObStorageChangeMemberArg()
   : tenant_id_(OB_INVALID_ID),
@@ -1234,6 +1328,40 @@ int ObUpdateTransferMetaInfoArg::assign(const ObUpdateTransferMetaInfoArg &other
 
 OB_SERIALIZE_MEMBER(ObUpdateTransferMetaInfoArg, tenant_id_, dest_ls_id_, transfer_meta_info_);
 
+ObCopySSTableMacroLogicIdInfoArg::ObCopySSTableMacroLogicIdInfoArg()
+  : tenant_id_(OB_INVALID_ID),
+    ls_id_(),
+    table_key_(),
+    version_(OB_INVALID_ID),
+    filled_tx_scn_(),
+    need_check_seq_(false),
+    ls_rebuild_seq_(-1)
+{
+}
+
+void ObCopySSTableMacroLogicIdInfoArg::reset()
+{
+  tenant_id_ = OB_INVALID_ID;
+  ls_id_.reset();
+  table_key_.reset();
+  version_ = OB_INVALID_ID;
+  filled_tx_scn_.reset();
+  need_check_seq_ = false;
+  ls_rebuild_seq_ = -1;
+}
+
+bool ObCopySSTableMacroLogicIdInfoArg::is_valid() const
+{
+  return OB_INVALID_ID != tenant_id_
+      && ls_id_.is_valid()
+      && table_key_.is_valid()
+      && version_ != OB_INVALID_ID
+      && filled_tx_scn_.is_valid()
+      && ((need_check_seq_ && ls_rebuild_seq_ >= 0) || !need_check_seq_);
+}
+
+OB_SERIALIZE_MEMBER(ObCopySSTableMacroLogicIdInfoArg, tenant_id_, ls_id_, table_key_, version_, filled_tx_scn_, need_check_seq_, ls_rebuild_seq_);
+
 ObRebuildTabletSSTableInfoArg::ObRebuildTabletSSTableInfoArg()
   : tenant_id_(OB_INVALID_ID),
     ls_id_(),
@@ -1267,6 +1395,31 @@ bool ObRebuildTabletSSTableInfoArg::is_valid() const
 
 OB_SERIALIZE_MEMBER(ObRebuildTabletSSTableInfoArg,
     tenant_id_, ls_id_, tablet_id_, dest_major_sstable_snapshot_, version_);
+
+ObAdvanceSrcLSCheckpointArg::ObAdvanceSrcLSCheckpointArg()
+  : tenant_id_(OB_INVALID_ID),
+    ls_id_(),
+    recycle_scn_()
+{
+}
+
+ObAdvanceSrcLSCheckpointArg::~ObAdvanceSrcLSCheckpointArg()
+{
+}
+
+bool ObAdvanceSrcLSCheckpointArg::is_valid() const
+{
+  return OB_INVALID_ID != tenant_id_ && ls_id_.is_valid() && recycle_scn_.is_valid();
+}
+
+void ObAdvanceSrcLSCheckpointArg::reset()
+{
+  tenant_id_ = OB_INVALID_ID;
+  ls_id_.reset();
+  recycle_scn_.reset();
+}
+
+OB_SERIALIZE_MEMBER(ObAdvanceSrcLSCheckpointArg, tenant_id_, ls_id_, recycle_scn_);
 
 template <ObRpcPacketCode RPC_CODE>
 ObStorageStreamRpcP<RPC_CODE>::ObStorageStreamRpcP(common::ObInOutBandwidthThrottle *bandwidth_throttle)
@@ -1669,6 +1822,31 @@ int ObGetLSReplicaMicroBlockArg::assign(const ObGetLSReplicaMicroBlockArg &other
 
 OB_SERIALIZE_MEMBER(ObGetLSReplicaMicroBlockArg, tenant_id_, micro_metas_);
 
+ObNotifySSWriterDoBackfillArg::ObNotifySSWriterDoBackfillArg()
+  : tenant_id_(OB_INVALID_ID),
+    ls_id_(),
+    tablet_id_(),
+    type_(ObSSWriterType::INVALID)
+{
+}
+
+bool ObNotifySSWriterDoBackfillArg::is_valid() const
+{
+  return OB_INVALID_ID != tenant_id_
+      && ls_id_.is_valid()
+      && tablet_id_.is_valid()
+      && type_ >= ObSSWriterType::INVALID && type_ <= ObSSWriterType::META;
+}
+
+void ObNotifySSWriterDoBackfillArg::reset()
+{
+  tenant_id_ = OB_INVALID_ID;
+  ls_id_.reset();
+  tablet_id_.reset();
+  type_ = ObSSWriterType::INVALID;
+}
+
+OB_SERIALIZE_MEMBER(ObNotifySSWriterDoBackfillArg, tenant_id_, ls_id_, tablet_id_, type_);
 #endif
 
 ObHAFetchMacroBlockP::ObHAFetchMacroBlockP(common::ObInOutBandwidthThrottle *bandwidth_throttle)
@@ -1681,6 +1859,11 @@ int ObHAFetchMacroBlockP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    //  Although migration and replication have different priorities,
+    //  they both belong to the same group — the background group
+    //  — under the public cloud IO isolation configuration scheme.
+    //  Therefore, using the HA high level here is sufficient.
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     blocksstable::ObBufferReader data;
     char *buf = NULL;
     last_send_time_ = this->get_receive_timestamp();
@@ -1700,18 +1883,20 @@ int ObHAFetchMacroBlockP::process()
       STORAGE_LOG(ERROR, "bandwidth_throttle must not null", K(ret), KP_(bandwidth_throttle));
     } else {
 #ifdef ERRSIM
-          if (!is_meta_tenant(arg_.tenant_id_) && 1001 == arg_.ls_id_.id() && !arg_.table_key_.tablet_id_.is_ls_inner_tablet()) {
-            FLOG_INFO("errsim storage ha fetch macro block", K_(arg));
-            SERVER_EVENT_SYNC_ADD("errsim_storage_ha", "fetch_macro_block");
-            DEBUG_SYNC(BEFORE_MIGRATE_FETCH_MACRO_BLOCK);
-          }
+      if (OB_SUCCESS != EN_KEEP_FETCH_MACRO_BLOCK_LOOP) {
+        (void)errsim_spin_wait_for_specific_tablet_();
+      } else if (!is_meta_tenant(arg_.tenant_id_) && 1001 == arg_.ls_id_.id() && !arg_.table_key_.tablet_id_.is_ls_inner_tablet()) {
+        FLOG_INFO("errsim storage ha fetch macro block", K_(arg));
+        SERVER_EVENT_SYNC_ADD("errsim_storage_ha", "fetch_macro_block");
+        DEBUG_SYNC(BEFORE_MIGRATE_FETCH_MACRO_BLOCK);
+      }
 #endif
 
       SMART_VARS_2((storage::ObCopyMacroBlockObProducer, producer), (ObCopyMacroBlockRangeArg, arg)) {
         if (OB_FAIL(arg.assign(arg_))) {
           LOG_WARN("failed to assign copy macro block range arg", K(ret), K(arg_));
         } else if (OB_FAIL(producer.init(arg.tenant_id_, arg.ls_id_, arg.table_key_, arg.copy_macro_range_info_,
-            arg.data_version_, arg.backfill_tx_scn_))) {
+            arg.data_version_, arg.backfill_tx_scn_, arg.copy_macro_block_infos_))) {
           LOG_WARN("failed to init macro block producer", K(ret), K(arg));
         } else {
           while (OB_SUCC(ret)) {
@@ -1762,6 +1947,36 @@ int ObHAFetchMacroBlockP::process()
   return ret;
 }
 
+#ifdef ERRSIM
+void ObHAFetchMacroBlockP::errsim_spin_wait_for_specific_tablet_()
+{
+  int64_t errsim_migration_ls_id = GCONF.errsim_migration_ls_id;
+  int64_t errsim_tablet_id = GCONF.errsim_migration_tablet_id;
+  const int64_t SPIN_WAIT_TIME = 30 * 1000 * 1000;
+
+  if (!is_meta_tenant(arg_.tenant_id_) && errsim_migration_ls_id == arg_.ls_id_.id() && !arg_.table_key_.tablet_id_.is_ls_inner_tablet()) {
+    // make target tablet process loop for 30s, block other tablet process
+    if (errsim_tablet_id == arg_.table_key_.tablet_id_.id() && arg_.table_key_.is_mds_sstable()) {
+      // for target tablet, loop 30s (only make one worker loop)
+      FLOG_INFO("[ERRSIM] skip debug sync, loop 30s", K_(arg));
+      int64_t start_ts = ObTimeUtil::current_time();
+      int64_t current_time = start_ts;
+      while (current_time - start_ts < SPIN_WAIT_TIME) {
+        if (current_time - start_ts >= SPIN_WAIT_TIME) {
+          break;
+        } else {
+          current_time = ObTimeUtil::current_time();
+        }
+      }
+    } else {
+      // block other tablet
+      FLOG_INFO("[ERRSIM] errsim storage ha fetch macro block", K_(arg));
+      DEBUG_SYNC(BEFORE_MIGRATE_FETCH_MACRO_BLOCK);
+    }
+  }
+}
+#endif
+
 ObFetchTabletInfoP::ObFetchTabletInfoP(common::ObInOutBandwidthThrottle *bandwidth_throttle)
     : ObStorageStreamRpcP(bandwidth_throttle)
 {
@@ -1771,6 +1986,7 @@ int ObFetchTabletInfoP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = nullptr;
     ObLS *ls = nullptr;
@@ -1882,6 +2098,7 @@ int ObFetchSSTableInfoP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = nullptr;
     char * buf = NULL;
@@ -2013,6 +2230,7 @@ int ObFetchLSInfoP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = nullptr;
     ObLS *ls = nullptr;
@@ -2097,16 +2315,33 @@ int ObFetchLSMetaInfoP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = nullptr;
     ObLS *ls = nullptr;
     logservice::ObLogHandler *log_handler = nullptr;
     ObLSMetaPackage ls_meta_package;
     const bool check_archive = true;
+    int64_t disk_abnormal_time = 0;
+    ObDeviceHealthStatus dhs = DEVICE_HEALTH_NORMAL;
+
+#ifdef ERRSIM
+    if (OB_SUCC(ret) && DEVICE_HEALTH_NORMAL == dhs && GCONF.fake_disk_error) {
+      dhs = DEVICE_HEALTH_ERROR;
+    }
+#endif
+
     LOG_INFO("start to fetch log stream info", K(arg_.ls_id_), K(arg_));
     if (!arg_.is_valid()) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("fetch ls info get invalid argument", K(ret), K(arg_));
+    } else if (DEVICE_HEALTH_NORMAL == dhs
+        && OB_FAIL(ObIOManager::get_instance().get_device_health_status(dhs, disk_abnormal_time))) {
+      STORAGE_LOG(WARN, "failed to check is disk error", KR(ret));
+    } else if (DEVICE_HEALTH_ERROR == dhs) {
+      ret = OB_DISK_ERROR;
+      STORAGE_LOG(ERROR, "observer has disk error, cannot be migrate src", KR(ret),
+        "disk_health_status", device_health_status_to_str(dhs), K(disk_abnormal_time));
     } else if (OB_ISNULL(ls_service = MTL(ObLSService *))) {
       ret = OB_ERR_UNEXPECTED;
       STORAGE_LOG(WARN, "ls service should not be null", K(ret), KP(ls_service));
@@ -2176,6 +2411,7 @@ int ObFetchLSMemberListP::process()
   const uint64_t tenant_id = arg_.tenant_id_;
   const share::ObLSID &ls_id = arg_.ls_id_;
   MTL_SWITCH(tenant_id) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSService *ls_svr = NULL;
     ObLSHandle ls_handle;
     ObLS *ls = NULL;
@@ -2230,6 +2466,7 @@ int ObFetchLSMemberAndLearnerListP::process()
   const uint64_t tenant_id = arg_.tenant_id_;
   const share::ObLSID &ls_id = arg_.ls_id_;
   MTL_SWITCH(tenant_id) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSService *ls_svr = NULL;
     ObLSHandle ls_handle;
     ObLS *ls = NULL;
@@ -2302,6 +2539,7 @@ int ObFetchSSTableMacroInfoP::process()
 
   last_send_time_ = this->get_receive_timestamp();
   MAKE_TENANT_SWITCH_SCOPE_GUARD(guard);
+  CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
 
   if (OB_FAIL(guard.switch_to(arg_.tenant_id_))) {
     LOG_ERROR("switch tenant fail", K(ret), K(arg_));
@@ -2516,6 +2754,106 @@ void ObFetchSSTableMacroInfoP::free_sstable_macro_range_producer_(ObICopySSTable
   }
 }
 
+ObFetchSSTableMacroLogicIdInfoP::ObFetchSSTableMacroLogicIdInfoP(common::ObInOutBandwidthThrottle *bandwidth_throttle)
+    : ObStorageStreamRpcP(bandwidth_throttle)
+{
+}
+
+int ObFetchSSTableMacroLogicIdInfoP::process()
+{
+  int ret = OB_SUCCESS;
+  ObLSHandle ls_handle;
+  ObLSService *ls_service = nullptr;
+  ObLS *ls = nullptr;
+  char *buf = nullptr;
+  ObMigrationStatus migration_status = ObMigrationStatus::OB_MIGRATION_STATUS_MAX;
+  const int64_t start_ts = ObTimeUtil::current_time();
+  const int64_t first_receive_ts = this->get_receive_timestamp();
+  LOG_INFO("start to fetch sstable macro info", K(arg_));
+
+  last_send_time_ = this->get_receive_timestamp();
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(guard);
+
+  if (OB_FAIL(guard.switch_to(arg_.tenant_id_))) {
+    LOG_ERROR("switch tenant fail", K(ret), K(arg_));
+  } else if (NULL == (buf = reinterpret_cast<char*>(allocator_.alloc(OB_MALLOC_BIG_BLOCK_SIZE)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    STORAGE_LOG(WARN, "failed to alloc migrate data buffer.", K(ret));
+  } else if (!result_.set_data(buf, OB_MALLOC_BIG_BLOCK_SIZE)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    STORAGE_LOG(WARN, "failed set data to result", K(ret));
+  } else if (OB_ISNULL(bandwidth_throttle_)) {
+    ret = OB_ERR_UNEXPECTED;
+    STORAGE_LOG(ERROR, "bandwidth_throttle_ must not null", K(ret),
+                KP_(bandwidth_throttle));
+  } else if (OB_ISNULL(ls_service = MTL(ObLSService *))) {
+    ret = OB_ERR_UNEXPECTED;
+    STORAGE_LOG(WARN, "ls service should not be null", K(ret), KP(ls_service));
+  } else if (OB_FAIL(ls_service->get_ls(arg_.ls_id_, ls_handle, ObLSGetMod::STORAGE_MOD))) {
+    LOG_WARN("fail to get log stream", KR(ret), K(arg_));
+  } else if (OB_UNLIKELY(nullptr == (ls = ls_handle.get_ls()))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("log stream should not be NULL", KR(ret), K(arg_), KP(ls));
+  } else if (OB_FAIL(ls->get_migration_status(migration_status))) {
+    LOG_WARN("failed to get migration status", KR(ret), K(arg_));
+  } else if (!ObMigrationStatusHelper::check_can_migrate_out(migration_status)) {
+    ret = OB_SRC_DO_NOT_ALLOWED_MIGRATE;
+    STORAGE_LOG(WARN, "src migrate status do not allow migrate out", KR(ret), K(migration_status));
+  } else if (arg_.need_check_seq_ && OB_FAIL(compare_ls_rebuild_seq(arg_.tenant_id_, arg_.ls_id_, arg_.ls_rebuild_seq_))) {
+    LOG_WARN("failed to compare ls rebuild seq", K(ret), K_(arg));
+  } else if (OB_FAIL(fetch_sstable_macro_logic_id_info_())) {
+    LOG_WARN("failed to fetch sstable macro logic id info", KR(ret), K(arg_));
+  } else if (arg_.need_check_seq_ && OB_FAIL(compare_ls_rebuild_seq(arg_.tenant_id_, arg_.ls_id_, arg_.ls_rebuild_seq_))) {
+    LOG_WARN("failed to compare ls rebuild seq", K(ret), K_(arg));
+  }
+
+  LOG_INFO("finish fetch sstable macro logic id info", K(ret), "cost_ts", ObTimeUtil::current_time() - start_ts,
+      "in rpc queue time", start_ts - first_receive_ts);
+
+  return ret;
+}
+
+int ObFetchSSTableMacroLogicIdInfoP::fetch_sstable_macro_logic_id_info_()
+{
+  int ret = OB_SUCCESS;
+
+  SMART_VAR(ObCopyLogicMacroBlockIdInfoObProducer, producer) {
+    if (OB_FAIL(producer.init(arg_.tenant_id_, arg_.ls_id_, arg_.table_key_, arg_.filled_tx_scn_))) {
+      LOG_WARN("failed to init copy logic macro block id info producer", K(ret), K(arg_));
+    } else {
+      ObLogicMacroBlockId logic_id;
+      int64_t block_count = 0;
+
+      while (OB_SUCC(ret)) {
+        logic_id.reset();
+        if (OB_FAIL(producer.get_next_logic_id(logic_id))) {
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+            LOG_INFO("finish to fill logic macro block ids", K(block_count));
+            break;
+          } else {
+            LOG_WARN("failed to get next logic macro block ids", K(ret), K(arg_));
+          }
+        } else if (OB_FAIL(fill_data(logic_id))) {
+          LOG_WARN("failed to fill logic macro block ids", K(ret), K(logic_id));
+        } else {
+          block_count++;
+          LOG_DEBUG("success to fill logic macro block id", K(logic_id), K(block_count));
+        }
+      }
+
+      if (OB_SUCC(ret)) {
+        if (arg_.need_check_seq_) {
+          if (OB_FAIL(compare_ls_rebuild_seq(arg_.tenant_id_, arg_.ls_id_, arg_.ls_rebuild_seq_))) {
+            LOG_WARN("failed to compare ls rebuild seq", K(ret), K_(arg));
+          }
+        }
+      }
+    }
+  }
+
+  return ret;
+}
 
 ObCheckStartTransferTabletsDelegate::ObCheckStartTransferTabletsDelegate()
   : is_inited_(false),
@@ -2543,6 +2881,7 @@ int ObCheckStartTransferTabletsDelegate::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = nullptr;
     ObLS *ls = nullptr;
@@ -2586,26 +2925,17 @@ int ObCheckStartTransferTabletsDelegate::check_transfer_out_tablet_sstable_(cons
   ObTableStoreIterator ddl_iter;
   ObTabletMemberWrapper<ObTabletTableStore> wrapper;
   const int64_t emergency_sstable_count = ObTabletTableStore::EMERGENCY_SSTABLE_CNT;
-
   if (OB_ISNULL(tablet)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("tablet is null", K(ret));
   } else if (OB_FAIL(tablet->fetch_table_store(wrapper))) {
     LOG_WARN("fetch table store fail", K(ret), KP(tablet));
-  } else if (!wrapper.get_member()->get_major_sstables().empty()) {
-    // do nothing
   } else if (wrapper.get_member()->get_table_count() > emergency_sstable_count) {
     ret = OB_TOO_MANY_SSTABLE;
     LOG_WARN("transfer src tablet has too many sstable, cannot transfer, need retry", K(ret),
         "table_count", wrapper.get_member()->get_table_count(), "emergency sstable count", emergency_sstable_count);
-  } else if (OB_FAIL(tablet->get_ddl_sstables(ddl_iter))) {
-    LOG_WARN("failed to get ddl sstable", K(ret));
-  } else if (ddl_iter.is_valid()) { // indicates the existence of ddl sstable
-    ret = OB_MAJOR_SSTABLE_NOT_EXIST;
-    LOG_WARN("major sstable do not exit, need to wait ddl merge", K(ret), "tablet_id", tablet->get_tablet_meta().tablet_id_);
-  } else if (tablet->get_tablet_meta().ha_status_.is_restore_status_full()) {
-    ret = OB_INVALID_TABLE_STORE;
-    LOG_WARN("neither major sstable nor ddl sstable exists", K(ret), K(ddl_iter));
+  } else if (OB_FAIL(ObTransferUtils::check_ddl_merge_finished(tablet))) {
+    LOG_WARN("failed to check ddl merge finished", K(ret), KPC(tablet));
   }
   return ret;
 }
@@ -2652,7 +2982,7 @@ int ObCheckStartTransferTabletsDelegate::check_start_transfer_out_tablets_()
       } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("tablet should not be NULL", K(ret), KP(tablet));
-      } else if (OB_FAIL(tablet->get_latest(user_data,
+      } else if (OB_FAIL(tablet->get_latest_tablet_status(user_data,
           writer, trans_stat, trans_version))) {
         LOG_WARN("failed to get lastest tablet status", K(ret), KPC(tablet));
       } else if (OB_UNLIKELY(mds::TwoPhaseCommitState::ON_COMMIT != trans_stat)) {
@@ -2678,8 +3008,6 @@ int ObCheckStartTransferTabletsDelegate::check_start_transfer_in_mv_tablets_()
   ObLSHandle ls_handle;
   ObLSService *ls_service = nullptr;
   ObLS *src_ls = nullptr;
-  ObStorageSchema *storage_schema = nullptr;
-  ObArenaAllocator allocator;
   if (OB_ISNULL(ls_service = MTL(ObLSService *))) {
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "ls service should not be null", K(ret), KP(ls_service));
@@ -2693,6 +3021,7 @@ int ObCheckStartTransferTabletsDelegate::check_start_transfer_in_mv_tablets_()
       const ObTransferTabletInfo &tablet_info = arg_.tablet_list_.at(i);
       ObTabletHandle tablet_handle;
       ObTablet *tablet = nullptr;
+      bool is_mv_major_refresh_tablet = false;
       if (OB_FAIL(src_ls->get_tablet(tablet_info.tablet_id_, tablet_handle, 0,
           ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
         LOG_WARN("failed to get tablet", K(ret), K(tablet_info));
@@ -2701,12 +3030,9 @@ int ObCheckStartTransferTabletsDelegate::check_start_transfer_in_mv_tablets_()
         LOG_WARN("tablet should not be NULL", K(ret), KP(tablet));
       } else if (tablet->is_ls_inner_tablet()) {
         // skip ls inner tablet
-      } else if (OB_FAIL(tablet->load_storage_schema(allocator, storage_schema))) {
-        LOG_WARN("load storage schema failed", K(ret), KPC(tablet));
-      } else if (OB_ISNULL(storage_schema)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("storage schema is NULL", K(ret), KPC(tablet));
-      } else if (storage_schema->is_mv_major_refresh()) {
+      } else if (OB_FAIL(tablet->check_is_mv_major_refresh_tablet(is_mv_major_refresh_tablet))) {
+        LOG_WARN("check mv major refresh tablet failed", KR(ret));
+      } else if (is_mv_major_refresh_tablet) {
         const int64_t snapshot = tablet->get_last_major_snapshot_version();
         if (0 == snapshot) {
           LOG_INFO("check major_mv merge_scn snapshot is 0, there is no major sstable", K(ret), K(arg_), K(snapshot), KPC(tablet));
@@ -2761,9 +3087,21 @@ int ObCheckStartTransferTabletsDelegate::check_start_transfer_in_tablets_()
       } else if (!tablet->is_empty_shell()) {
         ret = OB_EAGAIN;
         LOG_WARN("dest ls in start status should not exist transfer tablet, need retry", K(ret), KPC(tablet), K(tablet_info));
+      } else if (GCTX.is_shared_storage_mode()
+                 && tablet->get_transfer_seq() < tablet_info.transfer_seq_) {
+        ret = OB_EAGAIN;
+        LOG_WARN("the previous round's transfer out tablet has not finished gc", K(ret), KPC(tablet),
+          K(tablet_info));
       } else if (tablet->get_tablet_meta().transfer_info_.transfer_seq_ > tablet_info.transfer_seq_ + 1) {
         ret = OB_TABLET_TRANSFER_SEQ_NOT_MATCH;
-        LOG_WARN("tablet is in empty shell but transfer seq not match", K(ret), KPC(tablet), K(tablet_info));
+        LOG_WARN("tablet transfer seq is not match", K(ret), KPC(tablet), K(tablet_info));
+      } else {
+        //TODO(muwei.ym) now cannot cover empty shell because cover empty shell will delete empty shell first
+        //It make restart cannot find right filter condition
+        //Now disable cover empty shell
+        ret = OB_EAGAIN;
+        LOG_WARN("This tablet should not exist, need wait finish gc", K(ret), KPC(tablet),
+          K(tablet_info));
       }
     }
   }
@@ -2781,6 +3119,7 @@ int ObNotifyRestoreTabletsP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = nullptr;
     ObLS *ls = nullptr;
@@ -2851,6 +3190,7 @@ int ObInquireRestoreP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = nullptr;
     ObLS *ls = nullptr;
@@ -2918,6 +3258,7 @@ int ObUpdateLSMetaP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = nullptr;
     ObLS *ls = nullptr;
@@ -3101,6 +3442,7 @@ int ObGetLSActiveTransCountP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = nullptr;
     ObLS *ls = nullptr;
@@ -3158,6 +3500,7 @@ int ObGetTransferStartScnP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = nullptr;
     ObLS *ls = nullptr;
@@ -3260,6 +3603,7 @@ int OFetchLSReplayScnDelegate::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = NULL;
     ObLS *ls = NULL;
@@ -3323,6 +3667,7 @@ int ObCheckTransferTabletsBackfillDelegate::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = NULL;
     ObLS *ls = NULL;
@@ -3375,6 +3720,128 @@ int ObCheckTransferTabletsBackfillP::process()
   }
   return ret;
 }
+
+#ifdef OB_BUILD_SHARED_STORAGE
+ObCheckTransferOutTabletStatusDelegate::ObCheckTransferOutTabletStatusDelegate(
+    obrpc::ObCheckTransferOutTabletStatusRes &result)
+  : is_inited_(false),
+    arg_(),
+    result_(result)
+{}
+
+int ObCheckTransferOutTabletStatusDelegate::init(
+    const obrpc::ObCheckTransferOutTabletStatusArg &arg)
+{
+  int ret = OB_SUCCESS;
+  if (is_inited_) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("check start transfer backfill delegate init twice", K(ret));
+  } else if (!arg.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("get invalid arg", K(ret), K(arg));
+  } else if (OB_FAIL(arg_.assign(arg))) {
+    LOG_WARN("failed to assign arg", K(ret), K(arg));
+  } else {
+    is_inited_ = true;
+  }
+  return ret;
+}
+
+int ObCheckTransferOutTabletStatusDelegate::process()
+{
+  int ret = OB_SUCCESS;
+  MTL_SWITCH(arg_.tenant_id_) {
+    ObLSHandle ls_handle;
+    ObLSService *ls_service = nullptr;
+    ObLS *ls = nullptr;
+    ObTransferService *transfer_service = nullptr;
+    LOG_INFO("check transfer out tablet status", K(arg_));
+    if (OB_ISNULL(ls_service = MTL(ObLSService *))) {
+      ret = OB_ERR_UNEXPECTED;
+      STORAGE_LOG(WARN, "ls service should not be null", K(ret), KP(ls_service));
+    } else if (OB_FAIL(ls_service->get_ls(arg_.ls_id_, ls_handle, ObLSGetMod::STORAGE_MOD))) {
+      LOG_WARN("fail to get log stream", KR(ret), K(arg_));
+    } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("log stream should not be NULL", KR(ret), K(arg_), KP(ls));
+    } else if (OB_ISNULL(transfer_service = MTL(ObTransferService *))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("transfer service should not be null", K(ret), K_(arg));
+    } else {
+      bool all_is_transfer_out_deleted = true;
+      for (int64_t i = 0; OB_SUCC(ret) && i < arg_.tablet_list_.count(); ++i) {
+        bool is_transfer_out_deleted = false;
+        const ObTransferTabletInfo &tablet_info = arg_.tablet_list_.at(i);
+        if (OB_FAIL(check_is_transfer_out_deleted_(tablet_info, arg_.transfer_scn_, ls, is_transfer_out_deleted))) {
+          LOG_WARN("failed to check has transfer table", K(ret), K(tablet_info));
+        } else if (!is_transfer_out_deleted) {
+          all_is_transfer_out_deleted = false;
+          break;
+        }
+      }
+      if (OB_SUCC(ret)) {
+        result_.is_transfer_out_deleted_ = all_is_transfer_out_deleted;
+        if (!all_is_transfer_out_deleted) {
+          transfer_service->wakeup();
+        }
+        LOG_INFO("[TRANSFER]check transfer out tablet status", K(result_), K(arg_.tablet_list_), K(ls->get_ls_id()));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObCheckTransferOutTabletStatusDelegate::check_is_transfer_out_deleted_(
+    const ObTransferTabletInfo &tablet_info, const share::SCN &transfer_scn, storage::ObLS *ls, bool &is_transfer_out_deleted)
+{
+  int ret = OB_SUCCESS;
+  ObTabletHandle tablet_handle;
+  ObTablet *tablet = nullptr;
+  is_transfer_out_deleted = false;
+  if (OB_ISNULL(ls) || !tablet_info.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("ls is null or tablet info is invalid", K(ret), K(tablet_info));
+  } else if (OB_FAIL(ls->get_tablet(tablet_info.tablet_id_, tablet_handle, 0, ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
+    if (OB_TABLET_NOT_EXIST == ret) {
+      // tablet not exist
+      share::SCN max_decided_scn;
+      if (OB_FAIL(ls->get_max_decided_scn(max_decided_scn))) {
+        LOG_WARN("failed to get max decided scn", K(ret), KPC(ls));
+      } else if (max_decided_scn >= transfer_scn) {
+        // means transfer out tablet is already been gc
+        ret = OB_SUCCESS;
+        is_transfer_out_deleted = true;
+        LOG_INFO("transfer out tablet is already deleted", K(tablet_info), K(max_decided_scn), K(transfer_scn));
+      }
+    }
+    if (OB_FAIL(ret)) {
+      LOG_WARN("failed to get tablet", K(ret), K(tablet_info));
+    }
+  } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tablet should not be NULL", K(ret), KP(tablet));
+  } else if (tablet->get_tablet_meta().transfer_info_.transfer_seq_ != tablet_info.transfer_seq_) {
+    ret = OB_TABLET_TRANSFER_SEQ_NOT_MATCH;
+    LOG_WARN("transfer tablet seq is unexpected", K(ret), K(tablet_info), KPC(tablet));
+  } else if (tablet->get_tablet_meta().transfer_info_.is_transfer_out_deleted()) {
+    is_transfer_out_deleted = true;
+    LOG_INFO("transfer out tablet deleted", K(tablet_info), K(tablet->get_tablet_meta()));
+  }
+  return ret;
+}
+
+int ObCheckTransferOutTabletStatusP::process()
+{
+  int ret = OB_SUCCESS;
+  ObCheckTransferOutTabletStatusDelegate delegate(result_);
+  if (OB_FAIL(delegate.init(arg_))) {
+    LOG_WARN("failed to init delegate", K(ret));
+  } else if (OB_FAIL(delegate.process())) {
+    LOG_WARN("failed to do process", K(ret), K_(arg));
+  }
+  return ret;
+}
+#endif
 
 int ObStorageGetConfigVersionAndTransferScnP::process()
 {
@@ -3464,6 +3931,7 @@ int ObStorageGetConfigVersionAndTransferScnDelegate::process()
   }
 #endif
   MTL_SWITCH(tenant_id) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = NULL;
     ObLS *ls = NULL;
@@ -3500,6 +3968,7 @@ int ObStorageFetchLSViewP::process()
   int ret = OB_SUCCESS;
   LOG_INFO("receive fetch ls view request", K_(arg));
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = NULL;
     ObLS *ls = NULL;
@@ -3608,6 +4077,7 @@ int ObStorageSubmitTxLogP::process()
   const share::ObLSID &ls_id = arg_.ls_id_;
 
   MTL_SWITCH(tenant_id) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLS *ls = NULL;
     SCN scn;
@@ -3644,6 +4114,7 @@ int ObStorageGetTransferDestPrepareSCNP::process()
   const share::ObLSID &ls_id = arg_.ls_id_;
 
   MTL_SWITCH(tenant_id) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLS *ls = NULL;
     bool enable = false;
@@ -3683,6 +4154,7 @@ int ObStorageLockConfigChangeP::process()
   const int64_t lock_owner = arg_.lock_owner_;
   const int64_t lock_timeout = arg_.lock_timeout_;
   MTL_SWITCH(tenant_id) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = NULL;
     ObLS *ls = NULL;
@@ -3724,6 +4196,7 @@ int ObStorageUnlockConfigChangeP::process()
   const int64_t lock_owner = arg_.lock_owner_;
   const int64_t lock_timeout = arg_.lock_timeout_;
   MTL_SWITCH(tenant_id) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = NULL;
     ObLS *ls = NULL;
@@ -3763,6 +4236,7 @@ int ObStorageGetLogConfigStatP::process()
   const uint64_t tenant_id = arg_.tenant_id_;
   const share::ObLSID &ls_id = arg_.ls_id_;
   MTL_SWITCH(tenant_id) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = NULL;
     ObLS *ls = NULL;
@@ -3840,6 +4314,7 @@ int ObCheckTransferInTabletAbortDelegate::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = NULL;
     ObLS *ls = NULL;
@@ -3934,6 +4409,7 @@ int ObUpdateTransferMetaInfoDelegate::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = NULL;
     ObLS *ls = NULL;
@@ -4247,6 +4723,7 @@ int ObFetchReplicaPrewarmMicroBlockP::process()
     STORAGE_LOG(WARN, "invalid argument", KR(ret), K_(arg));
   } else {
     MTL_SWITCH(arg_.tenant_id_) {
+      CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_SS_LOCAL_CACHE_LOW);
       blocksstable::ObBufferReader data;
       char *buf = nullptr;
       last_send_time_ = this->get_receive_timestamp();
@@ -4299,6 +4776,344 @@ int ObFetchReplicaPrewarmMicroBlockP::process()
   return ret;
 }
 
+int ObHAGetLocalCacheInfoP::process()
+{
+  int ret = OB_SUCCESS;
+  if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_4_1_0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("get ha local cache info is not supported", KR(ret));
+  } else if (OB_UNLIKELY(!arg_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arg", KR(ret), K_(arg));
+  } else {
+    MTL_SWITCH(arg_.tenant_id_) {
+      ObSSLocalCacheService *local_cache_service = nullptr;
+      if (OB_ISNULL(local_cache_service = MTL(ObSSLocalCacheService*))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("local cache service should not be nullptr", KR(ret));
+      } else if (OB_FAIL(local_cache_service->get_ls_cache_info(arg_.ls_id_, result_.local_cache_ls_info_))) {
+        LOG_WARN("fail to get ls cache info", KR(ret), K_(arg));
+      }
+      LOG_INFO("get ls cache info", KR(ret), K_(arg), K_(result));
+    }
+  }
+  return ret;
+}
+
+int ObHAGetCacheJobInfoP::process()
+{
+  int ret = OB_SUCCESS;
+  if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_4_1_0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("get ha cache job info is not supported", KR(ret));
+  } else if (OB_UNLIKELY(!arg_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("get invalid args", K(ret), K_(arg));
+  } else {
+    MTL_SWITCH(arg_.tenant_id_) {
+      ObSSLocalCacheService *local_cache_service = nullptr;
+      if (OB_ISNULL(local_cache_service = MTL(ObSSLocalCacheService*))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("local cache service should not be nullptr", KR(ret));
+      } else if (OB_FAIL(local_cache_service->get_job_info(arg_.ls_id_, arg_.task_count_,
+                                                           result_.cache_job_infos_))) {
+        LOG_WARN("fail to get job info", KR(ret), K_(arg));
+      }
+      LOG_INFO("get job info", KR(ret), K_(arg), K_(result));
+    }
+  }
+  return ret;
+}
+
+ObFetchLocalCacheBlockP::ObFetchLocalCacheBlockP(ObInOutBandwidthThrottle *bandwidth_throttle)
+  : ObStorageStreamRpcP(bandwidth_throttle)
+{
+}
+
+int ObFetchLocalCacheBlockP::process()
+{
+  int ret = OB_SUCCESS;
+  if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_4_1_0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("fetch local cache block is not supported", KR(ret));
+  } else if (OB_UNLIKELY(!arg_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid args", KR(ret), K_(arg));
+  } else {
+    MTL_SWITCH(arg_.tenant_id_) {
+      CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
+      ObHAFetchLocalCacheBlockHeader header;
+      char *buf = nullptr;
+      blocksstable::ObBufferReader data;
+      int64_t data_size = 0; // including micro/macro meta and data
+      last_send_time_ = this->get_receive_timestamp();
+      const int64_t start_us = ObTimeUtility::current_time_us();
+      const int64_t first_receive_ts = this->get_receive_timestamp();
+      LOG_INFO("start to fetch local cache block", K_(arg));
+      // The reason that apply 4M buffer：
+      // buffer struct：meta_array + data
+      // meta: index info + other cache info
+      // other cache info: uint32(crc) + bool(in t1/t2), less than index info
+      // index info and data, come from a cache block, <= 2M
+      // other cache info array, also <= 2M
+      // so meta_array + data <= 4M
+      if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(OB_HA_FETCH_LOCAL_CACHE_BLOCK_RPC_BUF_SIZE)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("fail to alloc migrate data buffer", KR(ret));
+      } else if (OB_UNLIKELY(!result_.set_data(buf, OB_HA_FETCH_LOCAL_CACHE_BLOCK_RPC_BUF_SIZE))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("fail to set data to result", KR(ret));
+      } else if (OB_ISNULL(bandwidth_throttle_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("bandwidth_throttle must not null", KR(ret), KP_(bandwidth_throttle));
+      } else {
+        SMART_VAR(ObCopyCachedBlockDataProducer, producer) {
+          if (OB_FAIL(producer.init(arg_.local_cache_keys_))) {
+            LOG_WARN("fail to init cached block data producer", KR(ret), K_(arg));
+          } else {
+            bool is_iter_end = false;
+            while (OB_SUCC(ret) && !is_iter_end) {
+              header.reset();
+              if (OB_FAIL(producer.get_next_cached_block_data(header, data))) {
+                if (OB_ITER_END == ret) {
+                  ret = OB_SUCCESS; // ignore ret
+                  is_iter_end = true;
+                } else {
+                  LOG_WARN("fail to get next cached block data", KR(ret));
+                }
+              } else if (0 == header.body_size_) {
+                // do nothing. maybe micro cache is reorganized or gc, or macro cache is evicted or gc
+              } else if (OB_FAIL(fill_data(header))) {
+                LOG_WARN("fail to fill data", KR(ret), K(header), K(data));
+              } else if (OB_FAIL(fill_buffer(data))) {
+                LOG_WARN("fail to fill buffer", KR(ret), K(header), K(data));
+              } else {
+                data_size += header.body_size_;
+                LOG_TRACE("succ to fill cached block data", K(header), K(data));
+              }
+            }
+          }
+        }
+      }
+
+      LOG_INFO("finish to fetch local cache block", KR(ret), K(data_size), "cost_ts",
+               ObTimeUtility::current_time_us() - start_us, "in_rpc_queue_time",
+               start_us - first_receive_ts);
+    }
+  }
+  return ret;
+}
+
+int ObNotifySSWriterDoBackfillP::process()
+{
+  int ret = OB_SUCCESS;
+
+  if (OB_UNLIKELY(!arg_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid argument", KR(ret), K_(arg));
+  } else if (OB_FAIL(notify_sswriter_do_backfill_())) {
+    LOG_WARN("failed to notify sswriter do backfill", KR(ret), K(arg_));
+  }
+
+  return ret;
+}
+
+int ObNotifySSWriterDoBackfillP::notify_sswriter_do_backfill_()
+{
+  int ret = OB_SUCCESS;
+  bool is_sswriter = false;
+
+  MTL_SWITCH(arg_.tenant_id_) {
+    if (OB_FAIL(ObSSTransferBackfillUtils::check_self_is_sswriter(arg_.type_, arg_.ls_id_, arg_.tablet_id_,
+        is_sswriter))) {
+      LOG_WARN("failed to check self is sswriter", KR(ret), K(arg_));
+    } else if (!is_sswriter) {
+      // set result then skip
+      result_ = OB_NOT_MASTER;
+      LOG_INFO("[SS_TRANSFER_BACKFILL] is not valid sswriter", KR(ret), K(arg_));
+    } else {
+      ObTransferService *transfer_service = nullptr;
+      if (OB_ISNULL(transfer_service = MTL(ObTransferService*))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("transfer service should not be NULL", KR(ret), KP(transfer_service));
+      } else {
+        transfer_service->wakeup();
+        result_ = OB_SUCCESS;
+        LOG_TRACE("[SS_TRANSFER_BACKFILL] notify sswriter do backfill success", KR(ret), K(arg_));
+      }
+    }
+  }
+  return ret;
+}
+// ==================== ObGetLocalCacheKeyP ====================
+
+ERRSIM_POINT_DEF(EN_GET_LOCAL_CACHE_KEY_RECONNECT);
+int ObGetLocalCacheKeyP::process()
+{
+  int ret = OB_SUCCESS;
+  if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_4_1_0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("get local cache key is not supported", KR(ret));
+  } else if (!arg_.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("get invalid args", KR(ret), K(arg_));
+  } else {
+    const int64_t start_us = ObTimeUtil::current_time_us();
+    MTL_SWITCH(arg_.tenant_id_) {
+      CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
+      if (arg_.job_info_.job_type_ == ObHACacheJobType::MICRO_CACHE_JOB_TYPE) {
+        if (OB_FAIL(process_micro_cache_job_())) {
+          LOG_WARN("failed to process micro cache job", KR(ret), K(arg_));
+        }
+      } else if (arg_.job_info_.job_type_ == ObHACacheJobType::MACRO_CACHE_JOB_TYPE) {
+        if (OB_FAIL(process_macro_cache_job_())) {
+          LOG_WARN("failed to process macro cache job", KR(ret), K(arg_));
+        }
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("job type is not supported", KR(ret), K(arg_));
+      }
+    }
+    LOG_INFO("finish get local cache key", KR(ret), "cost_us", ObTimeUtil::current_time_us() - start_us,
+             K_(arg), "header", result_.header_);
+  }
+  return ret;
+}
+
+int ObGetLocalCacheKeyP::process_micro_cache_job_()
+{
+  int ret = OB_SUCCESS;
+  ObCopyLocalMetaProducer producer;
+  ObCopyMicroPrewarmMetaSet metas;
+  ObCopyLocalCacheKeyRpcHeader header;
+  int32_t object_count = 0;
+  result_.local_cache_keys_.job_type_ = ObHACacheJobType::MICRO_CACHE_JOB_TYPE;
+  int64_t serialize_size_sum = result_.local_cache_keys_.get_serialize_size();
+  ObCopyLocalCacheKeyRpcHeader::ConnectStatus connect_status = ObCopyLocalCacheKeyRpcHeader::ConnectStatus::MAX_STATUS;
+  LOG_INFO("start to fetch micro block header", K(arg_));
+
+  if (OB_FAIL(producer.init(arg_.job_info_, arg_.ls_id_))) {
+    LOG_WARN("failed to init micro block key producer", KR(ret), K(arg_));
+  } else {
+    int64_t iter_count = 0;
+    int64_t cur_idx = 0;
+    while (OB_SUCC(ret) && iter_count < MICRO_MAX_ITER_COUNT) {
+      iter_count++;
+      metas.reset();
+      cur_idx = producer.get_cur_idx();
+      if (OB_FAIL(producer.get_next_micro_metas(metas))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+          cur_idx -= 1;
+          connect_status = ObCopyLocalCacheKeyRpcHeader::ConnectStatus::ENDCONNECT;
+          break;
+        } else {
+          STORAGE_LOG(WARN, "failed to get next micro block key set", KR(ret));
+        }
+      } else if (!metas.is_valid()) {
+        LOG_INFO("skip this key set", K(arg_), K(metas));
+      }
+#ifdef ERRSIM
+      else if (EN_GET_LOCAL_CACHE_KEY_RECONNECT) {
+        FLOG_INFO("ERRSIM EN_GET_LOCAL_CACHE_KEY_RECONNECT", K(arg_));
+        cur_idx -= 1;
+        connect_status = ObCopyLocalCacheKeyRpcHeader::ConnectStatus::RECONNECT;
+        break;
+      }
+#endif
+      else {
+        const int64_t serialize_size = metas.get_serialize_size();
+        if (serialize_size_sum + KEY_SET_RESERVE_SIZE + serialize_size > MAX_KEY_SET_SIZE) {
+          cur_idx -= 1;
+          connect_status = ObCopyLocalCacheKeyRpcHeader::ConnectStatus::RECONNECT;
+          break;
+        } else if (OB_FAIL(result_.local_cache_keys_.micro_meta_set_array_.push_back(metas))) {
+          STORAGE_LOG(WARN, "fail to push back micro meta", KR(ret), K(metas));
+        } else {
+          serialize_size_sum += serialize_size;
+          object_count += static_cast<int32_t>(metas.micro_prewarm_metas_.count());
+        }
+      }
+    }
+    if (OB_SUCC(ret) && iter_count == MICRO_MAX_ITER_COUNT && connect_status == ObCopyLocalCacheKeyRpcHeader::ConnectStatus::MAX_STATUS ) {
+      connect_status = ObCopyLocalCacheKeyRpcHeader::ConnectStatus::RECONNECT;
+    }
+    if (OB_SUCC(ret)) {
+      header.connect_status_ = connect_status;
+      header.object_count_ = object_count;
+      header.end_idx_ = cur_idx;
+      result_.header_ = header;
+    }
+  }
+  return ret;
+}
+
+int ObGetLocalCacheKeyP::process_macro_cache_job_()
+{
+  int ret = OB_SUCCESS;
+  ObCopyLocalMetaProducer producer;
+  common::ObSArray<ObSSMacroPrewarmMeta> macro_metas;
+  ObCopyLocalCacheKeyRpcHeader header;
+  int32_t object_count = 0;
+  ObCopyLocalCacheKeyRpcHeader::ConnectStatus connect_status =
+      ObCopyLocalCacheKeyRpcHeader::ConnectStatus::RECONNECT;
+  result_.local_cache_keys_.job_type_ = ObHACacheJobType::MACRO_CACHE_JOB_TYPE;
+  int64_t serialize_size_sum = result_.local_cache_keys_.get_serialize_size();
+  LOG_INFO("start to get local macro cache key", K(arg_));
+
+  if (OB_FAIL(producer.init(arg_.job_info_, arg_.ls_id_))) {
+    LOG_WARN("failed to init macro producer", KR(ret), K(arg_));
+  } else {
+    int64_t cur_idx = 0;
+    while (OB_SUCC(ret)) {
+      cur_idx = producer.get_cur_idx();
+      if (OB_FAIL(producer.get_next_macro_metas(macro_metas))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+          cur_idx -= 1;
+          connect_status =
+              ObCopyLocalCacheKeyRpcHeader::ConnectStatus::ENDCONNECT;
+          break;
+        } else {
+          STORAGE_LOG(WARN, "failed to get next macro metas", KR(ret));
+        }
+      } else if (macro_metas.count() == 0) {
+        LOG_INFO("skip empty macro metas", K(arg_), K(macro_metas));
+      }
+#ifdef ERRSIM
+      else if (EN_GET_LOCAL_CACHE_KEY_RECONNECT) {
+        FLOG_INFO("ERRSIM EN_GET_LOCAL_CACHE_KEY_RECONNECT", K(arg_));
+        cur_idx -= 1;
+        connect_status = ObCopyLocalCacheKeyRpcHeader::ConnectStatus::RECONNECT;
+        break;
+      }
+#endif
+      else if (serialize_size_sum + KEY_SET_RESERVE_SIZE + macro_metas.get_serialize_size() > MAX_KEY_SET_SIZE) {
+        cur_idx -= 1;
+        connect_status = ObCopyLocalCacheKeyRpcHeader::ConnectStatus::RECONNECT;
+        break;
+      } else {
+        for (int64_t i = 0; i < macro_metas.count() && OB_SUCC(ret); i++) {
+          if (OB_FAIL(result_.local_cache_keys_.macro_meta_array_.push_back(macro_metas[i]))) {
+            STORAGE_LOG(WARN, "fail to push back macro meta", KR(ret), K(macro_metas[i]));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          serialize_size_sum += macro_metas.get_serialize_size();
+          object_count += static_cast<int32_t>(macro_metas.count());
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      header.connect_status_ = connect_status;
+      header.object_count_ = object_count;
+      header.end_idx_ = cur_idx;
+      result_.header_ = header;
+    }
+  }
+  return ret;
+}
+
 #endif
 
 ObRebuildTabletSSTableInfoP::ObRebuildTabletSSTableInfoP(common::ObInOutBandwidthThrottle *bandwidth_throttle)
@@ -4310,6 +5125,7 @@ int ObRebuildTabletSSTableInfoP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_HA_HIGH);
     ObLSHandle ls_handle;
     ObLSService *ls_service = nullptr;
     char * buf = NULL;
@@ -4392,6 +5208,34 @@ int ObRebuildTabletSSTableInfoP::build_sstable_info_(ObLS *ls)
       }
     }
   }
+  return ret;
+}
+
+int ObAdvanceSrcLSCheckpointP::process()
+{
+  int ret = OB_SUCCESS;
+
+  MTL_SWITCH(arg_.tenant_id_) {
+    ObLSHandle ls_handle;
+    ObLSService *ls_service = nullptr;
+    ObLS *ls = nullptr;
+    ObLSMigrationHandler *ls_migration_handler = nullptr;
+    if (OB_ISNULL(ls_service = MTL(ObLSService *))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ls service should not be null", KR(ret), KP(ls_service));
+    } else if (OB_FAIL(ls_service->get_ls(arg_.ls_id_, ls_handle, ObLSGetMod::STORAGE_MOD))) {
+      LOG_WARN("failed to get log stream", KR(ret), K(arg_));
+    } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ls should not be NULL", KR(ret), K(arg_), KP(ls));
+    } else if (OB_ISNULL(ls_migration_handler = ls->get_ls_migration_handler())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ls migration handler should not be NULL", KR(ret), K(arg_), KP(ls_migration_handler));
+    } else if (OB_FAIL(ls_migration_handler->update_advance_ls_checkpoint_scn(arg_.recycle_scn_))) {
+      LOG_WARN("failed to check and update need advance ls checkpoint", K(ret), K(arg_));
+    }
+  }
+
   return ret;
 }
 
@@ -4930,6 +5774,36 @@ int ObStorageRpc::fetch_ls_member_and_learner_list(
   return ret;
 }
 
+int ObStorageRpc::advance_src_ls_checkpoint(
+    const uint64_t tenant_id,
+    const ObStorageHASrcInfo &src_info,
+    const share::ObLSID &ls_id,
+    const share::SCN &recycle_scn)
+{
+  int ret = OB_SUCCESS;
+  obrpc::ObAdvanceSrcLSCheckpointArg arg;
+  obrpc::Int64 res = 0;
+  arg.tenant_id_ = tenant_id;
+  arg.ls_id_ = ls_id;
+  arg.recycle_scn_ = recycle_scn;
+
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+    STORAGE_LOG(WARN, "storage rpc is not inited", K(ret));
+  } else if (OB_INVALID_ID == tenant_id || !src_info.is_valid() || !ls_id.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid argument", K(ret), K(tenant_id), K(src_info), K(ls_id));
+  } else if (OB_FAIL(rpc_proxy_->to(src_info.src_addr_).dst_cluster_id(src_info.cluster_id_)
+        .by(tenant_id)
+        .group_id(share::OBCG_STORAGE)
+        .advance_src_ls_checkpoint(arg, res))) {
+    LOG_WARN("fail to advance src ls checkpoint", K(ret), K(tenant_id), K(ls_id), K(src_info));
+  } else {
+    LOG_INFO("succeed to advance src ls checkpoint", K(ret), K(tenant_id), K(ls_id), K(src_info));
+  }
+  return ret;
+}
+
 #ifdef OB_BUILD_SHARED_STORAGE
 int ObStorageRpc::get_ls_micro_block_cache_info(
     const uint64_t tenant_id,
@@ -5010,6 +5884,7 @@ int ObStorageRpc::get_micro_block_key_set(
   int ret = OB_SUCCESS;
   res.reset();
   obrpc::ObGetMicroBlockKeyArg arg;
+  const int64_t FETCH_MICRO_BLOCK_KEY_SET_TIMEOUT = 60 * 1000 * 1000LL; // 60s
 
   if (!is_inited_) {
     ret = OB_NOT_INIT;
@@ -5026,6 +5901,7 @@ int ObStorageRpc::get_micro_block_key_set(
     arg.job_info_ = job_info;
     if (OB_FAIL(rpc_proxy_->to(src_info.src_addr_).dst_cluster_id(src_info.cluster_id_)
         .by(tenant_id)
+        .timeout(FETCH_MICRO_BLOCK_KEY_SET_TIMEOUT)
         .group_id(share::OBCG_STORAGE)
         .fetch_micro_block_keys(arg, res))) {
       LOG_WARN("fail to fetch micro block keys", K(ret), K(tenant_id), K(ls_id), K(src_info));
@@ -5033,6 +5909,165 @@ int ObStorageRpc::get_micro_block_key_set(
   }
   return ret;
 }
+
+
+int ObStorageRpc::get_local_cache_ls_info(
+    const uint64_t tenant_id,
+    const ObLSID &ls_id,
+    const ObStorageHASrcInfo &src_info,
+    ObSSLocalCacheLSInfo &ls_cache_info)
+{
+  int ret = OB_SUCCESS;
+  ObGetHALocalCacheLSInfoArg arg;
+  ObGetHALocalCacheLSInfoRes res;
+  ls_cache_info.reset();
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    STORAGE_LOG(WARN, "storage rpc is not inited", KR(ret));
+  } else if (OB_UNLIKELY((OB_INVALID_TENANT_ID == tenant_id) || !ls_id.is_valid() || !src_info.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument!", KR(ret), K(tenant_id), K(ls_id), K(src_info));
+  } else if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_4_1_0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("get local cache ls info is not supported", KR(ret));
+  } else {
+    arg.tenant_id_ = tenant_id;
+    arg.ls_id_ = ls_id;
+    const int64_t rpc_timeout = ObStorageHAUtils::get_rpc_timeout();
+    if (OB_FAIL(rpc_proxy_->to(src_info.src_addr_)
+                            .timeout(rpc_timeout)
+                            .dst_cluster_id(src_info.cluster_id_)
+                            .by(tenant_id)
+                            .group_id(OBCG_STORAGE)
+                            .get_ha_local_cache_info(arg, res))) {
+      LOG_WARN("fail to get ha local cache info", KR(ret), K(tenant_id), K(ls_id), K(src_info));
+    } else {
+      ls_cache_info = res.local_cache_ls_info_;
+    }
+  }
+  return ret;
+}
+
+int ObStorageRpc::get_ls_migration_cache_job_info(
+    const uint64_t tenant_id,
+    const ObLSID &ls_id,
+    const ObStorageHASrcInfo &src_info,
+    const ObHALocalCacheTaskCount &task_count,
+    ObGetHACacheJobInfoRes &res)
+{
+  int ret = OB_SUCCESS;
+  res.reset();
+  ObGetHACacheJobInfoArg arg;
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    STORAGE_LOG(WARN, "storage rpc is not inited", KR(ret));
+  } else if (OB_UNLIKELY((OB_INVALID_TENANT_ID == tenant_id) || !ls_id.is_valid() || !src_info.is_valid() ||
+             ((task_count.micro_cache_task_count_ <= 0) && (task_count.macro_cache_task_count_ <= 0)))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(ls_id), K(src_info), K(task_count));
+  } else if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_4_1_0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("get ls migration cache job info is not supported", KR(ret));
+  } else {
+    arg.tenant_id_ = tenant_id;
+    arg.ls_id_ = ls_id;
+    arg.task_count_ = task_count;
+    const int64_t rpc_timeout = ObStorageHAUtils::get_rpc_timeout();
+    if (OB_FAIL(rpc_proxy_->to(src_info.src_addr_)
+                            .timeout(rpc_timeout)
+                            .dst_cluster_id(src_info.cluster_id_)
+                            .by(tenant_id)
+                            .group_id(OBCG_STORAGE)
+                            .get_ha_cache_job_info(arg, res))) {
+      LOG_WARN("fail to get migration cache job info", KR(ret), K(tenant_id), K(ls_id), K(src_info));
+    }
+  }
+  return ret;
+}
+
+int ObStorageRpc::get_local_cache_key(
+    const uint64_t tenant_id,
+    const share::ObLSID &ls_id,
+    const ObStorageHASrcInfo &src_info,
+    const ObHACacheJobInfo &job_info,
+    ObGetLocalCacheKeyRes &res)
+{
+  int ret = OB_SUCCESS;
+  res.reset();
+  ObGetLocalCacheKeyArg arg;
+
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+    STORAGE_LOG(WARN, "storage rpc is not inited", KR(ret));
+  } else if (OB_INVALID_ID == tenant_id || !ls_id.is_valid() ||
+             !src_info.is_valid() || !job_info.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(ls_id), K(src_info),
+             K(job_info));
+  } else if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_4_1_0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("get local cache key is not supported", KR(ret));
+  } else {
+    const int64_t rpc_timeout = ObStorageHAUtils::get_rpc_timeout();
+    arg.tenant_id_ = tenant_id;
+    arg.ls_id_ = ls_id;
+    arg.job_info_ = job_info;
+    if (OB_FAIL(rpc_proxy_->to(src_info.src_addr_)
+                    .dst_cluster_id(src_info.cluster_id_)
+                    .timeout(rpc_timeout)
+                    .by(tenant_id)
+                    .group_id(share::OBCG_STORAGE)
+                    .get_local_cache_key(arg, res))) {
+      LOG_WARN("fail to fetch local cache key", KR(ret), K(tenant_id), K(ls_id),
+               K(src_info));
+    }
+  }
+  return ret;
+}
+
+int ObStorageRpc::notify_sswriter_do_backfill(
+    const uint64_t tenant_id,
+    const share::ObLSID &ls_id,
+    const ObTabletID &tablet_id,
+    const ObSSWriterType type,
+    const ObStorageHASrcInfo &src_info)
+{
+  int ret = OB_SUCCESS;
+  obrpc::Int64 res = 0;
+
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+    STORAGE_LOG(WARN, "storage rpc is not inited", K(ret));
+  } else if (OB_INVALID_ID == tenant_id || !src_info.is_valid() || !ls_id.is_valid() || !tablet_id.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(tenant_id), K(src_info), K(ls_id), K(tablet_id));
+  } else if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_4_0_0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("Notify sswriter do backfill is not supported", KR(ret));
+  } else {
+    obrpc::ObNotifySSWriterDoBackfillArg arg;
+    arg.tenant_id_ = tenant_id;
+    arg.ls_id_ = ls_id;
+    arg.tablet_id_ = tablet_id;
+    arg.type_ = type;
+    if (OB_FAIL(rpc_proxy_->to(src_info.src_addr_).dst_cluster_id(src_info.cluster_id_)
+        .by(tenant_id)
+        .group_id(share::OBCG_STORAGE)
+        .notify_sswriter_do_backfill(arg, res))) {
+      LOG_WARN("fail to notify sswriter do backfill", K(ret), K(arg), K(tenant_id), K(ls_id), K(src_info));
+    } else if (OB_SUCCESS != res) {
+      // overwrite ret with res
+      ret = res;
+      LOG_WARN("notify result is not success", K(ret), K(res), K(arg));
+    } else {
+      LOG_TRACE("[SS_TRANSFER_BACKFILL] notify sswriter do backfill success", K(ret), K(arg));
+    }
+  }
+  return ret;
+}
+
 #endif
 } // storage
 } // oceanbase

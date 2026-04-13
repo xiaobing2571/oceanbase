@@ -29,18 +29,19 @@ public:
   virtual void reset() override;
   virtual void reuse() override;
   virtual void reclaim() override;
+  virtual int pause(bool& do_pause) override { do_pause = false; return OB_SUCCESS; }
+  INHERIT_TO_STRING_KV("ObMultipleMerge", ObMultipleMerge, K(handle_), K(fuse_row_cache_fetcher_));
 protected:
   virtual int calc_scan_range() override;
-  virtual int construct_iters(const bool is_refresh) override;
-  virtual int is_range_valid() const override;
+  virtual int construct_iters() override;
   virtual int inner_get_next_row(blocksstable::ObDatumRow &row);
 private:
-  virtual int get_table_row(const int64_t table_idx,
-                            const common::ObIArray<ObITable *> &tables,
-                            blocksstable::ObDatumRow &fuse_row,
-                            bool &final_result,
-                            bool &has_uncommited_row);
-  virtual int get_and_fuse_cache_row(const int64_t read_snapshot_version,
+  int get_table_row(const int64_t table_idx,
+                    const common::ObIArray<ObITable *> &tables,
+                    blocksstable::ObDatumRow &fuse_row,
+                    bool &final_result,
+                    bool &has_uncommited_row);
+  int get_and_fuse_cache_row(const int64_t read_snapshot_version,
                                      const int64_t multi_version_start,
                                      blocksstable::ObDatumRow &fuse_row,
                                      bool &final_result,
@@ -48,11 +49,9 @@ private:
                                      bool &need_update_fuse_cache);
   int get_normal_table_scan_row(const int64_t read_snapshot_version,
                                 const int64_t multi_version_start,
-                                const bool enable_fuse_row_cache,
                                 bool &have_uncommited_row,
                                 bool &need_update_fuse_cache);
-  int get_mview_table_scan_row(const bool enable_fuse_row_cache,
-                               bool &have_uncommited_row,
+  int get_mview_table_scan_row(bool &have_uncommited_row,
                                bool &need_update_fuse_cache);
 private:
   static const int64_t SINGLE_GET_FUSE_ROW_CACHE_PUT_COUNT_THRESHOLD = 50;

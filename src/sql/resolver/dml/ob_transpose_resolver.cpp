@@ -162,7 +162,7 @@ int ObTransposeResolver::resolve(const ParseNode &parse_tree) {
     } else if (OB_ISNULL(trans_def)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null", K(ret));
-    } else if (trans_def->need_use_unpivot_op() &&
+    } else if (trans_def->is_unpivot() &&
                OB_FAIL(try_add_cast_to_unpivot(static_cast<UnpivotDef &>(*trans_def)))) {
       LOG_WARN("fail to add cast to unpivot", KPC(orig_table_item), K(ret));
     } else if (OB_FAIL(get_old_or_group_column(columns_in_aggrs, *orig_table_item, *trans_def))) {
@@ -204,7 +204,7 @@ int ObTransposeResolver::resolve_transpose_clause(
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_ERROR("create unpivot info failed");
     } else {
-      PivotDef * pivot_def = new (ptr) PivotDef();
+      PivotDef * pivot_def = new (ptr) PivotDef(*cur_resolver_->params_.allocator_);
       // resolve pivot clause
       if (OB_FAIL(resolve_pivot_clause(transpose_node, orig_table_item, *pivot_def, columns_in_aggrs))) {
         LOG_WARN("failed to resolve pivot clause", K(ret));
@@ -217,7 +217,7 @@ int ObTransposeResolver::resolve_transpose_clause(
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_ERROR("create unpivot info failed");
     } else {
-      UnpivotDef * unpivot_def = new (ptr) UnpivotDef();
+      UnpivotDef * unpivot_def = new (ptr) UnpivotDef(*cur_resolver_->params_.allocator_);
       // resolve unpivot clause
       if (OB_FAIL(resolve_unpivot_clause(transpose_node, orig_table_item, *unpivot_def))) {
         LOG_WARN("failed to resolve pivot clause", K(ret));
@@ -312,11 +312,13 @@ int ObTransposeResolver::resolve_pivot_clause(
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("in_node is unexpected", K(in_node.type_), K(in_node.num_child_),
                 KP(in_node.children_), K(ret));
+    } else if (OB_FAIL(pivot_def.in_pairs_.prepare_allocate(in_node.num_child_))) {
+      LOG_WARN("failed to prepare allocate", K(ret));
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && i < in_node.num_child_; ++i) {
         const ParseNode *column_node = in_node.children_[i];
         const ParseNode *alias_node = NULL;
-        PivotDef::InPair in_pair;
+        PivotDef::InPair &in_pair = pivot_def.in_pairs_.at(i);
         if (OB_ISNULL(column_node)
             || OB_UNLIKELY(column_node->type_ != T_PIVOT_IN)
             || OB_UNLIKELY(column_node->num_child_ != 2)
@@ -343,9 +345,6 @@ int ObTransposeResolver::resolve_pivot_clause(
           if (OB_FAIL(get_combine_name(in_pair.const_exprs_, in_pair.name_))) {
             LOG_WARN("failed to get combine name", K(ret));
           }
-        }
-        if (OB_SUCC(ret) && OB_FAIL(pivot_def.in_pairs_.push_back(in_pair))) {
-          LOG_WARN("fail to push_back in_pair", K(in_pair), K(ret));
         }
       }//end of for in node
     }
@@ -383,10 +382,12 @@ int ObTransposeResolver::resolve_unpivot_clause(const ParseNode &transpose_node,
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("in_node is unexpected", K(in_node.type_), K(in_node.num_child_),
                 KP(in_node.children_), K(ret));
+    } else if (OB_FAIL(unpivot_def.in_pairs_.prepare_allocate(in_node.num_child_))) {
+      LOG_WARN("failed to prepare allocate", K(ret));
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && i < in_node.num_child_; ++i) {
         const ParseNode *column_node = in_node.children_[i];
-        UnpivotDef::InPair in_pair;
+        UnpivotDef::InPair &in_pair = unpivot_def.in_pairs_.at(i);
         if (OB_ISNULL(column_node)
             || OB_UNLIKELY(column_node->type_ != T_UNPIVOT_IN)
             || OB_UNLIKELY(column_node->num_child_ != 2)
@@ -434,9 +435,6 @@ int ObTransposeResolver::resolve_unpivot_clause(const ParseNode &transpose_node,
               LOG_WARN("failed to push back", K(ret));
             }
           }
-        }
-        if (OB_SUCC(ret) && OB_FAIL(unpivot_def.in_pairs_.push_back(in_pair))) {
-          LOG_WARN("fail to push_back in_pair", K(in_pair), K(ret));
         }
       }//end of for in node
     }
@@ -786,7 +784,7 @@ int ObTransposeResolver::try_add_cast_to_unpivot(UnpivotDef &unpivot_def)
       } else if (OB_FAIL(ObRawExprUtils::try_add_cast_expr_above(cur_resolver_->params_.expr_factory_,
                                                                  cur_resolver_->params_.session_info_,
                                                                  *in_pair.const_exprs_.at(j),
-                                                                 res_types.at(j),
+                                                                 left_types.at(j),
                                                                  casted_expr))) {
         LOG_WARN("failed to try add cast expr", K(ret));
       } else if (OB_ISNULL(casted_expr)) {
@@ -803,7 +801,7 @@ int ObTransposeResolver::try_add_cast_to_unpivot(UnpivotDef &unpivot_def)
       } else if (OB_FAIL(ObRawExprUtils::try_add_cast_expr_above(cur_resolver_->params_.expr_factory_,
                                                                  cur_resolver_->params_.session_info_,
                                                                  *in_pair.column_exprs_.at(j),
-                                                                 res_types.at(in_pair.const_exprs_.count() + j),
+                                                                 left_types.at(in_pair.const_exprs_.count() + j),
                                                                  casted_expr))) {
         LOG_WARN("failed to push back", K(ret));
       } else if (OB_ISNULL(casted_expr)) {
@@ -811,6 +809,22 @@ int ObTransposeResolver::try_add_cast_to_unpivot(UnpivotDef &unpivot_def)
         LOG_WARN("unexpected null", K(ret));
       } else {
         in_pair.column_exprs_.at(j) = casted_expr;
+      }
+    }
+  }
+
+  // record res types for label columns and value columns
+  for (int64_t i = 0; OB_SUCC(ret) && i < left_types.count(); ++i) {
+    if (OB_UNLIKELY(left_types.count() != unpivot_def.label_columns_.count() + unpivot_def.value_columns_.count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("count of res types not equal", K(ret));
+    } else if (i < unpivot_def.label_columns_.count()) {
+      if (OB_FAIL(unpivot_def.label_col_types_.push_back(left_types.at(i)))) {
+        LOG_WARN("failed to push back", K(ret));
+      }
+    } else {
+      if (OB_FAIL(unpivot_def.value_col_types_.push_back(left_types.at(i)))) {
+        LOG_WARN("failed to push back", K(ret));
       }
     }
   }
@@ -952,7 +966,7 @@ int ObTransposeResolver::get_exprs_for_pivot_table(PivotDef &pivot_def,
   }
   // get other select exprs
   for (int64_t i = 0; OB_SUCC(ret) && i < pivot_def.in_pairs_.count(); ++i) {
-    PivotDef::InPair in_pair = pivot_def.in_pairs_.at(i);
+    PivotDef::InPair &in_pair = pivot_def.in_pairs_.at(i);
     for (int64_t j = 0; OB_SUCC(ret) && j < pivot_def.aggr_pairs_.count(); ++j) {
       PivotDef::AggrPair &aggr_pair = pivot_def.aggr_pairs_.at(j);
       ObRawExpr *select_expr = NULL;
@@ -1107,7 +1121,9 @@ int ObTransposeResolver::get_exprs_for_unpivot_table(UnpivotDef &trans_def,
   if (OB_ISNULL(cur_resolver_) ||
       OB_ISNULL(expr_factory = cur_resolver_->params_.expr_factory_) ||
       OB_UNLIKELY(!trans_def.is_unpivot()) ||
-      OB_UNLIKELY(trans_def.in_pairs_.count() == 0)) {
+      OB_UNLIKELY(trans_def.in_pairs_.count() == 0) ||
+      OB_UNLIKELY(trans_def.label_columns_.count() != trans_def.label_col_types_.count()) ||
+      OB_UNLIKELY(trans_def.value_columns_.count() != trans_def.value_col_types_.count())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid argument or context", K(ret));
   } else {
@@ -1148,6 +1164,8 @@ int ObTransposeResolver::get_exprs_for_unpivot_table(UnpivotDef &trans_def,
         LOG_WARN("unpivot_expr is null", K(ret));
       } else if (OB_FAIL(target_expr->set_expr_name(trans_def.label_columns_.at(i)))) {
         LOG_WARN("failed to set expr name", K(ret));
+      } else if (OB_FALSE_IT(target_expr->set_result_type(trans_def.label_col_types_.at(i)))) {
+        LOG_WARN("failed to set result type", K(ret));
       } else if (OB_FAIL(select_exprs.push_back(target_expr))) {
         LOG_WARN("failed to push back", K(ret));
       }
@@ -1190,6 +1208,8 @@ int ObTransposeResolver::get_exprs_for_unpivot_table(UnpivotDef &trans_def,
         LOG_WARN("unpivot_expr is null", K(ret));
       } else if (OB_FAIL(target_expr->set_expr_name(trans_def.value_columns_.at(i)))) {
         LOG_WARN("failed to set expr name", K(ret));
+      } else if (OB_FALSE_IT(target_expr->set_result_type(trans_def.value_col_types_.at(i)))) {
+        LOG_WARN("failed to set result type", K(ret));
       } else if (OB_FAIL(select_exprs.push_back(target_expr))) {
         LOG_WARN("failed to push back", K(ret));
       }
@@ -1215,7 +1235,7 @@ int ObTransposeResolver::get_unpivot_item(UnpivotDef &unpivot_def,
   } else if (OB_ISNULL(ptr = allocator->alloc(sizeof(ObUnpivotItem)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_ERROR("create unpivot info failed");
-  } else if (OB_ISNULL(unpivot_item = new (ptr) ObUnpivotItem())) {
+  } else if (OB_ISNULL(unpivot_item = new (ptr) ObUnpivotItem(*allocator))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null", K(ret));
   } else {
@@ -1326,7 +1346,7 @@ int ObTransposeResolver::push_transpose_table_into_view(
     TableItem *table = NULL;
     ObArray<ColumnItem> column_items;
     ObArray<PartExprItem> part_expr_items;
-    CheckConstraintItem check_constraint_item;
+    CheckConstraintItem *check_constraint_item = NULL;
     if (OB_ISNULL(table = stmt->get_table_item_by_id(table_id))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("table is null", K(ret), K(table));
@@ -1537,7 +1557,11 @@ int ObTransposeResolver::get_combine_name(ObIArray<ObString> &names, ObString &c
       LOG_WARN("failed to append fmt", K(ret));
     }
   }
-  if (OB_SUCC(ret)) {
+  if (OB_FAIL(ret)) {
+  } else if (str.length() <= 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected str with its length equals to 0", K(ret));
+  } else {
     char *buf = NULL;
     if (OB_ISNULL(buf = static_cast<char *>(allocator->alloc(str.length() - 1)))) {
       ret = common::OB_ALLOCATE_MEMORY_FAILED;
@@ -1577,7 +1601,11 @@ int ObTransposeResolver::get_combine_name(ObIArray<ObRawExpr *> &exprs, ObString
       LOG_WARN("failed to append fmt", K(ret));
     }
   }
-  if (OB_SUCC(ret)) {
+  if (OB_FAIL(ret)) {
+  } else if (str.length() <= 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected str with its length equals to 0", K(ret));
+  } else {
     char *buf = NULL;
     if (OB_ISNULL(buf = static_cast<char *>(allocator->alloc(str.length() - 1)))) {
       ret = common::OB_ALLOCATE_MEMORY_FAILED;

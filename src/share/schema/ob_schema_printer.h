@@ -14,6 +14,7 @@
 #define OCEANBASE_SHARE_SCHEMA_OB_SCHEMA_PRINTER_H_
 #include <stdint.h>
 #include "share/ob_define.h"
+#include "share/schema/ob_udt_info.h"
 #include "lib/container/ob_iarray.h"
 #include "share/schema/ob_schema_struct.h"
 #include "pl/parser/ob_pl_parser.h"
@@ -192,6 +193,7 @@ public:
                                          int64_t& pos) const;
   int print_index_column(const ObTableSchema &table_schema,
                          const ObColumnSchemaV2 &column,
+                         const ObTableSchema &index_schema,
                          bool is_last,
                          char *buf,
                          int64_t buf_len,
@@ -272,6 +274,13 @@ public:
                                                   char* buf,
                                                   const int64_t& buf_len,
                                                   int64_t& pos) const;
+  int print_partition_func(const ObTableSchema &table_schema,
+                           char* buf,
+                           const int64_t& buf_len,
+                           int64_t& pos,
+                           bool is_subpart,
+                           bool strict_compat,
+                           const ObTimeZoneInfo *tz_info) const;
   int print_interval_if_ness(const ObTableSchema &table_schema,
                              char* buf,
                              const int64_t& buf_len,
@@ -420,12 +429,17 @@ public:
                                 char *buf,
                                 const int64_t &buf_len,
                                 int64_t &pos) const;
-  int print_element_type(const uint64_t tenant_id,
-                         const uint64_t element_type_id,
+  int print_element_type(const uint64_t element_type_id,
                          const ObUDTBase *element_type_info,
                          char* buf,
                          const int64_t& buf_len,
                          int64_t &pos) const;
+  int print_object_spec_definition(const uint64_t tenant_id,
+                                   ObUDTTypeInfo *udt_info,
+                                   char* buf,
+                                   const int64_t& buf_len,
+                                   int64_t& pos,
+                                   ObString methods_definition) const;
   int print_trigger_definition(const share::schema::ObTriggerInfo &trigger_info,
                                char *buf, int64_t buf_len, int64_t &pos,
                                bool get_ddl = false) const;
@@ -536,7 +550,16 @@ public:
                                      char* buf,
                                      const int64_t& buf_len,
                                      int64_t& pos) const;
+  int print_location_definiton(const uint64_t tenant_id,
+                               const uint64_t location_id,
+                               char *buf,
+                               const int64_t &buf_len,
+                               int64_t &pos) const;
   void set_sql_schema_guard(sql::ObSqlSchemaGuard *sql_schema_guard);
+  int print_table_definition_clustering_key(const ObTableSchema &table_schema,
+                                            char* buf,
+                                            const int64_t& buf_len,
+                                            int64_t& pos) const;
 private:
   static bool is_subpartition_valid_in_mysql(const ObTableSchema &table_schema)
   {

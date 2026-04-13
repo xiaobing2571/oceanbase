@@ -11,10 +11,12 @@
  */
 
 #define USING_LOG_PREFIX SHARE
+#define OB_BUILD_UNITTEST
 
 #include <gtest/gtest.h>
 #define private public
 #include "share/backup/ob_backup_path.h"
+#include "share/backup/ob_backup_struct.h"
 #ifdef OB_BUILD_TDE_SECURITY
 #include "share/ob_master_key_getter.h"
 #endif
@@ -173,7 +175,7 @@ TEST(ObBackupDest, oss)
 
 TEST(ObBackupDest, oss_encrypt)
 {
-  const char *backup_test = "oss://backup_dir?host=xxx.com&access_id=111&encrypt_key=9B6FDE7E1E54CD292CDE5494CEB86B6F";
+  const char *backup_test = "oss://backup_dir?host=xxx.com&access_id=111&encrypt_key=9B6FDE7E1E54CD292CDE5494CEB86B6F&dest_id=1001";
   ObBackupDest dest;
   EXPECT_EQ(OB_SUCCESS, ObMasterKeyGetter::instance().init(NULL));
   EXPECT_EQ(OB_SUCCESS, ObMasterKeyGetter::instance().set_root_key(OB_SYS_TENANT_ID,
@@ -186,9 +188,24 @@ TEST(ObBackupDest, oss_encrypt)
   const char *endpoint = "host=xxx.com";
   const char *authorization = "access_id=111&encrypt_key=9B6FDE7E1E54CD292CDE5494CEB86B6F";
   const char *extension = "";
+  const int64_t dest_id = 1001;
   ObBackupDest dest1;
-  ASSERT_EQ(OB_SUCCESS, dest1.set(path, endpoint, authorization, extension));
+  ObBackupDest dest3;
+  ASSERT_EQ(OB_SUCCESS, dest1.set(path, endpoint, authorization, extension, dest_id));
+  ASSERT_EQ(OB_SUCCESS, dest3.set(path, endpoint, authorization, extension, OB_INVALID_DEST_ID));
   ASSERT_TRUE(dest == dest1);
+  ASSERT_TRUE(dest != dest3);
+
+  ObBackupStorageInfo *storage_info1 = dest.get_storage_info();
+  ObBackupStorageInfo *storage_info2 = dest3.get_storage_info();
+  ASSERT_TRUE(storage_info1 != nullptr && storage_info2 != nullptr);
+
+  ObBackupStorageInfo storage_info3;
+  storage_info3.assign(*storage_info2);
+  ASSERT_TRUE(*storage_info1 != *storage_info2);
+  ASSERT_TRUE(*storage_info2 == storage_info3);
+  ASSERT_TRUE(*storage_info1 != storage_info3);
+
   ObString backup_test_str(backup_test);
   ObBackupDest dest2;
   ASSERT_EQ(OB_INVALID_BACKUP_DEST, dest2.set_without_decryption(backup_test_str));
@@ -196,12 +213,12 @@ TEST(ObBackupDest, oss_encrypt)
   char backup_dest_str[OB_MAX_BACKUP_DEST_LENGTH] = { 0 };
   char backup_path_str[OB_MAX_BACKUP_DEST_LENGTH] = { 0 };
   ASSERT_EQ(OB_SUCCESS, dest.get_backup_dest_str(backup_dest_str, sizeof(backup_dest_str)));
-  ASSERT_EQ(0, strcmp(backup_dest_str, "oss://backup_dir?host=xxx.com&access_id=111&encrypt_key=9B6FDE7E1E54CD292CDE5494CEB86B6F"));
+  ASSERT_EQ(0, strcmp(backup_dest_str, "oss://backup_dir?host=xxx.com&access_id=111&encrypt_key=9B6FDE7E1E54CD292CDE5494CEB86B6F&dest_id=1001"));
   ASSERT_EQ(OB_SUCCESS, dest.get_backup_path_str(backup_path_str, sizeof(backup_path_str)));
   ASSERT_EQ(0, strcmp(backup_path_str, "oss://backup_dir?host=xxx.com"));
 
   dest1.reset();
-  ASSERT_EQ(OB_SUCCESS, dest1.set(path, endpoint, authorization, extension));
+  ASSERT_EQ(OB_SUCCESS, dest1.set(path, endpoint, authorization, extension, dest_id));
   ASSERT_TRUE(dest == dest1);
   ObMasterKeyGetter::instance().stop();
   ObMasterKeyGetter::instance().wait();
@@ -218,40 +235,10 @@ TEST(ObBackupDest, cos)
   ObBackupDest dest3;
   char backup_dest_str[OB_MAX_BACKUP_DEST_LENGTH] = { 0 };
   char backup_path_str[OB_MAX_BACKUP_DEST_LENGTH] = { 0 };
-  ASSERT_EQ(OB_SUCCESS, dest.set(backup_test));
-  ASSERT_EQ(OB_SUCCESS, dest1.set(backup_test));
-  ASSERT_EQ(OB_SUCCESS, dest2.set_storage_path(ObString(backup_test)));
-  ASSERT_EQ(OB_SUCCESS, dest3.set_storage_path(ObString(backup_test1)));
-  LOG_INFO("dump backup dest", K(dest), K(dest.get_root_path()), KPC(dest.get_storage_info()));
-  LOG_INFO("dump backup dest", K(dest2), K(dest.get_root_path()), KPC(dest.get_storage_info()));
-  LOG_INFO("dump backup dest", K(dest3), K(dest.get_root_path()), KPC(dest.get_storage_info()));
-  ASSERT_EQ(0, strcmp(dest.root_path_, "cos://backup_dir"));
-  ASSERT_TRUE(dest.storage_info_->device_type_ == 2);
-
-  EXPECT_EQ(OB_SUCCESS, ObMasterKeyGetter::instance().init(NULL));
-  EXPECT_EQ(OB_SUCCESS, ObMasterKeyGetter::instance().set_root_key(OB_SYS_TENANT_ID,
-                                                        obrpc::RootKeyType::DEFAULT, ObString()));
-  ASSERT_EQ(OB_SUCCESS, dest.get_backup_dest_str(backup_dest_str, sizeof(backup_dest_str)));
-  ASSERT_EQ(0, strcmp(backup_dest_str, "cos://backup_dir?host=xxx.com&access_id=111&encrypt_key=9B6FDE7E1E54CD292CDE5494CEB86B6F&delete_mode=tagging&appid=333"));
-  ASSERT_EQ(OB_SUCCESS, dest.get_backup_path_str(backup_path_str, sizeof(backup_path_str)));
-  ASSERT_EQ(0, strcmp(backup_path_str, "cos://backup_dir?host=xxx.com"));
-  ASSERT_TRUE(dest.is_root_path_equal(dest1));
-  bool is_equal = false;
-  ASSERT_EQ(OB_SUCCESS, dest.is_backup_path_equal(dest1, is_equal));
-  ASSERT_TRUE(is_equal);
-  is_equal = false;
-  ASSERT_EQ(OB_SUCCESS, dest.is_backup_path_equal(dest2, is_equal));
-  ASSERT_TRUE(is_equal);
-  is_equal = false;
-  ASSERT_EQ(OB_SUCCESS, dest.is_backup_path_equal(dest3, is_equal));
-  ASSERT_TRUE(is_equal);
-  ASSERT_TRUE(dest == dest1);
-  dest1.reset();
-  ASSERT_EQ(OB_SUCCESS, dest1.set(dest.get_root_path().ptr(), dest.get_storage_info()));
-  ASSERT_TRUE(dest == dest1);
-  ObMasterKeyGetter::instance().stop();
-  ObMasterKeyGetter::instance().wait();
-  ObMasterKeyGetter::instance().reset();
+  ASSERT_EQ(OB_INVALID_BACKUP_DEST, dest.set(backup_test));
+  ASSERT_EQ(OB_INVALID_BACKUP_DEST, dest1.set(backup_test));
+  ASSERT_EQ(OB_INVALID_BACKUP_DEST, dest2.set_storage_path(ObString(backup_test)));
+  ASSERT_EQ(OB_INVALID_BACKUP_DEST, dest3.set_storage_path(ObString(backup_test1)));
 }
 
 TEST(ObBackupDest, cos_encrypt)
@@ -261,36 +248,189 @@ TEST(ObBackupDest, cos_encrypt)
   EXPECT_EQ(OB_SUCCESS, ObMasterKeyGetter::instance().init(NULL));
   EXPECT_EQ(OB_SUCCESS, ObMasterKeyGetter::instance().set_root_key(OB_SYS_TENANT_ID,
                                                         obrpc::RootKeyType::DEFAULT, ObString()));
-  ASSERT_EQ(OB_SUCCESS, dest.set(backup_test));
-  LOG_INFO("dump backup dest", K(dest.get_root_path()), KPC(dest.get_storage_info()));
-  ASSERT_EQ(0, strcmp(dest.root_path_, "cos://backup_dir"));
-  ASSERT_TRUE(dest.storage_info_->device_type_ == 2);
-  const char *path = "cos://backup_dir/";
-  const char *endpoint = "host=xxx.com";
-  const char *authorization = "access_id=111&encrypt_key=9B6FDE7E1E54CD292CDE5494CEB86B6F";
-  const char *extension = "appid=333";
-  ObBackupDest dest1;
-  ASSERT_EQ(OB_SUCCESS, dest1.set(path, endpoint, authorization, extension));
-  ASSERT_TRUE(dest == dest1);
-  ObString backup_test_str(backup_test);
-  ObBackupDest dest2;
-  ASSERT_EQ(OB_INVALID_BACKUP_DEST, dest2.set_without_decryption(backup_test_str));
-
-  char backup_dest_str[OB_MAX_BACKUP_DEST_LENGTH] = { 0 };
-  char backup_path_str[OB_MAX_BACKUP_DEST_LENGTH] = { 0 };
-  ASSERT_EQ(OB_SUCCESS, dest.get_backup_dest_str(backup_dest_str, sizeof(backup_dest_str)));
-  ASSERT_EQ(0, strcmp(backup_dest_str, "cos://backup_dir?host=xxx.com&access_id=111&encrypt_key=9B6FDE7E1E54CD292CDE5494CEB86B6F&appid=333"));
-  ASSERT_EQ(OB_SUCCESS, dest.get_backup_path_str(backup_path_str, sizeof(backup_path_str)));
-  ASSERT_EQ(0, strcmp(backup_path_str, "cos://backup_dir?host=xxx.com"));
-
-  dest1.reset();
-  ASSERT_EQ(OB_SUCCESS, dest1.set(path, endpoint, authorization, extension));
-  ASSERT_TRUE(dest == dest1);
-  ObMasterKeyGetter::instance().stop();
-  ObMasterKeyGetter::instance().wait();
-  ObMasterKeyGetter::instance().reset();
+  ASSERT_EQ(OB_INVALID_BACKUP_DEST, dest.set(backup_test));
 }
 #endif
+
+TEST(ObBackupExtraInfo, encode_decode_normal)
+{
+  int ret = OB_SUCCESS;
+  share::ObBackupExtraInfo info;
+  share::ObBackupExtraInfo decoded;
+  char buf[OB_INNER_TABLE_DEFAULT_VALUE_LENTH] = "";
+  int64_t pos = 0;
+
+  ASSERT_EQ(OB_SUCCESS, info.sslog_gts_.convert_for_gts(1234567890));
+  ASSERT_EQ(OB_SUCCESS, info.read_scn_.convert_for_gts(9876543210));
+
+  ret = info.encode_to_str(buf, sizeof(buf), pos);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ASSERT_GT(pos, 0);
+
+  ret = decoded.decode_from_str(buf);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ASSERT_EQ(info.sslog_gts_, decoded.sslog_gts_);
+  ASSERT_EQ(info.read_scn_, decoded.read_scn_);
+}
+
+TEST(ObBackupExtraInfo, encode_decode_min_scn)
+{
+  int ret = OB_SUCCESS;
+  share::ObBackupExtraInfo info;
+  share::ObBackupExtraInfo decoded;
+  char buf[OB_INNER_TABLE_DEFAULT_VALUE_LENTH] = "";
+  int64_t pos = 0;
+
+  ASSERT_EQ(OB_SUCCESS, info.sslog_gts_.convert_for_gts(1234567890));
+  info.read_scn_ = share::SCN::min_scn();
+
+  ret = info.encode_to_str(buf, sizeof(buf), pos);
+  ASSERT_EQ(OB_SUCCESS, ret);
+
+  ret = decoded.decode_from_str(buf);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ASSERT_EQ(info.sslog_gts_, decoded.sslog_gts_);
+  ASSERT_EQ(info.read_scn_, decoded.read_scn_);
+}
+
+TEST(ObBackupExtraInfo, encode_decode_max_uint64)
+{
+  int ret = OB_SUCCESS;
+  share::ObBackupExtraInfo info;
+  share::ObBackupExtraInfo decoded;
+  char buf[OB_INNER_TABLE_DEFAULT_VALUE_LENTH] = "";
+  int64_t pos = 0;
+
+  const uint64_t max_scn_ts = (1UL << 62) - 1;
+  ASSERT_EQ(OB_SUCCESS, info.sslog_gts_.convert_for_gts(max_scn_ts));
+  ASSERT_EQ(OB_SUCCESS, info.read_scn_.convert_for_gts(max_scn_ts));
+
+  ret = info.encode_to_str(buf, sizeof(buf), pos);
+  ASSERT_EQ(OB_SUCCESS, ret);
+
+  ret = decoded.decode_from_str(buf);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ASSERT_EQ(info.sslog_gts_, decoded.sslog_gts_);
+  ASSERT_EQ(info.read_scn_, decoded.read_scn_);
+}
+
+TEST(ObBackupExtraInfo, decode_empty_string)
+{
+  int ret = OB_SUCCESS;
+  share::ObBackupExtraInfo decoded;
+
+  ret = decoded.decode_from_str("");
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ASSERT_FALSE(decoded.sslog_gts_.is_valid());
+  ASSERT_FALSE(decoded.read_scn_.is_valid());
+}
+
+TEST(ObBackupExtraInfo, decode_null_ptr)
+{
+  int ret = OB_SUCCESS;
+  share::ObBackupExtraInfo decoded;
+
+  ret = decoded.decode_from_str(nullptr);
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ret);
+}
+
+TEST(ObBackupExtraInfo, decode_malformed)
+{
+  int ret = OB_SUCCESS;
+  share::ObBackupExtraInfo decoded;
+
+  ret = decoded.decode_from_str("sslog_gts:123");
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ret);
+
+  ret = decoded.decode_from_str("garbage_data");
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ret);
+
+  ret = decoded.decode_from_str("sslog_gts:123;read_scn:456");
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ret);
+}
+
+TEST(ObBackupExtraInfo, encode_buf_too_small)
+{
+  int ret = OB_SUCCESS;
+  share::ObBackupExtraInfo info;
+  char tiny_buf[10] = "";
+  int64_t pos = 0;
+
+  ASSERT_EQ(OB_SUCCESS, info.sslog_gts_.convert_for_gts(1234567890));
+  ASSERT_EQ(OB_SUCCESS, info.read_scn_.convert_for_gts(9876543210));
+
+  ret = info.encode_to_str(tiny_buf, sizeof(tiny_buf), pos);
+  ASSERT_NE(OB_SUCCESS, ret);
+}
+
+TEST(ObBackupExtraInfo, encode_null_buf)
+{
+  int ret = OB_SUCCESS;
+  share::ObBackupExtraInfo info;
+  int64_t pos = 0;
+
+  ASSERT_EQ(OB_SUCCESS, info.sslog_gts_.convert_for_gts(100));
+  ASSERT_EQ(OB_SUCCESS, info.read_scn_.convert_for_gts(200));
+
+  ret = info.encode_to_str(nullptr, 4096, pos);
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ret);
+}
+
+TEST(ObBackupExtraInfo, encode_decode_roundtrip_multiple)
+{
+  const uint64_t max_scn_ts = (1UL << 62) - 1;
+  const uint64_t test_values[][2] = {
+    {0, 0},
+    {1, 1},
+    {100, 200},
+    {1000000000ULL, 2000000000ULL},
+    {max_scn_ts, 0},
+    {0, max_scn_ts},
+  };
+
+  for (int i = 0; i < sizeof(test_values) / sizeof(test_values[0]); i++) {
+    share::ObBackupExtraInfo info;
+    share::ObBackupExtraInfo decoded;
+    char buf[OB_INNER_TABLE_DEFAULT_VALUE_LENTH] = "";
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, info.sslog_gts_.convert_for_gts(test_values[i][0]));
+    ASSERT_EQ(OB_SUCCESS, info.read_scn_.convert_for_gts(test_values[i][1]));
+    ASSERT_EQ(OB_SUCCESS, info.encode_to_str(buf, sizeof(buf), pos));
+    ASSERT_EQ(OB_SUCCESS, decoded.decode_from_str(buf));
+    ASSERT_EQ(info.sslog_gts_, decoded.sslog_gts_) << "roundtrip failed for gts at index " << i;
+    ASSERT_EQ(info.read_scn_, decoded.read_scn_) << "roundtrip failed for read_scn at index " << i;
+  }
+}
+
+TEST(ObBackupExtraInfo, has_value)
+{
+  share::ObBackupExtraInfo info;
+  ASSERT_FALSE(info.has_value());
+
+  ASSERT_EQ(OB_SUCCESS, info.sslog_gts_.convert_for_gts(100));
+  ASSERT_TRUE(info.has_value());
+
+  info.reset();
+  ASSERT_FALSE(info.has_value());
+
+  ASSERT_EQ(OB_SUCCESS, info.read_scn_.convert_for_gts(200));
+  ASSERT_TRUE(info.has_value());
+}
+
+TEST(ObBackupExtraInfo, assign)
+{
+  int ret = OB_SUCCESS;
+  share::ObBackupExtraInfo src;
+  share::ObBackupExtraInfo dst;
+
+  ASSERT_EQ(OB_SUCCESS, src.sslog_gts_.convert_for_gts(111));
+  ASSERT_EQ(OB_SUCCESS, src.read_scn_.convert_for_gts(222));
+
+  ret = dst.assign(src);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ASSERT_EQ(src.sslog_gts_, dst.sslog_gts_);
+  ASSERT_EQ(src.read_scn_, dst.read_scn_);
+}
 
 int main(int argc, char **argv)
 {

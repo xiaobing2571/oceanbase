@@ -176,11 +176,11 @@ int ObRow2ExprsProjector::project(const sql::ObExprPtrIArray &exprs,
       if (OB_UNLIKELY(item.obj_idx_ < 0
                       || (datum = &datums[item.obj_idx_])->is_nop())) {
         nop_pos[nop_cnt++] = item.expr_idx_;
-        item.eval_info_->evaluated_ = false;
+        item.eval_info_->set_evaluated(false);
       } else if (OB_UNLIKELY(datum->is_null())) {
         item.datum_->set_null();
-        item.eval_info_->evaluated_ = true;
-        item.eval_info_->projected_ = true;
+        item.eval_info_->set_evaluated(true);
+        item.eval_info_->set_projected(true);
       } else {
         if (OB_UNLIKELY(item.datum_->ptr_ != item.data_)) {
           item.datum_->ptr_ = item.data_;
@@ -189,8 +189,8 @@ int ObRow2ExprsProjector::project(const sql::ObExprPtrIArray &exprs,
           LOG_WARN("convert obj to datum failed", K(ret), K(i), K(item), KPC(datum));
         } else {
           // the other items may contain virtual columns, set evaluated flag.
-          item.eval_info_->evaluated_ = true;
-          item.eval_info_->projected_ = true;
+          item.eval_info_->set_evaluated(true);
+          item.eval_info_->set_projected(true);
         }
       }
     }
@@ -203,7 +203,7 @@ int ObRow2ExprsProjector::project(const sql::ObExprPtrIArray &exprs,
     for (int64_t i = other_idx_; OB_SUCC(ret) && i < outputs_.count(); i++) {
       const Item &item = outputs_.at(i);
       const blocksstable::ObStorageDatum *datum = NULL;
-      item.eval_info_->evaluated_ = true;
+      item.eval_info_->set_evaluated(true);
       if (OB_UNLIKELY(item.obj_idx_ < 0
                       || (datum = &datums[item.obj_idx_])->is_nop())) {
         nop_pos[nop_cnt++] = item.expr_idx_;
@@ -247,7 +247,8 @@ DEF_TO_STRING(ObDMLBaseParam)
        K_(direct_insert_task_id),
        K_(check_schema_version),
        K_(ddl_task_id),
-       KPC_(data_row_for_lob));
+       KPC_(data_row_for_lob),
+       K_(is_main_table_in_fts_ddl));
   J_OBJ_END();
   return pos;
 }
@@ -259,6 +260,21 @@ DEF_TO_STRING(ObRow2ExprsProjector::Item)
   J_KV(K(obj_idx_), K(expr_idx_), K(datum_), K(eval_info_), K(data_));
   J_OBJ_END();
   return pos;
+}
+
+int ScanResumePoint::init(bool *is_paused, int64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(is_paused)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null ptr");
+  } else {
+    is_paused_ = is_paused;
+    ATOMIC_STORE(is_paused_, false);
+    allocator_.set_tenant_id(tenant_id);
+    allocator_.set_label("ScanResumePoint");
+  }
+  return ret;
 }
 
 DEF_TO_STRING(ObTableScanParam)
@@ -299,9 +315,42 @@ DEF_TO_STRING(ObTableScanParam)
        K_(auto_split_filter_type),
        K_(is_tablet_spliting),
        K_(need_update_tablet_param),
-       KPC_(mds_collector));
+       KPC_(mds_collector),
+       K_(est_row_count_param),
+       K_(range_prefix_in_advance_scan));
   J_OBJ_END();
   return pos;
 }
+
+int ScanResumePoint::add_range(const ObITableReadInfo& read_info, const blocksstable::ObDatumRange& datum_range)
+{
+  INIT_SUCC(ret);
+  ObObjMeta* obj_metas;
+  ObDatumRange tmp_range;
+  ObNewRange new_range;
+  int rowkey_cnt = read_info.get_schema_rowkey_count();
+
+  if (OB_ISNULL(obj_metas = (ObObjMeta*)allocator_.alloc(rowkey_cnt * sizeof(ObObjMeta)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate memory for obj_metas", K(rowkey_cnt));
+  } else {
+    const common::ObIArray<ObColDesc>& col_desc = read_info.get_columns_desc();
+    for (int i = 0; i < rowkey_cnt; ++i) {
+      obj_metas[i] = col_desc.at(i).col_type_;
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(tmp_range.partial_copy(datum_range, allocator_))) {
+    LOG_WARN("failed to deep copy range");
+  } else if (OB_FAIL(tmp_range.to_new_range(new_range, obj_metas, allocator_))) {
+    LOG_WARN("Fail to convert datum range to new range");
+  } else if (OB_FAIL(ranges_.push_back(new_range))) {
+    LOG_WARN("failed to push back remain range");
+  }
+
+  return ret;
+}
+
 }
 }

@@ -103,6 +103,8 @@ int ObExprJsonExtract::eval_json_extract(const ObExpr &expr, ObEvalCtx &ctx, ObD
   ObIJsonBase *j_base = NULL;
   bool is_null_result = false;
   bool may_match_many = (expr.arg_cnt_ > 2);
+
+  ObItemType pick_type = static_cast<ObItemType>(expr.extra_);
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
   uint64_t tenant_id = ObMultiModeExprHelper::get_tenant_id(ctx.exec_ctx_.get_my_session());
   MultimodeAlloctor allocator(tmp_alloc_g.get_allocator(), expr.type_, tenant_id, ret);
@@ -157,9 +159,10 @@ int ObExprJsonExtract::eval_json_extract(const ObExpr &expr, ObEvalCtx &ctx, ObD
       } else {
         ObString path_text = path_data->get_string();
         ObJsonPath *j_path = NULL;
+        bool is_const = expr.args_[i]->is_const_expr();
         if (OB_FAIL(ObJsonExprHelper::get_json_or_str_data(expr.args_[i], ctx, allocator, path_text, is_null_result))) {
           LOG_WARN("fail to get real data.", K(ret), K(path_text));
-        } else if (OB_FAIL(ObJsonExprHelper::find_and_add_cache(path_cache, j_path, path_text, i, true))) {
+        } else if (OB_FAIL(ObJsonExprHelper::find_and_add_cache(allocator, path_cache, j_path, path_text, i, true, is_const))) {
           LOG_WARN("parse text to path failed", K(path_text), K(ret));
         } else if (OB_FAIL(j_base->seek(*j_path, j_path->path_node_cnt(), true, false, hit))) {
           LOG_WARN("json seek failed", K(path_text), K(ret));
@@ -188,13 +191,18 @@ int ObExprJsonExtract::eval_json_extract(const ObExpr &expr, ObEvalCtx &ctx, ObD
       if (hit_size == 1 && (may_match_many == false)) {
         jb_res = hits[0];
         ObString raw_str;
-        if (OB_FAIL(ret)) {
-          LOG_WARN("json extarct get results failed", K(ret));
+        ObJsonNodeType json_type = jb_res->json_type();
+        if (pick_type != T_NULL
+            && !ObJsonExprHelper::check_pick_type_match(json_type, pick_type)) {
+          res.set_null();
         } else if (OB_FAIL(jb_res->get_raw_binary(raw_str, &allocator))) {
           LOG_WARN("json extarct get result binary failed", K(ret));
         } else if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, res, raw_str))) {
           LOG_WARN("fail to pack json result", K(ret));
         }
+      } else if (pick_type != T_NULL) {
+        // do not support return array with pick type
+        res.set_null();
       } else {
         ObBinAggSerializer bin_agg(&allocator, AGG_JSON, static_cast<uint8_t>(ObJsonNodeType::J_ARRAY));
         ObJsonBin *j_node = NULL;
@@ -230,7 +238,7 @@ int ObExprJsonExtract::cg_expr(ObExprCGCtx &expr_cg_ctx, const ObRawExpr &raw_ex
                                ObExpr &rt_expr) const
 {
   UNUSED(expr_cg_ctx);
-  UNUSED(raw_expr);
+  rt_expr.extra_ = static_cast<uint64_t>(raw_expr.get_pick());
   if (rt_expr.datum_meta_.type_ == ObNullType) {
       rt_expr.eval_func_ = eval_json_extract_null;
   } else {

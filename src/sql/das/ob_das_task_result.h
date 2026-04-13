@@ -20,6 +20,7 @@
 #include "sql/engine/basic/ob_chunk_datum_store.h"
 #include "sql/engine/ob_tenant_sql_memory_manager.h"
 #include "sql/engine/ob_sql_mem_mgr_processor.h"
+#include "share/detect/ob_detectable_id.h"
 namespace oceanbase
 {
 namespace sql
@@ -87,8 +88,8 @@ public:
                K_(is_exiting),
                K_(io_read_bytes),
                K_(ssstore_read_bytes),
-               K_(ssstore_read_row_cnt),
-               K_(memstore_read_row_cnt),
+               K_(base_read_row_cnt),
+               K_(delta_read_row_cnt),
                K_(mem_profile_key),
                K_(interrupt_info));
 
@@ -119,12 +120,13 @@ public:
 
   int64_t io_read_bytes_;
   int64_t ssstore_read_bytes_;
-  int64_t ssstore_read_row_cnt_;
-  int64_t memstore_read_row_cnt_;
+  int64_t base_read_row_cnt_;
+  int64_t delta_read_row_cnt_;
   ObDASTCBMemProfileKey mem_profile_key_;
 
   // for detect & interrupt
   ObDASTCBInterruptInfo interrupt_info_;
+  ObDasExecuteRemoteInfo das_execute_remote_info_;
 private:
   common::ObSpinLock tcb_lock_; //用于控制资源资源释放的时序，保证并发访问的安全
 };
@@ -162,7 +164,8 @@ public:
       allocator_(tenant_id),
       profile_(ObSqlWorkAreaType::HASH_WORK_AREA),
       sql_mem_processor_(profile_),
-      mutex_(common::ObLatchIds::SQL_MEMORY_MGR_MUTEX_LOCK)
+      mutex_(common::ObLatchIds::SQL_MEMORY_MGR_MUTEX_LOCK),
+      total_alloc_size_(0)
   { }
   ~ObDASMemProfileInfo() {}
 
@@ -170,12 +173,17 @@ public:
   {
     lib::ObMutexGuard guard(mutex_);
     sql_mem_processor_.alloc(size);
+    total_alloc_size_ += size;
   }
 
   void free(int64_t size)
   {
     lib::ObMutexGuard guard(mutex_);
     sql_mem_processor_.free(size);
+    total_alloc_size_ -= size;
+    if (total_alloc_size_ < 0) {
+      SQL_DAS_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "total_alloc_size_ is less than 0", K(total_alloc_size_));
+    }
   }
 
   void dumped(int64_t size)
@@ -208,6 +216,7 @@ public:
   ObSqlWorkAreaProfile profile_;
   ObSqlMemMgrProcessor sql_mem_processor_;
   lib::ObMutex mutex_;
+  int64_t total_alloc_size_;
 };
 
 class ObDASTaskResultGC
@@ -318,8 +327,8 @@ public:
   int iterator_task_result(ObDASDataFetchRes &res,
                            int64_t &io_read_bytes,
                            int64_t &ssstore_read_bytes,
-                           int64_t &ssstore_read_row_cnt,
-                           int64_t &memstore_read_row_cnt);
+                           int64_t &base_read_row_cnt,
+                           int64_t &delta_read_row_cnt);
   int remove_expired_results();
 
 private:

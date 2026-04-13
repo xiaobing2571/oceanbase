@@ -22,6 +22,33 @@ namespace sql {
 
 class ObSqlMemMgrProcessor : public ObSqlMemoryCallback
 {
+public:
+  template <typename T>
+  struct DefaultPeriodicCheckOp
+  {
+    DefaultPeriodicCheckOp(T &store) : store_(store)
+    {}
+    bool operator()(int64_t cur_cnt) const
+    {
+      return store_.get_row_cnt_in_memory() > cur_cnt;
+    }
+
+  private:
+    T &store_;
+  };
+
+  struct DefaultMemExtendCheckOp
+  {
+    DefaultMemExtendCheckOp(ObSqlMemMgrProcessor &sql_mem_processor) : sql_mem_processor_(sql_mem_processor)
+    {}
+    bool operator()(int64_t max_memory_size) const
+    {
+      return sql_mem_processor_.get_data_size() > max_memory_size;
+    }
+  private:
+    ObSqlMemMgrProcessor &sql_mem_processor_;
+  };
+
 private:
   using PredFunc = std::function<bool(int64_t)>;
 public:
@@ -30,7 +57,8 @@ public:
     sql_mem_mgr_(nullptr), mem_callback_(nullptr), tenant_id_(OB_INVALID_ID),
     periodic_cnt_(1024), origin_max_mem_size_(0), default_available_mem_size_(0),
     is_auto_mgr_(false), dir_id_(0),
-    dummy_ptr_(nullptr), dummy_alloc_(nullptr)
+    dummy_ptr_(nullptr), dummy_alloc_(nullptr),
+    total_alloc_size_(0)
   {
     // trace memory dump
     op_monitor_info_->otherstat_6_id_ = ObSqlMonitorStatIds::MEMORY_DUMP;
@@ -41,7 +69,8 @@ public:
     sql_mem_mgr_(nullptr), mem_callback_(nullptr), tenant_id_(OB_INVALID_ID),
     periodic_cnt_(1024), origin_max_mem_size_(0), default_available_mem_size_(0),
     is_auto_mgr_(false), dir_id_(0),
-    dummy_ptr_(nullptr), dummy_alloc_(nullptr) {}
+    dummy_ptr_(nullptr), dummy_alloc_(nullptr),
+    total_alloc_size_(0) {}
   virtual ~ObSqlMemMgrProcessor() {}
 
   void set_sql_mem_mgr(ObTenantSqlMemoryManager *sql_mem_mgr)
@@ -72,11 +101,17 @@ public:
   void destroy()
   {
     if (0 < profile_.mem_used_ && OB_NOT_NULL(mem_callback_)) {
+      total_alloc_size_ -= profile_.mem_used_;
+      if (OB_UNLIKELY(total_alloc_size_ < 0)) {
+        SQL_ENG_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "total_alloc_size_ is less than 0",
+                        K(total_alloc_size_), "free_size", profile_.mem_used_);
+      }
       mem_callback_->free(profile_.mem_used_);
     }
     mem_callback_ = nullptr;
     sql_mem_mgr_ = nullptr;
     profile_.mem_used_ = 0;
+    total_alloc_size_ = 0;
   }
   void reset()
   {
@@ -93,7 +128,7 @@ public:
   int extend_max_memory_size(ObIAllocator *allocator, PredFunc dump_fun, bool &need_dump,
     int64_t mem_used, int64_t max_times = 1024);
 
-  int update_used_mem_size(int64_t used_size);
+  void update_used_mem_size(int64_t used_size);
 
   void set_periodic_cnt(int64_t cnt) { periodic_cnt_ = cnt; }
   int64_t get_periodic_cnt() const { return periodic_cnt_; }
@@ -141,6 +176,7 @@ public:
   {
     if (delta_size > 0 && delta_size >= UPDATED_DELTA_SIZE) {
       if (OB_NOT_NULL(mem_callback_)) {
+        total_alloc_size_ += delta_size;
         mem_callback_->alloc(delta_size);
       }
       profile_.mem_used_ += delta_size;
@@ -154,6 +190,11 @@ public:
       profile_.data_size_ += delta_size;
     } else if (delta_size < 0 && -delta_size >= UPDATED_DELTA_SIZE) {
       if (OB_NOT_NULL(mem_callback_)) {
+        total_alloc_size_ += delta_size;
+        if (OB_UNLIKELY(total_alloc_size_ < 0)) {
+          SQL_ENG_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "total_alloc_size_ is less than 0",
+                          K(total_alloc_size_), "free_size", delta_size);
+        }
         mem_callback_->free(-delta_size);
       }
       profile_.mem_used_ += delta_size;
@@ -168,7 +209,7 @@ public:
   ObSqlWorkAreaProfile &get_profile() const { return profile_; }
 
   int alloc_dir_id(int64_t &dir_id);
-  int64_t get_dir_id()
+  int64_t get_dir_id() const
   {
     if (dir_id_ < -1) {
       SQL_ENG_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "get unexpected dir id", K(dir_id_));
@@ -196,6 +237,7 @@ private:
   int64_t dir_id_;
   char *dummy_ptr_;
   ObIAllocator *dummy_alloc_;
+  int64_t total_alloc_size_;
 };
 
 class ObSqlWorkareaUtil

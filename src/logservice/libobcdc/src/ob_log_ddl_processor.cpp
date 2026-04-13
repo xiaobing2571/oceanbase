@@ -617,6 +617,10 @@ int ObLogDDLProcessor::handle_ddl_stmt_update_tic_(
           need_update_tic, stop_flag);
       break;
     }
+    case OB_DDL_RECOVER_TABLE_END : {
+      ret = handle_ddl_stmt_recover_table_end_(tenant, ddl_stmt, new_schema_version, need_update_tic, stop_flag);
+      break;
+    }
     case OB_DDL_DEL_DATABASE : {
       ret = handle_ddl_stmt_drop_database_(tenant, ddl_stmt, old_schema_version, new_schema_version,
           need_update_tic, stop_flag);
@@ -1227,6 +1231,26 @@ int ObLogDDLProcessor::handle_ddl_stmt_rename_table_(
   return ret;
 }
 
+int ObLogDDLProcessor::handle_ddl_stmt_recover_table_end_(
+    ObLogTenant &tenant,
+    DdlStmtTask &ddl_stmt,
+    const int64_t new_schema_version,
+    const bool need_update_tic,
+    volatile bool &stop_flag)
+{
+  int ret = OB_SUCCESS;
+
+  if (need_update_tic) {
+    RETRY_FUNC(stop_flag, tenant.get_part_mgr(), recover_table_end,
+        ddl_stmt.get_op_table_id(),
+        ddl_stmt,
+        new_schema_version,
+        DATA_OP_TIMEOUT);
+  }
+
+  return ret;
+}
+
 int ObLogDDLProcessor::handle_ddl_stmt_create_index_(
     ObLogTenant &tenant,
     DdlStmtTask &ddl_stmt,
@@ -1496,7 +1520,7 @@ int ObLogDDLProcessor::handle_ddl_stmt_add_tenant_(
       trans_commit_version);
   IObLogTenantMgr *tenant_mgr = TCTX.tenant_mgr_;
   ObLogSchemaGuard schema_guard;
-  const char *tenant_name = NULL;
+  ObFixedLengthString<OB_MAX_TENANT_NAME_LENGTH + 1> tenant_name;
   int64_t valid_schema_version = new_schema_version;
 
   if (OB_ISNULL(tenant_mgr)) {
@@ -1521,6 +1545,11 @@ int ObLogDDLProcessor::handle_ddl_stmt_add_tenant_(
     IGNORE_SCHEMA_ERROR(ret, K(valid_schema_version), K(start_serve_tstamp),
         K(target_tenant_id), K(ddl_stmt));
 
+    if (OB_TENANT_HAS_BEEN_DROPPED) {
+      ret = OB_SUCCESS;
+      // expect tenant_is_chosen = false cause tenant already dropped
+    }
+
     if (OB_SUCC(ret)) {
       bool filter_ddl_stmt = false;
       // Filter tenants that are not on the whitelist
@@ -1529,7 +1558,7 @@ int ObLogDDLProcessor::handle_ddl_stmt_add_tenant_(
       }
 
       // DB name is empty
-      if (OB_FAIL(commit_ddl_stmt_(tenant, ddl_stmt, new_schema_version, stop_flag, tenant_name, NULL, true, filter_ddl_stmt))) {
+      if (OB_FAIL(commit_ddl_stmt_(tenant, ddl_stmt, new_schema_version, stop_flag, tenant_name.ptr(), NULL, true, filter_ddl_stmt))) {
         if (OB_IN_STOP_STATE != ret) {
           LOG_ERROR("commit_ddl_stmt_ fail", KR(ret), K(tenant), K(ddl_stmt), K(filter_ddl_stmt),
               K(tenant_name));

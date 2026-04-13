@@ -32,13 +32,15 @@ public:
     : allocator_("VecIdxInfo"),
       complete_tablet_ids_(),
       partial_tablet_ids_(),
-      cur_idx_(0),
+      index_idx_(0),
+      cache_idx_(0),
       is_opened_(false)
   {
   }
   virtual ~ObVectorIndexInfoIterator() { reset(); }
   int open();
   int get_next_info(ObVectorIndexInfo &info);
+  int get_next_index_all_segments(ObLSID &ls_id, ObTabletID &tablet_id, common::ObIArray<ObVectorSegmentInfo> &segment_infos);
   void reset();
   bool is_opened() const { return is_opened_; }
 
@@ -47,8 +49,10 @@ private:
   common::ObArenaAllocator allocator_;
   common::ObSEArray<ObLSTabletPair, ObTabletCommon::DEFAULT_ITERATOR_TABLET_ID_CNT> complete_tablet_ids_;
   common::ObSEArray<ObLSTabletPair, ObTabletCommon::DEFAULT_ITERATOR_TABLET_ID_CNT> partial_tablet_ids_;
+  common::ObSEArray<ObLSTabletPair, ObTabletCommon::DEFAULT_ITERATOR_TABLET_ID_CNT> cache_tablet_ids_;
   common::hash::ObHashSet<int64_t> ptr_set_; // only for check // can't use elements
-  int64_t cur_idx_;
+  int64_t index_idx_;
+  int64_t cache_idx_;
   bool is_opened_;
 };
 
@@ -76,6 +80,7 @@ public:
     DATA_TABLET_ID,
     STATISTICS, // memory usage, status..., logic_version
     SYNC_INFO, // sync snapshot...
+    INDEX_TYPE
   };
   ObAllVirtualVectorIndexInfo();
   virtual ~ObAllVirtualVectorIndexInfo();

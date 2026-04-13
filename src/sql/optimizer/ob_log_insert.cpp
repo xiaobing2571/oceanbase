@@ -109,7 +109,19 @@ int ObLogInsert::get_plan_item_info(PlanText &plan_text,
         EXPLAIN_PRINT_EXPRS(column_values, type);
       }
     }
-
+    // print view check exprs
+    if (OB_SUCC(ret) && !get_index_dml_infos().empty() && NULL != get_index_dml_infos().at(0)) {
+      const ObIArray<ObRawExpr *> &view_check_exprs = get_index_dml_infos().at(0)->view_ck_exprs_;
+      if (!view_check_exprs.empty()) {
+        if(OB_FAIL(BUF_PRINTF(", "))) {
+          LOG_WARN("BUG_PRINTF fails", K(ret));
+        } else if (OB_FAIL(BUF_PRINTF("\n      "))) {
+          LOG_WARN("BUG_PRINTF fails", K(ret));
+        } else {
+          EXPLAIN_PRINT_EXPRS(view_check_exprs, type);
+        }
+      }
+    }
     if (OB_SUCC(ret) && insert_up_ ) {
       const IndexDMLInfo *table_insert_info = get_insert_up_index_dml_infos().at(0);
       if (OB_ISNULL(table_insert_info)) {
@@ -150,10 +162,19 @@ uint64_t ObLogInsert::hash(uint64_t seed) const
 int ObLogInsert::get_op_exprs(ObIArray<ObRawExpr*> &all_exprs)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(get_stmt())) {
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+  bool enable_insertup_column_store_opt = tenant_config.is_valid() ?
+                                          tenant_config->_enable_insertup_column_store_opt :
+                                          false;
+  uint64_t data_version = 0;
+
+  if (OB_ISNULL(get_stmt()) ||
+      OB_ISNULL(get_plan())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get unexpected null", K(ret));
+    LOG_WARN("get unexpected null", K(get_stmt()), K(get_plan()), K(ret));
   // TODO @yibo split log insert and log insert all
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
+    LOG_WARN("fail to get min data version", K(ret));
   } else if (get_stmt()->is_insert_stmt() && OB_FAIL(get_constraint_info_exprs(all_exprs))) {
     LOG_WARN("failed to add duplicate key checker exprs to ctx", K(ret));
   } else if (OB_FAIL(ObLogDelUpd::inner_get_op_exprs(all_exprs, false))) {
@@ -166,7 +187,13 @@ int ObLogInsert::get_op_exprs(ObIArray<ObRawExpr*> &all_exprs)
                                                                 all_exprs,
                                                                 true))) {
     LOG_WARN("failed to add table columns to ctx", K(ret));
-  } else { /*do nothing*/ }
+  } else if (get_insert_up() && enable_insertup_column_store_opt && data_version >= DATA_VERSION_4_5_0_0) {
+    if (OB_FAIL(generate_in_filter_for_insertup_opt())) {
+      LOG_WARN("failed to generate in filter expr for insertup opt", K(ret));;
+    } else if (OB_NOT_NULL(in_filter_expr_) && OB_FAIL(all_exprs.push_back(in_filter_expr_))) {
+      LOG_WARN("failed to push back in filter expr", K(ret));
+    }
+  }
   return ret;
 }
 
@@ -338,10 +365,11 @@ int ObLogInsert::get_constraint_info_exprs(ObIArray<ObRawExpr*> &all_exprs)
     LOG_WARN("get unexpected null", K(ret));
   } else if (NULL != constraint_infos_) {
     for (int64_t i = 0; OB_SUCC(ret) && i < constraint_infos_->count(); ++i) {
-      const ObIArray<ObColumnRefRawExpr*> &constraint_columns =
-          constraint_infos_->at(i).constraint_columns_;
       temp_exprs.reuse();
-      if (OB_FAIL(append(temp_exprs, constraint_columns))) {
+      if (OB_ISNULL(constraint_infos_->at(i))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("constraint info is null", K(ret));
+      } else if (OB_FAIL(append(temp_exprs, constraint_infos_->at(i)->constraint_columns_))) {
         LOG_WARN("failed to append exprs", K(ret));
       } else if (OB_FAIL(append_array_no_dup(all_exprs, temp_exprs))) {
         LOG_WARN("failed to append exprs", K(ret));
@@ -451,7 +479,7 @@ int ObLogInsert::generate_multi_part_partition_id_expr()
       IndexDMLInfo *index_info = get_replace_index_dml_infos().at(i);
       ObSqlSchemaGuard *schema_guard = NULL;
       const ObTableSchema *table_schema = NULL;
-      bool is_heap_table = false;
+      bool is_heap_or_cluster_by_table = false;
       ObArray<ObRawExpr *> column_exprs;
       if (OB_ISNULL(get_plan()) ||
           OB_ISNULL(schema_guard = get_plan()->get_optimizer_context().get_sql_schema_guard())) {
@@ -459,7 +487,8 @@ int ObLogInsert::generate_multi_part_partition_id_expr()
         LOG_WARN("get unexpected null", K(ret));
       } else if (OB_FAIL(schema_guard->get_table_schema(index_info->ref_table_id_, table_schema))) {
         LOG_WARN("failed to get table schema", K(ret));
-      } else if (table_schema != NULL && FALSE_IT(is_heap_table = table_schema->is_table_without_pk())) {
+      } else if (table_schema != NULL && FALSE_IT(is_heap_or_cluster_by_table =
+                (table_schema->is_table_without_pk() || table_schema->is_table_with_clustering_key()))) {
         // do nothing.
       } else {
         // When lookup_part_id_expr is a virtual generated column,
@@ -471,11 +500,11 @@ int ObLogInsert::generate_multi_part_partition_id_expr()
           LOG_WARN("replace dml info is null", K(ret));
         } else if (OB_FAIL(generate_old_calc_partid_expr(*index_info))) {
           LOG_WARN("failed to generate calc partid expr", K(ret));
-        } else if (!is_heap_table && OB_FAIL(ObLogTableScan::replace_gen_column(get_plan(),
+        } else if (!is_heap_or_cluster_by_table && OB_FAIL(ObLogTableScan::replace_gen_column(get_plan(),
                                             index_info->old_part_id_expr_,
                                             index_info->lookup_part_id_expr_))){
           LOG_WARN("failed to replace expr", K(ret));
-        } else if (is_heap_table) {
+        } else if (is_heap_or_cluster_by_table) {
           if (OB_FAIL(generate_lookup_part_id_expr(*index_info))) {
             LOG_WARN("failed to generate lookup part id expr", K(ret));
           } else if (OB_FAIL(ObRawExprUtils::extract_column_exprs(
@@ -496,7 +525,7 @@ int ObLogInsert::generate_multi_part_partition_id_expr()
       IndexDMLInfo *dml_info = get_insert_up_index_dml_infos().at(i);
       ObSqlSchemaGuard *schema_guard = NULL;
       const ObTableSchema *table_schema = NULL;
-      bool is_heap_table = false;
+      bool is_heap_or_cluster_by_table = false;
       ObArray<ObRawExpr *> column_exprs;
       if (OB_ISNULL(get_plan()) ||
           OB_ISNULL(schema_guard = get_plan()->get_optimizer_context().get_sql_schema_guard())) {
@@ -504,7 +533,8 @@ int ObLogInsert::generate_multi_part_partition_id_expr()
         LOG_WARN("get unexpected null", K(ret));
       } else if (OB_FAIL(schema_guard->get_table_schema(dml_info->ref_table_id_, table_schema))) {
         LOG_WARN("failed to get table schema", K(ret));
-      } else if (table_schema != NULL && FALSE_IT(is_heap_table = table_schema->is_table_without_pk())) {
+      } else if (table_schema != NULL && FALSE_IT(is_heap_or_cluster_by_table =
+                (table_schema->is_table_without_pk() || table_schema->is_table_with_clustering_key()))) {
         // do nothing.
       } else {
         // When lookup_part_id_expr is a virtual generated column,
@@ -519,11 +549,11 @@ int ObLogInsert::generate_multi_part_partition_id_expr()
           LOG_WARN("fail to generate calc partid expr", K(ret));
         } else if (OB_FAIL(generate_update_new_calc_partid_expr(*dml_info))) {
           LOG_WARN("failed to generate update new part id expr", K(ret));
-        } else if (!is_heap_table && OB_FAIL(ObLogTableScan::replace_gen_column(get_plan(),
+        } else if (!is_heap_or_cluster_by_table && OB_FAIL(ObLogTableScan::replace_gen_column(get_plan(),
                                             dml_info->old_part_id_expr_,
                                             dml_info->lookup_part_id_expr_))){
           LOG_WARN("failed to replace expr", K(ret));
-        } else if (is_heap_table) {
+        } else if (is_heap_or_cluster_by_table) {
           if (OB_FAIL(generate_lookup_part_id_expr(*dml_info))) {
             LOG_WARN("failed to generate lookup part id expr", K(ret));
           } else if (OB_FAIL(ObRawExprUtils::extract_column_exprs(
@@ -555,10 +585,13 @@ int ObLogInsert::inner_replace_op_exprs(ObRawExprReplacer &replacer)
     LOG_WARN("failed to replace dml info exprs", K(ret));
   } else if (NULL != constraint_infos_) {
     for (int64_t i = 0; OB_SUCC(ret) && i < constraint_infos_->count(); ++i) {
-      const ObIArray<ObColumnRefRawExpr*> &constraint_columns =
-          constraint_infos_->at(i).constraint_columns_;
-      for (int64_t i = 0; OB_SUCC(ret) && i < constraint_columns.count(); ++i) {
-        ObColumnRefRawExpr *expr = constraint_columns.at(i);
+      ObUniqueConstraintInfo *info = constraint_infos_->at(i);
+      if (OB_ISNULL(info)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("constraint info is null", K(ret));
+      }
+      for (int64_t j = 0; OB_SUCC(ret) && j < info->constraint_columns_.count(); ++j) {
+        ObColumnRefRawExpr *expr = info->constraint_columns_.at(j);
         if (OB_ISNULL(expr)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("get unexpected null", K(ret));
@@ -625,6 +658,69 @@ int ObLogInsert::op_is_update_pk_with_dop(bool &is_update)
       // is_update = false;
     } else if (index_dml_info->is_update_primary_key_ && (is_pdml() || get_das_dop() > 1)) {
       is_update = true;
+    }
+  }
+  return ret;
+}
+
+int ObLogInsert::generate_in_filter_for_insertup_opt()
+{
+  int ret = OB_SUCCESS;
+  if (nullptr != in_filter_expr_) {
+    // in filter expr is already generated, do nothing.
+  } else if (OB_UNLIKELY(!insert_up_ || index_dml_infos_.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument to generate in filter for insertup opt", K(ret));
+  } else {
+    const IndexDMLInfo *primary_dml_info = index_dml_infos_.at(0);
+    ObSqlSchemaGuard *schema_guard = nullptr;
+    const ObTableSchema *table_schema = nullptr;
+    ObSQLSessionInfo *session_info = nullptr;
+    bool is_column_store = false;
+    if (OB_ISNULL(primary_dml_info) ||
+        OB_ISNULL(get_plan()) ||
+        OB_ISNULL(schema_guard = get_plan()->get_optimizer_context().get_sql_schema_guard()) ||
+        OB_ISNULL(session_info = get_plan()->get_optimizer_context().get_session_info())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null", K(ret), K(primary_dml_info), K(get_plan()), K(schema_guard));
+    } else if (OB_FAIL(schema_guard->get_table_schema(primary_dml_info->ref_table_id_, table_schema))) {
+      LOG_WARN("failed to get table schema", K(ret));
+    } else if (OB_ISNULL(table_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null", K(ret), K(table_schema));
+    } else if (OB_FAIL(table_schema->get_is_column_store(is_column_store))) {
+      LOG_WARN("failed to get is column store", K(ret));
+    } else if (is_column_store && table_schema->is_heap_organized_table() && table_schema->is_table_without_pk()) {
+      // only generate in filter for heap column table
+      ObOpRawExpr *in_filter_expr = nullptr;
+      ObRawExpr *pk_increment = nullptr;
+      ObRawExprFactory &expr_factory = get_plan()->get_optimizer_context().get_expr_factory();
+      ObSEArray<ObRawExpr*, 1> rowkey_exprs;
+      if (OB_FAIL(get_plan()->get_rowkey_exprs(primary_dml_info->table_id_,
+                                               primary_dml_info->ref_table_id_,
+                                               rowkey_exprs))) {
+        LOG_WARN("get rowkey exprs failed", K(ret), KPC(primary_dml_info));
+      } else if (OB_UNLIKELY(rowkey_exprs.count() != 1) ||
+                 OB_ISNULL(rowkey_exprs.at(0)) ||
+                 OB_UNLIKELY(!rowkey_exprs.at(0)->get_result_type().is_uint64())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected rowkey expr type", K(ret), K(rowkey_exprs));
+      } else {
+        pk_increment = rowkey_exprs.at(0);
+        if (OB_FAIL(expr_factory.create_raw_expr(T_OP_LOCAL_DYNAMIC_FILTER, in_filter_expr))) {
+          LOG_WARN("failed to create raw expr", K(ret));
+        } else if (OB_ISNULL(in_filter_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected null", K(ret), K(in_filter_expr));
+        } else if (OB_FAIL(in_filter_expr->set_param_expr(pk_increment))) {
+          LOG_WARN("failed to set param expr", K(ret));
+        } else if (OB_FAIL(in_filter_expr->formalize(session_info))) {
+          LOG_WARN("fail to formalize expr", K(ret));
+        } else {
+          in_filter_expr->set_runtime_filter_type(RuntimeFilterType::IN);
+          in_filter_expr_ = in_filter_expr;
+        }
+      }
     }
   }
   return ret;

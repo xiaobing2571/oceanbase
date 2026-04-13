@@ -40,7 +40,7 @@ TEST_F(TestIntDictPdFilter, test_int_dict_decoder)
     const int64_t null_cnt = has_null ? 20 : 0;
     const int64_t row_cnt = 100 + null_cnt;
 
-    ObMicroBlockCSEncoder encoder;
+    ObMicroBlockCSEncoder<> encoder;
     ASSERT_EQ(OB_SUCCESS, encoder.init(ctx_));
     ObDatumRow row_arr[row_cnt];
     for (int64_t i = 0; i < row_cnt; ++i) {
@@ -139,7 +139,7 @@ TEST_F(TestIntDictPdFilter, test_positive_int_dict_decoder)
     bool has_null = flag;
     const int64_t null_cnt = has_null ? 20 : 0;
     const int64_t row_cnt = 100 + null_cnt;
-    ObMicroBlockCSEncoder encoder;
+    ObMicroBlockCSEncoder<> encoder;
     ASSERT_EQ(OB_SUCCESS, encoder.init(ctx_));
     encoder.is_all_column_force_raw_ = is_force_raw;
     ObDatumRow row_arr[row_cnt];
@@ -194,7 +194,7 @@ TEST_F(TestIntDictPdFilter, test_int_dict_const_decoder)
   ctx_.column_encodings_[1] = ObCSColumnHeader::Type::INT_DICT; // integer dict
 
   const int64_t row_cnt = 120;
-  ObMicroBlockCSEncoder encoder;
+  ObMicroBlockCSEncoder<> encoder;
   ASSERT_EQ(OB_SUCCESS, encoder.init(ctx_));
   ObDatumRow row_arr[row_cnt];
   for (int64_t i = 0; i < row_cnt; ++i) {
@@ -280,7 +280,7 @@ TEST_F(TestIntDictPdFilter, test_int_dict_null_const_decoder)
   ctx_.column_encodings_[1] = ObCSColumnHeader::Type::INT_DICT; // integer dict
 
   const int64_t row_cnt = 120;
-  ObMicroBlockCSEncoder encoder;
+  ObMicroBlockCSEncoder<> encoder;
   ASSERT_EQ(OB_SUCCESS, encoder.init(ctx_));
   ObDatumRow row_arr[row_cnt];
   for (int64_t i = 0; i < row_cnt; ++i) {
@@ -345,7 +345,7 @@ TEST_F(TestIntDictPdFilter, test_int_dict_const_without_null_decoder)
   ctx_.column_encodings_[1] = ObCSColumnHeader::Type::INT_DICT; // integer dict
 
   const int64_t row_cnt = 1200;
-  ObMicroBlockCSEncoder encoder;
+  ObMicroBlockCSEncoder<> encoder;
   ASSERT_EQ(OB_SUCCESS, encoder.init(ctx_));
   encoder.is_all_column_force_raw_ = is_force_raw;
   ObDatumRow row_arr[row_cnt];
@@ -438,7 +438,7 @@ TEST_F(TestIntDictPdFilter, test_all_null_int_dict_const_decoder)
   ctx_.column_encodings_[1] = ObCSColumnHeader::Type::INT_DICT; // integer dict
 
   const int64_t row_cnt = 120;
-  ObMicroBlockCSEncoder encoder;
+  ObMicroBlockCSEncoder<> encoder;
   ASSERT_EQ(OB_SUCCESS, encoder.init(ctx_));
   encoder.is_all_column_force_raw_ = is_force_raw;
   ObDatumRow row_arr[row_cnt];
@@ -492,9 +492,8 @@ TEST_F(TestIntDictPdFilter, test_exceed_range_compare_filter)
   ctx_.column_encodings_[1] = ObCSColumnHeader::Type::INT_DICT;
 
   const int64_t row_cnt = 2;
-  ObMicroBlockCSEncoder encoder;
+  ObMicroBlockCSEncoder<> encoder;
   ASSERT_EQ(OB_SUCCESS, encoder.init(ctx_));
-  encoder.has_lob_out_row_ = true;
   ObDatumRow row_arr[row_cnt];
   for (int64_t i = 0; i < row_cnt; ++i) {
     ASSERT_EQ(OB_SUCCESS, row_arr[i].init(allocator_, col_cnt));
@@ -554,7 +553,7 @@ TEST_F(TestIntDictPdFilter, test_singed_and_unsigned_compare_filter)
   ctx_.column_encodings_[2] = ObCSColumnHeader::Type::INT_DICT;
 
   const int64_t row_cnt = 2;
-  ObMicroBlockCSEncoder encoder;
+  ObMicroBlockCSEncoder<> encoder;
   ASSERT_EQ(OB_SUCCESS, encoder.init(ctx_));
   ObDatumRow row_arr[row_cnt];
   for (int64_t i = 0; i < row_cnt; ++i) {
@@ -616,6 +615,58 @@ TEST_F(TestIntDictPdFilter, test_singed_and_unsigned_compare_filter)
     integer_type_filter_normal_check(true, ObWhiteFilterOperatorType::WHITE_OP_GE, 4, 1, res_arr_ge);
   }
 
+  LOG_INFO(">>>>>>>>>>FINISH PD FILTER<<<<<<<<<<<");
+}
+
+TEST_F(TestIntDictPdFilter, test_bound_ref_exceed_range_compare_filter)
+{
+  const int64_t rowkey_cnt = 1;
+  const int64_t col_cnt = 2;
+  const bool enable_check = ENABLE_CASE_CHECK;
+  ObObjType col_types[col_cnt] = {ObInt32Type, ObIntType};
+  ASSERT_EQ(OB_SUCCESS, prepare(col_types, rowkey_cnt, col_cnt));
+  ctx_.column_encodings_[0] = ObCSColumnHeader::Type::INT_DICT;
+  ctx_.column_encodings_[1] = ObCSColumnHeader::Type::INT_DICT;
+
+  const int64_t row_cnt = 256;
+  ObMicroBlockCSEncoder encoder;
+  ASSERT_EQ(OB_SUCCESS, encoder.init(ctx_));
+  ObDatumRow row_arr[row_cnt];
+  for (int64_t i = 0; i < row_cnt; ++i) {
+    ASSERT_EQ(OB_SUCCESS, row_arr[i].init(allocator_, col_cnt));
+    row_arr[i].storage_datums_[0].set_int32(i);
+    row_arr[i].storage_datums_[1].set_int(i);
+    ASSERT_EQ(OB_SUCCESS, encoder.append_row(row_arr[i]));
+  }
+  HANDLE_TRANSFORM();
+
+  const int64_t col_offset = 1;
+  bool need_check = true;
+
+  // check EQ NE
+  {
+    int64_t ref_arr[4] = {-1, 0, 255, 256};
+    int64_t res_arr_eq[4] = {0, 1, 1, 0};
+    integer_type_filter_normal_check(true, ObWhiteFilterOperatorType::WHITE_OP_EQ, 4, 1, res_arr_eq);
+    int64_t res_arr_ne[4] = {256, 255, 255, 256};
+    integer_type_filter_normal_check(true, ObWhiteFilterOperatorType::WHITE_OP_NE, 4, 1, res_arr_ne);
+  }
+
+  // check LT/LE/GT/GE
+  {
+    int64_t ref_arr[4] = {-1, 0, 255, 256};
+    int64_t res_arr_lt[4] = {0, 0, 255, 256};
+    integer_type_filter_normal_check(true, ObWhiteFilterOperatorType::WHITE_OP_LT, 4, 1, res_arr_lt);
+    int64_t res_arr_le[4] = {0, 1, 256, 256};
+    integer_type_filter_normal_check(true, ObWhiteFilterOperatorType::WHITE_OP_LE, 4, 1, res_arr_le);
+  }
+  {
+    int64_t ref_arr[4] = {-1, 0, 255, 256};
+    int64_t res_arr_gt[4] = {256, 255, 0, 0};
+    integer_type_filter_normal_check(true, ObWhiteFilterOperatorType::WHITE_OP_GT, 4, 1, res_arr_gt);
+    int64_t res_arr_ge[4] = {256, 256, 1, 0};
+    integer_type_filter_normal_check(true, ObWhiteFilterOperatorType::WHITE_OP_GE, 4, 1, res_arr_ge);
+  }
   LOG_INFO(">>>>>>>>>>FINISH PD FILTER<<<<<<<<<<<");
 }
 

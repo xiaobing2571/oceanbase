@@ -130,6 +130,9 @@ int ObBackupWrapperIODevice::open(
 {
   int ret = OB_SUCCESS;
   ObMutexGuard guard(mutex_);
+  const uint64_t io_tenant_id = MTL_ID();
+  ObObjectStorageTenantGuard object_storage_tenant_guard(
+    io_tenant_id, OB_IO_MANAGER.get_object_storage_io_timeout_ms(io_tenant_id) * 1000LL);
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
     LOG_WARN("backup wrapper io device", K(ret));
@@ -289,10 +292,10 @@ int ObBackupWrapperIODevice::parse_storage_device_type_(
     device_type = OB_STORAGE_FILE;
   } else if (storage_type_prefix.prefix_match(OB_OSS_PREFIX)) {
     device_type = OB_STORAGE_OSS;
-  } else if (storage_type_prefix.prefix_match(OB_COS_PREFIX)) {
-    device_type = OB_STORAGE_COS;
   } else if (storage_type_prefix.prefix_match(OB_S3_PREFIX)) {
     device_type = OB_STORAGE_S3;
+  } else if (storage_type_prefix.prefix_match(OB_AZBLOB_PREFIX)) {
+    device_type = OB_STORAGE_AZBLOB;
   } else {
     ret = OB_INVALID_BACKUP_DEST;
     LOG_WARN("invaild device name info!", K(storage_type_prefix));
@@ -625,7 +628,7 @@ int ObBackupDeviceHelper::get_backup_dest_(const uint64_t tenant_id, const int64
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(tenant_id) {
-    ObTenantRestoreInfoMgr *mgr = MTL(ObTenantRestoreInfoMgr *);
+    ObTenantBackupDestInfoMgr *mgr = MTL(ObTenantBackupDestInfoMgr *);
     if (OB_ISNULL(mgr)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("mgr should not be null", K(ret));
@@ -642,7 +645,7 @@ int ObBackupDeviceHelper::get_backup_type_(const uint64_t tenant_id, const int64
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(tenant_id) {
-    ObTenantRestoreInfoMgr *mgr = MTL(ObTenantRestoreInfoMgr *);
+    ObTenantBackupDestInfoMgr *mgr = MTL(ObTenantBackupDestInfoMgr *);
     if (OB_ISNULL(mgr)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("mgr should not be null", K(ret));
@@ -663,11 +666,11 @@ int ObBackupDeviceHelper::get_restore_dest_id_(const uint64_t tenant_id, ObStora
   } else {
     MTL_SWITCH(tenant_id) {
       int64_t dest_id = 0;
-      ObTenantRestoreInfoMgr *mgr = MTL(ObTenantRestoreInfoMgr *);
+      ObTenantBackupDestInfoMgr *mgr = MTL(ObTenantBackupDestInfoMgr *);
       if (OB_ISNULL(mgr)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("mgr should not be null", K(ret));
-      } else if (OB_FAIL(mgr->get_restore_dest_id(dest_id))) {
+      } else if (OB_FAIL(mgr->get_dest_id(dest_id))) {
         LOG_WARN("failed to get backup type", K(ret), K(tenant_id));
       } else {
         mod.storage_id_ = dest_id;

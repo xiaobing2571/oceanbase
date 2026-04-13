@@ -217,7 +217,6 @@ int ObExprJsonValue::eval_json_value(const ObExpr &expr, ObEvalCtx &ctx, ObDatum
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
   uint64_t tenant_id = ObMultiModeExprHelper::get_tenant_id(ctx.exec_ctx_.get_my_session());
   MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator(), expr.type_, tenant_id, ret);
-  lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id, "JSONModule"));
   ObJsonBin st_json(&temp_allocator);
   ObIJsonBase *j_base = &st_json;
   ObJsonSeekResult hits;
@@ -288,6 +287,7 @@ int ObExprJsonValue::extract_plan_cache_param(const ObExprJsonQueryParamInfo *in
   json_param.empty_type_ = info->empty_type_;
   json_param.error_type_ = info->error_type_;
   json_param.ascii_type_ = info->ascii_type_;
+  json_param.pick_ = info->pick_;
   json_param.json_path_ = info->j_path_;
   json_param.is_init_from_cache_ = true;
   for (int i = 0; OB_SUCC(ret) && i < info->on_mismatch_.count(); i++) {
@@ -310,7 +310,6 @@ int ObExprJsonValue::eval_ora_json_value(const ObExpr &expr, ObEvalCtx &ctx, ObD
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
   uint64_t tenant_id = ObMultiModeExprHelper::get_tenant_id(ctx.exec_ctx_.get_my_session());
   MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator(), expr.type_, tenant_id, ret);
-  lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id, "JSONModule"));
   ObJsonBin st_json(&temp_allocator);
   ObIJsonBase *j_base = &st_json;
   ObJsonSeekResult hits;
@@ -479,6 +478,8 @@ int ObExprJsonQueryParamInfo::init_jsn_val_expr_param(ObIAllocator &alloc, ObExp
     LOG_WARN("fail to eval mismatch array", K(ret));
   } else if (OB_FAIL(ObJsonUtil::init_json_path(alloc, op_cg_ctx, path, *this))) { // parse json path
     LOG_WARN("fail to init path from str", K(ret));
+  } else {
+    pick_ = raw_expr->get_pick();
   }
   return ret;
 }
@@ -761,6 +762,10 @@ int ObExprJsonValue::doc_do_seek(ObJsonSeekResult &hits, bool &is_null_result, O
       LOG_WARN("json value seek result more than one.", K(hits.size()));
     } else if (hits[0]->json_type() == ObJsonNodeType::J_NULL) {
       is_null_result = true;
+    } else if (json_param->pick_ != T_NULL) {
+      if (!ObJsonExprHelper::check_pick_type_match(hits[0]->json_type(), json_param->pick_)) {
+        is_null_result = true;
+      }
     }
   }
   return ret;

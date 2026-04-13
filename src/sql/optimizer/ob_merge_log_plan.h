@@ -25,7 +25,12 @@ class ObMergeLogPlan : public ObDelUpdLogPlan
 {
 public:
   ObMergeLogPlan(ObOptimizerContext &ctx, const ObMergeStmt *merge_stmt)
-      : ObDelUpdLogPlan(ctx, merge_stmt)
+      : ObDelUpdLogPlan(ctx, merge_stmt),
+        index_update_infos_(allocator_),
+        index_delete_infos_(allocator_),
+        insert_condition_exprs_(allocator_),
+        update_condition_exprs_(allocator_),
+        delete_condition_exprs_(allocator_)
       {
       }
   virtual ~ObMergeLogPlan() {}
@@ -59,18 +64,12 @@ private:
   int create_pdml_merge_plan(ObLogicalOperator *&top,
                              ObTablePartitionInfo *insert_table_part,
                              ObExchangeInfo &exch_info);
-
-  int check_merge_need_multi_partition_dml(ObLogicalOperator &top,
-                                           ObTablePartitionInfo *insert_table_partition,
-                                           ObShardingInfo *insert_sharding,
-                                           bool &is_multi_part_dml,
-                                           ObIArray<std::pair<ObRawExpr*, ObRawExpr*>> &equal_pairs);
-  int check_update_insert_sharding_basic(ObLogicalOperator &top,
-                                         uint64_t table_id,
-                                         ObShardingInfo *insert_sharding,
-                                         ObShardingInfo *update_sharding,
-                                         bool &is_basic,
-                                         ObIArray<std::pair<ObRawExpr*, ObRawExpr*>> &equal_pairs);
+  int check_update_insert_single_part(ObLogicalOperator &top,
+                                      uint64_t table_id,
+                                      ObShardingInfo *insert_sharding,
+                                      ObShardingInfo *update_sharding,
+                                      bool &is_match_same_partition,
+                                      ObIArray<std::pair<ObRawExpr*, ObRawExpr*>> &equal_pairs);
   bool match_same_partition(const ObShardingInfo &l_sharding_info,
                             const ObShardingInfo &r_sharding_info);
   int generate_equal_constraint(ObLogicalOperator &top,
@@ -104,18 +103,29 @@ private:
                                     ObIArray<IndexDMLInfo*> &index_dml_infos,
                                     ObIArray<IndexDMLInfo*> &all_index_dml_infos);
 
-  int check_merge_stmt_need_multi_partition_dml(bool &is_multi_part_dml, bool &is_one_part_table);
+  int check_merge_stmt_need_multi_partition_dml(bool &is_multi_part_dml);
+  int check_need_multi_partition_dml(ObLogicalOperator &top,
+                                     const bool force_multi_part,
+                                     bool &is_multi_part_dml,
+                                     ObShardingInfo *&update_sharding);
+  int get_best_merge_dist_method(ObLogicalOperator &top,
+                                 ObShardingInfo *insert_sharding,
+                                 const bool force_multi_part,
+                                 const bool force_no_multi_part,
+                                 int64_t &dist_method,
+                                 bool &is_multi_part_dml,
+                                 ObIArray<std::pair<ObRawExpr*, ObRawExpr*>> &equal_pairs);
 
 
   DISALLOW_COPY_AND_ASSIGN(ObMergeLogPlan);
 
 private:
-  common::ObSEArray<IndexDMLInfo *, 4, common::ModulePageAllocator, true> index_update_infos_;
-  common::ObSEArray<IndexDMLInfo *, 4, common::ModulePageAllocator, true> index_delete_infos_;
+  ObSqlArray<IndexDMLInfo *> index_update_infos_;
+  ObSqlArray<IndexDMLInfo *> index_delete_infos_;
 
-  common::ObSEArray<ObRawExpr *, 4, common::ModulePageAllocator, true> insert_condition_exprs_;
-  common::ObSEArray<ObRawExpr *, 4, common::ModulePageAllocator, true> update_condition_exprs_;
-  common::ObSEArray<ObRawExpr *, 4, common::ModulePageAllocator, true> delete_condition_exprs_;
+  ObSqlArray<ObRawExpr *> insert_condition_exprs_;
+  ObSqlArray<ObRawExpr *> update_condition_exprs_;
+  ObSqlArray<ObRawExpr *> delete_condition_exprs_;
 };
 }//sql
 }//oceanbase

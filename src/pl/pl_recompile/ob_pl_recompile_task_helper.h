@@ -66,7 +66,8 @@ public:
   static int collect_delta_recompile_obj_data(common::ObMySQLProxy* sql_proxy,
                                                       uint64_t tenant_id,
                                                       ObIAllocator& allocator,
-                                                      int64_t& last_max_schema_version);
+                                                      int64_t& last_max_schema_version,
+                                                      share::schema::ObSchemaGetterGuard *schema_guard);
   static int collect_delta_error_data(common::ObMySQLProxy* sql_proxy,
                                                       uint64_t tenant_id,
                                                       int64_t last_max_schema_version,
@@ -87,7 +88,8 @@ public:
                                               ObISQLConnection *connection,
                                               ObIArray<ObPLRecompileInfo>& dep_objs,
                                               common::hash::ObHashMap<ObString, int64_t>& dropped_ref_objs,
-                                              int64_t recompile_start);
+                                              int64_t recompile_start,
+                                              schema::ObSchemaGetterGuard *schema_guard);
   static int construct_select_dep_table_sql(ObSqlString& query_inner_sql,
                                       common::hash::ObHashMap<int64_t, std::pair<ObString, int64_t>>& ddl_drop_obj_map,
                                       ObIArray<int64_t>& ddl_alter_obj_infos,
@@ -105,7 +107,8 @@ public:
                                   uint64_t tenant_id,
                                   int64_t last_max_schema_version,
                                   int64_t start,
-                                  int64_t end);
+                                  int64_t end,
+                                  schema::ObSchemaGetterGuard *schema_guard);
   static int recompile_single_obj(ObPLRecompileInfo& obj_info,
                                   ObISQLConnection *connection,
                                   uint64_t tenant_id);
@@ -125,6 +128,16 @@ public:
                           uint64_t tenant_id,
                           uint64_t coll_type,
                           int64_t& udt_id);
+  static int create_session(const uint64_t tenant_id,
+                            ObFreeSessionCtx &free_session_ctx,
+                            ObSQLSessionInfo *&session_info);
+  static int destroy_session(ObFreeSessionCtx &free_session_ctx,
+                            ObSQLSessionInfo *session_info);
+  static int init_session(ObSQLSessionInfo &session,
+                          const uint64_t tenant_id,
+                          const ObString &tenant_name,
+                          const ObCompatibilityMode compat_mode,
+                          ObObj &compat_obj);
 
 };
 

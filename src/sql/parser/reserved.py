@@ -1101,6 +1101,7 @@ class SqlKeywords:
          PARTITIONS
          PASSWORD
          PHASE
+         PHRASE
          PLUGIN
          PLUGINS
          PLUGIN_DIR
@@ -1540,6 +1541,7 @@ class SqlKeywords:
          COMMIT
          COMMITTED
          COMPACT
+         COMPACTION
          COMPLETION
          COMPRESSED
          COMPRESSION
@@ -1576,6 +1578,7 @@ class SqlKeywords:
          DELAY
          DELAY_KEY_WRITE
          DELETE_INSERT
+         DELETING
          DES_KEY_FILE
          DESTINATION
          DIAGNOSTICS
@@ -1788,6 +1791,7 @@ class SqlKeywords:
          PRIMARY_ZONE
          PRIVILEGES
          PROCESSLIST
+         PROCTIME
          PROFILE
          PROFILES
          PROXY
@@ -1840,6 +1844,7 @@ class SqlKeywords:
          SCHEDULE
          SCHEMA_NAME
          SCOPE
+         SCORE
          SECOND
          SECURITY
          SERIAL
@@ -1932,6 +1937,7 @@ class SqlKeywords:
          TP_NAME
          TRADITIONAL
          TRANSACTION
+         TRANSITION
          TRIGGER
          TRIGGERS
          TRIM
@@ -1973,6 +1979,7 @@ class SqlKeywords:
          ZONE
          ZONE_LIST
          LOCATION
+         API_MODE
                   '''
 
     ob_keywords = '''

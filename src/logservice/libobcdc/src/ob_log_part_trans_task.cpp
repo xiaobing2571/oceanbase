@@ -105,7 +105,8 @@ int MutatorRow::parse_columns_(
     const bool enable_output_hidden_primary_key,
     const ObLogAllDdlOperationSchemaInfo *all_ddl_operation_table_schema_info,
     const bool is_macroblock_row,
-    ColValueList &cols)
+    ColValueList &cols,
+    const bool is_mow_table_insert)
 {
   int ret = OB_SUCCESS;
 
@@ -224,6 +225,7 @@ int MutatorRow::parse_columns_(
             const bool is_lob_storage = obj_meta.is_lob_storage();
             // Default is false
             bool is_out_row = false;
+            const bool enable_filte_mow_lob_col = (1 == TCTX.enable_filter_mow_lob_);
 
             if (obj.is_null()) {
               // do nothing
@@ -238,45 +240,20 @@ int MutatorRow::parse_columns_(
 
               if (! is_out_row) {
                 OBLOG_FORMATTER_LOG(DEBUG, "is_lob_storage in row", K(column_id), K(is_lob_storage), K(is_parse_new_col), K(lob_common), K(obj));
-                obj.set_string(obj.get_type(), lob_common.get_inrow_data_ptr(), lob_common.get_byte_size(datum.len_));
-              } else {
-                const ObLobData &lob_data = *(reinterpret_cast<const ObLobData *>(lob_common.buffer_));
-
-                const ObLobDataOutRowCtx *lob_data_out_row_ctx =
-                  reinterpret_cast<const ObLobDataOutRowCtx *>(lob_data.buffer_);
-
-                OBLOG_FORMATTER_LOG(DEBUG, "is_lob_storage out row", K(column_id), K(is_lob_storage), K(is_parse_new_col), K(lob_common),
-                    K(lob_data), K(obj), KPC(lob_data_out_row_ctx));
-
-                if (is_parse_new_col) {
-                  // new_cols in MutatorRow for delete operation expect nop data, however delete_insert table mode set data(copy from old_cols), should skip such data;
-                  if (OB_LIKELY(!dml_flag.is_delete())) {
-                    ObLobDataGetCtx *lob_data_get_ctx = static_cast<ObLobDataGetCtx *>(allocator_.alloc(sizeof(ObLobDataGetCtx)));
-
-                    if (OB_ISNULL(lob_data_get_ctx)) {
-                      ret = OB_ALLOCATE_MEMORY_FAILED;
-                      LOG_ERROR("allocate memory for ObLobDataGetCtx fail", KR(ret), "size", sizeof(ObLobDataGetCtx));
-                    } else {
-                      new(lob_data_get_ctx) ObLobDataGetCtx();
-                      lob_data_get_ctx->reset((void *)(&new_lob_ctx_cols_), column_id, dml_flag, &lob_data);
-
-                      new_lob_ctx_cols_.add(lob_data_get_ctx);
-                    }
-                  }
-                } else {
-                  if (OB_FAIL(new_lob_ctx_cols_.set_old_lob_data(column_id, &lob_data))) {
-                    if (OB_ENTRY_NOT_EXIST != ret) {
-                      LOG_ERROR("new_lob_ctx_cols_ set_old_lob_data failed", KR(ret), K(column_id), K(lob_data));
-                    } else {
-                      // Not finding it is a possibility, eg:
-                      // LOB old row is out row storage, but new row is in row storage
-                      ret = OB_SUCCESS;
-                    }
-                  }
+                // only DML needs to reserve lob header
+                if (OB_NOT_NULL(all_ddl_operation_table_schema_info)) {
+                  obj.set_string(obj.get_type(), lob_common.get_inrow_data_ptr(), lob_common.get_byte_size(datum.len_));
                 }
+              } else if (is_mow_table_insert && enable_filte_mow_lob_col) {
+                if (REACH_TIME_INTERVAL(10 * _SEC_)) {
+                  LOG_INFO("is_mow_table_insert and enable_filte_mow_lob_col", K(ret), K(obj), K(column_id));
+                } else {
+                  LOG_DEBUG("is_mow_table_insert and enable_filte_mow_lob_col", K(ret), K(obj), K(column_id));
+                }
+              } else if (OB_FAIL(parse_outrow_lob_column_(is_parse_new_col, dml_flag, column_id, lob_common))) {
+                LOG_ERROR("parse_outrow_lob_column_ failed", K(ret), K(obj), K(column_id));
               }
             } // is_lob_storage
-
             if (OB_SUCC(ret) && OB_FAIL(add_column_(
                 column_id,
                 &obj,
@@ -297,6 +274,75 @@ int MutatorRow::parse_columns_(
     } // for
 
     ret = OB_ITER_END == ret ? OB_SUCCESS : ret;
+  }
+
+  return ret;
+}
+
+int MutatorRow::parse_outrow_lob_column_(
+    const bool is_parse_new_col,
+    const blocksstable::ObDmlRowFlag &dml_flag,
+    const uint64_t column_id,
+    const ObLobCommon &lob_common)
+{
+  int ret = OB_SUCCESS;
+
+  const ObLobData &lob_data = *(reinterpret_cast<const ObLobData *>(lob_common.buffer_));
+
+  const ObLobDataOutRowCtx *lob_data_out_row_ctx =
+    reinterpret_cast<const ObLobDataOutRowCtx *>(lob_data.buffer_);
+
+  OBLOG_FORMATTER_LOG(DEBUG, "is_lob_storage out row", K(column_id), K(is_lob_storage), K(is_parse_new_col), K(lob_common),
+                    K(lob_data), KPC(lob_data_out_row_ctx));
+
+  if (is_parse_new_col) {
+    // new_cols in MutatorRow for delete operation expect nop data, however delete_insert table mode set data(copy from old_cols), should skip such data;
+    if (OB_LIKELY(!dml_flag.is_delete())) {
+      ObLobDataGetCtx *lob_data_get_ctx = static_cast<ObLobDataGetCtx *>(allocator_.alloc(sizeof(ObLobDataGetCtx)));
+
+      if (OB_ISNULL(lob_data_get_ctx)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("allocate memory for ObLobDataGetCtx fail", KR(ret), "size", sizeof(ObLobDataGetCtx));
+      } else {
+        new(lob_data_get_ctx) ObLobDataGetCtx();
+        if (OB_FAIL(lob_data_get_ctx->reset((void *)(&new_lob_ctx_cols_), column_id, dml_flag, &lob_data, true/*is_new_col*/))) {
+          LOG_ERROR("lob_data_get_ctx reset failed", K(new_lob_ctx_cols_));
+        } else {
+          new_lob_ctx_cols_.add(lob_data_get_ctx);
+        }
+      }
+    }
+  } else {
+    if (OB_FAIL(new_lob_ctx_cols_.set_old_lob_data(column_id, &lob_data))) {
+      if (OB_ENTRY_NOT_EXIST != ret) {
+        LOG_ERROR("new_lob_ctx_cols_ set_old_lob_data failed", KR(ret), K(column_id), K(lob_data));
+      } else {
+        // Not finding it is a possibility, eg:
+        //   1. LOB old row is out row storage, but new row is in row storage.
+        //   2. Delete outrow lob.
+        ret = OB_SUCCESS;
+
+        if (! dml_flag.is_delete() && ! dml_flag.is_update()) {
+          // If neither of the above two possibilities, do nothing.
+        } else if (!lob_data_out_row_ctx->is_valid_old_value() && !lob_data_out_row_ctx->is_valid_old_value_ext_info_log()) {
+          // Among the two possibilities above, the lob_data_out_row_ctx op_type will be set to either 'VALID_OLD_VALUE' or
+          // 'VALID_OLD_VALUE_EXT_INFO_LOG'. If it is neither of these two types, do nothing.
+        } else {
+          ObLobDataGetCtx *lob_data_get_ctx = static_cast<ObLobDataGetCtx *>(allocator_.alloc(sizeof(ObLobDataGetCtx)));
+          if (OB_ISNULL(lob_data_get_ctx)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_ERROR("allocate memory for ObLobDataGetCtx fail", KR(ret), "size", sizeof(ObLobDataGetCtx));
+          } else {
+            new(lob_data_get_ctx) ObLobDataGetCtx();
+            if(OB_FAIL(lob_data_get_ctx->reset((void *)(&new_lob_ctx_cols_), column_id, dml_flag, &lob_data, false/*is_new_col*/))) {
+              LOG_ERROR("lob data get ctx reset failed", KR(ret));
+            } else {
+              new_lob_ctx_cols_.add(lob_data_get_ctx);
+            }
+          }
+        }
+      }
+    }
   }
 
   return ret;
@@ -379,11 +425,12 @@ int MutatorRow::add_column_(
     common::ObArrayHelper<common::ObString> extended_type_info;
     common::ObAccuracy accuracy;
     common::ObCollationType collation_type = ObCollationType::CS_TYPE_BINARY;
-
+    const common::ObSqlCollectionInfo *collection_info = nullptr;
     // Set meta information and scale information if column schema is valid
     if (NULL != column_schema_info) {
-      column_cast(cv_node->value_, *column_schema_info);
+      column_cast(cv_node->value_, *column_schema_info, is_out_row);
       column_schema_info->get_extended_type_info(extended_type_info);
+      collection_info = column_schema_info->get_collection_info();
       accuracy = column_schema_info->get_accuracy();
       collation_type = column_schema_info->get_collation_type();
     }
@@ -437,6 +484,7 @@ int MutatorRow::add_column_(
         allocator_,
         false,
         extended_type_info,
+        collection_info,
         accuracy,
         collation_type,
         tz_info_wrap))) {
@@ -900,7 +948,8 @@ int MacroBlockMutatorRow::parse_cols(
       enable_output_hidden_primary_key,
       all_ddl_operation_table_schema_info,
       true/*is_macroblock_row*/,
-      new_cols_))) {
+      new_cols_,
+      false))) {
       LOG_ERROR("parse new columns fail", KR(ret), K(tenant_id), K(table_id), K(obj2str_helper),
           K(tb_schema_info), K(enable_output_hidden_primary_key));
     }
@@ -1112,8 +1161,17 @@ int MemtableMutatorRow::parse_cols(
     ret = OB_STATE_NOT_MATCH;
   }
 
-  blocksstable::ObRowReader row_reader;
+  blocksstable::ObCompatRowReader row_reader;
   blocksstable::ObDatumRow datum_row(tenant_id);
+
+  // MOW table: UPDATE splits into DELETE + INSERT
+  // Log pattern: DELETE contains new data, INSERT contains old data
+  bool is_mow_table_insert = false;
+  if (blocksstable::ObDmlFlag::DF_INSERT == dml_flag_) {
+    if (OB_NOT_NULL(old_row_.data_) && old_row_.size_ > 0) {
+      is_mow_table_insert = true;
+    }
+  }
 
   // parse value of new column
   if (OB_SUCC(ret)) {
@@ -1136,7 +1194,8 @@ int MemtableMutatorRow::parse_cols(
         enable_output_hidden_primary_key,
         all_ddl_operation_table_schema_info,
         false/*is_macroblock_row*/,
-        new_cols_))) {
+        new_cols_,
+        is_mow_table_insert))) {
       LOG_ERROR("parse new columns fail", KR(ret), K(tenant_id), K(table_id), K(new_row_), K(obj2str_helper),
           K(tb_schema_info), K(enable_output_hidden_primary_key));
     } else {
@@ -1164,7 +1223,8 @@ int MemtableMutatorRow::parse_cols(
         enable_output_hidden_primary_key,
         all_ddl_operation_table_schema_info,
         false/*is_macroblock_row*/,
-        old_cols_))) {
+        old_cols_,
+        is_mow_table_insert))) {
       LOG_ERROR("parse old columns fail", KR(ret), K(tenant_id), K(table_id), K(old_row_), K(obj2str_helper),
           K(tb_schema_info), K(enable_output_hidden_primary_key));
     } else {
@@ -1212,7 +1272,7 @@ int MemtableMutatorRow::parse_cols(const ObCDCLobAuxTableSchemaInfo &inner_table
     LOG_ERROR("row has not been deserialized", KR(ret));
   }
 
-  blocksstable::ObRowReader row_reader;
+  blocksstable::ObCompatRowReader row_reader;
   blocksstable::ObDatumRow datum_row(OB_SERVER_TENANT_ID);
 
   // parse value of new column
@@ -1277,7 +1337,7 @@ int MemtableMutatorRow::parse_cols(const ObCDCLobAuxTableSchemaInfo &inner_table
 int MemtableMutatorRow::parse_ext_info_log(ObLobId &lob_id, ObString &ext_info_log)
 {
   int ret = OB_SUCCESS;
-  blocksstable::ObRowReader row_reader;
+  blocksstable::ObCompatRowReader row_reader;
   blocksstable::ObDatumRow datum_row;
   bool is_found = false;
   if (OB_UNLIKELY(cols_parsed_)) {
@@ -1465,7 +1525,7 @@ int DmlStmtTask::parse_col(
   common::ObArrayHelper<common::ObString> extended_type_info;
   common::ObAccuracy accuracy;
   common::ObCollationType collation_type = ObCollationType::CS_TYPE_BINARY;
-
+  const common::ObSqlCollectionInfo *collection_info = column_schema_info.get_collection_info();
   column_schema_info.get_extended_type_info(extended_type_info);
   accuracy = column_schema_info.get_accuracy();
   collation_type = column_schema_info.get_collation_type();
@@ -1478,6 +1538,7 @@ int DmlStmtTask::parse_col(
       row_.get_allocator(),
       false,
       extended_type_info,
+      collection_info,
       accuracy,
       collation_type,
       tz_info_wrap))) {
@@ -1628,6 +1689,16 @@ bool DdlStmtTask::is_sub_tls_id_alter_ddl_(const int64_t ddl_operation_type)
   return bool_ret;
 }
 
+bool DdlStmtTask::is_table_recover_end_ddl_(const int64_t ddl_operation_type)
+{
+  bool bool_ret = false;
+
+  ObSchemaOperationType op_type = static_cast<ObSchemaOperationType>(ddl_operation_type);
+  bool_ret = (OB_DDL_RECOVER_TABLE_END == op_type);
+
+  return bool_ret;
+}
+
 int DdlStmtTask::parse_ddl_info(
     ObLogBR *br,
     const uint64_t row_index,
@@ -1733,6 +1804,11 @@ int DdlStmtTask::parse_ddl_info(
 
       // obadmin performs dynamic add/drop operations on secondary tls_ids with null ddl_stmt_str, but not filtering
       if (is_sub_tls_id_alter_ddl_(ddl_operation_type_)) {
+        is_valid_ddl = true;
+      }
+
+      // table revoer
+      if (is_table_recover_end_ddl_(ddl_operation_type_)) {
         is_valid_ddl = true;
       }
     }
@@ -2541,9 +2617,9 @@ PartTransTask::PartTransTask() :
     local_schema_version_(OB_INVALID_VERSION),
     stmt_list_(),
     ddl_lob_aux_stmt_list_(),
-    data_ready_lock_(),
+    data_ready_lock_(common::ObLatchIds::OB_CDC_COMMON_LOCK),
     is_data_ready_(false),
-    wait_data_ready_cond_(),
+    wait_data_ready_cond_(ObCond::SPIN_WAIT_NUM, common::ObWaitEventIds::CDC_COMMON_COND_WAIT),
     wait_formatted_cond_(NULL),
     output_br_count_by_turn_(0),
     tic_update_infos_()

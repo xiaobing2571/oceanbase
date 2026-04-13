@@ -65,7 +65,8 @@ public:
     BASE_MAJOR_STATUS,
     CO_MERGE_TYPE,
     MDS_FILTER_INFO,
-    EXECUTE_TIME
+    EXECUTE_TIME,
+    FILTER_ROW_COUNT
   };
   ObAllVirtualTabletCompactionHistory();
   virtual ~ObAllVirtualTabletCompactionHistory();
@@ -80,6 +81,7 @@ private:
   {
     major_merge_info_iter_.reset();
     minor_merge_info_iter_.reset();
+    mds_merge_info_iter_.reset();
   }
 private:
   char ip_buf_[common::OB_IP_STR_BUFF];
@@ -90,9 +92,11 @@ private:
   char other_info_[common::OB_COMPACTION_EVENT_STR_LENGTH];
   char comment_[common::OB_COMPACTION_COMMENT_STR_LENGTH];
   char kept_snapshot_info_[common::OB_COMPACTION_INFO_LENGTH];
+  char co_major_merge_strategy_info_[common::OB_COMPACTION_INFO_LENGTH];
   compaction::ObSSTableMergeHistory merge_history_;
   compaction::ObIDiagnoseInfoMgr::Iterator major_merge_info_iter_;
   compaction::ObIDiagnoseInfoMgr::Iterator minor_merge_info_iter_;
+  compaction::ObIDiagnoseInfoMgr::Iterator mds_merge_info_iter_;
   DISALLOW_COPY_AND_ASSIGN(ObAllVirtualTabletCompactionHistory);
 };
 

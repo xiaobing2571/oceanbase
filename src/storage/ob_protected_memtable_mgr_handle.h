@@ -100,10 +100,10 @@ class ObProtectedMemtableMgrHandle
 public:
   ObProtectedMemtableMgrHandle()
     : memtable_mgr_handle_(),
-      memtable_mgr_handle_lock_() {}
+      memtable_mgr_handle_lock_(common::ObLatchIds::OB_PROTECTED_MEMTABLE_MGR_HANDLE_LOCK) {}
   ObProtectedMemtableMgrHandle(const ObMemtableMgrHandle &memtable_mgr_handle)
     : memtable_mgr_handle_(memtable_mgr_handle),
-      memtable_mgr_handle_lock_() {}
+      memtable_mgr_handle_lock_(common::ObLatchIds::OB_PROTECTED_MEMTABLE_MGR_HANDLE_LOCK) {}
   ObProtectedMemtableMgrHandle& operator=(const ObProtectedMemtableMgrHandle &r)
   {
     SpinWLockGuard guard(memtable_mgr_handle_lock_);
@@ -123,6 +123,16 @@ public:
       ret = static_cast<ObTabletMemtableMgr*>(memtable_mgr_handle_.get_memtable_mgr())->has_active_memtable();
     }
     return ret;
+  }
+
+  int64_t get_memtable_count()
+  {
+    int64_t memtable_count = 0;
+    SpinRLockGuard guard(memtable_mgr_handle_lock_);
+    if (memtable_mgr_handle_.is_valid()) {
+      memtable_count = static_cast<ObTabletMemtableMgr*>(memtable_mgr_handle_.get_memtable_mgr())->get_memtable_count();
+    }
+    return memtable_count;
   }
 
   bool has_memtable()

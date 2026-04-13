@@ -131,7 +131,8 @@ int ObPLCompilerUtils::compile_routine(ObExecContext &ctx,
   if (OB_SUCC(ret)
       && OB_NOT_NULL(routine_info)
       && !(is_recompile && routine_info->is_invoker_right())
-      && (OB_INVALID_VERSION == schema_version || schema_version == routine_info->get_schema_version())) {
+      && (OB_INVALID_VERSION == schema_version || schema_version == routine_info->get_schema_version())
+      && !routine_info->is_aggregate()) {
     ObCacheObjGuard cacheobj_guard(PL_ROUTINE_HANDLE);
     ObPLFunction* routine = nullptr;
     ObPLCacheCtx pc_ctx;
@@ -189,7 +190,7 @@ int ObPLCompilerUtils::compile_package(ObExecContext &ctx,
   int64_t compatible_mode = lib::is_oracle_mode() ? COMPATIBLE_ORACLE_MODE
                                                   : COMPATIBLE_MYSQL_MODE;
   CK (OB_NOT_NULL(ctx.get_sql_ctx()->schema_guard_));
-  OZ (schema_checker.init(*ctx.get_sql_ctx()->schema_guard_, ctx.get_my_session()->get_server_sid()));
+  OZ (schema_checker.init(*ctx.get_sql_ctx()->schema_guard_, ctx.get_my_session()->get_sessid_for_table()));
   OZ (ctx.get_sql_ctx()->schema_guard_->get_package_info(tenant_id, database_id, package_name, package_type, compatible_mode, package_info));
   CK (OB_NOT_NULL(package_info));
   CK (OB_NOT_NULL(ctx.get_sql_proxy()));
@@ -208,7 +209,7 @@ int ObPLCompilerUtils::compile_package(ObExecContext &ctx,
                                     package_guard,
                                     *ctx.get_sql_proxy(),
                                     false, false, false, NULL, NULL, TgTimingEvent::TG_TIMING_EVENT_INVALID,
-                                    false, is_recompile ? false : true);
+                                    nullptr, false, is_recompile ? false : true);
 
     OZ (package_guard.init());
     OZ (ctx.get_pl_engine()->get_package_manager().get_package_schema_info(resolve_ctx.schema_guard_,
@@ -257,7 +258,7 @@ int ObPLCompilerUtils::compile_trigger(ObExecContext &ctx,
                                     package_guard,
                                     *ctx.get_sql_proxy(),
                                     false, false, false, NULL, NULL, TgTimingEvent::TG_TIMING_EVENT_INVALID,
-                                    false, is_recompile ? false : true);
+                                    nullptr, false, is_recompile ? false : true);
 
     OZ (package_guard.init());
     OZ (ctx.get_pl_engine()->get_package_manager().get_cached_package(resolve_ctx,
@@ -301,7 +302,7 @@ int ObPLCompilerUtils::compile_udt(ObExecContext &ctx,
                                    package_guard,
                                    *ctx.get_sql_proxy(),
                                    false, false, false, NULL, NULL, TgTimingEvent::TG_TIMING_EVENT_INVALID,
-                                   false, is_recompile ? false : true);
+                                   nullptr, false, is_recompile ? false : true);
     OZ (package_guard.init());
     OZ (ctx.get_sql_ctx()->schema_guard_->get_udt_info(tenant_id, database_id, OB_INVALID_ID, udt_name, udt_info));
     CK (OB_NOT_NULL(udt_info));
@@ -319,7 +320,7 @@ int ObPLCompilerUtils::compile_udt(ObExecContext &ctx,
         bool is_valid = false;
         sql::ObResolverParams resolver_params;
         sql::ObSchemaChecker schema_checker;
-        OZ (schema_checker.init(*ctx.get_sql_ctx()->schema_guard_, ctx.get_my_session()->get_server_sid()));
+        OZ (schema_checker.init(*ctx.get_sql_ctx()->schema_guard_, ctx.get_my_session()->get_sessid_for_table()));
         OX (resolver_params.allocator_ = &ctx.get_allocator());
         OX (resolver_params.schema_checker_ = &schema_checker);
         OX (resolver_params.session_info_ = ctx.get_my_session());
@@ -347,8 +348,6 @@ int ObPLCompilerUtils::compile_udt(ObExecContext &ctx,
         OZ (pl::ObPLUDTObjectManager::compile_udt(resolve_ctx,
                                                   spec_id,
                                                   body_id,
-                                                  false,
-                                                  false,
                                                   udt_info,
                                                   obj_spec,
                                                   obj_body));

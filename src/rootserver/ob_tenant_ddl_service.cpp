@@ -32,6 +32,9 @@
 #include "share/ob_schema_status_proxy.h"
 #include "share/backup/ob_log_restore_config.h"//ObLogRestoreSourceServiceConfigParser
 #include "storage/tx/ob_ts_mgr.h"
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "storage/incremental/ob_shared_meta_service.h"
+#endif
 #ifdef OB_BUILD_TDE_SECURITY
 #include "share/ob_master_key_getter.h"
 #endif
@@ -45,6 +48,9 @@
 #include "share/ob_zone_merge_info.h"
 #include "share/ob_global_merge_table_operator.h"
 #include "share/ob_zone_merge_table_operator.h"
+#include "rootserver/freeze/ob_major_freeze_helper.h"
+#include "rootserver/ob_load_inner_table_schema_executor.h"
+#include "share/ob_license_utils.h"
 
 #define MODIFY_LOCALITY_NOT_ALLOWED() \
         do { \
@@ -383,17 +389,18 @@ int ObTenantDDLService::fill_user_sys_ls_info_(
     const SCN create_scn = SCN::base_scn();
     share::ObLSStatusInfo status_info;
     ObLSFlag flag(ObLSFlag::NORMAL_FLAG); // TODO: sys ls should be duplicate
+    ObUnitIDList unit_list; // empty unit list
     ObZone primary_zone;
     ObSqlString zone_priority;
     if (OB_FAIL(get_tenant_zone_priority(meta_tenant_schema, primary_zone,
             zone_priority))) {
       LOG_WARN("failed to get tenant zone priority", KR(ret), K(primary_zone), K(zone_priority));
     } else if (OB_FAIL(status_info.init(user_tenant_id, SYS_LS, 0/*ls_group_id*/, share::OB_LS_CREATING,
-            0/*unit_group_id*/, primary_zone, flag))) {
+            0/*unit_group_id*/, primary_zone, flag, unit_list))) {
       LOG_WARN("failed to init ls info", KR(ret), K(primary_zone),
-          K(user_tenant_id), K(flag));
+          K(user_tenant_id), K(flag), K(unit_list));
     } else if (OB_FAIL(ls_life_agent.create_new_ls_in_trans(status_info, create_scn, zone_priority.string(),
-            share::NORMAL_SWITCHOVER_STATUS, trans))) {
+        ObAllTenantInfo::INITIAL_SWITCHOVER_EPOCH, trans))) {
       LOG_WARN("failed to create new ls", KR(ret), K(status_info), K(create_scn), K(zone_priority));
     } else if (OB_FAIL(ls_operator.update_ls_status_in_trans(
                   user_tenant_id, SYS_LS, share::OB_LS_CREATING, share::OB_LS_NORMAL,
@@ -519,7 +526,8 @@ int ObTenantDDLService::init_meta_tenant_env_(
   } else {
     const uint64_t user_tenant_id = gen_user_tenant_id(tenant_id);
     ObAllTenantInfo tenant_info;
-    if (OB_FAIL(tenant_info.init(user_tenant_id, tenant_role, NORMAL_SWITCHOVER_STATUS, 0,
+    if (OB_FAIL(tenant_info.init(user_tenant_id, tenant_role, NORMAL_SWITCHOVER_STATUS,
+            ObAllTenantInfo::INITIAL_SWITCHOVER_EPOCH,
             SCN::base_scn(), SCN::base_scn(), SCN::base_scn(), recovery_until_scn))) {
       LOG_WARN("failed to init tenant info", KR(ret), K(tenant_id), K(tenant_role));
     } else if (OB_FAIL(ObAllTenantInfoProxy::init_tenant_info(tenant_info, &trans))) {
@@ -845,21 +853,30 @@ int ObTenantDDLService::create_tenant(const ObCreateTenantArg &arg,
     HEAP_VARS_2((ObTenantSchema, user_tenant_schema),
                 (ObTenantSchema, meta_tenant_schema)) {
       uint64_t user_tenant_id = OB_INVALID_TENANT_ID;
-      int64_t paxos_replica_number = 0;
       ObSEArray<ObConfigPairs, 2> init_configs;
       ObTenantRole tenant_role = arg.get_tenant_role();
       if (OB_FAIL(generate_tenant_schema(arg, tenant_role, schema_guard,
               user_tenant_schema, meta_tenant_schema, init_configs))) {
         LOG_WARN("fail to generate tenant schema", KR(ret), K(arg), K(tenant_role));
-      } else if (user_tenant_schema.get_arbitration_service_status().is_enable_like()
-                 && OB_FAIL(user_tenant_schema.get_paxos_replica_num(schema_guard, paxos_replica_number))) {
-        LOG_WARN("fail to get paxos replica number", KR(ret), K(user_tenant_schema));
-      } else if (user_tenant_schema.get_arbitration_service_status().is_enable_like()
-                 && paxos_replica_number != 2 && paxos_replica_number != 4) {
-        ret = OB_OP_NOT_ALLOW;
-        LOG_USER_ERROR(OB_OP_NOT_ALLOW, "The number of paxos replicas in locality is neither 2 nor 4, create tenant with arbitration service");
-        LOG_WARN("can not create tenant, because tenant with arb service, locality must be 2F or 4F", KR(ret), K(user_tenant_schema), K(paxos_replica_number));
+      } else if (OB_FAIL(ObShareUtil::check_replica_type_in_locality(user_tenant_schema))) {
+        LOG_WARN("fail to check replica type in locality", KR(ret), K(user_tenant_schema));
       } else if (FALSE_IT(user_tenant_id = user_tenant_schema.get_tenant_id())) {
+#ifdef OB_BUILD_SHARED_STORAGE
+      } else if (GCTX.is_shared_storage_mode()) {
+        MTL_SWITCH(OB_SYS_TENANT_ID) {
+          storage::ObSSMetaService *ss_meta_service = MTL(storage::ObSSMetaService *);
+          if (OB_ISNULL(ss_meta_service)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("ObSSMetaService is null", KR(ret), K(user_tenant_id), K(ss_meta_service), K(MTL_ID()));
+          } else if (OB_FAIL(ss_meta_service->add_tenant_id(user_tenant_id))) {
+            LOG_WARN("fail to add tenant id to sslog", KR(ret), K(user_tenant_id));
+          }
+        } else {
+          LOG_WARN("switch to sys tenant failed", KR(ret), K(user_tenant_id));
+        }
+      }
+      if (OB_FAIL(ret)) {
+#endif
       } else if (OB_FAIL(init_schema_status(
               user_tenant_schema.get_tenant_id(), tenant_role))) {
         LOG_WARN("fail to init schema status", KR(ret), K(user_tenant_id));
@@ -983,11 +1000,15 @@ int ObTenantDDLService::create_tenant_schema(
       FLOG_INFO("[CREATE_TENANT] STEP 1.1. start create tenant schema", K(arg));
       const int64_t tmp_start_time = ObTimeUtility::fast_current_time();
       ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
-      if (OB_FAIL(ddl_operator.create_tenant(meta_tenant_schema,
-                 OB_DDL_ADD_TENANT_START, trans))) {
+      int64_t user_tenant_count = 0;
+      if (OB_FAIL(schema_guard.get_user_tenant_count(user_tenant_count))) {
+        LOG_WARN("fail to get tenant ids", KR(ret));
+      } else if (OB_FAIL(ObLicenseUtils::check_for_create_tenant(user_tenant_count, arg.is_standby_tenant(), user_tenant_schema.get_tenant_name_str()))) {
+        LOG_WARN("create more tenant is not allowd", KR(ret), K(user_tenant_count));
+      } else if (OB_FAIL(ddl_operator.create_tenant(meta_tenant_schema, OB_DDL_ADD_TENANT_START, trans))) {
         LOG_WARN("create tenant failed", KR(ret), K(meta_tenant_schema));
-      } else if (OB_FAIL(ddl_operator.create_tenant(user_tenant_schema,
-                 OB_DDL_ADD_TENANT_START, trans, &arg.ddl_stmt_str_))) {
+      } else if (OB_FAIL(ddl_operator.create_tenant(
+                     user_tenant_schema, OB_DDL_ADD_TENANT_START, trans, &arg.ddl_stmt_str_))) {
         LOG_WARN("create tenant failed", KR(ret), K(user_tenant_schema));
       }
       FLOG_INFO("[CREATE_TENANT] STEP 1.1. finish create tenant schema", KR(ret), K(arg),
@@ -1008,6 +1029,10 @@ int ObTenantDDLService::create_tenant_schema(
         if (OB_FAIL(standby_create_root_key(user_tenant_id, arg, addrs))) {
           LOG_WARN("failed to create root key", KR(ret), K(user_tenant_id), K(arg));
         }
+      } else if (arg.is_restore_) {
+        if (OB_FAIL(restore_create_root_key(user_tenant_id, arg, addrs))) {
+          LOG_WARN("fail to restore create root key", KR(ret), K(user_tenant_id), K(arg));
+        }
       } else if (OB_FAIL(create_root_key(*rpc_proxy_, user_tenant_id, addrs))) {
         LOG_WARN("fail to create root key", KR(ret), K(addrs));
       }
@@ -1023,10 +1048,9 @@ int ObTenantDDLService::create_tenant_schema(
       lib::Worker::CompatMode compat_mode = get_worker_compat_mode(
                                          user_tenant_schema.get_compatibility_mode());
       if (OB_FAIL(unit_mgr_->grant_pools(
-                         trans, new_ug_id_array,
+                         trans,
                          compat_mode,
                          pools, user_tenant_id,
-                         false/*is_bootstrap*/,
                          arg.source_tenant_id_,
                          false/*check_data_version*/))) {
         LOG_WARN("grant_pools_to_tenant failed", KR(ret), K(arg), K(pools), K(user_tenant_id));
@@ -1182,7 +1206,7 @@ int ObTenantDDLService::check_need_create_root_key(const ObCreateTenantArg &arg,
   need_create = false;
   if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_2_0_0) {
     need_create = false;
-  } else if (arg.is_restore_tenant() || arg.is_clone_tenant()) {
+  } else if (arg.is_clone_tenant()) {
     need_create = false;
   } else {
     need_create = true;
@@ -1248,8 +1272,10 @@ int ObTenantDDLService::get_root_key_from_primary(const obrpc::ObCreateTenantArg
     } else if (OB_FAIL(root_key_arg.init_for_get(primary_tenant_id))) {
       LOG_WARN("failed to init for get", KR(ret), K(primary_tenant_id));
     }
+    //如果主备租户在同一个单节点的集群，addr里面就会只有一台RS的节点，
+    //skip_call_rs就不能为true。
     if (FAILEDx(notify_root_key(*rpc_proxy_, root_key_arg,
-            addr_list, result, true/*enable_default*/, true/*skip_call_rs*/,
+            addr_list, result, true/*enable_default*/, false/*skip_call_rs*/,
             cluster_id, &allocator))) {
       LOG_WARN("failed to get root key from obs", KR(ret), K(cluster_id),
           K(root_key_arg), K(addr_list));
@@ -1260,7 +1286,7 @@ int ObTenantDDLService::get_root_key_from_primary(const obrpc::ObCreateTenantArg
     if (OB_INVALID_ROOT_KEY == ret) {
       LOG_USER_ERROR(OB_INVALID_ROOT_KEY, "Can not get root key from primary tenant");
     }
-    LOG_INFO("get root key from primary tenant", K(primary_tenant_id), K(tenant_id), K(value),
+    FLOG_INFO("get root key from primary tenant", K(primary_tenant_id), K(tenant_id), K(value),
         K(addr_list), K(key_type), K(key_value), K(cluster_id));
   }
   return ret;
@@ -1318,7 +1344,8 @@ int ObTenantDDLService::notify_root_key(
     int tmp_ret = OB_SUCCESS;
     int return_ret = OB_SUCCESS;
     // need_to_call_rs is true only if skip_call_rs is false and not notify cross-cluster
-    bool need_call_rs = (!skip_call_rs) && (OB_INVALID_CLUSTER_ID == cluster_id);
+    // 存在单机上面既有主库也有备库，cluster_id有效也是要访问RS的
+    bool need_call_rs = !skip_call_rs;
     ObAddr rs_addr = GCONF.self_addr_;
     int64_t timeout = ctx.get_timeout();
     for (int64_t i = 0; OB_SUCC(ret) && i < addrs.count(); i++) {
@@ -1333,7 +1360,8 @@ int ObTenantDDLService::notify_root_key(
         need_call_rs = false;
       }
     } // end for
-    if (OB_FAIL(ret) || !need_call_rs) {
+    if (OB_FAIL(ret) || !need_call_rs || OB_INVALID_CLUSTER_ID != cluster_id) {
+      //如果不是本集群，不需要单独发一遍本集群的RS节点
     } else if (OB_TMP_FAIL(proxy.call(rs_addr, timeout, cluster_id, OB_SYS_TENANT_ID, arg))) {
       has_failed = true;
       return_ret= tmp_ret;
@@ -1426,6 +1454,34 @@ int ObTenantDDLService::notify_root_key(
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("get unexpect root key", K(ret));
       }
+    }
+  }
+  return ret;
+}
+
+int ObTenantDDLService::restore_create_root_key(
+             const uint64_t tenant_id,
+             const obrpc::ObCreateTenantArg &arg,
+             const common::ObIArray<common::ObAddr> &addrs)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(check_inner_stat())) {
+    LOG_WARN("variable is not init", KR(ret));
+  } else if (OB_UNLIKELY(!is_user_tenant(tenant_id) || !arg.is_restore_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(arg));
+  } else {
+    obrpc::RootKeyType key_type = arg.root_key_type_;
+    common::ObString root_key = arg.root_key_;
+    obrpc::ObRootKeyArg root_key_arg;
+    obrpc::ObRootKeyResult dummy_result;
+    if (RootKeyType::INVALID == key_type || root_key.empty()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid root key", KR(ret), K(tenant_id), K(key_type), K(root_key));
+    } else if (OB_FAIL(root_key_arg.init(tenant_id, key_type, root_key))) {
+      LOG_WARN("failed to init root key arg", KR(ret), K(tenant_id), K(key_type), K(root_key));
+    } else if (OB_FAIL(notify_root_key(*rpc_proxy_, root_key_arg, addrs, dummy_result))) {
+      LOG_WARN("fail to notify root key", KR(ret), K(root_key_arg));
     }
   }
   return ret;
@@ -1674,6 +1730,7 @@ int ObTenantDDLService::create_normal_tenant(obrpc::ObParallelCreateNormalTenant
   common::ObTraceIdGuard trace_id_guard(new_trace_id);
   TIMEGUARD_INIT(create_normal_tenant, 10_s);
   FLOG_INFO("[CREATE_TENANT] STEP 2. start create normal tenant", K(tenant_id));
+  ObArray<uint64_t> table_ids_to_construct; // empty means construct all
   ObArenaAllocator arena_allocator("InnerTableSchem", OB_MALLOC_MIDDLE_BLOCK_SIZE);
   ObSArray<ObTableSchema> tables;
   ObTenantSchema tenant_schema;
@@ -1695,7 +1752,8 @@ int ObTenantDDLService::create_normal_tenant(obrpc::ObParallelCreateNormalTenant
   // in this case, SQL.ENG will return -4138 which will retry immediately.
   // the retries will explod user's work queue .
   // so we create tablet before braodcast schema, make them retrun OB_TABLE_NOT_EXIST which will not be retried
-  if (FAILEDx(ObSchemaUtils::construct_inner_table_schemas(tenant_id, tables, arena_allocator))) {
+  if (FAILEDx(ObSchemaUtils::construct_inner_table_schemas(tenant_id, table_ids_to_construct,
+          true/*include_index_and_lob_aux_schemas*/, arena_allocator, tables))) {
     LOG_WARN("fail to get inner table schemas in tenant space", KR(ret), K(tenant_id));
   } else if (CLICK_FAIL(create_tenant_sys_tablets(tenant_id, tables))) {
     LOG_WARN("fail to create tenant partitions", KR(ret), K(tenant_id));
@@ -1767,7 +1825,7 @@ int ObTenantDDLService::broadcast_sys_table_schemas(const uint64_t tenant_id)
       ObArray<ObTableSchema> tables;
       addrs.reset();
       FOREACH_X(unit, units, OB_SUCC(ret)) {
-        if (!unit->is_valid() || !unit->is_active_status()) {
+        if (!unit->is_valid() || ObUnit::UNIT_STATUS_ACTIVE != unit->status_) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("invalid unit", KR(ret), K(*unit));
         } else if (OB_FAIL(addrs.push_back(unit->server_))) {
@@ -1821,13 +1879,88 @@ int ObTenantDDLService::broadcast_sys_table_schemas(const uint64_t tenant_id)
   return ret;
 }
 
-ERRSIM_POINT_DEF(ERRSIM_CREATE_SYS_TABLETS_ERROR);
 int ObTenantDDLService::create_tenant_sys_tablets(
     const uint64_t tenant_id,
     common::ObIArray<ObTableSchema> &tables)
 {
   const int64_t start_time = ObTimeUtility::fast_current_time();
-  FLOG_INFO("[CREATE_TENANT] STEP 2.2. start create sys table tablets", K(tenant_id));
+  LOG_INFO("[CREATE_TENANT] STEP 2.2. start create sys table tablets", K(tenant_id));
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(check_inner_stat())) {
+    LOG_WARN("variable is not init", KR(ret));
+  } else {
+    // FIXME: (yanmu.ztl) use actual trans later
+    ObMySQLTransaction trans;
+    ObSchemaGetterGuard dummy_guard;
+    SCN frozen_scn = SCN::base_scn();
+    if (OB_FAIL(trans.start(sql_proxy_, tenant_id))) {
+      LOG_WARN("fail to start trans", KR(ret), K(tenant_id));
+    } else if (OB_FAIL(create_tenant_sys_tablets_in_trans_(dummy_guard, trans, tenant_id, tables, frozen_scn))) {
+      LOG_WARN("failed to create tenant sys tablets in trans", KR(ret), K(tenant_id));
+    }
+    if (trans.is_started()) {
+      int tmp_ret = OB_SUCCESS;
+      if (OB_TMP_FAIL(trans.end(OB_SUCC(ret)))) {
+        LOG_WARN("trans end failed", "commit", ret == OB_SUCCESS, K(tmp_ret));
+        ret = OB_SUCC(ret) ? tmp_ret : ret;
+      }
+    }
+  }
+  LOG_INFO("[CREATE_TENANT] STEP 2.2. finish create sys table tablets", KR(ret), K(tenant_id),
+           "cost", ObTimeUtility::fast_current_time() - start_time);
+  return ret;
+}
+
+
+ERRSIM_POINT_DEF(ERRSIM_UPGRADE_CREATE_SYS_TABLETS);
+
+int ObTenantDDLService::batch_create_system_table(
+    ObSchemaGetterGuard &schema_guard,
+    ObDDLSQLTransaction &trans,
+    const uint64_t &tenant_id,
+    const ObIArray<uint64_t> &table_ids)
+{
+  int ret = OB_SUCCESS;
+  int64_t start_ts = ObTimeUtility::current_time();
+  FLOG_INFO("[UPGRADE] start to batch create system tables", KR(ret), K(tenant_id), K(table_ids));
+  ObArenaAllocator arena_allocator("InnerTableSchem", OB_MALLOC_MIDDLE_BLOCK_SIZE);
+  ObArray<ObTableSchema> schemas;
+  if (OB_FAIL(check_inner_stat())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("failed to check inner stat", KR(ret));
+  } else if (table_ids.empty()) {
+    // no need to create system tables
+  } else if (OB_FAIL(ObSchemaUtils::construct_inner_table_schemas(tenant_id, table_ids,
+          true /*include_index_and_lob_aux_schemas*/, arena_allocator, schemas))) {
+    LOG_WARN("failed to get hard code system table schemas", KR(ret), K(tenant_id), K(table_ids));
+  } else {
+    ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
+    SCN frozen_scn;
+    if (FAILEDx(ObMajorFreezeHelper::get_frozen_scn(tenant_id, frozen_scn))) {
+      LOG_WARN("fail to get frozen status for create tablet", KR(ret), K(tenant_id));
+    } else if (OB_FAIL(create_tenant_sys_tablets_in_trans_(schema_guard, trans, tenant_id, schemas, frozen_scn))) {
+      LOG_WARN("failed to create sys tablets in trans", KR(ret), K(tenant_id), K(frozen_scn));
+    } else if (OB_FAIL(ret = ERRSIM_UPGRADE_CREATE_SYS_TABLETS)) {
+      LOG_WARN("errsim upgrade create sys tables", KR(ret), K(tenant_id));
+    } else if (OB_FAIL(create_sys_table_schemas(ddl_operator, trans, schemas))) {
+      LOG_WARN("failed to create sys table schemas", KR(ret), K(tenant_id));
+    }
+  }
+  FLOG_INFO("[UPGRADE] finish batch create system tables, not commited", KR(ret), K(tenant_id),
+      K(table_ids), "cost", ObTimeUtility::current_time() - start_ts);
+  return ret;
+}
+
+ERRSIM_POINT_DEF(ERRSIM_CREATE_SYS_TABLETS_ERROR);
+int ObTenantDDLService::create_tenant_sys_tablets_in_trans_(
+      share::schema::ObSchemaGetterGuard &schema_guard,
+      ObMySQLTransaction &trans,
+      const uint64_t tenant_id,
+      common::ObIArray<share::schema::ObTableSchema> &tables,
+      const share::SCN &frozen_scn)
+{
+  const int64_t start_time = ObTimeUtility::fast_current_time();
+  LOG_INFO("start create sys table tablets", K(tenant_id));
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_inner_stat())) {
     LOG_WARN("variable is not init", KR(ret));
@@ -1837,25 +1970,19 @@ int ObTenantDDLService::create_tenant_sys_tablets(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ptr is null", KR(ret), KP_(rpc_proxy), KP_(lst_operator));
   } else {
-    // FIXME: (yanmu.ztl) use actual trans later
-    ObMySQLTransaction trans;
-    share::schema::ObSchemaGetterGuard dummy_guard;
-    SCN frozen_scn = SCN::base_scn();
     ObTableCreator table_creator(tenant_id,
                                  frozen_scn,
                                  trans);
     ObNewTableTabletAllocator new_table_tablet_allocator(
                               tenant_id,
-                              dummy_guard,
+                              schema_guard,
                               sql_proxy_);
     common::ObArray<share::ObLSID> ls_id_array;
     const ObTablegroupSchema *dummy_tablegroup_schema = NULL;
     ObArray<const share::schema::ObTableSchema*> table_schemas;
     ObArray<uint64_t> index_tids;
     ObArray<bool> need_create_empty_majors;
-    if (OB_FAIL(trans.start(sql_proxy_, tenant_id))) {
-      LOG_WARN("fail to start trans", KR(ret), K(tenant_id));
-    } else if (OB_FAIL(table_creator.init(false/*need_tablet_cnt_check*/))) {
+    if (OB_FAIL(table_creator.init(false/*need_tablet_cnt_check*/))) {
       LOG_WARN("fail to init tablet creator", KR(ret), K(tenant_id));
     } else if (OB_FAIL(new_table_tablet_allocator.init())) {
       LOG_WARN("fail to init new table tablet allocator", KR(ret));
@@ -1952,14 +2079,6 @@ int ObTenantDDLService::create_tenant_sys_tablets(
       ALLOW_NEXT_LOG();
       LOG_INFO("create tenant sys tables tablet", KR(ret), K(tenant_id));
     }
-    if (trans.is_started()) {
-      int temp_ret = OB_SUCCESS;
-      bool commit = OB_SUCC(ret);
-      if (OB_SUCCESS != (temp_ret = trans.end(commit))) {
-        ret = (OB_SUCC(ret)) ? temp_ret : ret;
-        LOG_WARN("trans end failed", K(commit), K(temp_ret));
-      }
-    }
 
     // finishing is always invoked for new table tablet allocator
     int tmp_ret = OB_SUCCESS;
@@ -1967,8 +2086,8 @@ int ObTenantDDLService::create_tenant_sys_tablets(
       LOG_WARN("fail to finish new table tablet allocator", KR(tmp_ret));
     }
   }
-  FLOG_INFO("[CREATE_TENANT] STEP 2.2. finish create sys table tablets", KR(ret), K(tenant_id),
-           "cost", ObTimeUtility::fast_current_time() - start_time);
+  LOG_INFO("finish create sys table tablets", KR(ret), K(tenant_id),
+      "cost", ObTimeUtility::fast_current_time() - start_time);
   return ret;
 }
 
@@ -2057,8 +2176,12 @@ int ObTenantDDLService::init_tenant_schema(
       if (OB_ISNULL(schema_service_impl)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("pointer is null", KR(ret), KP(schema_service_impl));
-      } else if (CLICK_FAIL(create_sys_table_schemas(ddl_operator, trans, tables))) {
+      } else if (!GCONF._enable_parallel_tenant_creation &&
+          CLICK_FAIL(create_sys_table_schemas(ddl_operator, trans, tables))) {
         LOG_WARN("fail to create sys tables", KR(ret), K(tenant_id));
+      } else if (GCONF._enable_parallel_tenant_creation &&
+          CLICK_FAIL(load_sys_table_schemas(tenant_schema, tables))) {
+        LOG_WARN("fail to load sys tables", KR(ret), K(tenant_id));
       } else if (OB_FAIL(schema_service_impl->gen_new_schema_version(
               tenant_id, init_schema_version, new_schema_version))) {
         LOG_WARN("failed to gen_new_schema_version", KR(ret), K(tenant_id));
@@ -2069,6 +2192,9 @@ int ObTenantDDLService::init_tenant_schema(
         LOG_WARN("fail to replace sys variable", KR(ret), K(sys_variable));
       } else if (CLICK_FAIL(ddl_operator.init_tenant_schemas(tenant_schema, sys_variable, trans))) {
         LOG_WARN("init tenant env failed", KR(ret), K(tenant_schema), K(sys_variable));
+      } else if (GCONF._enable_parallel_tenant_creation &&
+          CLICK_FAIL(ObLoadInnerTableSchemaExecutor::load_schema_version(tenant_id, trans))) {
+        LOG_WARN("failed to load core schema version", KR(ret), K(tenant_id));
       }
     }
   }
@@ -2086,6 +2212,37 @@ int ObTenantDDLService::init_tenant_schema(
 
   FLOG_INFO("[CREATE_TENANT] STEP 2.5. finish init tenant schemas", KR(ret), K(tenant_id),
            "cost", ObTimeUtility::fast_current_time() - start_time);
+  return ret;
+}
+
+int ObTenantDDLService::load_sys_table_schemas(
+    const ObTenantSchema &tenant_schema,
+    common::ObIArray<ObTableSchema> &tables)
+{
+  int ret = OB_SUCCESS;
+  const int64_t begin_time = ObTimeUtility::current_time();
+  FLOG_INFO("[CREATE_TENANT] start load all schemas", "table count", tables.count());
+  const uint64_t tenant_id = tenant_schema.get_tenant_id();
+  ObLoadInnerTableSchemaExecutor executor;
+  ObUnitTableOperator table;
+  common::ObArray<ObUnitConfig> configs;
+  if (OB_FAIL(check_inner_stat())) {
+    LOG_WARN("failed to check_inner_stat", KR(ret));
+  } else if (OB_FAIL(table.init(*sql_proxy_))) {
+    LOG_WARN("failed to init unit table operator", KR(ret));
+  } else if (OB_FAIL(table.get_unit_configs_by_tenant(gen_user_tenant_id(tenant_id), configs))) {
+    LOG_WARN("failed to get unit configs by tenant", KR(ret), K(tenant_id));
+  } else if (configs.count() <= 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("config is empty", KR(ret), K(configs));
+  } else if (OB_FAIL(executor.init(tables, tenant_schema.get_tenant_id(), configs.at(0).max_cpu(),
+          rpc_proxy_))) {
+    LOG_WARN("failed to init executor", KR(ret));
+  } else if (OB_FAIL(executor.execute())) {
+    LOG_WARN("failed to execute load all schema", KR(ret));
+  }
+  FLOG_INFO("[CREATE_TENANT] finish load all schemas", KR(ret), K(configs),
+      "cost", ObTimeUtility::current_time() - begin_time);
   return ret;
 }
 
@@ -2166,26 +2323,67 @@ int ObTenantDDLService::add_extra_tenant_init_config_(
   ObString config_value_immediate_check("False");
   ObString config_name_system_trig_enabled("_system_trig_enabled");
   ObString config_value_system_trig_enabled("false");
+  ObString config_name_enable_ps_parameterize("enable_ps_parameterize");
+  ObString config_value_enable_ps_parameterize("false");
+  ObString config_name_partition_balance_schedule_interval("partition_balance_schedule_interval");
+  ObString config_value_partition_balance_schedule_interval("0");
+  ObString config_name_update_trigger("_update_all_columns_for_trigger");
+  ObString config_value_update_trigger("true");
+  ObString config_name_ddl_thread_isolution("_enable_ddl_worker_isolation");
+  ObString config_value_ddl_thread_isolution("true");
+  ObString config_name_spill_compression_codec("spill_compression_codec");
+  ObString config_value_spill_compression_codec("LZ4");
+  ObString config_name_spf_batch_rescan("_enable_spf_batch_rescan");
+  ObString config_value_spf_batch_rescan("true");
+  ObString config_name_batch_rescan_flag("_enable_das_batch_rescan_flag");
+  ObString config_value_batch_rescan_flag("15");
+  ObString config_name_enable_mlog_auto_maintenance("enable_mlog_auto_maintenance");
+  ObString config_value_enable_mlog_auto_maintenance("true");
+  ObString config_name_prexec_prepare_with_params("_prexec_prepare_with_params");
+  ObString config_value_prexec_prepare_with_params("true");
+  ObString config_name_append_update_global_indexes_for_dynamic_partition("_append_update_global_indexes_for_dynamic_partition");
+  ObString config_value_append_update_global_indexes_for_dynamic_partition("AUTO");
+
   if (OB_FAIL(ObParallelDDLControlMode::generate_parallel_ddl_control_config_for_create_tenant(config_value))) {
     LOG_WARN("fail to generate parallel ddl control config value", KR(ret));
   }
   for (int index = 0 ; !find && OB_SUCC(ret) && index < init_configs.count(); ++index) {
     if (tenant_id == init_configs.at(index).get_tenant_id()) {
       find = true;
-      common::ObConfigPairs &parallel_table_config = init_configs.at(index);
-      if (OB_FAIL(parallel_table_config.add_config(config_name, config_value.string()))) {
+      common::ObConfigPairs &tenant_init_config = init_configs.at(index);
+      if (OB_FAIL(tenant_init_config.add_config(config_name, config_value.string()))) {
         LOG_WARN("fail to add config", KR(ret), K(config_name), K(config_value));
-      } else if (OB_FAIL(parallel_table_config.add_config(config_name_mysql_compatible_dates, config_value_mysql_compatible_dates))) {
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_mysql_compatible_dates, config_value_mysql_compatible_dates))) {
         LOG_WARN("fail to add config", KR(ret), K(config_name_mysql_compatible_dates), K(config_value_mysql_compatible_dates));
-      } else if (OB_FAIL(parallel_table_config.add_config(config_name_immediate_check_unique, config_value_immediate_check))) {
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_immediate_check_unique, config_value_immediate_check))) {
         LOG_WARN("fail to add config", KR(ret), K(config_name_immediate_check_unique), K(config_value_immediate_check));
-      } else if (OB_FAIL(parallel_table_config.add_config(config_name_system_trig_enabled, config_value_system_trig_enabled))) {
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_system_trig_enabled, config_value_system_trig_enabled))) {
         LOG_WARN("fail to add config", KR(ret), K(config_name_system_trig_enabled), K(config_value_system_trig_enabled));
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_enable_ps_parameterize, config_value_enable_ps_parameterize))) {
+        LOG_WARN("fail to add config", KR(ret), K(config_name_enable_ps_parameterize), K(config_value_enable_ps_parameterize));
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_partition_balance_schedule_interval, config_value_partition_balance_schedule_interval))) {
+        LOG_WARN("fail to add config", KR(ret), K(config_name_partition_balance_schedule_interval), K(config_value_partition_balance_schedule_interval));
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_update_trigger, config_value_update_trigger))) {
+        LOG_WARN("fail to add config", KR(ret), K(config_name_update_trigger), K(config_value_update_trigger));
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_ddl_thread_isolution, config_value_ddl_thread_isolution))) {
+        LOG_WARN("fail to add config", KR(ret), K(config_name_ddl_thread_isolution), K(config_value_ddl_thread_isolution));
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_spill_compression_codec, config_value_spill_compression_codec))) {
+        LOG_WARN("fail to add config", KR(ret), K(config_name_spill_compression_codec), K(config_value_spill_compression_codec));
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_spf_batch_rescan, config_value_spf_batch_rescan))) {
+        LOG_WARN("fail to add config", KR(ret), K(config_name_spf_batch_rescan), K(config_value_spf_batch_rescan));
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_batch_rescan_flag, config_value_batch_rescan_flag))) {
+        LOG_WARN("fail to add config", KR(ret), K(config_name_batch_rescan_flag), K(config_value_batch_rescan_flag));
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_enable_mlog_auto_maintenance, config_value_enable_mlog_auto_maintenance))) {
+        LOG_WARN("fail to add config", KR(ret), K(config_name_enable_mlog_auto_maintenance), K(config_value_enable_mlog_auto_maintenance));
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_prexec_prepare_with_params, config_value_prexec_prepare_with_params))) {
+        LOG_WARN("fail to add config", KR(ret), K(config_name_prexec_prepare_with_params), K(config_value_prexec_prepare_with_params));
+      } else if (OB_FAIL(tenant_init_config.add_config(config_name_append_update_global_indexes_for_dynamic_partition, config_value_append_update_global_indexes_for_dynamic_partition))) {
+        LOG_WARN("fail to add config", KR(ret), K(config_name_append_update_global_indexes_for_dynamic_partition), K(config_value_append_update_global_indexes_for_dynamic_partition));
       }
+      // ---- Add new tenant init config above this line -----
+      // At the same time, to verify modification, you need modify test case tenant_init_config(_oracle).test
     }
   }
-  // ---- Add new tenant init config above this line -----
-  // At the same time, to verify modification, you need modify test case tenant_init_config(_oracle).test
   if (OB_SUCC(ret) && !find) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("no matched tenant config", KR(ret), K(tenant_id), K(init_configs));
@@ -2252,10 +2450,11 @@ int ObTenantDDLService::modify_tenant(const ObModifyTenantArg &arg)
   } else if (!is_restore && (0 != arg.sys_var_list_.count())) {
     // The physical recovery may be in the system table recovery stage, and it is necessary to avoid
     // the situation where SQL cannot be executed and hang
+    const uint64_t tenant_id = orig_tenant_schema->get_tenant_id();
     if (OB_FAIL(get_tenant_schema_guard_with_version_in_inner_table(
-                orig_tenant_schema->get_tenant_id(), schema_guard))) {
+                tenant_id, schema_guard))) {
       LOG_WARN("fail to get schema guard with version in inner table",
-               K(ret), "tenant_id",  orig_tenant_schema->get_tenant_id());
+               K(ret), "tenant_id", tenant_id);
     } else if (OB_FAIL(schema_guard.get_tenant_info(tenant_name, orig_tenant_schema))) {
       ret = OB_TENANT_NOT_EXIST;
       LOG_USER_ERROR(OB_TENANT_NOT_EXIST, tenant_name.length(), tenant_name.ptr());
@@ -2327,7 +2526,7 @@ int ObTenantDDLService::set_new_tenant_options(
   } else if (arg.alter_option_bitset_.has_member(obrpc::ObModifyTenantArg::LOCALITY)) {
     common::ObArray<share::schema::ObZoneRegion> zone_region_list;
     AlterLocalityType alter_locality_type = ALTER_LOCALITY_INVALID;
-    bool tenant_pools_in_shrinking = false;
+    bool tenant_altering_unit_num = false;
     common::ObArray<share::ObResourcePoolName> resource_pool_names;
     if (new_tenant_schema.get_locality_str().empty()) {
       // It is not allowed to change the locality as an inherited attribute
@@ -2337,12 +2536,12 @@ int ObTenantDDLService::set_new_tenant_options(
     } else if (OB_UNLIKELY(NULL == unit_mgr_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unit_mgr_ is null", K(ret), KP(unit_mgr_));
-    } else if (OB_FAIL(unit_mgr_->check_tenant_pools_in_shrinking(
-            orig_tenant_schema.get_tenant_id(), tenant_pools_in_shrinking))) {
+    } else if (OB_FAIL(unit_mgr_->check_tenant_pools_altering_unit_num(
+            orig_tenant_schema.get_tenant_id(), tenant_altering_unit_num))) {
       LOG_WARN("fail to check tenant pools in shrinking", K(ret));
-    } else if (tenant_pools_in_shrinking) {
+    } else if (tenant_altering_unit_num) {
       ret = OB_OP_NOT_ALLOW;
-      LOG_USER_ERROR(OB_OP_NOT_ALLOW, "alter tenant locality when tenant pool is shrinking");
+      LOG_USER_ERROR(OB_OP_NOT_ALLOW, "alter tenant locality when tenant pool is shrinking or expanding");
       LOG_WARN("alter tenant locality not allowed", K(ret), K(orig_tenant_schema));
     } else if (OB_FAIL(get_new_tenant_pool_zone_list(
             arg, new_tenant_schema, resource_pool_names, zones_in_pool, zone_region_list))) {
@@ -2479,7 +2678,8 @@ int ObTenantDDLService::try_modify_tenant_locality(
     } else if (OB_FAIL(ObLocalityCheckHelp::check_alter_locality(
             pre_zone_locality, cur_zone_locality,
             alter_paxos_tasks, non_paxos_locality_modified,
-            pre_paxos_num, cur_paxos_num, new_tenant_schema.get_arbitration_service_status()))) {
+            pre_paxos_num, cur_paxos_num, new_tenant_schema.get_arbitration_service_status(),
+            orig_tenant_schema.get_tenant_id()))) {
       LOG_WARN("fail to check and get paxos replica task",
                K(ret), K(pre_zone_locality), K(cur_zone_locality), "arbitration service status",
                new_tenant_schema.get_arbitration_service_status());
@@ -2540,7 +2740,8 @@ int ObTenantDDLService::try_rollback_modify_tenant_locality(
     } else if (OB_FAIL(ObLocalityCheckHelp::check_alter_locality(
             pre_zone_locality, cur_zone_locality,
             alter_paxos_tasks, non_paxos_locality_modified,
-            pre_paxos_num, cur_paxos_num, new_schema.get_arbitration_service_status()))) {
+            pre_paxos_num, cur_paxos_num, new_schema.get_arbitration_service_status(),
+            orig_schema.get_tenant_id()))) {
       LOG_WARN("fail to check and get paxos replica task", K(ret), K(pre_zone_locality), K(cur_zone_locality),
                "arbitration service status", new_schema.get_arbitration_service_status());
     } else if (0 < alter_paxos_tasks.count() || non_paxos_locality_modified) {
@@ -2823,11 +3024,6 @@ int ObTenantDDLService::check_alter_schema_replica_options(
     }
   }
 
-  // retrun OB_OP_NOT_ALLOW if first_primary_zone changed when tenant rebalance is disabled.
-  if (FAILEDx(check_alter_tenant_when_rebalance_is_disabled_(orig_schema, new_schema))) {
-    LOG_WARN("failed to check alter tenant when rebalance is disabled", KR(ret), K(orig_schema), K(new_schema));
-  }
-
   if (OB_SUCC(ret)) {
     int64_t paxos_num = 0;
     if (OB_FAIL(new_schema.get_paxos_replica_num(schema_guard, paxos_num))) {
@@ -2837,61 +3033,6 @@ int ObTenantDDLService::check_alter_schema_replica_options(
       LOG_WARN("invalid paxos replica num", K(ret));
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, "locality paxos replica num");
     } else {} // good
-  }
-  return ret;
-}
-
-// alter tenant with primary_zone changed is not allowed when tenant rebalance is disabled.
-int ObTenantDDLService::check_alter_tenant_when_rebalance_is_disabled_(
-    const share::schema::ObTenantSchema &orig_tenant_schema,
-    const share::schema::ObTenantSchema &new_tenant_schema)
-{
-  int ret = OB_SUCCESS;
-  const uint64_t tenant_id = orig_tenant_schema.get_tenant_id();
-  ObArray<ObZone> orig_first_primary_zone;
-  ObArray<ObZone> new_first_primary_zone;
-  bool is_allowed = true;
-  bool is_first_primary_zone_changed = false;
-  if (OB_UNLIKELY(orig_tenant_schema.get_tenant_id() != new_tenant_schema.get_tenant_id())) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid input tenant schema", KR(ret), K(orig_tenant_schema), K(new_tenant_schema));
-  } else if (is_sys_tenant(tenant_id)) {
-    // primary_zone and locality changes in sys tenant do not cause rebalance,
-    // so alter sys tenant is not controlled by enable_rebalance.
-    is_allowed = true;
-  } else if (ObShareUtil::is_tenant_enable_rebalance(tenant_id)) {
-    is_allowed = true;
-  } else if (OB_FAIL(ObRootUtils::is_first_priority_primary_zone_changed(
-      orig_tenant_schema,
-      new_tenant_schema,
-      orig_first_primary_zone,
-      new_first_primary_zone,
-      is_first_primary_zone_changed))) {
-    LOG_WARN("fail to check is_first_priority_primary_zone_changed", KR(ret), K(orig_tenant_schema), K(new_tenant_schema));
-  } else if (is_first_primary_zone_changed) {
-    is_allowed = false;
-  }
-  if (OB_SUCC(ret) && !is_allowed) {
-    ObSqlString orig_str;
-    ObSqlString new_str;
-    ARRAY_FOREACH(orig_first_primary_zone, idx) {
-      if (OB_FAIL(orig_str.append_fmt(0 == idx ? "%s" : ",%s", orig_first_primary_zone.at(idx).ptr()))) {
-        LOG_WARN("append fmt failed", KR(ret), K(orig_first_primary_zone), K(idx));
-      }
-    }
-    ARRAY_FOREACH(new_first_primary_zone, idx) {
-      if (OB_FAIL(new_str.append_fmt(0 == idx ? "%s" : ",%s", new_first_primary_zone.at(idx).ptr()))) {
-        LOG_WARN("append fmt failed", KR(ret), K(new_first_primary_zone), K(idx));
-      }
-    }
-    ret = OB_OP_NOT_ALLOW;
-    LOG_WARN("enable_rebalance is disabled, alter tenant with primary zone changed not allowed", KR(ret),
-        K(tenant_id), K(orig_first_primary_zone), K(new_first_primary_zone));
-    char err_msg[DEFAULT_BUF_LENGTH];
-    (void)snprintf(err_msg, sizeof(err_msg),
-        "Tenant (%lu) Primary Zone with the first priority will be changed from '%s' to '%s', "
-        "but tenant 'enable_rebalance' is disabled, alter tenant", tenant_id, orig_str.ptr(), new_str.ptr());
-    LOG_USER_ERROR(OB_OP_NOT_ALLOW, err_msg);
   }
   return ret;
 }
@@ -3250,7 +3391,6 @@ int ObTenantDDLService::check_revoke_pools_permitted(
  */
 int ObTenantDDLService::modify_and_cal_resource_pool_diff(
     common::ObMySQLTransaction &trans,
-    common::ObIArray<uint64_t> &new_ug_id_array,
     share::schema::ObSchemaGetterGuard &schema_guard,
     const share::schema::ObTenantSchema &new_tenant_schema,
     const common::ObIArray<common::ObString> &new_pool_list,
@@ -3289,8 +3429,8 @@ int ObTenantDDLService::modify_and_cal_resource_pool_diff(
                 new_pool_name_list, old_pool_name_list, diff_pools))) {
           LOG_WARN("fail to cal resource pool list diff", K(ret));
         } else if (OB_FAIL(unit_mgr_->grant_pools(
-                trans, new_ug_id_array, compat_mode, diff_pools, tenant_id,
-                false/*is_bootstrap*/, OB_INVALID_TENANT_ID/*source_tenant_id*/,
+                trans, compat_mode, diff_pools, tenant_id,
+                OB_INVALID_TENANT_ID/*source_tenant_id*/,
                 true/*check_data_version*/))) {
           LOG_WARN("fail to grant pools", K(ret));
         }
@@ -3305,8 +3445,7 @@ int ObTenantDDLService::modify_and_cal_resource_pool_diff(
         } else if (!is_permitted) {
           ret = OB_OP_NOT_ALLOW;
           LOG_WARN("revoking resource pools is not allowed", K(ret), K(diff_pools));
-        } else if (OB_FAIL(unit_mgr_->revoke_pools(
-                trans, new_ug_id_array, diff_pools, tenant_id))) {
+        } else if (OB_FAIL(unit_mgr_->revoke_pools(trans, diff_pools, tenant_id))) {
           LOG_WARN("fail to revoke pools", K(ret));
         } else {} // no more to do
       } else if (new_pool_name_list.count() == old_pool_name_list.count()) {
@@ -3320,7 +3459,8 @@ int ObTenantDDLService::modify_and_cal_resource_pool_diff(
       } else {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("invalid argument", K(ret), K(new_pool_name_list), K(old_pool_name_list));
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "resource pool list");
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+            "resource pool list: only one resource pool can be added or reduced at a time");
       }
     }
     LOG_INFO("cal resource pool list result",
@@ -3590,14 +3730,13 @@ int ObTenantDDLService::modify_tenant_inner_phase(const ObModifyTenantArg &arg, 
     if (OB_SUCC(ret)) {
       ObDDLSQLTransaction trans(schema_service_);
       int64_t refreshed_schema_version = 0;
-      common::ObArray<uint64_t> new_ug_id_array;
       if (OB_FAIL(schema_guard.get_schema_version(OB_SYS_TENANT_ID, refreshed_schema_version))) {
         LOG_WARN("failed to get tenant schema version", KR(ret));
       } else if (OB_FAIL(trans.start(sql_proxy_, OB_SYS_TENANT_ID, refreshed_schema_version))) {
         LOG_WARN("start transaction failed", KR(ret), K(refreshed_schema_version));
       } else if (arg.alter_option_bitset_.has_member(obrpc::ObModifyTenantArg::RESOURCE_POOL_LIST)
             && OB_FAIL(modify_and_cal_resource_pool_diff(
-                trans, new_ug_id_array, schema_guard,
+                trans, schema_guard,
                 new_tenant_schema, arg.pool_list_, grant, diff_pools))) {
         LOG_WARN("fail to grant_pools", K(ret));
       }
@@ -3632,7 +3771,10 @@ int ObTenantDDLService::modify_tenant_inner_phase(const ObModifyTenantArg &arg, 
 #endif
       }
 
-      if (FAILEDx(ObAlterPrimaryZoneChecker::create_alter_tenant_primary_zone_rs_job_if_needed(
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(ObShareUtil::check_replica_type_in_locality(new_tenant_schema))) {
+        LOG_WARN("fail to check replica type in locality", KR(ret), K(new_tenant_schema));
+      } else if (OB_FAIL(ObAlterPrimaryZoneChecker::create_alter_tenant_primary_zone_rs_job_if_needed(
           arg,
           tenant_id,
           *orig_tenant_schema,
@@ -3673,11 +3815,12 @@ int ObTenantDDLService::modify_tenant_inner_phase(const ObModifyTenantArg &arg, 
 
       // When the new and old resource pool lists are consistent, no diff is generated, diff_pools is empty,
       // and there is no need to call the following function
-      if (OB_SUCC(ret)
-          && arg.alter_option_bitset_.has_member(obrpc::ObModifyTenantArg::RESOURCE_POOL_LIST)
+      if (arg.alter_option_bitset_.has_member(obrpc::ObModifyTenantArg::RESOURCE_POOL_LIST)
           && diff_pools.count() > 0) {
-        if (OB_FAIL(unit_mgr_->load())) {
-          LOG_WARN("unit_manager reload failed", K(ret));
+        int tmp_ret = OB_SUCCESS;
+        if (OB_TMP_FAIL(unit_mgr_->load())) {
+          ret = OB_SUCCESS == ret ? tmp_ret : ret;
+          LOG_WARN("unit_manager reload failed", KR(ret), KR(tmp_ret));
         }
       }
       if (OB_SUCC(ret) && arg.alter_option_bitset_.has_member(obrpc::ObModifyTenantArg::LOCALITY)) {
@@ -3722,7 +3865,8 @@ int ObTenantDDLService::modify_tenant_inner_phase(const ObModifyTenantArg &arg, 
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "rename special tenant");
     } else if (NULL != schema_guard.get_tenant_info(new_tenant_name)) {
       ret = OB_TENANT_EXIST;
-      LOG_USER_ERROR(OB_TENANT_EXIST, to_cstring(new_tenant_name));
+      ObCStringHelper helper;
+      LOG_USER_ERROR(OB_TENANT_EXIST, helper.convert(new_tenant_name));
       LOG_WARN("tenant already exists", K(ret), K(new_tenant_name));
     } else if (OB_FAIL(schema_guard.get_schema_version(OB_SYS_TENANT_ID, refreshed_schema_version))) {
       LOG_WARN("failed to get tenant schema version", KR(ret));
@@ -4204,8 +4348,9 @@ int ObTenantDDLService::check_create_tenant_schema(
     LOG_WARN("variable is not init", KR(ret));
   } else if (tenant_schema.get_tenant_name_str().length() > OB_MAX_TENANT_NAME_LENGTH) {
     ret = OB_INVALID_TENANT_NAME;
+    ObCStringHelper helper;
     LOG_USER_ERROR(OB_INVALID_TENANT_NAME,
-        to_cstring(tenant_schema.get_tenant_name_str()), OB_MAX_TENANT_NAME_LENGTH);
+        helper.convert(tenant_schema.get_tenant_name_str()), OB_MAX_TENANT_NAME_LENGTH);
     LOG_WARN("tenant name can't over max_tenant_name_length", KR(ret), K(OB_MAX_TENANT_NAME_LENGTH));
   } else if (OB_FAIL(check_create_tenant_locality(pool_list, tenant_schema, schema_guard))) {
     LOG_WARN("fail to check create tenant locality", KR(ret), K(pool_list), K(tenant_schema));
@@ -4481,21 +4626,33 @@ int ObTenantDDLService::set_schema_replica_num_options(
         ret = OB_INVALID_ARGUMENT;
         LOG_USER_ERROR(OB_INVALID_ARGUMENT, "locality");
         LOG_WARN("one zone should only have one paxos replica", K(ret), K(zone_replica_set));
-      } else if (zone_replica_set.get_full_replica_num() == 1
-                 && (zone_replica_set.get_logonly_replica_num() == 1
-                     || zone_replica_set.get_encryption_logonly_replica_num() == 1)) {
-        bool find = false;
-        for (int64_t j = 0; j < unit_infos.count() && OB_SUCC(ret); j++) {
-          if (unit_infos.at(j).unit_.zone_ == zone_replica_set.zone_
-              && REPLICA_TYPE_LOGONLY == unit_infos.at(j).unit_.replica_type_) {
-            find = true;
-            break;
-          }
-        } //end for unit_infos
-        if (!find) {
-          ret = OB_INVALID_ARGUMENT;
-          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "locality");
-          LOG_WARN("no logonly unit exist", K(ret), K(zone_replica_set));
+      } else if (OB_FAIL(check_locality_match_unit_type_(zone_replica_set, unit_infos))) {
+        LOG_WARN("fail to check locality match unit type", KR(ret), K(zone_replica_set), K(unit_infos));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTenantDDLService::check_locality_match_unit_type_(
+    const share::ObZoneReplicaAttrSet &zone_replica_set,
+    const ObIArray<share::ObUnitInfo> &unit_infos)
+{
+  int ret = OB_SUCCESS;
+  common::ObReplicaType replica_type_to_check = zone_replica_set.get_logonly_replica_num() == 1
+                                              ? ObReplicaType::REPLICA_TYPE_LOGONLY
+                                              : ObReplicaType::REPLICA_TYPE_FULL;
+  if (OB_UNLIKELY(0 >= unit_infos.count())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(unit_infos));
+  } else {
+    for (int64_t j = 0; j < unit_infos.count() && OB_SUCC(ret); j++) {
+      if (unit_infos.at(j).unit_.zone_ == zone_replica_set.zone_) {
+        if (OB_FAIL(ObShareUtil::check_unit_type_match_replica_type(
+                        replica_type_to_check,
+                        unit_infos.at(j).unit_))) {
+          LOG_WARN("fail to check replica type with unit type", KR(ret),
+                   K(replica_type_to_check), K(unit_infos), K(zone_replica_set), K(j));
         }
       }
     }
@@ -4563,7 +4720,8 @@ int ObTenantDDLService::check_schema_zone_list(
   for (int64_t i = 0; OB_SUCC(ret) && i < zone_list.count() - 1; ++i) {
     if (zone_list.at(i) == zone_list.at(i+1)) {
       ret = OB_ZONE_DUPLICATED;
-      LOG_USER_ERROR(OB_ZONE_DUPLICATED, to_cstring(zone_list.at(i)), to_cstring(zone_list));
+      ObCStringHelper helper;
+      LOG_USER_ERROR(OB_ZONE_DUPLICATED, helper.convert(zone_list.at(i)), helper.convert(zone_list));
       LOG_WARN("duplicate zone in zone list", K(zone_list), K(ret));
     }
   }
@@ -4574,7 +4732,8 @@ int ObTenantDDLService::check_schema_zone_list(
         LOG_WARN("check_zone_exist failed", "zone", zone_list.at(i), K(ret));
       } else if (!zone_exist) {
         ret = OB_ZONE_INFO_NOT_EXIST;
-        LOG_USER_ERROR(OB_ZONE_INFO_NOT_EXIST, to_cstring(zone_list.at(i)));
+        ObCStringHelper helper;
+        LOG_USER_ERROR(OB_ZONE_INFO_NOT_EXIST, helper.convert(zone_list.at(i)));
         LOG_WARN("zone not exist", "zone", zone_list.at(i), K(ret));
         break;
       }
@@ -5054,6 +5213,7 @@ int ObTenantDDLService::try_drop_meta_ls_(
     common::ObMySQLTransaction &trans)
 {
   int ret = OB_SUCCESS;
+  FLOG_INFO("try to drop meta ls", K(meta_tenant_id), K(ls_id));
   if (OB_FAIL(check_inner_stat())) {
     LOG_WARN("variable is not init");
   } else if (OB_UNLIKELY(!is_meta_tenant(meta_tenant_id) || !ls_id.is_valid_with_tenant(meta_tenant_id))) {
@@ -5082,7 +5242,6 @@ int ObTenantDDLService::try_drop_meta_ls_(
 }
 
 int ObTenantDDLService::drop_resource_pool_pre(const uint64_t tenant_id,
-                                         common::ObIArray<uint64_t> &drop_ug_id_array,
                                          ObIArray<ObResourcePoolName> &pool_names,
                                          ObMySQLTransaction &trans)
 {
@@ -5091,14 +5250,13 @@ int ObTenantDDLService::drop_resource_pool_pre(const uint64_t tenant_id,
     LOG_WARN("variable is not init");
   } else if (OB_FAIL(unit_mgr_->get_pool_names_of_tenant(tenant_id, pool_names))) {
     LOG_WARN("get_pool_names_of_tenant failed", K(tenant_id), KR(ret));
-  } else if (OB_FAIL(unit_mgr_->revoke_pools(trans, drop_ug_id_array, pool_names, tenant_id))) {
+  } else if (OB_FAIL(unit_mgr_->revoke_pools(trans, pool_names, tenant_id))) {
     LOG_WARN("revoke_pools failed", K(pool_names), K(tenant_id), KR(ret));
   }
   return ret;
 }
 
 int ObTenantDDLService::drop_resource_pool_final(const uint64_t tenant_id,
-                                           common::ObIArray<uint64_t> &drop_ug_id_array,
                                            ObIArray<ObResourcePoolName> &pool_names)
 {
   int ret = OB_SUCCESS;
@@ -5158,7 +5316,6 @@ int ObTenantDDLService::drop_tenant(const ObDropTenantArg &arg)
   bool is_standby = false;
   uint64_t user_tenant_id = common::OB_INVALID_ID;
   int64_t refreshed_schema_version = 0;
-  common::ObArray<uint64_t> drop_ug_id_array;
   bool specify_tenant_id = OB_INVALID_TENANT_ID != arg.tenant_id_;
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(check_inner_stat())) {
@@ -5250,8 +5407,7 @@ int ObTenantDDLService::drop_tenant(const ObDropTenantArg &arg)
         }
       }
       if (OB_FAIL(ret)) {
-      } else if (OB_FAIL(drop_resource_pool_pre(
-              user_tenant_id, drop_ug_id_array, pool_names, trans))) {
+      } else if (OB_FAIL(drop_resource_pool_pre(user_tenant_id, pool_names, trans))) {
         LOG_WARN("fail to drop resource pool pre", KR(ret));
       } else if (OB_FAIL(ddl_operator.drop_tenant(user_tenant_id, trans, &arg.ddl_stmt_str_))) {
         LOG_WARN("ddl_operator drop_tenant failed", K(user_tenant_id), KR(ret));
@@ -5259,6 +5415,8 @@ int ObTenantDDLService::drop_tenant(const ObDropTenantArg &arg)
         LOG_WARN("ddl_operator drop_tenant failed", K(meta_tenant_id), KR(ret));
       } else if (OB_FAIL(try_drop_meta_ls_(meta_tenant_id, SYS_LS, trans))) {
         LOG_WARN("failed to drop sys ls", KR(ret), K(meta_tenant_id));
+      } else if (OB_FAIL(try_drop_meta_ls_(meta_tenant_id, METADATA_LS, trans))) {
+        LOG_WARN("failed to drop sslog ls", KR(ret), K(meta_tenant_id));
       } else if (OB_FAIL(try_drop_meta_ls_(meta_tenant_id, SSLOG_LS, trans))) {
         LOG_WARN("failed to drop sslog ls", KR(ret), K(meta_tenant_id));
       } else if (tenant_schema->is_in_recyclebin()) {
@@ -5338,9 +5496,7 @@ int ObTenantDDLService::drop_tenant(const ObDropTenantArg &arg)
 
   if (drop_force) {
     if (OB_SUCC(ret) && OB_NOT_NULL(tenant_schema)) {
-      if (OB_FAIL(drop_resource_pool_final(
-              tenant_schema->get_tenant_id(), drop_ug_id_array,
-              pool_names))) {
+      if (OB_FAIL(drop_resource_pool_final(tenant_schema->get_tenant_id(), pool_names))) {
         LOG_WARN("fail to drop resource pool finsl", KR(ret), KPC(tenant_schema));
       }
     }
@@ -5926,6 +6082,7 @@ int ObTenantDDLService::init_tenant_global_stat_(
     LOG_WARN("failed to check_inner_stat", KR(ret));
   } else {
     const int64_t core_schema_version = OB_CORE_SCHEMA_VERSION + 1;
+    const int64_t sys_schema_version = OB_CORE_SCHEMA_VERSION + 1;
     const int64_t baseline_schema_version = OB_INVALID_VERSION;
     const int64_t ddl_epoch = 0;
     const SCN snapshot_gc_scn  = SCN::min_scn();
@@ -5952,7 +6109,7 @@ int ObTenantDDLService::init_tenant_global_stat_(
         ret = OB_ENTRY_NOT_EXIST;
         LOG_WARN("compatible version not defined", KR(ret), K(tenant_id), K(init_configs));
       } else if (OB_FAIL(global_stat_proxy.set_tenant_init_global_stat(
-              core_schema_version, baseline_schema_version,
+              core_schema_version, sys_schema_version, baseline_schema_version,
               snapshot_gc_scn, ddl_epoch, data_version, data_version, data_version))) {
         LOG_WARN("fail to set tenant init global stat", KR(ret), K(tenant_id),
             K(core_schema_version), K(baseline_schema_version),
@@ -6087,11 +6244,13 @@ int ObTenantDDLService::create_tenant_check_(const obrpc::ObCreateTenantArg &arg
     } else if (tenant_exist) {
       if (arg.if_not_exist_) {
         ret = OB_SUCCESS;
-        LOG_USER_NOTE(OB_TENANT_EXIST, to_cstring(tenant_name));
+        ObCStringHelper helper;
+        LOG_USER_NOTE(OB_TENANT_EXIST, helper.convert(tenant_name));
         LOG_INFO("tenant already exists, not need to create", KR(ret), K(tenant_name));
       } else {
         ret = OB_TENANT_EXIST;
-        LOG_USER_ERROR(OB_TENANT_EXIST, to_cstring(tenant_name));
+        ObCStringHelper helper;
+        LOG_USER_ERROR(OB_TENANT_EXIST, helper.convert(tenant_name));
         LOG_WARN("tenant already exists", KR(ret), K(tenant_name));
       }
     } else {

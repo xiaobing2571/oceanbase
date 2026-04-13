@@ -19,6 +19,10 @@
 #include "storage/shared_storage/prewarm/ob_mc_prewarm_struct.h"
 #include "mittest/shared_storage/clean_residual_data.h"
 #include "storage/shared_storage/ob_file_helper.h"
+#include "mittest/shared_storage/test_ss_macro_cache_mgr_util.h"
+#include "unittest/storage/test_dml_common.h"
+#include "storage/test_tablet_helper.h"
+#include "storage/shared_storage/ob_ss_object_access_util.h"
 #undef private
 #undef protected
 
@@ -81,20 +85,40 @@ public:
   virtual void SetUp();
   virtual void TearDown();
   void generate_shared_major_data_macro(const int64_t tablet_id);
+  void create_and_get_tablet(ObArenaAllocator &arena_allocator, const int64_t tablet_id, ObTabletHandle &tablet_handle);
 
 public:
   const int64_t THREAD_CNT = 4;
+  static const int64_t TEST_LS_ID = 1001;
 };
 
 void TestSSMCPrewarmStruct::SetUpTestCase()
 {
   GCTX.startup_mode_ = observer::ObServerMode::SHARED_STORAGE_MODE;
   EXPECT_EQ(OB_SUCCESS, MockTenantModuleEnv::get_instance().init());
+  ASSERT_EQ(OB_SUCCESS, TestSSMacroCacheMgrUtil::wait_macro_cache_ckpt_replay());
+
+  const ObLSID ls_id(TEST_LS_ID);
+  ObCreateLSArg arg;
+  ASSERT_EQ(OB_SUCCESS, gen_create_ls_arg(MTL_ID(), ls_id, arg));
+  ObLSService *ls_service = MTL(ObLSService *);
+  ASSERT_NE(nullptr, ls_service);
+  ASSERT_EQ(OB_SUCCESS, ls_service->create_ls(arg));
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::SS_PREWARM_MOD));
+  ObLS *ls = ls_handle.get_ls();
+  ASSERT_NE(nullptr, ls);
 }
 
 void TestSSMCPrewarmStruct::TearDownTestCase()
 {
   int ret = OB_SUCCESS;
+
+  const ObLSID ls_id(TEST_LS_ID);
+  ObLSService *ls_service = MTL(ObLSService *);
+  ASSERT_NE(nullptr, ls_service);
+  ASSERT_EQ(OB_SUCCESS, ls_service->remove_ls(ls_id));
+
   if (OB_FAIL(ResidualDataCleanerHelper::clean_in_mock_env())) {
       LOG_WARN("failed to clean residual data", KR(ret));
   }
@@ -138,6 +162,7 @@ void TestSSMCPrewarmStruct::generate_shared_major_data_macro(const int64_t table
     write_info.size_ = WRITE_IO_SIZE;
     write_info.io_timeout_ms_ = DEFAULT_IO_WAIT_TIME_MS;
     write_info.mtl_tenant_id_ = MTL_ID();
+    write_info.write_strategy_ = ObStorageObjectWriteStrategy::WRITE_THROUGH;
 
     // write
     MacroBlockId macro_id;
@@ -148,10 +173,27 @@ void TestSSMCPrewarmStruct::generate_shared_major_data_macro(const int64_t table
     ASSERT_TRUE(macro_id.is_valid());
     ObStorageObjectHandle object_handle;
     ASSERT_EQ(OB_SUCCESS, object_handle.set_macro_block_id(macro_id));
-    ObSSShareMacroWriter share_macro_writer;
-    ASSERT_EQ(OB_SUCCESS, share_macro_writer.aio_write(write_info, object_handle));
+    ASSERT_EQ(OB_SUCCESS, ObSSObjectAccessUtil::async_write_file(write_info, object_handle));
     ASSERT_EQ(OB_SUCCESS, object_handle.wait());
   }
+}
+
+void TestSSMCPrewarmStruct::create_and_get_tablet(
+    ObArenaAllocator &arena_allocator,
+    const int64_t tablet_id,
+    ObTabletHandle &tablet_handle)
+{
+  const ObLSID ls_id = ObLSID(TEST_LS_ID);
+  ObLSHandle ls_handle;
+  ObLSService *ls_svr = MTL(ObLSService *);
+  EXPECT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ASSERT_NE(nullptr, ls_handle.get_ls());
+  share::schema::ObTableSchema table_schema;
+  ASSERT_EQ(OB_SUCCESS, build_test_schema(table_schema, tablet_id));
+  ASSERT_EQ(OB_SUCCESS, TestTabletHelper::create_tablet(ls_handle, ObTabletID(tablet_id), table_schema, arena_allocator));
+  ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(ObTabletID(tablet_id), tablet_handle));
+  ASSERT_NE(nullptr, tablet_handle.get_obj());
+  ASSERT_EQ(tablet_id, tablet_handle.get_obj()->get_tablet_meta().tablet_id_.id());
 }
 
 TEST_F(TestSSMCPrewarmStruct, serialize)
@@ -235,11 +277,13 @@ TEST_F(TestSSMCPrewarmStruct, serialize)
 
 TEST_F(TestSSMCPrewarmStruct, parallel_append_hot_macro_infos)
 {
+  const ObLSID ls_id = ObLSID(TEST_LS_ID);
   const int64_t tablet_id = 200001;
   generate_shared_major_data_macro(tablet_id);
 
   const int64_t compaction_scn = 1711086717622000;
-  ObHotTabletInfoDataWriter hot_tablet_info_writer(tablet_id, compaction_scn);
+  const SCN reorganization_scn = SCN::base_scn();
+  ObHotTabletInfoDataWriter hot_tablet_info_writer(tablet_id, compaction_scn, reorganization_scn);
 
   TestSSMCPrewarmStruct::TestHotTabletInfoWriterThread threads(ObTenantEnv::get_tenant(),
                                                                &hot_tablet_info_writer);
@@ -250,7 +294,11 @@ TEST_F(TestSSMCPrewarmStruct, parallel_append_hot_macro_infos)
 
   ASSERT_EQ(OB_SUCCESS, hot_tablet_info_writer.complete());
 
-  ObHotTabletInfoReader hot_tablet_info_reader(tablet_id, compaction_scn, 100/*prewarm_percent*/);
+  ObSSTable fake_sstable;
+  ObTabletHandle tablet_handle;
+  ObArenaAllocator arena_allocator;
+  create_and_get_tablet(arena_allocator, tablet_id, tablet_handle);
+  ObHotTabletInfoReader hot_tablet_info_reader(compaction_scn, reorganization_scn, tablet_handle, fake_sstable);
   ASSERT_EQ(OB_SUCCESS, hot_tablet_info_reader.load_hot_macro_infos());
 
   int64_t total_micro_cnt = 0;
@@ -261,45 +309,16 @@ TEST_F(TestSSMCPrewarmStruct, parallel_append_hot_macro_infos)
   ASSERT_NE(nullptr, micro_cache);
   ObSSMicroCacheStat &micro_cache_stat = micro_cache->get_micro_cache_stat();
   ObSSMicroCachePrewarmStat &prewarm_stat = micro_cache_stat.prewarm_stat_;
-  ASSERT_EQ(total_micro_cnt, prewarm_stat.major_compaction_add_cnt_);
-}
-
-TEST_F(TestSSMCPrewarmStruct, prewarm_50_percent_data)
-{
-  const int64_t tablet_id = 200002;
-  generate_shared_major_data_macro(tablet_id);
-
-  const int64_t compaction_scn = 1711086717622000;
-  ObHotTabletInfoDataWriter hot_tablet_info_writer(tablet_id, compaction_scn);
-
-  TestSSMCPrewarmStruct::TestHotTabletInfoWriterThread threads(ObTenantEnv::get_tenant(),
-                                                               &hot_tablet_info_writer);
-  threads.set_thread_count(THREAD_CNT);
-  threads.start();
-  threads.wait();
-  threads.destroy();
-
-  ASSERT_EQ(OB_SUCCESS, hot_tablet_info_writer.complete());
-
-  ObHotTabletInfoReader hot_tablet_info_reader(tablet_id, compaction_scn, 50/*prewarm_percent*/);
-  ASSERT_EQ(OB_SUCCESS, hot_tablet_info_reader.load_hot_macro_infos());
-
-  int64_t total_micro_cnt = 0;
-  for (int64_t i = 0; i < THREAD_CNT; ++i) {
-    total_micro_cnt += (ObHotTabletInfoReader::AGGREGATED_READ_THRESHOLD - 1 + i);
-  }
-  ObSSMicroCache *micro_cache = MTL(ObSSMicroCache *);
-  ASSERT_NE(nullptr, micro_cache);
-  ObSSMicroCacheStat &micro_cache_stat = micro_cache->get_micro_cache_stat();
-  ObSSMicroCachePrewarmStat &prewarm_stat = micro_cache_stat.prewarm_stat_;
-  ASSERT_EQ(total_micro_cnt / 2, prewarm_stat.major_compaction_add_cnt_);
+  ASSERT_EQ(total_micro_cnt, prewarm_stat.major_compaction_pwm_stat_.add_cnt());
 }
 
 TEST_F(TestSSMCPrewarmStruct, empty_hot_macro_infos)
 {
+  const ObLSID ls_id = ObLSID(TEST_LS_ID);
   const int64_t tablet_id = 200003;
   const int64_t compaction_scn = 1711086717622000;
-  ObHotTabletInfoDataWriter hot_tablet_info_writer(tablet_id, compaction_scn);
+  const SCN reorganization_scn = SCN::base_scn();
+  ObHotTabletInfoDataWriter hot_tablet_info_writer(tablet_id, compaction_scn, reorganization_scn);
   ASSERT_EQ(OB_SUCCESS, hot_tablet_info_writer.complete());
 
   ObBackupIoAdapter io_adapter;
@@ -310,14 +329,15 @@ TEST_F(TestSSMCPrewarmStruct, empty_hot_macro_infos)
             ObStorageUsedType::TYPE::USED_TYPE_DATA, device_config));
   ASSERT_EQ(OB_SUCCESS, get_storage_type_from_path(device_config.path_, type));
   ASSERT_EQ(OB_SUCCESS, storage_info.set(type, device_config.endpoint_, device_config.access_info_,
-                                         device_config.extension_));
+                                         device_config.extension_, OB_INVALID_DEST_ID));
 
   // expect there is no prewarm data and index file
   ObTenantFileManager *file_manager = nullptr;
   ASSERT_NE(nullptr, file_manager = MTL(ObTenantFileManager *));
   ObStorageObjectHandle data_object_handle;
   ObStorageObjectOpt data_storage_opt;
-  data_storage_opt.set_ss_major_prewarm_opt(ObStorageObjectType::MAJOR_PREWARM_DATA, tablet_id, compaction_scn);
+  data_storage_opt.set_ss_major_prewarm_opt(ObStorageObjectType::MAJOR_PREWARM_DATA, tablet_id,
+                                            compaction_scn, reorganization_scn.get_val_for_sql());
   ASSERT_EQ(OB_SUCCESS, OB_STORAGE_OBJECT_MGR.alloc_object(data_storage_opt, data_object_handle));
   ObPathContext ctx;
   ASSERT_EQ(OB_SUCCESS, ctx.set_file_ctx(data_object_handle.get_macro_id(), 0/*ls_epoch_id*/, false/*is_local_cache*/));
@@ -329,21 +349,26 @@ TEST_F(TestSSMCPrewarmStruct, empty_hot_macro_infos)
   index_file_path[0] = '\0';
   ObStorageObjectHandle index_object_handle;
   ObStorageObjectOpt index_storage_opt;
-  index_storage_opt.set_ss_major_prewarm_opt(ObStorageObjectType::MAJOR_PREWARM_DATA, tablet_id, compaction_scn);
+  index_storage_opt.set_ss_major_prewarm_opt(ObStorageObjectType::MAJOR_PREWARM_DATA, tablet_id,
+                                             compaction_scn, reorganization_scn.get_val_for_sql());
   ASSERT_EQ(OB_SUCCESS, OB_STORAGE_OBJECT_MGR.alloc_object(index_storage_opt, index_object_handle));
   ASSERT_EQ(OB_SUCCESS, ctx.set_file_ctx(index_object_handle.get_macro_id(), 0/*ls_epoch_id*/, false/*is_local_cache*/));
   bool is_index_file_exist = false;
   ASSERT_EQ(OB_SUCCESS, io_adapter.is_exist(ctx.get_path(), &storage_info, is_index_file_exist));
   ASSERT_FALSE(is_index_file_exist);
 
-  ObHotTabletInfoReader hot_tablet_info_reader(tablet_id, compaction_scn, 100/*prewarm_percent*/);
+  ObSSTable fake_sstable;
+  ObTabletHandle tablet_handle;
+  ObArenaAllocator arena_allocator;
+  create_and_get_tablet(arena_allocator, tablet_id, tablet_handle);
+  ObHotTabletInfoReader hot_tablet_info_reader(compaction_scn, reorganization_scn, tablet_handle, fake_sstable);
   ASSERT_EQ(OB_SUCCESS, hot_tablet_info_reader.load_hot_macro_infos());
 
   ObSSMicroCache *micro_cache = MTL(ObSSMicroCache *);
   ASSERT_NE(nullptr, micro_cache);
   ObSSMicroCacheStat &micro_cache_stat = micro_cache->get_micro_cache_stat();
   ObSSMicroCachePrewarmStat &prewarm_stat = micro_cache_stat.prewarm_stat_;
-  ASSERT_EQ(0, prewarm_stat.major_compaction_add_cnt_);
+  ASSERT_EQ(0, prewarm_stat.major_compaction_pwm_stat_.add_cnt());
 }
 
 

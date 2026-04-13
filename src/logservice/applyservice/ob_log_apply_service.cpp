@@ -311,10 +311,10 @@ int ObApplyStatus::init(const share::ObLSID &id,
       try_wrlock_debug_time_ = OB_INVALID_TIMESTAMP;
       IGNORE_RETURN new (&fs_cb_) ObApplyFsCb(this);
       is_in_stop_state_ = false;
+      is_inited_ = true;
       if (OB_FAIL(palf_handle_->register_file_size_cb(&fs_cb_))) {
         CLOG_LOG(ERROR, "failed to register cb", K(ret), K(id));
       } else {
-        is_inited_ = true;
         CLOG_LOG(INFO, "apply status init success", K(ret), KPC(this), KP(&cb_append_stat_),
                  KP(&cb_wait_thread_stat_), KP(&cb_wait_commit_stat_), KP(&cb_execute_stat_));
       }
@@ -476,7 +476,7 @@ int ObApplyStatus::try_handle_cb_queue(ObApplyServiceQueueTask *cb_queue,
         CLOG_LOG(ERROR, "cb is NULL", KPC(cb_queue), KPC(this), K(ret));
       } else if ((lsn = cb->__get_lsn()).val_ < ATOMIC_LOAD(&palf_committed_end_lsn_.val_)) {
         // 小于确认日志位点的cb可以回调on_success
-        ObDIActionGuard(cb->get_cb_name());
+        ObDIActionGuard di_action_guard(cb->get_cb_name());
         if (OB_FAIL(cb_queue->pop())) {
           CLOG_LOG(ERROR, "cb_queue pop failed", KPC(cb_queue), KPC(this), K(ret));
         } else {
@@ -624,6 +624,17 @@ int ObApplyStatus::update_palf_committed_end_lsn(const palf::LSN &end_lsn,
       if (is_in_stop_state_) {
         //skip
         CLOG_LOG(WARN, "apply status has been stopped", K(ret), KPC(this));
+      } else if (proposal_id < curr_proposal_id) {
+        if (!GCONF.enable_logservice) {
+            // proposal_id can not recede
+            ret = OB_ERR_UNEXPECTED;
+            CLOG_LOG(ERROR, "invalid proposal_id", K(end_lsn), K(proposal_id), K(curr_proposal_id), KPC(this));
+        } else if (palf_committed_end_lsn_ > end_lsn) {
+            // for logservice, proposal_id may recede, but committed_end_lsn can not recede
+            ret = OB_ERR_UNEXPECTED;
+            CLOG_LOG(ERROR, "invalid new end_lsn", K(end_lsn), K(proposal_id), K(curr_proposal_id), KPC(this));
+        }
+
       } else if (proposal_id == curr_proposal_id && LEADER == role_) {
         if (palf_committed_end_lsn_ > end_lsn) {
           CLOG_LOG(ERROR, "invalid new end_lsn", KPC(this), K(proposal_id), K(end_lsn));
@@ -636,8 +647,7 @@ int ObApplyStatus::update_palf_committed_end_lsn(const palf::LSN &end_lsn,
             CLOG_LOG(ERROR, "submit_task_to_apply_service_ failed", KPC(this), K(ret), K(proposal_id), K(end_lsn));
           }
         }
-      } else if ((proposal_id == curr_proposal_id && FOLLOWER == role_)
-                 || proposal_id < curr_proposal_id) {
+      } else if (!GCONF.enable_logservice && proposal_id == curr_proposal_id && FOLLOWER == role_) {
         // apply切为follower之后, 同proposal_id的日志不应该还能滑出
         ret = OB_ERR_UNEXPECTED;
         CLOG_LOG(ERROR, "invalid new end_lsn", KPC(this), K(proposal_id), K(end_lsn));
@@ -989,22 +999,9 @@ void ObApplyStatusGuard::set_apply_status_(ObApplyStatus *apply_status)
 }
 
 //---------------ObLogApplyService---------------//
-bool ObLogApplyService::GetApplyStatusFunctor::operator()(const share::ObLSID &id,
-                                                          ObApplyStatus *apply_status)
-{
-  int ret = OB_SUCCESS;
-  if (OB_ISNULL(apply_status)) {
-    ret = OB_ERR_UNEXPECTED;
-    CLOG_LOG(WARN, "apply status is NULL", K(id), KR(ret));
-  } else {
-    guard_.set_apply_status_(apply_status);
-  }
-  ret_code_ = ret;
-  return OB_SUCCESS == ret;
-}
 
-bool ObLogApplyService::RemoveApplyStatusFunctor::operator()(const share::ObLSID &id,
-                                                             ObApplyStatus *apply_status)
+bool ObLogApplyService::RemoveApplyStatusFunctor::operator()(const palf::LSKey &id,
+                                                            ObApplyStatus *apply_status)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(apply_status)) {
@@ -1012,16 +1009,12 @@ bool ObLogApplyService::RemoveApplyStatusFunctor::operator()(const share::ObLSID
     CLOG_LOG(WARN, "apply status is NULL", K(id), KR(ret));
   } else if (OB_FAIL(apply_status->unregister_file_size_cb())) {
     CLOG_LOG(ERROR, "apply_status unregister_file_size_cb failed", K(ret), K(id));
-  } else if (0 == apply_status->dec_ref()) {
-    CLOG_LOG(INFO, "free apply status", KPC(apply_status));
-    apply_status->~ObApplyStatus();
-    mtl_free(apply_status);
   }
   ret_code_ = ret;
   return OB_SUCCESS == ret;
 }
 
-bool ObLogApplyService::ResetApplyStatusFunctor::operator()(const share::ObLSID &id,
+bool ObLogApplyService::ResetApplyStatusFunctor::operator()(const palf::LSKey &id,
                                                             ObApplyStatus *apply_status)
 {
   int ret = OB_SUCCESS;
@@ -1032,10 +1025,20 @@ bool ObLogApplyService::ResetApplyStatusFunctor::operator()(const share::ObLSID 
     CLOG_LOG(ERROR, "apply_status handle_drop_cb failed", K(ret), K(id));
   } else if (OB_FAIL(apply_status->unregister_file_size_cb())) {
     CLOG_LOG(ERROR, "apply_status unregister_file_size_cb failed", K(ret), K(id));
-  } else if (0 == apply_status->dec_ref()) {
-    CLOG_LOG(INFO, "free apply status", KPC(apply_status));
-    apply_status->~ObApplyStatus();
-    mtl_free(apply_status);
+  }
+  ret_code_ = ret;
+  return OB_SUCCESS == ret;
+}
+
+bool ObLogApplyService::StatApplyStatusFunctor::operator()(const palf::LSKey &id,
+                                                            ObApplyStatus *apply_status)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(apply_status)) {
+    ret = OB_ERR_UNEXPECTED;
+    CLOG_LOG(WARN, "apply status is NULL", K(id), KR(ret));
+  } else if (OB_FAIL(func_(*apply_status))) {
+    CLOG_LOG(WARN, "iter apply stat failed", K(ret));
   }
   ret_code_ = ret;
   return OB_SUCCESS == ret;
@@ -1146,10 +1149,14 @@ int ObLogApplyService::add_ls(const share::ObLSID &id)
 {
   int ret = OB_SUCCESS;
   ObApplyStatus *apply_status = NULL;
+  LSKey hash_map_key(id.id());
   ObMemAttr attr(MTL_ID(), ObModIds::OB_LOG_APPLY_STATUS);
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     CLOG_LOG(ERROR, "apply service not init", K(ret));
+  } else if (OB_UNLIKELY(!id.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    CLOG_LOG(ERROR, "Invalid argument", K(id));
   } else if (false == ATOMIC_LOAD(&is_running_)) {
     ret = OB_STATE_NOT_MATCH;
     CLOG_LOG(ERROR, "apply service has been stopped", K(ret));
@@ -1164,10 +1171,11 @@ int ObLogApplyService::add_ls(const share::ObLSID &id)
       CLOG_LOG(WARN, "failed to init apply status", K(ret), K(id), K(palf_env_), K(this));
     } else {
       apply_status->inc_ref();
-      if (OB_FAIL(apply_status_map_.insert(id, apply_status))) {
+      if (OB_FAIL(apply_status_map_.insert_and_get(hash_map_key, apply_status))) {
         CLOG_LOG(ERROR, "insert apply status failed", K(ret), K(id), KPC(apply_status));
         revert_apply_status(apply_status);
       } else {
+        apply_status_map_.revert(apply_status);
         CLOG_LOG(TRACE, "add_ls success", K(ret), K(id), KPC(apply_status));
       }
     }
@@ -1179,10 +1187,21 @@ int ObLogApplyService::remove_ls(const share::ObLSID &id)
 {
   int ret = OB_SUCCESS;
   RemoveApplyStatusFunctor functor;
+  LSKey hash_map_key(id.id());
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     CLOG_LOG(ERROR, "apply service not init", K(ret));
-  } else if (OB_FAIL(apply_status_map_.erase_if(id, functor))) {
+  } else if (OB_UNLIKELY(!id.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    CLOG_LOG(WARN, "invalid argument", K(id));
+  } else if (OB_FAIL(apply_status_map_.operate(hash_map_key, functor))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      CLOG_LOG(WARN, "apply service remove ls failed", K(ret), K(id));
+      ret = OB_SUCCESS;
+    } else {
+      CLOG_LOG(ERROR, "apply service remove ls failed", K(ret), K(id));
+    }
+  } else if (OB_FAIL(apply_status_map_.del(hash_map_key))) {
     if (OB_ENTRY_NOT_EXIST == ret) {
       CLOG_LOG(WARN, "apply service remove ls failed", K(ret), K(id));
       ret = OB_SUCCESS;
@@ -1325,14 +1344,22 @@ int ObLogApplyService::get_apply_status(const share::ObLSID &id,
                                         ObApplyStatusGuard &guard)
 {
   int ret = OB_SUCCESS;
-  GetApplyStatusFunctor functor(guard);
+  LSKey hash_map_key(id.id());
+  ObApplyStatus *apply_status = NULL;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     CLOG_LOG(WARN, "ObLogApplyServicenot init", K(ret));
-  } else if (OB_FAIL(apply_status_map_.operate(id, functor))) {
+  } else if (OB_UNLIKELY(!id.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    CLOG_LOG(ERROR, "Invalid argument", K(id));
+  } else if (OB_FAIL(apply_status_map_.get(hash_map_key, apply_status))) {
     CLOG_LOG(WARN, "get_apply_statusfailed", K(ret), K(id));
   } else {
+    guard.set_apply_status_(apply_status);
     CLOG_LOG(TRACE, "get_apply_status success", K(ret), K(id));
+  }
+  if (NULL != apply_status) {
+    apply_status_map_.revert(apply_status);
   }
   return ret;
 }
@@ -1448,16 +1475,17 @@ int ObLogApplyService::wait_append_sync(const share::ObLSID &ls_id)
 
 int ObLogApplyService::stat_for_each(const common::ObFunction<int (const ObApplyStatus &)> &func)
 {
-  auto stat_func = [&func](const share::ObLSID &id, ObApplyStatus *apply_status) -> bool {
-    int ret = OB_SUCCESS;
-    bool bret = true;
-    if (OB_FAIL(func(*apply_status))) {
-      bret = false;
-      CLOG_LOG(WARN, "iter apply stat failed", K(ret));
-    }
-    return bret;
-  };
-  return apply_status_map_.for_each(stat_func);
+  StatApplyStatusFunctor functor(func);
+  int ret = OB_SUCCESS;
+  if (false == ATOMIC_LOAD(&is_running_)) {
+    CLOG_LOG(WARN, "apply service has been stopped");
+  } else if (!func.is_valid()) {
+    // ObFunction will be invalid when allocating memory failed.
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    ret = apply_status_map_.for_each(functor);
+  }
+  return ret;
 }
 
 int ObLogApplyService::diagnose(const share::ObLSID &id,
@@ -1513,7 +1541,7 @@ int ObLogApplyService::remove_all_ls_()
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     CLOG_LOG(WARN, "apply service not init", K(ret));
-  } else if (OB_FAIL(apply_status_map_.for_each(functor))) {
+  } else if (OB_FAIL(apply_status_map_.remove_if(functor))) {
     CLOG_LOG(ERROR, "apply service remove all ls failed", K(ret));
   } else {
     CLOG_LOG(INFO, "apply service remove all ls");

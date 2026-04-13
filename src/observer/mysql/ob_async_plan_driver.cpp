@@ -15,6 +15,7 @@
 #include "ob_async_plan_driver.h"
 
 #include "observer/mysql/obmp_query.h"
+#include "observer/mysql/obmp_utils.h"
 
 namespace oceanbase
 {
@@ -56,6 +57,12 @@ int ObAsyncPlanDriver::response_result(ObMySQLResultSet &result)
   } else {
     // open 成功，允许异步回包
     result.set_end_trans_async(true);
+  }
+  OX (session_.reset_top_query_string());
+  session_.set_top_trace_id(nullptr);
+  int tmp_ret = ObMPUtils::try_add_changed_package_info(session_, result.get_exec_context());
+  if (tmp_ret != OB_SUCCESS) {
+    LOG_WARN("failed to add changed package info", K(tmp_ret));
   }
 
   if (OB_SUCCESS != ret) {

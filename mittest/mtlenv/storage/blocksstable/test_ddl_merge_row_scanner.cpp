@@ -73,7 +73,7 @@ TestDDLMergeRowScanner::TestDDLMergeRowScanner()
 {
   is_ddl_merge_data_ = true;
   max_row_cnt_ = 150000;
-  max_partial_row_cnt_ = 77873;
+  max_partial_row_cnt_ = 76697;
   co_sstable_row_offset_ = max_partial_row_cnt_ - 1;
   partial_kv_start_idx_ = 3;
 }
@@ -216,17 +216,18 @@ void TestDDLMergeRowScanner::test_single_case(
 
     ASSERT_EQ(OB_SUCCESS, ret);
     if (index < row_cnt_) {
+      ObCStringHelper helper;
       ret = scanner.inner_get_next_row(prow);
       ASSERT_EQ(OB_SUCCESS, ret) << i << "index: " << index << " start: " << start
           << " end: " << end << " prow: " << prow;
       ASSERT_TRUE(row == *prow) << i << "index: " << index << " start: " << start
-          << " end: " << end << " prow: " << prow;
+          << " end: " << end << " prow: " << prow << " row: " << helper.convert(&row);
 
       ret = merge_ddl_scanner.inner_get_next_row(kv_prow);
       ASSERT_EQ(OB_SUCCESS, ret) << i << "index: " << index << " start: " << start
-          << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
+          << " end: " << end << " kv_prow: " << helper.convert(kv_prow);
       ASSERT_TRUE(row == *kv_prow) << i << "index: " << index << " start: " << start
-          << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
+          << " end: " << end << " kv_prow: " << helper.convert(kv_prow) << " row: " << helper.convert(&row);
     }
   }
   ASSERT_EQ(OB_ITER_END, scanner.inner_get_next_row(prow));
@@ -320,10 +321,11 @@ void TestDDLMergeRowScanner::test_full_case(
       ASSERT_TRUE(row == *prow) << i << "index: " << index << " start: " << start
           << " end: " << end << " prow: " << prow;
       ret = merge_ddl_scanner.inner_get_next_row(kv_prow);
+      ObCStringHelper helper;
       ASSERT_EQ(OB_SUCCESS, ret) << i << "index: " << index << " start: " << start
-          << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
+          << " end: " << end << " kv_prow: " << helper.convert(kv_prow);
       ASSERT_TRUE(row == *kv_prow) << i << "index: " << index << " start: " << start
-          << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
+          << " end: " << end << " kv_prow: " << helper.convert(kv_prow);
     }
   }
   ASSERT_EQ(OB_ITER_END, scanner.inner_get_next_row(prow));
@@ -361,10 +363,11 @@ void TestDDLMergeRowScanner::test_full_case(
         ASSERT_TRUE(row == *prow) << i << "index: " << index << " start: " << start
             << " end: " << end << " prow: " << prow;
         ret = merge_ddl_scanner.inner_get_next_row(kv_prow);
+        ObCStringHelper helper;
         ASSERT_EQ(OB_SUCCESS, ret) << i << "index: " << index << " start: " << start
-            << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
+            << " end: " << end << " kv_prow: " << helper.convert(kv_prow);
         ASSERT_TRUE(row == *kv_prow) << i << "index: " << index << " start: " << start
-            << " end: " << end << " kv_prow: " << to_cstring(kv_prow);
+            << " end: " << end << " kv_prow: " << helper.convert(kv_prow);
       }
     }
     ASSERT_EQ(OB_ITER_END, scanner.inner_get_next_row(prow));

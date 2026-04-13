@@ -325,8 +325,8 @@ int ObSSTableSecMetaIterator::open_next_micro_block(MacroBlockId &macro_id)
   } else if (OB_UNLIKELY(!micro_data.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Invalid micro block data", K(ret), K(micro_data));
-  } else if (OB_FAIL(micro_reader_helper_.get_reader(micro_data.get_store_type(), micro_reader_))) {
-    LOG_WARN("fail to get micro block reader", K(ret), K(micro_data.get_store_type()));
+  } else if (OB_FAIL(micro_reader_helper_.get_reader(*micro_data.get_micro_header(), micro_reader_))) {
+    LOG_WARN("fail to get micro block reader", K(ret), "header", *micro_data.get_micro_header());
   } else if (OB_FAIL(micro_reader_->init(micro_data, &(rowkey_read_info_->get_datum_utils())))) {
     LOG_WARN("Fail to init micro block reader", K(ret));
   } else if (OB_FAIL(micro_reader_->get_row_count(row_cnt))) {
@@ -377,8 +377,8 @@ int ObSSTableSecMetaIterator::open_meta_root_block()
   if (OB_UNLIKELY(!micro_data.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Invalid micro block data", K(ret), K(micro_data));
-  } else if (OB_FAIL(micro_reader_helper_.get_reader(micro_data.get_store_type(), micro_reader_))) {
-    LOG_WARN("fail to get micro block reader", K(ret), K(micro_data.get_store_type()));
+  } else if (OB_FAIL(micro_reader_helper_.get_reader(*micro_data.get_micro_header(), micro_reader_))) {
+    LOG_WARN("fail to get micro block reader", K(ret), "header", *micro_data.get_micro_header());
   } else if (OB_FAIL(micro_reader_->init(micro_data, &(rowkey_read_info_->get_datum_utils())))) {
     LOG_WARN("Fail to init micro block reader", K(ret));
   } else if (OB_FAIL(micro_reader_->get_row_count(row_cnt))) {
@@ -533,6 +533,8 @@ int ObSSTableSecMetaIterator::get_micro_block(
             macro_id,
             idx_info,
             prefetch_flag_.is_use_block_cache(),
+            // Note: no need to pass effective_tablet_id for ObSSTableSecMetaIterator
+            ObTabletID(ObTabletID::INVALID_TABLET_ID)/*effective_tablet_id*/,
             data_handle.io_handle_,
             &io_allocator_))) {
           LOG_WARN("Fail to prefetch with async io", K(ret));

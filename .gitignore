@@ -25,6 +25,7 @@
 .auth_file
 .auth_file
 .autotools
+.clangd
 .clang_complete
 .configured
 .configured
@@ -40,6 +41,7 @@
 .pydevproject
 .review/
 .vscode/
+.cursor/
 /.obdev
 /.settings/
 BROWSE
@@ -185,6 +187,18 @@ src/pl/parser/pl_parser_mysql_mode.output
 src/pl/parser/pl_parser_oracle_mode.output
 src/share/inner_table/sys_package/syspack_source.cpp
 src/share/inner_table/sys_package/*.plw
+src/share/parameter/standalone_default_parameter.json
+src/share/parameter/shared_storage_default_parameter.json
+src/share/system_variable/standalone_default_system_variable.json
+src/share/system_variable/shared_storage_default_system_variable.json
+src/observer/dbms_scheduler/parser/_gen_parser.output
+src/observer/dbms_scheduler/parser/_gen_parser.error
+src/observer/dbms_scheduler/parser/_MD5
+src/observer/dbms_scheduler/parser/dbms_sched_parser_calendar_lex.c
+src/observer/dbms_scheduler/parser/dbms_sched_parser_calendar_lex.h
+src/observer/dbms_scheduler/parser/dbms_sched_parser_calendar_tab.c
+src/observer/dbms_scheduler/parser/dbms_sched_parser_calendar_tab.h
+src/observer/dbms_scheduler/parser/dbms_sched_parser_calendar.output
 
 ############# close_modules #############
 close_modules/oracle_pl/pl/parser/*.output
@@ -216,10 +230,12 @@ tools/deploy/debug/
 tools/deploy/dooba.py
 tools/deploy/etc/
 tools/deploy/focus_*
+tools/deploy/home/admin/
 tools/deploy/lib
 tools/deploy/lib/
 tools/deploy/list
 tools/deploy/log/
+tools/deploy/openlogic-openjdk-*
 tools/deploy/usr/
 tools/deploy/mysql_test/java/mytest.jar
 tools/deploy/mysql_test/r/*.reject

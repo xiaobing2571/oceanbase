@@ -33,7 +33,8 @@ public:
       const ObBatchExecParamType type,
       const share::ObLSID &ls_id,
       const int64_t merge_version,
-      const int64_t batch_size = DEFAULT_BATCH_SIZE);
+      const int64_t batch_size = DEFAULT_BATCH_SIZE,
+      const int64_t loop_cnt = 0);
   virtual ~ObBatchExecParam() { tablet_info_array_.reset(); }
   bool is_valid() const override { return ls_id_.is_valid() && compaction_scn_ > 0 && tablet_info_array_.count() > 0; }
   int assign(const ObBatchExecParam &other);
@@ -50,7 +51,7 @@ public:
   {
     tablet_info_array_.reset();
   }
-  VIRTUAL_TO_STRING_KV(K_(param_type), K_(ls_id), K_(compaction_scn), "tablet_id_cnt", tablet_info_array_.count(), K_(tablet_info_array));
+  VIRTUAL_TO_STRING_KV(K_(param_type), K_(ls_id), K_(compaction_scn), "tablet_id_cnt", tablet_info_array_.count(), K_(tablet_info_array), K_(loop_cnt));
 public:
   static constexpr int64_t DEFAULT_BATCH_SIZE = 128;
   static constexpr int64_t DEFAULT_ARRAY_SIZE = 64;
@@ -58,6 +59,7 @@ public:
   share::ObLSID ls_id_;
   int64_t compaction_scn_;
   int64_t batch_size_;
+  int64_t loop_cnt_;
   common::ObSEArray<ITEM, DEFAULT_ARRAY_SIZE> tablet_info_array_;
 };
 
@@ -86,7 +88,8 @@ struct ObBatchExecInfo
 struct ObBatchExecCollector
 {
   ObBatchExecCollector()
-    : remain_task_cnt_(0),
+    : lock_(common::ObLatchIds::OB_BATCH_EXEC_COLLECTOR_LOCK),
+      remain_task_cnt_(0),
       info_(),
       merge_history_()
   {}
@@ -109,7 +112,7 @@ public:
   virtual int inner_init() { return OB_SUCCESS; }
   virtual int create_first_task() override;
   virtual bool operator == (const ObIDag &other) const override;
-  virtual int64_t hash() const override { return param_.get_hash(); }
+  virtual uint64_t hash() const override { return param_.get_hash(); }
   virtual int fill_info_param(
       compaction::ObIBasicInfoParam *&out_param,
       ObIAllocator &allocator) const override;
@@ -170,6 +173,7 @@ ObBatchExecParam<ITEM>::ObBatchExecParam(const ObBatchExecParamType type)
     ls_id_(),
     compaction_scn_(0),
     batch_size_(DEFAULT_BATCH_SIZE),
+    loop_cnt_(0),
     tablet_info_array_()
 {
   tablet_info_array_.set_attr(lib::ObMemAttr(MTL_ID(), "BatchArr", ObCtxIds::MERGE_NORMAL_CTX_ID));
@@ -180,11 +184,13 @@ ObBatchExecParam<ITEM>::ObBatchExecParam(
     const ObBatchExecParamType type,
     const share::ObLSID &ls_id,
     const int64_t merge_version,
-    const int64_t batch_size)
+    const int64_t batch_size,
+    const int64_t loop_cnt)
   : param_type_(type),
     ls_id_(ls_id),
     compaction_scn_(merge_version),
     batch_size_(batch_size),
+    loop_cnt_(loop_cnt),
     tablet_info_array_()
 {
   tablet_info_array_.set_attr(lib::ObMemAttr(MTL_ID(), "BatchArr", ObCtxIds::MERGE_NORMAL_CTX_ID));
@@ -203,6 +209,7 @@ int ObBatchExecParam<ITEM>::assign(
     ls_id_ = other.ls_id_;
     compaction_scn_ = other.compaction_scn_;
     batch_size_ = other.batch_size_;
+    loop_cnt_ = other.loop_cnt_;
   }
   return ret;
 }

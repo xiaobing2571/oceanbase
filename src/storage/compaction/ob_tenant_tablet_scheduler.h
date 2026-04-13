@@ -27,6 +27,7 @@
 #include "share/compaction/ob_schedule_batch_size_mgr.h"
 #include "storage/compaction/ob_compaction_schedule_util.h"
 #include "storage/compaction/ob_medium_loop.h"
+#include "storage/compaction/ob_window_loop.h"
 #include "storage/compaction/ob_mview_compaction_util.h"
 #include "storage/column_store/ob_column_store_replica_util.h"
 
@@ -127,7 +128,7 @@ private:
   int inner_clear_flag_(const ObTabletID &tablet_id, const ProhibitFlag &input_flag); // hold lock outside !!
   int64_t transfer_flag_cnt_;
   int64_t split_flag_cnt_;
-  mutable obsys::ObRWLock lock_;
+  mutable obsys::ObRWLock<> lock_;
   common::hash::ObHashMap<ObTabletID, ProhibitFlag> tablet_id_map_; // tablet is used for transfer of medium compaction
 };
 
@@ -192,7 +193,7 @@ public:
       const int64_t prefix_len);
   static bool check_tx_table_ready(ObLS &ls, const share::SCN &check_scn);
   static int fill_minor_compaction_param(
-      const ObTabletHandle &tablet_handle,
+      const ObTablet &tablet,
       const ObGetMergeTablesResult &result,
       const int64_t total_sstable_cnt,
       const int64_t parallel_dag_cnt,
@@ -211,11 +212,14 @@ public:
   static int schedule_tablet_ss_minor_merge(
       ObLSHandle &ls_handle,
       const ObTabletID &tablet_id,
+      ObTabletHandle &local_tablet_handle,
       const share::SCN &transfer_scn);
   static int schedule_tablet_ss_minor_merge(
       const ObMergeType &merge_type,
       ObLSHandle &ls_handle,
-      ObTabletHandle &tablet_handle);
+      ObTabletHandle &tablet_handle,
+      const ObSSTabletTableStoreMetaInfo &table_store_meta_info,
+      bool &scheduled);
 #endif
   static int schedule_tablet_meta_merge(
       ObLSHandle &ls_handle,
@@ -232,11 +236,8 @@ public:
       const ObLSID &ls_id,
       const storage::ObTablet &tablet,
       const ObMergeType merge_type,
+      const int64_t schedule_scn,
       ObCSReplicaTabletStatus &cs_replica_status);
-  static int get_co_merge_type_for_compaction(
-      const int64_t merge_version,
-      const storage::ObTablet &tablet,
-      ObCOMajorMergePolicy::ObCOMajorMergeType &co_major_merge_type);
   static int schedule_merge_dag(
       const share::ObLSID &ls_id,
       const storage::ObTablet &tablet,
@@ -244,18 +245,15 @@ public:
       const int64_t &merge_snapshot_version,
       const ObExecMode exec_mode,
       const ObDagId *dag_net_id = nullptr,
-      const ObCOMajorMergePolicy::ObCOMajorMergeType co_major_merge_type = ObCOMajorMergePolicy::INVALID_CO_MAJOR_MERGE_TYPE);
+      const ObCOMajorMergeStrategy &co_major_merge_strategy = ObCOMajorMergeStrategy());
   static int schedule_convert_co_merge_dag_net(
       const ObLSID &ls_id,
       const ObTablet &tablet,
       const int64_t retry_times,
       const ObDagId& curr_dag_net_id,
       int &schedule_ret);
-  static int schedule_tablet_ddl_major_merge(
-      ObLSHandle &ls_handle,
-      ObTabletHandle &tablet_handle);
 #ifdef ERRSIM
-  static void errsim_after_mini_schedule_adaptive(
+  static void errsim_schedule_adaptive(
     const ObLSID &ls_id,
     const ObTabletID &tablet_id,
     const ObAdaptiveMergePolicy::AdaptiveCompactionEvent &event,
@@ -277,18 +275,20 @@ public:
   OB_INLINE int64_t get_schedule_batch_size() const { return batch_size_mgr_.get_schedule_batch_size(); }
   OB_INLINE int64_t get_checker_batch_size() const { return batch_size_mgr_.get_checker_batch_size(); }
   OB_INLINE ObMviewCompactionValidation &get_mview_validation() { return mview_validation_; }
+  OB_INLINE ObWindowLoop &get_window_loop() { return window_loop_; }
+public:
+  // for window compaction
+  bool need_do_window_compaction() const;
 private:
   friend struct ObTenantTabletSchedulerTaskMgr;
   int schedule_all_tablets_medium();
+  int schedule_all_tablets_window();
   int schedule_ls_minor_merge(ObLSHandle &ls_handle);
   OB_INLINE int schedule_tablet_minor(
     ObLSHandle &ls_handle,
     ObTabletHandle &tablet_handle,
     bool &schedule_minor_flag,
     bool &need_fast_freeze_flag);
-  int schedule_ddl_tablet_merge(
-    ObLSHandle &ls_handle,
-    ObTabletHandle &tablet_handle);
 public:
   typedef common::ObSEArray<ObGetMergeTablesResult, compaction::ObPartitionMergePolicy::OB_MINOR_PARALLEL_INFO_ARRAY_SIZE> MinorParallelResultArray;
 private:
@@ -314,6 +314,7 @@ private:
   ObTenantTabletSchedulerTaskMgr timer_task_mgr_;
   ObScheduleBatchSizeMgr batch_size_mgr_;
   ObMediumLoop medium_loop_;
+  ObWindowLoop window_loop_;
   ObMviewCompactionValidation mview_validation_;
 };
 

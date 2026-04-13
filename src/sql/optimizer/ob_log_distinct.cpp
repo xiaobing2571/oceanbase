@@ -38,9 +38,37 @@ int ObLogDistinct::get_plan_item_info(PlanText &plan_text,
     LOG_WARN("failed to get base plan item info", K(ret));
   } else {
     BEGIN_BUF_PRINT;
-    EXPLAIN_PRINT_EXPRS(distinct, type);
-    if (OB_SUCC(ret) && is_block_mode_) {
-      ret = BUF_PRINTF(", block");
+    if (group_distinct_exprs_.count() > 0) {
+      OX(BUF_PRINTF("group_distinct("));
+      for (int i = 0; OB_SUCC(ret) && i < group_distinct_exprs_.count(); i++) {
+        OX(BUF_PRINTF("["));
+        ObIArray<ObRawExpr *> &exprs = group_distinct_exprs_.at(i);
+        if (has_non_distinct_aggr_params_ && i == 0) {
+          // do nothing
+        } else {
+          for (int j = 0; OB_SUCC(ret) && j < exprs.count(); j++) {
+            if (OB_FAIL(exprs.at(j)->get_name(buf, buf_len, pos, type))) {
+              LOG_WARN("failed to print expr name", K(ret));
+            } else if (j < exprs.count() - 1) {
+              OX(BUF_PRINTF(", "));
+            }
+          }
+        }
+        if (i < group_distinct_exprs_.count() - 1) {
+          OX(BUF_PRINTF("], "));
+        } else {
+          OX(BUF_PRINTF("])"));
+        }
+      }
+      if (OB_SUCC(ret) && is_block_mode_) {
+        ret = BUF_PRINTF(", block");
+      }
+    } else {
+      EXPLAIN_PRINT_EXPRS(distinct, type);
+      if (OB_SUCC(ret) && is_block_mode_) { ret = BUF_PRINTF(", block"); }
+    }
+    if (OB_SUCC(ret) && is_push_down_) {
+      ret = BUF_PRINTF(", partial");
     }
     END_BUF_PRINT(plan_item.special_predicates_,
                   plan_item.special_predicates_len_);
@@ -52,8 +80,16 @@ int ObLogDistinct::get_plan_item_info(PlanText &plan_text,
 int ObLogDistinct::inner_replace_op_exprs(ObRawExprReplacer &replacer)
 {
   int ret = OB_SUCCESS;
-  if(OB_FAIL(replace_exprs_action(replacer, distinct_exprs_))) {
-    SQL_OPT_LOG(WARN, "failed to replace agg exprs in distinct op", K(ret));
+  if (group_distinct_exprs_.count() <= 0) {
+    if (OB_FAIL(replace_exprs_action(replacer, distinct_exprs_))) {
+      SQL_OPT_LOG(WARN, "failed to replace agg exprs in distinct op", K(ret));
+    }
+  } else {
+    for (int i = 0; OB_SUCC(ret) && i < group_distinct_exprs_.count(); i++) {
+      if (OB_FAIL(replace_exprs_action(replacer, group_distinct_exprs_.at(i)))) {
+        LOG_WARN("failed to replace exprs in distinct op", K(ret));
+      }
+    }
   }
   return ret;
 }
@@ -195,6 +231,10 @@ int ObLogDistinct::do_re_est_cost(EstimateCostInfo &param, double &card, double 
       card = child_ndv;
       if (param.override_) {
         total_ndv_ = child_ndv;
+        if (is_push_down_) {
+          // ignore cost of partial distinct
+          cost = child_cost;
+        }
       }
     }
   }
@@ -307,6 +347,8 @@ int ObLogDistinct::get_op_exprs(ObIArray<ObRawExpr*> &all_exprs)
   int ret = OB_SUCCESS;
   if (OB_FAIL(append(all_exprs, distinct_exprs_))) {
     LOG_WARN("failed to add exprs to ctx", K(ret));
+  } else if (group_distinct_exprs_.count() > 0 && OB_FAIL(all_exprs.push_back(grouping_id_))) {
+    LOG_WARN("failed to push back grouping id", K(ret));
   } else if (OB_FAIL(ObLogicalOperator::get_op_exprs(all_exprs))) {
     LOG_WARN("failed to get op exprs", K(ret));
   } else { /*do nothing*/ }
@@ -322,19 +364,14 @@ int ObLogDistinct::print_outline_data(PlanText &plan_text)
   int64_t &pos = plan_text.pos_;
   const ObDMLStmt *stmt = NULL;
   ObString qb_name;
-  const ObLogicalOperator *child = NULL;
-  const ObLogicalOperator *op = NULL;
   if (is_push_down()) {
     /* print outline in top distinct */
-  } else if (OB_ISNULL(get_plan()) || OB_ISNULL(stmt = get_plan()->get_stmt())
-      || OB_ISNULL(child = get_child(ObLogicalOperator::first_child))) {
+  } else if (OB_ISNULL(get_plan()) || OB_ISNULL(stmt = get_plan()->get_stmt())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected NULL", K(ret), K(get_plan()), K(stmt), K(child));
-  } else if (OB_FAIL(child->get_pushdown_op(log_op_def::LOG_DISTINCT, op))) {
-    LOG_WARN("failed to get push down distinct", K(ret));
+    LOG_WARN("unexpected NULL", K(ret), K(get_plan()), K(stmt));
   } else if (OB_FAIL(stmt->get_qb_name(qb_name))) {
     LOG_WARN("fail to get qb_name", K(ret), K(stmt->get_stmt_id()));
-  } else if (NULL != op &&
+  } else if (has_push_down_ &&
              OB_FAIL(BUF_PRINTF("%s%s(@\"%.*s\")",
                                 ObQueryHint::get_outline_indent(plan_text.is_oneline_),
                                 ObHint::get_hint_name(T_DISTINCT_PUSHDOWN),
@@ -386,13 +423,7 @@ int ObLogDistinct::print_used_hint(PlanText &plan_text)
     }
     if (OB_SUCC(ret) && (NULL != pushdown_hint || NULL != pq_hint)) {
       const ObLogicalOperator *child = NULL;
-      const ObLogicalOperator *op = NULL;
-      if (OB_ISNULL(child = get_child(ObLogicalOperator::first_child))) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected NULL", K(ret), K(child));
-      } else if (OB_FAIL(child->get_pushdown_op(log_op_def::LOG_DISTINCT, op))) {
-        LOG_WARN("failed to get push down distinct", K(ret));
-      } else if (NULL != pushdown_hint && (NULL == op ? pushdown_hint->is_disable_hint() : pushdown_hint->is_enable_hint())
+      if (NULL != pushdown_hint && (!has_push_down_ ? pushdown_hint->is_disable_hint() : pushdown_hint->is_enable_hint())
                  && OB_FAIL(pushdown_hint->print_hint(plan_text))) {
         LOG_WARN("failed to print used hint for group by", K(ret), KPC(pushdown_hint));
       } else if (NULL != pq_hint

@@ -30,6 +30,21 @@
 
 namespace oceanbase
 {
+
+namespace sql
+{
+namespace iceberg
+{
+class DataFile;
+class ObSerializableDataFile;
+}
+}
+
+namespace share
+{
+class ObILakeTableMetadata;
+}
+
 namespace sql
 {
 class ObResultSet;
@@ -94,7 +109,10 @@ public:
 
 class ObPhysicalPlanCtx
 {
-  OB_UNIS_VERSION(1);
+  // master version is 3, 42x version is 2.
+  // compatibility handling based on the version number during deserialization.
+  // notice: Do not modify the version number arbitrarily.
+  OB_UNIS_VERSION(3);
 public:
   explicit ObPhysicalPlanCtx(common::ObIAllocator &allocator);
   virtual ~ObPhysicalPlanCtx();
@@ -321,13 +339,10 @@ public:
   }
   inline uint64_t calc_last_insert_id_to_client()
   {
-    if (0 == last_insert_id_to_client_) {
-      last_insert_id_to_client_ =
-        last_insert_id_cur_stmt_ > 0 ?
-          last_insert_id_cur_stmt_ :
-          (last_insert_id_with_expr_ ?
-            last_insert_id_session_ :
-            autoinc_col_value_);
+    if (last_insert_id_changed_) {
+      last_insert_id_to_client_ = last_insert_id_session_;
+    } else if (last_insert_id_cur_stmt_ != 0) {
+      last_insert_id_to_client_ = last_insert_id_cur_stmt_;
     }
     return last_insert_id_to_client_;
   }
@@ -568,15 +583,25 @@ public:
   inline void set_enable_adaptive_pc(bool v) { enable_adaptive_pc_ = v; }
   inline bool enable_adaptive_pc() const { return enable_adaptive_pc_; }
   bool is_param_datum_frame_inited() const { return param_frame_ptrs_.count() > 0; }
+  void get_param_frame_info(int64_t param_idx,
+                            ObDatum *&datum,
+                            ObEvalInfo *&eval_info,
+                            VectorHeader *&vec_header);
+  inline const ObArray<iceberg::DataFile*>& get_iceberg_data_files() const
+  {
+    return iceberg_data_files_;
+  }
+  int set_iceberg_data_files(const common::ObIArray<iceberg::ObSerializableDataFile>& data_files);
+  inline const share::ObILakeTableMetadata* get_lake_table_metadata() const
+  {
+    return lake_table_metadata_;
+  }
+  int set_lake_table_metadata(const share::ObILakeTableMetadata* lake_table_metadata);
 private:
   int init_param_store_after_deserialize();
   void reset_datum_frame(char *frame, int64_t expr_cnt);
   int extend_param_frame(const int64_t old_size);
   int reserve_param_frame(const int64_t capacity);
-  void get_param_frame_info(int64_t param_idx,
-                            ObDatum *&datum,
-                            ObEvalInfo *&eval_info,
-                            VectorHeader *&vec_header);
   int inner_get_subschema_id_by_type_info(const ObObjMeta &obj_meta,
                                           const ObIArray<common::ObString> &type_info,
                                           uint16_t &subschema_id) const;
@@ -654,7 +679,7 @@ private:
   share::CacheHandle *autoinc_cache_handle_;
   // last_insert_id return to client
   uint64_t last_insert_id_to_client_;
-  // first auto-increment value in current stmt
+  // first auto-increment value in current stmt, last_insert_id which record in session
   uint64_t last_insert_id_cur_stmt_;
   // auto-increment value
   uint64_t autoinc_id_tmp_;
@@ -726,6 +751,10 @@ private:
   bool is_direct_insert_plan_; // for direct load: insert into/overwrite select
   bool check_pdml_affected_rows_; // now only worked for pdml checking affected_rows
   bool enable_adaptive_pc_;
+
+  // for iceberg table dml
+  ObArray<iceberg::DataFile*> iceberg_data_files_;
+  const share::ObILakeTableMetadata* lake_table_metadata_;
 };
 
 }

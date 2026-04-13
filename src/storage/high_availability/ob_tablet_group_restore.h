@@ -106,7 +106,6 @@ public:
   ObStorageHATableInfoMgr *ha_table_info_mgr_;
   bool need_check_seq_;
   int64_t ls_rebuild_seq_;
-  ObMacroBlockReuseMgr macro_block_reuse_mgr_;
   ObCopyTabletRecordExtraInfo extra_info_;
   // the size of data that still reside on backup
   int64_t backup_size_;
@@ -143,7 +142,7 @@ public:
   }
   virtual int start_running() override;
   virtual bool operator == (const share::ObIDagNet &other) const override;
-  virtual int64_t hash() const override;
+  virtual uint64_t hash() const override;
   virtual int fill_comment(char *buf, const int64_t buf_len) const override;
   virtual int fill_dag_net_key(char *buf, const int64_t buf_len) const override;
   virtual int clear_dag_net_ctx() override;
@@ -182,7 +181,7 @@ public:
   explicit ObTabletGroupRestoreDag(const share::ObDagType::ObDagTypeEnum &dag_type);
   virtual ~ObTabletGroupRestoreDag();
   virtual bool operator == (const share::ObIDag &other) const override;
-  virtual int64_t hash() const override;
+  virtual uint64_t hash() const override;
   virtual int fill_info_param(compaction::ObIBasicInfoParam *&out_param, ObIAllocator &allocator) const override;
   ObTabletGroupRestoreCtx *get_ctx() const { return static_cast<ObTabletGroupRestoreCtx *>(ha_dag_net_ctx_); }
 
@@ -358,7 +357,7 @@ public:
   ObTabletRestoreDag();
   virtual ~ObTabletRestoreDag();
   virtual bool operator == (const share::ObIDag &other) const override;
-  virtual int64_t hash() const override;
+  virtual uint64_t hash() const override;
   virtual int fill_dag_key(char *buf, const int64_t buf_len) const override;
   virtual int create_first_task() override;
   virtual int fill_info_param(compaction::ObIBasicInfoParam *&out_param, ObIAllocator &allocator) const override;
@@ -406,6 +405,12 @@ private:
       ObTabletCopyFinishTask *tablet_copy_finish_task,
       share::ObITask *&parent_task);
   int generate_ddl_restore_tasks_(
+      ObTabletCopyFinishTask *tablet_copy_finish_task,
+      share::ObITask *&parent_task);
+  int generate_inc_major_ddl_restore_tasks_(
+      ObTabletCopyFinishTask *tablet_copy_finish_task,
+      share::ObITask *&parent_task);
+  int generate_inc_major_restore_tasks_(
       ObTabletCopyFinishTask *tablet_copy_finish_task,
       share::ObITask *&parent_task);
   int generate_physical_restore_task_(
@@ -467,7 +472,6 @@ public:
   virtual int process() override;
   VIRTUAL_TO_STRING_KV(K("ObTabletRestoreTask"), KP(this), KPC(ha_dag_net_ctx_), KPC(tablet_restore_ctx_));
 private:
-  int verify_table_store_();
   int update_restore_status_();
   int record_server_event_();
   int report_restore_stat_();

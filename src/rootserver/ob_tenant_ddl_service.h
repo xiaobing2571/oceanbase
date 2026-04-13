@@ -36,6 +36,7 @@ class ObDDLTransController;
 namespace rootserver
 {
 class ObDDLService;
+class ObDDLSQLTransaction;
 struct ObSysStat
 {
   struct Item;
@@ -168,6 +169,10 @@ public:
              const bool skip_call_rs = false,
              const uint64_t &cluster_id = OB_INVALID_CLUSTER_ID,
              common::ObIAllocator *allocator = NULL);
+  int restore_create_root_key(
+             const uint64_t tenant_id,
+             const obrpc::ObCreateTenantArg &arg,
+             const common::ObIArray<common::ObAddr> &addrs);
 #endif
   template <typename SCHEMA>
   int check_primary_zone_locality_condition(
@@ -200,6 +205,12 @@ public:
   static int replace_sys_stat(const uint64_t tenant_id,
       ObSysStat &sys_stat,
       common::ObISQLClient &trans);
+
+  int batch_create_system_table(
+      ObSchemaGetterGuard &schema_guard,
+      ObDDLSQLTransaction &trans,
+      const uint64_t &tenant_id,
+      const ObIArray<uint64_t> &table_ids);
 
 private:
   int insert_tenant_merge_info_(const share::schema::ObSchemaOperationType op,
@@ -274,6 +285,9 @@ private:
   int create_sys_table_schemas(
       ObDDLOperator &ddl_operator,
       ObMySQLTransaction &trans,
+      common::ObIArray<share::schema::ObTableSchema> &tables);
+  int load_sys_table_schemas(
+      const ObTenantSchema &tenant_schema,
       common::ObIArray<share::schema::ObTableSchema> &tables);
   template <typename SCHEMA>
   int extract_first_primary_zone_array(
@@ -353,10 +367,6 @@ private:
       const share::schema::ObTenantSchema &orig_tenant_schema,
       const common::ObIArray<common::ObZone> &zones_in_pool,
       const common::ObIArray<share::schema::ObZoneRegion> &zone_region_list);
-
-  int check_alter_tenant_when_rebalance_is_disabled_(
-      const share::schema::ObTenantSchema &orig_tenant_schema,
-      const share::schema::ObTenantSchema &new_tenant_schema);
   int check_revoke_pools_permitted(
       share::schema::ObSchemaGetterGuard &schema_guard,
       const common::ObIArray<share::ObResourcePoolName> &new_pool_name_list,
@@ -474,6 +484,13 @@ private:
 
   int create_tenant_sys_tablets(const uint64_t tenant_id, common::ObIArray<ObTableSchema> &tables);
 
+  int create_tenant_sys_tablets_in_trans_(
+      share::schema::ObSchemaGetterGuard &schema_guard,
+      ObMySQLTransaction &trans,
+      const uint64_t tenant_id,
+      common::ObIArray<share::schema::ObTableSchema> &tables,
+      const share::SCN &frozen_scn);
+
   int update_sys_variables(const common::ObIArray<obrpc::ObSysVarIdValue> &sys_var_list,
                            const share::schema::ObSysVariableSchema &old_sys_variable,
                            share::schema::ObSysVariableSchema &new_sys_variable,
@@ -504,11 +521,9 @@ private:
       const share::schema::ObTenantSchema &related_tenant_schema);
 
   int drop_resource_pool_pre(const uint64_t tenant_id,
-                             common::ObIArray<uint64_t> &drop_ug_id_array,
                              ObIArray<share::ObResourcePoolName> &pool_names,
                              ObMySQLTransaction &trans);
   int drop_resource_pool_final(const uint64_t tenant_id,
-                               common::ObIArray<uint64_t> &drop_ug_id_array,
                                ObIArray<share::ObResourcePoolName> &pool_names);
   int try_drop_meta_ls_(const uint64_t meta_tenant_id,
                         const share::ObLSID &ls_id,
@@ -532,7 +547,6 @@ private:
 #endif
   int modify_and_cal_resource_pool_diff(
       common::ObMySQLTransaction &trans,
-      common::ObIArray<uint64_t> &new_ug_id_array,
       share::schema::ObSchemaGetterGuard &schema_guard,
       const share::schema::ObTenantSchema &new_tenant_schema,
       const common::ObIArray<common::ObString> &new_pool_list,
@@ -614,6 +628,10 @@ private:
   int add_extra_tenant_init_config_(
       const uint64_t tenant_id,
       common::ObIArray<common::ObConfigPairs> &init_configs);
+
+  int check_locality_match_unit_type_(
+      const share::ObZoneReplicaAttrSet &zone_replica_set,
+      const ObIArray<share::ObUnitInfo> &unit_infos);
 private:
   bool inited_;
   volatile bool stopped_;

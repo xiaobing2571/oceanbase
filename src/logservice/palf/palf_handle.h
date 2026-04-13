@@ -30,7 +30,7 @@ class SCN;
 namespace ipalf
 {
 class IPalfHandle;
-class IPalfLogIterator;
+template<class LogEntryType> class IPalfIterator;
 }
 namespace palf
 {
@@ -136,8 +136,10 @@ public:
 
   virtual int seek(const LSN &lsn, PalfGroupBufferIterator &iter) override final;
 
-  virtual int seek(const palf::LSN &lsn, ipalf::IPalfLogIterator &iter) override final;
-
+  virtual int seek(const palf::LSN &lsn, ipalf::IPalfIterator<ipalf::ILogEntry> &iter) override final;
+  virtual int seek(const palf::LSN &lsn, ipalf::IPalfIterator<ipalf::IGroupEntry> &iter) override final;
+  virtual int seek(const share::SCN &scn, ipalf::IPalfIterator<ipalf::ILogEntry> &iter) override final;
+  virtual int seek(const share::SCN &scn, ipalf::IPalfIterator<ipalf::IGroupEntry> &iter) override final;
   // @desc: seek a buffer(group buffer) iterator by scn, the first log A in iterator must meet
   // one of the following conditions:
   // 1. scn of log A equals to scn
@@ -232,15 +234,17 @@ public:
   virtual int get_palf_epoch(int64_t &palf_epoch) const override final;
 
   int get_global_learner_list(common::GlobalLearnerList &learner_list) const;
-  int get_paxos_member_list(common::ObMemberList &member_list, int64_t &paxos_replica_num) const;
+  int get_paxos_member_list(common::ObMemberList &member_list, int64_t &paxos_replica_num, const bool &filter_logonly_replica = false) const;
   int get_config_version(LogConfigVersion &config_version) const;
   int get_paxos_member_list_and_learner_list(common::ObMemberList &member_list,
                                                      int64_t &paxos_replica_num,
-                                                     GlobalLearnerList &learner_list) const;
+                                                     GlobalLearnerList &learner_list,
+                                                     const bool &filter_logonly_replica = false) const;
   int get_stable_membership(LogConfigVersion &config_version,
                                     common::ObMemberList &member_list,
                                     int64_t &paxos_replica_num,
-                                    common::GlobalLearnerList &learner_list) const;
+                                    common::GlobalLearnerList &learner_list,
+                                    const bool &filter_logonly_replica = false) const;
   virtual int get_election_leader(common::ObAddr &addr) const override final;
   int get_parent(common::ObAddr &parent) const;
 
@@ -271,6 +275,7 @@ public:
   // - OB_INVALID_ARGUMENT: invalid argument
   // - other: bug
   int force_set_member_list(const common::ObMemberList &new_member_list, const int64_t new_replica_num);
+  int inc_config_version(int64_t timeout_us);
 
   int get_ack_info_array(LogMemberAckInfoList &ack_info_array,
                                  common::GlobalLearnerList &degraded_list) const;
@@ -555,10 +560,12 @@ public:
   virtual int register_refresh_priority_cb() override final;
 
   virtual int unregister_refresh_priority_cb() override final;
+
+  virtual int set_allow_election_without_memlist(const bool allow_election_without_memlist) override final;
 #endif
 	//================= 依赖功能注册 ===========================
-  int set_location_cache_cb(PalfLocationCacheCb *lc_cb);
-  int reset_location_cache_cb();
+  virtual int set_location_cache_cb(PalfLocationCacheCb *lc_cb) override final;
+  virtual int reset_location_cache_cb() override final;
   virtual int set_election_priority(election::ElectionPriority *priority) override final;
   virtual int reset_election_priority() override final;
   virtual int set_locality_cb(palf::PalfLocalityInfoCb *locality_cb) override final;

@@ -34,6 +34,8 @@ namespace blocksstable
 {
 extern const char *DDL_EMPTY_SSTABLE_DUMMY_INDEX_DATA_BUF;
 extern const int64_t DDL_EMPTY_SSTABLE_DUMMY_INDEX_DATA_SIZE;
+class ObSSTableIndexScanParam;
+class ObSSTableIndexScanner;
 class ObSSTableSecMetaIterator;
 class ObIMacroBlockIterator;
 struct ObMacroBlocksWriteCtx;
@@ -71,21 +73,22 @@ public:
     NORMAL = 2
   };
   static const int SSTABLE_META_CACHE_VERSION_1 = 1;
-  static const int SSTABLE_META_CACHE_VERSION = 2;
+  static const int SSTABLE_META_CACHE_VERSION_V2 = 2;
+  static const int SSTABLE_META_CACHE_VERSION_V3 = 3; // add min_merged_trans_version_/length
   ObSSTableMetaCache();
   ~ObSSTableMetaCache() = default;
   void reset();
   int init(const blocksstable::ObSSTableMeta *meta, const bool has_multi_version_row = false);
   void set_upper_trans_version(const int64_t upper_trans_version);
+  void set_filled_tx_scn(const share::SCN &filled_tx_scn);
   bool is_valid() const { return version_ >= SSTABLE_META_CACHE_VERSION_1; }
-  int serialize(char *buf, const int64_t buf_len, int64_t &pos) const;
+  int serialize(const int64_t data_version, char *buf, const int64_t buf_len, int64_t &pos) const;
   int deserialize(const char *buf, const int64_t data_len, int64_t &pos);
   int deserialize_for_compat(const bool has_multi_version_row, const char *buf, const int64_t data_len, int64_t &pos);
-  int64_t get_serialize_size() const;
-
+  int64_t get_serialize_size(const int64_t data_version) const;
   TO_STRING_KV(K_(version), K_(has_multi_version_row), K_(status), K_(data_macro_block_count), K_(nested_size), K_(nested_offset),
         K_(total_macro_block_count), K_(total_use_old_macro_block_count), K_(row_count), K_(occupy_size), K_(data_checksum),
-        K_(max_merged_trans_version), K_(upper_trans_version), K_(filled_tx_scn), K_(contain_uncommitted_row));
+        K_(max_merged_trans_version), K_(min_merged_trans_version), K_(upper_trans_version), K_(filled_tx_scn), K_(contain_uncommitted_row));
 public:
   union {
     uint32_t header_;
@@ -96,7 +99,6 @@ public:
       uint32_t reserved_                  : 21;
     };
   };
-
   int32_t data_macro_block_count_;
   int32_t nested_size_;
   int32_t nested_offset_;
@@ -112,6 +114,9 @@ public:
   share::SCN filled_tx_scn_;
   bool contain_uncommitted_row_;
   share::SCN rec_scn_;
+  int32_t length_; //serialize length after SSTABLE_META_CACHE_VERSION_V3
+  int64_t min_merged_trans_version_;
+  // add new variables here, no need to inc version
 };
 
 
@@ -131,7 +136,15 @@ public:
   virtual int init(
       const ObTabletCreateSSTableParam &param,
       common::ObArenaAllocator *allocator);
-  static int copy_from_old_sstable(const ObSSTable &old_sstable, common::ObArenaAllocator &allocator, ObSSTable *&sstable);
+  struct IModifySSTableFunc {
+    virtual int operator()(ObSSTable &sstable, ObSSTableMeta &meta) = 0;
+  };
+  static int copy_from_old_sstable(
+      const ObSSTable &old_sstable,
+      common::ObArenaAllocator &allocator,
+      ObSSTable *&sstable,
+      const bool expand_macro_info = false,
+      IModifySSTableFunc *modify_func = nullptr);
   void reset();
 
   // Query interfaces
@@ -178,6 +191,11 @@ public:
       blocksstable::ObSSTableSecMetaIterator *&meta_iter,
       const bool is_reverse_scan = false,
       const int64_t sample_step = 0) const;
+  int scan_index(
+      const ObDatumRange &scan_range,
+      const ObSSTableIndexScanParam &scan_param,
+      ObIAllocator &allocator,
+      ObSSTableIndexScanner *&idx_scanner);
   int bf_may_contain_rowkey(const ObDatumRowkey &rowkey, bool &contain);
   int fill_column_ckm_array(ObIArray<int64_t> &column_checksums) const;
   // For transaction
@@ -192,9 +210,14 @@ public:
       storage::ObTableAccessContext &context,
       share::SCN &max_trans_version,
       ObRowsInfo &rows_info);
-  int set_upper_trans_version(
+  virtual int set_upper_trans_version(
       common::ObArenaAllocator &allocator,
       const int64_t upper_trans_version);
+  // for inc major sstable that needs update upper trans version && filled tx scn at same time
+  int backfill_commit_version(
+      common::ObArenaAllocator &allocator,
+      const int64_t commit_version,
+      const share::SCN &filled_tx_scn);
   virtual int64_t get_upper_trans_version() const override
   {
     return meta_cache_.upper_trans_version_;
@@ -202,6 +225,10 @@ public:
   virtual int64_t get_max_merged_trans_version() const override
   {
     return meta_cache_.max_merged_trans_version_;
+  }
+  virtual int64_t get_min_merged_trans_version() const override
+  {
+    return meta_cache_.min_merged_trans_version_;
   }
   OB_INLINE bool contain_uncommitted_row() const
   {
@@ -277,10 +304,7 @@ public:
   OB_INLINE bool is_loaded() const { return nullptr != meta_; }
   int persist_linked_block_if_need(
       ObArenaAllocator &allocator,
-      const ObTabletID &tablet_id,
-      const int64_t tablet_transfer_seq,
-      const int64_t snapshot_version,
-      blocksstable::ObIMacroBlockFlushCallback *ddl_redo_cb,
+      const ObLinkedMacroInfoWriteParam &param,
       int64_t &macro_start_seq,
       ObSharedObjectsWriteCtx &linked_block_write_ctx);
   int get_meta(ObSSTableMetaHandle &meta_handle, common::ObSafeArenaAllocator *allocator = nullptr) const;
@@ -289,7 +313,7 @@ public:
   int set_status_for_read(const ObSSTableStatus status);
 
   // TODO: get_index_tree_root and get_last_rowkey now required sstable to be loaded
-  int get_index_tree_root(
+  virtual int get_index_tree_root(
       blocksstable::ObMicroBlockData &index_data,
       const bool need_transform = true);
   int get_last_rowkey(
@@ -330,17 +354,19 @@ public:
     UNUSEDx(dir_name, schema, fname);
     return OB_NOT_SUPPORTED;
   }
-  virtual int64_t get_serialize_size() const override;
-  virtual int serialize(char *buf, const int64_t buf_len, int64_t &pos) const override;
+  virtual int64_t get_serialize_size(const uint64_t data_version) const;
+  virtual int serialize(
+      const uint64_t data_version,
+      char *buf,
+      const int64_t buf_len,
+      int64_t &pos) const;
   virtual int deserialize(
       common::ObArenaAllocator &allocator,
       const char *buf,
       const int64_t data_len,
       int64_t &pos);
-  int deserialize_post_work(
-      common::ObIAllocator *allocator);
-  virtual int serialize_full_table(char *buf, const int64_t buf_len, int64_t &pos) const;
-  virtual int64_t get_full_serialize_size() const; // return -1 when it fails to get meta
+  virtual int serialize_full_table(const uint64_t data_version, char *buf, const int64_t buf_len, int64_t &pos) const;
+  virtual int64_t get_full_serialize_size(const uint64_t data_version) const; // return -1 when it fails to get meta
   int assign_meta(ObSSTableMeta *dest);
   int build_multi_row_lock_checker(
       ObRowsInfo &rows_info,
@@ -363,11 +389,15 @@ protected:
       const ObTabletCreateSSTableParam &param,
       common::ObArenaAllocator *allocator);
   int get_last_rowkey(const ObDatumRowkey *&sstable_endkey);
-  int serialize_fixed_struct(char *buf, const int64_t buf_len, int64_t &pos) const;
+  int serialize_fixed_struct(const int64_t data_version, char *buf, const int64_t buf_len, int64_t &pos) const;
   int deserialize_fixed_struct(const char *buf, const int64_t data_len, int64_t &pos);
-  int64_t get_sstable_fix_serialize_size() const;
-  int64_t get_sstable_fix_serialize_payload_size() const;
-  int inner_deep_copy_and_inc_macro_ref(common::ObIAllocator &allocator, ObSSTable *&sstable) const;
+  int64_t get_sstable_fix_serialize_size(const int64_t data_version) const;
+  int64_t get_sstable_fix_serialize_payload_size(const int64_t data_version) const;
+  int inner_deep_copy_and_inc_macro_ref(common::ObIAllocator &allocator, ObSSTable *&sstable, const bool expand_macro_info) const;
+private:
+  int expand_macro_info_(common::ObIAllocator &allocator);
+  int inner_inc_macro_ref(bool &inc_success) const;
+  void inner_dec_macro_ref() const;
 protected:
   static const int64_t SSTABLE_VERSION = 1;
   static const int64_t SSTABLE_VERSION_V2 = 2;

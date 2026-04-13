@@ -152,6 +152,7 @@ private:
       ACTIVE = 1,
       STOP = 2,
       EMPTY = 3,
+      FORCE_STOP = 4,     // if round_id < max_round_id, and the round_end_file doesn't exist.
     };
 
     State state_;
@@ -173,6 +174,8 @@ private:
     bool is_in_stop_state() const;
     bool is_in_empty_state() const;
     bool is_in_active_state() const;
+    // is_in_force_stop_state: only precise for not max round
+    bool is_in_force_stop_state() const;
     bool check_round_continuous_(const RoundContext &pre_round) const;
 
     RoundContext &operator=(const RoundContext &other);
@@ -250,7 +253,7 @@ private:
   void check_if_switch_round_(const share::SCN &scn, const palf::LSN &lsn, RoundOp &op);
   bool is_max_round_done_(const palf::LSN &lsn) const;
   bool need_backward_round_(const palf::LSN &lsn) const;
-  bool need_forward_round_(const palf::LSN &lsn) const;
+  bool need_forward_round_(const share::SCN &scn, const palf::LSN &lsn) const;
   bool need_load_round_info_(const share::SCN &scn, const palf::LSN &lsn) const;
 
   // 获取指定round元信息
@@ -400,6 +403,8 @@ public:
   int update_max_lsn(const palf::LSN &lsn);
   int update_min_lsn(const palf::LSN &lsn);
   int get_max_archive_log(palf::LSN &lsn, share::SCN &scn);
+  // For active piece without single LS index, compute [min_lsn, max_lsn]
+  int get_active_piece_ls_lsn_range(palf::LSN &min_lsn, palf::LSN &max_lsn);
 
   TO_STRING_KV(K_(is_inited), K_(id), K_(array), K_(index), K_(file_id),
       K_(min_file_id), K_(max_file_id), K_(min_lsn), K_(max_lsn), K_(file_offset));
@@ -418,6 +423,7 @@ private:
     char *buf,
     const int64_t buf_size,
     int64_t &read_size);
+  int get_min_log_in_file_(const int64_t file_id, palf::LSN &lsn);
 
 private:
   bool is_inited_;

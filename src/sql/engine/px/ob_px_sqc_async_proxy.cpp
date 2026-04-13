@@ -68,11 +68,11 @@ int ObPxSqcAsyncProxy::launch_all_rpc_request() {
         args.enable_serialize_cache();
       }
       ARRAY_FOREACH_X(sqcs_, idx, count, OB_SUCC(ret)) {
-        if (OB_UNLIKELY(ObPxCheckAlive::is_in_blacklist(sqcs_.at(idx)->get_exec_addr(),
+        if (OB_UNLIKELY(ObPxCheckAlive::is_in_blacklist(sqcs_.at(idx).get_exec_addr(),
                         session_->get_process_query_time()))) {
           ret = OB_RPC_CONNECT_ERROR;
           LOG_WARN("peer no in communication, maybe crashed", K(ret),
-                  KPC(sqcs_.at(idx)), K(cluster_id), K(session_->get_process_query_time()));
+                  K(sqcs_.at(idx)), K(cluster_id), K(session_->get_process_query_time()));
         } else {
           ret = launch_one_rpc_request(args, idx, NULL);
         }
@@ -89,7 +89,7 @@ int ObPxSqcAsyncProxy::launch_all_rpc_request() {
 int ObPxSqcAsyncProxy::launch_one_rpc_request(ObPxRpcInitSqcArgs &args, int64_t idx, ObSqcAsyncCB *cb) {
   int ret = OB_SUCCESS;
   ObCurTraceId::TraceId *trace_id = NULL;
-  ObPxSqcMeta &sqc = *sqcs_.at(idx);
+  ObPxSqcMeta &sqc = sqcs_.at(idx);
   const ObAddr &addr = sqc.get_exec_addr();
   int64_t timeout_us =
       phy_plan_ctx_->get_timeout_timestamp() - ObTimeUtility::current_time();
@@ -162,6 +162,7 @@ int ObPxSqcAsyncProxy::wait_all() {
   // 2. 超时，ret = OB_TIMEOUT
   // 3. retry一个rpc失败
   oceanbase::lib::Thread::WaitGuard guard(oceanbase::lib::Thread::WAIT_FOR_PX_MSG);
+  common::ScopedTimer timer(ObMetricId::PX_WAIT_DISPATCH);
   while (return_cb_count_ < sqcs_.count() && OB_SUCC(ret)) {
 
     ObThreadCondGuard guard(cond_);
@@ -204,7 +205,7 @@ int ObPxSqcAsyncProxy::wait_all() {
             // SQC如果没有获得足够的worker，外层直接进行query级别的重试
             //
             LOG_INFO("can't get enough worker resource, and not retry",
-                K(cb_result.rc_), K(*sqcs_.at(idx)));
+                K(cb_result.rc_), K(sqcs_.at(idx)));
           }
           if (OB_FAIL(cb_result.rc_)) {
             // 错误可能包含 is_data_not_readable_err或者其他类型的错误

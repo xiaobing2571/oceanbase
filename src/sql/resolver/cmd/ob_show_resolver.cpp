@@ -180,7 +180,11 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CHECK_TABLE)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_OLAP_ASYNC_JOB_STATUS)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CATALOGS)
-            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CREATE_CATALOG)) {
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CREATE_CATALOG)
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_LOCATIONS)
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CREATE_LOCATION)
+            && OB_UNLIKELY(parse_tree.type_ != T_LOCATION_UTILS_LIST)
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_SENSITIVE_RULES)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected parse tree type", K(ret), K(parse_tree.type_));
   } else {
@@ -231,9 +235,8 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
           show_resv_ctx.condition_node_ = parse_tree.children_[1];
           show_resv_ctx.stmt_type_ = stmt::T_SHOW_TABLES;
           ParseNode *condition_node = show_resv_ctx.condition_node_;
-          ObString show_db_name;
           uint64_t show_db_id = OB_INVALID_ID;
-          if (OB_FAIL(get_database_info(catalog_id,
+          if (OB_FAIL(get_database_info_with_catalog(catalog_id,
                                         parse_tree.children_[0],
                                         database_name,
                                         real_tenant_id,
@@ -360,7 +363,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
           if (is_oracle_mode) {
             ret = OB_NOT_SUPPORTED;
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "show database in oracle mode is");
-          } else if (OB_UNLIKELY(parse_tree.num_child_ != 2 || NULL == parse_tree.children_)) {
+          } else if (OB_UNLIKELY((parse_tree.num_child_ != 2 && parse_tree.num_child_ != 3) || NULL == parse_tree.children_)) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("parse tree is wrong", K(ret), K(parse_tree.num_child_), K(parse_tree.children_));
           } else {
@@ -368,7 +371,23 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
             ParseNode *condition_node = show_resv_ctx.condition_node_;
             show_resv_ctx.stmt_type_ = stmt::T_SHOW_DATABASES;
             bool show_db_status = parse_tree.children_[1] != NULL ? true : false;
-            if (NULL != show_resv_ctx.condition_node_ && T_LIKE_CLAUSE == show_resv_ctx.condition_node_->type_) {
+            ParseNode *from_node = parse_tree.num_child_ == 3 ? parse_tree.children_[2] : NULL;
+            if (NULL != from_node) {
+              ObString catalog_name;
+              catalog_name.assign_ptr(from_node->str_value_, static_cast<ObString::obstr_size_t>(from_node->str_len_));
+              ObSchemaGetterGuard *schema_guard = schema_checker_->get_schema_guard();
+              if (OB_FAIL(schema_checker_->get_catalog_id_name(real_tenant_id, catalog_name, catalog_id))) {
+                LOG_WARN("failed to get catalog schema", K(ret));
+              } else if (catalog_id == OB_INTERNAL_CATALOG_ID) {
+                // do nothing
+              } else if (OB_FAIL(schema_guard->check_catalog_access(session_priv, enable_role_id_array, catalog_name))) {
+                LOG_WARN("failed to check catalog access", K(ret));
+              }
+            }
+
+            if (OB_FAIL(ret)) {
+
+            } else if (NULL != show_resv_ctx.condition_node_ && T_LIKE_CLAUSE == show_resv_ctx.condition_node_->type_) {
               if (OB_UNLIKELY(show_resv_ctx.condition_node_->num_child_ != 2
                               || NULL == show_resv_ctx.condition_node_->children_)) {
                 ret = OB_ERR_UNEXPECTED;
@@ -1199,29 +1218,31 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
                 K(parse_tree.children_));
           } else {
             show_resv_ctx.condition_node_ = parse_tree.children_[1];
-            uint64_t show_db_id;
-            if (OB_FAIL(get_database_info(catalog_id,
-                                          parse_tree.children_[0],
-                                          database_name,
-                                          real_tenant_id,
-                                          show_resv_ctx,
-                                          show_db_id))) {
-              LOG_WARN("fail to get database info", K(ret));
-            } else if (OB_UNLIKELY(OB_INVALID_ID == show_db_id)) {
-              ret = OB_ERR_UNEXPECTED;
-              LOG_WARN("database id is invalid", K(ret), K(show_db_id));
-            } else if (OB_FAIL(check_db_access_for_show_sql(catalog_id, show_resv_ctx, session_priv, enable_role_id_array))) {
-              LOG_WARN("check db access for show sql failed", K(ret));
-            } else {
-              int64_t proc_type = T_SHOW_PROCEDURE_STATUS == parse_tree.type_ ? ROUTINE_PROCEDURE_TYPE : ROUTINE_FUNCTION_TYPE;
-              show_resv_ctx.stmt_type_ = T_SHOW_PROCEDURE_STATUS == parse_tree.type_ ? stmt::T_SHOW_PROCEDURE_STATUS : stmt::T_SHOW_FUNCTION_STATUS;
-              GEN_SQL_STEP_1(ObShowSqlSet::SHOW_PROCEDURE_STATUS);
-              GEN_SQL_STEP_2(ObShowSqlSet::SHOW_PROCEDURE_STATUS,
-                            OB_SYS_DATABASE_NAME, OB_ALL_ROUTINE_TNAME,
-                            OB_SYS_DATABASE_NAME, OB_ALL_DATABASE_TNAME,
-                            OB_MYSQL_SCHEMA_NAME, OB_PROC_TNAME,
-                            show_db_id, proc_type);
+            bool skip_db_filter = OB_ISNULL(parse_tree.children_[0]);
+            uint64_t show_db_id = OB_INVALID_ID;
+            if (!skip_db_filter) {
+              if (OB_FAIL(get_database_info(catalog_id,
+                                            parse_tree.children_[0],
+                                            database_name,
+                                            real_tenant_id,
+                                            show_resv_ctx,
+                                            show_db_id))) {
+                LOG_WARN("fail to get database info", K(ret));
+              } else if (OB_UNLIKELY(OB_INVALID_ID == show_db_id)) {
+                ret = OB_ERR_UNEXPECTED;
+                LOG_WARN("database id is invalid", K(ret), K(show_db_id));
+              } else if (OB_FAIL(check_db_access_for_show_sql(catalog_id, show_resv_ctx, session_priv, enable_role_id_array))) {
+                LOG_WARN("check db access for show sql failed", K(ret));
+              }
             }
+            int64_t proc_type = T_SHOW_PROCEDURE_STATUS == parse_tree.type_ ? ROUTINE_PROCEDURE_TYPE : ROUTINE_FUNCTION_TYPE;
+            show_resv_ctx.stmt_type_ = T_SHOW_PROCEDURE_STATUS == parse_tree.type_ ? stmt::T_SHOW_PROCEDURE_STATUS : stmt::T_SHOW_FUNCTION_STATUS;
+            GEN_SQL_STEP_1(ObShowSqlSet::SHOW_PROCEDURE_STATUS);
+            GEN_SQL_STEP_2(ObShowSqlSet::SHOW_PROCEDURE_STATUS,
+                          OB_SYS_DATABASE_NAME, OB_ALL_ROUTINE_TNAME,
+                          OB_SYS_DATABASE_NAME, OB_ALL_DATABASE_TNAME,
+                          OB_MYSQL_SCHEMA_NAME, OB_PROC_TNAME,
+                          show_db_id, skip_db_filter ? "true" : "false", proc_type);
           }
         }();
         break;
@@ -1412,8 +1433,9 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
                                      tenant_node->children_[0]->str_value_);
                 if (ObString::make_string("seed") == show_tenant_name) {
                   params_.show_seed_ = true; // 传递给 stmt
-                } else if (OB_FAIL(schema_checker_->get_tenant_id(show_tenant_name, show_tenant_id))
-                            || OB_INVALID_ID == show_tenant_id) {
+                } else if (OB_FAIL(schema_checker_->get_tenant_id(show_tenant_name, show_tenant_id))) {
+                  LOG_WARN("fail to get tenant id", K(show_tenant_name), K(ret));
+                } else if (OB_INVALID_ID == show_tenant_id) {
                   ret = OB_ERR_INVALID_TENANT_NAME;
                   LOG_WARN("fail to get tenant id", K(show_tenant_name), K(ret));
                 } else {
@@ -1977,6 +1999,231 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
         }
         break;
       }
+      case T_SHOW_LOCATIONS: {
+        uint64_t min_version = OB_INVALID_VERSION;
+        if (OB_FAIL(GET_MIN_DATA_VERSION(real_tenant_id, min_version))) {
+            LOG_WARN("get min data_version failed", K(ret), K(real_tenant_id));
+        } else if (min_version < DATA_VERSION_4_4_0_0) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "show locations");
+          LOG_WARN("not support to show locations", K(ret), K(real_tenant_id));
+        } else if (OB_UNLIKELY(parse_tree.num_child_ != 0)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("parse tree is wrong", K(ret), K(parse_tree.num_child_));
+        } else {
+          show_resv_ctx.stmt_type_ = stmt::T_SHOW_LOCATIONS;
+          uint64_t tenant_id = is_oracle_mode ? session_info_->get_effective_tenant_id() : sql_tenant_id;
+          GEN_SQL_STEP_1(ObShowSqlSet::SHOW_LOCATIONS);
+          GEN_SQL_STEP_2(ObShowSqlSet::SHOW_LOCATIONS,
+                         REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME),
+                         REAL_NAME(OB_ALL_TENANT_LOCATION_TNAME, OB_ALL_VIRTUAL_TENANT_LOCATION_REAL_AGENT_ORA_TNAME),
+                         tenant_id);
+        }
+        break;
+      }
+      case T_SHOW_CREATE_LOCATION: {
+        uint64_t min_version = OB_INVALID_VERSION;
+        if (OB_FAIL(GET_MIN_DATA_VERSION(real_tenant_id, min_version))) {
+            LOG_WARN("get min data_version failed", K(ret), K(real_tenant_id));
+        } else if (min_version < DATA_VERSION_4_4_0_0) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "show create location");
+          LOG_WARN("not support to show create location", K(ret), K(real_tenant_id));
+        } else if (OB_UNLIKELY(parse_tree.num_child_ != 1) || OB_ISNULL(parse_tree.children_[0])) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("parse tree is wrong", K(ret), K(parse_tree.num_child_));
+        } else {
+          show_resv_ctx.stmt_type_ = stmt::T_SHOW_CREATE_LOCATION;
+          ObString location_name;
+          location_name.assign_ptr(parse_tree.children_[0]->str_value_,
+                                  static_cast<ObString::obstr_size_t>(parse_tree.children_[0]->str_len_));
+          ObSchemaGetterGuard *schema_guard = NULL;
+          uint64_t location_id = OB_INVALID_ID;
+          if(OB_ISNULL(schema_checker_) || OB_ISNULL(schema_guard = schema_checker_->get_schema_guard())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("got null ptr", K(ret));
+          } else if (OB_FAIL(schema_checker_->get_location_id_name(real_tenant_id, location_name, location_id))) {
+            LOG_WARN("failed to get location id", K(ret));
+          } else if (OB_FAIL(schema_guard->check_location_access(session_priv, enable_role_id_array, location_name))) {
+            LOG_WARN("failed to check location access", K(ret));
+          }
+          if (OB_SUCC(ret)) {
+            GEN_SQL_STEP_1(ObShowSqlSet::SHOW_CREATE_LOCATION);
+            GEN_SQL_STEP_2(ObShowSqlSet::SHOW_CREATE_LOCATION, OB_SYS_DATABASE_NAME,
+                           OB_TENANT_VIRTUAL_SHOW_CREATE_LOCATION_TNAME, location_id);
+          }
+        }
+        break;
+      }
+      case T_LOCATION_UTILS_LIST: {
+        uint64_t min_version = OB_INVALID_VERSION;
+        uint64_t location_id = OB_INVALID_ID;
+        ObString sub_path;
+        ObString pattern;
+        ObString location_name;
+        if (OB_FAIL(GET_MIN_DATA_VERSION(real_tenant_id, min_version))) {
+            LOG_WARN("get min data_version failed", K(ret), K(real_tenant_id));
+        } else if (min_version < DATA_VERSION_4_4_0_0) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "list location files");
+          LOG_WARN("not support to show create location", K(ret), K(real_tenant_id));
+        } else if (OB_UNLIKELY(parse_tree.num_child_ != 3) || OB_ISNULL(parse_tree.children_[0])) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("parse tree is wrong", K(ret), K(parse_tree.num_child_));
+        } else {
+          show_resv_ctx.stmt_type_ = stmt::T_LOCATION_UTILS_LIST;
+          ParseNode *child_node = parse_tree.children_[0];
+          location_name.assign_ptr(child_node->str_value_, static_cast<int32_t>(child_node->str_len_));
+          ObSchemaGetterGuard *schema_guard = NULL;
+          if(OB_ISNULL(schema_checker_)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("got null ptr", K(ret));
+          } else if (OB_FAIL(schema_checker_->get_location_id_name(real_tenant_id, location_name, location_id))) {
+            LOG_WARN("get location id failed", K(ret), K(real_tenant_id), K(location_name));
+          } else if(OB_ISNULL(schema_guard = schema_checker_->get_schema_guard())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("got null ptr", K(ret));
+          } else if (OB_FAIL(schema_guard->check_location_access(session_priv, enable_role_id_array, location_name))) {
+            LOG_WARN("failed to check location access", K(ret), K(session_priv), K(enable_role_id_array), K(location_name));
+          }
+          if (OB_SUCC(ret) && OB_NOT_NULL(parse_tree.children_[1])) {
+            ParseNode *child_node = parse_tree.children_[1];
+            sub_path.assign_ptr(child_node->str_value_, static_cast<int32_t>(child_node->str_len_));
+          }
+          if (OB_SUCC(ret) && OB_NOT_NULL(parse_tree.children_[2])) {
+            ParseNode *child_node = parse_tree.children_[2];
+            if (T_EXTERNAL_FILE_PATTERN != child_node->type_) {
+              ret = OB_ERR_UNEXPECTED;
+              SQL_RESV_LOG(WARN, "invalid file format option", K(ret));
+            } else if (child_node->num_child_ != 1 || OB_ISNULL(child_node->children_[0])) {
+              ret = OB_ERR_UNEXPECTED;
+              SQL_RESV_LOG(WARN, "unexpected child num", K(child_node->num_child_));
+            } else if (0 == child_node->children_[0]->str_len_) {
+              ObSqlString err_msg;
+              err_msg.append_fmt("empty regular expression");
+              ret = OB_ERR_REGEXP_ERROR;
+              LOG_USER_ERROR(OB_ERR_REGEXP_ERROR, err_msg.ptr());
+              SQL_RESV_LOG(WARN, "empty regular expression", K(ret));
+            } else {
+              pattern = ObString(child_node->children_[0]->str_len_,
+                                child_node->children_[0]->str_value_);
+              if (OB_FAIL(ObSQLUtils::convert_sql_text_to_schema_for_storing(*allocator_,
+                                                                              session_info_->get_dtc_params(),
+                                                                              pattern))) {
+                SQL_RESV_LOG(WARN, "failed to convert pattern to utf8", K(ret));
+              }
+            }
+          }
+        }
+        if (OB_SUCC(ret)) {
+          if (sub_path.empty()) {  // oracle模式下空串会导致全表扫描, 无法利用range_key传递参数
+            ObSqlString tmp_sub_path;
+            tmp_sub_path.append("/");
+            sub_path = tmp_sub_path.string();
+          }
+          if (pattern.empty()) {  // 同
+            ObSqlString tmp_pattern;
+            tmp_pattern.append("*");
+            pattern = tmp_pattern.string();
+          }
+          GEN_SQL_STEP_1(ObShowSqlSet::LOCATION_UTILS_LIST);
+          GEN_SQL_STEP_2(ObShowSqlSet::LOCATION_UTILS_LIST,
+                        REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME),
+                        REAL_NAME(OB_TENANT_VIRTUAL_LIST_FILE_TNAME, OB_TENANT_VIRTUAL_LIST_FILE_ORA_TNAME),
+                        location_id,
+                        sub_path.length(), sub_path.ptr(),
+                        pattern.length(), pattern.ptr());
+        }
+        break;
+      }
+      case T_SHOW_SENSITIVE_RULES: {
+        show_resv_ctx.stmt_type_ = stmt::T_SHOW_SENSITIVE_RULES;
+        ParseNode *option_node = NULL;
+        uint64_t tenant_id = is_oracle_mode ? session_info_->get_effective_tenant_id() : sql_tenant_id;
+        uint64_t min_version = OB_INVALID_VERSION;
+        if (OB_FAIL(GET_MIN_DATA_VERSION(real_tenant_id, min_version))) {
+            LOG_WARN("get min data_version failed", K(ret), K(real_tenant_id));
+        } else if (!((min_version >= MOCK_DATA_VERSION_4_3_5_3 && min_version < DATA_VERSION_4_4_0_0) ||
+                     (min_version >= MOCK_DATA_VERSION_4_4_2_0 && min_version < DATA_VERSION_4_5_0_0) ||
+                     (min_version >= DATA_VERSION_4_5_1_0))) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "show sensitive rules");
+          LOG_WARN("not support to show sensitive rules", K(ret), K(real_tenant_id));
+        } else if (OB_UNLIKELY(parse_tree.num_child_ != 1)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("parse tree is wrong", K(ret), K(parse_tree.num_child_));
+        } else if (OB_ISNULL(option_node = parse_tree.children_[0])) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("parse tree is wrong", K(ret), K(parse_tree.num_child_));
+        } else if (OB_UNLIKELY(T_SHOW_SENSITIVE_RULES_OPTION != option_node->type_)
+                   || OB_UNLIKELY(3 != option_node->num_child_)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("parse tree is wrong", K(ret), K(option_node->type_), K(option_node->num_child_));
+        } else {
+          ParseNode *from_relation_node = option_node->children_[0];
+          ParseNode *from_database_node = option_node->children_[1];
+          ParseNode *condition_node = option_node->children_[2];
+          show_resv_ctx.condition_node_ = condition_node;
+          bool show_from_table = false;
+          bool show_from_database = false;
+          uint64_t show_catalog_id = OB_INVALID_ID;
+          ObString show_db_name;
+          uint64_t show_db_id = OB_INVALID_ID;
+          ObString show_table_name;
+          uint64_t show_table_id = OB_INVALID_ID;
+          bool is_view;
+          if (OB_FAIL(ret)) {
+          } else if (NULL != from_relation_node) {  // show sensitive rule from table
+            show_from_table = true;
+            if (OB_FAIL(resolve_show_from_table(from_relation_node, from_database_node,
+                                                database_name.empty(), T_SHOW_SENSITIVE_RULES,
+                                                real_tenant_id, show_catalog_id, show_db_name,
+                                                show_db_id, show_table_name, show_table_id,
+                                                is_view, synonym_checker))) {
+              LOG_WARN("failed to resolve show from table", K(ret));
+            }
+          } else if (NULL != from_database_node) {  // show sensitive rule from DATABASE database
+            show_from_database = true;
+            if (OB_FAIL(resolve_show_from_database(*from_database_node,
+                                                   real_tenant_id,
+                                                   catalog_id,
+                                                   show_db_id,
+                                                   show_resv_ctx.show_database_name_))) {
+              LOG_WARN("fail to get database info", K(ret));
+            }
+          }
+
+          if (OB_FAIL(ret)) {
+          } else if (show_from_table) {
+            GEN_SQL_STEP_1(ObShowSqlSet::SHOW_SENSITIVE_RULES_FROM_TABLE);
+            GEN_SQL_STEP_2(ObShowSqlSet::SHOW_SENSITIVE_RULES_FROM_TABLE,
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_SENSITIVE_RULE_TNAME, OB_ALL_VIRTUAL_SENSITIVE_RULE_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_SENSITIVE_COLUMN_TNAME, OB_ALL_VIRTUAL_SENSITIVE_COLUMN_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_TABLE_TNAME, OB_ALL_VIRTUAL_TABLE_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_COLUMN_TNAME, OB_ALL_VIRTUAL_COLUMN_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_DATABASE_TNAME, OB_ALL_VIRTUAL_DATABASE_REAL_AGENT_ORA_TNAME),
+                           show_table_id);
+          } else if (show_from_database) {
+            GEN_SQL_STEP_1(ObShowSqlSet::SHOW_SENSITIVE_RULES_FROM_DATABASE);
+            GEN_SQL_STEP_2(ObShowSqlSet::SHOW_SENSITIVE_RULES_FROM_DATABASE,
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_SENSITIVE_RULE_TNAME, OB_ALL_VIRTUAL_SENSITIVE_RULE_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_SENSITIVE_COLUMN_TNAME, OB_ALL_VIRTUAL_SENSITIVE_COLUMN_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_TABLE_TNAME, OB_ALL_VIRTUAL_TABLE_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_COLUMN_TNAME, OB_ALL_VIRTUAL_COLUMN_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_DATABASE_TNAME, OB_ALL_VIRTUAL_DATABASE_REAL_AGENT_ORA_TNAME),
+                           show_db_id);
+          } else {
+            GEN_SQL_STEP_1(ObShowSqlSet::SHOW_SENSITIVE_RULES);
+            GEN_SQL_STEP_2(ObShowSqlSet::SHOW_SENSITIVE_RULES,
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_SENSITIVE_RULE_TNAME, OB_ALL_VIRTUAL_SENSITIVE_RULE_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_SENSITIVE_COLUMN_TNAME, OB_ALL_VIRTUAL_SENSITIVE_COLUMN_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_TABLE_TNAME, OB_ALL_VIRTUAL_TABLE_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_COLUMN_TNAME, OB_ALL_VIRTUAL_COLUMN_REAL_AGENT_ORA_TNAME),
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME), REAL_NAME(OB_ALL_DATABASE_TNAME, OB_ALL_VIRTUAL_DATABASE_REAL_AGENT_ORA_TNAME));
+          }
+        }
+        break;
+      }
       default:
         /* won't be here */
         ret = OB_NOT_IMPLEMENT;
@@ -2385,6 +2632,58 @@ int ObShowResolver::get_database_info(const uint64_t session_catalog_id,
                                                     show_resv_ctx.show_database_name_))) {
         LOG_WARN("fail to resolve show from database", K(ret), K(real_tenant_id));
       } else {/*do nothing*/}
+    }
+  }
+  return ret;
+}
+
+int ObShowResolver::get_database_info_with_catalog(uint64_t &catalog_id,
+                                                  const ParseNode *database_node,
+                                                  const common::ObString &session_database_name,
+                                                  uint64_t real_tenant_id,
+                                                  ObShowResolverContext &show_resv_ctx,
+                                                  uint64_t &show_db_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(schema_checker_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("some data member is not init", K(ret), K(schema_checker_));
+  } else if (OB_NOT_NULL(database_node)) {
+    if (database_node->num_child_ != 1
+        || OB_ISNULL(database_node->children_[0])
+        || database_node->children_[0]->num_child_ != 2) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("parse tree is wrong", K(ret), K(database_node->num_child_), K(database_node->children_));
+    } else {
+      ParseNode *catalog_name_node = database_node->children_[0]->children_[0];
+      ParseNode *database_name_node = database_node->children_[0]->children_[1];
+      if (OB_NOT_NULL(catalog_name_node)) {
+        ObString catalog_name;
+        catalog_name.assign_ptr(catalog_name_node->str_value_, static_cast<ObString::obstr_size_t>(catalog_name_node->str_len_));
+        if (OB_FAIL(schema_checker_->get_catalog_id_name(real_tenant_id, catalog_name, catalog_id))) {
+          LOG_WARN("failed to get catalog schema", K(ret));
+        }
+      }
+
+      if (OB_FAIL(ret)) {
+
+      } else if (OB_FAIL(resolve_show_from_database(*database_name_node,
+                                                    real_tenant_id,
+                                                    catalog_id,
+                                                    show_db_id,
+                                                    show_resv_ctx.show_database_name_))) {
+        LOG_WARN("fail to resolve show from database", K(ret), K(real_tenant_id));
+      }
+    }
+  } else {
+    if (OB_UNLIKELY(session_database_name.empty())) {
+      ret = OB_ERR_NO_DB_SELECTED;
+      LOG_WARN("no database selected");
+    } else {
+      show_resv_ctx.show_database_name_ = session_database_name;
+      if (OB_FAIL(schema_checker_->get_database_id(real_tenant_id, catalog_id, session_database_name, show_db_id))) {
+        LOG_WARN("fail to get database_id", K(ret), K(catalog_id), K(session_database_name), K(real_tenant_id));
+      }
     }
   }
   return ret;
@@ -2982,7 +3281,8 @@ int ObShowResolver::resolve_like_or_where_clause(ObShowResolverContext &ctx)
                  && parse_tree->type_ != T_SHOW_PROCEDURE_STATUS
                  && parse_tree->type_ != T_SHOW_FUNCTION_STATUS
                  && parse_tree->type_ != T_SHOW_TRIGGERS
-                 && parse_tree->type_ != T_SHOW_SEQUENCES)) {
+                 && parse_tree->type_ != T_SHOW_SEQUENCES
+                 && parse_tree->type_ != T_SHOW_SENSITIVE_RULES)) {
     // do nothing
   } else {
     // Like or Where clause
@@ -3244,6 +3544,20 @@ int ObShowResolver::replace_where_clause(ParseNode* node, const ObShowResolverCo
       }
       case T_OP_AND:
       case T_OP_OR:
+      case T_OP_CNN: {
+        if (NULL == node->children_) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("parse tree is wrong", K(ret), K(node->num_child_), K(node->children_));
+        } else {
+          for (int32_t i = 0; i < node->num_child_; i++) {
+            if (OB_FAIL(replace_where_clause(node->children_[i], show_resv_ctx))) {
+              LOG_WARN("failed replace expr", K(ret));
+            }
+          }
+        }
+        break;
+      }
+      case T_OP_XOR:
       case T_OP_ADD:
       case T_OP_MINUS:
       case T_OP_MUL:
@@ -3265,7 +3579,6 @@ int ObShowResolver::replace_where_clause(ParseNode* node, const ObShowResolverCo
       case T_OP_NE:
       case T_OP_IS:
       case T_OP_IS_NOT:
-      case T_OP_CNN:
       case T_OP_REGEXP:
       case T_OP_NOT_REGEXP:
       case T_OP_IN:
@@ -3566,55 +3879,40 @@ int ObShowResolver::ObSqlStrGenerator::gen_select_str(const char *select_str, ..
 int ObShowResolver::ObSqlStrGenerator::gen_from_str(const char *subquery_str, ...)
 {
   int ret = OB_SUCCESS;
-  HEAP_VAR(char[OB_MAX_SQL_LENGTH], tmp_buf) {
-    int64_t pos = 0;
-    if (OB_ISNULL(sql_buf_) || OB_ISNULL(subquery_str)) {
-      ret = OB_NOT_INIT;
-      LOG_WARN("sql buffer or subquery_str is not init", K(ret), K(sql_buf_), K(subquery_str));
-    }
-    if (lib::is_oracle_mode()) {
-      //show xxx will be banned on oracle mode，so here just replace ` to "
-      char new_str[OB_SHORT_SQL_LENGTH];
-      int64_t  len = strlen(subquery_str);
-      int64_t  new_len = 0;
-      for (int i = 0; i < len; i++) {
-        if ('`' != subquery_str[i]) {
-          new_str[new_len++] = subquery_str[i];
-        } else {
-          new_str[new_len++] = '"';
+  int64_t pos = 0;
+  int64_t len = 0;
+  if (OB_ISNULL(sql_buf_) || OB_ISNULL(subquery_str)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("sql buffer or subquery_str is not init", K(ret), K(sql_buf_), K(subquery_str));
+  } else if (FALSE_IT(len = strlen(subquery_str))) {
+  } else if (0 == len || len > OB_MAX_SQL_LENGTH) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("subquery_str length is invalid", K(ret), K(len), K(subquery_str));
+  } else {
+    HEAP_VARS_2((char[OB_MAX_SQL_LENGTH], tmp_buf), (char[OB_MAX_SQL_LENGTH], new_str)) {
+      if (lib::is_oracle_mode()) {
+        // replace ` to " for oracle mode
+        for (int64_t i = 0; i < len; i++) {
+          new_str[i] = ('`' == subquery_str[i]) ? '"' : subquery_str[i];
         }
+        new_str[len] = '\0';
       }
-      new_str[new_len] = '\0';
-      if (OB_FAIL(databuff_printf(tmp_buf,
-                                  OB_MAX_SQL_LENGTH,
-                                  pos,
-                                  " FROM (%s) %s",
-                                  new_str,
-                                  ObShowSqlSet::SUBQERY_ALIAS))) {
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(databuff_printf(tmp_buf,
+                                         OB_MAX_SQL_LENGTH,
+                                         pos,
+                                         " FROM (%s) %s",
+                                         lib::is_oracle_mode() ? new_str : subquery_str,
+                                         ObShowSqlSet::SUBQERY_ALIAS))) {
         LOG_WARN("fail to add subquery sql string", K(ret));
+      } else {
+        va_list subquery_args;
+        va_start(subquery_args, subquery_str);
+        if (OB_FAIL(databuff_vprintf(sql_buf_, OB_MAX_SQL_LENGTH, sql_buf_pos_, tmp_buf, subquery_args))) {
+          LOG_WARN("fail to add subquery args sql string", K(ret));
+        }
+        va_end(subquery_args);
       }
-    } else {
-      if (OB_FAIL(databuff_printf(tmp_buf,
-                                  OB_MAX_SQL_LENGTH,
-                                  pos,
-                                  " FROM (%s) %s",
-                                  subquery_str,
-                                  ObShowSqlSet::SUBQERY_ALIAS))) {
-        LOG_WARN("fail to add subquery sql string", K(ret));
-      }
-    }
-
-    if (OB_SUCC(ret)) {
-      va_list subquery_args;
-      va_start(subquery_args, subquery_str);
-      if (OB_FAIL(databuff_vprintf(sql_buf_,
-                                   OB_MAX_SQL_LENGTH,
-                                   sql_buf_pos_,
-                                   tmp_buf,
-                                   subquery_args))) {
-        LOG_WARN("fail to add subquery args sql string", K(ret));
-      }
-      va_end(subquery_args);
     }
   }
   return ret;
@@ -3868,7 +4166,7 @@ DEFINE_SHOW_CLAUSE_SET(SHOW_TABLE_STATUS,
                        "name");
 DEFINE_SHOW_CLAUSE_SET(SHOW_PROCEDURE_STATUS,
                        NULL,
-                       "select database_name AS `Db`, routine_name AS `Name`, c.type AS `Type`, c.definer AS `Definer`, p.gmt_modified AS `Modified`, p.gmt_create AS `Created`, c.security_type AS `Security_type`, p.comment AS `Comment`, character_set_client, collation_connection, db_collation AS `Database Collation`from %s.%s p, %s.%s d, %s.%s c where p.tenant_id = d.tenant_id and p.database_id = d.database_id and d.database_name = c.db and p.routine_name = c.name and (case c.type when 'PROCEDURE' then 1 when 'FUNCTION' then 2 else 0 end) = p.routine_type and d.database_id = %ld and p.routine_type = %ld and (0 = sys_privilege_check('routine_acc', effective_tenant_id()) or 0 = sys_privilege_check('routine_acc', effective_tenant_id(), d.database_name, p.routine_name, p.routine_type)) ORDER BY name COLLATE utf8mb4_bin ASC",
+                       "select database_name AS `Db`, routine_name AS `Name`, c.type AS `Type`, c.definer AS `Definer`, p.gmt_modified AS `Modified`, p.gmt_create AS `Created`, c.security_type AS `Security_type`, p.comment AS `Comment`, character_set_client, collation_connection, db_collation AS `Database Collation`from %s.%s p, %s.%s d, %s.%s c where p.tenant_id = d.tenant_id and p.database_id = d.database_id and d.database_name = c.db and p.routine_name = c.name and (case c.type when 'PROCEDURE' then 1 when 'FUNCTION' then 2 else 0 end) = p.routine_type and (d.database_id = %ld or %s) and p.routine_type = %ld and (0 = sys_privilege_check('routine_acc', effective_tenant_id()) or 0 = sys_privilege_check('routine_acc', effective_tenant_id(), d.database_name, p.routine_name, p.routine_type)) ORDER BY name COLLATE utf8mb4_bin ASC",
                        NULL,
                        "name");
 DEFINE_SHOW_CLAUSE_SET(SHOW_TRIGGERS,
@@ -4068,5 +4366,100 @@ DEFINE_SHOW_CLAUSE_SET(SHOW_CREATE_CATALOG,
                        "SELECT `catalog_name` AS `Catalog`, create_catalog AS `Create Catalog` FROM %s.%s  WHERE catalog_id = %ld",
                        R"(SELECT catalog_name AS "Catalog", create_catalog AS "Create Catalog" FROM %s.%s  WHERE catalog_id = %ld)",
                        NULL);
+DEFINE_SHOW_CLAUSE_SET(SHOW_LOCATIONS,
+                       NULL,
+                       "SELECT `location_name` AS `Location` FROM %s.%s WHERE tenant_id = %ld and check_location_access(`location_name`) order by `Location` asc",
+                       NULL,
+                       NULL);
+DEFINE_SHOW_CLAUSE_SET(SHOW_CREATE_LOCATION,
+                        NULL,
+                        "SELECT `location_name` AS `Location`, `create_location` AS `Create Location` FROM %s.%s  WHERE location_id = %ld",
+                        NULL,
+                        NULL);
+DEFINE_SHOW_CLAUSE_SET(LOCATION_UTILS_LIST,
+                       NULL,
+                       "SELECT `file_name` AS `File`, `file_size` AS `Size` FROM %s.%s WHERE location_id = %ld and location_sub_path = '%.*s' and pattern = '%.*s'",
+                       R"(SELECT file_name AS "File", file_size AS "Size" FROM %s.%s WHERE location_id = %ld and location_sub_path = '%.*s' and pattern = '%.*s')",
+                       NULL);
+
+#define SHOW_SENSITIVE_RULES_SQL_MYSQL(WHERE_CLAUSE) \
+  "SELECT rule_name, protection_policy, method, enabled, group_concat(cols order by database_id, table_id separator ', ') AS `protected_columns` FROM (        \
+     SELECT *, concat(database_name,'.',table_name,'(',group_concat(column_name order by column_id),')') AS `cols` FROM (                                      \
+       SELECT                                                                                                                                                  \
+         SR.tenant_id AS `tenant_id`,                                                                                                                          \
+         SR.sensitive_rule_id AS `rule_id`,                                                                                                                    \
+         SR.sensitive_rule_name AS `rule_name`,                                                                                                                \
+         CASE WHEN SR.protection_policy = 1 THEN 'NONE'                                                                                                        \
+              WHEN SR.protection_policy = 2 THEN 'ENCRYPTION'                                                                                                  \
+              WHEN SR.protection_policy = 3 THEN 'MASKING'                                                                                                     \
+              ELSE NULL                                                                                                                                        \
+         END AS `protection_policy`,                                                                                                                           \
+         SR.method AS `method`,                                                                                                                                \
+         CASE WHEN SR.enabled = 1 THEN 'YES' ELSE 'NO' END AS `enabled`,                                                                                       \
+         D.database_id AS `database_id`,                                                                                                                       \
+         D.database_name AS `database_name`,                                                                                                                   \
+         T.table_id AS `table_id`,                                                                                                                             \
+         T.table_name AS `table_name`,                                                                                                                         \
+         C.column_id AS `column_id`,                                                                                                                           \
+         C.column_name AS `column_name`                                                                                                                        \
+       FROM %s.%s AS SR                                                                                                                                        \
+       LEFT JOIN %s.%s AS SC ON SR.tenant_id = SC.tenant_id AND SR.sensitive_rule_id = SC.sensitive_rule_id                                                    \
+       LEFT JOIN %s.%s AS T  ON SC.tenant_id =  T.tenant_id AND SC.table_id = T.table_id AND T.table_mode >> 12 & 15 IN (0,1)                                  \
+       LEFT JOIN %s.%s AS C  ON SC.tenant_id =  C.tenant_id AND SC.column_id = C.column_id AND T.table_id = C.table_id AND T.table_id = C.table_id             \
+       LEFT JOIN %s.%s AS D  ON SC.tenant_id =  D.tenant_id AND T.database_id = D.database_id AND D.database_name != '__recyclebin' AND D.in_recyclebin = 0    \
+       WHERE 0 = sys_privilege_check('table_acc', effective_tenant_id())                                                                                       \
+          OR 0 = sys_privilege_check('table_acc', effective_tenant_id(), D.database_name, T.table_name)                                                        \
+     ) GROUP BY rule_id, database_id, table_id                                                                                                                 \
+   )" WHERE_CLAUSE " GROUP BY rule_id ORDER BY rule_id"
+
+#define SHOW_SENSITIVE_RULES_SQL_ORACLE(WHERE_CLAUSE) R"(
+  SELECT rule_name, protection_policy, method, enabled, LISTAGG(cols, ', ') WITHIN GROUP (ORDER BY database_id, table_id) AS protected_columns FROM (
+    SELECT
+      rule_id, rule_name, protection_policy, method, enabled, database_id, table_id,
+      DECODE(
+        database_id,
+        NULL,
+        NULL,
+        database_name || '.' || table_name || '(' || LISTAGG(column_name, ',') WITHIN GROUP (ORDER BY column_id) || ')'
+      ) AS cols
+    FROM (
+      SELECT
+        SR.sensitive_rule_id AS rule_id,
+        SR.sensitive_rule_name AS rule_name,
+        DECODE(SR.protection_policy, 1, 'NONE', 2, 'ENCRYPTION', 3, 'MASKING', 'UNKNOWN') AS protection_policy,
+        SR.method AS method,
+        DECODE(SR.enabled, 1, 'YES', 'NO') AS enabled,
+        D.database_id AS database_id,
+        D.database_name AS database_name,
+        T.table_id AS table_id,
+        T.table_name AS table_name,
+        C.column_id AS column_id,
+        C.column_name AS column_name
+      FROM %s.%s SR
+      LEFT JOIN %s.%s SC ON SR.tenant_id = SC.tenant_id AND SR.sensitive_rule_id = SC.sensitive_rule_id
+      LEFT JOIN %s.%s T ON SC.tenant_id = T.tenant_id AND SC.table_id = T.table_id AND BITAND(T.table_mode / 4096, 15) IN (0, 1)
+      LEFT JOIN %s.%s C ON SC.tenant_id = C.tenant_id AND SC.column_id = C.column_id AND T.table_id = C.table_id
+      LEFT JOIN %s.%s D ON SC.tenant_id = D.tenant_id AND T.database_id = D.database_id AND D.database_name != '__recyclebin' AND D.in_recyclebin = 0
+      WHERE D.database_id is NULL or T.table_id is NULL or C.column_id is NULL or 1 = user_can_access_obj(1, T.table_id, D.database_id)
+    ) GROUP BY rule_id, database_id, table_id, database_name, table_name, rule_name, protection_policy, method, enabled
+  ))" WHERE_CLAUSE R"( GROUP BY rule_id, rule_name, protection_policy, method, enabled ORDER BY rule_id)"
+
+// " this comment is just for correcting syntax highlight
+
+DEFINE_SHOW_CLAUSE_SET(SHOW_SENSITIVE_RULES,
+                       NULL,
+                       SHOW_SENSITIVE_RULES_SQL_MYSQL(""),
+                       SHOW_SENSITIVE_RULES_SQL_ORACLE(""),
+                       "rule_name");
+DEFINE_SHOW_CLAUSE_SET(SHOW_SENSITIVE_RULES_FROM_TABLE,
+                       NULL,
+                       SHOW_SENSITIVE_RULES_SQL_MYSQL("WHERE table_id = %ld"),
+                       SHOW_SENSITIVE_RULES_SQL_ORACLE("WHERE table_id = %ld"),
+                       "rule_name");
+DEFINE_SHOW_CLAUSE_SET(SHOW_SENSITIVE_RULES_FROM_DATABASE,
+                       NULL,
+                       SHOW_SENSITIVE_RULES_SQL_MYSQL("WHERE database_id = %ld"),
+                       SHOW_SENSITIVE_RULES_SQL_ORACLE("WHERE database_id = %ld"),
+                       "rule_name");
 }/* ns sql*/
 }/* ns oceanbase */

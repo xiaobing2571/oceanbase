@@ -177,6 +177,12 @@ public:
 
   inline void set_question_mark_count(int64_t count) { question_mark_count_ = count; }
   inline int64_t get_question_mark_count() { return question_mark_count_; }
+  inline void set_parse_question_mark_count(int64_t count) { parse_question_mark_count_ = count; }
+  inline int64_t get_parse_question_mark_count()const { return parse_question_mark_count_; }
+  inline void set_external_params_count(int64_t count) { external_params_count_ = count; }
+  inline int64_t get_external_params_count()const { return external_params_count_; }
+  inline bool get_is_select_for_update()const { return is_select_for_update_; }
+  inline void set_is_select_for_update(bool is_select_for_update) { is_select_for_update_ = is_select_for_update; }
   inline int64_t get_ref_count() const { return ATOMIC_LOAD(&ref_count_); }
   inline int64_t get_num_of_param() const { return ps_sql_meta_.get_param_size(); }
   inline int64_t get_num_of_column() const { return ps_sql_meta_.get_column_size(); }
@@ -256,6 +262,8 @@ public:
   bool is_expired() { return ATOMIC_LOAD(&is_expired_); }
   bool *get_is_expired_evicted_ptr() { return &is_expired_evicted_; }
   bool try_erase() { return 1 == ATOMIC_VCAS(&ref_count_, 1, 0); }
+  void set_ps_need_parameterization(bool ps_need_parameterization) { ps_need_parameterization_ = ps_need_parameterization; }
+  bool is_ps_need_parameterization() const { return ps_need_parameterization_; }
 
   DECLARE_VIRTUAL_TO_STRING;
 
@@ -298,6 +306,10 @@ private:
   ObFixedArray<ObPCParam *, common::ObIAllocator> raw_params_;
   ObFixedArray<int64_t, common::ObIAllocator> raw_params_idx_;
   stmt::StmtType literal_stmt_type_;
+  bool ps_need_parameterization_;
+  int64_t parse_question_mark_count_;
+  int64_t external_params_count_;
+  bool is_select_for_update_;
 };
 
 struct TypeInfo {
@@ -459,7 +471,8 @@ struct PsCacheInfoCtx
     no_param_sql_(),
     raw_params_(NULL),
     fixed_param_idx_(NULL),
-    stmt_type_(stmt::T_NONE) {}
+    stmt_type_(stmt::T_NONE),
+    ps_need_parameterization_(true) {}
 
 
   TO_STRING_KV(K_(param_cnt),
@@ -469,7 +482,8 @@ struct PsCacheInfoCtx
                K_(normalized_sql),
                K_(raw_sql),
                K_(no_param_sql),
-               K_(stmt_type));
+               K_(stmt_type),
+               K_(ps_need_parameterization));
 
   int64_t param_cnt_;
   int32_t num_of_returning_into_;
@@ -481,6 +495,7 @@ struct PsCacheInfoCtx
   common::ObIArray<ObPCParam*> *raw_params_;
   common::ObIArray<int64_t> *fixed_param_idx_;
   stmt::StmtType stmt_type_;
+  bool ps_need_parameterization_;
 };
 
 } //end of namespace sql

@@ -106,6 +106,7 @@ public:
 #endif
 #define OB_CLUSTER_PARAMETER(args...) args
   // Liboblog config.
+  DEF_TIME(init_timeout, OB_CLUSTER_PARAMETER, "2h", "[0s,1d]", "obcdc init timeout, 0s means never");
   // max memory occupied by libobcdc: 20G
   DEF_CAP(memory_limit, OB_CLUSTER_PARAMETER, "8G", "[2G,]", "memory limit");
   // Preserve the lower bound of system memory in %, in the range of 10% ~ 80%
@@ -292,6 +293,9 @@ public:
   // Whether output column by table defination
   T_DEF_BOOL(enable_output_by_table_def, OB_CLUSTER_PARAMETER, 0, "0:disabled, 1:enabled");
 
+  // Whether output the virtual generated column
+  T_DEF_BOOL(enable_output_virtual_generated_column, OB_CLUSTER_PARAMETER, 0, "0:disabled, 1:enabled");
+
   // Number of active ls count in memory
   // This value can be used as a reference for the number of data structure objects cached at the ls level
   T_DEF_INT_INFT(active_ls_count, OB_CLUSTER_PARAMETER, 10000, 1, "active ls count in memory");
@@ -328,7 +332,7 @@ public:
   T_DEF_INT_INFT(fetch_log_rpc_timeout_sec, OB_CLUSTER_PARAMETER, 15, 1, "fetch log rpc timeout in seconds");
 
   // Upper limit of progress difference between partitions, in seconds
-  T_DEF_INT_INFT(progress_limit_sec_for_dml, OB_CLUSTER_PARAMETER, 30, 1, "dml progress limit in seconds");
+  T_DEF_INT_INFT(progress_limit_sec_for_dml, OB_CLUSTER_PARAMETER, 3, 1, "dml progress limit in seconds");
 
   // The Sys Tenant is not filtered by default
   T_DEF_BOOL(enable_filter_sys_tenant, OB_CLUSTER_PARAMETER, 0, "0:disabled, 1:enabled");
@@ -617,10 +621,12 @@ public:
   // direct load inc
   // Whether to sync the incremental direct load data
   T_DEF_BOOL(enable_direct_load_inc, OB_CLUSTER_PARAMETER, 0, "0:disabled, 1:enabled");
+  T_DEF_BOOL(enable_filte_mow_lob_col, OB_CLUSTER_PARAMETER, 0, "0:disabled, 1:enabled");
   T_DEF_INT_INFT(direct_load_inc_thread_num, OB_CLUSTER_PARAMETER, 0, 0, "thread num of reading and parsing direct load inc log");
   T_DEF_INT_INFT(direct_load_inc_queue_backlog_lowest_tolerance, OB_CLUSTER_PARAMETER, 0, 0, "lowest threshold of queue_backlog that will touch parser flow control in direct load inc case");
   T_DEF_INT_INFT(sorted_list_auto_treeify_threshold, OB_CLUSTER_PARAMETER, 32, 0, "treeify list auto-treeify mode treeify threshold");
   T_DEF_INT_INFT(sorted_list_auto_untreeify_threshold, OB_CLUSTER_PARAMETER, 30, 0, "treeify list auto-treeify mode treeify threshold");
+  DEF_CAP(meta_data_inc_trans_size_upper_limit, OB_CLUSTER_PARAMETER, "4G", "[0M,]", "meta data increment part_trans_task size upper limit");
 
 #undef OB_CLUSTER_PARAMETER
 

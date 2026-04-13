@@ -32,7 +32,7 @@ public:
   virtual int store_column(ObMicroBufferWriter &buf_writer) = 0;
   virtual int store_column_meta(ObMicroBufferWriter &buf_writer) = 0;
   virtual ObCSColumnHeader::Type get_type() const = 0;
-  virtual int init(const ObColumnCSEncodingCtx &ctx, const int64_t column_index, const int64_t row_count);
+  virtual int init(const ObColumnCSEncodingCtx &ctx, const int64_t column_index, const ObObjMeta col_type, const int64_t row_count);
   virtual void reuse();
   // Used to choose the best column encoding algorithm which has the minimal store size
   virtual int64_t estimate_store_size() const = 0;
@@ -51,6 +51,7 @@ public:
 
 protected:
   int store_null_bitamp(ObMicroBufferWriter &buf_writer);
+  int store_nop_bitmap(ObMicroBufferWriter &buf_writer);
 
 private:
   int init_common_(const ObColumnCSEncodingCtx &ctx,

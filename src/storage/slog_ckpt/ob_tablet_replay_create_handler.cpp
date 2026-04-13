@@ -108,25 +108,11 @@ int ObTabletReplayCreateTask::add_item_range(const ObTabletReplayItemRange &rang
   return ret;
 }
 
-// ObMetaDiskAddr order: FILE < BLOCK < RAW_BLOCK
+// ObMetaDiskAddr order: SSLOG < FILE < BLOCK < RAW_BLOCK
 // the FILE disk type is only for empty shell tablet
 bool ObTabletReplayItem::operator<(const ObTabletReplayItem &r) const
 {
-  bool ret = false;
-  if (info_.addr_.type() < r.info_.addr_.type()) {
-    ret = true;
-  } else if (info_.addr_.type() == r.info_.addr_.type()) {
-    if (info_.addr_.is_block()) {
-      if (info_.addr_.block_id() < r.info_.addr_.block_id()) {
-        ret = true;
-      } else {
-        // addrs in same block are no need to sort between themself by offset
-      }
-    } else {
-      // FILE addrs are no need to sort between themself
-    }
-  }
-  return ret;
+  return info_.addr_ < r.info_.addr_;
 }
 
 //============================= ObTabletReplayCreateHandler ==============================//
@@ -151,6 +137,7 @@ int ObTabletReplayCreateHandler::init(
   int ret = OB_SUCCESS;
   int64_t cost_time_us = 0;
   const int64_t start_time = ObTimeUtility::current_time();
+  const int64_t ls_buckets_count = ObTenantSuperBlock::MAX_LS_COUNT;
   total_tablet_cnt_ = tablet_item_map.size();
   common::hash::ObHashMap<ObTabletMapKey, ObReplayTabletValue>::const_iterator iter = tablet_item_map.begin();
 
@@ -163,6 +150,11 @@ int ObTabletReplayCreateHandler::init(
       static_cast<ObTabletReplayItem*>(allocator_.alloc(total_tablet_cnt_ * sizeof(ObTabletReplayItem))))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("fail to alloc tablet_addr_arr", K(ret), K(total_tablet_cnt_));
+  } else if (OB_FAIL(ls_bucket_lock_.init(ls_buckets_count,
+                                          ObLatchIds::BLOCK_MANAGER_LOCK,
+                                          "TabletReplay",
+                                          MTL_ID()))) {
+    LOG_WARN("fail to init ls bucket lock", K(ret), K(ls_buckets_count));
   } else {
     int64_t i = 0;
     for ( ; iter != tablet_item_map.end(); iter++, i++) {
@@ -192,7 +184,8 @@ int ObTabletReplayCreateHandler::concurrent_replay(ObStartupAccelTaskHandler* st
 #define ADD_ITEM_RANGE_TO_TASK(                                                        \
     startup_accel_handler, start_item_idx, end_item_idx, only_support_discrete)        \
   ObTabletReplayItemRange range(start_item_idx, end_item_idx);                         \
-  if (only_support_discrete) {                                                         \
+  if (OB_FAIL(ret)) {                                                                  \
+  } else if (only_support_discrete) {                                                  \
     if (OB_FAIL(add_item_range_to_task_(startup_accel_handler,                         \
         ObTabletReplayCreateTask::DISCRETE, range, discrete_task_))) {                 \
       LOG_WARN("fail to add_item_range_to_task_", K(ret), KPC(discrete_task_));        \
@@ -217,7 +210,13 @@ int ObTabletReplayCreateHandler::concurrent_replay(ObStartupAccelTaskHandler* st
       startup_accel_handler->get_task_allocator().free(task);                          \
       task = nullptr;                                                                  \
     }                                                                                  \
-  }
+  } else if (OB_NOT_NULL(task)) {                                                      \
+    LOG_WARN("some error happened, destroy task", K(ret), KPC(task),                   \
+      K(inflight_task_cnt_));                                                          \
+    task->~ObTabletReplayCreateTask();                                                 \
+    startup_accel_handler->get_task_allocator().free(task);                            \
+    task = nullptr;                                                                    \
+  }                                                                                    \
 
   int ret = OB_SUCCESS;
   const int64_t start_time = ObTimeUtility::current_time();
@@ -246,11 +245,16 @@ int ObTabletReplayCreateHandler::concurrent_replay(ObStartupAccelTaskHandler* st
 
     if (i < total_tablet_cnt_) {
       // <2> handle block addr
-      MacroBlockId pre_block_id = total_tablet_item_arr_[i].info_.addr_.block_id();
+      MacroBlockId pre_block_id;
       MacroBlockId curr_block_id;
+      if (OB_FAIL(total_tablet_item_arr_[i].info_.addr_.get_macro_block_id(pre_block_id))) {
+        LOG_WARN("failed to get macro block id", K(ret), "addr", total_tablet_item_arr_[i].info_.addr_);
+      }
+
       for ( ; OB_SUCC(ret) && i < total_tablet_cnt_; i++ ) {
-        curr_block_id = total_tablet_item_arr_[i].info_.addr_.block_id();
-        if (pre_block_id == curr_block_id) {
+        if (OB_FAIL(total_tablet_item_arr_[i].info_.addr_.get_macro_block_id(curr_block_id))) {
+          LOG_WARN("failed to get macro block id", K(ret), "addr", total_tablet_item_arr_[i].info_.addr_);
+        } else if (pre_block_id == curr_block_id) {
           tablet_cnt_in_block ++;
           valid_size_in_block += upper_align(total_tablet_item_arr_[i].info_.addr_.size(), 4096);
         } else {
@@ -436,9 +440,10 @@ int ObTabletReplayCreateHandler::replay_aggregate_tablets(const ObIArray<ObTable
     read_info.io_desc_.set_mode(ObIOMode::READ);
     read_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_COMPACT_READ);
     read_info.io_desc_.set_sys_module_id(ObIOModule::SHARED_BLOCK_RW_IO);
-    read_info.macro_block_id_ = total_tablet_item_arr_[range_arr.at(i).first].info_.addr_.block_id();
     read_info.mtl_tenant_id_ = MTL_ID();
-    if (OB_FAIL(ObObjectManager::read_object(read_info, object_handle))) {
+    if (OB_FAIL(total_tablet_item_arr_[range_arr.at(i).first].info_.addr_.get_macro_block_id(read_info.macro_block_id_))) {
+      LOG_WARN("failed to get macro block id", K(ret), "addr", total_tablet_item_arr_[range_arr.at(i).first].info_.addr_);
+    } else if (OB_FAIL(ObObjectManager::read_object(read_info, object_handle))) {
       LOG_WARN("fail to read block", K(ret), K(read_info));
     }
     for (int64_t idx = range_arr.at(i).first; OB_SUCC(ret) && idx < range_arr.at(i).second; idx++) {
@@ -487,7 +492,7 @@ int ObTabletReplayCreateHandler::do_replay(
   return ret;
 }
 
-int ObTabletReplayCreateHandler::replay_create_tablet(const ObTabletReplayItem &replay_item, const char *buf, const int64_t buf_len)
+int ObTabletReplayCreateHandler::replay_create_tablet(const ObTabletReplayItem &replay_item, const char *buf, const int64_t buf_len) const
 {
   int ret = OB_SUCCESS;
   ObLSTabletService *ls_tablet_svr = nullptr;
@@ -496,6 +501,9 @@ int ObTabletReplayCreateHandler::replay_create_tablet(const ObTabletReplayItem &
   const ObTabletMapKey &key = replay_item.info_.key_;
   const ObUpdateTabletPointerParam param(replay_item);
   ObLSRestoreStatus ls_restore_status;
+  const ObTabletPoolType type = ObTabletPoolType::TP_LARGE;
+  ObUpdateTabletPointerParam tablet_ptr_param = param;
+  tablet_ptr_param.refresh_tablet_cache();
 
   if (OB_FAIL(get_tablet_svr_(key.ls_id_, ls_tablet_svr, ls_handle))) {
     LOG_WARN("fail to get ls tablet service", K(ret));
@@ -503,10 +511,10 @@ int ObTabletReplayCreateHandler::replay_create_tablet(const ObTabletReplayItem &
     LOG_WARN("fail to get ls handle", K(ret), K(key));
   } else if (ls_restore_status.is_in_clone_and_tablet_meta_incomplete()) {
     LOG_INFO("the ls is_in_clone_and_tablet_meta_incomplete", K(key), K(ls_restore_status));
-  } else if (OB_FAIL(ls_tablet_svr->replay_create_tablet(param, buf, buf_len, key.tablet_id_, tablet_transfer_info))) {
+  } else if (OB_FAIL(ls_tablet_svr->replay_create_tablet(param, buf, buf_len, key.tablet_id_, type, tablet_transfer_info))) {
     LOG_WARN("fail to create tablet for replay", K(ret), K(key), K(param));
-  } else if (tablet_transfer_info.has_transfer_table() &&
-      OB_FAIL(record_ls_transfer_info_(ls_handle, key.tablet_id_, tablet_transfer_info))) {
+  } else if (tablet_transfer_info.has_transfer_table() && !tablet_ptr_param.is_empty_shell()
+      && OB_FAIL(record_ls_transfer_info_(ls_handle, key.tablet_id_, tablet_transfer_info))) {
     LOG_WARN("fail to record_ls_transfer_info", K(ret), K(key), K(tablet_transfer_info));
   }
   return ret;
@@ -530,7 +538,7 @@ int ObTabletReplayCreateHandler::replay_inc_macro_ref(
   return ret;
 }
 
-int ObTabletReplayCreateHandler::replay_clone_tablet(const ObTabletReplayItem &replay_item, const char *buf, const int64_t buf_len)
+int ObTabletReplayCreateHandler::replay_clone_tablet(const ObTabletReplayItem &replay_item, const char *buf, const int64_t buf_len) const
 {
   int ret = OB_SUCCESS;
   ObLSTabletService *ls_tablet_svr = nullptr;
@@ -539,9 +547,10 @@ int ObTabletReplayCreateHandler::replay_clone_tablet(const ObTabletReplayItem &r
   const ObUpdateTabletPointerParam param(replay_item);
   ObTabletTransferInfo tablet_transfer_info;
   ObTabletHandle tablet_handle;
+  const ObTabletPoolType type = ObTabletPoolType::TP_LARGE;
   if (OB_FAIL(get_tablet_svr_(key.ls_id_, ls_tablet_svr, ls_handle))) {
     LOG_WARN("fail to get ls tablet service", K(ret));
-  } else if (OB_FAIL(ls_tablet_svr->replay_create_tablet(param, buf, buf_len, key.tablet_id_, tablet_transfer_info))) {
+  } else if (OB_FAIL(ls_tablet_svr->replay_create_tablet(param, buf, buf_len, key.tablet_id_, type, tablet_transfer_info))) {
     LOG_WARN("fail to create tablet for replay", K(ret), K(key), K(param));
   } else if (tablet_transfer_info.has_transfer_table() &&
       OB_FAIL(record_ls_transfer_info_(ls_handle, key.tablet_id_, tablet_transfer_info))) {
@@ -590,17 +599,10 @@ int ObTabletReplayCreateHandler::check_is_need_record_transfer_info_(
   return ret;
 }
 
-int ObTabletReplayCreateHandler::record_ls_transfer_info_tmp(
-      const ObLSHandle &ls_handle,
-      const ObTabletID &tablet_id,
-      const ObTabletTransferInfo &tablet_transfer_info)
-{
-  return record_ls_transfer_info_(ls_handle, tablet_id, tablet_transfer_info);
-}
 int ObTabletReplayCreateHandler::record_ls_transfer_info_(
     const ObLSHandle &ls_handle,
     const ObTabletID &tablet_id,
-    const ObTabletTransferInfo &tablet_transfer_info)
+    const ObTabletTransferInfo &tablet_transfer_info) const
 {
   int ret = OB_SUCCESS;
   storage::ObLS *ls = NULL;
@@ -625,25 +627,61 @@ int ObTabletReplayCreateHandler::record_ls_transfer_info_(
     LOG_WARN("failed to get ls restore status", K(ret), KPC(ls));
   } else if (ls_restore_status.is_before_restore_to_consistent_scn()) {
     LOG_INFO("the log stream in restore is before restore to consistent scn, no need to record transfer info", "ls_id", ls->get_ls_id(), K(ls_restore_status));
-  }else if (!tablet_transfer_info.has_transfer_table()) {
+  } else if (!tablet_transfer_info.has_transfer_table()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet should have transfer table", K(ret), "ls_id", ls->get_ls_id(), K(tablet_id), K(tablet_transfer_info));
-  } else if (ls->get_ls_startup_transfer_info().is_valid()) {
-    if (ls->get_ls_startup_transfer_info().ls_id_ != tablet_transfer_info.ls_id_
-        || ls->get_ls_startup_transfer_info().transfer_start_scn_ != tablet_transfer_info.transfer_start_scn_) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("The transfer_info of different tablet records on the same ls is different", K(ret), "ls_id", ls->get_ls_id(),
-          K(tablet_id), K(tablet_transfer_info), "ls_startup_transfer_info", ls->get_ls_startup_transfer_info());
+  } else {
+    bool need_init = true;
+    const ObLSID ls_id = ls->get_ls_id();
+    // rlock scope
+    {
+      ObBucketHashRLockGuard rlock_guard(ls_bucket_lock_, ls_id.hash());
+      const ObLSTransferInfo &ls_startup_transfer_info = ls->get_ls_startup_transfer_info();
+      if (OB_FAIL(rlock_guard.get_ret())) {
+        LOG_WARN("failed to hold bucket rlock", K(ret), K(ls_id), K(ls_id.hash()));
+      } else if (ls_startup_transfer_info.is_valid()) {
+        if (ls_startup_transfer_info.ls_id_ != tablet_transfer_info.ls_id_
+            || ls_startup_transfer_info.transfer_start_scn_ != tablet_transfer_info.transfer_start_scn_) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("The transfer_info of different tablet records on the same ls is different", K(ret), K(ls_id),
+              K(tablet_id), K(tablet_transfer_info), K(ls_startup_transfer_info));
+        } else {
+          // ls_start_transfer_info already been inited, set need_init to false.
+          need_init = false;
+        }
+      }
     }
-  } else if (OB_FAIL(check_is_need_record_transfer_info_(tablet_transfer_info.ls_id_,
-      tablet_transfer_info.transfer_start_scn_, is_need))) {
-    LOG_WARN("failed to check is need record ls", K(ret), "ls_id", ls->get_ls_id(), K(tablet_id), K(tablet_transfer_info));
-  } else if (!is_need) {
-    // do nothing
-  } else if (OB_FAIL(ls->get_ls_startup_transfer_info().init(tablet_transfer_info.ls_id_,
-      tablet_transfer_info.transfer_start_scn_))) {
-    LOG_WARN("failed to init ls transfer info", K(ret), "ls_id", ls->get_ls_id(), K(tablet_id), K(tablet_transfer_info));
+
+    if (OB_FAIL(ret)) {
+    } else if (!need_init) {
+      // do nothing
+    } else {
+      // wlock scope
+      ObBucketHashWLockGuard wlock_guard(ls_bucket_lock_, ls_id.hash());
+      ObLSTransferInfo &ls_startup_transfer_info = ls->get_ls_startup_transfer_info();
+      if (OB_FAIL(wlock_guard.get_ret())) {
+        LOG_WARN("failed to hold bucket wlock", K(ret), K(ls_id), K(ls_id.hash()));
+      }
+      // double check after rlock been released
+      else if (ls_startup_transfer_info.is_valid()) {
+        if (ls_startup_transfer_info.ls_id_ != tablet_transfer_info.ls_id_
+            || ls_startup_transfer_info.transfer_start_scn_ != tablet_transfer_info.transfer_start_scn_) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("The transfer_info of different tablet records on the same ls is different", K(ret), K(ls_id),
+              K(tablet_id), K(tablet_transfer_info), K(ls_startup_transfer_info));
+        }
+      } else if (OB_FAIL(check_is_need_record_transfer_info_(tablet_transfer_info.ls_id_,
+          tablet_transfer_info.transfer_start_scn_, is_need))) {
+        LOG_WARN("failed to check is need record ls", K(ret), K(ls_id), K(tablet_id), K(tablet_transfer_info));
+      } else if (!is_need) {
+        // do nothing
+      } else if (OB_FAIL(ls_startup_transfer_info.init(tablet_transfer_info.ls_id_,
+          tablet_transfer_info.transfer_start_scn_))) {
+        LOG_WARN("failed to init ls transfer info", K(ret), K(ls_id), K(tablet_id), K(tablet_transfer_info));
+      }
+    }
   }
+
   return ret;
 }
 

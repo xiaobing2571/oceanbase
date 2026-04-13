@@ -59,8 +59,7 @@ void *ObMemtableCtx::alloc_mvcc_row_callback()
   if (OB_ISNULL(ret = std::malloc(sizeof(ObMvccRowCallback)))) {
     TRANS_LOG_RET(ERROR, OB_ALLOCATE_MEMORY_FAILED, "callback alloc error, no memory", K(*this));
   } else {
-    ATOMIC_FAA(&callback_mem_used_, sizeof(ObMvccRowCallback));
-    ATOMIC_INC(&callback_alloc_count_);
+    callback_alloc_count_.inc();
   }
   return ret;
 }
@@ -70,7 +69,7 @@ void ObMemtableCtx::free_mvcc_row_callback(ObITransCallback *cb)
   if (OB_ISNULL(cb)) {
     TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "cb is null, unexpected error", KP(cb), K(*this));
   } else {
-    ATOMIC_INC(&callback_free_count_);
+    callback_free_count_.inc();
     std::free(cb);
     cb = NULL;
   }
@@ -248,13 +247,18 @@ public:
     ObTabletMemtableMgr *memtable_mgr = new ObTabletMemtableMgr;
     int64_t schema_version  = 1;
     uint32_t freeze_clock = 0;
+    bool memtable_use_hash_index = true;
+#ifdef MEMTABLE_USE_HASH_INDEX_FLAG
+    memtable_use_hash_index = (MEMTABLE_USE_HASH_INDEX_FLAG != 0);
+#endif
 
     EXPECT_EQ(OB_SUCCESS, memtable->init(table_key,
                                          ls_handle,
                                          freezer,
                                          memtable_mgr,
                                          schema_version,
-                                         freeze_clock));
+                                         freeze_clock,
+                                         memtable_use_hash_index));
 
     return memtable;
   }
@@ -275,7 +279,7 @@ public:
          iter != (ObMvccRowCallback *)(cb_list.get_guard());
          iter = (ObMvccRowCallback *)(iter->get_next())) {
       if (iter->seq_no_ > to) {
-        iter->tnode_->set_delayed_cleanout(true);
+        iter->tnode_->set_delayed_cleanout();
       }
     }
   }
@@ -288,7 +292,7 @@ public:
     for (ObMvccRowCallback *iter = (ObMvccRowCallback *)(cb_list.get_guard()->get_next());
          iter != (ObMvccRowCallback *)(cb_list.get_guard()); iter = next) {
       next = (ObMvccRowCallback *)(iter->get_next());
-      iter->tnode_->set_delayed_cleanout(true);
+      iter->tnode_->set_delayed_cleanout();
       iter->remove();
     }
   }
@@ -374,7 +378,7 @@ public:
       for (ObMvccRowCallback *iter = (ObMvccRowCallback *)(cb_list.get_guard()->get_next());
            iter != (ObMvccRowCallback *)(cb_list.get_guard());
            iter = (ObMvccRowCallback *)(iter->get_next())) {
-        iter->tnode_->set_delayed_cleanout(true);
+        iter->tnode_->set_delayed_cleanout();
       }
     }
   }
@@ -396,7 +400,7 @@ public:
       for (ObMvccRowCallback *iter = (ObMvccRowCallback *)(cb_list.get_guard()->get_next());
            iter != (ObMvccRowCallback *)(cb_list.get_guard());
            iter = (ObMvccRowCallback *)(iter->get_next())) {
-        iter->tnode_->set_delayed_cleanout(true);
+        iter->tnode_->set_delayed_cleanout();
       }
     }
   }
@@ -1093,7 +1097,7 @@ public:
     // EXPECT_EQ(0, tnode->acc_checksum_);
     EXPECT_EQ(mt->get_timestamp(), tnode->version_);
     EXPECT_EQ(ndt_type, tnode->type_);
-    EXPECT_EQ(tnode_flag, tnode->flag_);
+    EXPECT_EQ(tnode_flag, tnode->flag_.flag_status_);
 
     int ret = OB_SUCCESS;
     const ObMemtableDataHeader *mtd = reinterpret_cast<const ObMemtableDataHeader *>(tnode->buf_);
@@ -1166,7 +1170,7 @@ public:
     EXPECT_EQ(0, tnode->acc_checksum_);
     EXPECT_EQ(wmt->get_timestamp(), tnode->version_);
     EXPECT_EQ(NDT_NORMAL, tnode->type_);
-    EXPECT_EQ(ObMvccTransNode::F_INIT, tnode->flag_);
+    EXPECT_EQ(ObMvccTransNode::TransNodeFlag::F_INIT, tnode->flag_.flag_status_);
 
     int ret = OB_SUCCESS;
     const ObMemtableDataHeader *mtd = reinterpret_cast<const ObMemtableDataHeader *>(tnode->buf_);
@@ -1326,7 +1330,7 @@ TEST_F(TestMemtableV2, test_write_read_conflict)
                INT64_MAX, /*trans_version*/
                wtx_seq_no,
                0,         /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                DF_INSERT,
                1,         /*key*/
                2          /*value*/);
@@ -1393,7 +1397,7 @@ TEST_F(TestMemtableV2, test_write_read_conflict)
                2000, /*trans_version*/
                wtx_seq_no,
                0,         /*modify_count*/
-               ObMvccTransNode::F_COMMITTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                2          /*value*/);
@@ -1423,7 +1427,7 @@ TEST_F(TestMemtableV2, test_write_read_conflict)
                2000, /*trans_version*/
                wtx_seq_no,
                0,         /*modify_count*/
-               ObMvccTransNode::F_COMMITTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                2          /*value*/,
@@ -1470,7 +1474,7 @@ TEST_F(TestMemtableV2, test_tx_abort)
                INT64_MAX, /*trans_version*/
                wtx_seq_no,
                0,         /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                2          /*value*/);
@@ -1508,7 +1512,7 @@ TEST_F(TestMemtableV2, test_tx_abort)
                INT64_MAX, /*trans_version*/
                wtx_seq_no,
                0,         /*modify_count*/
-               ObMvccTransNode::F_ABORTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_ABORTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                2          /*value*/);
@@ -1537,7 +1541,7 @@ TEST_F(TestMemtableV2, test_tx_abort)
                INT64_MAX, /*trans_version*/
                wtx_seq_no,
                0,         /*modify_count*/
-               ObMvccTransNode::F_ABORTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_ABORTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                2          /*value*/);
@@ -1582,7 +1586,7 @@ TEST_F(TestMemtableV2, test_write_write_conflict)
                INT64_MAX, /*trans_version*/
                ObTxSEQ(ObSequence::get_max_seq_no()),
                0,         /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                2          /*value*/);
@@ -1649,7 +1653,7 @@ TEST_F(TestMemtableV2, test_write_write_conflict)
                INT64_MAX, /*trans_version*/
                ObTxSEQ(ObSequence::get_max_seq_no()),
                1,         /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                4          /*value*/);
@@ -1717,7 +1721,7 @@ TEST_F(TestMemtableV2, test_write_write_conflict)
                INT64_MAX, /*trans_version*/
                wtx2_seq_no,
                2,         /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                3          /*value*/);
@@ -1753,7 +1757,7 @@ TEST_F(TestMemtableV2, test_write_write_conflict)
                INT64_MAX, /*trans_version*/
                wtx2_seq_no,
                2,         /*modify_count*/
-               ObMvccTransNode::F_ABORTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_ABORTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                3          /*value*/);
@@ -1799,7 +1803,7 @@ TEST_F(TestMemtableV2, test_lock)
                INT64_MAX,   /*trans_version*/
                wtx_seq_no,
                0,           /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_LOCK,
                1,           /*key*/
                UNUSED_VALUE /*value*/);
@@ -1866,7 +1870,7 @@ TEST_F(TestMemtableV2, test_lock)
                INT64_MAX,   /*trans_version*/
                wtx_seq_no,
                0,           /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_LOCK,
                1,           /*key*/
                UNUSED_VALUE /*value*/);
@@ -1906,7 +1910,7 @@ TEST_F(TestMemtableV2, test_lock)
                2000, /*trans_version*/
                wtx_seq_no,
                0,    /*modify_count*/
-               ObMvccTransNode::F_COMMITTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_LOCK,
                1,           /*key*/
                UNUSED_VALUE /*value*/);
@@ -1918,7 +1922,7 @@ TEST_F(TestMemtableV2, test_lock)
                INT64_MAX,   /*trans_version*/
                wtx2_seq_no,
                0,           /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_LOCK,
                1,           /*key*/
                UNUSED_VALUE /*value*/);
@@ -1971,7 +1975,7 @@ TEST_F(TestMemtableV2, test_lock)
                INT64_MAX,               /*trans_version*/
                wtx2_seq_no,
                0,                       /*modify_count*/
-               ObMvccTransNode::F_ABORTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_ABORTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_LOCK,
                1,           /*key*/
                UNUSED_VALUE /*value*/);
@@ -1983,7 +1987,7 @@ TEST_F(TestMemtableV2, test_lock)
                INT64_MAX,               /*trans_version*/
                wtx3_seq_no,
                0,                       /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_INSERT,
                1, /*key*/
                4  /*value*/);
@@ -2106,7 +2110,7 @@ TEST_F(TestMemtableV2, test_rollback_to)
                INT64_MAX, /*trans_version*/
                wtx_seq_no2,
                1,         /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                3          /*value*/);
@@ -2245,7 +2249,7 @@ TEST_F(TestMemtableV2, test_replay)
                INT64_MAX, /*trans_version*/
                wtx_seq_no2,
                2,         /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                3,         /*value*/
@@ -2258,7 +2262,7 @@ TEST_F(TestMemtableV2, test_replay)
                INT64_MAX, /*trans_version*/
                wtx_seq_no1,
                1,         /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                2,         /*value*/
@@ -2323,7 +2327,7 @@ TEST_F(TestMemtableV2, test_replay)
                800, /*trans_version*/
                wtx3_seq_no1,
                0,         /*modify_count*/
-               ObMvccTransNode::F_COMMITTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                4,         /*value*/
@@ -2433,7 +2437,7 @@ TEST_F(TestMemtableV2, test_replay)
 //                INT64_MAX, /*trans_version*/
 //                wtx_seq_no2,
 //                1,         /*modify_count*/
-//                ObMvccTransNode::TransNodeFlag::F_INIT,
+//                ObMvccTransNode::TransNodeFlag::TransNodeFlag::F_INIT,
 //                ObDmlFlag::DF_INSERT,
 //                1,         /*key*/
 //                3,         /*value*/
@@ -2446,7 +2450,7 @@ TEST_F(TestMemtableV2, test_replay)
 //                INT64_MAX, /*trans_version*/
 //                wtx_seq_no1,
 //                0,         /*modify_count*/
-//                ObMvccTransNode::TransNodeFlag::F_INIT,
+//                ObMvccTransNode::TransNodeFlag::TransNodeFlag::F_INIT,
 
 //                ObDmlFlag::DF_INSERT,
 //                1,         /*key*/
@@ -2569,7 +2573,7 @@ TEST_F(TestMemtableV2, test_compact)
                2000,        /*trans_version*/
                wtx_seq_no2,
                1,         /*modify_count*/
-               ObMvccTransNode::F_COMMITTED,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                3,         /*value*/
@@ -2582,7 +2586,7 @@ TEST_F(TestMemtableV2, test_compact)
                2000, /*trans_version*/
                wtx_seq_no2,
                1,         /*modify_count*/
-               ObMvccTransNode::F_COMMITTED,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                3,         /*value*/
@@ -2627,7 +2631,7 @@ TEST_F(TestMemtableV2, test_compact)
                INT64_MAX,                 /*trans_version*/
                wtx3_seq_no1,
                2,                         /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                4,         /*value*/
@@ -2640,7 +2644,7 @@ TEST_F(TestMemtableV2, test_compact)
                2000,                    /*trans_version*/
                wtx_seq_no2,
                1,                       /*modify_count*/
-               ObMvccTransNode::F_COMMITTED,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                3,         /*value*/
@@ -2678,7 +2682,7 @@ TEST_F(TestMemtableV2, test_compact)
                3000,                 /*trans_version*/
                wtx3_seq_no1,
                2,                         /*modify_count*/
-               ObMvccTransNode::F_COMMITTED,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                4,         /*value*/
@@ -2691,7 +2695,7 @@ TEST_F(TestMemtableV2, test_compact)
                3000,                    /*trans_version*/
                wtx3_seq_no1,
                2,                       /*modify_count*/
-               ObMvccTransNode::F_COMMITTED,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                4,         /*value*/
@@ -2783,7 +2787,7 @@ TEST_F(TestMemtableV2, test_compact_v2)
                INT64_MAX,        /*trans_version*/
                wtx_seq_no1,
                0,         /*modify_count*/
-               ObMvccTransNode::F_INIT | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_INIT | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_LOCK,
                1,         /*key*/
                UNUSED_VALUE /*value*/);
@@ -2796,7 +2800,7 @@ TEST_F(TestMemtableV2, test_compact_v2)
                INT64_MAX,        /*trans_version*/
                wtx_seq_no2,
                1,         /*modify_count*/
-               ObMvccTransNode::F_INIT | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_INIT | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                2 /*value*/);
@@ -2818,7 +2822,7 @@ TEST_F(TestMemtableV2, test_compact_v2)
                2000,        /*trans_version*/
                wtx_seq_no1,
                0,         /*modify_count*/
-               ObMvccTransNode::F_COMMITTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_LOCK,
                1,         /*key*/
                UNUSED_VALUE /*value*/);
@@ -2831,7 +2835,7 @@ TEST_F(TestMemtableV2, test_compact_v2)
                2000,        /*trans_version*/
                wtx_seq_no2,
                1,         /*modify_count*/
-               ObMvccTransNode::F_COMMITTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                2 /*value*/);
@@ -2844,7 +2848,7 @@ TEST_F(TestMemtableV2, test_compact_v2)
                2000,        /*trans_version*/
                wtx_seq_no3,
                2,         /*modify_count*/
-               ObMvccTransNode::F_COMMITTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                3 /*value*/);
@@ -2857,7 +2861,7 @@ TEST_F(TestMemtableV2, test_compact_v2)
                2000,        /*trans_version*/
                wtx_seq_no3,
                2,         /*modify_count*/
-               ObMvccTransNode::F_COMMITTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                ObDmlFlag::DF_INSERT,
                1,         /*key*/
                3, /*value*/
@@ -3249,7 +3253,7 @@ TEST_F(TestMemtableV2, test_fast_commit)
                INT64_MAX, /*trans_version*/
                wtx_seq_no,
                0,         /*modify_count*/
-               ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                DF_INSERT,
                1,         /*key*/
                2          /*value*/);
@@ -3282,7 +3286,7 @@ TEST_F(TestMemtableV2, test_fast_commit)
                2000, /*trans_version*/
                wtx_seq_no,
                0,         /*modify_count*/
-               ObMvccTransNode::F_COMMITTED | ObMvccTransNode::F_DELAYED_CLEANOUT,
+               ObMvccTransNode::TransNodeFlag::F_COMMITTED | ObMvccTransNode::TransNodeFlag::F_DELAYED_CLEANOUT,
                DF_INSERT,
                1,         /*key*/
                2          /*value*/);
@@ -3367,7 +3371,7 @@ TEST_F(TestMemtableV2, test_fast_commit_with_no_delay_cleanout)
                INT64_MAX, /*trans_version*/
                wtx_seq_no,
                0,         /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                DF_INSERT,
                1,         /*key*/
                2          /*value*/);
@@ -3409,7 +3413,7 @@ TEST_F(TestMemtableV2, test_fast_commit_with_no_delay_cleanout)
                INT64_MAX, /*trans_version*/
                wtx_seq_no,
                0,         /*modify_count*/
-               ObMvccTransNode::F_INIT,
+               ObMvccTransNode::TransNodeFlag::F_INIT,
                DF_INSERT,
                1,         /*key*/
                2          /*value*/);
@@ -3711,11 +3715,19 @@ int ObLSTxCtxMgr::init(const int64_t tenant_id,
 
 int main(int argc, char **argv)
 {
-  system("rm -rf test_memtable.log*");
-  OB_LOGGER.set_file_name("test_memtable.log", true, false,
-                          "test_memtable.log",
-                          "test_memtable.log",
-                          "test_memtable.log");
+  bool memtable_use_hash_index = true;
+  #ifdef MEMTABLE_USE_HASH_INDEX_FLAG
+      memtable_use_hash_index = (MEMTABLE_USE_HASH_INDEX_FLAG != 0);
+  #endif
+  std::string log_file_name = "test_memtable.log";
+  if (!memtable_use_hash_index) {
+    log_file_name = "test_memtable_no_hash_index.log";
+  }
+  system(std::string("rm -rf " + log_file_name + "*").c_str());
+  OB_LOGGER.set_file_name(log_file_name.c_str(), true, false,
+                          log_file_name.c_str(),
+                          log_file_name.c_str(),
+                          log_file_name.c_str());
   OB_LOGGER.set_log_level("INFO");
   STORAGE_LOG(INFO, "begin unittest: test simple memtable");
   ::testing::InitGoogleTest(&argc, argv);

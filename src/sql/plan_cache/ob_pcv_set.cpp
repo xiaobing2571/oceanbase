@@ -91,6 +91,7 @@ void ObPCVSet::destroy()
     plan_num_ = 0;
     need_check_gen_tbl_col_ = false;
     is_inited_ = false;
+    expired_time_ = 0;
   }
 }
 
@@ -173,7 +174,7 @@ int ObPCVSet::inner_get_cache_obj(ObILibCacheCtx &ctx,
         /*do nothing*/
       } else {
         matched_pcv = pcv;
-        if (OB_FAIL(pcv->choose_plan(pc_ctx, schema_array, plan))) {
+        if (OB_FAIL(pcv->choose_plan(pc_ctx, schema_array, need_check_schema, plan))) {
           LOG_TRACE("failed to get plan in plan cache value", K(ret));
         }
         break;
@@ -227,7 +228,8 @@ int ObPCVSet::inner_add_cache_obj(ObILibCacheCtx &ctx,
     if (REACH_TIME_INTERVAL(PRINT_PLAN_EXCEEDS_LOG_INTERVAL)) {
       LOG_INFO("number of plans in a single pcv_set reach limit", K(ret), K(get_plan_num()), K(pc_ctx));
     }
-  } else if (OB_FAIL(ObPlanCacheValue::get_all_dep_schema(*pc_ctx.sql_ctx_.schema_guard_,
+  } else if (!ObPlanCache::is_contains_external_object(plan->get_dependency_table()) &&
+             OB_FAIL(ObPlanCacheValue::get_all_dep_schema(*pc_ctx.sql_ctx_.schema_guard_,
                                                           plan->get_dependency_table(),
                                                           schema_array))) {
     LOG_WARN("failed to get all dep schema", K(ret));
@@ -351,7 +353,7 @@ int ObPCVSet::create_new_pcv(ObPlanCacheValue *&new_pcv)
   if (nullptr == (buff = allocator_.alloc(sizeof(ObPlanCacheValue)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate memory for ObPlanCacheValue", K(ret));
-  } else if (nullptr == (new_pcv = new(buff)ObPlanCacheValue())) {
+  } else if (nullptr == (new_pcv = new(buff)ObPlanCacheValue(get_next_pcv_id()))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("failed to construct ObPlanCacheValue", K(ret));
   } else {
@@ -531,6 +533,18 @@ int ObPCVSet::get_evolving_evolution_task(EvolutionPlanList &evo_task_list)
   return ret;
 }
 #endif
+
+bool ObPCVSet::set_expired_time()
+{
+  bool ret = false;
+  int64_t expired_time = ATOMIC_LOAD(&expired_time_);
+  int64_t cur_time = ObTimeUtility::current_time();
+  const static int64_t REGENERATE_EXPIRED_PLAN_INTERVAL = 10 * 1000 * 1000L; // 10 second
+  if (expired_time + REGENERATE_EXPIRED_PLAN_INTERVAL < cur_time) {
+    ret = expired_time == ATOMIC_VCAS(&expired_time_, expired_time, cur_time);
+  }
+  return ret;
+}
 
 }
 }

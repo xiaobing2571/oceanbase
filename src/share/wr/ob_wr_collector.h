@@ -14,12 +14,13 @@
 #define OCEANBASE_WR_OB_WORKLOAD_REPOSITORY_COLLECTOR_H_
 #include "share/wr/ob_wr_snapshot_rpc_processor.h"
 #include "sql/plan_cache/ob_i_lib_cache_object.h"
+#include "share/wr/ob_wr_rpc_proxy.h"
 
 namespace oceanbase
 {
 namespace share
 {
-
+constexpr const char* WR_SNAP_ID_SEQNENCE_NAME = "OB_WORKLOAD_REPOSITORY_SNAP_ID_SEQNENCE";
 enum class ObWrSnapshotStatus : int64_t;
 
 struct ObWrSysstat
@@ -110,16 +111,19 @@ public:
     delta_read_io_bytes_ = 0;
     delta_write_io_requests_ = 0;
     delta_write_io_bytes_ = 0;
+    tenant_id_ = 0;
+    weight_ = 0.0;
+    is_wr_weight_sample_ = false;
   };
 
-  TO_STRING_KV(K_(svr_ip), K_(svr_port), K_(sample_id), K_(session_id), K_(sample_time),
-      K_(user_id), K_(session_type), K_(sql_id), K_(trace_id), K_(event_no), K_(event_id),
-      K_(time_waited), K_(p1), K_(p2), K_(p3), K_(sql_plan_line_id), K_(group_id), K_(time_model),
-      K_(module), K_(action), K_(client_id), K_(plan_id), K_(top_level_sql_id),
-      K_(plsql_entry_object_id), K_(plsql_entry_subprogram_id), K_(plsql_entry_subprogram_name),
-      K_(plsql_object_id), K_(plsql_subprogram_id), K_(plsql_subprogram_name), K_(plan_hash),
-      K_(thread_id), K_(stmt_type), K_(tablet_id), K_(blocking_session_id), K_(proxy_sid),
-      K_(delta_read_io_requests), K_(delta_read_io_bytes), K_(delta_write_io_requests), K_(delta_write_io_bytes));
+  TO_STRING_KV(K_(svr_ip), K_(svr_port), K_(sample_id), K_(session_id), K_(sample_time), K_(user_id), K_(session_type),
+      K_(sql_id), K_(trace_id), K_(event_no), K_(event_id), K_(time_waited), K_(p1), K_(p2), K_(p3),
+      K_(sql_plan_line_id), K_(group_id), K_(time_model), K_(module), K_(action), K_(client_id), K_(plan_id),
+      K_(top_level_sql_id), K_(plsql_entry_object_id), K_(plsql_entry_subprogram_id), K_(plsql_entry_subprogram_name),
+      K_(plsql_object_id), K_(plsql_subprogram_id), K_(plsql_subprogram_name), K_(plan_hash), K_(thread_id),
+      K_(stmt_type), K_(tablet_id), K_(blocking_session_id), K_(proxy_sid), K_(delta_read_io_requests),
+      K_(delta_read_io_bytes), K_(delta_write_io_requests), K_(delta_write_io_bytes), K_(tenant_id),
+      K_(weight), K_(is_wr_weight_sample));
   char svr_ip_[OB_IP_STR_BUFF];
   int64_t svr_port_;
   int64_t sample_id_;
@@ -165,6 +169,9 @@ public:
   int64_t delta_read_io_bytes_;
   int64_t delta_write_io_requests_;
   int64_t delta_write_io_bytes_;
+  int64_t tenant_id_;
+  double weight_;
+  bool is_wr_weight_sample_;
 };
 
 
@@ -231,6 +238,8 @@ public:
     first_load_time_ = 0;
     plan_cache_hit_total_ = 0;
     plan_cache_hit_delta_ = 0;
+    sample_time_ = 0;
+    latest_active_time_ = 0;
   };
 
   TO_STRING_KV(K_(svr_ip), K_(svr_port), K_(sql_id), K_(plan_hash), K_(plan_id));
@@ -292,6 +301,8 @@ public:
   int64_t first_load_time_;
   int64_t plan_cache_hit_total_;
   int64_t plan_cache_hit_delta_;
+  int64_t sample_time_;
+  int64_t latest_active_time_;
 };
 
 
@@ -430,6 +441,8 @@ public:
   int init();
   int collect();
   int collect_ash();
+  int collect_sqlstat();
+  int update_sqlstat();
   static int exec_read_sql_with_retry(common::ObCommonSqlProxy::ReadResult &res, const uint64_t tenant_id, const char *sql);
   static int exec_write_sql_with_retry(const uint64_t tenant_id, const char *sql, int64_t &affected_rows);
   template <typename T>
@@ -442,15 +455,12 @@ private:
   int collect_statname();
   int collect_eventname();
   int collect_system_event();
-  int collect_sqlstat();
-  int update_sqlstat();
   int collect_sqltext();
   int collect_sql_plan();
   int collect_res_mgr_sysstat();
   int write_to_wr(ObDMLSqlSplicer &dml_splicer, const char *table_name, int64_t tenant_id, bool ignore_error=false);
   int write_to_wr_sql_plan_and_aux(ObDMLSqlSplicer &dml_splicer, ObDMLSqlSplicer &dml_splicer_aux,
       const char *table_name, const char *table_name_aux, int64_t tenant_id, bool ignore_error = false);
-  int fetch_snapshot_id_sequence_curval(int64_t &snap_id);
   int get_cur_snapshot_id_for_ahead_snapshot(int64_t &snap_id);
   int get_begin_interval_time(int64_t &begin_interval_time);
   int update_last_snapshot_end_time();
@@ -461,6 +471,7 @@ private:
   int64_t snapshot_end_time_;
   int64_t timeout_ts_;
   bool snapshot_ahead_;
+  obrpc::ObWrRpcProxy wr_proxy_;
 };
 
 class ObWrDeleter
@@ -471,6 +482,7 @@ public:
   ~ObWrDeleter() = default;
   DISABLE_COPY_ASSIGN(ObWrDeleter);
   int do_delete();
+  int get_sample_time_by_snap_id(int64_t &min_sample_time, int64_t &max_sample_time, const int64_t snap_id, const int64_t cluster_id, const int64_t query_timeout);
   TO_STRING_KV(K_(purge_arg));
 
 private:
@@ -488,15 +500,6 @@ private:
   int modify_snapshot_status(const uint64_t tenant_id, const int64_t cluster_id,
     const int64_t snap_id, const int64_t query_timeout, const ObWrSnapshotStatus status);
   const ObWrPurgeSnapshotArg &purge_arg_;
-};
-
-typedef common::hash::ObHashMap<sql::ObSqlStatRecordKey, sql::ObExecutedSqlStatRecord*> TmpSqlStatMap;
-struct ObUpdateSqlStatOp
-{
-public:
-  ObUpdateSqlStatOp() {}
-  void reset() {}
-  int operator()(common::hash::HashMapPair<sql::ObCacheObjID, sql::ObILibCacheObject *> &entry);
 };
 
 }  // namespace share

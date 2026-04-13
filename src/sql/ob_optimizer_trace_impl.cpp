@@ -165,8 +165,9 @@ ObOptimizerTraceImpl::ObOptimizerTraceImpl()
     section_(0),
     trace_level_(0),
     enable_(false),
-    trace_state_(1),
-    enable_trace_cost_model_(false)
+    enable_trace_cost_model_(false),
+    enable_mem_perf_(false),
+    trace_state_(1)
 {
 
 }
@@ -210,13 +211,25 @@ int ObOptimizerTraceImpl::set_parameters(const common::ObString &identifier,
   return ret;
 }
 
+int ObOptimizerTraceImpl::enable_mem_perf(const common::ObString &identifier)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(log_handle_.set_identifier(identifier))) {
+    LOG_WARN("ObStringBuf write string error", K(ret));
+  } else {
+    set_mem_perf_enable(true);
+  }
+  return ret;
+}
+
 void ObOptimizerTraceImpl::reset()
 {
   log_handle_.close();
   sql_id_.reset();
   enable_ = false;
-  trace_state_ = 1;
   enable_trace_cost_model_ = false;
+  enable_mem_perf_ = false;
+  trace_state_ = 1;
 }
 
 bool ObOptimizerTraceImpl::enable(const common::ObString &sql_id)
@@ -351,7 +364,7 @@ int ObOptimizerTraceImpl::append(const uint32_t &value)
 
 int ObOptimizerTraceImpl::append(const double & value)
 {
-  return append_format<32>("%f", value);
+  return append_format<32>("%g", value);
 }
 
 int ObOptimizerTraceImpl::append(const ObObj& value)
@@ -473,7 +486,11 @@ int ObOptimizerTraceImpl::append(const ObLogPlan *log_plan)
   if (OB_NOT_NULL(target_plan) &&
       target_plan->get_stmt()->is_explain_stmt()) {
     const ObLogValues *op = static_cast<const ObLogValues*>(target_plan->get_plan_root());
-    target_plan = op->get_explain_plan();
+    if (op != NULL && op->get_explain_plan() != NULL) {
+      target_plan = op->get_explain_plan();
+    } else {
+      LOG_WARN("unexpected explain plan root or explain_plan_ is null");
+    }
   }
   if (OB_NOT_NULL(target_plan)) {
     ObExplainDisplayOpt option;
@@ -562,6 +579,8 @@ int ObOptimizerTraceImpl::append(const Path *path)
   if (OB_NOT_NULL(path)) {
     increase_section();
     new_line();
+    append("path#");
+    append(path->path_number_, ",");
     append_ptr(path);
     new_line();
     append("tables:", path->parent_);
@@ -571,7 +590,7 @@ int ObOptimizerTraceImpl::append(const Path *path)
       const ObIndexMetaInfo &index_info = ap.est_cost_info_.index_meta_info_;
       if (ap.is_index_merge_path()) {
         const IndexMergePath& index_merge_path = static_cast<const IndexMergePath&>(ap);
-        append("is index merge: True, index merge conditions:", index_merge_path.root_);
+        append("is index merge: True, index merge tree:", index_merge_path.root_);
       } else {
         append("is index merge: False, index id:", ap.index_id_, ", global index:", ap.is_global_index_, ", unique index:", index_info.is_unique_index_);
       }
@@ -587,6 +606,11 @@ int ObOptimizerTraceImpl::append(const Path *path)
       append("prefix filters:", ap.est_cost_info_.prefix_filters_, ",selectivity:", ap.est_cost_info_.prefix_filter_sel_);
       new_line();
       append("pushdown prefix filters:", ap.est_cost_info_.pushdown_prefix_filters_, ",selectivity:", ap.est_cost_info_.pushdown_prefix_filter_sel_);
+      if (ap.use_skip_scan_ != OptSkipScanState::SS_DISABLE) {
+        new_line();
+        append("ss range filters:", ap.est_cost_info_.ss_postfix_range_filters_, ",selectivity:", ap.est_cost_info_.ss_postfix_range_filters_sel_);
+        append(",ss prefix ndv:", ap.est_cost_info_.ss_prefix_ndv_);
+      }
       new_line();
       append("postfix filters:", ap.est_cost_info_.postfix_filters_, ",selectivity:", ap.est_cost_info_.postfix_filter_sel_);
       new_line();
@@ -608,6 +632,9 @@ int ObOptimizerTraceImpl::append(const Path *path)
     append(", server count:", path->server_cnt_);
     new_line();
     append(path->get_sharding());
+    new_line();
+    append("ordering:", path->get_ordering());
+    append("intersting info:", path->get_interesting_order_info());
     decrease_section();
   }
   return ret;
@@ -619,6 +646,8 @@ int ObOptimizerTraceImpl::append(const JoinPath* join_path)
   if (OB_NOT_NULL(join_path)) {
     increase_section();
     new_line();
+    append("path#");
+    append(join_path->path_number_, ",");
     append_ptr(join_path);
     new_line();
     if (HASH_JOIN == join_path->join_algo_) {
@@ -638,12 +667,33 @@ int ObOptimizerTraceImpl::append(const JoinPath* join_path)
     new_line();
     append(join_path->get_sharding());
     new_line();
+    if (join_path->is_nl_style_pipelined_path()) {
+      append("Is nl style pipeline path");
+      new_line();
+    } else if (join_path->is_pipelined_path()) {
+      append("Is pipeline path");
+      new_line();
+    }
+    if (join_path->contain_normal_nl()) {
+      append("Contain normal nl");
+      new_line();
+    }
+    if (join_path->has_none_equal_join()) {
+      append("Contain non-equal join");
+      new_line();
+    }
+    if (join_path->contain_expansion_join()) {
+      append("Contain expansion join");
+      new_line();
+    }
     append("left path:");
     if (OB_NOT_NULL(join_path->left_path_) && OB_NOT_NULL(join_path->left_path_->parent_)) {
       increase_section();
       new_line();
       append("tables:", join_path->left_path_->parent_);
       new_line();
+      append("path#");
+      append(join_path->left_path_->path_number_, ",");
       append_ptr(join_path->left_path_);
       new_line();
       append("cost:", join_path->left_path_->cost_, ",card:", join_path->left_path_->parent_->get_output_rows(),
@@ -653,6 +703,8 @@ int ObOptimizerTraceImpl::append(const JoinPath* join_path)
       if (NULL != join_path->left_path_->get_sharding()) {
         append(",part count:", join_path->left_path_->get_sharding()->get_part_cnt());
       }
+      new_line();
+      append("ordering:", join_path->left_path_->get_ordering());
       decrease_section();
     }
     new_line();
@@ -667,6 +719,8 @@ int ObOptimizerTraceImpl::append(const JoinPath* join_path)
         new_line();
         append("tables:", join_path->right_path_->parent_);
         new_line();
+        append("path#");
+        append(join_path->right_path_->path_number_, ",");
         append_ptr(join_path->right_path_);
         new_line();
         append("cost:", join_path->right_path_->cost_, ",card:", join_path->right_path_->parent_->get_output_rows(),
@@ -774,6 +828,9 @@ int ObOptimizerTraceImpl::append(const ObDSResultItem &ds_result)
   } else if (OB_DS_INDEX_SCAN_STAT == ds_result.type_ &&
              OB_FAIL(append(", tpye:index scan"))) {
     LOG_WARN("failed to append msg", K(ret));
+  } else if (OB_DS_INDEX_SKIP_SCAN_STAT == ds_result.type_ &&
+             OB_FAIL(append(", tpye:index skip scan"))) {
+    LOG_WARN("failed to append msg", K(ret));
   } else if (OB_DS_INDEX_BACK_STAT == ds_result.type_ &&
              OB_FAIL(append(", tpye:index back"))) {
     LOG_WARN("failed to append msg", K(ret));
@@ -857,16 +914,17 @@ int ObOptimizerTraceImpl::append(const ObSkylineDim &dim)
     case ObSkylineDim::INTERESTING_ORDER: {
       const ObInterestOrderDim &order_dim = static_cast<const ObInterestOrderDim &>(dim);
       append("[intersting order dim] is interesting order:", order_dim.is_interesting_order_);
-      append(", need index back:", order_dim.need_index_back_);
-      append(", can extract range:", order_dim.can_extract_range_);
-      append(", column ids:", common::ObArrayWrap<uint64_t>(order_dim.column_ids_,  order_dim.column_cnt_));
-      append(", filter columns:", common::ObArrayWrap<uint64_t>(order_dim.filter_column_ids_, order_dim.filter_column_cnt_));
+      append(", column ids:", order_dim.column_ids_);
       break;
     }
     case ObSkylineDim::QUERY_RANGE: {
       const ObQueryRangeDim &range_dim = static_cast<const ObQueryRangeDim &>(dim);
       append("[query range dim] contain false range:", range_dim.contain_always_false_);
-      append(", rowkey ids:", common::ObArrayWrap<uint64_t>(range_dim.column_ids_, range_dim.column_cnt_));
+      append(", rowkey ids:", range_dim.range_column_ids_);
+      if (!range_dim.ss_range_column_ids_.empty()) {
+        append(", skip scan range ids:", range_dim.ss_range_column_ids_);
+        append(", skip scan offset ids:", range_dim.ss_offset_column_ids_);
+      }
       break;
     }
     case ObSkylineDim::UNIQUE_RANGE: {
@@ -973,8 +1031,34 @@ int ObOptimizerTraceImpl::append(const ObTabletID& id)
 int ObOptimizerTraceImpl::append(const ObIndexMergeNode *node)
 {
   int ret = OB_SUCCESS;
-  if (OB_NOT_NULL(node)) {
-    append(node->filter_);
+  if (OB_ISNULL(node)) {
+    // do nothing
+  } else if (node->is_merge_node()) {
+    if (INDEX_MERGE_UNION == node->node_type_) {
+      if (OB_FAIL(append("OR("))) {
+        LOG_WARN("failed to append node type or", K(ret));
+      }
+    } else if (INDEX_MERGE_INTERSECT == node->node_type_) {
+      if (OB_FAIL(append("AND("))) {
+        LOG_WARN("failed to append node type and", K(ret));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < node->children_.count(); ++i) {
+      if (OB_FAIL(SMART_CALL(append(node->children_.at(i))))) {
+        LOG_WARN("failed to append child node", K(ret), K(i));
+      } else if (i < node->children_.count() - 1 && OB_FAIL(append(", "))) {
+        LOG_WARN("failed to append comma", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(append(")"))) {
+      LOG_WARN("failed to append right bracket", K(ret));
+    }
+  } else { // is scan node
+    if (OB_FAIL(append(node->index_tid_, ":"))) {
+      LOG_WARN("failed to append index tid", K(ret));
+    } else if (OB_FAIL(append(node->filter_))) {
+      LOG_WARN("failed to append filter", K(ret));
+    }
   }
   return ret;
 }
@@ -1006,6 +1090,23 @@ int ObOptimizerTraceImpl::append<ColumnItem>(const ObIArrayWrap<ColumnItem>& val
   for (int i = 0; OB_SUCC(ret) && i < value.count(); ++i) {
     if (OB_FAIL(append(value.at(i).column_name_))) {
     } else if (i > 0 && OB_FAIL(new_line())) {
+    }
+  }
+  return ret;
+}
+
+int ObOptimizerTraceImpl::append(const OrderItem &order)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(append(order.expr_))) {
+    LOG_WARN("failed to append");
+  } else if (order.is_ascending()) {
+    if (OB_FAIL(append(" ASC"))) {
+      LOG_WARN("failed to append");
+    }
+  } else {
+    if (OB_FAIL(append(" DESC"))) {
+      LOG_WARN("failed to append");
     }
   }
   return ret;
@@ -1237,6 +1338,21 @@ int ObOptimizerTraceImpl::trace_mem_used()
     }
   }
   return ret;
+}
+
+ObMemPerfGuard::ObMemPerfGuard(const ObString &section) : section_(section)
+{
+  print_trace("begin");
+}
+
+ObMemPerfGuard::~ObMemPerfGuard()
+{
+  print_trace("end");
+}
+
+void ObMemPerfGuard::print_trace(const ObString &stage)
+{
+  MEM_TRACE("[MEM PERF]", K_(section), stage);
 }
 
 }

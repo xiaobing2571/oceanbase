@@ -40,6 +40,7 @@ public:
     new_reqs_.set_attr(ObMemAttr(MTL_ID(), "ModNewReqs"));
     new_results_.set_attr(ObMemAttr(MTL_ID(), "ModNewRes"));
     is_alloc_from_pool_ = true;
+    is_alloc_req_res_ = true;
   }
   virtual ~ObIModel() {}
   virtual int prepare(ObTableExecCtx &ctx,
@@ -146,7 +147,8 @@ public:
   }
   virtual int work(ObTableExecCtx &ctx,
                    const ObTableQueryAsyncRequest &req,
-                   ObTableQueryAsyncResult &res);
+                   ObTableQueryAsyncResult &res,
+                   ObTableExecCtx &arg_ctx);
   virtual int work(ObTableExecCtx &ctx,
                    const ObRedisRpcRequest &req,
                    ObRedisResult &res)
@@ -271,6 +273,7 @@ public:
   OB_INLINE common::ObIArray<ObTableLSOpResult*> &get_new_results() { return new_results_; }
   OB_INLINE bool is_alloc_from_pool() { return is_alloc_from_pool_; }
   OB_INLINE uint64_t get_lease_timeout_period() { return lease_timeout_period_; }
+  OB_INLINE table::ObTableNewQueryAsyncSession *get_query_session() { return query_session_; }
 protected:
   int alloc_and_init_request_result(ObTableExecCtx &ctx,
                                     const ObTableLSOpRequest &src_req,
@@ -330,6 +333,7 @@ protected:
   common::ObSEArray<ObTableLSOpRequest*, 8> new_reqs_;
   common::ObSEArray<ObTableLSOpResult*, 8> new_results_;
   bool is_alloc_from_pool_;
+  bool is_alloc_req_res_;
 private:
   common::ObArenaAllocator allocator_;
   table::ObTableNewQueryAsyncSession *query_session_;

@@ -43,6 +43,7 @@ class ObHDFSStorageInfo;
 }
 namespace sql
 {
+struct ObFastParserResult;
 class RowDesc;
 class ObSQLSessionInfo;
 class ObRawExpr;
@@ -53,7 +54,6 @@ class ObOpRawExpr;
 class OrderItem;
 class ObTaskExecutorCtx;
 class ObTableLocation;
-class ObPhyTableLocation;
 class ObQueryRange;
 class ObSqlExpression;
 class ObPhysicalPlan;
@@ -71,6 +71,7 @@ struct ObPCResourceMapRule;
 class ObResolverParams;
 class ObGlobalHint;
 class ObSqlSchemaGuard;
+struct ObPlanCacheCtx;
 
 struct EstimatedPartition {
   common::ObAddr addr_;
@@ -172,6 +173,9 @@ public:
   static bool is_trans_commit_need_disconnect_err(int err);
 
   static int check_enable_decimalint(const sql::ObSQLSessionInfo *session, bool &enable_decimalint);
+  static int check_rowsets_enabled(const sql::ObSQLSessionInfo *session,
+                                   const ObGlobalHint &global_hint,
+                                   bool &rowsets_enabled);
 
   static void check_if_need_disconnect_after_end_trans(const int end_trans_err,
                                                        const bool is_rollback,
@@ -218,12 +222,12 @@ public:
                                        ObIAllocator &allocator);
 
   static void clear_expr_eval_flags(const ObExpr &expr, ObEvalCtx &ctx);
-  static int clear_expr_eval_flags_norecursive(const ObExpr &expr, ObEvalCtx &ctx);
 
   static int calc_sql_expression_without_row(ObExecContext &exec_ctx,
                                              const ObISqlExpression &expr,
                                              ObObj &result,
-                                             ObIAllocator *allocator = NULL);
+                                             ObIAllocator *allocator = NULL,
+                                             bool is_pl_expr_eval = false);
 
   static int calc_const_expr(const ObRawExpr *expr,
                              const ParamStore *params,
@@ -434,6 +438,10 @@ public:
                              ObObjPrintParams print_params = ObObjPrintParams(),
                              const ParamStore *param_store = NULL,
                              const ObSQLSessionInfo *session = NULL);
+  static int reconstruct_ps_sql(ObSqlString &reconstruct_sql, const ObString &ps_sql,
+                                const ObIArray<const common::ObObjParam *> &const_tokens);
+  static int append_obj_param(ObSqlString &reconstruct_sql, const common::ObObjParam & obj_param);
+  static int is_opt_hdfs_external_hive_table(const ObTableSchema *table_schema, bool &is_hive_table);
   static int print_sql(char *buf,
                        int64_t buf_len,
                        int64_t &pos,
@@ -520,6 +528,17 @@ public:
 
   static int wrap_column_convert_ctx(const common::ObExprCtx &expr_ctx, common::ObCastCtx &column_conv_ctx);
 
+  static int convert_number_to_int_with_trunc(const number::ObNumber &nmb,
+                                               int64_t &int_value,
+                                               int &cmp);
+  static int adjust_key_border_for_number_convert(const int cmp,
+                                                   const bool is_start_key,
+                                                   const bool is_last_obj,
+                                                   int64_t &nth_obj,
+                                                   const int64_t obj_cnt,
+                                                   common::ObObj *new_key_obj,
+                                                   common::ObBorderFlag &border_flag);
+
   static void init_type_ctx(const ObSQLSessionInfo *session, ObExprTypeCtx &type_ctx);
   static int get_solidified_vars_from_ctx(const ObRawExpr &expr,
                                           const ObLocalSessionVar *&local_vars);
@@ -587,6 +606,7 @@ public:
                                  const ObExecuteMode exec_mode,
                                  ObSQLSessionInfo &session,
                                  bool is_sensitive = false);
+  static void fixup_commit_time(ObSQLSessionInfo &session);
   static int64_t get_query_record_size_limit(uint64_t tenant_id)
   {
     int64_t thredhold = OB_MAX_SQL_LENGTH;
@@ -608,6 +628,15 @@ public:
                                                     ObString &sql_text,
                                                     int64_t convert_flag = 0,
                                                     int64_t *action_flag = NULL);
+  // similar to convert_sql_text_from_schema_for_resolve,
+  // but only for generated column definition text
+  static int convert_gen_col_def_text_from_schema_for_resolve(
+             common::ObIAllocator &allocator,
+             const common::ObDataTypeCastParams &dtc_params,
+             const ObColumnSchemaV2 *column_schema,
+             common::ObString &gen_col_def_text,
+             int64_t convert_flag = 0,
+             int64_t *action_flag = NULL);
   /**
    * @brief convert_sql_text_to_schema_for_storing
    * @param dtc_params, collation settings from session
@@ -707,12 +736,6 @@ public:
                                                 ObPCResourceMapRule &resource_map_rule,
                                                 uint64_t &group_id);
 
-#ifdef OB_BUILD_SPM
-  static int handle_plan_baseline(const ObAuditRecordData &audit_record,
-                                  ObPhysicalPlan *plan,
-                                  const int ret_code,
-                                  ObSqlCtx &sql_ctx);
-#endif
   static int async_recompile_view(const share::schema::ObTableSchema &old_view_schema,
                                   ObSelectStmt *select_stmt,
                                   bool reset_column_infos,
@@ -767,6 +790,9 @@ public:
                                      ObExternalFileFormat::FormatType &type);
   static int get_external_table_type(const ObString &table_format_or_properties,
                                      ObExternalFileFormat::FormatType &type);
+  static int get_odps_api_mode(const ObString &table_format_or_properties,
+                                    bool &is_odps_external_table,
+                                    ObODPSGeneralFormat::ApiMode& mode);
   static int is_odps_external_table(const uint64_t tenant_id,
                                     const uint64_t table_id,
                                     bool &is_odps_external_table);
@@ -774,6 +800,7 @@ public:
                                     bool &is_odps_external_table);
   static int is_odps_external_table(const ObString &table_format_or_properties,
                                     bool &is_odps_external_table);
+  static int check_location_constraint(const ObTableSchema &table_schema);
   static int extract_odps_part_spec(const ObString &all_part_spec, ObIArray<ObString> &part_spec_list);
   static int check_ident_name(const common::ObCollationType cs_type, common::ObString &name,
                               const bool check_for_path_char, const int64_t max_ident_len);
@@ -797,6 +824,28 @@ public:
 
   static int get_strong_partition_replica_addr(const ObCandiTabletLoc &phy_part_loc_info,
                                                ObAddr &selected_addr);
+
+  static int match_ccl_rule(ObIAllocator &alloc, ObSQLSessionInfo &session, ObSqlCtx &context,
+                            const ObString &sql, bool is_ps_mode,
+                            const ObIArray<const common::ObObjParam *> &param_store,
+                            const ObString &format_sqlid, CclRuleContainsInfo contians_info,
+                            ParseResult *parse_result = nullptr, ObStmt *stmt = nullptr);
+
+  static int match_ccl_rule(const ObPlanCacheCtx *pc_ctx, ObSQLSessionInfo &session, bool is_ps_mode,
+                            const DependenyTableStore &dependency_table_store);
+  static int parameterize_pl_sql(const ObString &raw_sql,
+    ParamStore &pl_params,
+    ObIAllocator &allocator,
+    const ObSQLSessionInfo &session,
+    ObString &parameterized_sql,
+    ObFastParserResult &fp_result,
+    bool param_byorder);
+  static int construct_mixed_param_store(const ObFastParserResult &fp_result,
+    ParamStore &pl_params,
+    ObIAllocator &allocator,
+    const ObSQLSessionInfo &session,
+    bool param_byorder);
+
 private:
   static bool check_mysql50_prefix(common::ObString &db_name);
   static bool part_expr_has_virtual_column(const ObExpr *part_expr);
@@ -927,6 +976,20 @@ class JsonObjectStarChecker : public RelExprCheckerBase
 public:
   JsonObjectStarChecker(common::ObIArray<ObRawExpr *> &rel_array);
   virtual ~JsonObjectStarChecker() {}
+  int add_expr(ObRawExpr *&expr);
+private:
+  common::ObIArray<ObRawExpr *> &rel_array_;
+  int64_t init_size_;
+};
+
+class SemanticVectorDistExprChecker : public RelExprCheckerBase
+{
+public:
+  SemanticVectorDistExprChecker(common::ObIArray<ObRawExpr *> &rel_array)
+      : RelExprCheckerBase(), rel_array_(rel_array), init_size_(rel_array.count())
+  {
+  }
+  virtual ~SemanticVectorDistExprChecker() {}
   int add_expr(ObRawExpr *&expr);
 private:
   common::ObIArray<ObRawExpr *> &rel_array_;
@@ -1163,7 +1226,8 @@ public:
       const bool has_tenant_id_col,
       const int64_t tenant_id_col_idx);
 private:
-  int convert_key(const ObRowkey &src, ObRowkey &dst, bool is_start_key, int64_t pos);
+  int convert_key(const ObRowkey &src, ObRowkey &dst, bool is_start_key, int64_t pos,
+                  ObBorderFlag &border_flag);
   int get_all_columns_schema();
   int init_output_row(int64_t cell_cnt);
   int get_need_convert_key_ranges_pos(ObNewRange &key_range, int64_t &pos);
@@ -1227,6 +1291,20 @@ enum PreCalcExprExpectResult {
   PRE_CALC_NOT_PRECISE,
   PRE_CALC_ROWID,
   PRE_CALC_LOSSLESS_CAST, // only used in rewrite, will be converted to cast(expr, type) = expr
+  PRE_CALC_JSON_CONTAINS_PRECISE,
+  PRE_CALC_JSON_CONTAINS_NOT_PRECISE,
+  PRE_CALC_JSON_TYPE,
+  PRE_CALC_SEARCH_INDEX_CONSTRAINT,
+};
+
+union ObConstraintExtra{
+  ObConstraintExtra() : extra_(-1) {}
+  int64_t extra_;
+  struct {
+    int64_t escape_char_  :   8;
+    int64_t reserved_     :   56;
+  };
+  TO_STRING_KV(K_(extra), K_(escape_char));
 };
 
 struct ObExprConstraint
@@ -1234,18 +1312,34 @@ struct ObExprConstraint
   ObExprConstraint() :
       pre_calc_expr_(NULL),
       expect_result_(PRE_CALC_RESULT_NONE),
-      ignore_const_check_(false) {}
+      ignore_const_check_(false),
+      cons_extra_() {}
   ObExprConstraint(ObRawExpr *expr, PreCalcExprExpectResult expect_result) :
       pre_calc_expr_(expr),
       expect_result_(expect_result),
-      ignore_const_check_(false) {}
+      ignore_const_check_(false),
+      cons_extra_() {}
+  ObExprConstraint(ObRawExpr *expr, PreCalcExprExpectResult expect_result, ObConstraintExtra extra) :
+      pre_calc_expr_(expr),
+      expect_result_(expect_result),
+      ignore_const_check_(false),
+      cons_extra_(extra) {}
   bool operator==(const ObExprConstraint &rhs) const;
+  static bool has_extra(PreCalcExprExpectResult expect_result)
+  {
+    return PRE_CALC_PRECISE == expect_result ||
+           PRE_CALC_NOT_PRECISE == expect_result ||
+           PRE_CALC_JSON_TYPE == expect_result ||
+           PRE_CALC_SEARCH_INDEX_CONSTRAINT == expect_result;
+  }
   ObRawExpr *pre_calc_expr_;
   PreCalcExprExpectResult expect_result_;
   bool ignore_const_check_;
+  ObConstraintExtra cons_extra_;
   TO_STRING_KV(KP_(pre_calc_expr),
                K_(expect_result),
-               K_(ignore_const_check));
+               K_(ignore_const_check),
+               K_(cons_extra));
 };
 
 struct ObPreCalcExprConstraint : public common::ObDLinkBase<ObPreCalcExprConstraint>
@@ -1253,15 +1347,19 @@ struct ObPreCalcExprConstraint : public common::ObDLinkBase<ObPreCalcExprConstra
   public:
     ObPreCalcExprConstraint(common::ObIAllocator &allocator):
       pre_calc_expr_info_(allocator),
-      expect_result_(PRE_CALC_RESULT_NONE)
+      expect_result_(PRE_CALC_RESULT_NONE),
+      cons_extras_(allocator)
     {
     }
     virtual int assign(const ObPreCalcExprConstraint &other, common::ObIAllocator &allocator);
     virtual int check_is_match(ObDatumObjParam &datum_param,
                                ObExecContext &exec_ctx,
+                               ObConstraintExtra *extra,
                                bool &is_match) const;
+    TO_STRING_KV(K(expect_result_));
     ObPreCalcExprFrameInfo pre_calc_expr_info_;
     PreCalcExprExpectResult expect_result_;
+    ObFixedArray<ObConstraintExtra, common::ObIAllocator> cons_extras_;
 };
 
 struct ObRowidConstraint : public ObPreCalcExprConstraint
@@ -1277,9 +1375,150 @@ struct ObRowidConstraint : public ObPreCalcExprConstraint
                        common::ObIAllocator &allocator) override;
     virtual int check_is_match(ObDatumObjParam &datum_param,
                                ObExecContext &exec_ctx,
+                               ObConstraintExtra *extra,
                                bool &is_match) const override;
     uint8_t rowid_version_;
     ObFixedArray<ObObjType, common::ObIAllocator> rowid_type_array_;
+};
+
+struct ObJsonTypeConstraint
+{
+  public:
+    enum JsonType {
+      JSON_TYPE_SCALAR,
+      JSON_TYPE_ARRAY,
+      JSON_TYPE_JSON_CONTAINS_NO_INDEX_MERGE,
+      JSON_TYPE_NOT_ARRAY_OR_SCALAR,
+      JSON_TYPE_ALL_MEMBER_SCALAR,       // json scalar or array all member is scalar
+      JSON_TYPE_ARRAY_ALL_MEMBER_SCALAR, // json array all member is scalar and constrain element count
+    };
+    static int check_is_match(ObObjParam &obj_param,
+                              ObExecContext &exec_ctx,
+                              ObConstraintExtra *extra,
+                              bool &is_match);
+    static int64_t make_extra(int32_t json_type, int32_t element_count)
+    {
+      return (static_cast<int64_t>(json_type) << 32) | (static_cast<uint32_t>(element_count));
+    }
+    static int32_t get_json_type(int64_t extra)
+    {
+      return static_cast<int32_t>(extra >> 32);
+    }
+    static int32_t get_element_count(int64_t extra)
+    {
+      return static_cast<int32_t>(extra & 0xFFFFFFFF);
+    }
+};
+
+struct ObSearchIndexConstraint
+{
+  public:
+  enum ConstraintType {
+    // Scenario: simple JSON column comparison, e.g. WHERE json_col > CAST('"x"' AS JSON).
+    // Requires: value is a JSON scalar (not object/array); if the scalar is a string,
+    // its encoded length must fit within SEARCH_INDEX_VALUE_LENGTH (no truncation).
+    JSON_TYPE_SCALAR,
+    // Scenario: JSON overlaps/contains query, e.g. WHERE json_col MEMBER OF(json_arr).
+    // Requires: value is a JSON scalar or a JSON array whose every element is a scalar,
+    // with the same string-length safety check as JSON_TYPE_SCALAR on each element.
+    JSON_TYPE_SCALAR_OR_ARRAY,
+    // Scenario: IN-list rewritten to JSON overlaps with a fixed-size array.
+    // Same requirements as JSON_TYPE_SCALAR_OR_ARRAY, plus when the value is a JSON
+    // array, its element count must exactly match the expected count (from the IN-list).
+    // Scalar values are also accepted (same as JSON_TYPE_SCALAR_OR_ARRAY).
+    JSON_ARRAY_COUNT,
+    // Scenario: array(varchar) column in search index.
+    // Requires: every varchar element in the array has an encoded length that fits
+    // within SEARCH_INDEX_VALUE_LENGTH.
+    ARRAY_STRING_LENGTH,
+    // Scenario: array column IN-list rewritten to array overlaps with a fixed-size array.
+    // Requires: the array element count exactly matches the expected count.
+    ARRAY_ELEMENT_COUNT,
+    // Scenario: pick json_string/json_number where the constant is VARCHAR,
+    // e.g. WHERE json_value(c1, '$' pick json_string) > '1'.
+    // Requires: the string's encoded length fits within SEARCH_INDEX_VALUE_LENGTH.
+    STRING_TYPE_LENGTH,
+  };
+  static int check_is_match(ObObjParam &obj_param,
+                            ObExecContext &exec_ctx,
+                            ObConstraintExtra *extra,
+                            bool &is_match);
+
+  // Pack three constraint fields into a single int64_t for ObConstraintExtra::extra_.
+  // Used to pass search index constraint metadata from plan cache to runtime check.
+  //
+  // Bit layout of extra:
+  //   [63 .......... 48] [47 .......... 16] [15 .... 8] [7 ...... 0]
+  //       (unused)         element_count     enc_type    cons_type
+  //
+  // - cons_type    (bits 0-7):   ConstraintType enum, determines which check to run.
+  // - enc_type     (bits 8-15):  JSON path encoding type for type-match validation;
+  //                              0 means no type restriction.
+  // - element_count(bits 16-47): expected array element count for JSON_ARRAY_COUNT /
+  //                              ARRAY_ELEMENT_COUNT constraints; unused by others.
+  static int64_t make_extra(int32_t type, int32_t json_encode_type, int32_t element_count)
+  {
+    return (static_cast<int64_t>(type) & 0xFF) |
+           ((static_cast<int64_t>(json_encode_type) & 0xFF) << 8) |
+           ((static_cast<int64_t>(element_count) & 0xFFFFFFFF) << 16);
+  }
+
+  // Extract ConstraintType from bits 0-7.
+  static int32_t get_constraint_type(int64_t extra)
+  {
+    return static_cast<int32_t>(extra & 0xFF);
+  }
+
+  // Extract JSON path encoding type from bits 8-15.
+  static int32_t get_json_encode_type(int64_t extra)
+  {
+    return static_cast<int32_t>((extra >> 8) & 0xFF);
+  }
+
+  // Extract expected element count from bits 16-47.
+  static int32_t get_element_count(int64_t extra)
+  {
+    return static_cast<int32_t>((extra >> 16) & 0xFFFFFFFF);
+  }
+
+private:
+  static bool is_json_constraint(const ConstraintType constraint_type)
+  {
+    return constraint_type == JSON_TYPE_SCALAR ||
+           constraint_type == JSON_TYPE_SCALAR_OR_ARRAY ||
+           constraint_type == JSON_ARRAY_COUNT;
+  }
+
+  static bool is_array_constraint(const ConstraintType constraint_type)
+  {
+    return constraint_type == ARRAY_ELEMENT_COUNT || constraint_type == ARRAY_STRING_LENGTH;
+  }
+
+  static int check_json_is_match(ObObjParam &obj_param,
+                                 ObExecContext &exec_ctx,
+                                 int64_t extra,
+                                 bool &is_match);
+
+  static int check_array_is_match(ObObjParam &obj_param,
+                                  ObExecContext &exec_ctx,
+                                  int64_t extra,
+                                  bool &is_match);
+
+  static int check_string_length_is_match(ObObjParam &obj_param,
+                                          bool &is_match);
+
+public:
+  static int is_json_scalar_or_array_match(const ObIJsonBase *j_base,
+                                           const uint8_t encode_type,
+                                           bool &is_match);
+
+  static int is_json_scalar_match(const ObIJsonBase *j_base,
+                                  const uint8_t encode_type,
+                                  bool &is_match);
+
+  static int is_array_string_length_match(common::ObIArrayType *arr_obj, bool &is_match);
+
+  static bool need_array_string_constraint(const ObSqlCollectionInfo &coll_info);
 };
 
 //this guard use to link the exec context and session

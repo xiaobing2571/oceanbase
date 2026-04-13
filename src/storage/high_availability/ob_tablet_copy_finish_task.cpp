@@ -16,7 +16,7 @@
 #include "storage/high_availability/ob_storage_ha_tablet_builder.h"
 #include "storage/high_availability/ob_storage_ha_utils.h"
 #ifdef OB_BUILD_SHARED_STORAGE
-#include "storage/compaction/ob_refresh_tablet_util.h"
+#include "storage/compaction_v2/ob_ss_compact_helper.h"
 #endif
 
 namespace oceanbase
@@ -62,11 +62,13 @@ void ObTabletCopyFinishTaskParam::reset()
 ObTabletCopyFinishTask::ObTabletCopyFinishTask()
   : ObITask(TASK_TYPE_MIGRATE_FINISH_PHYSICAL),
     is_inited_(false),
-    lock_(common::ObLatchIds::BACKUP_LOCK),
+    lock_(common::ObLatchIds::OB_TABLET_COPY_FINISH_TASK_SPIN_RW_LOCK),
     ha_dag_(nullptr),
     arena_allocator_("TabCopyFinish"),
     minor_tables_handle_(),
     ddl_tables_handle_(),
+    inc_major_ddl_tables_handle_(),
+    inc_major_tables_handle_(),
     major_tables_handle_(),
     mds_tables_handle_(),
     last_meta_seq_array_(),
@@ -78,8 +80,7 @@ ObTabletCopyFinishTask::~ObTabletCopyFinishTask()
 {
 }
 
-int ObTabletCopyFinishTask::init(
-    const ObTabletCopyFinishTaskParam &param)
+int ObTabletCopyFinishTask::init(const ObTabletCopyFinishTaskParam &param)
 {
   int ret = OB_SUCCESS;
   if (is_inited_) {
@@ -138,8 +139,6 @@ int ObTabletCopyFinishTask::process()
     LOG_WARN("failed to create new table store with major", K(ret), K_(param));
   } else if (OB_FAIL(create_new_table_store_with_minor_())) {
     LOG_WARN("failed to create new table store with minor", K(ret), K_(param));
-  } else if (OB_FAIL(trim_tablet_())) {
-    LOG_WARN("failed to trim tablet", K(ret), K_(param));
   } else if (OB_FAIL(check_tablet_valid_())) {
     LOG_WARN("failed to check tablet valid", K(ret), KPC(this));
   } else if (OB_FAIL(check_finish_copy_tablet_data_valid_())) {
@@ -157,6 +156,8 @@ int ObTabletCopyFinishTask::process()
   int64_t sstable_count = mds_tables_handle_.get_count()
                           + minor_tables_handle_.get_count()
                           + ddl_tables_handle_.get_count()
+                          + inc_major_ddl_tables_handle_.get_count()
+                          + inc_major_tables_handle_.get_count()
                           + major_tables_handle_.get_count();
 
   int tmp_ret = OB_SUCCESS;
@@ -220,9 +221,6 @@ int ObTabletCopyFinishTask::add_sstable(ObTableHandleV2 &table_handle, const int
   } else if (!table_handle.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("add sstable get invalid argument", K(ret), K(table_handle));
-  } else if (!table_handle.get_table()->get_key().is_major_sstable()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("table is not major", K(ret), K(table_handle));
   } else if (OB_FAIL(get_tables_handle_ptr_(table_handle.get_table()->get_key(), tables_handle_ptr))) {
     LOG_WARN("failed to get tables handle ptr", K(ret), K(table_handle));
   } else if (OB_FAIL(tables_handle_ptr->add_table(table_handle))) {
@@ -268,7 +266,7 @@ int ObTabletCopyFinishTask::get_sstable(
     if (OB_SUCC(ret) && !found) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("can not get sstable, unexected", K(ret), K(table_key), K(major_tables_handle_),
-          K(minor_tables_handle_), K(ddl_tables_handle_));
+          K(minor_tables_handle_), K(ddl_tables_handle_), K(inc_major_ddl_tables_handle_), K(inc_major_tables_handle_));
     }
   }
   return ret;
@@ -314,12 +312,18 @@ int ObTabletCopyFinishTask::create_new_table_store_with_minor_()
     param.src_tablet_meta_ = param_.src_tablet_meta_;
     param.restore_action_ = param_.restore_action_;
     param.release_mds_scn_ = mds_max_end_scn;
-
-    if (OB_FAIL(param.assign_sstables(mds_tables_handle_, minor_tables_handle_, ddl_tables_handle_))) {
+#ifdef ERRSIM
+    if (ObTabletRestoreAction::is_restore_replace_remote_sstable(param_.restore_action_)) {
+      if (inc_major_ddl_tables_handle_.get_count() > 0) {
+        DEBUG_SYNC(BEFORE_REPLACE_REMOTE_INC_MAJOR_DDL);
+      }
+    }
+#endif
+    if (OB_FAIL(param.assign_sstables(mds_tables_handle_, minor_tables_handle_, ddl_tables_handle_, inc_major_tables_handle_, inc_major_ddl_tables_handle_))) {
       LOG_WARN("failed to assign sstables", K(ret), KPC(param_.ls_), "tablet_id", param_.tablet_id_);
     } else if (OB_FAIL(ObStorageHATabletBuilderUtil::build_table_with_minor_tables(param))) {
       LOG_WARN("failed to build table with minor tables", K(ret), K(mds_tables_handle_),
-        K(minor_tables_handle_), K(ddl_tables_handle_), K(param_.restore_action_));
+        K(minor_tables_handle_), K(ddl_tables_handle_), K(inc_major_ddl_tables_handle_), K(inc_major_tables_handle_), K(param_.restore_action_));
       if (OB_RELEASE_MDS_NODE_ERROR == ret) {
         //Release mds node failed must do dag net retry.
         //Because ls still replay and mds may has residue node which makes data incorrect.
@@ -352,9 +356,6 @@ int ObTabletCopyFinishTask::check_finish_copy_tablet_data_valid_()
   } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet should not be NULL", K(ret), "tablet_id", param_.tablet_id_, KP(tablet));
-  } else if (tablet->get_tablet_meta().has_next_tablet_) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("tablet here should only has one", K(ret), KPC(tablet));
   } else if (OB_FAIL(ObStorageHATabletBuilderUtil::check_remote_logical_sstable_exist(tablet, is_logical_sstable_exist))) {
     LOG_WARN("failed to check remote logical sstable exist", K(ret), KPC(tablet));
   } else if (is_logical_sstable_exist) {
@@ -405,34 +406,15 @@ int ObTabletCopyFinishTask::get_tables_handle_ptr_(
     tables_handle_ptr = &minor_tables_handle_;
   } else if (table_key.is_ddl_sstable()) {
     tables_handle_ptr = &ddl_tables_handle_;
+  } else if (table_key.is_inc_major_ddl_sstable()) {
+    tables_handle_ptr = &inc_major_ddl_tables_handle_;
+  } else if (table_key.is_inc_major_type_sstable()) {
+    tables_handle_ptr = &inc_major_tables_handle_;
   } else if (table_key.is_mds_sstable()) {
     tables_handle_ptr = &mds_tables_handle_;
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get tables handle ptr get unexpected table key", K(ret), K(table_key));
-  }
-  return ret;
-}
-
-int ObTabletCopyFinishTask::trim_tablet_()
-{
-  int ret = OB_SUCCESS;
-  ObTabletHandle tablet_handle;
-  ObTablet *tablet = nullptr;
-  const bool is_rollback = false;
-  bool need_merge = false;
-
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("tablet copy finish task do not init", K(ret));
-  } else if (OB_FAIL(param_.ls_->ha_get_tablet(param_.tablet_id_, tablet_handle))) {
-    LOG_WARN("failed to get tablet", K(ret), K(param_));
-  } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("tablet should not be NULL", K(ret), K(param_));
-  } else if (tablet->get_tablet_meta().has_next_tablet_
-      && OB_FAIL(param_.ls_->trim_rebuild_tablet(param_.tablet_id_, is_rollback))) {
-    LOG_WARN("failed to trim rebuild tablet", K(ret), K(param_));
   }
   return ret;
 }
@@ -460,12 +442,22 @@ int ObTabletCopyFinishTask::check_tablet_valid_()
   int ret = OB_SUCCESS;
   ObTabletHandle tablet_handle;
   ObTablet *tablet = nullptr;
+#ifdef ERRSIM
+  if (GCONF.errsim_test_tablet_id == param_.tablet_id_.id()
+      && (ObTabletRestoreAction::ACTION::RESTORE_REMOTE_SSTABLE == param_.restore_action_)) {
+     LOG_ERROR("before check tablet valid", "tablet_id", param_.tablet_id_);
+    DEBUG_SYNC(BEFORE_CHECK_TABLET_VALID);
+  }
+#endif
   if (!is_inited_) {
     ret = OB_NOT_INIT;
     LOG_WARN("tablet finish restore task do not init", K(ret));
-  } else if (OB_FAIL(param_.ls_->get_tablet(param_.tablet_id_, tablet_handle,
-      ObTabletCommon::DEFAULT_GET_TABLET_NO_WAIT, ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
-    LOG_WARN("failed to get tablet", K(ret), "tablet_id", param_.tablet_id_);
+  } else if (OB_FAIL(param_.ls_->ha_get_tablet(param_.tablet_id_, tablet_handle))) {
+    if (OB_TABLET_NOT_EXIST == ret) {
+      LOG_INFO("tablet is not exist, skip check valid", "tablet_id", param_.tablet_id_);
+    } else {
+      LOG_WARN("failed to get tablet", K(ret), "tablet_id", param_.tablet_id_);
+    }
   } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet should not be NULL", K(ret), KP(tablet), K(param_));
@@ -491,12 +483,47 @@ int ObTabletCopyFinishTask::get_tablet_status(ObCopyTabletStatus::STATUS &status
   return ret;
 }
 
+int ObTabletCopyFinishTask::get_latest_major_sstable(
+  const ObITable::TableKey &table_key,
+  ObTableHandleV2 &table_handle)
+{
+  int ret = OB_SUCCESS;
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("tablet copy finish task do not init", K(ret));
+  } else {
+    common::SpinRLockGuard guard(lock_);
+    // find the latest major sstable, read from major_tables_handles_ backwards
+    for (int64_t idx = major_tables_handle_.get_count() - 1; OB_SUCC(ret) && idx >= 0; --idx) {
+      ObTableHandleV2 tmp_table_handle;
+      ObITable::TableKey tmp_table_key;
+
+      if (OB_FAIL(major_tables_handle_.get_table(idx, tmp_table_handle))) {
+        LOG_WARN("failed to get table", K(ret), K(idx), K(major_tables_handle_));
+      } else if (!tmp_table_handle.is_valid()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("table handle should not be NULL", K(ret), K(tmp_table_handle));
+      } else if (FALSE_IT(tmp_table_key = tmp_table_handle.get_table()->get_key())) {
+      } else if (tmp_table_key.table_type_ == table_key.table_type_
+          && tmp_table_key.tablet_id_ == table_key.tablet_id_
+          && tmp_table_key.column_group_idx_ == table_key.column_group_idx_) {
+        table_handle = tmp_table_handle;
+        break;
+      }
+    }
+
+    if (OB_SUCC(ret) && !table_handle.is_valid()) {
+      ret = OB_ENTRY_NOT_EXIST;
+      LOG_WARN("failed to find latest major sstable", K(ret), K(table_key), K(major_tables_handle_));
+    }
+  }
+  return ret;
+}
+
 ERRSIM_POINT_DEF(EN_COPY_COLUMN_STORE_MAJOR_FAILED);
 int ObTabletCopyFinishTask::deal_with_major_sstables_()
 {
   int ret = OB_SUCCESS;
-  ObTablesHandleArray shared_major_sstables;
-  ObTablesHandleArray local_major_sstables;
   if (!is_inited_) {
     ret = OB_NOT_INIT;
     LOG_WARN("tablet copy finish task do not init", K(ret));
@@ -504,13 +531,6 @@ int ObTabletCopyFinishTask::deal_with_major_sstables_()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("src tablet meta should not be null", K(ret));
   } else if (major_tables_handle_.empty()) {
-    // do nothing
-  } else if (OB_FAIL(classify_major_sstables_(shared_major_sstables, local_major_sstables))) {
-    LOG_WARN("failed to split major sstables", K(ret));
-  } else if (OB_FAIL(deal_with_shared_majors_(shared_major_sstables))) {
-    // TODO(jyx441808): remove this logic when migration can fetch src macro id list for shared sstable
-    LOG_WARN("failed to deal with shared majors", K(ret));
-  } else if (local_major_sstables.empty()) {
     // do nothing
   } else {
     const bool need_replace_remote_sstable = ObTabletRestoreAction::is_restore_replace_remote_sstable(param_.restore_action_);
@@ -529,7 +549,7 @@ int ObTabletCopyFinishTask::deal_with_major_sstables_()
     }
     ObBuildMajorSSTablesParam major_sstables_param(
       param_.src_tablet_meta_->storage_schema_,
-      param_.src_tablet_meta_->has_truncate_info_);
+      param_.src_tablet_meta_->has_merged_with_mds_info_);
 
     if (FAILEDx(ObStorageHATabletBuilderUtil::build_tablet_with_major_tables(param_.ls_,
                                                                              param_.tablet_id_,
@@ -621,135 +641,6 @@ int ObTabletCopyFinishTask::get_mds_sstable_max_end_scn_(share::SCN &max_end_scn
   }
   return ret;
 }
-
-int ObTabletCopyFinishTask::classify_major_sstables_(
-    ObTablesHandleArray &shared_major_sstables,
-    ObTablesHandleArray &local_major_sstables)
-{
-  int ret = OB_SUCCESS;
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("tablet copy finish task do not init", K(ret));
-  } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < major_tables_handle_.get_count(); ++i) {
-      ObTableHandleV2 table_handle;
-      ObSSTable *sstable = nullptr;
-      ObSSTableMetaHandle meta_handle;
-      if (OB_FAIL(major_tables_handle_.get_table(i, table_handle))) {
-        LOG_WARN("failed to get table handle", K(ret), K(i));
-      } else if (OB_FAIL(table_handle.get_sstable(sstable))) {
-        LOG_WARN("failed to get sstable", K(ret), K(table_handle));
-      } else if (OB_FAIL(sstable->get_meta(meta_handle))) {
-        LOG_WARN("failed to get sstable meta", K(ret), KPC(sstable));
-      } else if (!meta_handle.get_sstable_meta().get_basic_meta().table_shared_flag_.is_shared_sstable()
-          || param_.is_leader_restore_) {
-        if (OB_FAIL(local_major_sstables.add_table(table_handle))) {
-          LOG_WARN("failed to add table", K(ret), KPC(sstable), K(table_handle));
-        }
-      } else {
-        if (OB_FAIL(shared_major_sstables.add_table(table_handle))) {
-          LOG_WARN("failed to add table", K(ret), KPC(sstable), K(table_handle));
-        }
-      }
-    }
-  }
-  return ret;
-}
-
-int ObTabletCopyFinishTask::deal_with_shared_majors_(ObTablesHandleArray &major_tables_handle)
-{
-  int ret = OB_SUCCESS;
-#ifdef OB_BUILD_SHARED_STORAGE
-
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("tablet copy finish task do not init", K(ret));
-  } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < major_tables_handle.get_count(); ++i) {
-      ObTabletHandle tablet_handle;
-      ObTablet *tablet = nullptr;
-      ObTabletMemberWrapper<ObTabletTableStore> table_store_wrapper;
-      ObTableHandleV2 table_handle;
-      ObSSTable *sstable = nullptr;
-      bool is_exist = false;
-
-      if (OB_FAIL(major_tables_handle.get_table(i, table_handle))) {
-        LOG_WARN("failed to get table handle", K(ret), K(i));
-      } else if (OB_FAIL(table_handle.get_sstable(sstable))) {
-        LOG_WARN("failed to get sstable", K(ret), K(table_handle));
-      } else if (OB_FAIL(param_.ls_->ha_get_tablet(param_.tablet_id_, tablet_handle))) {
-        LOG_WARN("failed to get tablet", K(ret), "tablet_id", param_.tablet_id_);
-      } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("tablet should not be NULL", K(ret), "tablet_id", param_.tablet_id_);
-      } else if (OB_FAIL(tablet->fetch_table_store(table_store_wrapper))) {
-        LOG_WARN("fail to fetch table store", K(ret));
-      } else if (OB_FAIL(check_local_sstable_exist_(sstable->get_key(), table_store_wrapper, is_exist))) {
-        LOG_WARN("failed to check local sstable exist", K(ret), KPC(sstable));
-      } else if (is_exist) {
-        LOG_INFO("sstable is already exist in tablet, no need refresh", K(ret), KPC(sstable));
-      } else {
-        const ObITable::TableKey &table_key = sstable->get_key();
-        const ObDownloadTabletMetaParam download_tablet_meta_param(table_key.get_snapshot_version()/*snapshot_version*/,
-                                                                   true/*allow_dup_major*/,
-                                                                   false/*init_major_ckm_info*/,
-                                                                   false/*need_prewarm*/);
-        if (OB_FAIL(ObRefreshTabletUtil::download_major_compaction_tablet_meta(*param_.ls_, param_.tablet_id_, download_tablet_meta_param))) {
-          LOG_WARN("failed to download major compaction tablet meta", K(ret), K(download_tablet_meta_param));
-        } else {
-          LOG_INFO("succeed to download major compaction tablet meta", "tablet_id", param_.tablet_id_, KPC(sstable));
-        }
-      }
-    }
-  }
-#endif
-  return ret;
-}
-
-#ifdef OB_BUILD_SHARED_STORAGE
-int ObTabletCopyFinishTask::check_local_sstable_exist_(
-    const ObITable::TableKey &table_key,
-    ObTabletMemberWrapper<ObTabletTableStore> &table_store_wrapper,
-    bool &is_exist)
-{
-  int ret = OB_SUCCESS;
-  is_exist = false;
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("tablet copy finish task do not init", K(ret));
-  } else if (!table_key.is_valid()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("check local sstable exist get invalid argument", K(ret), K(table_key));
-  } else {
-    const bool unpack_co = true;
-    const ObSSTableArray &local_major_tables = table_store_wrapper.get_member()->get_major_sstables();
-    ObTableStoreIterator iter;
-    if (OB_FAIL(iter.add_tables(local_major_tables, 0, local_major_tables.count(), unpack_co))) {
-      LOG_WARN("failed to add local major tables", K(ret), K(local_major_tables));
-    } else {
-      while (OB_SUCC(ret)) {
-        ObITable *table = nullptr;
-        if (OB_FAIL(iter.get_next(table))) {
-          if (OB_ITER_END == ret) {
-            ret = OB_SUCCESS;
-            break;
-          } else {
-            LOG_WARN("failed to get next table", K(ret));
-          }
-        } else if (OB_ISNULL(table)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("table should not be NULL", K(ret), KP(table));
-        } else if (table->get_key() == table_key) {
-          is_exist = true;
-          LOG_INFO("table is already exist", K(table_key));
-          break;
-        }
-      }
-    }
-  }
-  return ret;
-}
-#endif
 
 }
 }

@@ -22,6 +22,7 @@
 #ifdef OB_BUILD_ORACLE_PL
 #include "pl/ob_pl_warning.h"
 #endif
+#include "ob_pl_resolve_cache.h"
 
 #ifndef LOG_IN_CHECK_MODE
 #define LOG_IN_CHECK_MODE(fmt, args...) \
@@ -86,6 +87,7 @@ public:
                  const ParamStore *param_list = NULL,
                  sql::ExternalParams *extern_param_info = NULL,
                  TgTimingEvent tg_timing_event = TgTimingEvent::TG_TIMING_EVENT_INVALID,
+                 ObPLResolveCache *resolve_cache = nullptr,
                  bool is_sync_package_var = false,
                  bool need_add_pl_cache = true) :
         allocator_(allocator),
@@ -93,31 +95,44 @@ public:
         schema_guard_(schema_guard),
         package_guard_(package_guard),
         sql_proxy_(sql_proxy),
-        params_(),
+        secondary_namespace_(nullptr),
+        param_list_(param_list),
+        tg_timing_event_(tg_timing_event),
+        is_execute_call_stmt_(false),
         is_prepare_protocol_(is_ps),
         is_check_mode_(is_check_mode),
         is_sql_scope_(is_sql_scope_),
         extern_param_info_(extern_param_info),
         is_udt_udf_ctx_(false),
         is_sync_package_var_(is_sync_package_var),
-        need_add_pl_cache_(need_add_pl_cache)
-  {
-    params_.param_list_ = param_list;
-    params_.tg_timing_event_ = tg_timing_event;
-  }
+        need_add_pl_cache_(need_add_pl_cache),
+        need_destruct_resolve_cache_(false),
+        pl_resolve_cache_(resolve_cache),
+        pl_sql_transpiled_exprs_(),
+        forbid_pl_sql_transpiler_(false),
+        is_prepare_with_params_(false)
+  {}
   virtual ~ObPLResolveCtx() {
+    if (need_destruct_resolve_cache_ && OB_NOT_NULL(pl_resolve_cache_)) {
+      pl_resolve_cache_->~ObPLResolveCache();
+    }
   }
 
   virtual int get_user_type(uint64_t type_id,
                             const ObUserDefinedType *&user_type,
                             ObIAllocator *allocator = NULL) const;
+  ObPLResolveCache *get_pl_resolve_cache();
+  int get_pl_resolve_cache(ObPLResolveCache *&resolve_cache);
 
   common::ObIAllocator &allocator_;
   sql::ObSQLSessionInfo &session_info_;
   share::schema::ObSchemaGetterGuard &schema_guard_;
   ObPLPackageGuard &package_guard_;
   common::ObMySQLProxy &sql_proxy_;
-  sql::ObResolverParams params_;
+  ObPLBlockNS *secondary_namespace_;
+  const ParamStore *param_list_;
+  TgTimingEvent tg_timing_event_;
+  bool is_execute_call_stmt_;
   bool is_prepare_protocol_;
   bool is_check_mode_;
   bool is_sql_scope_; // 标识是否是由纯SQL语句过来的表达式解析请求
@@ -127,6 +142,11 @@ public:
   bool need_add_pl_cache_; // indicate if this pl object need add into pl cache when re_compile
   ObSEArray<const ObUserDefinedType *, 32> type_buffer_;
   ObPLEnumSetCtx *enum_set_ctx_;
+  bool need_destruct_resolve_cache_;
+  ObPLResolveCache *pl_resolve_cache_;
+  ObSEArray<ObUDFRawExpr *, 4, common::ModulePageAllocator, true> pl_sql_transpiled_exprs_;
+  bool forbid_pl_sql_transpiler_;
+  bool is_prepare_with_params_;
 };
 
 class ObPLMockSelfArg
@@ -218,7 +238,8 @@ public:
                bool is_sql_scope_ = false,
                const ParamStore *param_list = NULL,
                sql::ExternalParams *extern_param_info = NULL,
-               TgTimingEvent tg_timing_event = TgTimingEvent::TG_TIMING_EVENT_INVALID) :
+               TgTimingEvent tg_timing_event = TgTimingEvent::TG_TIMING_EVENT_INVALID,
+               ObPLResolveCache *resolve_cache = nullptr) :
     resolve_ctx_(allocator,
                  session_info,
                  schema_guard,
@@ -229,7 +250,8 @@ public:
                  is_sql_scope_,
                  param_list,
                  extern_param_info,
-                 tg_timing_event),
+                 tg_timing_event,
+                 resolve_cache),
     external_ns_(resolve_ctx_, parent_ns),
     expr_factory_(expr_factory),
     stmt_factory_(allocator),
@@ -239,9 +261,14 @@ public:
     arg_cnt_(0),
     question_mark_cnt_(0),
     next_user_defined_exception_id_(1),
-    ob_sequence_ns_checker_(resolve_ctx_.params_),
+    ob_sequence_ns_checker_(params_),
     item_type_(T_MAX),
-    fast_check_status_times_(0) { expr_factory_.set_is_called_sql(false); }
+    fast_check_status_times_(0)
+    {
+      expr_factory_.set_is_called_sql(false);
+      params_.param_list_ = param_list;
+      params_.tg_timing_event_ = tg_timing_event;
+    }
   virtual ~ObPLResolver() {}
 
   enum GotoRestrictionType {
@@ -277,6 +304,7 @@ public:
 public:
   inline ObPLExternalNS &get_external_ns() { return external_ns_; }
   inline const ObPLResolveCtx &get_resolve_ctx() const { return resolve_ctx_; }
+  inline ObPLResolveCtx &get_resolve_ctx() { return resolve_ctx_; }
   inline ObPLBlockNS &get_current_namespace() const { return current_block_->get_namespace(); }
   inline const ObIArray<int64_t> &get_subprogram_path() const { return current_subprogram_path_; }
   inline int push_subprogram_path(int64_t idx) { return current_subprogram_path_.push_back(idx); }
@@ -284,6 +312,7 @@ public:
   inline const ObIArray<ObPLStmt *> &get_goto_stmts() const { return goto_stmts_; }
   inline int push_goto_stmts(ObPLStmt *stmt) { return goto_stmts_.push_back(stmt); }
   inline void pop_goto_stmts() { goto_stmts_.pop_back(); }
+  inline sql::ObResolverParams &get_params() { return params_; }
 
 public:
   /**
@@ -372,6 +401,14 @@ public:
                              ObPLCompileUnitAST &unit_ast,
                              sql::ObRawExpr *&expr);
 
+  int try_sql_transpiler(ObObjAccessIdx &access_idx,
+                         ObPLCompileUnitAST &mock_ast,
+                         sql::ObRawExpr *&expr);
+
+  int sql_transpiler_substitute(const ObPLFunctionAST &ast,
+                                ObUDFRawExpr &udf_expr,
+                                ObRawExpr *&target_expr);
+
   static
   int resolve_obj_access_node(ParseNode *node,
                               common::ObIAllocator &allocator,
@@ -423,8 +460,9 @@ public:
                        ObRecordType *&record_type);
   static
   int build_record_type_by_view_schema(const ObPLResolveCtx &resolve_ctx,
-                                const share::schema::ObTableSchema* view_schema,
-                                ObRecordType *&record_type);
+                                      common::ObIAllocator &allocator,
+                                      const share::schema::ObTableSchema* view_schema,
+                                      ObRecordType *&record_type);
   static
   int build_record_type_by_table_schema(share::schema::ObSchemaGetterGuard &schema_guard,
                                 common::ObIAllocator &allocator,
@@ -476,10 +514,15 @@ public:
   static int get_local_variable_constraint(
     const ObPLBlockNS &ns, int64_t var_idx, bool &not_null, ObPLIntegerRange &range);
 
-  static int restriction_on_result_cache(share::schema::ObIRoutineInfo *routine_info);
-  static int resolve_sf_clause(const ObStmtNodeTree *node,
+  static int check_udf_ret_type(ObPLINS &ctx, const ObPLDataType &ret_type);
+  static int restriction_on_result_cache(ObPLINS &ctx,
+                                         share::schema::ObIRoutineInfo *routine_info,
+                                         const ObPLDataType &ret_type);
+  static int resolve_sf_clause(ObPLINS &ctx,
+                               const ObStmtNodeTree *node,
                                share::schema::ObIRoutineInfo *routine_info,
                                ObProcType &routine_type,
+                               bool is_anonymous_block,
                                const ObPLDataType &ret_type);
   static int build_pl_integer_type(ObPLIntegerType type, ObPLDataType &data_type);
   static bool is_question_mark_value(ObRawExpr *into_expr, ObPLBlockNS *ns);
@@ -488,6 +531,7 @@ public:
                                     ObPLBlockNS *ns,
                                     const ObPLDataType *type,
                                     ObPLDependencyTable &deps,
+                                    sql::ObSQLSessionInfo &session_info,
                                     bool need_check = false);
 
   static
@@ -524,11 +568,11 @@ public:
   int check_common_accessible(
     AccessorItem &caller, ObIArray<AccessorItem> &accessors);
   int resolve_routine_accessible_by(
-    const ObString source, ObIArray<AccessorItem> &result);
+    const ObString source, ObIAllocator &allocator, ObIArray<AccessorItem> &result);
   int resolve_package_accessible_by(
-    const ObString source, ObIArray<AccessorItem> &result);
+    const ObString source, ObIAllocator &allocator, ObIArray<AccessorItem> &result);
   int resolve_accessible_by(
-    const ObStmtNodeTree *accessor_list, ObIArray<AccessorItem> &result);
+    const ObStmtNodeTree *accessor_list, ObIAllocator &alloc, ObIArray<AccessorItem> &result);
 
   static
   int resolve_sp_subtype_precision(ObSQLSessionInfo &session_info,
@@ -666,6 +710,35 @@ public:
              || OB_TIMEOUT == ret
              || OB_SIZE_OVERFLOW == ret;
   }
+
+  static int get_into_expr_expected_type(ObRawExpr *into_expr,
+                                         ObPLBlockNS *ns,
+                                         ObPLResolveCtx *pl_resolve_ctx,
+                                         ObPLDataType &expected_type_local,
+                                         ObRawExpr *value_expr,
+                                         ObPLDependencyTable &dependency_table);
+
+  static int set_into_expr_type_from_value_expr(ObRawExpr *value_expr,
+                                                ObRawExpr *into_expr,
+                                                ObPLDataType &expected_type,
+                                                ObPLBlockNS &ns,
+                                                ObPLResolveCtx &pl_resolve_ctx,
+                                                ObPLDependencyTable &dependency_table);
+
+  static int add_column_convert_expr(ObRawExpr *&expr,
+                                     const ObPLDataType *expected_type,
+                                     sql::ObRawExprFactory &expr_factory,
+                                     sql::ObSQLSessionInfo *session_info);
+
+  static bool is_need_add_checker(const ObPLIntegerType &type, const ObRawExpr *expr);
+
+  static int add_pl_integer_checker_expr(ObRawExprFactory &expr_factory,
+                                  const ObPLIntegerType &type,
+                                  int32_t lower,
+                                  int32_t upper,
+                                  ObRawExpr *&expr);
+  static int check_update_column(const ObPLBlockNS &ns, uint64_t var_idx, const ObIArray<ObObjAccessIdx>& access_idxs,
+                                 sql::ObSQLSessionInfo &session_info, share::schema::ObSchemaGetterGuard &schema_guard);
 
 private:
   int resolve_declare_var(const ObStmtNodeTree *parse_tree, ObPLDeclareVarStmt *stmt, ObPLFunctionAST &func_ast);
@@ -823,6 +896,8 @@ private:
                    sql::ObRawExpr *&expr, uint64_t line_number = 0, /* where this expr called */
                    bool need_add = true, const ObPLDataType *expected_type = NULL,
                    bool is_behind_limit = false, bool is_add_bool = false);
+  bool check_need_cast(const ObDataType &data_type,
+                                    const ObRawExpr &expr);
   int resolve_columns(ObRawExpr *&expr, ObArray<sql::ObQualifiedName> &columns, ObPLCompileUnitAST &unit_ast);
   int formalize_expr(ObRawExpr &expr);
   static int formalize_expr(ObRawExpr &expr, const ObSQLSessionInfo *session_info, const ObPLINS &ns);
@@ -997,6 +1072,19 @@ private:
                                    ObPLForAllStmt *stmt,
                                    ObPLFunctionAST &func,
                                    ObIArray<ObObjAccessIdx> &access_idxs);
+  int try_transform_sql_stmt_to_assign_stmt(ObPLFunctionAST &func, ObPLStmt *&old_stmt);
+  int check_can_transform_to_assign_stmt(ObPLFunctionAST &func,
+                                         ObPLStmt *&old_stmt,
+                                         ObIArray<ObPLDataType> &into_expr_types,
+                                         bool &can_transform_to_assign_stmt);
+  int check_value_expr_can_transform(ObRawExpr *expr,
+                                     ObPLFunctionAST &func,
+                                     ObPLSqlStmt *sql_stmt,
+                                     int64_t into_idx,
+                                     bool &can_transform);
+  int transform_value_expr(ObRawExpr *&value_expr, ObPLDataType &into_expr_type);
+  int replace_seq_expr_recursively(ObRawExpr *&expr, ObPLBlockNS *ns);
+  int remove_cast_expr_for_temporal_type(ObRawExpr *&expr);
 private:
   int check_duplicate_condition(const ObPLConditionValue &value,
                                 ObPLDeclareHandlerStmt::DeclareHandler::HandlerDesc &cur_desc,
@@ -1014,9 +1102,10 @@ private:
   int get_const_expr_value(const ObRawExpr *expr, uint64_t &val);
   int check_variable_accessible(const ObPLBlockNS &ns,
                                 const ObIArray<ObObjAccessIdx>& access_idxs,
-                                bool for_write);
+                                bool for_write,
+                                bool is_inout_param = false);
   int check_variable_accessible(ObRawExpr *expr, bool for_write);
-  int get_subprogram_var(
+  static int get_subprogram_var(
     ObPLBlockNS &ns, uint64_t subprogram_id, int64_t var_idx, const ObPLVar *&var);
   static
   int make_var_from_access(const ObIArray<ObObjAccessIdx> &access_idxs,
@@ -1034,7 +1123,7 @@ private:
   void set_current(ObPLStmtBlock &block)
   {
     current_block_ = &block;
-    resolve_ctx_.params_.secondary_namespace_ = &block.get_namespace();
+    resolve_ctx_.secondary_namespace_ = &block.get_namespace();
   }
   int check_and_record_stmt_type(ObPLFunctionAST &func, sql::ObSPIService::ObSPIPrepareResult &prepare_result);
   int check_declare_order(ObPLStmtType type);
@@ -1075,31 +1164,26 @@ private:
                      common::ObIArray<sql::ObOpRawExpr*> &op_exprs,
                      bool is_prepare_protocol/*= false*/);
   int check_expr_result_type(const ObRawExpr *expr, ObPLIntegerType &pl_integer_type, bool &is_anonymos_arg);
-  bool is_need_add_checker(const ObPLIntegerType &type, const ObRawExpr *expr);
-  int add_pl_integer_checker_expr(ObRawExprFactory &expr_factory,
-                                  const ObPLIntegerType &type,
-                                  int32_t lower,
-                                  int32_t upper,
-                                  ObRawExpr *&expr);
   int add_pl_integer_checker_expr(ObRawExprFactory &expr_factory, ObRawExpr *&expr, bool &need_replace);
-
+#ifdef OB_BUILD_ORACLE_PL
   int check_use_idx_illegal(ObRawExpr* expr, int64_t idx);
 
   int check_raw_expr_in_forall(ObRawExpr* expr,
                                int64_t idx,
-                               bool &need_modify,
-                               bool &can_array_binding);
+                               bool &need_modify);
   int modify_raw_expr_in_forall(ObPLForAllStmt &stmt,
                                 ObPLFunctionAST &func,
-                                ObPLSqlStmt &sql_stmt,
+                                const ObIArray<int64_t>& params,
+                                ObIArray<int64_t>& array_binding_params,
                                 ObIArray<int64_t>& modify_exprs);
   int modify_raw_expr_in_forall(ObPLForAllStmt &stmt,
                                 ObPLFunctionAST &func,
-                                ObPLSqlStmt &sql_stmt,
+                                ObIArray<int64_t>& array_binding_params,
                                 int64_t modify_expr_id,
-                                int64_t table_idx);
+                                ObObjAccessRawExpr *obj_access_expr);
   int check_forall_sql_and_modify_params(ObPLForAllStmt &stmt,
                                 ObPLFunctionAST &func);
+#endif
   int replace_record_member_default_expr(ObRawExpr *&expr);
   int check_param_default_expr_legal(ObRawExpr *expr, bool is_subprogram_expr = true);
   int check_params_legal_in_body_routine(ObPLFunctionAST &routine_ast,
@@ -1176,7 +1260,6 @@ private:
                                    ObPLDataType pl_data_type,
                                    ObPLFunctionAST &func,
                                    int64_t &idx);
-  int check_update_column(const ObPLBlockNS &ns, const ObIArray<ObObjAccessIdx>& access_idxs);
   int get_udt_names(ObSchemaGetterGuard &schema_guard,
                     const uint64_t udt_id,
                     ObString &database_name,
@@ -1268,6 +1351,7 @@ private:
   uint64_t arg_cnt_; // 对于匿名快用于表示总的question mark个数,对于routine用于表示入参个数
   uint64_t question_mark_cnt_; // 表示解析到当前语句时question_mark_cnt_数目(不包含当前语句)
   uint64_t next_user_defined_exception_id_; // 用户定义的ExceptionID, 从1开始递增
+  sql::ObResolverParams params_;
   sql::ObSequenceNamespaceChecker ob_sequence_ns_checker_; // check if an sequence is defined.
   ObArray<int64_t> current_subprogram_path_; // 当前解析到的subprogram的寻址路径
   ObArray<ObPLStmt *> goto_stmts_; // goto语句的索引，用来二次解析。

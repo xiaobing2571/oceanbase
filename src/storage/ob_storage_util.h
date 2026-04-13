@@ -90,9 +90,12 @@ int fill_exprs_lob_locator(const ObTableIterParam &iter_param,
 
 int check_skip_by_monotonicity(sql::ObBlackFilterExecutor &filter,
                                blocksstable::ObStorageDatum &min_datum,
+                               const bool is_min_prefix,
                                blocksstable::ObStorageDatum &max_datum,
+                               const bool is_max_prefix,
                                const sql::ObBitVector &skip_bit,
                                const bool has_null,
+                               const bool is_pad_coll,
                                ObBitmap *result_bitmap,
                                sql::ObBoolMask &bool_mask);
 
@@ -346,7 +349,12 @@ inline static common::ObDatumCmpFuncType get_datum_cmp_func(const common::ObObjM
         is_oracle_mode,
         col_obj_type.has_lob_header() || param_obj_type.has_lob_header());
   } else {
-    sql::ObExprBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(col_obj_type.get_type(), col_obj_type.get_collation_type());
+    sql::ObExprBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(
+        col_obj_type.get_type(),
+        col_obj_type.get_collation_type(),
+        col_obj_type.get_scale(),
+        is_oracle_mode,
+        col_obj_type.is_lob_storage());
     cmp_func = is_oracle_mode ? basic_funcs->null_last_cmp_ : basic_funcs->null_first_cmp_;
   }
   return cmp_func;
@@ -450,7 +458,7 @@ inline int reverse_trans_version_val(common::ObDatum &datum)
   return ret;
 }
 int reverse_trans_version_val(common::ObDatum *datums, const int64_t count);
-int reverse_trans_version_val(ObIVector *vector, const int64_t count);
+int reverse_trans_version_val(ObIVector *vector, const int64_t count, const int64_t vec_offset = 0);
 
 enum class StorageScanType : int8_t
 {

@@ -32,6 +32,8 @@ namespace oceanbase
 namespace common
 {
 
+int64_t get_io_depth(const int64_t io_size);
+
 struct ObIOConfig final
 {
 public:
@@ -242,7 +244,7 @@ typedef ObSEArray<int64_t, GROUP_START_NUM> ObIOGroupThrottledTimeArray;
 class ObIOUsage final
 {
 public:
-  ObIOUsage() : info_(), failed_req_info_(), group_throttled_time_us_(), lock_() {}
+  ObIOUsage() : info_(), failed_req_info_(), group_throttled_time_us_(), lock_(common::ObLatchIds::OB_IO_USAGE_LOCK) {}
   ~ObIOUsage();
   int init(const uint64_t tenant_id, const int64_t group_num);
   int refresh_group_num (const int64_t group_num);
@@ -284,7 +286,8 @@ public:
   void stop();
   void wait();
   void destroy();
-  int send_detect_task();
+  int send_sn_detect_task();
+  int send_ss_detect_task();
   virtual void run1() override;
 private:
   int try_release_thread();
@@ -413,6 +416,7 @@ public:
   virtual ~ObIOChannel();
 
   int base_init(ObDeviceChannel *device_channel);
+  static int convert_sys_errno(const int system_errno);
   virtual int submit(ObIORequest &req) = 0;
   virtual void cancel(ObIORequest &req) = 0;
   virtual int64_t get_queue_count() const = 0;
@@ -672,6 +676,8 @@ public:
   ObIOFaultDetector(const ObIOConfig &io_config);
   virtual ~ObIOFaultDetector();
   int init();
+  void stop();
+  void wait();
   void destroy();
   int start();
   virtual void handle(void *task) override;

@@ -16,6 +16,9 @@
 #include "src/sql/engine/px/ob_dfo.h"
 #include "sql/engine/dml/ob_dml_service.h"
 #include "storage/blocksstable/ob_datum_row_utils.h"
+#include "sql/das/ob_das_dml_vec_iter.h"
+#include "sql/das/ob_das_search_index_utils.h"
+
 namespace oceanbase
 {
 namespace common
@@ -58,7 +61,8 @@ public:
       got_old_row_(false),
       iter_has_built_(false),
       is_main_table_in_fts_ddl_(das_ctdef->is_main_table_in_fts_ddl_),
-      allocator_(alloc)
+      allocator_(alloc),
+      main_ctdef_(das_ctdef)
   {
     batch_size_ = MIN(write_buffer_.get_row_cnt(), DEFAULT_BATCH_SIZE);
   }
@@ -133,6 +137,7 @@ private:
   bool is_main_table_in_fts_ddl_;
   common::ObIAllocator &allocator_;
   int64_t batch_size_;
+  const ObDASDMLBaseCtDef *main_ctdef_;
 };
 
 int ObDASUpdIterator::get_next_row(blocksstable::ObDatumRow *&row)
@@ -305,8 +310,9 @@ int ObDASUpdIterator::get_next_domain_index_row(ObDatumRow *&row)
   }
   if (OB_SUCC(ret)) {
     if (OB_ISNULL(domain_iter_)){
+      bool is_search_index = das_ctdef_->table_param_.get_data_table().is_search_index();
       const IntFixedArray &cur_proj = got_old_row_ ? das_ctdef_->new_row_projector_ : das_ctdef_->old_row_projector_;
-      ObDomainDMLParam param(allocator_, &cur_proj, result_iter_, das_ctdef_, nullptr/*main_ctdef*/);
+      ObDomainDMLParam param(allocator_, &cur_proj, result_iter_, das_ctdef_, is_search_index ? main_ctdef_ : nullptr);
       if (das_ctdef_->table_param_.get_data_table().is_fts_index() && !got_old_row_) {
         param.mode_ = is_main_table_in_fts_ddl_ ? ObDomainDMLMode::DOMAIN_DML_MODE_DEFAULT : ObDomainDMLMode::DOMAIN_DML_MODE_FT_SCAN;
         param.ft_doc_word_info_ = ft_doc_word_info_;
@@ -323,6 +329,10 @@ int ObDASUpdIterator::get_next_domain_index_row(ObDatumRow *&row)
         iter_has_built_ = false;
         got_old_row_ = true;
         domain_iter_->set_row_projector(&(das_ctdef_->new_row_projector_));
+        sql::ObEmbeddedVecDMLIterator* tmp_iter = dynamic_cast<sql::ObEmbeddedVecDMLIterator *>(domain_iter_);
+        if (OB_NOT_NULL(tmp_iter)) {
+          tmp_iter->is_old_row_ = false;
+        }
         if (OB_FAIL(domain_iter_->change_domain_dml_mode(ObDomainDMLMode::DOMAIN_DML_MODE_DEFAULT))) {
           LOG_WARN("fail to change domain dml mode", K(ret));
         } else {
@@ -348,8 +358,9 @@ int ObDASUpdIterator::get_next_domain_index_rows(ObDatumRow *&rows, int64_t &row
   }
   if (OB_SUCC(ret)) {
     if (OB_ISNULL(domain_iter_)) {
+      bool is_search_index = das_ctdef_->table_param_.get_data_table().is_search_index();
       const IntFixedArray &cur_proj = got_old_row_ ? das_ctdef_->new_row_projector_ : das_ctdef_->old_row_projector_;
-      ObDomainDMLParam param(allocator_, &cur_proj, result_iter_, das_ctdef_, nullptr/*main_ctdef*/);
+      ObDomainDMLParam param(allocator_, &cur_proj, result_iter_, das_ctdef_, is_search_index ? main_ctdef_ : nullptr);
       if (das_ctdef_->table_param_.get_data_table().is_fts_index() && !got_old_row_) {
         param.mode_ = is_main_table_in_fts_ddl_ ? ObDomainDMLMode::DOMAIN_DML_MODE_DEFAULT : ObDomainDMLMode::DOMAIN_DML_MODE_FT_SCAN;
         param.ft_doc_word_info_ = ft_doc_word_info_;
@@ -366,6 +377,10 @@ int ObDASUpdIterator::get_next_domain_index_rows(ObDatumRow *&rows, int64_t &row
         iter_has_built_ = false;
         got_old_row_ = true;
         domain_iter_->set_row_projector(&(das_ctdef_->new_row_projector_));
+        sql::ObEmbeddedVecDMLIterator* tmp_iter = dynamic_cast<sql::ObEmbeddedVecDMLIterator *>(domain_iter_);
+        if (OB_NOT_NULL(tmp_iter)) {
+          tmp_iter->is_old_row_ = false;
+        }
         if (OB_FAIL(domain_iter_->change_domain_dml_mode(ObDomainDMLMode::DOMAIN_DML_MODE_DEFAULT))) {
           LOG_WARN("fail to change domain dml mode", K(ret));
         } else {
@@ -389,9 +404,10 @@ int ObDASIndexDMLAdaptor<DAS_OP_TABLE_UPDATE, ObDASUpdIterator>::write_rows(cons
 {
   int ret = OB_SUCCESS;
   ObAccessService *as = MTL(ObAccessService *);
-  if (OB_UNLIKELY(ctdef.table_param_.get_data_table().is_vector_delta_buffer() &&
+  if (OB_UNLIKELY((ctdef.table_param_.get_data_table().is_vector_delta_buffer() ||
+                  ctdef.table_param_.get_data_table().is_hybrid_vector_index_log()) &&
                   !ctdef.is_access_mlog_as_master_table_)) {
-    // for vector delta buffer, only do insert when DML with main table
+    // for vector delta buffer/hybrid log table, only do insert when DML with main table
     if (OB_FAIL(as->insert_rows(ls_id, tablet_id, *tx_desc_, dml_param_,
                                 ctdef.column_ids_, &iter, affected_rows))) {
       if (OB_TRY_LOCK_ROW_CONFLICT != ret) {
@@ -471,6 +487,7 @@ int ObDASUpdateOp::open_op()
   upd_adaptor.tablet_id_ = tablet_id_;
   upd_adaptor.ls_id_ = ls_id_;
   upd_adaptor.related_tablet_ids_ = &related_tablet_ids_;
+  upd_adaptor.is_do_gts_opt_ = das_gts_opt_info_.use_specify_snapshot_;
   upd_adaptor.das_allocator_ = &op_alloc_;
   upd_adaptor.ft_doc_word_infos_ = &doc_word_infos;
   if (OB_FAIL(ObDASDomainUtils::build_ft_doc_word_infos(ls_id_, trans_desc_, snapshot_, related_ctdefs_, related_tablet_ids_,

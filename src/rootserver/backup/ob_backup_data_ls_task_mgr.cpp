@@ -16,7 +16,7 @@
 #include "ob_backup_task_scheduler.h"
 #include "storage/backup/ob_backup_operator.h"
 #include "storage/backup/ob_backup_operator.h"
-
+#include "share/backup/ob_backup_connectivity.h"
 
 namespace oceanbase
 {
@@ -83,7 +83,12 @@ int ObBackupDataLSTaskMgr::process(int64_t &finish_cnt)
     FLOG_INFO("[DATA_BACKUP]schedule backup ls task", KPC(ls_attr_));
     switch (ls_attr_->status_.status_) {
       case ObBackupTaskStatus::Status::INIT: {
-        if (OB_FAIL(gen_and_add_task_())) {
+        bool can_add_task = false;
+        if (OB_FAIL(task_scheduler_->check_can_add_task(can_add_task))) {
+          LOG_WARN("failed to check can add task", K(ret));
+        } else if (!can_add_task) {
+          LOG_INFO("queue is full, skip add task now", K(ret));
+        } else if (OB_FAIL(gen_and_add_task_())) {
           LOG_WARN("[DATA_BACKUP]failed to gen and add task into task schedulers", K(ret), KPC(ls_attr_));
         }
         break;
@@ -317,6 +322,8 @@ int ObBackupDataLSTaskMgr::handle_execute_over(
   if (!ls_attr.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(ls_attr));
+  } else if (ls_attr.task_type_.is_need_add_file_list() && OB_FAIL(add_file_list_(sql_proxy, ls_attr))) {
+    LOG_WARN("failed to add file list", K(ret), K(ls_attr));
   } else if (OB_FAIL(new_ls_attr.assign(ls_attr))) {
     LOG_WARN("failed to assign ls attr", K(ret), K(ls_attr));
   } else if (OB_FAIL(extra_condition.assign_fmt(
@@ -455,27 +462,31 @@ int ObBackupDataLSTaskMgr::finish_(int64_t &finish_cnt)
     ObMySQLTransaction trans;
     if (OB_FAIL(ret)) {
     } else if (job_attr_->can_retry_) {
-      if (ObTimeUtility::current_time() < ls_attr_->end_ts_ + OB_BACKUP_RETRY_TIME_INTERVAL) {
+      int64_t cur_ts = ObTimeUtility::current_time();
+      if (cur_ts < ls_attr_->end_ts_ + OB_BACKUP_RETRY_TIME_INTERVAL) {
+        backup_service_->set_idle_time(OB_BACKUP_RETRY_TIME_INTERVAL);
       } else if (OB_FAIL(trans.start(sql_proxy_, gen_meta_tenant_id(ls_attr_->tenant_id_)))) {
         LOG_WARN("fail to start trans", K(ret));
       } else {
-        if (OB_FAIL(redo_ls_task(*backup_service_, trans, *ls_attr_, ls_attr_->start_turn_id_,
+        // lock current backup set task row to serialize with other leaders and prevent double-master
+        ObBackupSetTaskAttr lock_set_task_attr;
+        if (OB_FAIL(ObBackupTaskOperator::get_backup_task(trans,
+                job_attr_->job_id_, ls_attr_->tenant_id_, /*for update*/true, lock_set_task_attr))) {
+          LOG_WARN("failed to lock backup set task row for update", K(ret), KPC(job_attr_), KPC(ls_attr_));
+        } else if (!lock_set_task_attr.status_.is_task_doing_status()) {
+          ret = OB_STATE_NOT_MATCH;
+          LOG_WARN("backup set task status not allow retry, expect DOING", K(ret), K(lock_set_task_attr));
+        } else if (OB_FAIL(redo_ls_task(*backup_service_, trans, *ls_attr_, ls_attr_->start_turn_id_,
           ls_attr_->turn_id_, next_retry_id))) {
             LOG_WARN("[DATA_BACKUP]failed to redo ls task", K(ret), KPC(ls_attr_));
-        } 
+        }
+
+        int trans_ret = backup_service_->end_transaction(trans, ret);
+        ret = COVER_SUCC(trans_ret);
         if (OB_SUCC(ret)) {
-          if (OB_FAIL(trans.end(true))) {
-            LOG_WARN("fail to commit", K(ret));
-          } else {
-            set_task_attr_->retry_cnt_ += next_retry_id;
-            backup_service_->wakeup();
-            LOG_INFO("redo backup ls task", KPC(ls_attr_));
-          }
-        } else {
-          int tmp_ret = OB_SUCCESS;
-          if (OB_SUCCESS != (tmp_ret = trans.end(false))) {
-            LOG_WARN("fail to roll back", K(tmp_ret));
-          }
+          set_task_attr_->retry_cnt_ += next_retry_id;
+          backup_service_->wakeup();
+          LOG_INFO("redo backup ls task", KPC(ls_attr_));
         }
       }
     } else {
@@ -517,6 +528,41 @@ int ObBackupDataLSTaskMgr::cancel(int64_t &finish_cnt)
     LOG_WARN("[DATA_BACKUP]failed to advance status", K(ret), K(*ls_attr_), K(next_status));
   } else {
     ++finish_cnt;
+  }
+  return ret;
+}
+
+int ObBackupDataLSTaskMgr::add_file_list_(
+    common::ObISQLClient &sql_proxy,
+    const share::ObBackupLSTaskAttr &ls_attr)
+{
+  int ret = OB_SUCCESS;
+  ObBackupJobAttr job_attr;
+  ObBackupDest backup_dest;
+  storage::ObBackupDataStore store;
+  share::ObBackupSetDesc desc;
+  if (OB_FAIL(ObBackupJobOperator::get_job(sql_proxy, false/*need_lock*/, ls_attr.tenant_id_, ls_attr.job_id_,
+                                              false/*is_initiator*/, job_attr))) {
+    LOG_WARN("failed to get job", K(ret), K(ls_attr));
+  } else if (FALSE_IT(desc.backup_set_id_ = job_attr.backup_set_id_)) {
+  } else if (FALSE_IT(desc.backup_type_ = job_attr.backup_type_)) {
+  } else if (OB_FAIL(ObBackupStorageInfoOperator::get_backup_dest(sql_proxy, job_attr.tenant_id_,
+                                                                      job_attr.backup_path_, backup_dest))) {
+    LOG_WARN("failed to get backup dest", K(ret), K(ls_attr), K(job_attr));
+  } else if (OB_FAIL(store.init(backup_dest, desc))) {
+    LOG_WARN("failed to init store", K(ret), K(ls_attr), K(backup_dest), K(desc), K(job_attr));
+  } else if (ls_attr.task_type_.is_backup_meta()) {
+    if (OB_FAIL(store.write_backup_meta_file_list(ls_attr))) {
+      LOG_WARN("failed to write backup meta file list", K(ret), K(ls_attr));
+    }
+  } else if (ls_attr.task_type_.is_backup_user()) {
+    if (OB_FAIL(store.write_backup_data_file_list(ls_attr))) {
+      LOG_WARN("failed to write backup data file list", K(ret), K(ls_attr));
+    }
+  } else if (ls_attr.task_type_.is_backup_fuse_meta_info()) {
+    if (OB_FAIL(store.write_backup_fuse_meta_info_file_list(ls_attr))) {
+      LOG_WARN("failed to write backup fuse tablet meta file list", K(ret), K(ls_attr));
+    }
   }
   return ret;
 }

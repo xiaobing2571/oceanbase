@@ -11,7 +11,8 @@
  */
 
 #include "ob_mvcc_trans_ctx.h"
-#include "storage/memtable/ob_lock_wait_mgr.h"
+#include "storage/memtable/ob_memtable.h"
+#include "storage/lock_wait_mgr/ob_lock_wait_mgr.h"
 #include "storage/tx/ob_trans_part_ctx.h"
 
 namespace oceanbase
@@ -19,6 +20,7 @@ namespace oceanbase
 using namespace common;
 using namespace share;
 using namespace transaction;
+using namespace lockwaitmgr;
 namespace memtable
 {
 
@@ -125,19 +127,21 @@ int ObITransCallback::log_sync_fail_cb(const share::SCN max_committed_scn)
 // All safety check is in before append
 void ObITransCallback::append(ObITransCallback *node)
 {
+  ObITransCallback *next = this->get_next();
   node->set_prev(this);
-  node->set_next(this->get_next());
-  this->get_next()->set_prev(node);
+  node->set_next(next);
   this->set_next(node);
+  next->set_prev(node);
 }
 
 void ObITransCallback::append(ObITransCallback *head,
                               ObITransCallback *tail)
 {
+  ObITransCallback *next = this->get_next();
   head->set_prev(this);
-  tail->set_next(this->get_next());
-  this->get_next()->set_prev(tail);
+  tail->set_next(next);
   this->set_next(head);
+  next->set_prev(tail);
 }
 
 int ObITransCallback::remove()
@@ -151,6 +155,14 @@ int ObITransCallback::remove()
     prev->set_next(next);
     next->set_prev(prev);
   }
+  return ret;
+}
+
+int ObITransCallback::get_holder_info(RowHolderInfo &holder_info) const
+{
+  int ret = OB_ERR_UNEXPECTED;
+  DETECT_LOG(WARN, "this callback should not be called", KP(this), K(lbt()));
+  ob_abort();
   return ret;
 }
 
@@ -205,18 +217,9 @@ void ObTransCallbackMgr::reset()
       }
     }
   }
-  if (NULL != cb_allocators_) {
-    for (int i = 0; i < MAX_CB_ALLOCATOR_COUNT; ++i) {
-      cb_allocators_[i].reset();
-    }
-  }
   if (OB_NOT_NULL(callback_lists_)) {
     cb_allocator_.free(callback_lists_);
     callback_lists_ = NULL;
-  }
-  if (OB_NOT_NULL(cb_allocators_)) {
-    cb_allocator_.free(cb_allocators_);
-    cb_allocators_ = NULL;
   }
   parallel_stat_ = 0;
   write_epoch_ = 0;
@@ -238,13 +241,13 @@ void ObTransCallbackMgr::reset()
 
 void ObTransCallbackMgr::free_mvcc_row_callback(ObITransCallback *cb)
 {
-  int64_t owner = cb->owner_;
+  int64_t owner = cb->owner_; // 0: use obj pool, 1: use cb_allocator_
   if (-1 == owner) {
     TRANS_LOG_RET(WARN, OB_ERR_UNEXPECTED, "callback free failed", KPC(cb));
   } else if (0 == owner) {
     mem_ctx_obj_pool_.free<ObMvccRowCallback>(cb);
-  } else if (0 < owner && MAX_CB_ALLOCATOR_COUNT >= owner && OB_NOT_NULL(cb_allocators_)) {
-    cb_allocators_[owner - 1].free(cb);
+  } else if (1 == owner) {
+    cb_allocator_.free(cb);
   } else {
     TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "unexpected cb", KPC(cb));
 #ifdef ENABLE_DEBUG_LOG
@@ -255,55 +258,18 @@ void ObTransCallbackMgr::free_mvcc_row_callback(ObITransCallback *cb)
 
 void *ObTransCallbackMgr::alloc_mvcc_row_callback()
 {
-  int ret = OB_SUCCESS;
   ObITransCallback *callback = nullptr;
-  const int64_t tid = get_itid() + 1;
-  const int64_t slot = tid % MAX_CB_ALLOCATOR_COUNT;
-  int64_t stat = ATOMIC_LOAD(&parallel_stat_);
-
-  if (PARALLEL_STMT == stat || (for_replay_ && parallel_replay_)) {
-    if (NULL == cb_allocators_) {
-      WRLockGuard guard(rwlock_);
-      if (NULL == cb_allocators_) {
-        ObMemtableCtxCbAllocator *tmp_cb_allocators = nullptr;
-        if (NULL == (tmp_cb_allocators = (ObMemtableCtxCbAllocator *)cb_allocator_.alloc(
-                       sizeof(ObMemtableCtxCbAllocator) * MAX_CB_ALLOCATOR_COUNT))) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
-          TRANS_LOG(WARN, "alloc cb allocator fail", K(ret));
-        } else {
-          for (int i = 0; OB_SUCC(ret) && i < MAX_CB_ALLOCATOR_COUNT; ++i) {
-            UNUSED(new(tmp_cb_allocators + i) ObMemtableCtxCbAllocator());
-            if (OB_FAIL(tmp_cb_allocators[i].init(MTL_ID()))) {
-              TRANS_LOG(ERROR, "cb_allocator_ init error", K(ret));
-            }
-          }
-          if (OB_SUCC(ret)) {
-            cb_allocators_ = tmp_cb_allocators;
-          }
-        }
-      }
-    }
-
-    if (OB_SUCC(ret)) {
-      if (NULL == cb_allocators_) {
-        ret = OB_ERR_UNEXPECTED;
-        TRANS_LOG(WARN, "cb allocators is not inited", K(ret));
-      } else {
-        callback = (ObITransCallback *)(cb_allocators_[slot].alloc(sizeof(ObMvccRowCallback)));
-        if (nullptr != callback) {
-          callback->owner_ = slot + 1;
-        }
-      }
+  if (PARALLEL_STMT == parallel_stat_ || (for_replay_ && parallel_replay_)) {
+    cb_allocator_.expand_nway();
+    callback = (ObITransCallback *)(cb_allocator_.alloc(sizeof(ObMvccRowCallback)));
+    if (nullptr != callback) {
+      callback->owner_ = 1;
     }
   } else {
     callback = (ObITransCallback *)(mem_ctx_obj_pool_.alloc<ObMvccRowCallback>());
     if (nullptr != callback) {
       callback->owner_ = 0;
     }
-  }
-
-  if (OB_FAIL(ret)) {
-    callback = nullptr;
   }
 
   return callback;
@@ -432,7 +398,6 @@ int ObTransCallbackMgr::append(ObITransCallback *head,
       // We donot support batch append for replay now
       OB_ASSERT(1 == length);
     }
-
     // Step1: prepare the callback append(epoch for pdml and statistic)
     for (ObITransCallback *cb = head; cb != nullptr; cb = cb->get_next()) {
       (void)before_append(cb);
@@ -542,10 +507,11 @@ int ObTransCallbackMgr::append(ObITransCallback *head,
 void ObTransCallbackMgr::before_append(ObITransCallback *node)
 {
   int64_t size = node->get_data_size();
+  int64_t old_row_size = node->get_old_row_data_size();
   if (for_replay_) {
     inc_flushed_log_size(size);
   } else {
-    inc_pending_log_size(size);
+    inc_pending_log_size(size + old_row_size);
   }
 }
 
@@ -553,10 +519,11 @@ void ObTransCallbackMgr::after_append(ObITransCallback *node, const int ret_code
 {
   if (OB_SUCCESS != ret_code) {
     int64_t size = node->get_data_size();
+    int64_t old_row_size = node->get_old_row_data_size();
     if (for_replay_) {
       inc_flushed_log_size(-1 * size);
     } else {
-      inc_pending_log_size(-1 * size);
+      inc_pending_log_size(-1 * (size + old_row_size));
     }
   }
 }
@@ -675,16 +642,24 @@ int ObTransCallbackMgr::remove_callbacks_for_fast_commit(const int16_t callback_
 }
 
 // for leader
-// called after log apply thread has callbacked the log_cb
-// @scopes: the log's callback-list scopes
-int ObTransCallbackMgr::remove_callbacks_for_fast_commit(const ObCallbackScopeArray &scopes)
+// called after log apply thread has called the log_cb
+// @callback_scope_host_bitmap: the log's callback-list idx bitmap [0-63]
+int ObTransCallbackMgr::remove_callbacks_for_fast_commit(const uint64_t callback_scope_host_bitmap)
 {
   const share::SCN stop_scn = is_serial_final_() ? share::SCN::invalid_scn() : serial_sync_scn_;
   int ret = OB_SUCCESS;
-  ARRAY_FOREACH(scopes, i) {
-    if (OB_FAIL(scopes.at(i).host_->remove_callbacks_for_fast_commit(stop_scn))) {
-      TRANS_LOG(WARN, "remove callbacks for fast commit fail", K(ret), K(i), KPC(scopes.at(i).host_));
+  uint64_t bitmap = callback_scope_host_bitmap;
+  while (bitmap != 0 && OB_SUCC(ret)) {
+    // Position of the lowest set bit in [0, 63]. Note: undefined behavior when bitmap == 0.
+    int idx = __builtin_ctzll(bitmap);
+    ObTxCallbackList *list = get_callback_list_(idx, true);
+    if (OB_ISNULL(list)) {
+      ret = OB_ERR_UNEXPECTED;
+      TRANS_LOG(ERROR, "callback list is null", K(ret), K(idx));
+    } else if (OB_FAIL(list->remove_callbacks_for_fast_commit(stop_scn))) {
+      TRANS_LOG(WARN, "remove callbacks for fast commit fail", K(ret), K(idx), KPC(list));
     }
+    bitmap &= (bitmap - 1); // Clear the lowest set bit.
   }
   return ret;
 }
@@ -816,6 +791,7 @@ void ObTransCallbackMgr::calc_next_to_fill_log_info_(const ObIArray<RedoLogEpoch
   }
 }
 
+//#pragma clang optimize off
 int ObTransCallbackMgr::prep_and_fill_from_list_(ObTxFillRedoCtx &ctx,
                                                  ObITxFillRedoFunctor &func,
                                                  int16 &callback_scope_idx,
@@ -859,6 +835,7 @@ int ObTransCallbackMgr::prep_and_fill_from_list_(ObTxFillRedoCtx &ctx,
   }
   return ret;
 }
+//#pragma clang optimize on
 
 bool ObTransCallbackMgr::check_list_has_min_epoch_(const int my_idx,
                                                    const int64_t my_epoch,
@@ -1283,6 +1260,31 @@ int ObTransCallbackMgr::log_sync_succ(const ObCallbackScopeArray &callbacks,
   return ret;
 }
 
+int ObTransCallbackMgr::prepare_log_submitted(const ObCallbackScopeArray &callbacks)
+{
+  int ret = OB_SUCCESS;
+  uint64_t prepared_bitmap = 0;
+  ARRAY_FOREACH(callbacks, i) {
+    const ObCallbackScope &scope = callbacks.at(i);
+    if (!scope.is_empty()) {
+      if (OB_FAIL(scope.host_->prepare_log_submitted())) {
+        TRANS_LOG(ERROR, "prepare log submitted fail", K(ret));
+      } else {
+        prepared_bitmap |= (1ULL << scope.host_->get_id());
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    ARRAY_FOREACH_NORET(callbacks, i) {
+      const ObCallbackScope &scope = callbacks.at(i);
+      if (prepared_bitmap & (1ULL << scope.host_->get_id())) {
+        scope.host_->clear_prepared_log_submitted();
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTransCallbackMgr::log_sync_fail(const ObCallbackScopeArray &callbacks,
                                       const share::SCN scn,
                                       int64_t &removed_cnt)
@@ -1350,9 +1352,10 @@ int ObTransCallbackMgr::get_memtable_key_arr(ObMemtableKeyArray &memtable_key_ar
 {
   int ret = OB_SUCCESS;
   int fail_at = 0;
+  int64_t timeout = ObClockGenerator::getClock() + 100_ms;
   CALLBACK_LISTS_FOREACH(idx, list) {
     fail_at = idx;
-    ret = list->get_memtable_key_arr_w_timeout(memtable_key_arr);
+    ret = list->get_memtable_key_arr_w_timeout(memtable_key_arr, timeout);
     if (OB_ITER_STOP == ret) { ret = OB_SUCCESS; }
   }
   if (OB_FAIL(ret)) {
@@ -1381,10 +1384,8 @@ int ObTransCallbackMgr::acquire_callback_list(const bool new_epoch)
   // other thread will stay in slot by its offset with first thread
   if (new_epoch) {
     ++write_epoch_;
-    write_epoch_start_tid_ = tid;
-    slot = 0;
-  } else if (tid == write_epoch_start_tid_) {
-    slot = 0;
+    slot = (is_parallel_logging_() && GCONF._enable_randomize_redo_logging_slot) ? (write_epoch_ % MAX_CALLBACK_LIST_COUNT) : 0;
+    write_epoch_start_tid_ = slot + tid;
   } else {
     // to ensure slot is positive: (m + (a - b) % m) % m
     slot =  (MAX_CALLBACK_LIST_COUNT + ((tid - write_epoch_start_tid_) % MAX_CALLBACK_LIST_COUNT)) % MAX_CALLBACK_LIST_COUNT;
@@ -1409,11 +1410,11 @@ void ObTransCallbackMgr::revert_callback_list()
 
 void ObTransCallbackMgr::wakeup_waiting_txns_()
 {
-  if (OB_ISNULL(MTL(ObLockWaitMgr*))) {
+  if (OB_ISNULL(MTL(lockwaitmgr::ObLockWaitMgr*))) {
     TRANS_LOG_RET(WARN, OB_ERR_UNEXPECTED, "MTL(ObLockWaitMgr*) is null");
   } else {
     ObMemtableCtx &mem_ctx = static_cast<ObMemtableCtx&>(host_);
-    MTL(ObLockWaitMgr*)->wakeup(mem_ctx.get_trans_ctx()->get_trans_id());
+    MTL(lockwaitmgr::ObLockWaitMgr*)->wakeup(mem_ctx.get_trans_ctx()->get_trans_id());
   }
 }
 
@@ -1557,6 +1558,22 @@ void ObTransCallbackMgr::trans_start()
   reset();
 }
 
+ObMvccRowCallback::ObMvccRowCallback(ObIMvccCtx &ctx, ObMvccRow &value, ObMemtable *memtable)
+  : ObITransCallback(),
+    ctx_(ctx),
+    value_(value),
+    tnode_(NULL),
+    data_size_(-1),
+    memtable_(memtable),
+    is_link_(false),
+    not_calc_checksum_(false),
+    is_non_unique_local_index_cb_(false),
+    seq_no_(),
+    column_cnt_(0),
+    freeze_clock_(memtable == NULL ? 0 : memtable->get_freeze_clock())
+{
+}
+
 int ObMvccRowCallback::before_append(const bool is_replay)
 {
   int ret = OB_SUCCESS;
@@ -1613,6 +1630,7 @@ uint32_t ObMvccRowCallback::get_freeze_clock() const
 {
   if (OB_ISNULL(memtable_)) {
     TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "mvcc row memtable is NULL", KPC(this));
+    ob_abort();
     return 0;
   } else {
     return memtable_->get_freeze_clock();
@@ -1733,7 +1751,8 @@ int ObMvccRowCallback::elr_trans_preparing()
     value_.elr(mem_ctx->get_trans_ctx()->get_trans_id(),
                ctx_.get_commit_version(),
                get_tablet_id(),
-               (ObMemtableKey*)&key_);
+               (ObMemtableKey*)&key_,
+               is_non_unique_local_index_cb_);
   }
   return OB_SUCCESS;
 }
@@ -1781,11 +1800,11 @@ int ObMvccRowCallback::get_cluster_version(uint64_t &cluster_version) const
   return ret;
 }
 
-ObTransCtx *ObMvccRowCallback::get_trans_ctx() const
+ObPartTransCtx *ObMvccRowCallback::get_trans_ctx() const
 {
   int ret = OB_SUCCESS;
   ObMemtableCtx *mem_ctx = static_cast<ObMemtableCtx*>(&ctx_);
-  ObTransCtx *trans_ctx = NULL;
+  ObPartTransCtx *trans_ctx = NULL;
 
   if (OB_ISNULL(mem_ctx)) {
     ret = OB_ERR_UNEXPECTED;
@@ -1832,9 +1851,13 @@ int ObMvccRowCallback::checkpoint_callback()
   if (need_submit_log_) {
     ret = OB_ERR_UNEXPECTED;
     TRANS_LOG(ERROR, "checkpoint never called on submitted callback", KPC(this));
-  } else if (OB_FAIL(value_.remove_callback(*this))) {
-    TRANS_LOG(ERROR, "remove callback from trans node failed", K(ret), K(*this));
   } else if (OB_NOT_NULL(tnode_)) {
+    ObAddr tx_scheduler = get_trans_ctx()->get_scheduler();
+    (void) MTL(ObLockWaitMgr*)->transform_row_lock_to_tx_lock(get_tablet_id(),
+                                                              *get_key(),
+                                                              tnode_->tx_id_,
+                                                              tx_scheduler);
+    tnode_->set_delayed_cleanout();
     (void)value_.update_dml_flag_(get_dml_flag(), tnode_->get_scn());
   }
 
@@ -1848,6 +1871,13 @@ void ObMvccRowCallback::after_append_fail(const bool is_replay)
   }
 }
 
+int ObMvccRowCallback::get_holder_info(RowHolderInfo &holder_info) const
+{
+  holder_info.scn_ = get_scn();
+  holder_info.seq_ = get_seq_no();
+  return get_trans_id(holder_info.tx_id_);
+}
+
 static blocksstable::ObDmlFlag get_dml_flag(ObMvccTransNode *node)
 {
   return NULL == node ? blocksstable::ObDmlFlag::DF_NOT_EXIST : reinterpret_cast<ObMemtableDataHeader *>(node->buf_)->dml_flag_;
@@ -1858,6 +1888,9 @@ blocksstable::ObDmlFlag ObMvccRowCallback::get_dml_flag() const
   return memtable::get_dml_flag(tnode_);
 }
 
+void ObMvccRowCallback::commit_trans_node_() {
+  tnode_->trans_commit(ctx_.get_commit_version(), ctx_.get_tx_end_scn());
+}
 int ObMvccRowCallback::trans_commit()
 {
   int ret = OB_SUCCESS;
@@ -1917,7 +1950,7 @@ int ObMvccRowCallback::trans_commit()
       if (OB_SUCC(ret)) {
         if (OB_FAIL(value_.trans_commit(ctx_.get_commit_version(), *tnode_))) {
           TRANS_LOG(WARN, "mvcc trans ctx trans commit error", K(ret), K_(ctx), K_(value));
-        } else if (FALSE_IT(tnode_->trans_commit(ctx_.get_commit_version(), ctx_.get_tx_end_scn()))) {
+        } else if (FALSE_IT(commit_trans_node_())) {
         } else if (FALSE_IT(wakeup_row_waiter_if_need_())) {
         } else if (blocksstable::ObDmlFlag::DF_LOCK == get_dml_flag()) {
           unlink_trans_node();
@@ -1973,10 +2006,10 @@ int ObMvccRowCallback::trans_commit()
 int ObMvccRowCallback::wakeup_row_waiter_if_need_()
 {
   int ret = OB_SUCCESS;
-  if (NULL != tnode_ &&
-      (tnode_->is_committed() || tnode_->is_aborted()) // tnode trans end
+  if (NULL != tnode_
+    && (tnode_->is_committed() || tnode_->is_aborted()) // tnode trans end
     && !tnode_->is_elr() // no need for elr trx
-    && tnode_->next_ == NULL // latest trans node
+    && (tnode_->next_ == NULL) // latest trans node
     && (tnode_->prev_ == NULL || (tnode_->prev_->is_committed() // pre node status should be decided
                                || tnode_->prev_->is_aborted()
                                || tnode_->prev_->is_elr()))) {
@@ -1987,15 +2020,6 @@ int ObMvccRowCallback::wakeup_row_waiter_if_need_()
     // no need to wake up:
     //   case 1: elr transaction
     ret = value_.wakeup_waiter(get_tablet_id(), key_);
-    /*****[for deadlock]*****/
-    ObLockWaitMgr *p_lwm = MTL(ObLockWaitMgr *);
-    if (OB_ISNULL(p_lwm)) {
-      ret = OB_ERR_UNEXPECTED;
-      TRANS_LOG(WARN, "lock wait mgr is nullptr", K(*this));
-    } else {
-      p_lwm->reset_hash_holder(get_tablet_id(), key_, ctx_.get_tx_id());
-    }
-    /************************/
   }
   return ret;
 }
@@ -2028,13 +2052,13 @@ int ObMvccRowCallback::rollback_callback()
   ObRowLatchGuard guard(value_.latch_);
 
   if (NULL != tnode_) {
-    tnode_->set_aborted();
+    tnode_->trans_rollback();
     wakeup_row_waiter_if_need_();
     unlink_trans_node();
   }
 
   if (need_submit_log_ && SCN::max_scn() == scn_) {
-    ctx_.inc_pending_log_size(-1 * data_size_);
+    ctx_.inc_pending_log_size(-1 * (data_size_ + get_old_row_data_size()));
   }
 
   return OB_SUCCESS;
@@ -2149,6 +2173,7 @@ int64_t ObMvccRowCallback::to_string(char *buf, const int64_t buf_len) const
   databuff_printf(buf, buf_len, pos, "), seq_no=%ld, memtable=%p, scn=",
       seq_no_.cast_to_int(), memtable_);
   databuff_printf(buf, buf_len, pos, scn_);
+  databuff_printf(buf, buf_len, pos, ", freeze_clock=%u", get_freeze_clock());
   return pos;
 }
 
@@ -2156,10 +2181,7 @@ int ObMvccRowCallback::log_sync_fail(const share::SCN max_committed_scn)
 {
   int ret = OB_SUCCESS;
   ObRowLatchGuard guard(value_.latch_);
-  if (nullptr != tnode_) {
-    tnode_->set_aborted();
-    unlink_trans_node();
-  }
+  unlink_trans_node();
   memtable_->set_max_end_scn(max_committed_scn, true);
   return ret;
 }
@@ -2173,7 +2195,6 @@ int ObMvccRowCallback::clean_unlog_cb()
 
   if (need_submit_log_) {
     if (nullptr != tnode_) {
-      tnode_->set_aborted();
       unlink_trans_node();
     }
     need_submit_log_ = false;
@@ -2270,6 +2291,23 @@ inline ObTxCallbackList *ObTransCallbackMgr::get_callback_list_(const int16_t in
   return NULL;
 }
 
+inline const ObTxCallbackList *ObTransCallbackMgr::get_callback_list_(const int16_t index, const bool nullable) const
+{
+  if (index == 0) {
+    return &callback_list_;
+  }
+  if (callback_lists_) {
+    OB_ASSERT(index < MAX_CALLBACK_LIST_COUNT);
+    return &callback_lists_[index - 1];
+  } else if (!nullable) {
+    TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "callback list is null", K(index));
+#ifdef ENABLE_DEBUG_LOG
+    ob_abort();
+#endif
+  }
+  return NULL;
+}
+
 void ObTransCallbackMgr::check_all_redo_flushed()
 {
   bool ok = true;
@@ -2290,15 +2328,33 @@ int ObTransCallbackMgr::get_logging_list_count() const
   return callback_lists_ ? MAX_CALLBACK_LIST_COUNT : 1;
 }
 
-bool ObTransCallbackMgr::pending_log_size_too_large(const transaction::ObTxSEQ &write_seq_no,
+bool ObTransCallbackMgr::pending_log_size_too_large(const int16_t branch_id,
                                                     const int64_t limit)
 {
   if (is_parallel_logging_()) {
-    ObTxCallbackList *list = get_callback_list_(write_seq_no.get_branch() % MAX_CALLBACK_LIST_COUNT, true);
+    ObTxCallbackList *list = get_callback_list_(branch_id % MAX_CALLBACK_LIST_COUNT, true);
     return list ? list->pending_log_too_large(limit) : 0;
   } else {
     return ATOMIC_LOAD(&pending_log_size_) > limit;
   }
+}
+
+int16_t ObTransCallbackMgr::get_pending_log_size_too_large_list(const int64_t limit) const
+{
+  int16_t ret = -1;
+  if (is_parallel_logging_() && callback_lists_) {
+    int16_t start_idx = get_itid() % MAX_CALLBACK_LIST_COUNT;
+    for (int i = start_idx; i < MAX_CALLBACK_LIST_COUNT; i++) {
+      const ObTxCallbackList *list = get_callback_list_(i, true);
+      if (list && !list->is_logging_locked() && list->pending_log_too_large(limit)) {
+        ret = i;
+        break;
+      }
+    }
+  } else if (ATOMIC_LOAD(&pending_log_size_) > limit) {
+    ret = 0;
+  }
+  return ret;
 }
 
 void ObTransCallbackMgr::set_parallel_logging(const share::SCN serial_final_scn,
@@ -2327,25 +2383,20 @@ void ObTransCallbackMgr::set_skip_checksum_calc()
   ATOMIC_STORE(&skip_checksum_, true);
 }
 
-bool ObTransCallbackMgr::is_logging_blocked(bool &has_pending_log) const
+bool ObTransCallbackMgr::has_pending_log_for_freeze(const uint32_t freeze_clock) const
 {
-  int ret = OB_SUCCESS;
-  bool all_blocked = false;
+  bool bret = false;
   RDLockGuard guard(rwlock_);
   if (!for_replay_) {
+    int ret = OB_SUCCESS;
     CALLBACK_LISTS_FOREACH_CONST(idx, list) {
-      if (list->has_pending_log()) {
-        has_pending_log = true;
-        if (list->is_logging_blocked()) {
-          all_blocked = true;
-        } else {
-          all_blocked = false;
-          break;
-        }
+      if (list->has_pending_log_for_freeze(freeze_clock)) {
+        bret = true;
+        break;
       }
     }
   }
-  return all_blocked;
+  return bret;
 }
 
 int64_t ObTransCallbackMgr::get_pending_log_size() const
@@ -2359,6 +2410,16 @@ int64_t ObTransCallbackMgr::get_pending_log_size() const
       size += list->get_pending_log_size();
     }
     return size;
+  }
+}
+
+int64_t ObTransCallbackMgr::get_branch_pending_log_size(const int16_t branch) const
+{
+  if (is_parallel_logging_()) {
+    const ObTxCallbackList *list = get_callback_list_(branch % MAX_CALLBACK_LIST_COUNT, true);
+    return list ? list->get_pending_log_size() : 0;
+  } else {
+    return ATOMIC_LOAD(&pending_log_size_);
   }
 }
 

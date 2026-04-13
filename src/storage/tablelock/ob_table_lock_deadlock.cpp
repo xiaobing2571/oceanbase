@@ -54,6 +54,9 @@ int ObTxLockPartOnDetectOp::operator() (
   } else if (OB_ISNULL(ls = handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls should not be null", K(ret));
+  } else if (ls->is_logonly_replica()) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("logonly replica has no tablet", KR(ret), KPC(ls));
   } else if (OB_FAIL(ls->get_tx_ctx(lock_part_id_.trans_id_,
                                     true, /* does not check leader*/
                                     ctx))) {
@@ -124,8 +127,10 @@ static int alloc_buffers(char *&buffer, char *&buffer2)
   return ret;
 }
 
-int ObTxLockPartCollectCallBack::operator()(ObDetectorUserReportInfo &info)
+int ObTxLockPartCollectCallBack::operator()(const ObDependencyHolder &blocked_holder,
+                                            ObDetectorUserReportInfo &info)
 {
+  UNUSED(blocked_holder);
   int ret = OB_SUCCESS;
   char * buffer = nullptr;
   char * resource = nullptr;
@@ -162,7 +167,7 @@ int ObTxLockPartCollectCallBack::operator()(ObDetectorUserReportInfo &info)
 }
 
 int ObTransLockPartBlockCallBack::operator()(
-    common::ObIArray<ObDependencyResource> &depend_res,
+    common::ObIArray<ObDependencyHolder> &depend_res,
     bool &need_remove)
 {
   int ret = OB_SUCCESS;
@@ -173,6 +178,7 @@ int ObTransLockPartBlockCallBack::operator()(
   ObPartTransCtx *ctx = nullptr;
   ObMemtableCtx *mem_ctx = nullptr;
   ObTxIDSet conflict_tx_set;
+  transaction::SessionIDPair sess_id_pair;
 
   if (OB_UNLIKELY(!is_valid())) {
     ret = OB_ERR_UNEXPECTED;
@@ -191,6 +197,9 @@ int ObTransLockPartBlockCallBack::operator()(
   } else if (OB_ISNULL(ls = handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls should not be null", K(ret));
+  } else if (ls->is_logonly_replica()) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("logonly replica has no tablet", KR(ret), KPC(ls));
   } else if (OB_FAIL(ls->get_tx_ctx(lock_op_.create_trans_id_,
                                     true, /* does not check leader*/
                                     ctx))) {
@@ -233,11 +242,11 @@ int ObTransLockPartBlockCallBack::operator()(
         //       we need get dependency next time.
         const ObTransID &block_trans_id = *it;
         binary_key.set_user_key(block_trans_id);
-        if (OB_FAIL(ObTransDeadlockDetectorAdapter::get_trans_scheduler_info_on_participant(
-            block_trans_id, ls_id_, block_trans_addr))) {
+        if (OB_FAIL(ObTransDeadlockDetectorAdapter::get_trans_info_on_participant(
+            block_trans_id, ls_id_, block_trans_addr, sess_id_pair))) {
           LOG_WARN("get block trans scheduler address failed", K(ret), K_(ls_id), K(block_trans_id));
         } else {
-          ObDependencyResource resource(block_trans_addr,
+          ObDependencyHolder resource(block_trans_addr,
                                         binary_key);
           if (OB_FAIL(depend_res.push_back(resource))) {
             LOG_WARN("push into array failed.", K(ret), K(resource));
@@ -296,6 +305,8 @@ int ObTableLockDeadlockDetectorHelper::register_trans_lock_part(
     } else if (OB_FAIL(MTL(ObDeadLockDetectorMgr*) ->register_key(tx_lock_part_id,
                                                                   on_detect_op,
                                                                   on_collect_callback,
+                                                                  share::detector::DummyFillCallBack(),
+                                                                  0,
                                                                   priority))) {
       LOG_WARN("register to deadlock detector failed.",
               K(ret), K(tx_lock_part_id), K(priority));

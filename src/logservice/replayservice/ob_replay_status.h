@@ -39,7 +39,7 @@ namespace ipalf
 {
 class IPalfEnv;
 class IPalfHandle;
-class IPalfLogIterator;
+template <class LogEntryType> class IPalfIterator;
 }
 namespace logservice
 {
@@ -340,7 +340,7 @@ private:
   //initial log scn when enable replay, logs which scn small than this value should skip replay
   share::SCN base_scn_;
   //for unittest, should be a member not pointer
-  ipalf::IPalfLogIterator iterator_;
+  ipalf::IPalfIterator<ipalf::ILogEntry> iterator_;
 };
 
 class ObReplayServiceReplayTask : public ObReplayServiceTask
@@ -416,7 +416,7 @@ private:
   ObReplayStatus *replay_status_;
 };
 
-class ObReplayStatus
+class ObReplayStatus : public common::LinkHashValue<palf::LSKey>
 {
 public:
   typedef common::RWLock RWLock;
@@ -534,6 +534,15 @@ public:
                          int64_t &unsubmitted_log_size,
                          int64_t &replayed_log_size,
                          int64_t &unreplayed_log_size);
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+  int get_replay_process(share::SCN &max_replayed_scn,
+                         palf::LSN &min_unreplayed_lsn,
+                         ObRole &role,
+                         int64_t &proposal_id,
+                         ObAddr &election_leader,
+                         bool &is_active_follower,
+                         bool &is_in_sync);
+#endif // OB_BUILD_SHARED_LOG_SERVICE
   //提交日志检查barrier状态
   int check_submit_barrier();
   //回放日志检查barrier状态

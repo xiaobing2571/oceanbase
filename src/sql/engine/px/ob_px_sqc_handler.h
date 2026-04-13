@@ -31,7 +31,7 @@ class ObPxWorkNotifier
 {
 public:
   ObPxWorkNotifier() : start_worker_count_(0), finish_worker_count_(0),
-  expect_worker_count_(0), cond_() {}
+  expect_worker_count_(0), cond_(common::ObWaitEventIds::OB_PX_WORK_NOTIFIER_COND_WAIT) {}
   ~ObPxWorkNotifier() = default;
 
   int wait_all_worker_start();
@@ -55,6 +55,15 @@ private:
   common::ObArray<int64_t> tid_array_;
 };
 
+struct ObPxSqcMetrics
+{
+  int64_t sqc_des_cost_{0};
+  int64_t sqc_rpc_process_cost_{0};
+  int64_t sqc_rpc_after_cost_{0};
+  int64_t split_gi_cost_{0};
+  int64_t dispatch_tasks_ts_{0};
+};
+
 class ObPxSqcHandler
 {
 public:
@@ -66,7 +75,8 @@ public:
     des_phy_plan_(nullptr), sqc_init_args_(nullptr), sub_coord_(nullptr), rpc_level_(INT32_MAX),
     node_sequence_id_(0), has_interrupted_(false),
     part_ranges_spin_lock_(common::ObLatchIds::PX_TENANT_TARGET_LOCK),
-    is_session_query_locked_(false) {
+    is_session_query_locked_(false),
+    sqc_metrics_(), tenant_min_cpu_(0) {
   }
   ~ObPxSqcHandler() = default;
   static constexpr const char *OP_LABEL = ObModIds::ObModIds::OB_SQL_SQC_HANDLER;
@@ -127,17 +137,25 @@ public:
   int64_t get_rpc_level() { return rpc_level_; }
   void set_rpc_level(int64_t level) { rpc_level_ = level; }
   void set_node_sequence_id(uint64_t node_sequence_id) { node_sequence_id_ = node_sequence_id; }
+  int dop_scaling_by_load(int64_t &reserved_px_thread_count);
+  static int64_t dop_scaling_by_load(int64_t dop, int64_t low_water, int64_t high_water, int64_t realtime_task_cnt);
   int thread_count_auto_scaling(int64_t &reserved_px_thread_count);
   bool has_interrupted() const { return has_interrupted_; }
   const Ob2DArray<ObPxTabletRange> &get_partition_ranges() const { return part_ranges_; }
   int set_partition_ranges(const Ob2DArray<ObPxTabletRange> &part_ranges,
                            char *buf = NULL, int64_t max_size = 0);
+  int prepare_tablets_info();
+
+  ObPxSqcMetrics &get_sqc_metrics() { return sqc_metrics_; }
+  const ObPxSqcMetrics &get_sqc_metrics() const { return sqc_metrics_; }
+
   TO_STRING_KV(K_(tenant_id), K_(reserved_px_thread_count), KP_(notifier),
       K_(exec_ctx), K_(des_phy_plan), K_(sqc_init_args), KP_(sub_coord), K_(rpc_level));
 
 private:
   void init_flt_content();
   int destroy_sqc(int &report_ret);
+  int task_need_regeneration_for_external_table(ObGranulePump &pump, bool &need_regeneration);
 private:
   lib::MemoryContext mem_context_;
   uint64_t tenant_id_;
@@ -166,6 +184,8 @@ private:
   Ob2DArray<ObPxTabletRange> part_ranges_;
   SpinRWLock part_ranges_spin_lock_;
   bool is_session_query_locked_;
+  ObPxSqcMetrics sqc_metrics_;
+  int64_t tenant_min_cpu_;
 };
 
 }

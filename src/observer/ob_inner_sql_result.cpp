@@ -40,6 +40,27 @@ inline int ObInnerSQLResult::check_extend_value(const common::ObObj &obj)
   return ret;
 }
 
+ObInnerSQLResult::ObInnerSessionGuard::ObInnerSessionGuard(sql::ObSQLSessionInfo *session_info, bool is_inner)
+  : session_info_(session_info), old_inner_flag_(false), is_inner_(is_inner)
+{
+  if (OB_NOT_NULL(session_info_)) {
+    old_inner_flag_ = session_info_->is_inner();
+    if (!is_inner_ && !old_inner_flag_) {
+      session_info_->set_inner_flag(true);
+    }
+    // For PL execution (old_inner_flag_=true), do nothing
+  }
+}
+
+ObInnerSQLResult::ObInnerSessionGuard::~ObInnerSessionGuard()
+{
+  if (OB_NOT_NULL(session_info_) && !is_inner_ && !old_inner_flag_) {
+    // Only restore if we actually changed it (i.e., it was false before)
+    // For PL execution (old_inner_flag_=true), we didn't change anything, so don't restore
+    session_info_->set_inner_flag(old_inner_flag_);
+  }
+}
+
 ObInnerSQLResult::ObInnerSQLResult(ObSQLSessionInfo &session, bool is_inner_session, ObDiagnosticInfo *di)
     : column_map_created_(false), column_indexed_(false), column_map_(),
       mem_context_(nullptr),
@@ -56,7 +77,9 @@ ObInnerSQLResult::ObInnerSQLResult(ObSQLSessionInfo &session, bool is_inner_sess
       has_tenant_resource_(true),
       tenant_(nullptr),
       is_inner_session_(is_inner_session),
-      inner_sql_di_(di)
+      inner_sql_di_(di),
+      interrupt_checker_(),
+      inner_session_guard_(&session, is_inner_session)
 
 {
   sql_ctx_.exec_type_ = InnerSql;
@@ -88,8 +111,12 @@ int ObInnerSQLResult::init(bool has_tenant_resource)
       remote_result_set_ = new (buf_) ObRemoteResultSet(mem_context_->get_arena_allocator());
       remote_result_set_->reset_and_init_remote_resp_handler();
     } else {
-      result_set_ = new (buf_) ObResultSet(session_, mem_context_->get_arena_allocator());
-      result_set_->set_is_inner_result_set(true);
+      // The constructor of some members depends on MTL_ID, such as `temp_ctx_`(ObTMArray)
+      // of `exec_ctx_, so here need to switch to the corresponding tenant to new object.
+      MTL_SWITCH(session_.get_effective_tenant_id()) {
+        result_set_ = new (buf_) ObResultSet(session_, mem_context_->get_arena_allocator());
+        result_set_->set_is_inner_result_set(true);
+      }
     }
     is_inited_ = true;
   }
@@ -128,6 +155,7 @@ int ObInnerSQLResult::open()
   execute_start_ts_ = ObTimeUtility::current_time();
   MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
   ObInnerSqlWaitGuard guard(is_inner_session(), inner_sql_di_, &session_);
+  ObInterruptCheckerGuard interrupt_guard(interrupt_checker_);
 
   if (has_tenant_resource()) {
     result_set().get_exec_context().set_plan_start_time(execute_start_ts_);
@@ -139,7 +167,7 @@ int ObInnerSQLResult::open()
     LOG_WARN("switch tenant failed", K(ret), K(session_.get_effective_tenant_id()));
   } else {
     lib::CompatModeGuard g(compat_mode_);
-    SQL_INFO_GUARD(session_.get_current_query_string(), session_.get_cur_sql_id());
+    SQL_INFO_GUARD(sql_ctx_.cur_sql_, ObString(sql_ctx_.sql_id_));
     ObInnerSQLSessionGuard sess_guard(&session_);
     bool is_select = has_tenant_resource() ?
            ObStmt::is_select_stmt(result_set_->get_stmt_type())
@@ -206,8 +234,9 @@ int ObInnerSQLResult::inner_close()
 {
   int ret = OB_SUCCESS;
   lib::CompatModeGuard g(compat_mode_);
-  SQL_INFO_GUARD(session_.get_current_query_string(), session_.get_cur_sql_id());
+  SQL_INFO_GUARD(sql_ctx_.cur_sql_, ObString(sql_ctx_.sql_id_));
   ObInnerSQLSessionGuard sess_guard(&session_);
+  ObInterruptCheckerGuard interrupt_guard(interrupt_checker_);
   LOG_DEBUG("compat_mode_", K(ret), K(compat_mode_), K(lbt()));
 
   MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
@@ -237,6 +266,7 @@ int ObInnerSQLResult::next()
   MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
   ObInnerSqlWaitGuard guard(is_inner_session(), inner_sql_di_, &session_);
   ACTIVE_SESSION_FLAG_SETTER_GUARD(in_sql_execution);
+  ObInterruptCheckerGuard interrupt_guard(interrupt_checker_);
   LOG_DEBUG("compat_mode_", K(ret), K(compat_mode_), K(lbt()));
   if (!opened_) {
     ret = OB_NOT_INIT;
@@ -250,7 +280,7 @@ int ObInnerSQLResult::next()
   } else {
     row_ = NULL;
     lib::CompatModeGuard g(compat_mode_);
-    SQL_INFO_GUARD(session_.get_current_query_string(), session_.get_cur_sql_id());
+    SQL_INFO_GUARD(sql_ctx_.cur_sql_, ObString(sql_ctx_.sql_id_));
     ObInnerSQLSessionGuard sess_guard(&session_);
     WITH_CONTEXT(mem_context_) {
       if (has_tenant_resource() && OB_FAIL(result_set_->get_next_row(row_))) {

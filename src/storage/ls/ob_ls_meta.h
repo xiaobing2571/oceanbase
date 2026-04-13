@@ -69,7 +69,7 @@ public:
   int set_start_work_state();
   int set_start_ha_state();
   int set_finish_ha_state();
-  int set_remove_state();
+  int set_remove_state(const bool write_slog);
   const ObLSPersistentState &get_persistent_state() const;
   ObLSMeta &operator=(const ObLSMeta &other);
   share::SCN get_clog_checkpoint_scn() const;
@@ -117,6 +117,9 @@ public:
   int get_rebuild_info(ObLSRebuildInfo &rebuild_info) const;
   int get_create_type(int64_t &create_type) const;
   int check_ls_need_online(bool &need_online) const;
+  int get_transfer_meta(
+      share::SCN &transfer_scn,
+      ObLSTransferMetaInfo &transfer_meta_info) const;
   int set_transfer_meta_info(
       const share::SCN &replay_scn,
       const share::ObLSID &src_ls,
@@ -138,12 +141,18 @@ public:
       const share::ObLSRestoreStatus &restore_status,
       const share::SCN &create_scn,
       const ObMajorMVMergeInfo &major_mv_merge_info,
-      const ObLSStoreFormat &store_format);
+      const ObLSStoreFormat &store_format,
+      const uint64_t data_version,
+      const ObReplicaType &replica_type = REPLICA_TYPE_FULL);
   int64_t get_ls_epoch() const { return ls_epoch_; }
   void set_ls_epoch(const int64_t ls_epoch) { ls_epoch_ = ls_epoch; }
+  int get_ss_restart_recover_scn(share::SCN &ss_recover_scn) const;
+  int set_ss_restart_recover_scn(const share::SCN &ss_recover_scn);
+  uint64_t get_data_version() const;
 
   ObReplicaType get_replica_type() const
-  { return unused_replica_type_; }
+  { return replica_type_; }
+
   // IF I have locked with W:
   //    lock with R/W will be succeed do nothing.
   // ELSE:
@@ -183,9 +192,9 @@ public:
   TO_STRING_KV(K_(tenant_id), K_(ls_id), K_(ls_persistent_state),
                K_(clog_checkpoint_scn), K_(clog_base_lsn),
                K_(rebuild_seq), K_(migration_status), K(gc_state_), K(offline_scn_),
-               K_(restore_status), K_(replayable_point), K_(tablet_change_checkpoint_scn),
+               K_(restore_status), K_(replica_type), K_(replayable_point), K_(tablet_change_checkpoint_scn),
                K_(all_id_meta), K_(transfer_scn), K_(rebuild_info), K_(transfer_meta_info),
-               K_(store_format));
+               K_(store_format), K_(ls_epoch), K_(ss_restart_recover_scn));
 private:
   int check_can_update_();
 public:
@@ -198,7 +207,7 @@ private:
   void update_clog_checkpoint_in_ls_meta_package_(const share::SCN& clog_checkpoint_scn,
                                                   const palf::LSN& clog_base_lsn);
 protected:
-  ObReplicaType unused_replica_type_;
+  ObReplicaType replica_type_;
   ObLSPersistentState ls_persistent_state_;
   typedef common::ObFunction<int(const ObLSMeta &)> WriteSlog;
   // for test
@@ -235,6 +244,7 @@ protected:
   ObMajorMVMergeInfo major_mv_merge_info_;
   common::ObLSStoreFormat store_format_;    // set on initialization and then remain unchanged
   int64_t ls_epoch_;
+  share::SCN ss_restart_recover_scn_;
 };
 
 }  // namespace storage

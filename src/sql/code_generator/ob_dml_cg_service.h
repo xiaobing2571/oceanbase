@@ -89,7 +89,15 @@ public:
 
   int generate_scan_ctdef(ObLogInsert &op,
                           const IndexDMLInfo &index_dml_info,
-                          ObDASScanCtDef &scan_ctdef);
+                          ObDASScanCtDef &scan_ctdef,
+                          bool do_in_filter_opt = false);
+
+  int generate_index_scan_ctdef(ObLogDelUpd &op,
+                                const IndexDMLInfo &ins_index_dml_info,
+                                const IndexDMLInfo &upd_index_dml_info,
+                                ExprFixedArray &unique_key_conv_exprs,
+                                ExprFixedArray &unique_index_rowkey_exprs,
+                                ObDASScanCtDef *&scan_ctdef);
 
   int generate_err_log_ctdef(const ObErrLogDefine &err_log_define,
                              ObErrLogCtDef &err_log_ins_ctdef);
@@ -114,9 +122,10 @@ public:
   int get_table_rowkey_exprs(const IndexDMLInfo &index_dml_info,
                              ObIArray<ObRawExpr*> &rowkey_exprs);
 
-  int check_is_heap_table(ObLogicalOperator &op,
-                          uint64_t ref_table_id,
-                          bool &is_heap_table);
+  int check_is_heap_table_or_cluster_by_table(ObLogicalOperator &op,
+                                              uint64_t ref_table_id,
+                                              bool &is_heap_table,
+                                              bool &is_cluster_by_table);
   int get_column_ref_base_cid(const ObLogicalOperator &op, const ObColumnRefRawExpr *col, uint64_t &base_cid);
 
 private:
@@ -243,6 +252,21 @@ private:
                                 const ObIArray<uint64_t> &dml_column_ids,
                                 ObDASDMLBaseCtDef &das_ctdef,
                                 IntFixedArray &row_projector);
+  int set_embedded_vec_ref_flag(const ObIArray<ObRawExpr*> &cur_row,
+                                ObDASDMLBaseCtDef &das_ctdef);
+  template<typename OldExprType, typename NewExprType>
+  int generate_search_index_das_projector(const common::ObIArray<uint64_t> &dml_column_ids,
+                                          const common::ObIArray<OldExprType*> &old_row,
+                                          const common::ObIArray<NewExprType*> &new_row,
+                                          const common::ObIArray<ObRawExpr*> &full_row,
+                                          ObDASDMLBaseCtDef &das_ctdef);
+  template<typename ExprType>
+  int add_search_index_doc_id_projector(const ObIArray<ExprType*> &cur_row,
+                                        const ObIArray<ObRawExpr*> &full_row,
+                                        const ObIArray<uint64_t> &dml_column_ids,
+                                        uint32_t proj_idx,
+                                        ObDASDMLBaseCtDef &das_ctdef,
+                                        IntFixedArray &row_projector);
   int fill_multivalue_extra_info_on_table_param(
                             share::schema::ObSchemaGetterGuard *guard,
                             const ObTableSchema *index_schema,
@@ -303,6 +327,9 @@ private:
                               ObDMLBaseCtDef &dml_base_ctdef,
                               common::ObIArray<ObRawExpr*> &old_row,
                               common::ObIArray<ObRawExpr*> &new_row);
+  int is_disable_trigger(ObLogPlan *log_plan,
+                         ObString trigger_name,
+                         bool &is_disabled);
   int convert_normal_triggers(ObLogDelUpd &log_op,
                               const IndexDMLInfo &dml_info,
                               ObDMLBaseCtDef &dml_ctdef,
@@ -311,7 +338,23 @@ private:
   int convert_trigger_rowid(ObLogDelUpd &log_op,
                             const IndexDMLInfo &dml_info,
                             ObDMLBaseCtDef &dml_ctdef);
-  int add_trigger_arg(const ObTriggerInfo &trigger_info, ObDMLBaseCtDef &dml_ctdef);
+  int generate_trigger_arg(ObSQLSessionInfo &session_info,
+                           share::schema::ObSchemaGetterGuard &schema_guard,
+                           const ObTableSchema &table_schema,
+                           const ObTriggerInfo &trigger_info,
+                           ObTriggerArg &trigger_arg,
+                           int64_t col_cnt,
+                           bool is_prune_columns);
+  int generate_trigger_arg(ObTrigDMLCtDef &trig_ctdef,
+                           ObIArray<const ObTriggerInfo *> &trigger_infos,
+                           ObSQLSessionInfo &session_info,
+                           share::schema::ObSchemaGetterGuard &schema_guard,
+                           const ObTableSchema &table_schema,
+                           bool is_instead_of);
+  int merge_trigger_ref_types(ObTrigDMLCtDef &trig_ctdef,
+                              bool is_instead_of,
+                              int64_t col_cnt);
+
   int convert_triggers(ObLogDelUpd &log_op,
                        const IndexDMLInfo &dml_info,
                        ObDMLBaseCtDef &dml_ctdef,
@@ -319,8 +362,10 @@ private:
   int add_all_column_infos(ObLogDelUpd &op,
                            const common::ObIArray<ObColumnRefRawExpr*> &columns,
                            bool is_heap_table,
+                           bool is_cluster_by_table,
                            ColContentFixedArray &column_infos);
   int convert_upd_assign_infos(bool is_heap_table,
+                               bool is_cluster_by_table,
                                const IndexDMLInfo &index_dml_info,
                                ColContentFixedArray &assign_infos);
   int convert_check_constraint(ObLogDelUpd &log_op,
@@ -436,6 +481,12 @@ private:
                                      const uint64_t table_id,
                                      const IndexDMLInfo &index_dml_info,
                                      ObDASDMLBaseCtDef &das_dml_ctdef);
+  int fill_search_index_extra_info_on_table_param(share::schema::ObSchemaGetterGuard *guard,
+                                                  const share::schema::ObTableSchema *index_schema,
+                                                  uint64_t tenant_id,
+                                                  ObDASDMLBaseCtDef &das_dml_ctdef);
+  int generate_search_index_updated_column_ids(const ObDASDMLBaseCtDef &das_ctdef,
+                                               common::ObIArray<uint64_t> &updated_column_ids);
 private:
   int need_fire_update_event(const ObTableSchema &table_schema,
                             const ObString &update_events,
@@ -443,6 +494,10 @@ private:
                             const ObSQLSessionInfo &session,
                             ObIAllocator &allocator,
                             bool &need_fire);
+  int get_first_unique_index_tid(ObLogicalOperator &op,
+                                  const IndexDMLInfo &primary_index_dml_info,
+                                  uint64_t &unique_index_tid);
+
 #ifdef OB_BUILD_TDE_SECURITY
   int init_encrypt_metas_(const share::schema::ObTableSchema *table_schema,
                           share::schema::ObSchemaGetterGuard *guard,
@@ -452,6 +507,7 @@ private:
                                ObIArray<transaction::ObEncryptMetaCache>&meta_array);
 #endif
   int generate_table_loc_meta(const IndexDMLInfo &index_dml_info, ObDASTableLocMeta &loc_meta);
+
 private:
   ObStaticEngineCG &cg_;
 };

@@ -36,6 +36,17 @@ enum QueryRelation
 };
 
 struct ObStmtMapInfo {
+
+  /**
+   * Property of WHERE condition for temp table extraction.
+   * Indicates how a WHERE predicate can be handled when extracting common temp table.
+   */
+  enum CondProperty {
+    NONE = 0,            // cannot be pulled up to HAVING
+    PULLUP_GROUP = 1,    // can be directly pulled up through GROUP BY
+    SIMPLE_COND = 2,     // simple equality like "c1 = const", need to restore c1 to GROUP BY first
+    CONV_TO_MINMAX = 3   // can be converted to MIN/MAX in HAVING (e.g., c1 > 0 -> MAX(c1) > 0)
+  };
   common::ObSEArray<common::ObSEArray<int64_t, 4>, 4> view_select_item_map_;
   common::ObSEArray<ObExprConstraint, 4> expr_cons_map_;
   common::ObSEArray<ObPCConstParamInfo, 4> const_param_map_;
@@ -47,6 +58,7 @@ struct ObStmtMapInfo {
   common::ObSEArray<int64_t, 4> group_map_;
   common::ObSEArray<int64_t, 4> having_map_;
   common::ObSEArray<int64_t, 4> select_item_map_;
+  common::ObSEArray<CondProperty, 4> cond_property_map_;
   bool is_table_equal_;
   bool is_from_equal_;
   bool is_semi_info_equal_;
@@ -89,14 +101,22 @@ struct ObStmtMapInfo {
                K_(view_select_item_map),
                K_(is_order_equal),
                K_(is_distinct_equal),
-               K_(left_can_be_replaced));
+               K_(left_can_be_replaced),
+               K_(is_table_equal),
+               K_(is_from_equal),
+               K_(is_semi_info_equal),
+               K_(is_cond_equal),
+               K_(is_group_equal),
+               K_(is_having_equal),
+               K_(is_select_item_equal),
+               K_(is_qualify_filter_equal));
 };
 
 struct StmtCompareHelper {
-  StmtCompareHelper()
-  :stmt_map_infos_(),
-  similar_stmts_(),
-  hint_force_stmt_set_(),
+  StmtCompareHelper(ObIAllocator &allocator)
+  :stmt_map_infos_(allocator),
+  similar_stmts_(allocator),
+  hint_force_stmt_set_(allocator),
   stmt_(NULL)
   {}
 
@@ -110,8 +130,8 @@ struct StmtCompareHelper {
     K_(stmt)
   );
 
-  ObSEArray<ObStmtMapInfo, 8> stmt_map_infos_;
-  ObSEArray<ObSelectStmt*, 8> similar_stmts_;
+  ObSqlArray<ObStmtMapInfo> stmt_map_infos_;
+  ObSqlArray<ObSelectStmt*> similar_stmts_;
   QbNameList hint_force_stmt_set_;
   ObSelectStmt *stmt_;
 
@@ -129,6 +149,8 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
     outer_(NULL),
     map_info_(),
     equal_param_info_(),
+    first_equal_sets_(NULL),
+    second_equal_sets_(NULL),
     is_in_same_stmt_(true),
     ora_numeric_cmp_for_grouping_items_(false)
   {
@@ -141,6 +163,8 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
     outer_(NULL),
     map_info_(),
     equal_param_info_(),
+    first_equal_sets_(NULL),
+    second_equal_sets_(NULL),
     is_in_same_stmt_(true),
     ora_numeric_cmp_for_grouping_items_(false)
   {
@@ -156,6 +180,8 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
     outer_(NULL),
     map_info_(),
     equal_param_info_(),
+    first_equal_sets_(NULL),
+    second_equal_sets_(NULL),
     is_in_same_stmt_(is_in_same_stmt),
     ora_numeric_cmp_for_grouping_items_(false)
   {
@@ -173,6 +199,29 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
     outer_(outer),
     map_info_(map_info),
     equal_param_info_(),
+    first_equal_sets_(NULL),
+    second_equal_sets_(NULL),
+    is_in_same_stmt_(is_in_same_stmt),
+    ora_numeric_cmp_for_grouping_items_(false)
+  {
+    init_override_params();
+  }
+  ObStmtCompareContext(const ObDMLStmt *inner,
+                       const ObDMLStmt *outer,
+                       const ObStmtMapInfo &map_info,
+                       const ObIArray<ObHiddenColumnItem> *calculable_items,
+                       const EqualSets *first_equal_sets,
+                       const EqualSets *second_equal_sets,
+                       bool need_check_deterministic = false,
+                       bool is_in_same_stmt = true) :
+    ObExprEqualCheckContext(need_check_deterministic),
+    calculable_items_(calculable_items),
+    inner_(inner),
+    outer_(outer),
+    map_info_(map_info),
+    equal_param_info_(),
+    first_equal_sets_(first_equal_sets),
+    second_equal_sets_(second_equal_sets),
     is_in_same_stmt_(is_in_same_stmt),
     ora_numeric_cmp_for_grouping_items_(false)
   {
@@ -203,6 +252,7 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
   // 用于比较两个 expr 是否结构对称
   // 区别仅在于部分 column 的 table id 不同
   bool compare_column(const ObColumnRefRawExpr &inner, const ObColumnRefRawExpr &outer) override;
+  bool compare_column_inner(const ObColumnRefRawExpr &inner, const ObColumnRefRawExpr &outer);
 
   bool compare_const(const ObConstRawExpr &inner, const ObConstRawExpr &outer) override;
 
@@ -223,6 +273,8 @@ struct ObStmtCompareContext : ObExprEqualCheckContext
   common::ObSEArray<ObPCParamEqualInfo, 4> equal_param_info_;
   common::ObSEArray<ObExprConstraint, 4> expr_cons_info_;
   common::ObSEArray<ObPCConstParamInfo, 4> const_param_info_;
+  const EqualSets *first_equal_sets_;
+  const EqualSets *second_equal_sets_;
   bool is_in_same_stmt_; // only if the two stmts are in the same parent stmt, can we compare table id and column id directly
   bool ora_numeric_cmp_for_grouping_items_;
 
@@ -254,7 +306,16 @@ public:
                                     QueryRelation &relation,
                                     bool is_strict_select_list = false,
                                     bool need_check_select_items = true,
-                                    bool is_in_same_stmt = true);
+                                    bool is_in_same_stmt = true,
+                                    bool force_check_group_by = false);
+  static int can_compare_by_set_semantics(const ObSelectStmt *stmt,
+                                          bool ignore_filling_null,
+                                          bool &bret);
+  static int check_stmt_set_containment(const ObDMLStmt *first,
+                                       const ObDMLStmt *second,
+                                       ObStmtMapInfo &map_info,
+                                       QueryRelation &relation,
+                                       bool is_in_same_stmt = false);
 
   static int compute_conditions_map(const ObDMLStmt *first,
                                     const ObDMLStmt *second,
@@ -265,7 +326,9 @@ public:
                                     QueryRelation &relation,
                                     bool is_in_same_cond = true,
                                     bool is_same_by_order = false,
-                                    bool need_check_second_range = false);
+                                    bool need_check_second_range = false,
+                                    const EqualSets *first_equal_sets = NULL,
+                                    const EqualSets *second_equal_sets = NULL);
 
   static int compute_orderby_map(const ObDMLStmt *first,
                                  const ObDMLStmt *second,
@@ -292,6 +355,12 @@ public:
                                const ObRawExpr *right,
                                ObStmtCompareContext &context,
                                bool &is_same);
+
+  static int compute_cond_property_map(const ObSelectStmt *stmt,
+                                       ObStmtMapInfo &map_info);
+  static int check_where_pullup_to_having(const ObSelectStmt *stmt,
+                                          const ObRawExpr *where_pred,
+                                          bool &can_pullup);
 
   static int compute_semi_infos_map(const ObDMLStmt *first,
                                     const ObDMLStmt *second,
@@ -397,7 +466,33 @@ public:
                             const bool in_same_stmt,
                             uint64_t &inner_table_id,
                             uint64_t &inner_column_id);
-
+private:
+  // begin: functions for set-semantic comparison
+  static int check_select_items_equivalence(const ObSelectStmt *first,
+                                           const ObSelectStmt *second,
+                                           ObStmtMapInfo &map_info,
+                                           bool is_in_same_stmt,
+                                           const EqualSets *first_equal_sets,
+                                           const EqualSets *second_equal_sets);
+  static int check_join_conditions_containment(const ObSelectStmt *first_sel,
+                                               const ObSelectStmt *second_sel,
+                                               ObStmtMapInfo &map_info,
+                                               QueryRelation &relation,
+                                               bool is_in_same_stmt,
+                                               const EqualSets *first_equal_sets,
+                                               const EqualSets *second_equal_sets);
+  static int check_has_full_join(const ObSelectStmt *stmt, bool &has_full_join);
+  static int check_has_full_join_rec(const JoinedTable *joined_table, bool &has_full_join);
+  static int check_from_items_containment(const ObSelectStmt *first_sel,
+                                         const ObSelectStmt *second_sel,
+                                         bool is_in_same_stmt,
+                                         ObStmtMapInfo &map_info,
+                                         QueryRelation &relation);
+  static int extract_non_filtered_side_table_items(const ObSelectStmt *sel,
+                                          ObIArray<const TableItem*> &table_items);
+  static int extract_non_filtered_side_table_items_rec(const TableItem *table_item,
+                                                       ObIArray<const TableItem*> &table_items);
+  // end: functions for set-semantic comparison
 };
 
 }

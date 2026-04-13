@@ -66,18 +66,25 @@ struct ObMergeParameter {
   {
     return nullptr != mview_merge_param_;
   }
+  ObMergeType get_merge_type() const;
   bool is_delete_insert_merge() const;
+  int get_rowid_range_by_scn_range(const share::ObScnRange &scn_range, const blocksstable::ObDatumRange *&rowid_range) const;
+  bool is_ha_compeleted() const;
+  const ObVersionRange &get_merge_version_range() const;
+  bool is_empty_table(const ObITable &table) const;
 
   const ObStaticMergeParam &static_param_;
   /* rest variables are different for MergeTask */
-  ObVersionRange merge_version_range_; // modify for different merge_type
   blocksstable::ObDatumRange merge_range_; // rowkey_range
-  blocksstable::ObDatumRange merge_rowid_range_;
+  share::ObScnRange *sstable_scn_range_array_; // to distinguish which major/inc major each merge_rowid_range corresponds to
+  blocksstable::ObDatumRange *merge_rowid_range_array_; // each major/inc major a range
   ObITableReadInfo *cg_rowkey_read_info_;
   compaction::ObCachedTransStateMgr *trans_state_mgr_;
   share::ObDiagnoseLocation *error_location_;
   ObMviewMergeParameter *mview_merge_param_;
   ObIAllocator *allocator_;
+  // Built once per merge task for mini merge (schema not simplified, CS encoding); used by merge iters via iter_param.default_row_
+  blocksstable::ObDatumRow *default_row_;
 
   int64_t to_string(char* buf, const int64_t buf_len) const;
 private:
@@ -116,11 +123,12 @@ struct ObTabletMergeDagParam : public share::ObIDagInitParam
     const compaction::ObMergeType merge_type,
     const share::ObLSID &ls_id,
     const ObTabletID &tablet_id,
-    const int64_t schedule_transfer_seq);
+    const int32_t schedule_private_transfer_epoch);
   virtual bool is_valid() const override;
   VIRTUAL_TO_STRING_KV(K_(skip_get_tablet), "merge_type", merge_type_to_str(merge_type_), K_(merge_version),
      K_(ls_id), K_(tablet_id), "exec_mode", exec_mode_to_str(exec_mode_),
-     K_(need_swap_tablet_flag), K_(is_reserve_mode), K_(schedule_transfer_seq), K(reorganization_scn_));
+     K_(need_swap_tablet_flag), K_(is_reserve_mode), K_(schedule_private_transfer_epoch), K(reorganization_scn_),
+     K_(modified_start_scn));
 
   bool skip_get_tablet_;
   bool need_swap_tablet_flag_;
@@ -128,11 +136,12 @@ struct ObTabletMergeDagParam : public share::ObIDagInitParam
   ObExecMode exec_mode_;
   compaction::ObMergeType merge_type_;
   int64_t merge_version_;
-  int64_t schedule_transfer_seq_; // only affect minor and major now
+  int32_t schedule_private_transfer_epoch_; // only affect minor and major now
   share::SCN reorganization_scn_; // for shared storage merge
   share::ObLSID ls_id_;
   ObTabletID tablet_id_;
   ObCompactionParam compaction_param_; // used for adaptive compaction dag scheduling
+  share::SCN modified_start_scn_; // for upload minor
 };
 
 class ObTabletMergePrepareTask: public share::ObITask
@@ -183,7 +192,7 @@ public:
         && ls_id_.is_valid() && tablet_id_.is_valid();
   }
 
-  virtual int64_t inner_hash() const;
+  virtual uint64_t inner_hash() const;
   bool belong_to_same_tablet(const ObMergeDagHash *other) const;
 
   TO_STRING_KV("merge_type", merge_type_to_str(merge_type_), K_(ls_id), K_(tablet_id));
@@ -207,7 +216,7 @@ public:
   bool is_reserve_mode() const { return param_.is_reserve_mode_; }
   void set_reserve_mode() { param_.is_reserve_mode_ = true; }
   virtual bool operator == (const ObIDag &other) const override;
-  virtual int64_t hash() const override;
+  virtual uint64_t hash() const override;
   virtual int fill_info_param(compaction::ObIBasicInfoParam *&out_param, ObIAllocator &allocator) const override;
   virtual int fill_dag_key(char *buf, const int64_t buf_len) const override;
   virtual bool ignore_warning() override
@@ -264,13 +273,13 @@ class ObTabletMergeExecuteDag: public ObTabletMergeDag
 {
 public:
   ObTabletMergeExecuteDag();
+  ObTabletMergeExecuteDag(const share::ObDagType::ObDagTypeEnum type);
   virtual ~ObTabletMergeExecuteDag();
   virtual int init_by_param(const share::ObIDagInitParam *param) override; // for diagnose
   int prepare_init(
       const ObTabletMergeDagParam &param,
       const lib::Worker::CompatMode compat_mode,
-      const ObGetMergeTablesResult &result,
-      storage::ObLSHandle &ls_handle);
+      const ObGetMergeTablesResult &result);
   virtual bool operator == (const ObIDag &other) const override;
   const share::ObScnRange& get_merge_range() const { return result_.scn_range_; }
   const ObGetMergeTablesResult& get_result() const { return result_; }

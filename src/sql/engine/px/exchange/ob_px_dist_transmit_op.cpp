@@ -24,8 +24,9 @@ namespace sql
 
 OB_SERIALIZE_MEMBER((ObPxDistTransmitOpInput, ObPxTransmitOpInput));
 
-OB_SERIALIZE_MEMBER((ObPxDistTransmitSpec, ObPxTransmitSpec), dist_exprs_,
-    dist_hash_funcs_, sort_cmp_funs_, sort_collations_, calc_tablet_id_expr_, popular_values_hash_);
+OB_SERIALIZE_MEMBER((ObPxDistTransmitSpec, ObPxTransmitSpec), dist_exprs_, dist_hash_funcs_,
+                    sort_cmp_funs_, sort_collations_, calc_tablet_id_expr_, popular_values_hash_,
+                    dup_expr_list_, encoded_dup_expr_, aggr_code_expr_, max_aggr_code_);
 
 int ObPxDistTransmitOp::inner_open()
 {
@@ -252,7 +253,7 @@ int ObPxDistTransmitOp::do_transmit()
         }
         break;
       }
-       case ObPQDistributeMethod::RANGE: {
+      case ObPQDistributeMethod::RANGE: {
         if (OB_FAIL(do_range_dist())) {
           LOG_WARN("do broadcast distribution failed",  K(ret));
         }
@@ -314,6 +315,9 @@ int ObPxDistTransmitOp::do_hash_dist()
                     &MY_SPEC.dist_exprs_, &MY_SPEC.dist_hash_funcs_,
                     ctx_.get_physical_plan_ctx()->get_phy_plan()->get_min_cluster_version()
                      >= CLUSTER_VERSION_4_3_5_0);
+    if (MY_SPEC.encoded_dup_expr_ != nullptr) {
+      slice_id_calc.set_aggr_code_and_dup_list(MY_SPEC.aggr_code_expr_, &MY_SPEC.dup_expr_list_);
+    }
     if (OB_FAIL(send_rows<ObSliceIdxCalc::HASH>(slice_id_calc))) {
       LOG_WARN("row distribution failed", K(ret));
     }
@@ -466,17 +470,16 @@ int ObPxDistTransmitOp::do_sm_broadcast_dist()
 {
   int ret = OB_SUCCESS;
   ObPxDistTransmitOpInput *trans_input = NULL;
-  ObSchemaGetterGuard schema_guard;
   const ObTableSchema *table_schema = NULL;
   uint64_t repart_ref_table_id = MY_SPEC.repartition_ref_table_id_;
   uint64_t tenant_id = ctx_.get_my_session()->get_effective_tenant_id();
   if (OB_ISNULL(trans_input = static_cast<ObPxDistTransmitOpInput *>(get_input()))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("input is null", K(ret));
-  } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(
-      tenant_id, schema_guard))) {
-    LOG_WARN("faile to get schema guard", K(ret));
-  } else if (OB_FAIL(schema_guard.get_table_schema(
+  } else if (OB_ISNULL(ctx_.get_sql_ctx()) || OB_ISNULL(ctx_.get_sql_ctx()->schema_guard_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql ctx or schema guard is null", K(ret), KP(ctx_.get_sql_ctx()));
+  } else if (OB_FAIL(ctx_.get_sql_ctx()->schema_guard_->get_table_schema(
       tenant_id, repart_ref_table_id, table_schema))) {
     LOG_WARN("faile to get table schema", K(ret), K(repart_ref_table_id));
   } else if (OB_ISNULL(table_schema)) {
@@ -509,18 +512,17 @@ int ObPxDistTransmitOp::do_sm_pkey_hash_dist()
   int ret = OB_SUCCESS;
   // TODO bin.lb: to be implement
   ObPxDistTransmitOpInput *trans_input = NULL;
-  ObSchemaGetterGuard schema_guard;
   const ObTableSchema *table_schema = NULL;
   uint64_t repart_ref_table_id = MY_SPEC.repartition_ref_table_id_;
   if (OB_ISNULL(trans_input = static_cast<ObPxDistTransmitOpInput *>(get_input()))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("input is null", K(ret));
-  } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(
-      ctx_.get_my_session()->get_effective_tenant_id(), schema_guard))) {
-    LOG_WARN("faile to get schema guard", K(ret));
-  } else if (OB_FAIL(schema_guard.get_table_schema(
-    ctx_.get_my_session()->get_effective_tenant_id(),
-    repart_ref_table_id, table_schema))) {
+  } else if (OB_ISNULL(ctx_.get_sql_ctx()) || OB_ISNULL(ctx_.get_sql_ctx()->schema_guard_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql ctx or schema guard is null", K(ret), KP(ctx_.get_sql_ctx()));
+  } else if (OB_FAIL(ctx_.get_sql_ctx()->schema_guard_->get_table_schema(
+      ctx_.get_my_session()->get_effective_tenant_id(),
+      repart_ref_table_id, table_schema))) {
     LOG_WARN("faile to get table schema", K(ret), K(repart_ref_table_id));
   } else if (OB_ISNULL(table_schema)) {
     ret = OB_SCHEMA_ERROR;
@@ -751,8 +753,6 @@ int ObPxDistTransmitOp::add_row_for_piece_msg(ObChunkDatumStore &sample_store)
       OZ(last_row_.shadow_copy(MY_SPEC.sampling_saving_row_, eval_ctx_));
     }
 
-    OZ(setup_sampled_rows_output());
-
     if (OB_SUCC(ret)) {
       const int64_t input_rows = sampled_input_rows_.get_row_cnt();
       int64_t sample_rows = input_rows / DYNAMIC_SAMPLE_INTERVAL;
@@ -768,6 +768,7 @@ int ObPxDistTransmitOp::add_row_for_piece_msg(ObChunkDatumStore &sample_store)
         OZ(sample_store.add_row(MY_SPEC.dist_exprs_, &eval_ctx_));
       }
     }
+    OZ(setup_sampled_rows_output());
   }
   return ret;
 }
@@ -844,7 +845,6 @@ int ObPxDistTransmitOp::add_batch_row_for_piece_msg(ObChunkDatumStore &sample_st
     } else {
       brs_.end_ = false;
     }
-    OZ(setup_sampled_rows_output());
 
     if (OB_SUCC(ret)) {
       const int64_t input_rows = sampled_input_rows_.get_row_cnt();
@@ -865,6 +865,7 @@ int ObPxDistTransmitOp::add_batch_row_for_piece_msg(ObChunkDatumStore &sample_st
       }
       clear_evaluated_flag();
     }
+    OZ(setup_sampled_rows_output());
   }
   return ret;
 }
@@ -946,7 +947,6 @@ int ObPxDistTransmitOp::add_batch_row_for_piece_msg_vec(ObChunkDatumStore &sampl
     } else {
       brs_.end_ = false;
     }
-    OZ(setup_sampled_rows_output());
 
     if (OB_SUCC(ret)) {
       const int64_t input_rows = sampled_input_rows_.get_row_cnt();
@@ -967,6 +967,7 @@ int ObPxDistTransmitOp::add_batch_row_for_piece_msg_vec(ObChunkDatumStore &sampl
       }
       clear_evaluated_flag();
     }
+    OZ(setup_sampled_rows_output());
   }
   return ret;
 }
@@ -1011,6 +1012,109 @@ int ObPxDistTransmitOp::setup_sampled_rows_output()
       sampled_input_rows_.set_iteration_age(&sampled_input_rows_it_age_);
     }
     cur_transmit_sampled_rows_ = &sampled_rows2transmit_.at(0);
+  }
+  return ret;
+}
+
+int ObPxDistTransmitOp::do_project_trans_exprs(const ObIArray<ObExpr *> &trans_exprs,
+                                               const ObBatchRows &brs, ObEvalCtx &eval_ctx)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(trans_exprs);
+  if (OB_ISNULL(MY_SPEC.aggr_code_expr_)
+      || OB_ISNULL(MY_SPEC.encoded_dup_expr_)
+      || brs.size_ <= 0
+      || brs.skip_->accumulate_bit_cnt(brs.size_) == brs.size_) {
+    // do nothing
+  } else {
+    if (OB_FAIL(MY_SPEC.aggr_code_expr_->eval_vector(eval_ctx, brs))) {
+      LOG_WARN("failed to eval aggr code expr", K(ret));
+    }
+    int64_t aggr_code = -1;
+    for (int i = 0; OB_SUCC(ret) && i < brs.size_; i++) {
+      if (brs.skip_->at(i)) {
+      } else {
+        aggr_code = MY_SPEC.aggr_code_expr_->get_vector(eval_ctx)->get_int(i);
+      }
+    }
+    for (int i = brs.size_ - 1; OB_SUCC(ret) && i >= 0; i--) {
+      if (brs.skip_->at(i)) {
+      } else if (aggr_code != MY_SPEC.aggr_code_expr_->get_vector(eval_ctx)->get_int(i)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid aggr code", K(ret), K(aggr_code),
+                 K(MY_SPEC.aggr_code_expr_->get_vector(eval_ctx)->get_int(i)));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ObExpr *dup_expr = MY_SPEC.dup_expr_list_.at(aggr_code);
+      ObExpr *encoded_dup_expr = MY_SPEC.encoded_dup_expr_;
+      if (OB_ISNULL(dup_expr) && aggr_code == 0) {
+        if (OB_FAIL(encoded_dup_expr->init_vector_default(eval_ctx_, brs.size_))) {
+          LOG_WARN("init vector default failed", K(ret));
+        } else {
+          encoded_dup_expr->get_nulls(eval_ctx).set_all(brs.size_);
+          encoded_dup_expr->get_vector(eval_ctx)->set_has_null();
+        }
+      } else if (OB_ISNULL(dup_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid null dup expr", K(ret), K(aggr_code));
+      } else if (OB_FAIL(dup_expr->eval_vector(eval_ctx, brs))) {
+        LOG_WARN("failed to eval dup expr", K(ret));
+      } else if (dup_expr->get_format(eval_ctx_) == VEC_UNIFORM) {
+        if (OB_FAIL(encoded_dup_expr->init_vector(eval_ctx_, VEC_UNIFORM, brs.size_))) {
+          LOG_WARN("init vector default failed", K(ret));
+        } else {
+          ObDatum *src = static_cast<ObUniformBase *>(dup_expr->get_vector(eval_ctx))->get_datums();
+          ObDatum *dst = static_cast<ObUniformBase *>(encoded_dup_expr->get_vector(eval_ctx))->get_datums();
+          if (src != dst) { MEMCPY(dst, src, brs_.size_ * sizeof(ObDatum)); }
+        }
+      } else if (dup_expr->get_format(eval_ctx_) == VEC_UNIFORM
+                 || dup_expr->get_format(eval_ctx_) == VEC_DISCRETE
+                 || dup_expr->get_format(eval_ctx_) == VEC_CONTINUOUS
+                 || (dup_expr->get_format(eval_ctx_) == VEC_FIXED
+                     && is_fixed_length_vec(encoded_dup_expr->get_vec_value_tc()))) {
+        if (OB_FAIL(encoded_dup_expr->init_vector(eval_ctx_, dup_expr->get_format(eval_ctx_), brs.size_))) {
+          LOG_WARN("init vector failed", K(ret));
+        } else {
+          VectorHeader &to_vec_header = encoded_dup_expr->get_vector_header(eval_ctx);
+          VectorHeader &from_vec_header = dup_expr->get_vector_header(eval_ctx);
+          if (OB_FAIL(to_vec_header.assign(from_vec_header))) {
+            LOG_WARN("assign vector header failed", K(ret));
+          } else {
+            ObEvalInfo &from_info = dup_expr->get_eval_info(eval_ctx);
+            ObEvalInfo &to_info = encoded_dup_expr->get_eval_info(eval_ctx);
+            to_info = from_info;
+            to_info.cnt_ = brs.size_;
+          }
+        }
+      } else if (dup_expr->get_format(eval_ctx_) == VEC_FIXED
+                 && is_discrete_vec(encoded_dup_expr->get_vec_value_tc())) {
+        // encoded dup expr is discrete type
+        if (OB_FAIL(encoded_dup_expr->init_vector_default(eval_ctx_, brs.size_))) {
+          LOG_WARN("init vector default failed", K(ret));
+        } else {
+          ObFixedLengthBase *from_vec = static_cast<ObFixedLengthBase *>(dup_expr->get_vector(eval_ctx));
+          ObBitmapNullVectorBase *from_nulls = static_cast<ObBitmapNullVectorBase *>(dup_expr->get_vector(eval_ctx));
+          ObDiscreteFormat *to_vec = static_cast<ObDiscreteFormat *>(encoded_dup_expr->get_vector(eval_ctx));
+          for (int i = 0; OB_SUCC(ret) && i < brs.size_; i++) {
+            if (brs.skip_->at(i)) {
+            } else if (from_nulls->is_null(i)) {
+              to_vec->set_null(i);
+            } else {
+              const char *payload = from_vec->get_data() + from_vec->get_length() * i;
+              to_vec->set_payload_shallow(i, payload, from_vec->get_length());
+            }
+          }
+        }
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected vector format", K(ret), K(dup_expr->get_format(eval_ctx)), K(*dup_expr));
+      }
+      if (OB_FAIL(ret)) {
+      } else {
+        encoded_dup_expr->set_evaluated_projected(eval_ctx);
+      }
+    }
   }
   return ret;
 }

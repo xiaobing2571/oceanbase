@@ -99,7 +99,7 @@ private:
                          ObRawExpr *&replace_expr,
                          ObIArray<ObAggFunRawExpr*> &new_aggr_items);
 
-  static bool is_valid_aggr_type(const ObItemType aggr_type);
+  bool is_valid_aggr_type(const ObItemType aggr_type) const;
 
   static bool is_covar_expr_type(const ObItemType aggr_type) {
     return aggr_type == T_FUN_COVAR_POP || aggr_type == T_FUN_COVAR_SAMP;
@@ -148,7 +148,9 @@ private:
     return aggr_type == T_FUN_AVG || aggr_type == T_FUN_STDDEV ||
            aggr_type == T_FUN_VARIANCE || aggr_type == T_FUN_STDDEV_POP ||
            aggr_type == T_FUN_STDDEV_SAMP ||
-           aggr_type == T_FUN_APPROX_COUNT_DISTINCT;
+           aggr_type == T_FUN_APPROX_COUNT_DISTINCT ||
+           aggr_type == T_FUN_SYS_RB_AND_CARDINALITY_AGG ||
+           aggr_type == T_FUN_SYS_RB_OR_CARDINALITY_AGG;
   }
 
   int expand_avg_expr(ObAggFunRawExpr *aggr_expr,
@@ -179,6 +181,9 @@ private:
                                         ObRawExpr *&replace_expr,
                                         ObIArray<ObAggFunRawExpr *> &new_aggr_items);
 
+  int expand_rb_cardinality_expr(ObAggFunRawExpr *aggr_expr,
+                                 ObRawExpr *&replace_expr,
+                                 ObIArray<ObAggFunRawExpr*> &new_aggr_items);
   int add_cast_expr(ObRawExpr *expr,
                     const ObRawExprResType &dst_type,
                     ObRawExpr *&new_expr);

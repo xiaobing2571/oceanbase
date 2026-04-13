@@ -15,8 +15,9 @@
 #include "share/ob_define.h"
 #include "share/ob_ls_id.h"
 #include "share/location_cache/ob_location_struct.h"
+#include "share/ob_i_tablet_scan.h"
 #include "common/ob_tablet_id.h"
-#include "sql/ob_phy_table_location.h"
+#include "sql/optimizer/ob_phy_table_location_info.h"
 #include "rpc/obrpc/ob_rpc_result_code.h"
 
 #define DAS_SCAN_OP(_task_op) \
@@ -92,6 +93,21 @@ enum ObDASOpType
   DAS_OP_FUNC_LOOKUP,
   DAS_OP_INDEX_PROJ_LOOKUP,
   DAS_OP_DOMAIN_ID_MERGE,
+  DAS_OP_IR_ES_MATCH,
+  DAS_OP_IR_ES_SCORE,
+  DAS_OP_SCALAR_QUERY,
+  DAS_OP_SCALAR_SCAN_QUERY,
+  DAS_OP_FUSION_QUERY,
+  DAS_OP_BOOLEAN_QUERY,
+  DAS_OP_MATCH_QUERY,
+  DAS_OP_MATCH_PHRASE_QUERY,
+  DAS_OP_MULTI_MATCH_QUERY,
+  DAS_OP_QUERY_STRING_QUERY,
+  DAS_OP_VEC_INDEX_DRIVER,
+  DAS_OP_VEC_INDEX_SCAN,
+  DAS_OP_VEC_INDEX_HNSW_SCAN,
+  DAS_OP_VEC_INDEX_IVF_SCAN,
+  DAS_OP_TOPK_COLLECT,
   //append OpType before me
   DAS_OP_MAX
 };
@@ -147,7 +163,8 @@ public:
       uint64_t is_external_table_               : 1; //mark if this table is an external table
       uint64_t is_external_files_on_disk_       : 1; //mark if files in external table are located at local disk
       uint64_t das_empty_part_                  : 1; //mark there is false startup filter on DAS access table
-      uint64_t reserved_                        : 56;
+      uint64_t is_lake_table_                   : 1; //mark if this table is an lake table
+      uint64_t reserved_                        : 55;
     };
   };
   int64_t route_policy_;
@@ -225,6 +242,7 @@ static const int64_t DAS_TABLET_LOC_MAP_BUCKET_SIZE = 5000;
 
 typedef common::ObList<ObDASTabletLoc*, common::ObIAllocator> DASTabletLocList;
 typedef common::ObList<ObDASTabletLoc*, common::ObIAllocator>::iterator DASTabletLocListIter;
+typedef common::ObList<ObDASTabletLoc*, common::ObIAllocator>::const_iterator ConstDASTabletLocListIter;
 typedef common::ObIArray<ObDASTabletLoc*> DASTabletLocIArray;
 typedef common::ObSEArray<ObDASTabletLoc*, 1> DASTabletLocSEArray;
 typedef common::ObArray<ObDASTabletLoc*> DASTabletLocArray;
@@ -364,6 +382,7 @@ public:
   virtual bool has_expr() const { return false; }
   virtual bool has_pdfilter_or_calc_expr() const { return false; }
   virtual bool has_pl_udf() const { return false; }
+  virtual bool is_search_ctdef() const { return false; }
 
 protected:
   ObDASBaseCtDef(ObDASOpType op_type)
@@ -449,7 +468,57 @@ enum ObTSCIRScanType : uint16_t
   OB_VEC_IVF_ROWKEY_CID_SCAN, // for pq is pq ROWKEY_CID_TABLE
   OB_VEC_IVF_SPECIAL_AUX_SCAN,// for pq is pq id, for sq is sq meta
   OB_VEC_SPIV_INDEX_SCAN,
+  OB_VEC_EMBEDDED_SCAN,
+  OB_IR_BLOCK_MAX_SCAN,
+  OB_VEC_SPIV_BLOCK_MAX_SCAN,
   // OB_VEC_SPIV_INDEX_AGG,
+  OB_IR_MULTIVALUE_IDX_SCAN
+};
+
+struct ObDASPushDownTopN
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObDASPushDownTopN()
+  : order_type_(NULLS_FIRST_ASC),
+    sort_key_(nullptr),
+    limit_expr_(nullptr),
+    offset_expr_(nullptr),
+    with_ties_(false),
+    is_push_into_index_(false)
+    {}
+  ~ObDASPushDownTopN() {}
+
+  TO_STRING_KV(K_(order_type), K_(sort_key), K_(limit_expr), K_(offset_expr), K_(with_ties), K_(is_push_into_index));
+
+  OB_INLINE bool is_valid() const
+  {
+    return nullptr != limit_expr_;
+  }
+
+  OB_INLINE ObDASPushDownTopN& operator=(const ObDASPushDownTopN &other)
+  {
+    if (OB_LIKELY(this != &other)) {
+      order_type_ = other.order_type_;
+      sort_key_ = other.sort_key_;
+      limit_expr_ = other.limit_expr_;
+      offset_expr_ = other.offset_expr_;
+      with_ties_ = other.with_ties_;
+      is_push_into_index_ = other.is_push_into_index_;
+    }
+    return *this;
+  }
+
+  static int prepare_limit_param(ObEvalCtx &eval_ctx,
+                                 const ObDASPushDownTopN &push_down_topn,
+                                 ObLimitParam &limit_param);
+
+  ObOrderDirection order_type_;
+  ObExpr *sort_key_;
+  ObExpr *limit_expr_;
+  ObExpr *offset_expr_;
+  bool with_ties_;
+  bool is_push_into_index_;
 };
 
 }  // namespace sql

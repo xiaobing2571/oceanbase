@@ -276,7 +276,7 @@ public:
   virtual void reuse();
   // reset to state before init
   virtual void reset();
-  void destroy() { reset(); }
+  void destroy() { unregister_profile(); reset(); }
 
   // Add row and return the stored row.
   int add_row(const common::ObIArray<ObExpr*> &expr,
@@ -714,8 +714,43 @@ protected:
   // 基于此，看后面是否统一考虑采用这种方案，也就是分两部分：data size和total mem used size来判断是否dump
   bool need_dump()
   {
-    return sql_mem_processor_.get_data_size() > sql_mem_processor_.get_mem_bound()
-        || mem_context_->used() >= profile_.get_max_bound();
+    return sql_mem_processor_.get_data_size() + get_ht_bucket_size() > sql_mem_processor_.get_mem_bound()
+        || get_total_used_size() >= profile_.get_global_bound_size();
+  }
+
+  int64_t get_ht_bucket_size()
+  {
+    int64_t ret = 0;
+    if (part_cnt_ != 0) {
+      if (use_partition_topn_sort_) {
+        ret = get_partition_topn_ht_bucket_size();
+      } else {
+        ret = get_partition_sort_ht_bucket_size();
+      }
+    }
+    return ret;
+  }
+
+  int64_t get_partition_sort_ht_bucket_size() // calculate partition sort hash table needed size
+  {
+    int64_t row_cnt = datum_store_.get_row_cnt();
+    return ((part_cnt_ == 0) ? 0 :
+          (row_cnt * FIXED_PART_NODE_SIZE * 2) +                          // size of(part_hash_nodes_)
+          (next_pow2(std::max(16L, row_cnt)) * FIXED_PART_BKT_SIZE * 2)); // size of(buckets_)
+  }
+
+  int64_t get_partition_topn_ht_bucket_size() // calculate partition topn sort hash table needed size
+  {
+    int64_t ret = 0;
+    ret += max_bucket_cnt_ * sizeof(PartHeapNode*);
+    ret += part_group_cnt_ * sizeof(PartHeapNode);
+    ret += pt_row_cnt_ * sizeof(ObChunkDatumStore::StoredRow*);
+    return ret;
+  }
+
+  int64_t get_total_used_size()
+  {
+    return mem_context_->used() + get_partition_sort_ht_bucket_size();
   }
   int preprocess_dump(bool &dumped);
   // before add row process: update date used memory, try dump ...
@@ -797,7 +832,7 @@ protected:
                           const int64_t batch_size,
                           const uint16_t selector[],
                           const int64_t size);
-  bool use_compact_store() { return use_compact_format_ || compress_type_ != NONE_COMPRESSOR; }
+  bool use_compact_store() { return use_compact_format_; }
   template<typename ArrayType>
   int prepare_bucket_array(ArrayType *&buckets, uint64_t bucket_num);
   DISALLOW_COPY_AND_ASSIGN(ObSortOpImpl);
@@ -812,6 +847,8 @@ protected:
   typedef common::ObBinaryHeap<ObChunkDatumStore::StoredRow **, Compare, 16> IMMSHeap;
   typedef common::ObBinaryHeap<ObSortOpChunk *, Compare, MAX_MERGE_WAYS> EMSHeap;
   //typedef common::ObBinaryHeap<ObChunkDatumStore::StoredRow *, Compare> TopnHeap;
+  const static int64_t FIXED_PART_NODE_SIZE = sizeof(PartHashNode);
+  const static int64_t FIXED_PART_BKT_SIZE = sizeof(PartHashNode *);
   static const int64_t MAX_ROW_CNT = 268435456; // (2G / 8)
   static const int64_t STORE_ROW_HEADER_SIZE = sizeof(SortStoredRow);
   static const int64_t STORE_ROW_EXTRA_SIZE = sizeof(uint64_t);
@@ -876,6 +913,7 @@ protected:
   ObSEArray<TopnHeapNode*, 16> heap_nodes_;
   int64_t cur_heap_idx_;
   int64_t part_group_cnt_;
+  int64_t pt_row_cnt_;
   common::ObIArray<ObChunkDatumStore::StoredRow *> *rows_;
   ObTempBlockStore::BlockHolder compact_blk_holder_;
   ObChunkDatumStore::IteratedBlockHolder default_blk_holder_;

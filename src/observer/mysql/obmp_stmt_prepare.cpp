@@ -340,7 +340,7 @@ int ObMPStmtPrepare::process_prepare_stmt(const ObMultiStmtItem &multi_stmt_item
   //对于tracelog的处理，不影响正常逻辑，错误码无须赋值给ret
   int tmp_ret = OB_SUCCESS;
   //清空WARNING BUFFER
-  tmp_ret = do_after_process(session, ctx_, async_resp_used);
+  tmp_ret = do_after_process(session, async_resp_used);
   tmp_ret = record_flt_trace(session);
   // need_response_error这个变量保证仅在
   // do { do_process } while(retry) 之前出错才会
@@ -397,6 +397,10 @@ int ObMPStmtPrepare::do_process(ObSQLSessionInfo &session,
                                 && session.get_local_ob_enable_sql_audit();
   const bool enable_sqlstat = session.is_sqlstat_enabled();
   single_process_timestamp_ = ObTimeUtility::current_time();
+  //if single_process_timestamp_ is set and session is killed when set session active,
+  //exec_start_timestamp_ will not be set, so get plan time and execute time in sql audit will be wrong.
+  //so set exec_start_timestamp_ to single_process_timestamp_ here.
+  exec_start_timestamp_ = single_process_timestamp_;
   bool is_diagnostics_stmt = false;
   bool need_response_error = true;
   const ObString &sql = ctx_.multi_stmt_item_.get_sql();
@@ -420,6 +424,7 @@ int ObMPStmtPrepare::do_process(ObSQLSessionInfo &session,
         sqlstat_record.set_is_in_retry(session.get_is_in_retry());
         session.sql_sess_record_sql_stat_start_value(sqlstat_record);
       }
+      session.set_retry_wait_event_begin_time();
       result.set_has_more_result(has_more_result);
       ObTaskExecutorCtx *task_ctx = result.get_exec_context().get_task_executor_ctx();
       int64_t execution_id = 0;
@@ -507,6 +512,14 @@ int ObMPStmtPrepare::do_process(ObSQLSessionInfo &session,
       sqlstat_record.set_partition_cnt(result.get_exec_context().get_das_ctx().get_related_tablet_cnt());
       sqlstat_record.set_is_route_miss(result.get_session().partition_hit().get_bool()? 0 : 1);
       sqlstat_record.set_is_plan_cache_hit(ctx_.plan_cache_hit_);
+      sqlstat_record.set_is_muti_query(session.get_capability().cap_flags_.OB_CLIENT_MULTI_STATEMENTS);
+      if (OB_NOT_NULL(session.get_cur_exec_ctx()) && OB_NOT_NULL(session.get_cur_exec_ctx()->get_sql_ctx())) {
+        sqlstat_record.set_is_muti_query_batch(session.get_cur_exec_ctx()->get_sql_ctx()->multi_stmt_item_.is_batched_multi_stmt());
+      }
+      if (OB_NOT_NULL(result.get_physical_plan())) {
+        sqlstat_record.set_is_full_table_scan(result.get_physical_plan()->contain_table_scan());
+      }
+      sqlstat_record.set_is_failed(0 != ret && OB_ITER_END != ret);
       sqlstat_record.move_to_sqlstat_cache(result.get_session(),
                                                  ctx_.cur_sql_,
                                                  result.get_physical_plan());
@@ -589,6 +602,12 @@ int ObMPStmtPrepare::response_result(
     LOG_WARN("send param packet failed", K(ret));
   } else if (OB_FAIL(send_column_packet(session, result))) {
     LOG_WARN("send column packet failed", K(ret));
+  }
+  if (OB_FAIL(ret)) {
+    int sret = OB_SUCCESS;
+    if (OB_SUCCESS != (sret = send_error_packet(ret, NULL))) {
+      LOG_WARN("send error packet fail", K(sret), K(ret));
+    }
   }
   return ret;
 }

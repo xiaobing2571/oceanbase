@@ -34,6 +34,11 @@ enum ObSqlWorkAreaType
 
 class ObSqlProfileExecInfo {
 public:
+  ObSqlProfileExecInfo(const int64_t dop, const int64_t plan_id, const int64_t exec_id,
+      const int64_t session_id, const uint64_t db_id, const bool disable_auto_mem_mgr)
+   : dop_(dop), plan_id_(plan_id), exec_id_(exec_id), session_id_(session_id),
+     db_id_(db_id), my_session_(nullptr), disable_auto_mem_mgr_(disable_auto_mem_mgr)
+  {}
   ObSqlProfileExecInfo() : dop_(-1), plan_id_(-1), exec_id_(-1),
                            session_id_(-1), db_id_(-1), my_session_(nullptr),
                            disable_auto_mem_mgr_(false) {
@@ -43,7 +48,8 @@ public:
       : dop_(other.dop_), plan_id_(other.plan_id_), exec_id_(other.exec_id_),
         session_id_(other.session_id_), db_id_(other.db_id_),
         my_session_(other.my_session_),
-        disable_auto_mem_mgr_(other.disable_auto_mem_mgr_) {
+        disable_auto_mem_mgr_(other.disable_auto_mem_mgr_),
+        trace_id_(other.trace_id_) {
     if (*(other.get_sql_id()) == '\0') {
       sql_id_[0] = '\0';
     } else {
@@ -63,6 +69,7 @@ public:
   ObSQLSessionInfo *get_my_session() { return my_session_; }
   void reset_my_session() { my_session_ = nullptr; }
   bool get_disable_auto_mem_mgr() { return disable_auto_mem_mgr_; }
+  const common::ObCurTraceId::TraceId& get_trace_id() const { return trace_id_; }
 
   TO_STRING_KV(K_(dop), K_(plan_id), K_(exec_id), K_(session_id), K_(db_id), K_(sql_id), K_(disable_auto_mem_mgr));
 
@@ -75,6 +82,7 @@ private:
   char sql_id_[common::OB_MAX_SQL_ID_LENGTH + 1];
   ObSQLSessionInfo *my_session_;
   bool disable_auto_mem_mgr_;
+  common::ObCurTraceId::TraceId trace_id_;
 };
 
 class ObSqlWorkAreaProfile : public common::ObDLinkBase<ObSqlWorkAreaProfile>
@@ -85,7 +93,7 @@ public:
     random_id_(0), type_(type), op_type_(PHY_INVALID), op_id_(UINT64_MAX), exec_info_(),
     min_size_(0), row_count_(0), input_size_(0), bucket_size_(0),
     chunk_size_(0), cache_size_(-1), one_pass_size_(0), expect_size_(OB_INVALID_ID),
-    global_bound_size_(INT64_MAX), max_bound_(INT64_MAX), delta_size_(0), data_size_(0),
+    global_bound_size_(INT64_MAX), delta_size_(0), data_size_(0),
     max_mem_used_(0), mem_used_(0),
     pre_mem_used_(0), dumped_size_(0), max_dumped_size_(0), data_ratio_(0.5),
     active_time_(0), number_pass_(0),
@@ -149,8 +157,6 @@ public:
   OB_INLINE int64_t get_global_bound_size() const { return global_bound_size_; }
   OB_INLINE void set_global_bound_size(int64_t global_bound_size)
             { global_bound_size_ = global_bound_size; }
-  OB_INLINE int64_t get_max_bound() const { return max_bound_; }
-  OB_INLINE void set_max_bound(int64_t max_bound) { max_bound_ = max_bound; }
 
   OB_INLINE bool is_hash_join_wa() const { return ObSqlWorkAreaType::HASH_WORK_AREA == type_; }
   OB_INLINE bool is_sort_wa() const { return ObSqlWorkAreaType::SORT_WORK_AREA == type_; }
@@ -191,6 +197,7 @@ public:
   const char* get_sql_id();
   uint64_t get_session_id();
   uint64_t get_db_id();
+  const common::ObCurTraceId::TraceId& get_trace_id() const { return exec_info_.get_trace_id(); }
 
   OB_INLINE bool need_profiled()
   {
@@ -222,11 +229,6 @@ private:
   int64_t one_pass_size_;
   int64_t expect_size_;
   int64_t global_bound_size_;
-  // 取 min(cache_size, global_bound_size)
-  // sort场景，在global_bound_size比较大情况下，sort理论上有data和extra内存，data应该是one-pass size
-  // 也就是expect_size
-  // 但总体内存应该是global_bound_size和cache size更小值，其实也可以用expect_size和global_bound_size取最大值
-  int64_t max_bound_;
 public:
   int64_t delta_size_;
   int64_t data_size_;
@@ -393,6 +395,7 @@ public:
     sql_exec_id_ = other.sql_exec_id_;
     session_id_ = other.session_id_;
     database_id_ = other.database_id_;
+    trace_id_ = other.trace_id_;
   }
 
   ObSqlWorkareaProfileInfo &operator=(const ObSqlWorkareaProfileInfo &other)
@@ -417,6 +420,7 @@ public:
   uint64_t sql_exec_id_;
   uint64_t session_id_;
   uint64_t database_id_;
+  common::ObCurTraceId::TraceId trace_id_;
 };
 
 class ObSqlWorkAreaIntervalStat
@@ -468,6 +472,7 @@ public:
   void reset() { total_alloc_size_ = 0; total_dump_size_ = 0; }
   int64_t get_total_alloc_size() const { return total_alloc_size_; }
   int64_t get_total_dump_size() const { return total_dump_size_; }
+  void reset_total_alloc_size_if_negative();
 private:
   int64_t total_alloc_size_;
   int64_t total_dump_size_;
@@ -835,6 +840,15 @@ OB_INLINE void ObTenantSqlMemoryCallback::free(int64_t size)
 OB_INLINE void ObTenantSqlMemoryCallback::dumped(int64_t size)
 {
   (ATOMIC_AAF(&total_dump_size_, size));
+}
+
+OB_INLINE void ObTenantSqlMemoryCallback::reset_total_alloc_size_if_negative()
+{
+  // try to reset total_alloc_size_ if it is negative, only once
+  int64_t old_val = ATOMIC_LOAD(&total_alloc_size_);
+  if (old_val < 0) {
+    ATOMIC_CAS(&total_alloc_size_, old_val, 0);
+  }
 }
 
 } // sql

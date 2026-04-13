@@ -27,6 +27,15 @@ using namespace share;
 using namespace sql;
 using namespace storage;
 
+int ObTableLoadTaskThreadPoolScheduler::MyThreadPool::init()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(pool_cond_.init(1/*default_event_id*/))) {
+    LOG_WARN("init pool condition failed", K(ret));
+  }
+  return ret;
+}
+
 void ObTableLoadTaskThreadPoolScheduler::MyThreadPool::run1()
 {
   OB_ASSERT(OB_NOT_NULL(scheduler_));
@@ -35,11 +44,17 @@ void ObTableLoadTaskThreadPoolScheduler::MyThreadPool::run1()
   // 启动成功的线程数+1
   if (thread_count == ATOMIC_AAF(&running_thread_count_, 1)) {
     scheduler_->before_running();
+    ObThreadCondGuard guard(pool_cond_);
+    (void) pool_cond_.broadcast();
+  } else {
+    const int64_t DEFAULT_TIMEOUT_MS = 5000L; // 5s
+    ObThreadCondGuard guard(pool_cond_);
+    (void) pool_cond_.wait(DEFAULT_TIMEOUT_MS);
   }
   while (!has_set_stop()) {
     // 等待所有线程起来
     if (!scheduler_->is_running()) {
-      PAUSE();
+      usleep(100);
     } else {
       scheduler_->run(get_thread_idx());
       break;
@@ -64,7 +79,9 @@ ObTableLoadTaskThreadPoolScheduler::ObTableLoadTaskThreadPoolScheduler(int64_t t
     thread_pool_(this),
     worker_ctx_array_(nullptr),
     state_(STATE_ZERO),
-    is_inited_(false)
+    is_inited_(false),
+    state_mutex_(common::ObLatchIds::TABLE_LOAD_THREAD_POOL_SCHEDULER_STATE_MUTEX),
+    wb_mutex_(common::ObLatchIds::TABLE_LOAD_THREAD_POOL_SCHEDULER_WB_MUTEX)
 {
   allocator_.set_tenant_id(MTL_ID());
   snprintf(name_, OB_THREAD_NAME_BUF_LEN, "TLD_%03ld_%s", table_id % 1000, label);
@@ -110,6 +127,8 @@ int ObTableLoadTaskThreadPoolScheduler::init()
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
     LOG_WARN("ObTableLoadTaskThreadPoolScheduler init twice", KR(ret), KP(this));
+  } else if (OB_FAIL(thread_pool_.init())) {
+    LOG_WARN("init thread pool failed", K(ret));
   } else {
     thread_pool_.set_thread_count(thread_count_);
     thread_pool_.set_run_wrapper(MTL_CTX());
@@ -242,6 +261,7 @@ void ObTableLoadTaskThreadPoolScheduler::run(uint64_t thread_idx)
   share::ObTenantBase *tenant_base = MTL_CTX();
   lib::Worker::CompatMode mode = ((omt::ObTenant *)tenant_base)->get_compat_mode();
   lib::Worker::set_compatibility_mode(mode);
+  common::ob_setup_default_tsi_warning_buffer();
   CONSUMER_GROUP_FUNC_GUARD(ObFunctionType::PRIO_IMPORT);
 
   LOG_INFO("table load task thread run", KP(this), "pid", get_tid_cache(), K(thread_idx));

@@ -18,6 +18,7 @@
 #include "storage/blocksstable/ob_data_file_prepare.h"
 #include "mtlenv/mock_tenant_module_env.h"
 #include "src/storage/backup/ob_backup_iterator.h"
+#include "close_modules/shared_storage/storage/incremental/sslog/ob_sslog_define.h"
 
 using namespace oceanbase;
 using namespace oceanbase::common;
@@ -63,7 +64,7 @@ private:
 };
 
 ObFakeBackupTabletProvider::ObFakeBackupTabletProvider()
-    : is_inited_(false), mutex_(), task_id_(-1), supplied_item_count_(0), total_item_count_(0)
+    : is_inited_(false), mutex_(common::ObLatchIds::OB_TEST_BACKUP_FAKE_TABLET_PROVIDER_MUTEX), task_id_(-1), supplied_item_count_(0), total_item_count_(0)
 {}
 
 ObFakeBackupTabletProvider::~ObFakeBackupTabletProvider()
@@ -214,6 +215,29 @@ TEST(TestBackupUtils, test_task_mgr)
   test_task_mgr(1024, 10240, 1);
 }
 
+TEST(TestBackupUtils, test_should_backup_sslog_meta_type)
+{
+  using namespace oceanbase::sslog;
+  // meta types that should be backed up
+  EXPECT_TRUE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_LS_META));
+  EXPECT_TRUE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_TABLET_META));
+  EXPECT_TRUE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_MINI_SSTABLE));
+  EXPECT_TRUE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_MINOR_SSTABLE));
+  EXPECT_TRUE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_MDS_MINI_SSTABLE));
+  EXPECT_TRUE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_MDS_MINOR_SSTABLE));
+  EXPECT_TRUE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_FLUSH_MINI_SSTABLE));
+  EXPECT_TRUE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_SPLIT_MINOR_SSTABLE));
+  EXPECT_TRUE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_SPLIT_MDS_MINOR_SSTABLE));
+  EXPECT_TRUE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_MAJOR_SSTABLE));
+  // meta types that should NOT be backed up
+  EXPECT_FALSE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_INVALID_META));
+  EXPECT_FALSE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_TABLET_TABLESTORE));
+  EXPECT_FALSE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_TABLET_STORAGE_SCHEMA));
+  EXPECT_FALSE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_TABLET_SSTABLE));
+  EXPECT_FALSE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_TABLET_SSTABLE_FOR_DDL));
+  EXPECT_FALSE(should_backup_sslog_meta_type(ObSSLogMetaType::SSLOG_MAX_META));
+}
+
 void make_macro_block_id_array(const int64_t tablet_id, const int64_t logic_version,
     const common::ObIArray<int64_t> &data_seq_list, common::ObIArray<ObBackupMacroBlockIDPair> &id_list)
 {
@@ -256,7 +280,6 @@ void TestBackupExternalSort::SetUp()
   TestDataFilePrepare::SetUp();
   EXPECT_EQ(OB_SUCCESS, init_tenant_mgr());
   ASSERT_EQ(OB_SUCCESS, common::ObClockGenerator::init());
-  ASSERT_EQ(OB_SUCCESS, tmp_file::ObTmpBlockCache::get_instance().init("tmp_block_cache", 1));
   ASSERT_EQ(OB_SUCCESS, tmp_file::ObTmpPageCache::get_instance().init("sn_tmp_page_cache", 1));
 
   static ObTenantBase tenant_ctx(OB_SYS_TENANT_ID);
@@ -274,10 +297,10 @@ void TestBackupExternalSort::SetUp()
 
   tmp_file::ObTenantTmpFileManager *tf_mgr = nullptr;
   EXPECT_EQ(OB_SUCCESS, mtl_new_default(tf_mgr));
-  EXPECT_EQ(OB_SUCCESS, tmp_file::ObTenantTmpFileManager::mtl_init(tf_mgr));
-  tf_mgr->get_sn_file_manager().page_cache_controller_.write_buffer_pool_.default_wbp_memory_limit_ = 40*1024*1024;
-  EXPECT_EQ(OB_SUCCESS, tf_mgr->start());
   tenant_ctx.set(tf_mgr);
+  EXPECT_EQ(OB_SUCCESS, tmp_file::ObTenantTmpFileManager::mtl_init(tf_mgr));
+  tf_mgr->get_sn_file_manager().write_cache_.default_memory_limit_ = 40*1024*1024;
+  EXPECT_EQ(OB_SUCCESS, tf_mgr->start());
 
   ObTenantEnv::set_tenant(&tenant_ctx);
   SERVER_STORAGE_META_SERVICE.is_started_ = true;
@@ -287,7 +310,6 @@ void TestBackupExternalSort::TearDown()
 {
   allocator_.reuse();
 
-  tmp_file::ObTmpBlockCache::get_instance().destroy();
   tmp_file::ObTmpPageCache::get_instance().destroy();
   ObTimerService *timer_service = MTL(ObTimerService *);
   ASSERT_NE(nullptr, timer_service);

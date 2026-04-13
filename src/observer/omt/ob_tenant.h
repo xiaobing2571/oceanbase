@@ -49,6 +49,7 @@ class ObAllVirtualDumpTenantInfo;
 }
 namespace omt
 {
+extern thread_local bool count_usleep_as_blocking;
 typedef common::ObPriorityQueue2<1, QQ_MAX_PRIO - 1, RQ_MAX_PRIO - QQ_MAX_PRIO, OB_MAX_NUMA_NUM> ReqQueue;
 class ObPxPool
     : public share::ObThreadPool
@@ -65,7 +66,8 @@ public:
       group_id_(0),
       is_inited_(false),
       concurrency_(0),
-      active_threads_(0)
+      active_threads_(0),
+      recycle_lock_(common::ObLatchIds::OB_PX_POOL_RECYCLE_LOCK)
   {}
   virtual void stop();
   void set_tenant_id(uint64_t tenant_id) { tenant_id_ = tenant_id; }
@@ -150,7 +152,7 @@ public:
     pools = nullptr;
   }
 public:
-  ObPxPools() : tenant_id_(common::OB_INVALID_ID)
+  ObPxPools() : tenant_id_(common::OB_INVALID_ID), lock_(common::ObLatchIds::OB_PX_POOLS_LOCK)
   {}
   ~ObPxPools()
   {
@@ -382,7 +384,21 @@ class ObTenant : public share::ObTenantBase
   // How long to preserve inactive worker before free it to worker
   // pool.
   static constexpr int64_t PRESERVE_INACTIVE_WORKER_TIME = 10 * 1000L * 1000L;
-
+  class ObUsleepBlockingGuard
+  {
+  public:
+    explicit ObUsleepBlockingGuard(const bool count_as_blocking)
+      : old_value_(count_usleep_as_blocking)
+    {
+      count_usleep_as_blocking = count_as_blocking;
+    }
+    ~ObUsleepBlockingGuard()
+    {
+      count_usleep_as_blocking = old_value_;
+    }
+  private:
+    bool old_value_;
+  };
 public:
   enum { MAX_RESOURCE_GROUP = 8 };
 
@@ -425,8 +441,14 @@ public:
   void set_unit_min_cpu(double cpu);
   OB_INLINE int64_t total_worker_cnt() const { return total_worker_cnt_; }
   int64_t cpu_quota_concurrency() const;
+  int64_t min_active_worker_cnt() const;
   int64_t min_worker_cnt() const;
   int64_t max_worker_cnt() const;
+  int64_t priority_worker_cnt() const;
+  int64_t cur_ddl_thread_count() {return ATOMIC_LOAD(&total_ddl_thread_cnt_);}
+  void inc_ddl_thread_count() { ATOMIC_INC(&total_ddl_thread_cnt_); };
+  void dec_ddl_thread_count() { ATOMIC_DEC(&total_ddl_thread_cnt_); };
+  bool check_ddl_thread_is_limit(const int64_t cpu_quota_concurrency) { return ATOMIC_LOAD(&total_ddl_thread_cnt_) >= static_cast<int64_t>(unit_min_cpu() * cpu_quota_concurrency); }
   lib::Worker::CompatMode get_compat_mode() const;
   OB_INLINE share::ObTenantSpace &ctx() { return *ctx_; }
   int rdlock(common::ObLDHandle &handle);
@@ -446,8 +468,11 @@ public:
   void handle_retry_req(bool need_clear = false);
   void check_worker_count(ObThWorker &w);
   void update_queue_size();
+  // 切换worker到大查询组(0→OBCG_LQ)
+  int switch_worker_to_large_query_group(ObThWorker* worker);
 
   int timeup();
+  void update_lq_cpu_limit();
   int get_default_group_throttled_time(int64_t &default_group_throttled_time);
   void print_throttled_time();
   void regist_threads_to_cgroup();
@@ -481,8 +506,6 @@ public:
 
   int mark_group_deleted(uint64_t group_id);
 
-  void lq_end(ObThWorker &w);
-  // called each checkpoint for worker of this tenant.
   void lq_wait(ObThWorker &w);
   int lq_yield(ObThWorker &w);
 
@@ -491,6 +514,7 @@ public:
   OB_INLINE double get_token_usage() const { return token_usage_; }
   OB_INLINE int64_t get_worker_time() const { return ATOMIC_LOAD(&worker_us_); }
   OB_INLINE int64_t get_cpu_time() const { return ATOMIC_LOAD(&cpu_time_us_); }
+  OB_INLINE int64_t get_group_cpu_time(uint64_t group_id) const { return ATOMIC_LOAD(&group_cpu_time_us_[group_id]); }
   int64_t get_rusage_time();
   // sql throttle
   void update_sql_throttle_metrics(const ObSqlThrottleMetrics &metrics)
@@ -519,6 +543,7 @@ public:
   GroupMap& get_group_map() { return group_map_;}
   ReqQueue& get_req_queue() { return req_queue_; }
   ObMultiLevelQueue* get_multi_level_queue() { return multi_level_queue_; }
+  void sample_cpu_time_from_proc_once();
   // OB_INLINE bool has_normal_request() const { return req_queue_.size() != 0; }
   // OB_INLINE bool has_level_request() const { return OB_NOT_NULL(multi_level_queue_) && multi_level_queue_->get_total_size() != 0; }
 private:
@@ -563,6 +588,7 @@ protected:
   // workers can make progress.
   volatile bool shrink_ CACHE_ALIGNED;
   int64_t total_worker_cnt_;
+  int64_t total_ddl_thread_cnt_;
   void *gc_thread_;
   bool has_created_;
   int64_t stopped_;
@@ -615,6 +641,8 @@ public:
   double token_usage_;
   int64_t token_usage_check_ts_;
   int64_t token_change_ts_ CACHE_ALIGNED;
+  int64_t stream_rpc_wait_cnt_ CACHE_ALIGNED;
+  int64_t stream_rpc_wait_cnt_limit_ CACHE_ALIGNED; // used to limit the concurrency of processing stream rpc
 
   share::ObTenantSpace *ctx_;
 
@@ -623,6 +651,8 @@ public:
   // idle time between two checkpoints
   int64_t worker_us_;
   int64_t default_group_throttled_time_us_;
+  int64_t last_check_ts_;
+  double last_lq_cpu_;
   int64_t cpu_time_us_ CACHE_ALIGNED;
 }; // end of class ObTenant
 
@@ -655,6 +685,8 @@ OB_INLINE int64_t ObResourceGroup::max_worker_cnt() const
     cnt = 2;
   } else if (OB_UNLIKELY(share::OBCG_HB_SERVICE == group_id_)) {
     cnt = 1;
+  } else if (OB_UNLIKELY(share::OBCG_LQ == group_id_)) {
+    cnt = std::max(min_worker_cnt(), tenant_->max_worker_cnt() / 2);
   } else {
     cnt = tenant_->max_worker_cnt();
   }

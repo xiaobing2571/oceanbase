@@ -84,8 +84,8 @@ void prepare_data_desc(ObWholeDataStoreDesc &data_desc,ObTableSchema *table_sche
 {
   int ret = OB_SUCCESS;
   ret = data_desc.init(false/*is_ddl*/, *table_schema, ObLSID(1), ObTabletID(1), MAJOR_MERGE,
-  ObTimeUtility::fast_current_time()/*snapshot_version*/, DATA_CURRENT_VERSION,
-  table_schema->get_micro_index_clustered(), 0/*transfer_seq*/, share::SCN::min_scn());
+      ObTimeUtility::fast_current_time()/*snapshot_version*/, DATA_CURRENT_VERSION,
+      table_schema->get_micro_index_clustered(), 0/*transfer_seq*/, 0/*concurrent_cnt*/, share::SCN::min_scn());
   data_desc.get_desc().sstable_index_builder_ = sstable_builder;
   ASSERT_EQ(OB_SUCCESS, ret);
 }
@@ -359,7 +359,7 @@ private:
 
 TestConcurrencyDefensesStressMacroWriter::TestConcurrencyDefensesStressMacroWriter()
   : tenant_id_(0), thread_cnt_(0), row_count_(0), allocator_(), row_generate_(NULL), data_store_desc_(NULL), start_seq_(NULL),
-    lob_iter_(NULL), index_writer_(NULL), sstable_builder_(NULL), lock_(), tenant_base_(500)
+    lob_iter_(NULL), index_writer_(NULL), sstable_builder_(NULL), lock_(common::ObLatchIds::TEST_LATCH_LOCK), tenant_base_(500)
 {
 }
 
@@ -438,7 +438,7 @@ private:
 
 TestConcurrencyDefensesStressIndexBuilder::TestConcurrencyDefensesStressIndexBuilder()
   : tenant_id_(0), thread_cnt_(0), row_count_(0), allocator_(), row_generate_(NULL), table_schema_(nullptr), data_store_desc_(NULL),
-    lob_iter_(NULL), index_writer_(NULL), sstable_builder_(NULL), lock_(), tenant_base_(500)
+    lob_iter_(NULL), index_writer_(NULL), sstable_builder_(NULL), lock_(common::ObLatchIds::TEST_LATCH_LOCK), tenant_base_(500)
 {
 }
 
@@ -517,7 +517,7 @@ TEST_F(TestConcurrencyDefenses, test_index_builder_concurrency_defense)
   ObWholeDataStoreDesc data_desc;
   ret = data_desc.init(false/*is_ddl*/, table_schema_, ObLSID(1), ObTabletID(1), MAJOR_MERGE,
   ObTimeUtility::fast_current_time()/*snapshot_version*/, DATA_CURRENT_VERSION,
-  table_schema_.get_micro_index_clustered(), 0/*transfer_seq*/, share::SCN::min_scn()/*reorgnize scn*/);
+  table_schema_.get_micro_index_clustered(), 0/*transfer_seq*/, 0/*concurrent_cnt*/, share::SCN::min_scn()/*reorgnize scn*/);
   ASSERT_EQ(OB_SUCCESS, ret);
   data_desc.get_desc().sstable_index_builder_ = &sstable_builder;
 

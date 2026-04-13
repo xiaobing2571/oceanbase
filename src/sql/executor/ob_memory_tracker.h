@@ -24,19 +24,29 @@ class MemoryContext;
 struct ObMemTracker
 {
   ObMemTracker() :
-    cache_mem_limit_(0), check_status_times_(0), try_check_tick_(0), mem_context_(nullptr)
+    cur_mem_used_(0), peek_mem_used_(0),
+    cache_mem_limit_(-1), check_status_times_(0), try_check_tick_(0), mem_quota_pct_(0),
+    tenant_id_(0), mem_context_(nullptr)
   {}
   void reset()
   {
-    cache_mem_limit_ = 0;
+    cur_mem_used_ = 0;
+    peek_mem_used_ = 0;
+    cache_mem_limit_ = -1;
     check_status_times_ = 0;
     try_check_tick_ = 0;
+    mem_quota_pct_ = 0;
+    tenant_id_ = 0;
     mem_context_ = nullptr;
   }
 
+  int64_t cur_mem_used_;
+  int64_t peek_mem_used_;
   int64_t cache_mem_limit_;
   uint16_t check_status_times_;
   uint16_t try_check_tick_;
+  int64_t mem_quota_pct_;
+  uint64_t tenant_id_;
   lib::MemoryContext *mem_context_;
 };
 
@@ -45,18 +55,15 @@ class ObMemTrackerGuard
 public:
   const static uint64_t DEFAULT_CHECK_STATUS_TRY_TIMES = 1024;
   const static uint64_t UPDATE_MEM_LIMIT_THRESHOLD = 512;
-  ObMemTrackerGuard(lib::MemoryContext &mem_context)
-  {
-    mem_tracker_.reset();
-    mem_tracker_.mem_context_ = &mem_context;
-  }
+  const static int64_t UNLIMITED_MEM_QUOTA_PCT = 100;
+  ObMemTrackerGuard(lib::MemoryContext &mem_context);
   ~ObMemTrackerGuard()
   {
     mem_tracker_.reset();
   }
   static void reset_try_check_tick();
   static void dump_mem_tracker_info();
-  static void update_mem_limit();
+  static void update_config();
   static int check_status();
   static int try_check_status(int64_t check_try_times = DEFAULT_CHECK_STATUS_TRY_TIMES);
 

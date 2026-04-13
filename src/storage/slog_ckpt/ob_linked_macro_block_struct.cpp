@@ -13,7 +13,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/slog_ckpt/ob_linked_macro_block_struct.h"
-
+#include "storage/tablet/ob_tablet_persister.h"
 
 namespace oceanbase
 {
@@ -146,5 +146,128 @@ void ObMetaBlockListHandle::reset_new_handle()
 {
   meta_handles_[1 - cur_handle_pos_].reset();
 }
+
+bool ObLinkedMacroInfoWriteParam::is_valid() const
+{
+  bool is_valid = false;
+  switch (type_) {
+    case ObLinkedMacroBlockWriteType::PRIV_MACRO_INFO : {
+      is_valid = tablet_id_.is_valid() && tablet_private_transfer_epoch_ >= 0;
+      break;
+    }
+    case ObLinkedMacroBlockWriteType::SHARED_MAJOR_MACRO_INFO : {
+      is_valid = tablet_id_.is_valid() && start_macro_seq_ >= 0;
+      break;
+    }
+    case ObLinkedMacroBlockWriteType::SHARED_INC_MACRO_INFO : {
+      is_valid = ls_id_.is_valid() && tablet_id_.is_valid() && start_macro_seq_ >= 0 && reorganization_scn_ >= 0;
+      break;
+    }
+    default : {
+      int ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid arguments", K(ret), KPC(this));
+    }
+  }
+  return is_valid;
+}
+
+int ObLinkedMacroInfoWriteParam::build_linked_marco_info_param(
+    const ObTabletPersisterParam &persist_param,
+    const int64_t cur_macro_seq)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!persist_param.is_valid() || cur_macro_seq < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(ret), K(persist_param), K(cur_macro_seq));
+  } else if (persist_param.is_major_shared_object()) {
+    type_            = ObLinkedMacroBlockWriteType::SHARED_MAJOR_MACRO_INFO;
+    tablet_id_       = persist_param.tablet_id_;
+    start_macro_seq_ = cur_macro_seq;
+    write_callback_  = persist_param.ddl_redo_callback_;
+  } else if (persist_param.is_inc_shared_object()) {
+#ifdef OB_BUILD_SHARED_STORAGE
+    type_               = ObLinkedMacroBlockWriteType::SHARED_INC_MACRO_INFO;
+    ls_id_              = persist_param.ls_id_;
+    tablet_id_          = persist_param.tablet_id_;
+    op_id_              = persist_param.op_handle_->get_atomic_op()->get_op_id();
+    start_macro_seq_    = cur_macro_seq;
+    reorganization_scn_ = persist_param.reorganization_scn_;
+    write_callback_     = persist_param.ddl_redo_callback_;
+#endif
+  } else { // private
+    type_                = ObLinkedMacroBlockWriteType::PRIV_MACRO_INFO;
+    tablet_id_           = persist_param.tablet_id_;
+    tablet_private_transfer_epoch_ = persist_param.private_transfer_epoch_;
+    write_callback_      = persist_param.ddl_redo_callback_;
+  }
+  return ret;
+}
+
+void ObLinkedMacroInfoWriteParam::reset()
+{
+  type_ = ObLinkedMacroBlockWriteType::LMI_MAX_TYPE;
+  ls_id_.reset();
+  tablet_id_.reset();
+  tablet_private_transfer_epoch_ = -1;
+  start_macro_seq_  = -1;
+  reorganization_scn_ = -1;
+  op_id_ = 0;
+  write_callback_ = nullptr;
+}
+
+int ObSlogCheckpointFdDispenser::init(const int64_t cur_file_id)
+{
+  int ret = OB_SUCCESS;
+  if (!GCTX.is_shared_storage_mode()) {
+    // do nothing
+  } else if (OB_UNLIKELY(is_inited_)) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("init twice", K(ret), KPC(this));
+  } else if (OB_UNLIKELY(cur_file_id < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid cur_file_id", K(ret), K(cur_file_id));
+  } else {
+    min_file_id_ = next_file_id_ = cur_file_id + 1;
+    is_inited_ = true;
+  }
+  return ret;
+}
+
+int ObSlogCheckpointFdDispenser::acquire_new_file_id(/*out*/int64_t &file_id)
+{
+  int ret = OB_SUCCESS;
+  file_id = 0;
+  if (!GCTX.is_shared_storage_mode()) {
+    // do nothing
+  } else if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not inited", K(ret), KPC(this));
+  } else {
+    file_id = ATOMIC_FAA(&next_file_id_, 1);
+  }
+  return ret;
+}
+
+int ObSlogCheckpointFdDispenser::assign_to(
+    /*out*/int64_t &min_file_id,
+    /*out*/int64_t &max_file_id) const
+{
+  int ret = OB_SUCCESS;
+  min_file_id = max_file_id = 0;
+  if (!GCTX.is_shared_storage_mode()) {
+    // do nothing
+  } else if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not inited", K(ret), KPC(this));
+  } else if (FALSE_IT(min_file_id = get_min_file_id_())) {
+  } else if (FALSE_IT(max_file_id = get_max_file_id_())) {
+  } else if (OB_UNLIKELY(min_file_id > max_file_id)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("min_file_id is greater than max_file_id", K(ret),
+      K(min_file_id), K(max_file_id), KPC(this));
+  }
+  return ret;
+}
+
 }  // end namespace storage
 }  // end namespace oceanbase

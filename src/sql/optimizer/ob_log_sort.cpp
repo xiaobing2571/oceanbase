@@ -21,6 +21,27 @@ using namespace oceanbase::common;
 
 #define MIN_TSC_OUTPUT_ROWS_FOR_PD_TOPN_FILTER 256
 
+void ObTopNFilterInfo::init(int64_t p2p_sequence_id, ObRawExpr *pushdown_topn_filter_expr,
+                            int64_t effective_sk_cnt, bool is_shuffle, ObLogicalOperator *node,
+                            bool enable_runtime_filter_adaptive_apply)
+{
+  p2p_sequence_id_ = p2p_sequence_id;
+  pushdown_topn_filter_expr_ = pushdown_topn_filter_expr;
+  effective_sk_cnt_ = effective_sk_cnt;
+  is_shuffle_ = is_shuffle;
+  enabled_ = true;
+  topn_filter_node_ = node;
+  if (!enable_runtime_filter_adaptive_apply) {
+    enable_runtime_filter_adaptive_apply_ = false;
+  } else if (node->get_type() == log_op_def::LOG_TABLE_SCAN) {
+    ObLogTableScan *scan = static_cast<ObLogTableScan *>(node);
+    if (scan->get_scan_order() == common::ObQueryFlag::ScanOrder::NoOrder) {
+      // for table engine delete insert, we should disable runtime filter slide window
+      enable_runtime_filter_adaptive_apply_ = false;
+    }
+  }
+}
+
 int ObLogSort::set_sort_keys(const common::ObIArray<OrderItem> &order_keys)
 {
   int ret = OB_SUCCESS;
@@ -562,7 +583,7 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
   ObSQLSessionInfo *session_info = nullptr;
   uint64_t table_id = OB_INVALID_ID;
   int64_t p2p_sequence_id = OB_INVALID_ID;
-  common::ObSEArray<ObRawExpr *, 8, common::ModulePageAllocator, true> candidate_sk_exprs;
+  common::ObSEArray<ObRawExpr *, 8> candidate_sk_exprs;
   int64_t effective_sk_cnt = 0;
   bool tsc_has_exchange = false;
   bool tsc_has_px_coord = false;
@@ -582,6 +603,9 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
     LOG_WARN("session_info unexpected null");
   } else if (OB_ISNULL(topn_expr_)) {
     // not topn scene
+    can_allocate = false;
+  } else if (topn_expr_ && part_cnt_ > 0) {
+    // no topn runtime filter in partition topn
     can_allocate = false;
   } else if (prefix_pos_ > 0) {
     // For index (c1, c2 c3), if order by c1, c3, its prefix sort scene
@@ -644,6 +668,7 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
   }
 
   if (OB_SUCC(ret) && can_allocate) {
+    bool enable_runtime_filter_adaptive_apply = get_plan()->get_optimizer_context().enable_runtime_filter_adaptive_apply();
     ObRawExprFactory &expr_factory = get_plan()->get_optimizer_context().get_expr_factory();
     if (OB_FAIL(
             expr_factory.create_raw_expr(T_OP_PUSHDOWN_TOPN_FILTER, pushdown_topn_filter_expr))) {
@@ -675,7 +700,7 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
       LOG_WARN("fail to generate p2p dh id", K(ret));
     } else {
       (void)topn_filter_info_.init(p2p_sequence_id, pushdown_topn_filter_expr, effective_sk_cnt,
-                                   tsc_has_exchange, node);
+                                   tsc_has_exchange, node, enable_runtime_filter_adaptive_apply);
     }
   }
 
@@ -689,7 +714,7 @@ int ObLogSort::try_allocate_pushdown_topn_runtime_filter()
 // get the front sort keys from same table, topn filter can pushdown to this table
 int ObLogSort::get_candidate_pushdown_sort_keys(
     uint64_t &table_id,
-    common::ObSEArray<ObRawExpr *, 8, common::ModulePageAllocator, true> &candidate_sk_exprs)
+    common::ObIArray<ObRawExpr *> &candidate_sk_exprs)
 {
   int ret = OB_SUCCESS;
   bool can_expr_pushdown = true;

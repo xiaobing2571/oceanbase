@@ -14,10 +14,12 @@
 #define OCEANBASE_DAS_DOMAIN_UTILS_H
 
 #include "lib/allocator/page_arena.h"
-#include "lib/hash/ob_hashset.h"
+#include "share/datum/ob_datum.h"
 #include "sql/das/ob_das_dml_ctx_define.h"
-#include "storage/fts/ob_fts_plugin_helper.h"
 #include "storage/fts/ob_fts_doc_word_iterator.h"
+#include "storage/fts/ob_fts_plugin_helper.h"
+#include "storage/fts/ob_ft_token_processor.h"
+#include "storage/fts/ob_i_ft_parser.h"
 
 namespace oceanbase
 {
@@ -27,33 +29,155 @@ namespace sql
 class ObFTIndexRowCache final
 {
 public:
-  static ObObjDatumMapType FTS_INDEX_TYPES[4];
-  static ObObjDatumMapType FTS_DOC_WORD_TYPES[4];
-  static ObExprOperatorType FTS_INDEX_EXPR_TYPE[4];
-  static ObExprOperatorType FTS_DOC_WORD_EXPR_TYPE[4];
+static const int64_t ALL_EXPR_COUNT = 5;
 
-  ObFTIndexRowCache();
-  ~ObFTIndexRowCache();
-  int init(
-      const bool is_fts_index_aux,
-      const common::ObString &parser_name,
-      const common::ObString &parser_properties);
-  int segment(
-      const common::ObObjMeta &ft_obj_meta,
-      const common::ObString &doc_id,
-      const common::ObString &fulltext);
+static const int64_t FTS_INDEX_COL_CNT = 5;
+static const int64_t FTS_DOC_WORD_COL_CNT = 5;
+static ObObjDatumMapType FTS_INDEX_OBJ_TYPES[FTS_INDEX_COL_CNT];
+static ObObjDatumMapType FTS_DOC_WORD_OBJ_TYPES[FTS_DOC_WORD_COL_CNT];
+static ObExprOperatorType FTS_INDEX_EXPR_TYPE[FTS_INDEX_COL_CNT];
+static ObExprOperatorType FTS_DOC_WORD_EXPR_TYPE[FTS_DOC_WORD_COL_CNT];
+
+public:
+  ObFTIndexRowCache() :
+      is_inited_(false),
+      is_token_doc_(true),
+      ft_doc_token_need_sort_(false),
+      is_buildin_parser_(false),
+      need_sample_(false),
+      token_iterator_(nullptr),
+      chars_per_token_(0),
+      row_pool_index_(0),
+      fts_index_type_(ObFTSIndexType::OB_FTS_INDEX_TYPE_INVALID),
+      datum_row_(),
+      token_arr_(),
+      helper_(),
+      metadata_allocator_(),
+      scratch_allocator_(),
+      meta_(),
+      ft_token_processor_(scratch_allocator_),
+      all_ft_exprs_() { }
+
+  ~ObFTIndexRowCache()
+  {
+    reset();
+  }
+
+  int init(const bool is_token_doc,
+           const bool ft_doc_token_need_sort,
+           const common::ObString &parser_name,
+           const common::ObString &parser_properties,
+           const common::ObIArray<ObExpr *> &all_ft_exprs,
+           const common::ObIArray<ObExpr *> &other_exprs,
+           const ObFTSIndexType fts_index_type);
+
+  int segment(const common::ObObjMeta &ft_obj_meta, const ObDatum &doc_id, const common::ObString &fulltext);
+
   int get_next_row(blocksstable::ObDatumRow *&row);
-  void reset();
-  void reuse();
-  TO_STRING_KV(K_(row_idx), K_(is_fts_index_aux), K_(helper), K_(is_inited), K_(rows));
-private:
-  lib::MemoryContext merge_memctx_;
-  ObDomainIndexRow rows_;
-  uint64_t row_idx_;
-  bool is_fts_index_aux_;
-  storage::ObFTParseHelper helper_;
-  bool is_inited_;
 
+  void reset();
+
+  void reuse();
+
+  OB_INLINE void set_need_sample(const bool need_sample) { need_sample_ = need_sample; }
+
+  OB_INLINE ObExpr *get_doc_id_expr() const { return all_ft_exprs_.at(DOC_ID_EXPR_IDX); }
+
+  OB_INLINE ObExpr *get_ft_expr() const { return all_ft_exprs_.at(FT_EXPR_IDX); }
+
+  OB_INLINE ObExpr *get_token_count_expr() const { return all_ft_exprs_.at(TOKEN_CNT_EXPR_IDX); }
+
+  OB_INLINE ObExpr *get_doc_length_expr() const { return all_ft_exprs_.at(DOC_LEN_EXPR_IDX); }
+
+  OB_INLINE common::ObSEArray<ObExpr *, ALL_EXPR_COUNT> &get_all_exprs() { return all_ft_exprs_; }
+  OB_INLINE common::ObSEArray<ObExpr *, ALL_EXPR_COUNT> &get_other_exprs() { return other_exprs_; }
+
+  TO_STRING_KV(K_(is_inited), K_(is_token_doc), K_(is_buildin_parser), KP_(token_iterator),
+               K_(chars_per_token), K_(row_pool_index), K_(helper), K_(parser_context), K_(meta),
+               K(ft_token_map_.size()), K_(ft_token_processor), K(all_ft_exprs_.count()));
+
+private:
+  class ObFTTokenComparator
+  {
+  public:
+    ObFTTokenComparator(ObDatumCmpFuncType cmp_func)
+      : cmp_func_(cmp_func),
+        sort_ret_(OB_SUCCESS) { }
+    ~ObFTTokenComparator() = default;
+    bool operator()(const ObFTTokenPair *l, const ObFTTokenPair *r)
+    {
+      int cmp_ret = 0;
+      if (OB_UNLIKELY(OB_SUCCESS != sort_ret_)) {
+      } else if (OB_SUCCESS != (sort_ret_ = cmp_func_(l->first.get_token(),
+                                                      r->first.get_token(),
+                                                      cmp_ret))) {
+        // fail to compare token
+      }
+      return cmp_ret < 0;
+    }
+    OB_INLINE int get_sort_ret() const { return sort_ret_; }
+
+  private:
+    ObDatumCmpFuncType cmp_func_;
+    int sort_ret_;
+  };
+
+private:
+  int prepare_parser(const common::ObObjMeta &ft_obj_meta,
+                     const char *fulltext,
+                     const int64_t fulltext_len);
+
+  int create_ft_token_map(const int64_t ft_token_bkt_cnt);
+
+  /**
+   * @brief estimate the average number of characters per token
+   * @details the default value is 4 (different parsers or configurations may return different values)
+   */
+  int estimate_chars_per_token();
+
+  int fetch_exprs(const common::ObIArray<ObExpr *> &all_ft_exprs,
+                  const common::ObIArray<ObExpr *> &other_exprs);
+
+private:
+  static const int64_t  FT_TOKEN_ARR_CAPACITY = 64L * 1024L;
+  static const uint64_t MIN_FT_TOKEN_BUCKET_COUNT = 4;
+  static const uint64_t MAX_FT_TOKEN_BUCKET_COUNT = 2L * 1024L * 1024L;
+
+  static const int64_t DOC_ID_COL_IDX = 0;
+  static const int64_t TOKEN_COL_IDX = 1;
+  static const int64_t TOKEN_CNT_COL_IDX = 2;
+  static const int64_t DOC_LEN_COL_IDX = 3;
+  static const int64_t TOKEN_POS_LIST_COL_IDX = 4;
+
+  static const int64_t DOC_ID_EXPR_IDX = 0;
+  static const int64_t FT_EXPR_IDX = 1;
+  static const int64_t TOKEN_CNT_EXPR_IDX = 2;
+  static const int64_t DOC_LEN_EXPR_IDX = 3;
+
+private:
+  bool is_inited_;
+  bool is_token_doc_;
+  bool ft_doc_token_need_sort_;
+  bool is_buildin_parser_;
+  bool need_sample_;
+  plugin::ObITokenIterator *token_iterator_;
+  int64_t chars_per_token_;
+  int64_t row_pool_index_;
+  ObFTSIndexType fts_index_type_;
+  blocksstable::ObDatumRow datum_row_;
+  // for doc token sort by token
+  ObArray<const ObFTTokenPair *> token_arr_;
+  storage::ObFTParseHelper helper_;
+  common::ObArenaAllocator metadata_allocator_;
+  common::ObArenaAllocator scratch_allocator_;
+  plugin::ObFTParserParam parser_context_;
+  common::ObObjMeta meta_;
+  ObFTTokenMap ft_token_map_;
+  ObFTTokenProcessor ft_token_processor_;
+  common::ObSEArray<ObExpr *, ALL_EXPR_COUNT> all_ft_exprs_;
+  common::ObSEArray<ObExpr *, ALL_EXPR_COUNT> other_exprs_;
+
+private:
   DISALLOW_COPY_AND_ASSIGN(ObFTIndexRowCache);
 };
 
@@ -77,41 +201,23 @@ public:
       doc_word_found_(false)
   {}
   ~ObFTDocWordInfo() = default;
-  ObFTDocWordInfo(const ObFTDocWordInfo &src)
-    : table_id_(src.table_id_),
-      doc_word_table_id_(src.doc_word_table_id_),
-      doc_word_ls_id_(src.doc_word_ls_id_),
-      doc_word_tablet_id_(src.doc_word_tablet_id_),
-      snapshot_(),
-      doc_word_schema_version_(src.doc_word_schema_version_),
-      doc_word_found_(src.doc_word_found_)
+
+  int assign(const ObFTDocWordInfo &src)
   {
-    snapshot_.valid_ = src.snapshot_.valid_;
-    snapshot_.committed_ = src.snapshot_.committed_;
-    snapshot_.core_ = src.snapshot_.core_;
-    snapshot_.source_ = src.snapshot_.source_;
-    snapshot_.snapshot_lsid_ = src.snapshot_.snapshot_lsid_;
-    snapshot_.snapshot_ls_role_ = src.snapshot_.snapshot_ls_role_;
-    snapshot_.snapshot_acquire_addr_ = src.snapshot_.snapshot_acquire_addr_;
+    int ret = OB_SUCCESS;
+    table_id_ = src.table_id_;
+    doc_word_table_id_ = src.doc_word_table_id_;
+    doc_word_ls_id_ = src.doc_word_ls_id_;
+    doc_word_tablet_id_ = src.doc_word_tablet_id_;
+    doc_word_schema_version_ = src.doc_word_schema_version_;
+    doc_word_found_ = src.doc_word_found_;
+
+    if (OB_FAIL(snapshot_.assign(src.snapshot_))) {
+      STORAGE_LOG(WARN, "failed to assign snapshot", K(ret));
+    }
+    return ret;
   }
 
-  ObFTDocWordInfo &operator=(const ObFTDocWordInfo &src)
-  {
-      table_id_ =src.table_id_;
-      doc_word_table_id_ = src.doc_word_table_id_;
-      doc_word_ls_id_ = src.doc_word_ls_id_;
-      doc_word_tablet_id_ = src.doc_word_tablet_id_;
-      doc_word_schema_version_ = src.doc_word_schema_version_;
-      doc_word_found_ = src.doc_word_found_;
-      snapshot_.valid_ = src.snapshot_.valid_;
-      snapshot_.committed_ = src.snapshot_.committed_;
-      snapshot_.core_ = src.snapshot_.core_;
-      snapshot_.source_ = src.snapshot_.source_;
-      snapshot_.snapshot_lsid_ = src.snapshot_.snapshot_lsid_;
-      snapshot_.snapshot_ls_role_ = src.snapshot_.snapshot_ls_role_;
-      snapshot_.snapshot_acquire_addr_ = src.snapshot_.snapshot_acquire_addr_;
-      return *this;
-  }
   TO_STRING_KV(K_(table_id),
                K_(doc_word_table_id),
                K_(doc_word_ls_id),
@@ -127,6 +233,9 @@ public:
   transaction::ObTxReadSnapshot snapshot_;
   int64_t doc_word_schema_version_;
   bool doc_word_found_;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObFTDocWordInfo);
 };
 
 class ObDomainDMLParam final
@@ -188,14 +297,14 @@ public:
       const IntFixedArray &row_projector,
       const ObDASWriteBuffer::DmlRow &dml_row,
       ObDomainIndexRow &spat_rows);
-  static int generate_fulltext_word_rows(
-      common::ObIAllocator &allocator,
-      storage::ObFTParseHelper *helper,
-      const common::ObObjMeta &ft_obj_meta,
-      const ObString &doc_id,
-      const ObString &fulltext,
-      const bool is_fts_index_aux,
-      ObDomainIndexRow &word_rows);
+  static int generate_fulltext_word_rows(common::ObIAllocator &allocator,
+                                         storage::ObFTParseHelper *helper,
+                                         const common::ObObjMeta &ft_obj_meta,
+                                         const ObDatum &doc_id_datum,
+                                         const ObString &fulltext,
+                                         const bool is_fts_index_aux,
+                                         const bool need_pos_list,
+                                         ObDomainIndexRow &word_rows);
   static int generate_multivalue_index_rows(
       ObIAllocator &allocator,
       const ObDASDMLBaseCtDef &das_ctdef,
@@ -206,13 +315,6 @@ public:
       const ObDASWriteBuffer::DmlRow &dml_row,
       ObDomainIndexRow &domain_rows);
 private:
-  static int segment_and_calc_word_count(
-      common::ObIAllocator &allocator,
-      storage::ObFTParseHelper *helper,
-      const common::ObCollationType &type,
-      const ObString &fulltext,
-      int64_t &doc_length,
-      ObFTWordMap &words_count);
   static int calc_save_rowkey_policy(
     ObIAllocator &allocator,
     const ObDASDMLBaseCtDef &das_ctdef,
@@ -265,6 +367,8 @@ protected:
       const ObDASDMLBaseCtDef *das_ctdef,
       const ObDASDMLBaseCtDef *main_ctdef);
   virtual int generate_domain_rows(const ObChunkDatumStore::StoredRow *store_row) = 0;
+
+  virtual int check_sync_interval(bool &is_sync_interval) const { UNUSED(is_sync_interval); return OB_SUCCESS; }
 
 protected:
   ObDomainDMLMode mode_;
@@ -336,7 +440,6 @@ private:
     ObString &multivalue_data);
 };
 
-
 class ObFTDMLIterator final : public ObDomainDMLIterator
 {
 public:
@@ -368,16 +471,14 @@ public:
   INHERIT_TO_STRING_KV("ObDomainDMLIterator", ObDomainDMLIterator, K_(ft_parse_helper), K_(is_inited));
 protected:
   virtual int generate_domain_rows(const ObChunkDatumStore::StoredRow *store_row) override;
-  int get_ft_and_doc_id(
-      const ObChunkDatumStore::StoredRow *store_row,
-      ObString &doc_id,
-      ObString &ft,
-      common::ObObjMeta &ft_meta);
-  int get_ft_and_doc_id_for_update(
-      const ObChunkDatumStore::StoredRow *store_row,
-      ObString &doc_id,
-      ObString &ft,
-      common::ObObjMeta &ft_meta);
+  int get_ft_and_doc_id(const ObChunkDatumStore::StoredRow *store_row,
+                        ObDatum &doc_id_datum,
+                        ObString &ft,
+                        common::ObObjMeta &ft_meta);
+  int get_ft_and_doc_id_for_update(const ObChunkDatumStore::StoredRow *store_row,
+                                   ObDatum &doc_id_datum,
+                                   ObString &ft,
+                                   common::ObObjMeta &ft_meta);
   int generate_ft_word_rows(const ObChunkDatumStore::StoredRow *store_row);
   int scan_ft_word_rows(const ObChunkDatumStore::StoredRow *store_row);
   int build_ft_word_row(blocksstable::ObDatumRow *src_row, blocksstable::ObDatumRow *&dest_row);

@@ -40,7 +40,7 @@ struct ObStorageHATabletsBuilderParam final
   int assign(const ObStorageHATabletsBuilderParam &param);
 
   TO_STRING_KV(K_(tenant_id), KPC_(ls), K_(tablet_id_array), K_(src_info), K_(local_rebuild_seq),
-      K_(need_check_seq), K_(is_leader_restore), K_(need_keep_old_tablet), KP_(ha_table_info_mgr),
+      K_(need_check_seq), K_(is_leader_restore), KP_(ha_table_info_mgr),
       K_(restore_action), KP_(bandwidth_throttle), KP_(svr_rpc_proxy), KP_(storage_rpc));
 
   uint64_t tenant_id_;
@@ -50,7 +50,6 @@ struct ObStorageHATabletsBuilderParam final
   int64_t local_rebuild_seq_;
   bool need_check_seq_;
   bool is_leader_restore_;
-  bool need_keep_old_tablet_;
 
   ObStorageHATableInfoMgr *ha_table_info_mgr_;
   common::ObInOutBandwidthThrottle *bandwidth_throttle_;
@@ -67,19 +66,20 @@ struct ObBuildMajorSSTablesParam final
 {
   ObBuildMajorSSTablesParam(
       const ObStorageSchema &storage_schema,
-      const bool has_truncate_info)
+      const bool has_merged_with_mds_info)
     : storage_schema_(storage_schema),
-      has_truncate_info_(has_truncate_info)
+      has_merged_with_mds_info_(has_merged_with_mds_info)
   {}
   bool is_valid() const
   {
     return storage_schema_.is_valid();
   }
-  TO_STRING_KV(K_(storage_schema), K_(has_truncate_info));
+  TO_STRING_KV(K_(storage_schema), K_(has_merged_with_mds_info));
   const ObStorageSchema &storage_schema_;
-  const bool has_truncate_info_;
+  const bool has_merged_with_mds_info_;
 };
 
+class ObTabletCopyDependencyMgr;
 class ObStorageHATabletsBuilder
 {
 public:
@@ -94,8 +94,8 @@ public:
       ObICopyLSViewInfoReader *reader,
       ObIDagNet *dag_net,
       common::ObIArray<ObLogicTabletID> &sys_tablet_id_list,
-      common::ObIArray<ObLogicTabletID> &data_tablet_id_list,
-      CopyTabletSimpleInfoMap &simple_info_map);
+      ObTabletCopyDependencyMgr &tablet_dep_mgr
+    );
   // Restore PENDING tablets meta. PENDING tablets will be exist at restore phase RESTORE_SYS_TABLETS,
   // RESTORE_TO_CONSISTENT_SCN, or QUICK_RESTORE. Leader gets the meta from backup, follower gets it from leader.
   // If that tablet meta identified uniquely by transfer sequence exists, replace and update the restore status to EMPTY.
@@ -104,9 +104,8 @@ public:
   int build_tablets_sstable_info(ObIDagNet *dag_net);
   int create_all_tablets_with_4_1_rpc(
       ObIDagNet *dag_net,
-      CopyTabletSimpleInfoMap &simple_info_map,
       common::ObIArray<ObLogicTabletID> &sys_tablet_id_list,
-      common::ObIArray<ObLogicTabletID> &data_tablet_id_list);
+      ObTabletCopyDependencyMgr &tablet_dep_mgr);
 private:
   int get_tablet_info_reader_(ObICopyTabletInfoReader *&reader);
   int get_tablet_info_restore_reader_(ObICopyTabletInfoReader *&reader);
@@ -146,6 +145,10 @@ private:
       const ObTablet *tablet,
       const ObSSTableArray &ddl_sstable_array,
       share::ObScnRange &scn_range);
+  int get_need_copy_inc_major_ddl_sstable_end_scn_(
+      const ObTablet *tablet,
+      const ObSSTableArray &ddl_sstable_array,
+      share::SCN &need_copy_end_scn);
   int get_ddl_sstable_min_start_scn_(
       const ObSSTableArray &ddl_sstable_array,
       share::SCN &max_start_scn);
@@ -158,8 +161,6 @@ private:
   int hold_local_complete_tablet_sstable_(
       ObTablet *tablet,
       ObTablesHandleArray &tables_handle);
-  int remove_uncomplete_tablet_(
-      const common::ObTabletID &tablet_id);
   int modified_tablet_info_(
       obrpc::ObCopyTabletInfo &tablet_info);
 
@@ -352,7 +353,9 @@ public:
     int assign_sstables(
         ObTablesHandleArray &mds_tables,
         ObTablesHandleArray &minor_tables,
-        ObTablesHandleArray &ddl_tables);
+        ObTablesHandleArray &ddl_tables,
+        ObTablesHandleArray &inc_major_tables,
+        ObTablesHandleArray &inc_major_ddl_tables);
 
     ObLS *ls_;
     common::ObTabletID tablet_id_;
@@ -360,10 +363,12 @@ public:
     ObTablesHandleArray mds_tables_;
     ObTablesHandleArray minor_tables_;
     ObTablesHandleArray ddl_tables_;
+    ObTablesHandleArray inc_major_ddl_tables_;
+    ObTablesHandleArray inc_major_tables_;
     ObTabletRestoreAction::ACTION restore_action_;
     share::SCN release_mds_scn_;
     TO_STRING_KV(KP_(ls), K_(tablet_id), KP_(src_tablet_meta), K_(mds_tables),
-        K_(minor_tables), K_(ddl_tables), K_(restore_action), K_(release_mds_scn));
+        K_(minor_tables), K_(ddl_tables), K_(inc_major_ddl_tables), K_(inc_major_tables), K_(restore_action), K_(release_mds_scn));
     DISALLOW_COPY_AND_ASSIGN(BatchBuildMinorSSTablesParam);
   };
 
@@ -449,6 +454,9 @@ private:
       const ObStorageSchema &storage_schema,
       const ObTablesHandleArray &major_tables,
       bool &is_hybrid_store);
+  static int assemble_and_append_hybrid_store_tables_(
+    const ObTablesHandleArray &hybrid_tables,
+    ObTablesHandleArray &sstables);
 };
 
 

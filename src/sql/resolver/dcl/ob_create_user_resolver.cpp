@@ -14,6 +14,7 @@
 #include "sql/resolver/dcl/ob_create_user_resolver.h"
 #include "sql/resolver/ddl/ob_database_resolver.h"
 #include "sql/resolver/dcl/ob_set_password_resolver.h"
+#include "lib/encrypt/ob_encrypted_helper.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -91,21 +92,43 @@ int ObCreateUserResolver::resolve(const ParseNode &parse_tree)
         if (OB_ISNULL(user_pass)) {
           ret = OB_ERR_PARSE_SQL;
           LOG_WARN("The child of parseNode should not be NULL", K(ret), K(i));
-        } else if (OB_UNLIKELY(lib::is_oracle_mode() && 4 != user_pass->num_child_) ||
+        } else if (OB_UNLIKELY(lib::is_oracle_mode() && 5 != user_pass->num_child_) ||
                    OB_UNLIKELY(lib::is_mysql_mode() && 5 != user_pass->num_child_ )) {
           ret = OB_ERR_PARSE_SQL;
           LOG_WARN("sql_parser parse user_identification error", K(ret));
         } else {
+          // resolve user name and host name
           ObString user_name;
           ObString host_name;
-
           if (OB_FAIL(resolve_user_host(user_pass, user_name, host_name))) {
             LOG_WARN("fail to resolve user_host");
           }
 
+          // resolve authentication plugin
           ObString password;
           ObString need_enc_str = ObString::make_string("NO");
           bool need_enc = true;
+          ObString plugin;
+          bool is_plugin_supported = true;
+          if (OB_SUCC(ret)) {
+            if (OB_NOT_NULL(user_pass->children_[4])) {
+              plugin.assign_ptr(str_tolower(const_cast<char *>(user_pass->children_[4]->str_value_),
+                                            static_cast<int32_t>(user_pass->children_[4]->str_len_)),
+                                            static_cast<int32_t>(user_pass->children_[4]->str_len_));
+              if (plugin.empty()) {
+                ret = OB_ERR_PLUGIN_IS_NOT_LOADED;
+                LOG_WARN("invalid auth plugin", K(plugin), K(ret));
+              }
+            } else {
+              // Use default_authentication_plugin system variable as default
+              if (OB_FAIL(params_.session_info_->get_sys_variable(
+                      share::SYS_VAR_DEFAULT_AUTHENTICATION_PLUGIN, plugin))) {
+                LOG_WARN("fail to get default_authentication_plugin variable", K(ret));
+              }
+            }
+          }
+
+          // resolve password definition
           if (OB_SUCC(ret)) {
             if (user_name.empty()) {
               ret = OB_CANNOT_USER;
@@ -126,13 +149,15 @@ int ObCreateUserResolver::resolve(const ParseNode &parse_tree)
                 need_enc_str = ObString::make_string("YES");
               } else {
                 //no enc
-                if (!ObSetPasswordResolver::is_valid_mysql41_passwd(password)) {
+                if (!ObSetPasswordResolver::is_valid_encrypted_passwd(password, plugin)) {
                   ret = OB_ERR_PASSWORD_FORMAT;
-                  LOG_WARN("Wrong password format", K(user_name), K(password), K(ret));
+                  LOG_WARN("Wrong password format", K(user_name), K(password), K(plugin), K(ret));
                 }
               }
             }
           }
+
+          // resolve user profile
           uint64_t profile_id = OB_INVALID_ID;
           if (OB_SUCC(ret) && NULL != profile) {
             ParseNode *profile_name = nullptr;
@@ -152,6 +177,8 @@ int ObCreateUserResolver::resolve(const ParseNode &parse_tree)
             }
           }
           create_user_stmt->set_profile_id(profile_id);  //只有oracle模式profile id是有效的
+
+          // check password strength
           if (OB_SUCC(ret) && need_enc) {
             if (!lib::is_oracle_mode() && OB_FAIL(check_password_strength(password))) {
               LOG_WARN("password don't satisfied current policy", K(ret));
@@ -162,15 +189,41 @@ int ObCreateUserResolver::resolve(const ParseNode &parse_tree)
               LOG_WARN("fail to check password strength", K(ret));
             }
           }
-          
+
+          // check user name and password length
           if (OB_SUCC(ret)) {
             if (user_name.length() > OB_MAX_USER_NAME_LENGTH) {
               ret = OB_WRONG_USER_NAME_LENGTH;
               LOG_USER_ERROR(OB_WRONG_USER_NAME_LENGTH, user_name.length(), user_name.ptr());
-            } else if (OB_FAIL(create_user_stmt->add_user(user_name, host_name, password, need_enc_str))) {
-              LOG_WARN("Failed to add user to ObCreateUserStmt", K(user_name), K(host_name), K(password), K(ret));
+            } else if (password.length() > OB_MAX_PASSWORD_LENGTH) {
+              if (lib::is_oracle_mode()) {
+                ret = OB_ERR_MISSING_OR_INVALID_PASSWORD;
+                LOG_USER_ERROR(OB_ERR_MISSING_OR_INVALID_PASSWORD);
+              } else {
+                ret = OB_NOT_SUPPORTED;
+                LOG_USER_ERROR(OB_NOT_SUPPORTED, "create a user with an excessively long password");
+              }
+            } else if (OB_FAIL(ObEncryptedHelper::
+                               check_data_version_for_auth_plugin(plugin,
+                                                                  params_.session_info_->get_effective_tenant_id(),
+                                                                  is_plugin_supported))) {
+              LOG_WARN("failed to check data version for auth plugin", K(ret));
+            } else if (OB_UNLIKELY(!is_plugin_supported)) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_WARN("caching_sha2_password is not supported when MIN_DATA_VERSION is below 4_4_2_0", K(ret));
+            } else if (OB_FAIL(create_user_stmt->add_user(user_name,
+                                                          host_name,
+                                                          password,
+                                                          need_enc_str,
+                                                          ObEncryptedHelper::format_plugin_name(plugin)))) {
+              LOG_WARN("Failed to add user to ObCreateUserStmt",
+                       K(user_name),
+                       K(host_name),
+                       K(password),
+                       K(plugin),
+                       K(ret));
             } else {
-              //do nothing
+              // do nothing
             }
           }
         }

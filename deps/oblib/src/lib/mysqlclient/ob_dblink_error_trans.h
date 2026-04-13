@@ -71,12 +71,33 @@ public:
     virtual ~CleanDblinkArrayFunc() = default;
     int operator()(common::hash::HashMapPair<uint32_t, int64_t> &kv);
   };
+  class GetDblinkConnCall
+  {
+  public:
+    GetDblinkConnCall(uint64_t dblink_id)
+      : dblink_id_(dblink_id), dblink_conn_(nullptr) {}
+    ~GetDblinkConnCall() = default;
+    void operator() (common::hash::HashMapPair<uint32_t, int64_t> &entry);
+  public:
+    uint64_t dblink_id_;
+    common::sqlclient::ObISQLConnection *dblink_conn_;
+  };
+  class AppendDblinkConnCall
+  {
+  public:
+    AppendDblinkConnCall(common::sqlclient::ObISQLConnection &dblink_conn)
+      : dblink_conn_(dblink_conn) {}
+    ~AppendDblinkConnCall() = default;
+    int operator() (common::hash::HashMapPair<uint32_t, int64_t> &entry);
+  public:
+    common::sqlclient::ObISQLConnection &dblink_conn_;
+  };
 public:
   static int mtl_new(ObTenantDblinkKeeper *&dblink_keeper);
   static int mtl_init(ObTenantDblinkKeeper *&dblink_keeper);
   static void mtl_destroy(ObTenantDblinkKeeper *&dblink_keeper);
 public:
-  ObTenantDblinkKeeper()
+  ObTenantDblinkKeeper():lock_(common::ObLatchIds::DBLINK_KEEPER_LOCK)
   {
     tenant_id_ = common::OB_INVALID_ID;
   }
@@ -93,7 +114,7 @@ private:
   int destroy();
 private:
   uint64_t tenant_id_;
-  obsys::ObRWLock lock_;
+  obsys::ObRWLock<> lock_;
   hash::ObHashMap<uint32_t, int64_t> dblink_conn_map_;
 };
 #endif

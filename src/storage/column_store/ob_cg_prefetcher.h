@@ -36,9 +36,11 @@ public:
       cur_micro_data_read_idx_(-1),
       agg_group_(nullptr),
       sstable_index_filter_(nullptr)
-  {}
+  {
+    prefetcher_sstable_type_ = ObIndexTreeMultiPassPrefetcher::CG_PREFETCH;
+  }
   virtual ~ObCGPrefetcher()
-  {}
+  { ObSSTableIndexFilterFactory::destroy_sstable_index_filter(sstable_index_filter_); }
   virtual void reset() override;
   virtual void reuse() override;
   int init(
@@ -68,7 +70,7 @@ public:
   }
   OB_INLINE bool is_prefetched_full() const
   {
-    return micro_data_prefetch_idx_  - cur_micro_data_read_idx_ == max_micro_handle_cnt_
+    return micro_data_prefetch_idx_  - cur_micro_data_read_idx_ == MAX_DATA_PREFETCH_DEPTH
         || access_ctx_->micro_block_handle_mgr_.reach_hold_limit();
   }
   OB_INLINE bool can_index_filter_skip(blocksstable::ObMicroIndexInfo &index_info)
@@ -116,6 +118,7 @@ private:
     }
     return can_continuous;
   }
+  void update_need_prewarm();
   struct ObCSIndexTreeLevelHandle : public ObIndexTreeLevelHandle {
   public:
     int prefetch(const int64_t level, ObCGPrefetcher &prefetcher);

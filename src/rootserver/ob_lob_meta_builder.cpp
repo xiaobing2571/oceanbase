@@ -95,6 +95,10 @@ int ObLobMetaBuilder::generate_aux_lob_meta_schema(
     if (OB_SUCC(ret)) {
       aux_lob_meta_schema.set_micro_index_clustered(data_schema.get_micro_index_clustered());
       aux_lob_meta_schema.set_enable_macro_block_bloom_filter(data_schema.get_enable_macro_block_bloom_filter());
+      aux_lob_meta_schema.set_micro_block_format_version(data_schema.get_micro_block_format_version());
+      if (data_schema.is_oracle_tmp_table_v2()) {
+        aux_lob_meta_schema.set_oracle_tmp_table_v2_index_table();
+      }
     }
 
   }
@@ -154,15 +158,17 @@ int ObLobMetaBuilder::set_basic_infos(
   aux_lob_meta_schema.set_autoinc_column_id(0);
   aux_lob_meta_schema.set_progressive_merge_num(data_schema.get_progressive_merge_num());
   // keep the initial value for table_mode, do not get table mode from data_schema which may be hidden table
-  // aux_lob_meta_schema.set_table_mode(data_schema.get_table_mode());
   aux_lob_meta_schema.set_block_size(data_schema.get_block_size());
   aux_lob_meta_schema.set_pctfree(data_schema.get_pctfree());
   aux_lob_meta_schema.set_storage_format_version(data_schema.get_storage_format_version());
   aux_lob_meta_schema.set_progressive_merge_round(data_schema.get_progressive_merge_round());
   aux_lob_meta_schema.set_duplicate_attribute(data_schema.get_duplicate_scope(),
                                               data_schema.get_duplicate_read_consistency());
+  aux_lob_meta_schema.set_merge_engine_type(ObMergeEngineStoreFormat::get_lob_aux_inherit_merge_engine_type(data_schema.get_merge_engine_type()));
   if (OB_FAIL(aux_lob_meta_schema.set_compress_func_name(data_schema.get_compress_func_name()))) {
     LOG_WARN("set_compress_func_name failed", K(data_schema));
+  } else if (OB_FAIL(aux_lob_meta_schema.set_ttl_definition(data_schema.get_ttl_definition(), data_schema.get_ttl_flag()))) {
+    LOG_WARN("set_ttl_definition failed", K(data_schema));
   }
   return ret;
 }

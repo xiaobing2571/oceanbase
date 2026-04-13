@@ -1902,7 +1902,7 @@ int ObInnerTableSchema::all_table_schema(ObTableSchema &table_schema)
 
   if (OB_SUCC(ret)) {
     ObObj micro_block_format_version_default;
-    micro_block_format_version_default.set_int(1);
+    micro_block_format_version_default.set_int(ObMicroBlockFormatVersionHelper::DEFAULT_VERSION);
     ADD_COLUMN_SCHEMA_T("micro_block_format_version", //column_name
       ++column_id, //column_id
       0, //rowkey_id
@@ -1917,6 +1917,101 @@ int ObInnerTableSchema::all_table_schema(ObTableSchema &table_schema)
       false, //is_autoincrement
       micro_block_format_version_default,
       micro_block_format_version_default); //default_value
+  }
+
+  if (OB_SUCC(ret)) {
+    ObObj semistruct_properties_default;
+    semistruct_properties_default.set_lob_value(ObLongTextType, "", static_cast<int32_t>(strlen("")));
+    ADD_COLUMN_SCHEMA_T("semistruct_properties", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObLongTextType, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      0, //column_length
+      -1, //column_precision
+      -1, //column_scale
+      false, //is_nullable
+      false, //is_autoincrement
+      semistruct_properties_default,
+      semistruct_properties_default); //default_value
+  }
+
+  if (OB_SUCC(ret)) {
+    ObObj mview_expand_definition_default;
+    mview_expand_definition_default.set_lob_value(ObLongTextType, "", static_cast<int32_t>(strlen("")));
+    ADD_COLUMN_SCHEMA_T("mview_expand_definition", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObLongTextType, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      0, //column_length
+      -1, //column_precision
+      -1, //column_scale
+      false, //is_nullable
+      false, //is_autoincrement
+      mview_expand_definition_default,
+      mview_expand_definition_default); //default_value
+  }
+
+  if (OB_SUCC(ret)) {
+    ObObj ttl_flag_default;
+    ttl_flag_default.set_varbinary(ObString::make_string("\x01"));
+    ADD_COLUMN_SCHEMA_T("ttl_flag", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObVarcharType, //column_type
+      CS_TYPE_BINARY, //column_collation_type
+      OB_MAX_VARCHAR_LENGTH, //column_length
+      -1, //column_precision
+      -1, //column_scale
+      false, //is_nullable
+      false, //is_autoincrement
+      ttl_flag_default,
+      ttl_flag_default); //default_value
+  }
+
+  if (OB_SUCC(ret)) {
+    ObObj delta_format_default;
+    delta_format_default.set_varchar(ObString::make_string("flat"));
+    ADD_COLUMN_SCHEMA_T("delta_format", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObVarcharType, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      OB_MAX_VARCHAR_LENGTH, //column_length
+      -1, //column_precision
+      -1, //column_scale
+      false, //is_nullable
+      false, //is_autoincrement
+      delta_format_default,
+      delta_format_default); //default_value
+  }
+
+  if (OB_SUCC(ret)) {
+    ObObj skip_index_level_default;
+    skip_index_level_default.set_int(0);
+    ADD_COLUMN_SCHEMA_T("skip_index_level", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObIntType, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      sizeof(int64_t), //column_length
+      -1, //column_precision
+      -1, //column_scale
+      false, //is_nullable
+      false, //is_autoincrement
+      skip_index_level_default,
+      skip_index_level_default); //default_value
   }
   table_schema.set_index_using_type(USING_BTREE);
   table_schema.set_row_store_type(ENCODING_ROW_STORE);

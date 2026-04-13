@@ -19,6 +19,12 @@
 
 namespace oceanbase
 {
+
+namespace compaction
+{
+enum ObMergeType : uint8_t;
+}
+
 namespace common
 {
 
@@ -66,7 +72,16 @@ enum class ObMergeEngineType : uint8_t
 {
   OB_MERGE_ENGINE_PARTIAL_UPDATE = 0,
   OB_MERGE_ENGINE_DELETE_INSERT = 1,
-  OB_MERGE_ENGINE_MAX
+  OB_MERGE_ENGINE_APPEND_ONLY = 2, //FARM COMPAT WHITELIST
+  OB_MERGE_ENGINE_UNKNOWN = 3,
+  OB_MERGE_ENGINE_MAX = 255
+};
+
+enum ObSkipIndexLevel : uint8_t
+{
+  OB_SKIP_INDEX_LEVEL_BASE_ONLY = 0,
+  OB_SKIP_INDEX_LEVEL_BASE_AND_DELTA_SSTABLE = 1,
+  OB_SKIP_INDEX_LEVEL_MAX
 };
 
 struct ObStoreFormatItem
@@ -83,6 +98,8 @@ public:
   static const ObStoreFormatType STORE_FORMAT_MYSQL_DEFAULT = OB_STORE_FORMAT_DYNAMIC_MYSQL;
   static const ObStoreFormatType STORE_FORMAT_ORACLE_START = OB_STORE_FORMAT_NOCOMPRESS_ORACLE;
   static const ObStoreFormatType STORE_FORMAT_ORACLE_DEFAULT = OB_STORE_FORMAT_ARCHIVE_ORACLE;
+  // originally row store type of mini / minor sstable is flat
+  static const ObRowStoreType DEFAULT_MINOR_ROW_STORE_TYPE = FLAT_ROW_STORE;
 private:
   ObStoreFormat() {};
   virtual ~ObStoreFormat() {};
@@ -91,13 +108,27 @@ public:
   {
     return type >= FLAT_ROW_STORE && type < MAX_ROW_STORE;
   }
+  static inline bool is_minor_row_store_type_valid(const ObRowStoreType type)
+  {
+    return is_row_store_type_with_flat(type) || CS_ENCODING_ROW_STORE == type;
+  }
   static inline const char *get_row_store_name(const ObRowStoreType type)
   {
     return is_row_store_type_valid(type) ? row_store_name[type] : NULL;
   }
   static inline ObRowStoreType get_default_row_store_type(const bool is_major = true)
   {
-    return is_major ? ENCODING_ROW_STORE : FLAT_ROW_STORE;
+    return is_major ? ENCODING_ROW_STORE : DEFAULT_MINOR_ROW_STORE_TYPE;
+  }
+  static int resolve_delta_row_store_type(const ObString& delta_format, ObRowStoreType& row_store_type);
+  static const char* get_delta_format_name(const ObRowStoreType row_store_type)
+  {
+    return is_minor_row_store_type_valid(row_store_type) ? delta_format_name[row_store_type] : nullptr;
+  }
+  static bool is_delta_format_valid(const ObString &delta_format)
+  {
+    ObRowStoreType row_store_type;
+    return OB_SUCCESS == resolve_delta_row_store_type(delta_format, row_store_type);
   }
   static int find_row_store_type(const ObString &row_store, ObRowStoreType &row_store_type);
   static inline bool is_store_format_mysql(const ObStoreFormatType store_format)
@@ -132,6 +163,10 @@ public:
   {
     return is_store_format_valid(store_format) ? store_format_items[store_format].row_store_type_: MAX_ROW_STORE;
   }
+  static inline bool is_row_store_type_with_flat(const ObRowStoreType type)
+  {
+    return FLAT_ROW_STORE == type || FLAT_OPT_ROW_STORE == type;
+  }
   static inline bool is_row_store_type_with_encoding(const ObRowStoreType type)
   {
     return ENCODING_ROW_STORE == type || SELECTIVE_ENCODING_ROW_STORE == type || CS_ENCODING_ROW_STORE == type;
@@ -158,6 +193,7 @@ public:
 private:
   static const ObStoreFormatItem store_format_items[OB_STORE_FORMAT_MAX];
   static const char *row_store_name[MAX_ROW_STORE];
+  static const char *delta_format_name[MAX_ROW_STORE];
 };
 
 class ObTableStoreFormat {
@@ -214,11 +250,35 @@ static const char *MergeEngineTypeStr[] = { "PARTIAL_UPDATE",
 class ObMergeEngineStoreFormat
 {
 public:
-  static inline bool is_merge_engine_valid(const ObMergeEngineType type)
+  static OB_INLINE bool is_merge_engine_valid(const ObMergeEngineType type)
   {
-    return type >= ObMergeEngineType::OB_MERGE_ENGINE_PARTIAL_UPDATE && type < ObMergeEngineType::OB_MERGE_ENGINE_MAX;
+    return type == ObMergeEngineType::OB_MERGE_ENGINE_PARTIAL_UPDATE ||
+           type == ObMergeEngineType::OB_MERGE_ENGINE_DELETE_INSERT ||
+           type == ObMergeEngineType::OB_MERGE_ENGINE_APPEND_ONLY;
   }
-  static inline const char *get_merge_engine_type_name(const ObMergeEngineType merge_engine_type)
+  static OB_INLINE bool is_default_merge_engine(const ObMergeEngineType type)
+  {
+    return type == ObMergeEngineType::OB_MERGE_ENGINE_PARTIAL_UPDATE;
+  }
+
+  static OB_INLINE bool is_merge_engine_support_delta_sstable_skip_index(const ObMergeEngineType type)
+  {
+    return type == ObMergeEngineType::OB_MERGE_ENGINE_DELETE_INSERT ||
+           type == ObMergeEngineType::OB_MERGE_ENGINE_APPEND_ONLY;
+  }
+
+  static OB_INLINE ObMergeEngineType get_lob_aux_inherit_merge_engine_type(const ObMergeEngineType type)
+  {
+    // LOB_AUX can't inherit delete-insert merge engine because of the dependency of sql_seq in OBCDC
+    switch (type) {
+      case ObMergeEngineType::OB_MERGE_ENGINE_APPEND_ONLY:
+        return ObMergeEngineType::OB_MERGE_ENGINE_APPEND_ONLY;
+      default:
+        return ObMergeEngineType::OB_MERGE_ENGINE_PARTIAL_UPDATE;
+    }
+  }
+
+  static OB_INLINE const char *get_merge_engine_type_name(const ObMergeEngineType merge_engine_type)
   {
     const int64_t merge_engine_type_idx = static_cast<int64_t>(merge_engine_type);
     const char *str = "INVALID";
@@ -229,6 +289,10 @@ public:
       }
       case ObMergeEngineType::OB_MERGE_ENGINE_DELETE_INSERT: {
         str = "DELETE_INSERT";
+        break;
+      }
+      case ObMergeEngineType::OB_MERGE_ENGINE_APPEND_ONLY: {
+        str = "APPEND_ONLY";
         break;
       }
       case ObMergeEngineType::OB_MERGE_ENGINE_MAX:

@@ -395,7 +395,7 @@ do {                                                                            
       } else if ((result->pl_parse_info_.is_pl_parse_ && NULL == result->pl_parse_info_.pl_ns_) \
                  || result->is_dynamic_sql_) { \
         if (result->no_param_sql_len_ + (start - result->pl_parse_info_.last_pl_symbol_pos_ - 1) \
-            + (int)(log10(idx)) + 3 \
+            + (0 == idx ? 0 : (int)(log10(idx))) + 3 \
             > result->no_param_sql_buf_len_) { \
           char *buf = parse_malloc(result->no_param_sql_buf_len_ * 2, result->malloc_pool_); \
           if (OB_UNLIKELY(NULL == buf)) { \
@@ -973,6 +973,7 @@ for (int32_t _i = 0; _i < _yyleng; ++_i) {                                      
                            NULL,                                                  \
                            NULL,                                                  \
                            NULL,                                                  \
+                           NULL,                                                  \
                            NULL,  /* PARSE_SELECT_WITH_CHECK_OPTION */            \
                            NULL   /* PARSE_SELECT_INTO_EXTRA */);
 
@@ -1140,7 +1141,7 @@ do {\
     }                                                                           \
   } while(0);                                                                   \
 
-#define malloc_select_values_stmt(node, result, values_node, order_by_node, approx_node, limit_node)\
+#define malloc_select_values_stmt(node, result, values_node, order_by_node, approx_node, limit_node, vector_index_params)\
   do {\
     /*gen select list*/\
     ParseNode *star_node = NULL;\
@@ -1162,6 +1163,7 @@ do {\
     node->children_[PARSE_SELECT_ORDER] = order_by_node;\
     node->children_[PARSE_SELECT_APPROX] = approx_node;\
     node->children_[PARSE_SELECT_LIMIT] = limit_node;\
+    node->children_[PARSE_SELECT_VECTOR_INDEX_PARAMS] = vector_index_params;\
   } while(0);\
 
 #define refine_insert_values_table(node)\
@@ -1228,20 +1230,21 @@ do {\
     } \
   } while(0); \
 
-#define flatten_and_or(malloc_pool, result, ret_node, left_node, right_node, type) \
+#define flatten_bin_op(malloc_pool, result, ret_node, left_node, right_node, type) \
   do { \
     ret_node = NULL; \
-    if (NULL == left_node || NULL == right_node || (T_OP_OR != type && T_OP_AND != type)) { \
+    if (NULL == left_node || NULL == right_node || (T_OP_OR != type && T_OP_AND != type && T_OP_CNN != type)) { \
       result->extra_errno_ = OB_PARSER_ERR_UNEXPECTED; \
       yyerror(NULL, result, "unexpected param\n"); \
       YYABORT; \
-    } else if (left_node->type_ == type && right_node->type_ == type) { \
+    } else if (left_node->type_ == type && (T_OP_CNN != type || 1 != left_node->is_assigned_from_child_) && \
+               right_node->type_ == type && (T_OP_CNN != type || 1 != right_node->is_assigned_from_child_)) { \
       /* (A OR B) OR (C OR D) */ \
       append_list(malloc_pool, result, ret_node, left_node, right_node); \
-    } else if (left_node->type_ == type && right_node->type_ != type) { \
+    } else if (left_node->type_ == type && right_node->type_ != type && (T_OP_CNN != type || 1 != left_node->is_assigned_from_child_)) { \
       /* (A OR B) OR C */ \
       push_back_list(malloc_pool, result, ret_node, left_node, right_node); \
-    } else if (left_node->type_ != type && right_node->type_ == type) { \
+    } else if (left_node->type_ != type && right_node->type_ == type && (T_OP_CNN != type || 1 != right_node->is_assigned_from_child_)) { \
       /* A OR (B OR C) */ \
       push_front_list(malloc_pool, result, ret_node, right_node, left_node); \
     } else { \

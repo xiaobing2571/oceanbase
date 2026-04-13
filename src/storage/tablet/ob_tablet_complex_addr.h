@@ -21,6 +21,8 @@
 #include "storage/meta_mem/ob_meta_obj_struct.h"
 #include "storage/multi_data_source/adapter_define/mds_dump_node.h"
 #include "storage/tablet/ob_tablet_dumped_medium_info.h"
+#include "storage/tablet/ob_tablet_table_store.h"
+
 
 namespace oceanbase
 {
@@ -86,7 +88,7 @@ bool ObTabletComplexAddr<T>::is_memory_object() const
 template <typename T>
 bool ObTabletComplexAddr<T>::is_disk_object() const
 {
-  return nullptr == ptr_ && addr_.is_block();
+  return nullptr == ptr_ && (addr_.is_block() || addr_.is_sslog());
 }
 
 template <typename T>
@@ -156,6 +158,10 @@ int64_t ObTabletComplexAddr<share::ObTabletAutoincSeq>::to_string(char *buf, con
 
 template <>
 int64_t ObTabletComplexAddr<ObTabletDumpedMediumInfo>::to_string(char *buf, const int64_t buf_len) const;
+
+template <>
+int64_t ObTabletComplexAddr<ObTabletTableStore>::to_string(char *buf, const int64_t buf_len) const;
+
 } // namespace storage
 } // namespace oceanbase
 

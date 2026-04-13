@@ -53,6 +53,10 @@ public:
       const ObIVector &vector,
       const int64_t vec_idx,
       const ObDatum &datum);
+  static bool verify_vector_and_datum_match_nop(
+      const ObIVector &vector,
+      const int64_t vec_idx,
+      const ObDatum &datum);
   static bool need_test_vec_with_type(
       const VectorFormat &format,
       const VecValueTypeClass &vec_tc);
@@ -174,7 +178,18 @@ public:
   void set_column_type_column_equal();
 
   void set_column_type_column_substring();
-
+  int build_block(
+    char *&buf,
+    int64_t &size)
+  {
+    int ret = OB_SUCCESS;
+    ObMicroBlockDesc micro_block_desc;
+    if (OB_SUCC(encoder_.build_micro_block_desc_in_unittest(micro_block_desc))) {
+      buf = encoder_.data_buffer_.data();
+      size = encoder_.data_buffer_.size();
+    }
+    return ret;
+  }
 protected:
   ObRowGenerate row_generate_;
   ObMicroBlockEncodingCtx ctx_;
@@ -729,10 +744,11 @@ void TestColumnDecoder::basic_filter_pushdown_in_op_test()
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
 
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_)) << "buffer size: " << data.get_buf_size() << std::endl;
 
   for (int64_t i = 0; i < full_column_cnt_; ++i) {
@@ -834,9 +850,10 @@ void TestColumnDecoder::basic_filter_pushdown_eq_ne_nu_nn_test()
 
   char* buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_)) << "buffer size: " << data.get_buf_size() << std::endl;
 
   for (int64_t i = 0; i < full_column_cnt_; ++i) {
@@ -963,10 +980,11 @@ void TestColumnDecoder::basic_filter_pushdown_comparison_test()
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
 
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_)) << "buffer size: " << data.get_buf_size() << std::endl;
   sql::ObPushdownWhiteFilterNode white_filter(allocator_);
 
@@ -1093,9 +1111,10 @@ void TestColumnDecoder::filter_pushdown_comaprison_neg_test()
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_)) << "buffer size: " << data.get_buf_size() << std::endl;
   sql::ObPushdownWhiteFilterNode white_filter(allocator_);
 
@@ -1233,10 +1252,11 @@ void TestColumnDecoder::basic_filter_pushdown_bt_test()
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
 
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_)) << "buffer size: " << data.get_buf_size() << std::endl;
   sql::ObPushdownWhiteFilterNode white_filter(allocator_);
 
@@ -1354,9 +1374,10 @@ void TestColumnDecoder::batch_decode_to_datum_test(bool is_condensed)
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_));
   const ObRowHeader *row_header = nullptr;
   int64_t row_len = 0;
@@ -1427,9 +1448,10 @@ void TestColumnDecoder::cell_decode_to_datum_test()
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_));
   int64_t row_len = 0;
   const char *row_data = nullptr;
@@ -1493,9 +1515,10 @@ void TestColumnDecoder::cell_decode_to_datum_test_without_hex()
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_));
   int64_t row_len = 0;
   const char *row_data = nullptr;
@@ -1573,9 +1596,10 @@ void TestColumnDecoder::cell_column_equal_decode_to_datum_test()
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_));
   int64_t row_len = 0;
   const char *row_data = nullptr;
@@ -1676,9 +1700,10 @@ void TestColumnDecoder::cell_inter_column_substring_to_datum_test()
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_));
   int64_t row_len = 0;
   const char *row_data = nullptr;
@@ -1728,7 +1753,7 @@ void TestColumnDecoder::cell_inter_column_substring_to_datum_test()
 //   }
 //   char *buf = NULL;
 //   int64_t size = 0;
-//   ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+//   ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
 //   ObMicroBlockDecoder decoder;
 //   // Batch get rows by row
 //   ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
@@ -1843,9 +1868,10 @@ void TestColumnDecoder::batch_decode_to_vector_test(
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_));
 
   ObArenaAllocator frame_allocator;
@@ -1958,9 +1984,10 @@ void TestColumnDecoder::col_equal_batch_decode_to_vector_test(const VectorFormat
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_));
 
   ObArenaAllocator frame_allocator;
@@ -2082,9 +2109,10 @@ void TestColumnDecoder::col_substr_batch_decode_to_vector_test(const VectorForma
 
   char *buf = NULL;
   int64_t size = 0;
-  ASSERT_EQ(OB_SUCCESS, encoder_.build_block(buf, size));
+  ASSERT_EQ(OB_SUCCESS, build_block(buf, size));
   ObMicroBlockDecoder decoder;
-  ObMicroBlockData data(encoder_.data_buffer_.data(), encoder_.data_buffer_.length());
+  ObMicroBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.init_with_prepare_micro_header(encoder_.data_buffer_.data(), encoder_.data_buffer_.length()));
   ASSERT_EQ(OB_SUCCESS, decoder.init(data, read_info_));
   ObArenaAllocator frame_allocator;
   sql::ObExecContext exec_context(test_allocator);
@@ -2217,6 +2245,27 @@ bool VectorDecodeTestUtil::verify_vector_and_datum_match(
   int bret = false;
   ObDatum vec_datum;
   if (datum.is_null()) {
+    bret = vector.is_null(vec_idx);
+  } else {
+    ObLength length = vector.get_length(vec_idx);
+    vec_datum.len_ = length;
+    vec_datum.ptr_ = vector.get_payload(vec_idx);
+    bret = ObDatum::binary_equal(vec_datum, datum);
+  }
+  if (!bret) {
+    LOG_INFO("datum not match with datum from vector", K(vec_idx), K(datum), K(vec_datum));
+  }
+  return bret;
+}
+
+bool VectorDecodeTestUtil::verify_vector_and_datum_match_nop(
+    const ObIVector &vector,
+    const int64_t vec_idx,
+    const ObDatum &datum)
+{
+  int bret = false;
+  ObDatum vec_datum;
+  if (datum.is_null_or_nop()) {
     bret = vector.is_null(vec_idx);
   } else {
     ObLength length = vector.get_length(vec_idx);

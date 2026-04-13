@@ -48,25 +48,28 @@ public:
   static int alloc_exprs_memory(ObTableCtx &ctx, ObExprFrameInfo &expr_frame_info);
   static int refresh_insert_exprs_frame(ObTableCtx &ctx,
                                         const common::ObIArray<sql::ObExpr *> &exprs,
-                                        const ObTableEntity &entity);
+                                        const ObITableEntity &entity);
   static int refresh_delete_exprs_frame(ObTableCtx &ctx,
                                         const common::ObIArray<sql::ObExpr *> &exprs,
                                         const ObTableEntity &entity);
   static int refresh_replace_exprs_frame(ObTableCtx &ctx,
                                          const common::ObIArray<sql::ObExpr *> &exprs,
-                                         const ObTableEntity &entity);
+                                         const ObITableEntity &entity);
   static int refresh_ttl_exprs_frame(ObTableCtx &ctx,
                                      const common::ObIArray<sql::ObExpr *> &ins_new_row,
-                                     const ObTableEntity &entity);
+                                     const ObITableEntity &entity);
   static int refresh_update_exprs_frame(ObTableCtx &ctx,
                                         const common::ObIArray<sql::ObExpr *> &new_row,
                                         const ObTableEntity &entity);
   static int refresh_insert_up_exprs_frame(ObTableCtx &ctx,
                                            const common::ObIArray<sql::ObExpr *> &ins_new_row,
-                                           const ObTableEntity &entity);
+                                           const ObITableEntity &entity);
   static int refresh_rowkey_exprs_frame(ObTableCtx &ctx,
                                         const common::ObIArray<sql::ObExpr *> &exprs,
-                                        const common::ObIArray<ObObj> &rowkey);
+                                        ObRowkey &rowkey);
+  static int refresh_hbase_exprs_frame(ObTableCtx &ctx,
+                                       const common::ObIArray<sql::ObExpr *> &exprs,
+                                       const ObHCell &hcell);
 private:
   static int refresh_exprs_frame(ObTableCtx &ctx,
                                  const common::ObIArray<sql::ObExpr *> &exprs,
@@ -104,6 +107,10 @@ private:
                                          sql::ObRawExpr *delta_expr = nullptr);
 
   static int generate_count_expr(ObTableCtx &ctx, sql::ObAggFunRawExpr *&expr);
+
+  static int generate_heap_table_hidden_pk_increment_expr(ObTableCtx &ctx,
+                                                          const ObTableColumnItem &item,
+                                                          sql::ObRawExpr *&expr);
 
   static int generate_autoinc_nextval_expr(ObTableCtx &ctx,
                                            const ObTableColumnItem &item,
@@ -285,7 +292,8 @@ private:
                                              const uint64_t table_id,
                                              sql::ObUniqueConstraintInfo &constraint_info);
   static int generate_constraint_infos(ObTableCtx &ctx,
-                                       common::ObIArray<sql::ObUniqueConstraintInfo> &cst_infos);
+                                       ObIAllocator &allocator,
+                                       common::ObIArray<sql::ObUniqueConstraintInfo*> &cst_infos);
   static int generate_constraint_ctdefs(ObTableCtx &ctx,
                                         ObIAllocator &allocator,
                                         sql::ObRowkeyCstCtdefArray &cst_ctdefs);

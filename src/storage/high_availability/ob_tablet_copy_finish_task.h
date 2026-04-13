@@ -60,8 +60,7 @@ class ObTabletCopyFinishTask final : public share::ObITask
 public:
   ObTabletCopyFinishTask();
   virtual ~ObTabletCopyFinishTask();
-  int init(
-      const ObTabletCopyFinishTaskParam &param);
+  int init(const ObTabletCopyFinishTaskParam &param);
   virtual int process() override;
   VIRTUAL_TO_STRING_KV(K("ObTabletCopyFinishTask"), KP(this));
   int add_sstable(ObTableHandleV2 &table_handle);
@@ -73,12 +72,14 @@ public:
   int set_tablet_status(const ObCopyTabletStatus::STATUS &status);
   int get_tablet_status(ObCopyTabletStatus::STATUS &status);
   int get_restore_action(ObTabletRestoreAction::ACTION &restore_action);
+  int get_latest_major_sstable(
+      const ObITable::TableKey &table_key,
+      ObTableHandleV2 &table_handle);
 
   const ObMigrationTabletParam *get_src_tablet_meta() const { return param_.src_tablet_meta_; }
 private:
   int create_new_table_store_with_major_();
   int create_new_table_store_with_minor_();
-  int trim_tablet_();
 
   int check_finish_copy_tablet_data_valid_();
   int get_tables_handle_ptr_(
@@ -91,17 +92,6 @@ private:
       const ObTablesHandleArray &major_tables_handle);
   int get_mds_sstable_max_end_scn_(share::SCN &max_escn);
   int check_log_replay_to_mds_sstable_end_scn_();
-  int classify_major_sstables_(
-      ObTablesHandleArray &shared_major_sstables,
-      ObTablesHandleArray &local_major_sstables);
-  int deal_with_shared_majors_(ObTablesHandleArray &major_tables_handle);
-#ifdef OB_BUILD_SHARED_STORAGE
-  int check_local_sstable_exist_(
-      const ObITable::TableKey &table_key,
-      ObTabletMemberWrapper<ObTabletTableStore> &table_store_wrapper,
-      bool &is_exist);
-#endif
-
 private:
   bool is_inited_;
   common::SpinRWLock lock_;
@@ -109,6 +99,8 @@ private:
   common::ObArenaAllocator arena_allocator_;
   ObTablesHandleArray minor_tables_handle_;
   ObTablesHandleArray ddl_tables_handle_;
+  ObTablesHandleArray inc_major_ddl_tables_handle_;
+  ObTablesHandleArray inc_major_tables_handle_;
   ObTablesHandleArray major_tables_handle_;
   ObTablesHandleArray mds_tables_handle_;
   common::ObArray<std::pair<ObITable::TableKey, int64_t>> last_meta_seq_array_;

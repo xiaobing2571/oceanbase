@@ -13,11 +13,14 @@
 #ifndef OCEANBASE_SQL_OB_LOG_LIMIT_H
 #define OCEANBASE_SQL_OB_LOG_LIMIT_H
 #include "sql/optimizer/ob_logical_operator.h"
+#include "sql/optimizer/ob_log_plan.h"
 #include "sql/optimizer/ob_log_set.h"
 namespace oceanbase
 {
 namespace sql
 {
+  template<typename R, typename C>
+  class PlanVisitor;
   class ObLogLimit : public ObLogicalOperator
   {
   public:
@@ -28,7 +31,9 @@ namespace sql
           is_fetch_with_ties_(false),
           limit_expr_(NULL),
           offset_expr_(NULL),
-          percent_expr_(NULL)
+          percent_expr_(NULL),
+          step_(LimitType::SINGLE_LIMIT),
+          order_items_(plan.get_allocator())
     {}
     virtual ~ObLogLimit() {}
     virtual int get_op_exprs(ObIArray<ObRawExpr*> &all_exprs) override;
@@ -55,6 +60,26 @@ namespace sql
     {
       is_top_limit_ = is_top_limit;
     }
+    void set_is_final()
+    {
+      step_ = LimitType::FINAL_LIMIT;
+    }
+    void set_partial(bool is_partial)
+    {
+      step_ = is_partial ? LimitType::PARTIAL_LIMIT : step_;
+    }
+    inline bool is_partial()
+    {
+      return step_ == LimitType::PARTIAL_LIMIT;
+    }
+    inline bool is_final()
+    {
+      return step_ == LimitType::FINAL_LIMIT;
+    }
+    inline bool is_single()
+    {
+      return step_ == LimitType::SINGLE_LIMIT;
+    }
     inline bool is_top_limit()
     {
       return is_top_limit_;
@@ -80,8 +105,8 @@ namespace sql
     ObRawExpr *limit_expr_;
     ObRawExpr *offset_expr_;
     ObRawExpr *percent_expr_;
-    ObSEArray<OrderItem, 4, common::ModulePageAllocator, true> order_items_;
-
+    LimitType step_;
+    ObSqlArray<OrderItem> order_items_;
   };
 }
 }

@@ -35,7 +35,8 @@ OB_SERIALIZE_MEMBER((ObMergeGroupBySpec, ObGroupBySpec),
                     sort_cmp_funcs_,
                     enable_encode_sort_,
                     est_rows_per_group_,
-                    enable_hash_base_distinct_
+                    enable_hash_base_distinct_,
+                    backup_exprs_
 );
 
 DEF_TO_STRING(ObMergeGroupBySpec)
@@ -308,6 +309,7 @@ int ObMergeGroupByOp::inner_close()
 {
   int ret = OB_SUCCESS;
   reset();
+  inner_sort_.destroy();
   if (OB_FAIL(ObGroupByOp::inner_close())) {
     LOG_WARN("failed to inner close", K(ret));
   }

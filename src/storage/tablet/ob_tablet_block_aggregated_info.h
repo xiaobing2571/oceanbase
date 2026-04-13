@@ -36,8 +36,8 @@ enum class ObTabletMacroType : int16_t
   SHARED_META_BLOCK = 3,
   SHARED_DATA_BLOCK = 4,
   LINKED_BLOCK = 5,
+  SSLOG_ROW = 6,
   MAX
-
 };
 struct ObSharedBlockInfo final
 {
@@ -116,22 +116,24 @@ public:
       const int64_t meta_bucket_num = EXCLUSIVE_BLOCK_BUCKET_NUM,
       const int64_t data_bucket_num = EXCLUSIVE_BLOCK_BUCKET_NUM,
       const int64_t shared_meta_bucket_num = SHARED_BLOCK_BUCKET_NUM,
-      const int64_t shared_data_bucket_num = SHARED_BLOCK_BUCKET_NUM);
+      const int64_t shared_data_bucket_num = SHARED_BLOCK_BUCKET_NUM,
+      const int64_t sslog_meta_key_bucket_num = SHARED_BLOCK_BUCKET_NUM);
 
 public:
-  TabletMacroSet meta_block_info_set_; // MacroBlockID of small_sstable->addr, other_block & linked_block in normal sstable
-  TabletMacroSet data_block_info_set_; // only data block of sstable, not include index_block and meta_block
+  TabletMacroSet meta_block_info_set_; // META_BLOCK: MacroBlockID of small_sstable->addr, other_block & linked_block in normal sstable
+  TabletMacroSet data_block_info_set_; // DATA_BLOCK: only data block of sstable, not include index_block and meta_block
   TabletMacroSet backup_block_info_set_;
-  TabletMacroSet shared_meta_block_info_set_; // MacroBlockID of
+  TabletMacroSet shared_meta_block_info_set_; // SHARED_META_BLOCK: MacroBlockID of
                                               // (sstable [stable.serialize], sstable->addr[->block_id()],
                                               //  table_store, auto_inc_seq, storage_schema, dump_kvs, medium_info_list)
-  TabletMacroMap clustered_data_block_info_map_; // map<macro_id, used_size (sum of nest_size, less than 2MB)>
+  TabletMacroMap clustered_data_block_info_map_; // SHARED_DATA_BLOCK map<macro_id, used_size (sum of nest_size, less than 2MB)>
                                                  // small_sstable->meta->macro_info_->nested_size
 };
 
 class ObTabletMacroInfo final
 {
 friend class ObMacroInfoIterator;
+friend class ObTablet;
 private:
   template <typename T>
   class ObBlockInfoArray final
@@ -173,6 +175,7 @@ public:
   int64_t get_deep_copy_size() const;
   int deep_copy(char *buf, const int64_t buf_len, ObTabletMacroInfo *&dest_obj) const;
   bool is_valid() const;
+  bool is_inited() const { return is_inited_; }
   TO_STRING_KV(
       K_(entry_block),
       K_(meta_block_info_arr),
@@ -202,7 +205,12 @@ public:
   ObBlockInfoArray<blocksstable::MacroBlockId> data_block_info_arr_;
   ObBlockInfoArray<blocksstable::MacroBlockId> shared_meta_block_info_arr_;
   ObBlockInfoArray<ObSharedBlockInfo> shared_data_block_info_arr_;
+private:
   bool is_inited_;
+  // Non-persistent flag indicating whether this object is owned by tablet (in tablet's memory buffer).
+  // If true, the object is a shallow copy from tablet's macro_info_addr_.ptr_ and should not be reset.
+  // If false, the object is newly allocated/deserialized and should be reset when done.
+  bool is_owned_by_tablet_;
 };
 
 /**

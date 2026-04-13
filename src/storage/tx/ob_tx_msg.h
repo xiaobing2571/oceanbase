@@ -65,6 +65,10 @@ namespace transaction
       TX_FREE_ROUTE_PUSH_STATE       = 80,
       TX_FREE_ROUTE_CHECK_ALIVE      = 81,
       TX_FREE_ROUTE_CHECK_ALIVE_RESP = 82,
+
+      /* for hotspot tx */
+      TX_HOTSPOT_DISPATCH_REDO = 90,
+      TX_HOTSPOT_SUBMIT_OTHER_REDO = 91,
     };
 
     struct ObTxMsg : public obrpc::ObIFill
@@ -146,9 +150,10 @@ namespace transaction
       share::ObLSArray parts_;
       ObTxCommitParts commit_parts_;
       common::ObString app_trace_info_;
+      common::ObString app_trace_id_;
       bool is_valid() const;
       INHERIT_TO_STRING_KV("txMsg", ObTxMsg, K_(expire_ts), K_(xid), K_(parts),
-          K_(app_trace_info));
+          K_(app_trace_info), K_(app_trace_id));
       OB_UNIS_VERSION(1);
     };
 
@@ -215,19 +220,23 @@ namespace transaction
       share::SCN commit_start_scn_;
       share::ObLSArray parts_;
       common::ObString app_trace_info_;
+      common::ObString app_trace_id_;
       ObTxCommitParts commit_parts_;
       bool is_valid() const;
-      INHERIT_TO_STRING_KV("txMsg", ObTxMsg, K_(expire_ts), K_(commit_start_scn), K_(parts), K_(app_trace_info), K_(commit_parts));
+      INHERIT_TO_STRING_KV("txMsg", ObTxMsg, K_(expire_ts), K_(commit_start_scn), K_(parts),
+          K_(app_trace_info), K_(commit_parts), K_(app_trace_id));
       OB_UNIS_VERSION(1);
     };
     struct ObTxCommitRespMsg : public ObTxMsg {
       ObTxCommitRespMsg() :
-          ObTxMsg(TX_COMMIT_RESP)
+          ObTxMsg(TX_COMMIT_RESP),
+          need_wait_interval_us_(0)
       {}
       share::SCN commit_version_;
       int ret_;
+      int64_t need_wait_interval_us_;
       bool is_valid() const;
-      INHERIT_TO_STRING_KV("txMsg", ObTxMsg, K_(ret), K_(commit_version));
+      INHERIT_TO_STRING_KV("txMsg", ObTxMsg, K_(ret), K_(commit_version), K_(need_wait_interval_us));
       OB_UNIS_VERSION(1);
     };
 
@@ -333,6 +342,7 @@ namespace transaction
     public:
       share::ObLSID upstream_;
       ObString app_trace_info_;
+      ObString app_trace_id_;
       bool is_valid() const;
       INHERIT_TO_STRING_KV("txMsg", ObTxMsg, K_(upstream));
       OB_UNIS_VERSION(1);
@@ -471,6 +481,7 @@ namespace transaction
       ObXATransID xid_;
       share::ObLSID upstream_;
       ObString app_trace_info_;
+      ObString app_trace_id_;
       bool is_valid() const;
       INHERIT_TO_STRING_KV("txMsg", ObTxMsg, K_(xid), K_(upstream));
       OB_UNIS_VERSION(1);

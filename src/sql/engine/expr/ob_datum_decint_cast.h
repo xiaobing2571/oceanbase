@@ -180,14 +180,12 @@ void batch_implicit_scale(ObDatumVector &arg_dv, ObDatumVector &result_dv, unsig
       } else {
         for (int i = 0; i < batch_size; i++) { scale_up_task(i); }
       }
-      eval_flags.set_all(batch_size);
     } else {
       for (int i = 0; i < batch_size; i++) {
         if (skip.at(i) || eval_flags.at(i)) {
           continue;
         } else {
           scale_up_task(i);
-          eval_flags.set(i);
         }
       }
     }
@@ -195,14 +193,12 @@ void batch_implicit_scale(ObDatumVector &arg_dv, ObDatumVector &result_dv, unsig
     if (OB_LIKELY(skip.accumulate_bit_cnt(batch_size) == 0
                   && eval_flags.accumulate_bit_cnt(batch_size) == 0)) {
       for (int i = 0; i < batch_size; i++) { scale_down_task(i); }
-      eval_flags.set_all(batch_size);
     } else {
       for (int i = 0; i < batch_size; i++) {
         if (skip.at(i) || eval_flags.at(i)) {
           continue;
         } else {
           scale_down_task(i);
-          eval_flags.set(i);
         }
       }
     }
@@ -279,14 +275,12 @@ void batch_explicit_scale(ObDatumVector &arg_dv, ObDatumVector &result_dv, unsig
       for (int i = 0; i < batch_size; i++) {
         scale_up_task(i);
       }
-      eval_flags.set_all(batch_size);
     } else {
       for (int i = 0; i < batch_size; i++) {
         if (skip.at(i) || eval_flags.at(i)) {
           continue;
         } else {
           scale_up_task(i);
-          eval_flags.set(i);
         }
       }
     }
@@ -296,14 +290,12 @@ void batch_explicit_scale(ObDatumVector &arg_dv, ObDatumVector &result_dv, unsig
       for (int i = 0; i < batch_size; i++) {
         scale_down_task(i);
       }
-      eval_flags.set_all(batch_size);
     } else {
       for (int i = 0; i < batch_size; i++) {
         if (skip.at(i) || eval_flags.at(i)) {
           continue;
         } else {
           scale_down_task(i);
-          eval_flags.set(i);
         }
       }
     }
@@ -387,14 +379,12 @@ void batch_const_scale(ObDatumVector &arg_dv, ObDatumVector &result_dv, const in
     if (OB_LIKELY(skip.accumulate_bit_cnt(batch_size) == 0
         && eval_flags.accumulate_bit_cnt(batch_size) == 0)) {
       for (int i = 0; i < batch_size; i++) { scale_up_task(i); }
-      eval_flags.set_all(batch_size);
     } else {
       for (int i = 0; i < batch_size; i++) {
         if (skip.at(i) || eval_flags.at(i)) {
           continue;
         } else {
           scale_up_task(i);
-          eval_flags.set(i);
         }
       }
     }
@@ -402,14 +392,12 @@ void batch_const_scale(ObDatumVector &arg_dv, ObDatumVector &result_dv, const in
     if (OB_LIKELY(skip.accumulate_bit_cnt(batch_size) == 0
                   && eval_flags.accumulate_bit_cnt(batch_size) == 0)) {
       for (int i = 0; i < batch_size; i++) { scale_down_task(i); }
-      eval_flags.set_all(batch_size);
     } else {
       for (int i = 0; i < batch_size; i++) {
         if (skip.at(i) || eval_flags.at(i)) {
           continue;
         } else {
           scale_down_task(i);
-          eval_flags.set(i);
         }
       }
     }
@@ -584,14 +572,12 @@ static int int_fast_batch_cast(const ObExpr &expr, ObEvalCtx &ctx, const ObBitVe
     } else {
       if (OB_LIKELY(skip_sz== 0 && eval_sz == 0)) {
         for (int i = 0; i < batch_size; i++) { cast_task(i); }
-        eval_flags.set_all(batch_size);
       } else {
         for (int i = 0; i < batch_size; i++) {
           if (skip.at(i) || eval_flags.at(i)) {
             continue;
           } else {
             cast_task(i);
-            eval_flags.set(i);
           }
         }
       }
@@ -704,14 +690,12 @@ DEF_BATCH_CAST_FUNC(ObDecimalIntTC, ObDecimalIntTC)
           for (int i = 0; i < batch_size; i++) {
             result_dv.at(i)->set_datum(*arg_dv.at(i));
           } // end for
-          eval_flags.set_all(batch_size);
         } else {
           for (int i = 0; i < batch_size; i++) {
             if (skip.at(i) || eval_flags.at(i)) {
               continue;
             } else {
               result_dv.at(i)->set_datum(*arg_dv.at(i));
-              eval_flags.set(i);
             }
           } // end for
         }
@@ -734,7 +718,6 @@ DEF_BATCH_CAST_FUNC(ObIntTC, ObDecimalIntTC)
       result_dv.at(i)->set_decimal_int(reinterpret_cast<const ObDecimalInt *>(&tmp_v),             \
                                        sizeof(int_type));                                          \
     }                                                                                              \
-    eval_flags.set(i);                                                                             \
   }
 
   int ret = OB_SUCCESS;
@@ -786,7 +769,6 @@ DEF_BATCH_CAST_FUNC(ObUIntTC, ObDecimalIntTC)
       result_dv.at(i)->set_decimal_int(reinterpret_cast<const ObDecimalInt *>(&tmp_v),             \
                                        sizeof(int_type));                                          \
     }                                                                                              \
-    eval_flags.set(i);                                                                             \
   }
 
 #define CONST_CAST_UINT(int_type) DO_CONST_CAST(uint64_t, int_type)
@@ -1260,6 +1242,8 @@ int eval_questionmark_decint2nmb(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &ex
   ObDatum *child_eval_datum = NULL;
   if (OB_FAIL(expr.args_[0]->eval(ctx, child_eval_datum))) {
     LOG_WARN("failef to eval child datum");
+  } else if (child_eval_datum->is_null()) {
+    expr_datum.set_null();
   } else {
     // child is questionmark, do not need evaluation.
     const ObDatum &child = expr.args_[0]->locate_expr_datum(ctx);
@@ -1283,6 +1267,8 @@ static int _eval_questionmark_nmb2decint(const ObExpr &expr, ObEvalCtx &ctx, ObD
   ObDatum *child_eval_datum = NULL;
   if (OB_FAIL(expr.args_[0]->eval(ctx, child_eval_datum))) {
     LOG_WARN("failef to eval child datum");
+  } else if (child_eval_datum->is_null()) {
+    expr_datum.set_null();
   } else {
     // child is questionmark, do not need evaluation.
     const ObDatum &child = expr.args_[0]->locate_expr_datum(ctx);
@@ -1311,6 +1297,8 @@ static int _eval_questionmark_decint2decint(const ObExpr &expr, ObEvalCtx &ctx, 
   ObDatum *child_eval_datum = NULL;
   if (OB_FAIL(expr.args_[0]->eval(ctx, child_eval_datum))) {
     LOG_WARN("failef to eval child datum");
+  } else if (child_eval_datum->is_null()) {
+    expr_datum.set_null();
   } else {
     ObScale out_scale = expr.datum_meta_.scale_;
     ObPrecision out_prec = expr.datum_meta_.precision_;

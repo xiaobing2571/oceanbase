@@ -30,7 +30,7 @@ public:
   ObIMicroBlockDecoder() : ObIMicroBlockReader() {}
   virtual ~ObIMicroBlockDecoder() {}
   virtual int compare_rowkey(
-    const ObDatumRowkey &rowkey, const int64_t index, int32_t &compare_result) override = 0;
+    const ObDatumRowkey &rowkey, const int64_t index, int32_t &compare_result, const int64_t common_prefix_len = 0) override = 0;
   virtual int compare_rowkey(const ObDatumRange &range, const int64_t index,
     int32_t &start_key_compare_result, int32_t &end_key_compare_result) = 0;
 
@@ -40,9 +40,6 @@ public:
     common::ObBitmap &result_bitmap) = 0;
   virtual int filter_pushdown_filter(const sql::ObPushdownFilterExecutor *parent,
     sql::ObWhiteFilterExecutor &filter, const sql::PushdownFilterInfo &pd_filter_info,
-    common::ObBitmap &result_bitmap) = 0;
-  virtual int filter_pushdown_truncate_filter(const sql::ObPushdownFilterExecutor *parent,
-    sql::ObPushdownFilterExecutor &filter, const sql::PushdownFilterInfo &pd_filter_info,
     common::ObBitmap &result_bitmap) = 0;
   virtual int get_rows(const common::ObIArray<int32_t> &cols,
     const common::ObIArray<const share::schema::ObColumnParam *> &col_params, const bool is_padding_mode,
@@ -58,27 +55,15 @@ public:
       const int64_t begin_idx,
       int64_t &row_idx,
       bool &equal) override;
-  virtual int get_rows(
-      const common::ObIArray<int32_t> &cols,
-      const common::ObIArray<const share::schema::ObColumnParam *> &col_params,
-      const common::ObIArray<blocksstable::ObStorageDatum> *default_datums,
-      const bool is_padding_mode,
-      const int32_t *row_ids,
-      const int64_t row_cap,
-      const char **cell_datas,
-      const int64_t vec_offset,
-      uint32_t *len_array,
-      sql::ObEvalCtx &eval_ctx,
-      sql::ObExprPtrIArray &exprs,
-      const bool need_init_vector) = 0;
 
 protected:
   virtual int find_bound(const ObDatumRange &range, const int64_t begin_idx, int64_t &row_idx,
     bool &equal, int64_t &end_key_begin_idx, int64_t &end_key_end_idx) override;
 
-  // For column store
+  // For column store and skip scan
   virtual int find_bound(const ObDatumRowkey &key, const bool lower_bound, const int64_t begin_idx,
-    const int64_t end_idx, int64_t &row_idx, bool &equal) override;
+    const int64_t end_idx, int64_t &row_idx, bool &equal,
+    const int64_t common_prefix_len = 0) override;
 
   #define FOREACH_ADD_DECODER(col_param) \
   for (int64_t i = 0; OB_SUCC(ret) && i < request_cnt_; ++i) { \

@@ -20,6 +20,7 @@
 #include "storage/lob/ob_lob_manager.h"
 #include "lib/charset/ob_charset_string_helper.h"
 #include "sql/engine/expr/ob_json_param_type.h"
+#include "sql/engine/expr/ob_array_expr_utils.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -759,6 +760,27 @@ int ObJsonExprHelper::get_json_val(const ObExpr &expr, ObEvalCtx &ctx,
                                                                   format_json)))) {
       LOG_WARN("failed: parse value to jsonBase", K(ret), K(val_type));
     }
+  } else if (val_type == ObCollectionSQLType) {
+    ObString val_str = json_datum->get_string();
+    ObString res_str;
+    void *buf = NULL;
+    if (OB_FAIL(ObArrayExprUtils::convert_to_string(*allocator, ctx, json_arg->obj_meta_.get_subschema_id(),
+                                                    val_str, res_str))) {
+      LOG_WARN("failed to convert collection to string", K(ret), K(val_type));
+    } else if (OB_ISNULL(buf = allocator->alloc(sizeof(ObJsonString)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("fail to allocate json string", K(ret));
+    } else {
+      ObIJsonBase* json_node = NULL;
+      json_node = (ObJsonString*)new(buf)ObJsonString(res_str.ptr(), res_str.length());
+      if (to_bin) {
+        if (OB_FAIL(ObJsonBaseFactory::transform(allocator, json_node, ObJsonInType::JSON_BIN, j_base))) {
+          LOG_WARN("failed: json tree to bin", K(ret));
+        }
+      } else {
+        j_base = json_node;
+      }
+    }
   } else {
     ObBasicSessionInfo *session = ctx.exec_ctx_.get_my_session();
     ObScale scale = json_arg->datum_meta_.scale_;
@@ -1205,12 +1227,14 @@ int ObJsonExprHelper::find_and_add_schema_cache(ObJsonSchemaCache* schema_cache,
   return ret;
 }
 
-int ObJsonExprHelper::find_and_add_cache(ObJsonPathCache* path_cache, ObJsonPath*& res_path,
-                                         ObString& path_str, int arg_idx, bool enable_wildcard,
-                                         bool is_const)
+int ObJsonExprHelper::find_and_add_cache(
+    ObIAllocator &allocator,
+    ObJsonPathCache* path_cache, ObJsonPath*& res_path,
+    ObString& path_str, int arg_idx, bool enable_wildcard,
+    bool is_const)
 {
   INIT_SUCC(ret);
-  if (OB_FAIL(path_cache->find_and_add_cache(res_path, path_str, arg_idx, is_const))) {
+  if (OB_FAIL(path_cache->find_and_add_cache(allocator, res_path, path_str, arg_idx, is_const))) {
     ret = OB_ERR_INVALID_JSON_PATH;
     LOG_USER_ERROR(OB_ERR_INVALID_JSON_PATH);
   } else if (!enable_wildcard && res_path->can_match_many()) {
@@ -1220,7 +1244,7 @@ int ObJsonExprHelper::find_and_add_cache(ObJsonPathCache* path_cache, ObJsonPath
   return ret;
 }
 
-bool ObJsonExprHelper::is_convertible_to_json(ObObjType &type)
+bool ObJsonExprHelper::is_convertible_to_json(const ObObjType type)
 {
   bool val = false;
   switch (type) {
@@ -2166,6 +2190,19 @@ int ObJsonExprHelper::get_clause_opt(ObExpr *expr,
   return ret;
 }
 
+bool ObJsonExprHelper::check_pick_type_match(ObJsonNodeType json_type, ObItemType pick_type)
+{
+  bool is_match = true;
+  if (lib::is_mysql_mode()) {
+    if (pick_type == T_JSON_NUMBER) {
+      is_match = ObIJsonBase::is_json_number_type(json_type);
+    } else if (pick_type == T_JSON_STRING) {
+      is_match = (json_type == ObJsonNodeType::J_STRING);
+    }
+  }
+  return is_match;
+}
+
 int ObJsonExprHelper::get_cast_string_len(ObExprResType &type1,
                         ObExprResType &type2,
                         common::ObExprTypeCtx &type_ctx,
@@ -2667,6 +2704,50 @@ int ObJsonExprHelper::get_json_max_depth_config()
   return json_max_depth;
 }
 
+bool ObJsonExprHelper::is_json_special_same_as_expr(ObItemType type, int64_t index)
+{
+  bool is_special = false;
+  if ((T_FUN_SYS_JSON_VALUE == type &&
+        (JSN_VAL_EMPTY == index || JSN_VAL_ERROR == index)) ||
+      (T_FUN_SYS_JSON_QUERY == type &&
+        (JSN_QUE_EMPTY == index || JSN_QUE_ERROR == index || JSN_QUE_MISMATCH == index))) {
+    is_special = true;
+  }
+  return is_special;
+}
+
+bool ObJsonExprHelper::check_json_inner_same_as(const ObSysFunRawExpr *expr1,
+                                                const ObSysFunRawExpr *expr2,
+                                                int64_t index,
+                                                ObExprEqualCheckContext *check_context)
+{
+  bool bool_ret = true;
+  if (!expr1->get_param_expr(index)->same_as(*expr2->get_param_expr(index), check_context)) {
+    if (T_INT == expr1->get_param_expr(index)->get_expr_type()
+        && T_INT == expr2->get_param_expr(index)->get_expr_type()) {
+      const ObConstRawExpr* val1 = static_cast<const ObConstRawExpr*>(expr1->get_param_expr(index));
+      const ObConstRawExpr* val2 = static_cast<const ObConstRawExpr*>(expr2->get_param_expr(index));
+      int64_t int_value1 = val1->get_value().get_int();
+      int64_t int_value2 = val2->get_value().get_int();
+      if (T_FUN_SYS_JSON_VALUE == expr1->get_expr_type()) {
+        if (!((int_value1 == 1 && int_value2 == 3) || (int_value1 == 3 && int_value2 == 1))) {
+          bool_ret = false;
+        }
+      } else if (T_FUN_SYS_JSON_QUERY == expr1->get_expr_type()) {
+        if ((JSN_QUE_ERROR == index || JSN_QUE_EMPTY == index) && !((int_value1 == 1 && int_value2 == 5) || (int_value1 == 5 && int_value2 == 1))) {
+          bool_ret = false;
+        } else if (JSN_QUE_MISMATCH == index && !((int_value1 == 1 && int_value2 == 2) || (int_value1 == 2 && int_value2 == 1)))   {
+          bool_ret = false;
+        }
+      }
+    } else {
+      bool_ret = false;
+    }
+  }
+
+  return bool_ret;
+}
+
 /********** ObJsonExprHelper for json partial update  ****************/
 int ObJsonExprHelper::pack_json_diff_res(
     const ObExpr &expr,
@@ -2814,7 +2895,7 @@ int ObJsonExprHelper::get_session_query_timeout_ts(ObEvalCtx &ctx, int64_t &time
 bool ObJsonExprHelper::check_json_path_can_pushdown(const ObRawExpr &path_expr)
 {
   bool res = false;
-  if (! path_expr.is_const_expr()) {
+  if (! path_expr.is_const_raw_expr()) {
     LOG_INFO("path expr is not const expr, so not support", K(path_expr));
   } else {
     const ObConstRawExpr &const_param = static_cast<const ObConstRawExpr &>(path_expr);
@@ -2837,6 +2918,7 @@ bool ObJsonExprHelper::check_json_expr_can_pushdown(const ObRawExpr &json_expr)
   if (T_FUN_SYS_JSON_VALUE == json_expr.get_expr_type() && json_expr.get_param_count() == OB_JSON_VALUE_EXPR_PARAM_COUNT) {
     const ObRawExpr *doc_expr = json_expr.get_param_expr(JSN_VAL_DOC);
     const ObRawExpr *path_expr = json_expr.get_param_expr(JSN_VAL_PATH);
+    ObItemType pick_type = json_expr.get_pick();
     const ObRawExpr *type_expr = json_expr.get_param_expr(JSN_VAL_RET);
     const ObRawExpr *trunc_expr = json_expr.get_param_expr(JSN_VAL_TRUNC);
     const ObRawExpr *ascii_expr = json_expr.get_param_expr(JSN_VAL_ASCII);
@@ -2859,22 +2941,25 @@ bool ObJsonExprHelper::check_json_expr_can_pushdown(const ObRawExpr &json_expr)
     // check path_expr
     } else if (! check_json_path_can_pushdown(*path_expr)) {
       LOG_INFO("json path is not support pushdown", KPC(path_expr), K(json_expr));
+    // check pick (stored in extra_)
+    } else if (pick_type != T_NULL) {
+      LOG_INFO("pick is not default, so do not support pushdown", K(pick_type), K(json_expr));
     // check return type expr
-    } else if (! type_expr->is_const_expr()) {
+    } else if (! type_expr->is_const_raw_expr()) {
       LOG_INFO("returning type is not const, so do not pushdown", KPC(type_expr), K(json_expr));
     // check trunc expr
-    } else if (! trunc_expr->is_const_expr() || static_cast<const ObConstRawExpr *>(trunc_expr)->get_value().get_int() != 0) {
+    } else if (! trunc_expr->is_const_raw_expr() || static_cast<const ObConstRawExpr *>(trunc_expr)->get_value().get_int() != 0) {
       LOG_INFO("truncate expr is not default value, so do not support pushdown", KPC(trunc_expr), K(json_expr));
     // check ascii expr
-    } else if (! ascii_expr->is_const_expr() || static_cast<const ObConstRawExpr *>(ascii_expr)->get_value().get_int() != 0) {
+    } else if (! ascii_expr->is_const_raw_expr() || static_cast<const ObConstRawExpr *>(ascii_expr)->get_value().get_int() != 0) {
       LOG_INFO("ascii expr not default value, so do not support pushdown", KPC(ascii_expr), K(json_expr));
-    } else if (! empty_expr->is_const_expr() || static_cast<const ObConstRawExpr *>(empty_expr)->get_value().get_int() != JSN_VALUE_IMPLICIT) {
+    } else if (! empty_expr->is_const_raw_expr() || static_cast<const ObConstRawExpr *>(empty_expr)->get_value().get_int() != JSN_VALUE_IMPLICIT) {
       LOG_INFO("empty clause expr not default value, so do not support pushdown", KPC(empty_expr), K(json_expr));
-    } else if (! empty_def_expr->is_const_expr() || ! static_cast<const ObConstRawExpr *>(empty_def_expr)->get_value().is_null()) {
+    } else if (! empty_def_expr->is_const_raw_expr() || ! static_cast<const ObConstRawExpr *>(empty_def_expr)->get_value().is_null()) {
       LOG_INFO("empty define clause expr not default value, so do not support pushdown", KPC(empty_def_expr), K(json_expr));
-    } else if (! error_expr->is_const_expr() || static_cast<const ObConstRawExpr *>(error_expr)->get_value().get_int() != JSN_VALUE_IMPLICIT) {
+    } else if (! error_expr->is_const_raw_expr() || static_cast<const ObConstRawExpr *>(error_expr)->get_value().get_int() != JSN_VALUE_IMPLICIT) {
       LOG_INFO("error clause expr not default value, so do not support pushdown", KPC(error_expr), K(json_expr));
-    } else if (! error_def_expr->is_const_expr() || ! static_cast<const ObConstRawExpr *>(error_def_expr)->get_value().is_null()) {
+    } else if (! error_def_expr->is_const_raw_expr() || ! static_cast<const ObConstRawExpr *>(error_def_expr)->get_value().is_null()) {
       LOG_INFO("error define clause expr not default value, so do not support pushdown", KPC(error_def_expr), K(json_expr));
     } else {
       res = true;
@@ -2894,7 +2979,7 @@ int ObJsonExprHelper::get_sub_column_path_from_json_expr(ObIAllocator& allocator
     if (OB_ISNULL(path_expr)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("path_expr is null", K(ret), K(json_expr));
-    } else if (! path_expr->is_const_expr()) {
+    } else if (! path_expr->is_const_raw_expr()) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("path_expr is not const", K(ret), KPC(path_expr), K(json_expr));
     } else {

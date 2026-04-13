@@ -64,7 +64,7 @@ void ObRemoteFetchLogImpl::destroy()
 
 int ObRemoteFetchLogImpl::do_schedule(const share::ObLogRestoreSourceItem &source)
 {
-  ObDIActionGuard(ObDIActionGuard::NS_ACTION, "SourceType[%s]", ObLogRestoreSourceItem::get_source_type_str(source.type_));
+  ObDIActionGuard di_action_guard(ObDIActionGuard::NS_ACTION, "SourceType[%s]", ObLogRestoreSourceItem::get_source_type_str(source.type_));
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
@@ -83,6 +83,7 @@ int ObRemoteFetchLogImpl::do_schedule(const share::ObLogRestoreSourceItem &sourc
   } else if (is_location_log_source_type(source.type_) || is_raw_path_log_source_type(source.type_)) {
     ret = archive_driver_->do_schedule();
     archive_driver_->set_global_recovery_scn(source.until_scn_);
+    archive_driver_->print_stat();
   } else {
     ret = OB_NOT_SUPPORTED;
     CLOG_LOG(WARN, "unsupported log source type", K(ret), K_(source.type));

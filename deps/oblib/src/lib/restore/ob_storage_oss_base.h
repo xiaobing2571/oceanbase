@@ -42,6 +42,7 @@ static const int OSS_BAD_REQUEST = 400;
 static const int OSS_OBJECT_NOT_EXIST = 404;
 static const int OSS_PERMISSION_DENIED = 403;
 static const int OSS_OBJECT_PWRITE_OFFSET_NOT_MATH = 409;
+static const int OSS_TOO_MANY_REQUESTS = 429;
 static const int OSS_LIMIT_EXCEEDED = 503;
 static const int MD5_STR_LENGTH = 32;//md5 buffer length
 static const char OSS_META_MD5[] = "x-oss-meta-md5";
@@ -68,6 +69,8 @@ int ob_oss_str_assign(aos_string_t &dst, const int64_t len, const char *src);
 class ObStorageOSSRetryStrategy : public ObStorageIORetryStrategy<aos_status_t *>
 {
 public:
+  using ObStorageIORetryStrategyBase<aos_status_t *>::errsim_retry_count_;
+  using ObStorageIORetryStrategyBase<aos_status_t *>::MAX_ERRSIM_RETRY_COUNT;
   ObStorageOSSRetryStrategy(const int64_t timeout_us = ObObjectStorageTenantGuard::get_timeout_us());
   virtual ~ObStorageOSSRetryStrategy();
 
@@ -87,7 +90,7 @@ public:
 
 protected:
   virtual bool should_retry_impl_(
-      const RetType &outcome, const int64_t attempted_retries) const override;
+      const RetType &outcome, const int64_t attempted_retries) override;
 
   int reinitialize_headers_() const;
   int reinitialize_buffer_() const;
@@ -155,9 +158,10 @@ public:
   int init(const common::ObString &storage_info);
   int init_oss_options(aos_pool_t *&aos_pool, oss_request_options_t *&oss_option);
   virtual bool is_inited();
-  int get_oss_file_meta(const common::ObString &bucket, const common::ObString &object,
-                        bool &is_file_exist, const char *&remote_md5, int64_t &file_length);
-  void print_oss_info(aos_table_t *resp_headers, aos_status_s *aos_ret, const int ob_errcode);
+  int get_oss_file_meta(
+      const common::ObString &bucket, const common::ObString &object,
+      ObStorageObjectMetaBase &meta, const char *&remote_md5);
+  void handle_oss_error(aos_table_t *req_headers, aos_table_t *resp_headers, aos_status_s *aos_ret, int &ob_errcode);
 
   int init_with_storage_info(common::ObObjectStorageInfo *storage_info);
   int init_oss_endpoint();
@@ -281,6 +285,8 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObStorageOssReader);
 };
 
+int ob_strtotime(const char *date_time, int64_t &time_s);
+
 class ObStorageOssUtil: public ObIStorageUtil
 {
 public:
@@ -308,7 +314,6 @@ public:
   virtual int is_tagging(const common::ObString &uri, bool &is_tagging);
   virtual int del_unmerged_parts(const ObString &uri) override;
 private:
-  int ob_strtotime(const char *date_time, int64_t &time);
   int tagging_object_(
       const common::ObString &uri,
       ObStorageOssBase &oss_base,

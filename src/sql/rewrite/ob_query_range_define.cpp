@@ -19,10 +19,15 @@
 #include "sql/engine/ob_exec_context.h"
 #include "sql/optimizer/ob_opt_est_utils.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
+#include "share/search_index/ob_search_index_encoder.h"
+#include "share/search_index/ob_search_index_config_filter.h"
 
 namespace oceanbase {
 using namespace common;
+using namespace share;
+
 namespace sql {
+ERRSIM_POINT_DEF(ERRSIM_FAST_NLJ_RANGE_GENERATOR_CHECK);
 
 void ObRangeNode::reset()
 {
@@ -329,7 +334,10 @@ OB_DEF_SERIALIZE_SIZE(ObRangeMap)
 }
 
 //ObRangeColumnMeta
-OB_SERIALIZE_MEMBER(ObRangeColumnMeta, column_type_);
+OB_SERIALIZE_MEMBER(ObRangeColumnMeta, column_type_, column_id_);
+
+//ObFastFinalPos
+OB_SERIALIZE_MEMBER(ObFastFinalPos, index_, offset_, flags_);
 
 int ObQueryRangeCtx::init(ObPreRangeGraph *pre_range_graph,
                           const ObIArray<ColumnItem> &range_columns,
@@ -341,13 +349,17 @@ int ObQueryRangeCtx::init(ObPreRangeGraph *pre_range_graph,
                           const int64_t index_prefix,
                           const ColumnIdInfoMap *geo_column_id_map,
                           const bool force_no_link,
-                          const ObTableSchema *index_schema)
+                          const ObTableSchema *index_schema,
+                          ObRawExprFactory *constraints_expr_factory,
+                          const bool ignore_fake_const_udf,
+                          ObSearchIndexRangeCtx *search_index_range_ctx)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(pre_range_graph)  || OB_ISNULL(exec_ctx_) || OB_ISNULL(exec_ctx_->get_my_session()) ||
-      OB_UNLIKELY(range_columns.count() <= 0)) {
+  ObQueryCtx *query_ctx = NULL;
+  if (OB_ISNULL(pre_range_graph) || OB_ISNULL(exec_ctx_) || OB_ISNULL(exec_ctx_->get_my_session()) ||
+      OB_ISNULL(query_ctx = exec_ctx_->get_query_ctx()) || OB_UNLIKELY(range_columns.count() <= 0)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get unexpected param", K(pre_range_graph), K(exec_ctx_));
+    LOG_WARN("get unexpected param", K(ret), K(pre_range_graph), K(exec_ctx_), K(query_ctx));
   } else if (OB_FAIL(column_metas_.assign(pre_range_graph->get_column_metas()))) {
     LOG_WARN("failed to assign column meta");
   } else if (OB_FAIL(column_flags_.prepare_allocate(pre_range_graph->get_column_metas().count()))) {
@@ -355,8 +367,9 @@ int ObQueryRangeCtx::init(ObPreRangeGraph *pre_range_graph,
   } else if (OB_FAIL(exec_ctx_->get_my_session()->
              is_enable_range_extraction_for_not_in(enable_not_in_range_))) {
     LOG_WARN("failed to check not in range enabled", K(ret));
-  } else if (OB_FAIL(exec_ctx_->get_my_session()->
-             get_optimizer_features_enable_version(optimizer_features_enable_version_))) {
+  } else if (OB_FAIL(query_ctx->get_global_hint().opt_params_.get_bool_opt_param(ObOptParamHint::ENABLE_RANGE_EXTRACTION_FOR_NOT_IN, enable_not_in_range_))) {
+    LOG_WARN("fail to check opt param not in range enabled", K(ret));
+  } else if (OB_FALSE_IT(optimizer_features_enable_version_ = query_ctx->optimizer_features_enable_version_)) {
     LOG_WARN("failed to get optimizer features enable version", K(ret));
   } else {
     column_cnt_ = range_columns.count();
@@ -371,11 +384,19 @@ int ObQueryRangeCtx::init(ObPreRangeGraph *pre_range_graph,
     geo_column_id_map_ = geo_column_id_map;
     is_geo_range_ = geo_column_id_map != NULL;
     force_no_link_ = force_no_link;
+    constraints_expr_factory_ = constraints_expr_factory;
+    ignore_fake_const_udf_ = ignore_fake_const_udf;
     if (OB_NOT_NULL(index_schema) &&
         index_schema->is_unique_index() &&
         index_schema->get_index_column_num() > 0) {
       unique_index_column_num_ = index_schema->get_index_column_num();
     }
+    if (OB_NOT_NULL(index_schema)) {
+      is_global_index_ = index_schema->is_global_index_table();
+    }
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(search_index_range_ctx)) {
+    search_index_range_ctx_ = search_index_range_ctx;
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < range_columns.count(); ++i) {
     const ColumnItem &col = range_columns.at(i);
@@ -437,6 +458,8 @@ int ObPreRangeGraph::deep_copy(const ObPreRangeGraph &other)
     LOG_WARN("failed to assign unprecise range exprs");
   } else if (OB_FAIL(total_range_sizes_.assign(other.total_range_sizes_))) {
     LOG_WARN("failed to assign total range sizes");
+  } else if (OB_FAIL(fast_final_pos_arr_.assign(other.fast_final_pos_arr_))) {
+    LOG_WARN("failed to assign fast final pos arrary");
   } else if (OB_FAIL(deep_copy_range_graph(other.node_head_))) {
     LOG_WARN("failed to deep copy range graph");
   } else if (OB_FAIL(deep_copy_column_metas(other.column_metas_))) {
@@ -532,6 +555,7 @@ int ObPreRangeGraph::deep_copy_column_metas(const ObIArray<ObRangeColumnMeta*> &
     } else {
       column_meta = new(ptr)ObRangeColumnMeta();
       column_meta->column_type_ = src_meta->column_type_;
+      column_meta->column_id_ = src_meta->column_id_;
       column_metas_.at(i) = column_meta;
     }
   }
@@ -616,7 +640,10 @@ int ObPreRangeGraph::preliminary_extract_query_range(const ObIArray<ColumnItem> 
                                                      const bool ignore_calc_failure,
                                                      const int64_t index_prefix /* =-1*/,
                                                      const ObTableSchema *index_schema /* = NULL*/,
-                                                     const ColumnIdInfoMap *geo_column_id_map /* = NULL*/)
+                                                     const ColumnIdInfoMap *geo_column_id_map /* = NULL*/,
+                                                     ObRawExprFactory *constraint_expr_factory /* = NULL*/,
+                                                     const bool ignore_fake_const_udf /* = false*/,
+                                                     ObSearchIndexRangeCtx *search_index_range_ctx /* = NULL*/)
 {
   int ret = OB_SUCCESS;
   bool force_no_link = false;
@@ -630,7 +657,9 @@ int ObPreRangeGraph::preliminary_extract_query_range(const ObIArray<ColumnItem> 
   } else if (OB_FAIL(ctx.init(this, range_columns, expr_constraints,
                               params, &expr_factory,
                               phy_rowid_for_table_loc, ignore_calc_failure, index_prefix,
-                              geo_column_id_map, force_no_link, index_schema))) {
+                              geo_column_id_map, force_no_link, index_schema,
+                              constraint_expr_factory, ignore_fake_const_udf,
+                              search_index_range_ctx))) {
     LOG_WARN("failed to init query range context");
   } else {
     ObExprRangeConverter converter(allocator_, ctx);
@@ -710,40 +739,162 @@ int ObPreRangeGraph::get_fast_nlj_tablet_ranges(ObFastFinalNLJRangeCtx &fast_nlj
                                                 common::ObIAllocator &allocator,
                                                 ObExecContext &exec_ctx,
                                                 const ParamStore &param_store,
+                                                int64_t range_buffer_idx,
                                                 void *range_buffer,
                                                 ObQueryRangeArray &ranges,
                                                 const common::ObDataTypeCastParams &dtc_params) const
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(!fast_nlj_range_ctx.has_check_valid)) {
-    if (OB_FAIL(ObRangeGenerator::check_can_final_fast_nlj_range(*this,
-                                                                 param_store,
-                                                                 fast_nlj_range_ctx.is_valid))) {
-      LOG_WARN("failed to check can final fast nlj range", K(ret));
+  if (fast_nlj_range_) {
+    if (OB_UNLIKELY(!fast_nlj_range_ctx.has_check_valid_)) {
+      if (OB_FAIL(ObRangeGenerator::check_can_final_fast_nlj_range(*this,
+                                                                  param_store,
+                                                                  fast_nlj_range_ctx.is_valid_))) {
+        LOG_WARN("failed to check can final fast nlj range", K(ret));
+      }
+      fast_nlj_range_ctx.has_check_valid_ = true;
     }
-    fast_nlj_range_ctx.has_check_valid = true;
-  }
-  if (OB_FAIL(ret)) {
-  } else if (OB_LIKELY(fast_nlj_range_ctx.is_valid)) {
-    if (OB_FAIL(ObRangeGenerator::generate_fast_nlj_range(*this,
-                                                          param_store,
-                                                          allocator,
-                                                          range_buffer))) {
-      LOG_WARN("failed to generate fast nlj range", K(ret));
-    } else if (OB_FAIL(ranges.push_back(static_cast<ObNewRange*>(range_buffer)))) {
-      LOG_WARN("failed to push back array", K(ret));
+    if (OB_FAIL(ret)) {
+    } else if (OB_LIKELY(fast_nlj_range_ctx.is_valid_)) {
+      if (OB_FAIL(ObRangeGenerator::generate_fast_nlj_range(*this,
+                                                            param_store,
+                                                            allocator,
+                                                            range_buffer,
+                                                            ranges))) {
+        LOG_WARN("failed to generate fast nlj range", K(ret));
+      }
+    } else {
+      bool dummy_all_single_value_ranges = false;
+      if (OB_FAIL(get_tablet_ranges(allocator,
+                                    exec_ctx,
+                                    ranges,
+                                    dummy_all_single_value_ranges,
+                                    dtc_params))) {
+        LOG_WARN("failed to get tablet ranges", K(ret));
+      }
     }
-  } else {
+  } else if (general_nlj_range_) {
+    ObArray<ObObj> objs;
+    bool can_fast_extract = true;
     bool dummy_all_single_value_ranges = false;
-    if (OB_FAIL(get_tablet_ranges(allocator,
-                                  exec_ctx,
-                                  ranges,
-                                  dummy_all_single_value_ranges,
-                                  dtc_params))) {
-      LOG_WARN("failed to get tablet ranges", K(ret));
+    bool always_false = false;
+    bool always_true = false;
+    bool need_check_range = false;
+    ObQueryRangeArray check_ranges;
+    if (OB_UNLIKELY(!fast_nlj_range_ctx.has_check_valid_)) {
+      if (OB_FAIL(get_tablet_ranges(allocator,
+                                    exec_ctx,
+                                    ranges,
+                                    dummy_all_single_value_ranges,
+                                    dtc_params))) {
+        LOG_WARN("failed to get tablet ranges", K(ret));
+      } else if (ranges.empty() && enable_new_false_range()) {
+        // always false
+      } else if (ranges.count() == 1 &&
+                 OB_FAIL(ObRangeGenerator::check_range_type(ranges.at(0), always_true, always_false))) {
+        LOG_WARN("failed to check false range", K(ret), K(ranges));
+      } else if (always_true) {
+        fast_nlj_range_ctx.has_check_valid_ = true;
+        fast_nlj_range_ctx.is_valid_ = false;
+      } else if (always_false) {
+        // do nothing
+      } else if (OB_FAIL(ObRangeGenerator::check_can_fast_extract_nlj_range(allocator,
+                                                                            exec_ctx,
+                                                                            dtc_params,
+                                                                            *this,
+                                                                            objs,
+                                                                            always_false,
+                                                                            can_fast_extract))) {
+        LOG_WARN("failed to check can fast extract nlj range", K(ret));
+      } else if (!can_fast_extract) {
+        fast_nlj_range_ctx.has_check_valid_ = true;
+        fast_nlj_range_ctx.is_valid_ = false;
+      } else if (OB_FAIL(fast_nlj_range_ctx.init_first_ranges(column_count_,
+                                                              range_buffer_idx,
+                                                              ranges))) {
+        LOG_WARN("failed to init first ranges", K(ret));
+      } else {
+        fast_nlj_range_ctx.has_check_valid_ = true;
+        fast_nlj_range_ctx.is_valid_ = true;
+      }
+    } else if (!fast_nlj_range_ctx.is_valid_) {
+      if (OB_FAIL(get_tablet_ranges(allocator,
+                                    exec_ctx,
+                                    ranges,
+                                    dummy_all_single_value_ranges,
+                                    dtc_params))) {
+        LOG_WARN("failed to get tablet ranges", K(ret));
+      }
+    } else if (OB_FAIL(ObRangeGenerator::check_can_fast_extract_nlj_range(allocator,
+                                                                          exec_ctx,
+                                                                          dtc_params,
+                                                                          *this,
+                                                                          objs,
+                                                                          always_false,
+                                                                          can_fast_extract))) {
+      LOG_WARN("failed to check can fast extract nlj range", K(ret));
+    } else if (!can_fast_extract) {
+      if (OB_FAIL(get_tablet_ranges(allocator,
+                                    exec_ctx,
+                                    ranges,
+                                    dummy_all_single_value_ranges,
+                                    dtc_params))) {
+        LOG_WARN("failed to get tablet ranges", K(ret));
+      } else {
+        fast_nlj_range_ctx.is_valid_ = false;
+      }
+    } else if (always_false) {
+      need_check_range = true;
+    } else if (OB_FAIL(ObRangeGenerator::fill_general_nlj_range(fast_nlj_range_ctx,
+                                                                *this,
+                                                                objs,
+                                                                range_buffer_idx,
+                                                                always_false,
+                                                                ranges))) {
+      LOG_WARN("failed to fill general nlj range", K(ret));
+    } else {
+      need_check_range = true;
+    }
+
+    if (OB_SUCC(ret) && always_false) {
+      ranges.reuse();
+      if (!enable_new_false_range()) {
+        ObNewRange *range = static_cast<ObNewRange*>(range_buffer);
+        ObObj *starts = reinterpret_cast<ObObj*>(static_cast<char*>(range_buffer) + sizeof(ObNewRange));
+        ObObj *ends = starts + column_count_;
+        for (int i = 0; OB_SUCC(ret) && i < column_count_; ++i) {
+          starts[i].set_max_value();
+          ends[i].set_min_value();
+        }
+        range->start_key_.assign(starts, column_count_);
+        range->end_key_.assign(ends, column_count_);
+        range->table_id_ = get_table_id();
+        if (OB_FAIL(ranges.push_back(range))) {
+          LOG_WARN("failed to push back ranges", K(ret));
+        }
+      }
+    }
+
+    if (OB_SUCC(ret) && ERRSIM_FAST_NLJ_RANGE_GENERATOR_CHECK && need_check_range) {
+      if (OB_FAIL(get_tablet_ranges(allocator,
+                                    exec_ctx,
+                                    check_ranges,
+                                    dummy_all_single_value_ranges,
+                                    dtc_params))) {
+        LOG_WARN("failed to get tablet ranges", K(ret));
+      } else if (check_ranges.count() != ranges.count()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("check and find error ranges", K(objs), K(ranges), K(check_ranges));
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < ranges.count(); ++i) {
+          if (!ranges.at(i)->equal(*check_ranges.at(i))) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("check and find error ranges", K(objs), K(ranges), K(check_ranges));
+          }
+        }
+      }
     }
   }
-
   return ret;
 }
 
@@ -764,7 +915,8 @@ int ObPreRangeGraph::fill_column_metas(const ObIArray<ColumnItem> &range_columns
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to allocate memeory for ObRangeColumnMeta");
     } else {
-      ObRangeColumnMeta *column_meta = new(ptr)ObRangeColumnMeta(column_expr->get_result_type());
+      ObRangeColumnMeta *column_meta =
+          new (ptr) ObRangeColumnMeta(column_expr->get_result_type(), column_expr->get_column_id());
       if (column_meta->column_type_.is_lob_locator()) {
         column_meta->column_type_.set_type(ObLongTextType);
       }
@@ -786,11 +938,12 @@ int ObPreRangeGraph::fill_column_metas(const ObIArray<ColumnItem> &range_columns
 
 int ObPreRangeGraph::get_prefix_info(int64_t &equal_prefix_count,
                                      int64_t &range_prefix_count,
+                                     int64_t &ss_range_prefix_count,
                                      bool &contain_always_false) const
 {
   int ret = OB_SUCCESS;
-  equal_prefix_count = OB_USER_MAX_ROWKEY_COLUMN_NUMBER;
-  range_prefix_count = OB_USER_MAX_ROWKEY_COLUMN_NUMBER;
+  equal_prefix_count = OB_MAX_ROWKEY_COLUMN_NUMBER;
+  range_prefix_count = 0;
   if (OB_ISNULL(node_head_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null range node");
@@ -800,11 +953,27 @@ int ObPreRangeGraph::get_prefix_info(int64_t &equal_prefix_count,
     contain_always_false = node_head_->always_false_;
   } else {
     bool equals[column_count_];
+    bool extract_ranges[column_count_];
     MEMSET(equals, 0, sizeof(bool) * column_count_);
-    if (OB_FAIL(get_prefix_info(node_head_, equals, equal_prefix_count))) {
+    MEMSET(extract_ranges, 0, sizeof(bool) * column_count_);
+    if (OB_FAIL(get_prefix_info(node_head_, equals, extract_ranges, 0,
+                                equal_prefix_count, range_prefix_count))) {
       LOG_WARN("failed to get prefix info");
-    } else {
-      range_prefix_count = (equal_prefix_count == column_count_) ? equal_prefix_count : equal_prefix_count + 1;
+    } else if (is_ss_range()) {
+      const ObRangeNode *cur_node = node_head_;
+      while (cur_node != nullptr && cur_node->min_offset_ < skip_scan_offset_) {
+        cur_node = cur_node->and_next_;
+      }
+      if (cur_node != nullptr && cur_node->min_offset_ == skip_scan_offset_) {
+        const ObRangeNode *ss_head = cur_node;
+        int64_t ss_equal_prefix_count = OB_MAX_ROWKEY_COLUMN_NUMBER;
+        MEMSET(equals, 0, sizeof(bool) * column_count_);
+        MEMSET(extract_ranges, 0, sizeof(bool) * column_count_);
+        if (OB_FAIL(get_prefix_info(node_head_, equals, extract_ranges, skip_scan_offset_,
+                                    ss_equal_prefix_count, ss_range_prefix_count))) {
+          LOG_WARN("failed to get prefix info");
+        }
+      }
     }
   }
   return ret;
@@ -812,39 +981,50 @@ int ObPreRangeGraph::get_prefix_info(int64_t &equal_prefix_count,
 
 int ObPreRangeGraph::get_prefix_info(const ObRangeNode *range_node,
                                      bool* equals,
-                                     int64_t &equal_prefix_count) const
+                                     bool* extract_ranges,
+                                     const int64_t start_offset,
+                                     int64_t &equal_prefix_count,
+                                     int64_t &range_prefix_count) const
 {
   int ret = OB_SUCCESS;
-  ObSEArray<int64_t, 8> new_idx;
+  ObSEArray<int64_t, 8> new_equal_idx;
+  ObSEArray<int64_t, 8> new_range_idx;
   for (const ObRangeNode *cur_node = range_node; OB_SUCC(ret) && cur_node != NULL; cur_node = cur_node->or_next_) {
-    // reset equal flag in previous or range node
-    for (int64_t j = 0; j < new_idx.count(); ++j) {
-      equals[new_idx.at(j)] = false;
-    }
-    new_idx.reset();
-
     if (cur_node->min_offset_ >= 0 &&
-        OB_FAIL(get_new_equal_idx(cur_node, equals, new_idx))) {
+        OB_FAIL(get_new_equal_idx(cur_node, equals, new_equal_idx))) {
+      LOG_WARN("failed to get new idx");
+    } else if (cur_node->min_offset_ >= 0 &&
+        OB_FAIL(get_new_range_idx(cur_node, extract_ranges, new_range_idx))) {
       LOG_WARN("failed to get new idx");
     } else if (cur_node->and_next_ != nullptr) {
-      if (OB_FAIL(SMART_CALL(get_prefix_info(cur_node->and_next_, equals, equal_prefix_count)))) {
+      if (OB_FAIL(SMART_CALL(get_prefix_info(cur_node->and_next_, equals, extract_ranges, start_offset,
+                                             equal_prefix_count, range_prefix_count)))) {
         LOG_WARN("failed to check is strict equal graph");
       }
     } else {
-      int64_t cur_pos = 0;
-      for (; cur_pos < column_count_; ++cur_pos) {
+      int64_t cur_pos = start_offset;
+      int64_t tmp_range_prefix_count = 0;
+      for (; cur_pos < column_count_; ++cur_pos, ++tmp_range_prefix_count) {
         if (!equals[cur_pos]) {
+          if (extract_ranges[cur_pos]) {
+            ++tmp_range_prefix_count;
+          }
           break;
         }
       }
+      cur_pos -= start_offset;
       equal_prefix_count = std::min(equal_prefix_count, cur_pos);
+      range_prefix_count = std::max(range_prefix_count, tmp_range_prefix_count);
     }
-  }
-  // reset equal flag in current range node
-  if (OB_SUCC(ret)) {
-    for (int64_t j = 0; j < new_idx.count(); ++j) {
-      equals[new_idx.at(j)] = false;
+    // reset flag in current range node
+    for (int64_t j = 0; j < new_equal_idx.count(); ++j) {
+      equals[new_equal_idx.at(j)] = false;
     }
+    new_equal_idx.reuse();
+    for (int64_t j = 0; j < new_range_idx.count(); ++j) {
+      extract_ranges[new_range_idx.at(j)] = false;
+    }
+    new_range_idx.reuse();
   }
   return ret;
 }
@@ -858,6 +1038,25 @@ int ObPreRangeGraph::get_new_equal_idx(const ObRangeNode *range_node,
     if (!equals[i] && range_node->start_keys_[i] == range_node->end_keys_[i] &&
         (range_node->start_keys_[i] < OB_RANGE_EXTEND_VALUE || range_node->start_keys_[i] == OB_RANGE_NULL_VALUE)) {
       equals[i] = true;
+      if (OB_FAIL(new_idx.push_back(i))) {
+        LOG_WARN("failed to push back idx", K(i));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObPreRangeGraph::get_new_range_idx(const ObRangeNode *range_node,
+                                       bool* extract_ranges,
+                                       ObIArray<int64_t> &new_idx) const
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = range_node->min_offset_; OB_SUCC(ret) && i <= range_node->max_offset_; ++i) {
+    if (!extract_ranges[i] && (range_node->start_keys_[i] < OB_RANGE_EXTEND_VALUE ||
+                               range_node->start_keys_[i] == OB_RANGE_NULL_VALUE  ||
+                               range_node->end_keys_[i] < OB_RANGE_EXTEND_VALUE ||
+                               range_node->end_keys_[i] == OB_RANGE_NULL_VALUE)) {
+      extract_ranges[i] = true;
       if (OB_FAIL(new_idx.push_back(i))) {
         LOG_WARN("failed to push back idx", K(i));
       }
@@ -997,6 +1196,13 @@ OB_DEF_SERIALIZE(ObPreRangeGraph)
   OB_UNIS_ENCODE(range_map_);
   OB_UNIS_ENCODE(skip_scan_offset_);
   OB_UNIS_ENCODE(flags_);
+  if (OB_SUCC(ret)) {
+    int64_t count = fast_final_pos_arr_.count();
+    OB_UNIS_ENCODE(count);
+    for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+      OB_UNIS_ENCODE(fast_final_pos_arr_.at(i));
+    }
+  }
   return ret;
 }
 
@@ -1044,6 +1250,19 @@ OB_DEF_DESERIALIZE(ObPreRangeGraph)
   OB_UNIS_DECODE(range_map_);
   OB_UNIS_DECODE(skip_scan_offset_);
   OB_UNIS_DECODE(flags_);
+  if (OB_SUCC(ret)) {
+    fast_final_pos_arr_.reset();
+    int64_t count = 0;
+    OB_UNIS_DECODE(count);
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(fast_final_pos_arr_.prepare_allocate(count))) {
+        LOG_WARN("failed to prepare allocate fast final pos arr", K(count));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+      OB_UNIS_DECODE(fast_final_pos_arr_.at(i));
+    }
+  }
   return ret;
 }
 
@@ -1068,6 +1287,11 @@ OB_DEF_SERIALIZE_SIZE(ObPreRangeGraph)
   OB_UNIS_ADD_LEN(range_map_);
   OB_UNIS_ADD_LEN(skip_scan_offset_);
   OB_UNIS_ADD_LEN(flags_);
+  count = fast_final_pos_arr_.count();
+  OB_UNIS_ADD_LEN(count);
+  for (int64_t i = 0; i < count; ++i) {
+    OB_UNIS_ADD_LEN(fast_final_pos_arr_.at(i));
+  }
   return len;
 }
 
@@ -1083,7 +1307,8 @@ DEF_TO_STRING(ObPreRangeGraph)
          K_(is_equal_range),
          K_(is_precise_get),
          K_(is_standard_range),
-         K_(contain_exec_param));
+         K_(contain_exec_param),
+         K_(flags));
     J_COMMA();
     J_NAME(N_RANGE_GRAPH);
     J_COLON();
@@ -1146,13 +1371,15 @@ int ObPreRangeGraph::get_range_exprs(ObRawExprFactory &expr_factory,
   const ColumnIdInfoMap *geo_column_id_map = nullptr;
   const ObTableSchema *index_schema = nullptr;
   bool force_no_link = true;
+  bool ignore_fake_const_udf = false;
   ObQueryRangeCtx ctx(exec_ctx);
   if (OB_FAIL(fill_column_metas(range_columns))) {
     LOG_WARN("failed to fill column metas");
   } else if (OB_FAIL(ctx.init(this, range_columns, expr_constraints,
                               params, &expr_factory,
                               phy_rowid_for_table_loc, ignore_calc_failure, index_prefix,
-                              geo_column_id_map, force_no_link, index_schema))) {
+                              geo_column_id_map, force_no_link, index_schema,
+                              NULL, ignore_fake_const_udf, NULL /*search_index_range_ctx*/))) {
     LOG_WARN("failed to init query range context");
   } else {
     ObExprRangeConverter converter(allocator_, ctx);
@@ -1571,6 +1798,15 @@ int ObPreRangeGraph::range_node_to_expr(ObQueryRangeCtx &ctx,
              node->end_keys_[node->max_offset_ + 1] == OB_RANGE_MAX_VALUE)) {
           op_type = T_OP_LE;
         }
+      } else if ((is_mysql_mode() && start_val_idx == OB_RANGE_NULL_VALUE && end_val_idx == OB_RANGE_MAX_VALUE) ||
+                 (is_oracle_mode() && start_val_idx == OB_RANGE_MIN_VALUE && end_val_idx == OB_RANGE_NULL_VALUE)) {
+        // is not null expr
+        // mysql mode: (null, max)
+        // oracle mode: (min, null)
+        op_type = T_OP_IS;
+        if (OB_FAIL(ObRawExprUtils::build_is_not_null_expr(expr_factory, column_expr, true, expr))) {
+          LOG_WARN("failed to build is null expr");
+        }
       } else {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("get unexpected range node", KPC(node));
@@ -1737,6 +1973,100 @@ int ObPreRangeGraph::create_op_expr(ObRawExprFactory &expr_factory,
     LOG_WARN("failed to add extra for op expr", KPC(extra_value_expr));
   } else {
     op_expr = tmp_expr;
+  }
+  return ret;
+}
+
+int ObPreRangeGraph::set_general_nlj_range_extraction(const ObIArray<ObFastFinalPos> &pos_arr)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(fast_final_pos_arr_.assign(pos_arr))) {
+    LOG_WARN("failed to assign array", K(ret));
+  } else {
+    general_nlj_range_ = true;
+  }
+  return ret;
+}
+
+ObSearchIndexRangeCtx::~ObSearchIndexRangeCtx()
+{
+  if (OB_NOT_NULL(json_filter_)) {
+    json_filter_->~ObSearchIndexConfigFilter();
+    json_filter_ = nullptr;
+  }
+}
+
+int ObSearchIndexRangeCtx::init(const ObTableSchema *base_table_schema,
+                                 const ColumnItem &column_item,
+                                 ObExecContext *exec_ctx,
+                                const ObTableSchema *index_schema,
+                                common::ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  const ObColumnSchemaV2 *index_column_schema = nullptr;
+  if (OB_ISNULL(base_table_schema) || OB_ISNULL(index_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null param", K(ret), K(base_table_schema), K(index_schema));
+  } else if (OB_ISNULL(exec_ctx)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null param", K(ret), KP(exec_ctx));
+  } else if (OB_UNLIKELY(column_item.is_invalid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null param", K(ret), K(column_item));
+  } else {
+    const uint64_t column_id = column_item.column_id_;
+    const int64_t column_idx = base_table_schema->get_column_idx(column_id);
+    if (column_idx < 0) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to get column idx", K(ret), K(column_id));
+    } else {
+      column_idx_ = column_idx;
+      column_meta_.column_id_ = column_id;
+      const ObRawExprResType col_type = column_item.expr_->get_result_type();
+      column_meta_.column_type_ = col_type;
+      if (col_type.is_lob_locator()) {
+        column_meta_.column_type_.set_type(ObLongTextType);
+      } else if (ob_is_string_tc(col_type.get_type())) {
+        const ObLength column_length = col_type.get_length();
+        need_constraint_ = ObSearchIndexValueEncoder::string_column_may_truncate(col_type, column_length);
+      } else if (ob_is_json_tc(col_type.get_type())) {
+        need_constraint_ = true;
+      } else if (ob_is_collection_sql_type(col_type.get_type())) {
+        uint16_t subschema_id = col_type.get_subschema_id();
+        ObSubSchemaValue value;
+        const ObSqlCollectionInfo *coll_info = nullptr;
+        if (OB_FAIL(exec_ctx->get_sqludt_meta_by_subschema_id(subschema_id, value))) {
+          LOG_WARN("failed to get subschema", K(ret), K(subschema_id));
+        } else if (OB_ISNULL(coll_info = reinterpret_cast<const ObSqlCollectionInfo *>(value.value_))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("collection info is null", K(ret));
+        } else {
+          need_constraint_ = ObSearchIndexConstraint::need_array_string_constraint(*coll_info);
+        }
+      }
+      if (ob_is_json(column_meta_.column_type_.get_type())) {
+        // Find the corresponding index column by column_id
+        index_column_schema = index_schema->get_column_schema(column_id);
+        if (OB_NOT_NULL(index_column_schema)) {
+          const ObString &column_comment = index_column_schema->get_comment_str();
+          if (!column_comment.empty()) {
+            void *filter_buf = allocator.alloc(sizeof(share::ObSearchIndexConfigFilter));
+            if (OB_ISNULL(filter_buf)) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+              LOG_WARN("failed to allocate memory for json filter", K(ret));
+            } else {
+              const uint64_t tenant_id = index_schema->get_tenant_id();
+              json_filter_ = new (filter_buf) share::ObSearchIndexConfigFilter(tenant_id);
+              if (OB_FAIL(json_filter_->init_from_comment(column_comment))) {
+                LOG_WARN("failed to parse json column filter", K(ret), K(column_comment));
+                json_filter_->~ObSearchIndexConfigFilter();
+                json_filter_ = nullptr;
+              }
+            }
+          }
+        }
+      }
+    }
   }
   return ret;
 }

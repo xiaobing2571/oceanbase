@@ -28,6 +28,7 @@
 #include "common/ob_range.h"
 #include "common/ob_store_format.h"
 #include "common/ob_tablet_id.h"
+#include "share/compaction_ttl/ob_ttl_definition.h"
 #include "share/ob_define.h"
 #include "share/ob_get_compat_mode.h"
 #include "share/schema/ob_schema_struct.h"
@@ -35,6 +36,10 @@
 #include "lib/compress/ob_compress_util.h"
 #include "share/storage_cache_policy/ob_storage_cache_common.h"
 #include "storage/ob_micro_block_format_version_helper.h"
+#include "share/semistruct/ob_semistruct_properties.h"
+#include "storage/blocksstable/index_block/ob_index_block_util.h"
+#include "storage/compaction_ttl/ob_ttl_filter_info.h"
+#include "storage/blocksstable/index_block/ob_index_block_util.h"
 namespace oceanbase
 {
 
@@ -57,8 +62,10 @@ namespace common
 
 namespace share
 {
+enum class ObLakeTableFormat;
 namespace schema
 {
+struct ObFTSIndexParams;
 class ObSchemaGetterGuard;
 class ObColDesc;
 class ObConstraint;
@@ -198,6 +205,7 @@ inline bool not_compat_for_queuing_mode(const uint64_t min_data_version)
 const char *table_mode_flag_to_str(const ObTableModeFlag &table_mode);
 #define QUEUING_MODE_NOT_COMPAT_WARN_STR "moderate/super/extreme table mode is not supported in data_version < 4.2.1.5 or 4.2.2 <= data_version < 4.2.3 or 4.3.0 <= data_version < 4.3.2"
 #define QUEUING_MODE_NOT_COMPAT_USER_ERROR_STR            "moderate/super/extreme table mode in data_version < 4.2.1.5 or 4.2.2 <= data_version < 4.2.3 or 4.3.0 <= data_version < 4.3.2"
+#define SKIP_IDNEX_ROW_SIZE_LIMIT_COEFF 1.0f
 
 enum ObTablePKMode
 {
@@ -309,6 +317,12 @@ enum ObTableReferencedByFastLSMMVFlag
 {
   IS_NOT_REFERENCED_BY_FAST_LSM_MV = 0,
   IS_REFERENCED_BY_FAST_LSM_MV = 1
+};
+
+enum ObMvCntProctimeTableFlag
+{
+  MV_NOT_CNT_PROCTIME_TABLE = 0,
+  MV_CNT_PROCTIME_TABLE = 1
 };
 
 struct ObTableMode {
@@ -481,7 +495,10 @@ private:
   static const int32_t MM_TABLE_REFERENCED_BY_FAST_LSM_MV_BITS = 1;
   static const uint32_t MM_TABLE_REFERENCED_BY_FAST_LSM_MV_MASK =
       (1U << MM_TABLE_REFERENCED_BY_FAST_LSM_MV_BITS) - 1;
-  static const int32_t MM_RESERVED = 62;
+  static const int32_t MM_CNT_PROCTIME_TABLE_OFFSET = 2;
+  static const int32_t MM_CNT_PROCTIME_TABLE_BITS = 1;
+  static const uint32_t MM_CNT_PROCTIME_TABLE_MASK = (1U << MM_CNT_PROCTIME_TABLE_BITS) - 1;
+  static const int32_t MM_RESERVED = 61;
 public:
   ObMvMode() { reset(); }
   virtual ~ObMvMode() { reset(); }
@@ -501,6 +518,11 @@ public:
         (mv_mode >> MM_TABLE_REFERENCED_BY_FAST_LSM_MV_OFFSET) &
         MM_TABLE_REFERENCED_BY_FAST_LSM_MV_MASK);
   }
+  static ObMvCntProctimeTableFlag get_cnt_proctime_table_flag(int64_t mv_mode)
+  {
+    return (ObMvCntProctimeTableFlag)((mv_mode >> MM_CNT_PROCTIME_TABLE_OFFSET) &
+                                       MM_CNT_PROCTIME_TABLE_MASK);
+  }
   union
   {
     int64_t mode_;
@@ -508,21 +530,19 @@ public:
     {
       uint64_t mv_major_refresh_flag_ : MM_MV_MAJOR_REFRESH_BITS;
       uint64_t table_referenced_by_fast_lsm_mv_flag_ : MM_TABLE_REFERENCED_BY_FAST_LSM_MV_BITS;
+      uint64_t cnt_proctime_table_ : MM_CNT_PROCTIME_TABLE_BITS;
       uint64_t reserved_ : MM_RESERVED;
     };
   };
   TO_STRING_KV("mv_major_refresh_flag", mv_major_refresh_flag_,
-               "table_referenced_by_fast_lsm_mv_flag", table_referenced_by_fast_lsm_mv_flag_);
+               "table_referenced_by_fast_lsm_mv_flag", table_referenced_by_fast_lsm_mv_flag_,
+               "cnt_proctime_table", cnt_proctime_table_);
 };
 
 struct ObSemiStructEncodingType
 {
   OB_UNIS_VERSION(1);
 public:
-  enum Mode {
-    NONE = 0,
-    ENCODING = 1
-  };
 
 public:
   ObSemiStructEncodingType():
@@ -531,10 +551,13 @@ public:
 
   ~ObSemiStructEncodingType() { reset(); }
 
-  void reset() { flags_ = 0;}
-  bool is_enable_semistruct_encoding() const { return ENCODING == mode_; }
+  void reset() { flags_ = 0; }
+  bool is_enable_semistruct_encoding() const {
+    return ObSemistructProperties::MAX_MODE > mode_ && ObSemistructProperties::NONE < mode_;
+  }
   int64_t get_deep_copy_size() const { return sizeof(ObSemiStructEncodingType); }
 
+public:
   union
   {
     int64_t flags_;
@@ -544,6 +567,7 @@ public:
       uint64_t reserved_ : 56;
     };
   };
+
   TO_STRING_KV(K_(mode), K_(reserved));
 };
 
@@ -648,6 +672,22 @@ struct ObBackUpTableModeOp
   }
 };
 
+struct ColTypeComparator {
+  const ObSEArray<ObObjMeta, 16> &column_types;
+
+  ColTypeComparator(const ObSEArray<ObObjMeta, 16> &col_types) : column_types(col_types) {}
+
+  bool operator()(const int64_t lhs, const int64_t rhs) const {
+    int64_t lhs_priority = blocksstable::get_col_type_skip_index_priority(column_types.at(lhs).get_type());
+    int64_t rhs_priority = blocksstable::get_col_type_skip_index_priority(column_types.at(rhs).get_type());
+    if (lhs_priority != rhs_priority) {
+      return lhs_priority < rhs_priority;
+    } else {
+      return lhs < rhs;
+    }
+  }
+};
+
 // add virtual function in ObMergeSchema, should edit ObStorageSchema & ObTableSchema
 class ObMergeSchema
 {
@@ -666,6 +706,7 @@ public:
   virtual inline uint64_t get_master_key_id() const { return OB_INVALID_ID; }
   virtual inline bool is_use_bloomfilter() const { return false; }
   virtual inline bool get_enable_macro_block_bloom_filter() const { return false; }
+  virtual inline int64_t get_micro_block_format_version() const { return storage::ObMicroBlockFormatVersionHelper::DEFAULT_VERSION; }
   virtual inline bool is_primary_aux_vp_table() const { return false; }
   virtual inline bool is_primary_vp_table() const { return false; }
   virtual inline bool is_aux_vp_table() const { return false; }
@@ -680,18 +721,24 @@ public:
   virtual bool need_encrypt() const = 0;
   virtual inline bool is_global_index_table() const = 0;
   virtual inline common::ObRowStoreType get_row_store_type() const { return common::MAX_ROW_STORE; }
+  virtual inline common::ObRowStoreType get_minor_row_store_type() const { return common::MAX_ROW_STORE; }
   virtual inline const char *get_compress_func_name() const { return all_compressor_name[ObCompressorType::NONE_COMPRESSOR]; }
   virtual inline common::ObCompressorType get_compressor_type() const { return ObCompressorType::NONE_COMPRESSOR; }
   virtual inline int64_t get_progressive_merge_round() const { return INVAID_RET; }
   virtual inline int64_t get_progressive_merge_num() const { return INVAID_RET; }
   virtual inline ObMergeEngineType get_merge_engine_type() const { return ObMergeEngineType::OB_MERGE_ENGINE_MAX; }
   virtual inline bool is_delete_insert_merge_engine() const { return false; }
+  virtual inline bool is_append_only_merge_engine() const { return false; }
+  virtual inline ObSkipIndexLevel get_skip_index_level() const { return ObSkipIndexLevel::OB_SKIP_INDEX_LEVEL_BASE_ONLY; }
   virtual inline ObTableModeFlag get_table_mode_flag() const { return TABLE_MODE_MAX; }
   virtual inline ObTableType get_table_type() const { return MAX_TABLE_TYPE; }
   virtual inline ObTableMode get_table_mode_struct() const = 0;
   virtual inline ObIndexType get_index_type() const { return INDEX_TYPE_MAX; }
   virtual inline ObIndexStatus get_index_status() const { return INDEX_STATUS_MAX; }
   virtual inline bool is_index_table() const = 0;
+  virtual inline bool has_ttl_definition() const { return false; }
+  virtual inline bool was_compaction_ttl() const { return false; }
+  virtual int get_is_column_store(bool &is_column_store) const { UNUSED(is_column_store); return common::OB_NOT_SUPPORTED; }
 
   virtual int get_store_column_ids(common::ObIArray<ObColDesc> &column_ids, const bool full_col) const
   {
@@ -755,11 +802,7 @@ public:
     UNUSED(column_descs);
     return common::OB_NOT_SUPPORTED;
   }
-  virtual int get_skip_index_col_attr(common::ObIArray<ObSkipIndexColumnAttr> &skip_idx_attrs) const
-  {
-    UNUSED(skip_idx_attrs);
-    return common::OB_NOT_SUPPORTED;
-  }
+  int get_skip_index_col_attr(const bool is_major, const int64_t data_version, common::ObIArray<ObSkipIndexColumnAttr> &skip_idx_attrs) const;
   virtual int get_mv_mode_struct(ObMvMode &mv_mode) const
   {
     UNUSED(mv_mode);
@@ -770,6 +813,22 @@ public:
     UNUSED(type);
     return common::OB_NOT_SUPPORTED;
   }
+  virtual const common::ObString& get_semistruct_properties() const
+  {
+    return EMPTY_STRING;
+  }
+
+protected:
+  virtual int get_skip_index_col_attr_by_schema(common::ObIArray<ObSkipIndexColumnAttr> &skip_idx_attrs,
+                                                ObSEArray<ObObjMeta, 16> *column_types=nullptr,
+                                                const bool only_set_fts=false) const
+  {
+    UNUSEDx(skip_idx_attrs, column_types, only_set_fts);
+    return common::OB_NOT_SUPPORTED;
+  }
+  int get_delta_skip_index_adaptively(common::ObIArray<ObSkipIndexColumnAttr> &skip_idx_attrs) const;
+
+public:
   DECLARE_PURE_VIRTUAL_TO_STRING;
   const static int64_t INVAID_RET = -1;
   static common::ObString EMPTY_STRING;
@@ -839,7 +898,7 @@ public:
   inline common::ObNameCaseMode get_name_case_mode() const { return name_case_mode_; }
   inline void set_table_type(const ObTableType table_type) { table_type_ = table_type; }
   virtual inline ObTableType get_table_type() const override { return table_type_; }
-  inline void set_table_mode(const int32_t table_mode) { table_mode_.mode_ = table_mode; }
+  inline void assign_table_mode_from_mysql_result(const int32_t table_mode) { table_mode_.mode_ = table_mode; }
   inline int32_t get_table_mode() const { return table_mode_.mode_; }
   inline void set_table_mode_struct(const ObTableMode table_mode) { table_mode_ = table_mode; }
   virtual inline ObTableMode get_table_mode_struct() const override { return table_mode_; }
@@ -872,6 +931,12 @@ public:
     { return (ObTableAutoIncrementMode)table_mode_.auto_increment_mode_; }
   inline bool is_order_auto_increment_mode() const
   { return ORDER == (ObTableAutoIncrementMode)table_mode_.auto_increment_mode_; }
+  inline void set_minor_row_store_type(const common::ObRowStoreType minor_row_store_type) { minor_row_store_type_ = minor_row_store_type; }
+  inline ObRowStoreType get_minor_row_store_type() const override final { return minor_row_store_type_; }
+  int set_delta_format(const ObString& delta_format);
+  ObString get_delta_format() const {
+    return ObString(ObStoreFormat::get_delta_format_name(minor_row_store_type_));
+  }
 
   inline void set_table_rowid_mode(const ObTableRowidMode table_rowid_mode)
     { table_mode_.rowid_mode_ = table_rowid_mode; }
@@ -895,16 +960,19 @@ public:
   inline bool is_queuing_table() const
   { return is_queuing_table_mode(static_cast<ObTableModeFlag>(table_mode_.mode_flag_)); }
   // returns true when the primary key in ob contains the hidden column
+  // 返回true: HEAP模式下任意表和index模式的无主键表
   inline bool is_table_with_hidden_pk_column() const
   { return (TOM_HEAP_ORGANIZED == (enum ObTableOrganizationMode)table_mode_.table_organization_mode_ ||
            (TOM_INDEX_ORGANIZED == (enum ObTableOrganizationMode)table_mode_.table_organization_mode_ &&
             TOM_TABLE_WITHOUT_PK == (enum ObTablePrimaryKeyExistsMode)table_mode_.pk_exists_)); }
   // returns true when ob considers the table does not have the user provided primary key and use the
   // hidden pk as ob's primary key
+  // 返回true: 用户没指定主键（IOT模式）或者cluster by列（HEAP模式）
   inline bool is_table_without_pk() const
   { return TOM_TABLE_WITHOUT_PK == (enum ObTablePrimaryKeyExistsMode)table_mode_.pk_exists_; }
   // returns true when ob considers the table has the user provided primary key (order by columns
   // in the heap organized table and primary key columns in the index organized table)
+  // 返回true: 用户明确指定了主键（IOT模式）或者cluster by列（HEAP模式）
   inline bool is_table_with_pk() const
   { return TOM_TABLE_WITH_PK == (enum ObTablePrimaryKeyExistsMode)table_mode_.pk_exists_; }
   // returns true when users define the table organization as heap (by tenant config or table option)
@@ -913,6 +981,12 @@ public:
   // returns true when users define the table organization as index (by tenant config or table option)
   inline bool is_index_organized_table() const
   { return TOM_INDEX_ORGANIZED == (enum ObTableOrganizationMode)table_mode_.table_organization_mode_; }
+  inline bool is_table_with_clustering_key() const
+  { return is_table_with_pk() && is_table_with_hidden_pk_column(); }
+  // returns true when the table is index-organized and has a user-defined primary key (IOT with PK)
+  // 返回true: 表为索引组织表（IOT）且用户明确指定了主键
+  inline bool is_index_organized_table_with_pk() const
+  { return is_index_organized_table() && is_table_with_pk(); }
   inline bool view_column_filled() const
   { return FILLED == (enum ObViewColumnFilledFlag)table_mode_.view_column_filled_flag_; }
   inline void set_view_column_filled_flag(const ObViewColumnFilledFlag flag)
@@ -972,10 +1046,17 @@ public:
       const common::ObString *&locality_str) const override;
   int get_tablet_ids(
       common::ObIArray<ObTabletID> &tablet_ids) const;
+  // including LEVEL_ONE and LEVEL_TWO
+  int get_first_level_hidden_tablet_ids(
+      common::ObIArray<ObTabletID> &tablet_ids) const;
   int get_part_idx_by_tablet(
       const ObTabletID &tablet_id,
       int64_t &part_id,
       int64_t &subpart_id) const;
+  int get_part_idx_by_tablets(
+      const ObIArray<uint64_t> &tablet_ids,
+      ObIArray<int64_t> &part_idx,
+      ObIArray<int64_t> &subpart_idx) const;
   int get_part_id_by_tablet(
       const ObTabletID &tablet_id,
       int64_t &part_id,
@@ -1109,12 +1190,15 @@ public:
   inline bool is_vir_table() const { return share::schema::ObTableType::VIRTUAL_TABLE == table_type_; }
   inline bool is_view_table() const { return share::schema::is_view_table(table_type_); }
   inline bool is_index_table()  const { return share::schema::is_index_table(table_type_); }
-  inline bool is_tmp_table() const { return is_mysql_tmp_table() || share::schema::ObTableType::TMP_TABLE_ORA_SESS == table_type_ || share::schema::ObTableType::TMP_TABLE_ORA_TRX == table_type_; }
+  inline bool is_tmp_table() const { return is_mysql_tmp_table() || is_oracle_tmp_table() || is_oracle_tmp_table_v2(); }
   inline bool is_ctas_tmp_table() const { return 0 != session_id_ && !is_tmp_table(); }
   inline bool is_mysql_tmp_table() const { return share::schema::is_mysql_tmp_table(table_type_); }
   inline bool is_oracle_tmp_table() const { return share::schema::ObTableType::TMP_TABLE_ORA_SESS == table_type_ || share::schema::ObTableType::TMP_TABLE_ORA_TRX == table_type_; }
+  inline bool is_oracle_tmp_table_v2() const { return share::schema::ObTableType::TMP_TABLE_ORA_SESS_V2 == table_type_ || share::schema::ObTableType::TMP_TABLE_ORA_TRX_V2 == table_type_; }
   inline bool is_oracle_sess_tmp_table() const { return share::schema::ObTableType::TMP_TABLE_ORA_SESS == table_type_; }
+  inline bool is_oracle_sess_tmp_table_v2() const { return share::schema::ObTableType::TMP_TABLE_ORA_SESS_V2 == table_type_; }
   inline bool is_oracle_trx_tmp_table() const { return share::schema::ObTableType::TMP_TABLE_ORA_TRX == table_type_; }
+  inline bool is_oracle_trx_tmp_table_v2() const { return share::schema::ObTableType::TMP_TABLE_ORA_TRX_V2 == table_type_; }
   virtual inline bool is_aux_vp_table() const override { return share::schema::ObTableType::AUX_VERTIAL_PARTITION_TABLE == table_type_; }
   inline bool is_aux_lob_piece_table() const { return share::schema::is_aux_lob_piece_table(table_type_); }
   inline bool is_aux_lob_meta_table() const { return share::schema::is_aux_lob_meta_table(table_type_); }
@@ -1130,8 +1214,27 @@ public:
   inline bool is_mlog_table() const { return is_mlog_table(table_type_); }
   inline static bool is_mlog_table(share::schema::ObTableType table_type)
   { return MATERIALIZED_VIEW_LOG == table_type; }
+  inline bool is_tmp_mlog_table() const { return is_tmp_mlog_table(table_type_, table_name_); }
+  inline static bool is_tmp_mlog_table(share::schema::ObTableType table_type, ObString table_name)
+  { return is_mlog_table(table_type) && (table_name.prefix_match(OB_TMP_MLOG_PREFIX_MYSQL) || table_name.prefix_match(OB_TMP_MLOG_PREFIX_ORACLE)); }
   inline static bool is_user_data_table(share::schema::ObTableType table_type)
   { return USER_TABLE == table_type; }
+
+  inline static bool is_trans_version_skip_index_table(share::schema::ObTableType table_type)
+  {
+    // we only build trans version's skip index for below table
+    // user data table,
+    // materailized view
+    // mlog
+    // index, lob meta, lob piece
+    return is_user_data_table(table_type)
+           || is_materialized_view(table_type)
+           || is_mlog_table(table_type)
+           || table_type == ObTableType::USER_INDEX
+           || table_type == ObTableType::AUX_LOB_META
+           || table_type == ObTableType::AUX_LOB_PIECE;
+  }
+
   inline bool is_in_recyclebin() const
   { return common::OB_RECYCLEBIN_SCHEMA_ID == database_id_; }
   virtual inline bool is_external_table() const override { return EXTERNAL_TABLE == table_type_; }
@@ -1144,12 +1247,20 @@ public:
   inline bool is_multivalue_index() const;
   inline bool is_multivalue_index_aux() const;
   inline bool is_spatial_index() const;
+  inline bool is_search_index() const;
+  inline bool is_search_def_index() const;
+  inline bool is_search_data_index() const;
+  inline static bool is_search_index(const ObIndexType index_type);
+  inline static bool is_search_def_index(const ObIndexType index_type);
+  inline static bool is_search_data_index(const ObIndexType index_type);
   inline static bool is_spatial_index(const ObIndexType index_type);
   inline bool is_vec_index() const;
   inline static bool is_vec_index(const ObIndexType index_type);
   inline bool is_vec_domain_index() const;
   inline bool is_built_in_vec_index() const;
   inline bool is_vec_hnsw_index() const;
+  inline bool is_hybrid_vec_index() const;
+  inline static bool is_hybrid_vec_index(const ObIndexType index_type);
   inline bool is_vec_ivf_index() const;
   inline bool is_vec_ivfpq_index() const;
   inline bool is_vec_ivfsq8_index() const;
@@ -1170,7 +1281,10 @@ public:
   inline bool is_vec_ivfpq_rowkey_cid_index() const;
   inline bool is_vec_rowkey_vid_type() const;
   inline bool is_vec_vid_rowkey_type() const;
+  inline bool is_vec_shared_table_type() const;
   inline bool is_vec_delta_buffer_type() const;
+  inline bool is_hybrid_vec_index_log_type() const;
+  inline bool is_hybrid_vec_index_embedded_type() const;
   inline bool is_vec_dim_docid_value_type() const;
   inline bool is_vec_index_id_type() const;
   inline bool is_vec_index_snapshot_data_type() const;
@@ -1178,6 +1292,7 @@ public:
   inline bool is_built_in_fts_index() const;
   inline bool is_built_in_multivalue_index() const;
   inline bool is_built_in_index() const;  // fts / vector index
+  inline bool is_no_need_rebuild_index() const;  // for offline ddl.
   inline bool is_rowkey_doc_id() const;
   inline bool is_doc_id_rowkey() const;
   inline bool is_fts_index_aux() const;
@@ -1274,14 +1389,18 @@ public:
     const bool heap_case =  is_index_local_storage() && data_table_schema.is_table_without_pk();
     const bool fts_case = is_partitioned_table() && is_index_local_storage() && (is_fts_index_aux() || is_fts_doc_word_aux());
     const bool multivalue_case = is_partitioned_table() && is_index_local_storage() && is_multivalue_index_aux();
-    const bool vec_case = is_partitioned_table() && is_index_local_storage() && (is_vec_delta_buffer_type() || is_vec_index_id_type() || is_vec_index_snapshot_data_type());
-    return heap_case || fts_case || vec_case || multivalue_case;
+    const bool vec_case = is_partitioned_table() && is_index_local_storage() &&
+                          (is_vec_delta_buffer_type() || is_vec_index_id_type() || is_vec_index_snapshot_data_type() || is_vec_spiv_index_aux());
+    const bool cluster_case = is_partitioned_table() && is_index_local_storage() && data_table_schema.is_table_with_clustering_key();
+    const bool search_case = is_partitioned_table() && is_index_local_storage() && is_search_data_index();
+    return heap_case || fts_case || vec_case || multivalue_case || cluster_case || search_case;
   }
   inline void set_with_dynamic_partition_policy(bool with_dynamic_partition_policy)
   {
     with_dynamic_partition_policy_ = with_dynamic_partition_policy;
   }
   virtual inline bool with_dynamic_partition_policy() const { return with_dynamic_partition_policy_; }
+  virtual bool is_oracle_tmp_table_v2_index_table() const { return false; }
 
   DECLARE_VIRTUAL_TO_STRING;
 protected:
@@ -1330,6 +1449,7 @@ protected:
   // storage cache policy type
   storage::ObStorageCachePolicyType storage_cache_policy_type_;
   bool with_dynamic_partition_policy_; // do not persist to disk
+  ObRowStoreType minor_row_store_type_;
 };
 
 class ObTableSchema : public ObSimpleTableSchemaV2
@@ -1470,7 +1590,9 @@ public:
   inline void set_store_format(const common::ObStoreFormatType store_format) { store_format_ = store_format; }
   inline void set_storage_format_version(const int64_t storage_format_version) { storage_format_version_ = storage_format_version; }
   inline void set_merge_engine_type(const ObMergeEngineType merge_engine_type) { merge_engine_type_ = merge_engine_type; }
+  inline void set_skip_index_level(const ObSkipIndexLevel skip_index_level) { skip_index_level_ = skip_index_level; }
   int set_store_format(const common::ObString &store_format);
+  int set_fts_params_to_index_params(const ObFTSIndexParams &fts_index_params);
   inline void set_row_store_type(const common::ObRowStoreType row_store_type) { row_store_type_ = row_store_type; }
   int set_row_store_type(const common::ObString &row_store);
   int set_tablegroup_name(const char *tablegroup_name) { return deep_copy_str(tablegroup_name, tablegroup_name_); }
@@ -1487,6 +1609,8 @@ public:
   inline void set_dop(int64_t table_dop) { table_dop_ = table_dop; }
   int set_external_file_location(const common::ObString &location) { return deep_copy_str(location, external_file_location_); }
   int set_external_file_location_access_info(const common::ObString &access_info) { return deep_copy_str(access_info, external_file_location_access_info_); }
+  void set_external_location_id(uint64_t id) { external_location_id_ = id; }
+  int set_external_sub_path(const common::ObString &sub_path) { return deep_copy_str(sub_path, external_sub_path_); }
   int set_external_file_format(const common::ObString &format) { return deep_copy_str(format, external_file_format_); }
   int set_external_file_pattern(const common::ObString &pattern) { return deep_copy_str(pattern, external_file_pattern_); }
   int set_external_properties(const common::ObString &format) { return deep_copy_str(format, external_properties_); }
@@ -1510,6 +1634,7 @@ public:
   int add_subpartition_key(const common::ObString &column_name);
   int add_zone(const common::ObString &zone);
   int set_view_definition(const common::ObString &view_definition);
+  int set_expand_view_definition_for_mv(const common::ObString &expand_view_definition_for_mv);
   int set_parser_name_and_properties(const common::ObString &parser_name, const common::ObString &parser_properties);
   int set_parser_name(const common::ObString &parser_name) { return deep_copy_str(parser_name, parser_name_); }
   int set_parser_properties(const common::ObString &parser_properties) { return deep_copy_str(parser_properties, parser_properties_); }
@@ -1531,7 +1656,8 @@ public:
   int is_range_col_part_type(bool &is_range_column_type) const;
   void forbid_auto_partition();
   void clear_constraint();
-  int set_ttl_definition(const common::ObString &ttl_definition) { return deep_copy_str(ttl_definition, ttl_definition_); }
+  int set_ttl_definition(const common::ObString &ttl_definition, const ObTTLFlag &ttl_flag);
+  int set_ttl_definition(const common::ObString &ttl_definition, const ObString &ttl_flag_str);
   int set_kv_attributes(const common::ObString &kv_attributes) { return deep_copy_str(kv_attributes, kv_attributes_); }
   int set_index_params(const common::ObString &index_params) { return deep_copy_str(index_params, index_params_); }
   int set_exec_env(const common::ObString &exec_env) { return deep_copy_str(exec_env, exec_env_); }
@@ -1540,8 +1666,8 @@ public:
   { auto_increment_cache_size_ = auto_increment_cache_size; }
 //get methods
   bool is_valid() const;
-  int check_valid(const bool count_varchar_size_by_byte) const;
-
+  int check_valid(const bool for_create) const;
+  int check_ttl_definition_valid() const;
   int get_generated_column_by_define(const common::ObString &col_def,
                                      const bool only_hidden_column,
                                      share::schema::ObColumnSchemaV2 *&gen_col);
@@ -1582,8 +1708,8 @@ public:
   inline int64_t get_index_column_number() const { return index_column_num_; }
   inline uint64_t get_max_used_column_id() const { return max_used_column_id_; }
   inline int64_t get_sess_active_time() const { return sess_active_time_; }
-  // Whether it is a temporary table created by ob proxy 64bit > uint max
-  inline bool is_obproxy_create_tmp_tab() const { return is_tmp_table() && get_session_id() > 0xFFFFFFFFL;}
+  // Whether it is a temporary table created by ob proxy ssid > int32_t max
+  inline bool is_obproxy_create_tmp_tab() const { return is_tmp_table() && static_cast<uint32_t>(get_session_id()) <= 0x7FFFFFFFU;}
   inline int64_t get_rowkey_split_pos() const { return rowkey_split_pos_; }
   inline int64_t get_block_size() const { return block_size_;}
   virtual inline bool is_use_bloomfilter() const override { return is_use_bloomfilter_; }
@@ -1608,6 +1734,8 @@ public:
   inline int64_t get_storage_format_version() const { return storage_format_version_; }
   inline virtual ObMergeEngineType get_merge_engine_type() const override { return merge_engine_type_; }
   inline virtual bool is_delete_insert_merge_engine() const override { return ObMergeEngineType::OB_MERGE_ENGINE_DELETE_INSERT == merge_engine_type_; }
+  inline virtual bool is_append_only_merge_engine() const override { return ObMergeEngineType::OB_MERGE_ENGINE_APPEND_ONLY == merge_engine_type_; }
+  inline virtual ObSkipIndexLevel get_skip_index_level() const override { return skip_index_level_; }
   inline const char *get_tablegroup_name_str() const { return extract_str(tablegroup_name_); }
   inline const common::ObString &get_tablegroup_name() const { return tablegroup_name_; }
   inline const char *get_comment() const { return extract_str(comment_); }
@@ -1629,6 +1757,19 @@ public:
   inline ObViewSchema &get_view_schema() { return view_schema_; }
   inline const ObViewSchema &get_view_schema() const { return view_schema_; }
   inline const common::ObString &get_ttl_definition() const { return ttl_definition_; }
+  inline ObTTLFlag get_ttl_flag() const { return ttl_flag_; }
+  virtual bool has_ttl_definition() const override { return !get_ttl_definition().empty(); }
+  virtual bool was_compaction_ttl() const override { return get_ttl_flag().was_compaction_ttl_; }
+  inline bool is_compaction_rowscn_ttl_di_table() const
+  {
+    return get_ttl_flag().ttl_type_ == share::ObTTLDefinition::COMPACTION
+           && is_delete_insert_merge_engine()
+           && get_ttl_flag().ttl_column_type_ == ObTTLFlag::TTLColumnType::ROWSCN;
+  }
+  void update_being_scn_ttl_time(const int64_t timestamp_us)
+  {
+    ttl_flag_.update_being_scn_ttl_time(timestamp_us);
+  }
   inline const common::ObString &get_kv_attributes() const { return kv_attributes_; }
   inline const common::ObString &get_index_params() const { return index_params_; }
   inline const common::ObString &get_exec_env() const { return exec_env_; }
@@ -1643,13 +1784,20 @@ public:
   inline const char *get_parser_name() const { return extract_str(parser_name_); }
   inline const common::ObString &get_parser_name_str() const { return parser_name_; }
   inline const common::ObString &get_parser_property_str() const { return parser_properties_; }
+  int get_fts_params_from_index_params(ObFTSIndexParams &fts_index_params) const;
 
   inline uint64_t get_index_attributes_set() const { return index_attributes_set_; }
   inline int64_t get_dop() const  { return table_dop_; }
   inline void set_catalog_id(const uint64_t catalog_id) { catalog_id_ = catalog_id; }
   inline uint64_t get_catalog_id() const { return catalog_id_; }
+  inline void set_lake_table_format(share::ObLakeTableFormat lake_table_format) { lake_table_format_ = lake_table_format; }
+  share::ObLakeTableFormat get_lake_table_format() const { return lake_table_format_; }
+  inline void set_lake_table_snapshot_id(const int64_t lake_table_snapshot_id) { lake_table_snapshot_id_ = lake_table_snapshot_id; }
+  inline int64_t get_lake_table_snapshot_id() const { return lake_table_snapshot_id_; }
   const ObString &get_external_file_location() const { return external_file_location_; }
   const ObString &get_external_file_location_access_info() const { return external_file_location_access_info_; }
+  uint64_t get_external_location_id() const { return external_location_id_; }
+  const ObString &get_external_sub_path() const { return external_sub_path_; }
   const ObString &get_external_file_format() const { return external_file_format_; }
   const ObString &get_external_file_pattern() const { return external_file_pattern_; }
   const ObString &get_external_properties() const { return external_properties_; }
@@ -1657,6 +1805,8 @@ public:
   bool is_external_table_immediate_refresh() const { return get_external_table_auto_refresh() == 1; }
   bool is_external_table_interval_refresh() const { return get_external_table_auto_refresh() == 2; }
   bool is_external_table_auto_refresh_off() const { return get_external_table_auto_refresh() == 0; }
+  virtual bool is_oracle_tmp_table_v2_index_table() const override { return (table_flags_ & ORCL_TEMP_TABLE_V2_INDEX_TABLE_FLAG) != 0; }
+  void set_oracle_tmp_table_v2_index_table() { table_flags_ |= ORCL_TEMP_TABLE_V2_INDEX_TABLE_FLAG; }
   inline void set_name_generated_type(const ObNameGeneratedType is_sys_generated) {
     name_generated_type_ = is_sys_generated;
   }
@@ -1704,6 +1854,11 @@ public:
   {
     enable_macro_block_bloom_filter_ = enable_macro_block_bloom_filter;
   }
+  inline int64_t get_micro_block_format_version() const override { return micro_block_format_version_; }
+  inline void set_micro_block_format_version(const int64_t micro_block_format_version)
+  {
+    micro_block_format_version_ = micro_block_format_version;
+  }
   inline int64_t get_virtual_column_cnt() const { return virtual_column_cnt_; }
   inline const_column_iterator column_begin() const { return column_array_; }
   inline const_column_iterator column_end() const { return NULL == column_array_ ? NULL : &(column_array_[column_cnt_]); }
@@ -1723,20 +1878,29 @@ public:
   virtual int get_rowkey_column_ids(common::ObIArray<share::schema::ObColDesc> &column_ids) const override;
   virtual int set_precision_to_column_desc(common::ObIArray<share::schema::ObColDesc> &column_ids) const override;
   int get_rowkey_column_ids(common::ObIArray<uint64_t> &column_ids) const;
+  int get_rowkey_column_ids_without_valid_check(common::ObIArray<uint64_t> &column_ids) const;
   int get_rowkey_partkey_column_ids(common::ObIArray<uint64_t> &column_ids) const;
   int get_column_ids_without_rowkey(common::ObIArray<share::schema::ObColDesc> &column_ids, const bool no_virtual = false) const;
   int get_generated_column_ids(common::ObIArray<uint64_t> &column_ids) const;
   inline bool has_generated_column() const { return generated_columns_.num_members() > 0; }
   int has_not_null_unique_key(ObSchemaGetterGuard &schema_guard, bool &bool_result) const;
   // returns true when user defined primary key is given
+  // 返回true: 用户明确指定了主键列（IOT模式和HEAP模式）；
   int is_table_with_logic_pk(ObSchemaGetterGuard &schema_guard, bool &bool_result) const;
-  int get_heap_table_pk(ObIArray<uint64_t> &pk_ids) const;
+  // 返回用户指定的主键列（IOT模式和HEAP模式）；
+  int get_logic_pk_column_ids(ObSchemaGetterGuard *schema_guard, ObIArray<uint64_t> &pk_ids) const;
+  int get_heap_table_pk(ObSchemaGetterGuard *schema_guard, ObIArray<uint64_t> &pk_ids) const;
+  int get_heap_table_pk_without_valid_check(ObSchemaGetterGuard *schema_guard, ObIArray<uint64_t> &pk_ids) const;
 
   // The table has a generated column that is a partition key.
   bool has_generated_and_partkey_column() const;
   int check_is_stored_generated_column_base_column(uint64_t column_id, bool &is_stored_base_col) const;
   // Check whether the data table column has prefix index column deps.
-  int check_prefix_index_columns_depend(const ObColumnSchemaV2 &data_column_schema, ObSchemaGetterGuard &schema_guard, bool &has_prefix_idx_col_deps) const;
+  int check_prefix_index_columns_depend(const ObColumnSchemaV2 &data_column_schema,
+                                       ObSchemaGetterGuard &schema_guard,
+                                       bool &has_prefix_idx_col_deps,
+                                       bool &can_change_prefix_column_length,
+                                       const ObColumnSchemaV2 *&prefix_column) const;
   int check_functional_index_columns_depend(const ObColumnSchemaV2 &data_column_schema, ObSchemaGetterGuard &schema_guard, bool &has_prefix_idx_col_deps) const;
   int check_column_has_multivalue_index_depend(const ObColumnSchemaV2 &data_column_schema, bool &has_func_idx_col_deps) const;
   int add_base_table_id(uint64_t base_table_id) { return base_table_ids_.push_back(base_table_id); }
@@ -1758,12 +1922,17 @@ public:
       const bool no_virtual = false) const;
   int get_spatial_geo_column_id(uint64_t &geo_column_id) const;
   int get_spatial_index_column_ids(common::ObIArray<uint64_t> &column_ids) const;
-  int get_fulltext_column_ids(uint64_t &doc_id_col_id, uint64_t &ft_col_id) const;
+  int get_fulltext_column_ids(uint64_t &doc_id_col_id, uint64_t &ft_col_id) const
+      __attribute__((deprecated("Use get_fulltext_typed_col_ids() which adapt to more docid type.")));
+
+  int get_fulltext_typed_col_ids(uint64_t &doc_id_col_id, ObDocIDType &type, uint64_t &ft_col_id) const;
   int get_multivalue_column_id(uint64_t &multivalue_col_id) const;
 
   int get_sparse_vec_index_column_id(uint64_t &sparse_vec_col_id) const;
   int get_vec_index_column_id(uint64_t &with_cascaded_info_column_id) const;
   int get_vec_index_vid_col_id(uint64_t &vec_id_col_id, bool is_cid = false) const;
+  int get_hybrid_vec_chunk_column_id(const ObTableSchema &data_table_schema, uint64_t &hybrid_vec_chunk_col_id) const;
+  int get_hybrid_vec_embedded_column_id(uint64_t &vec_id_col_id) const;
   // get columns for building rowid
   int get_column_ids_serialize_to_rowid(common::ObIArray<uint64_t> &col_ids,
                                         int64_t &rowkey_cnt) const;
@@ -1793,7 +1962,6 @@ public:
   // whether table should check merge progress
   int is_need_check_merge_progress(bool &need_check) const;
   int get_multi_version_column_descs(common::ObIArray<ObColDesc> &column_descs) const;
-  virtual int get_skip_index_col_attr(common::ObIArray<ObSkipIndexColumnAttr> &skip_idx_attrs) const override;
   template <typename Allocator>
   static int build_index_table_name(Allocator &allocator,
                                     const uint64_t data_table_id,
@@ -1821,7 +1989,7 @@ public:
   //
   bool is_column_store_supported() const { return is_column_store_supported_; }
   void set_column_store(const bool support_column_store) { is_column_store_supported_ = support_column_store; }
-  int get_is_column_store(bool &is_column_store) const;
+  virtual int get_is_column_store(bool &is_column_store) const override;
   uint64_t get_max_used_column_group_id() const { return max_used_column_group_id_; }
   uint64_t get_next_single_column_group_id() const { return max_used_column_group_id_ > ROWKEY_COLUMN_GROUP_ID ? max_used_column_group_id_ + 1 : ROWKEY_COLUMN_GROUP_ID + 1; }
   int check_is_normal_cgs_at_the_end(bool &is_normal_cgs_at_the_end) const;
@@ -1843,7 +2011,8 @@ public:
   static int build_mlog_table_name(Allocator &allocator,
                                    const common::ObString &base_table_name,
                                    common::ObString &mlog_table_name,
-                                   const bool is_oracle_mode);
+                                   const bool is_oracle_mode,
+                                   const bool is_tmp = false);
 
   //other methods
   int64_t get_convert_size() const;
@@ -1880,15 +2049,15 @@ public:
   int check_enable_split_partition(bool is_auto_partitioning) const;
   int check_validity_for_auto_partition() const;
   int check_can_do_manual_split_partition() const;
-  ObPartitionLevel get_target_part_level_for_auto_partitioned_table() const;
+  int get_target_part_level_for_auto_partitioned_table(ObPartitionLevel &target_part_level) const;
   int get_part_func_expr_str(ObString &part_func_expr, common::ObIAllocator &allocator,
                              const bool using_auto_partitioned_mode) const;
   int get_presetting_partition_keys(common::ObIArray<uint64_t> &partition_key_ids) const;
-  int get_partition_keys_by_part_func_expr(common::ObString &part_func_expr_str, common::ObIArray<uint64_t> &partition_key_ids) const;
+  int get_partition_keys_by_part_func_expr(const common::ObString &part_func_expr_str, common::ObIArray<uint64_t> &partition_key_ids) const;
   int extract_actual_index_rowkey_columns_name(ObIArray<ObString> &rowkey_columns_name) const;
   int is_presetting_partition_key(const uint64_t partition_key_id, bool &is_presetting_partition_key) const;
-  int check_primary_key_cover_partition_column();
-  int check_rowkey_cover_partition_keys(const common::ObPartitionKeyInfo &part_key);
+  int check_primary_key_cover_partition_column(ObSchemaGetterGuard &schema_guard);
+  int check_logic_pk_cover_partition_keys(const common::ObPartitionKeyInfo &part_key, const common::ObIArray<uint64_t> &logic_pks);
   int check_index_table_cover_partition_keys(const common::ObPartitionKeyInfo &part_key) const;
   int check_create_index_on_hidden_primary_key(const ObTableSchema &index_table) const;
   int check_skip_index_valid() const;
@@ -2013,18 +2182,20 @@ public:
   int check_alter_column_in_rowkey(const ObColumnSchemaV2 &src_column,
                                    const ObColumnSchemaV2 &dst_column,
                                    bool &is_in_rowkey) const;
-  int check_alter_column_accuracy(const ObColumnSchemaV2 &src_column,
-                                  ObColumnSchemaV2 &dst_column,
-                                  const int32_t src_col_byte_len,
-                                  const int32_t dst_col_byte_len,
-                                  const bool is_oracle_mode,
-                                  bool &is_offline) const;
-  int check_alter_column_type(const ObColumnSchemaV2 &src_column,
-                              ObColumnSchemaV2 &dst_column,
-                              const int32_t src_col_byte_len,
-                              const int32_t dst_col_byte_len,
-                              const bool is_oracle_mode,
-                              bool &is_offline) const;
+  static int check_alter_column_accuracy(const ObColumnSchemaV2 &src_column,
+                                         const ObColumnSchemaV2 &dst_column,
+                                         const int32_t src_col_byte_len,
+                                         const int32_t dst_col_byte_len,
+                                         const bool is_oracle_mode,
+                                         bool &is_offline,
+                                         bool &is_type_reduction);
+  static int check_alter_column_type(const ObColumnSchemaV2 &src_column,
+                                     const ObColumnSchemaV2 &dst_column,
+                                     const int32_t src_col_byte_len,
+                                     const int32_t dst_col_byte_len,
+                                     const bool is_oracle_mode,
+                                     bool &is_offline,
+                                     bool &is_type_reduction);
 
   int get_column_byte_length(const bool is_oracle_mode, const ObColumnSchemaV2 &col,
                              const bool use_lob_inrow_threshold, int64_t &length) const;
@@ -2035,8 +2206,8 @@ public:
                                           common::ObIArray<ObColumnSchemaV2 *> &column_group) const;
   ObColumnSchemaV2* get_xml_hidden_column_schema(uint64_t column_id, uint64_t udt_set_id) const;
   ObColumnSchemaV2* get_xml_hidden_column_parent_col_schema(uint64_t column_id, uint64_t udt_set_id) const;
-  bool is_same_type_category(const ObColumnSchemaV2 &src_column,
-                             const ObColumnSchemaV2 &dst_column) const;
+  static bool is_same_type_category(const ObColumnSchemaV2 &src_column,
+                                    const ObColumnSchemaV2 &dst_column);
   int check_has_trigger_on_table(ObSchemaGetterGuard &schema_guard,
                                  bool &is_enable,
                                  uint64_t trig_event = ObTriggerEvents::get_all_event()) const;
@@ -2047,10 +2218,12 @@ public:
   int convert_column_ids_for_ddl(const hash::ObHashMap<uint64_t, uint64_t> &column_id_map);
   int sort_column_array_by_column_id();
   int check_column_array_sorted_by_column_id(const bool skip_rowkey) const;
-  int check_has_local_index(ObSchemaGetterGuard &schema_guard, bool &has_local_index) const;
-  int check_has_fts_index(ObSchemaGetterGuard &schema_guard, bool &has_fts_index) const;
-  int check_has_multivalue_index(ObSchemaGetterGuard &schema_guard, bool &has_multivalue_index) const;
-  int check_has_hnsw_vector_index(ObSchemaGetterGuard &schema_guard, bool &has_vector_index) const;
+  int check_has_index_local_storage(ObSchemaGetterGuard &schema_guard, bool &has_local_index) const;
+  int check_has_fts_index_aux(ObSchemaGetterGuard &schema_guard, bool &has_fts_index) const;
+  int check_has_multivalue_index_aux(ObSchemaGetterGuard &schema_guard, bool &has_multivalue_index) const;
+  int check_has_vec_domain_index(ObSchemaGetterGuard &schema_guard, bool &has_vector_index) const;
+  int check_has_spatial_index(ObSchemaGetterGuard &schema_guard, bool &has_vector_index) const;
+  int check_has_unique_index(ObSchemaGetterGuard &schema_guard, bool &has_unique_index) const;
   int is_real_unique_index_column(ObSchemaGetterGuard &schema_guard,
                                   uint64_t column_id,
                                   bool &is_uni) const;
@@ -2071,14 +2244,19 @@ public:
   void set_aux_lob_meta_tid(const uint64_t& table_id) { aux_lob_meta_tid_ = table_id; }
   void set_aux_lob_piece_tid(const uint64_t& table_id) { aux_lob_piece_tid_ = table_id; }
   int get_rowkey_doc_tid(uint64_t &index_table_id) const;
+
+  // NOTE: here you can get a **generated** doc id column id.
   int get_docid_col_id(uint64_t &docid_col_id) const;
   int get_rowkey_vid_tid(uint64_t &index_table_id) const;
+  int get_embedded_vec_tid(uint64_t &index_table_id) const;
+  int get_rowkey_cid_tid(uint64_t &index_table_id, const ObIndexType index_type) const;
   uint64_t get_aux_lob_meta_tid() const { return aux_lob_meta_tid_; }
   uint64_t get_aux_lob_piece_tid() const { return aux_lob_piece_tid_; }
   bool has_lob_column(const bool ignore_unused_column) const;
   int64_t get_lob_columns_count() const;
   bool has_lob_aux_table() const { return (aux_lob_meta_tid_ != OB_INVALID_ID && aux_lob_piece_tid_ != OB_INVALID_ID); }
   bool has_mlog_table() const { return (OB_INVALID_ID != mlog_tid_); }
+  bool has_tmp_mlog_table() const { return (OB_INVALID_ID != tmp_mlog_tid_); }
   bool required_by_mview_refresh() const { return has_mlog_table() || table_referenced_by_fast_lsm_mv(); }
   // ObColumnIterByPrevNextID's column id is not in order, it means table has add column instant and return true
   int has_add_column_instant(bool &add_column_instant) const;
@@ -2113,6 +2291,8 @@ public:
   }
   void set_mlog_tid(const uint64_t& table_id) { mlog_tid_ = table_id; }
   uint64_t get_mlog_tid() const { return mlog_tid_; }
+  void set_tmp_mlog_tid(const uint64_t& table_id) { tmp_mlog_tid_ = table_id; }
+  uint64_t get_tmp_mlog_tid() const { return tmp_mlog_tid_; }
   inline sql::ObLocalSessionVar &get_local_session_var() { return local_session_vars_; }
   inline const sql::ObLocalSessionVar &get_local_session_var() const { return local_session_vars_; }
   inline void set_mv_mode(const int64_t mv_mode) { mv_mode_.mode_ = mv_mode; }
@@ -2145,14 +2325,37 @@ public:
   {
     mv_mode_.table_referenced_by_fast_lsm_mv_flag_ = flag;
   }
-  void set_semistruct_encoding_type(const int64_t type) { semistruct_encoding_type_.flags_ = type; }
-  void set_semistruct_encoding_type(const ObSemiStructEncodingType& type) { semistruct_encoding_type_ = type; }
-  const ObSemiStructEncodingType& get_semistruct_encoding_type() const { return semistruct_encoding_type_; }
-  int64_t get_semistruct_encoding_flags() const { return semistruct_encoding_type_.flags_; }
-  virtual int get_semistruct_encoding_type(ObSemiStructEncodingType& type) const
+  inline int set_semistruct_properties(const common::ObString &semistruct_properties)
+  {
+    return deep_copy_str(semistruct_properties, semistruct_properties_);
+  }
+  virtual const common::ObString& get_semistruct_properties() const override
+  {
+    return semistruct_properties_;
+  }
+  void set_semistruct_encoding_type(const uint64_t &flags)
+  {
+    semistruct_encoding_type_.flags_ = flags;
+  }
+  inline void set_semistruct_encoding_type(const ObSemiStructEncodingType &type)
+  {
+    semistruct_encoding_type_ = type;
+  }
+  virtual int get_semistruct_encoding_type(ObSemiStructEncodingType& type) const override
   {
     type = semistruct_encoding_type_;
     return OB_SUCCESS;
+  }
+  int64_t get_semistruct_encoding_flags() const { return semistruct_encoding_type_.flags_; }
+  inline const ObSemiStructEncodingType& get_semistruct_encoding_type() const { return semistruct_encoding_type_; }
+  inline bool is_mv_cnt_proctime_table() const
+  {
+    return MV_CNT_PROCTIME_TABLE ==
+           (enum ObMvCntProctimeTableFlag)mv_mode_.cnt_proctime_table_;
+  }
+  inline void set_mv_cnt_proctime_table(const ObMvCntProctimeTableFlag flag)
+  {
+    mv_mode_.cnt_proctime_table_ = flag;
   }
   inline int set_dynamic_partition_policy(const common::ObString &dynamic_partition_policy)
   {
@@ -2168,6 +2371,12 @@ public:
   }
   int get_part_key_column_type(const int64_t index, ObObjType &type) const;
   int get_part_key_column_name(const int64_t index, ObString &name) const;
+
+  int check_support_interval_part() const;
+  int check_identity_column_for_interval_part() const;
+  int get_hidden_column_count(int64_t &hidden_column_count) const;
+  int get_search_data_index_tid(uint64_t &tid) const;
+
   DECLARE_VIRTUAL_TO_STRING;
 
 protected:
@@ -2187,6 +2396,9 @@ protected:
   int add_column_group_to_hash_array(ObColumnGroupSchema *column_group,
                                      const KeyType &key,
                                      ArrayType *&array);
+  virtual int get_skip_index_col_attr_by_schema(common::ObIArray<ObSkipIndexColumnAttr> &skip_idx_attrs,
+                                                ObSEArray<ObObjMeta, 16> *column_types=nullptr,
+                                                const bool only_set_fts=false) const;
 protected:
   int add_cst_to_cst_array(ObConstraint *cst);
   int remove_cst_from_cst_array(const ObConstraint *cst);
@@ -2345,6 +2557,8 @@ protected:
 
   //external table
   uint64_t catalog_id_ = OB_INTERNAL_CATALOG_ID; // do not need to serialized
+  share::ObLakeTableFormat lake_table_format_; // do not need to serialized
+  int64_t lake_table_snapshot_id_ = OB_INVALID_ID; // do not need to serialized
   common::ObString external_file_format_;
   common::ObString external_file_location_;
   common::ObString external_file_location_access_info_;
@@ -2383,6 +2597,10 @@ protected:
   common::ObString dynamic_partition_policy_;
   uint64_t external_location_id_;
   common::ObString external_sub_path_;
+  uint64_t tmp_mlog_tid_;
+  common::ObString semistruct_properties_;
+  ObTTLFlag ttl_flag_;
+  ObSkipIndexLevel skip_index_level_;
 };
 
 class ObPrintableTableSchema final : public ObTableSchema
@@ -2460,6 +2678,36 @@ inline bool ObSimpleTableSchemaV2::is_multivalue_index() const
   return share::schema::is_multivalue_index(index_type_);
 }
 
+inline bool ObSimpleTableSchemaV2::is_search_index() const
+{
+  return share::schema::is_search_index(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_search_def_index() const
+{
+  return share::schema::is_search_def_index(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_search_data_index() const
+{
+  return share::schema::is_search_data_index(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_search_index(const ObIndexType index_type)
+{
+  return share::schema::is_search_index(index_type);
+}
+
+inline bool ObSimpleTableSchemaV2::is_search_def_index(const ObIndexType index_type)
+{
+  return share::schema::is_search_def_index(index_type);
+}
+
+inline bool ObSimpleTableSchemaV2::is_search_data_index(const ObIndexType index_type)
+{
+  return share::schema::is_search_data_index(index_type);
+}
+
 inline bool ObSimpleTableSchemaV2::is_multivalue_index_aux() const
 {
   return share::schema::is_multivalue_index_aux(index_type_);
@@ -2503,6 +2751,16 @@ inline bool ObSimpleTableSchemaV2::is_vec_ivfpq_index() const
 inline bool ObSimpleTableSchemaV2::is_vec_domain_index() const
 {
   return share::schema::is_vec_domain_index(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_hybrid_vec_index() const
+{
+  return share::schema::is_hybrid_vec_index(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_hybrid_vec_index(const ObIndexType index_type)
+{
+  return share::schema::is_hybrid_vec_index(index_type);
 }
 
 inline bool ObSimpleTableSchemaV2::is_vec_spiv_index() const
@@ -2590,9 +2848,24 @@ inline bool ObSimpleTableSchemaV2::is_vec_vid_rowkey_type() const
   return share::schema::is_vec_vid_rowkey_type(index_type_);
 }
 
+inline bool ObSimpleTableSchemaV2::is_vec_shared_table_type() const
+{
+  return is_vec_rowkey_vid_type() || is_vec_vid_rowkey_type();
+}
+
 inline bool ObSimpleTableSchemaV2::is_vec_delta_buffer_type() const
 {
   return share::schema::is_vec_delta_buffer_type(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_hybrid_vec_index_log_type() const
+{
+  return share::schema::is_hybrid_vec_index_log_type(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_hybrid_vec_index_embedded_type() const
+{
+  return share::schema::is_hybrid_vec_index_embedded_type(index_type_);
 }
 
 inline bool ObSimpleTableSchemaV2::is_vec_dim_docid_value_type() const
@@ -2628,6 +2901,11 @@ inline bool ObSimpleTableSchemaV2::is_built_in_multivalue_index() const
 inline bool ObSimpleTableSchemaV2::is_built_in_index() const
 {
   return share::schema::is_built_in_index(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_no_need_rebuild_index() const
+{
+  return (is_built_in_index() && !is_vec_index_snapshot_data_type()) || is_vec_delta_buffer_type() || is_hybrid_vec_index_log_type();
 }
 
 inline bool ObSimpleTableSchemaV2::is_rowkey_doc_id() const
@@ -2690,7 +2968,9 @@ inline bool ObSimpleTableSchemaV2::is_domain_index(const ObIndexType index_type)
          share::schema::is_vec_ivfflat_centroid_index(index_type) ||
          share::schema::is_vec_ivfpq_centroid_index(index_type) ||
          share::schema::is_vec_ivfsq8_centroid_index(index_type) ||
-         share::schema::is_vec_dim_docid_value_type(index_type);
+         share::schema::is_vec_dim_docid_value_type(index_type) ||
+         share::schema::is_hybrid_vec_index(index_type) ||
+         share::schema::is_search_index(index_type);
 }
 
 inline bool ObSimpleTableSchemaV2::is_fts_or_multivalue_index() const
@@ -2716,7 +2996,8 @@ inline bool ObSimpleTableSchemaV2::should_check_major_merge_progress() const
   return is_normal_schema() && (is_sys_table()
           || is_user_table()
           || is_tmp_table()
-          || is_aux_lob_table());
+          || is_aux_lob_table()
+          || is_mlog_table());
 }
 
 inline int64_t ObTableSchema::get_id_hash_array_mem_size(const int64_t column_cnt) const
@@ -3084,10 +3365,16 @@ template <typename Allocator>
 int ObTableSchema::build_mlog_table_name(Allocator &allocator,
                                          const common::ObString &base_table_name,
                                          common::ObString &mlog_table_name,
-                                         const bool is_oracle_mode)
+                                         const bool is_oracle_mode,
+                                         const bool is_tmp)
 {
   int ret = OB_SUCCESS;
-  const ObString prefix(is_oracle_mode ? common::OB_MLOG_PREFIX_ORACLE : common::OB_MLOG_PREFIX_MYSQL);
+  ObString prefix;
+  if (is_tmp) {
+    prefix = (is_oracle_mode ? common::OB_TMP_MLOG_PREFIX_ORACLE : common::OB_TMP_MLOG_PREFIX_MYSQL);
+  } else {
+    prefix = (is_oracle_mode ? common::OB_MLOG_PREFIX_ORACLE : common::OB_MLOG_PREFIX_MYSQL);
+  }
   int32_t buf_len = prefix.length() + base_table_name.length() + 1;
   char *name_buf = nullptr;
   if (OB_ISNULL(name_buf = static_cast<char *>(allocator.alloc(buf_len)))) {

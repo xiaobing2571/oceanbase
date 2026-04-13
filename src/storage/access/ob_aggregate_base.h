@@ -15,7 +15,9 @@
 
 #include <stdint.h>
 #include "share/aggregate/agg_ctx.h"
+#include "share/ob_compute_property.h"
 #include "storage/blocksstable/ob_datum_row.h"
+#include "share/aggregate/agg_reuse_cell.h"
 
 namespace oceanbase
 {
@@ -70,16 +72,14 @@ public:
       bound_row_id_(OB_INVALID_CS_ROW_ID),
       is_reverse_(false)
   {}
-  ObPushdownRowIdCtx(const int32_t *row_ids, int64_t row_cap, const bool check_scan_order = true)
+  ObPushdownRowIdCtx(const int32_t *row_ids, int64_t row_cap)
     : row_ids_(row_ids),
       row_cap_(row_cap),
       begin_(-1),
       end_(-1),
       bound_row_id_(OB_INVALID_CS_ROW_ID)
   {
-    if (check_scan_order) {
-      is_reverse_ = row_cap_ > 1 && row_ids_[1] < row_ids_[0];
-    }
+    is_reverse_ = row_cap_ > 1 && row_ids_[1] < row_ids_[0];
   }
   void reuse()
   {
@@ -129,29 +129,48 @@ public:
 class ObAggCellBase
 {
 public:
-  ObAggCellBase(common::ObIAllocator &allocator);
+  ObAggCellBase(common::ObIAllocator &allocator, const share::ObAggrParamProperty &param_prop);
   virtual ~ObAggCellBase() {}
   virtual void reset();
   virtual void reuse();
+  /**
+    * agg_row_idx:
+    *  Effective when group by pushdown
+    * agg_batch_size:
+    *  Effective when aggregate with expr pushdown,
+    *  It indicates the batch size when aggregate batch single rows, 0 means default batch size.
+    *  When it is not 1, the last batch must be aggregated explicitly by the invoker.
+    */
   virtual int eval(
       blocksstable::ObStorageDatum &datum,
       const int64_t row_count = 1,
-      const int64_t agg_row_idx = 0) = 0;
-  // virtual bool need_access_data() const = 0;
-  // virtual int32_t get_col_offset() const = 0;
+      const int64_t agg_row_idx = 0,
+      const int64_t agg_batch_size = 0) = 0;
   virtual ObObjType get_obj_type() const = 0;
   int reserve_bitmap(const int64_t size);
   OB_INLINE bool is_assigned_to_group_by_processor() const
   { return is_assigned_to_group_by_processor_; }
-  OB_INLINE void set_assigned_to_group_by_processor()
-  { is_assigned_to_group_by_processor_ = true; }
+  OB_INLINE void set_assigned_to_group_by_processor(bool is_assigned)
+  { is_assigned_to_group_by_processor_ = is_assigned; }
   OB_INLINE const ObDatum &get_result_datum() const { return result_datum_; };
   OB_INLINE ObPDAggType get_type() const { return agg_type_; }
-  OB_INLINE bool is_min_agg() const { return PD_MIN == agg_type_; }
-  OB_INLINE bool is_max_agg() const { return PD_MAX == agg_type_; }
+  OB_INLINE bool is_min_agg() const
+  {
+    return (PD_MIN == agg_type_ && is_monotonic_asc()) || (PD_MAX == agg_type_ && is_monotonic_desc());
+  }
+  OB_INLINE bool is_max_agg() const
+  {
+    return (PD_MAX == agg_type_ && is_monotonic_asc()) || (PD_MIN == agg_type_ && is_monotonic_desc());
+  }
   OB_INLINE ObBitmap &get_bitmap() { return *bitmap_; };
-  VIRTUAL_TO_STRING_KV(K_(agg_type), K_(is_inited), KPC_(bitmap), KP_(agg_row_reader),
-    K_(result_datum), K_(skip_index_datum), K_(skip_index_datum_is_prefix), K_(is_assigned_to_group_by_processor));
+  OB_INLINE void set_ignore_eval_index_info(const bool ignore_eval_index_info) { ignore_eval_index_info_ = ignore_eval_index_info; }
+  VIRTUAL_TO_STRING_KV(K_(agg_type), K_(is_inited), K_(param_prop), KP_(agg_row_reader), K_(ignore_eval_index_info),
+    K_(result_datum), K_(skip_index_datum), K_(skip_index_datum_is_prefix), K_(is_assigned_to_group_by_processor), KPC_(bitmap));
+protected:
+  OB_INLINE bool is_monotonic_asc() const { return share::Monotonicity::ASC == param_prop_.mono_; }
+  OB_INLINE bool is_monotonic_desc() const { return share::Monotonicity::DESC == param_prop_.mono_; }
+  OB_INLINE bool is_monotonic() const { return is_monotonic_asc() || is_monotonic_desc(); }
+  OB_INLINE bool is_param_null_prop() const { return param_prop_.is_null_prop_; }
 protected:
   ObBitmap *bitmap_;
   blocksstable::ObAggRowReader *agg_row_reader_;
@@ -159,8 +178,10 @@ protected:
   blocksstable::ObStorageDatum skip_index_datum_;
   common::ObIAllocator &allocator_;
   ObPDAggType agg_type_;
+  share::ObAggrParamProperty param_prop_;
   bool is_assigned_to_group_by_processor_;
   bool skip_index_datum_is_prefix_;
+  bool ignore_eval_index_info_;
   bool is_inited_;
 };
 
@@ -176,8 +197,7 @@ public:
       const ObTableAccessContext *context,
       const int32_t col_offset,
       blocksstable::ObIMicroBlockReader *reader,
-      const ObPushdownRowIdCtx &pd_row_id_ctx,
-      const bool reserve_memory) = 0;
+      const ObPushdownRowIdCtx &pd_row_id_ctx) = 0;
   virtual int can_use_index_info(const blocksstable::ObMicroIndexInfo &index_info, const int32_t col_index, bool &can_agg) = 0;
   virtual int fill_index_info(const blocksstable::ObMicroIndexInfo &index_info, const bool is_cg) = 0;
   DECLARE_PURE_VIRTUAL_TO_STRING;
@@ -190,6 +210,7 @@ public:
   virtual int can_use_index_info(const blocksstable::ObMicroIndexInfo &index_info, bool &can_agg) = 0;
   virtual int fill_index_info(const blocksstable::ObMicroIndexInfo &index_info, const bool is_cg) = 0;
   virtual int collect_aggregated_result() = 0;
+  virtual int set_ignore_eval_index_info(const bool ignore_eval_index_info) = 0;
   DECLARE_PURE_VIRTUAL_TO_STRING;
 };
 
@@ -247,6 +268,7 @@ public:
   virtual void reset();
   virtual void reuse();
   virtual int init(const ObTableAccessParam &param, const ObTableAccessContext &context, sql::ObEvalCtx &eval_ctx) = 0;
+  virtual int init_for_single_row(const ObTableAccessParam &param, const ObTableAccessContext &context, sql::ObEvalCtx &eval_ctx) = 0;
   virtual int eval_batch(
       common::ObDatum *datums,
       const int64_t count,
@@ -256,16 +278,19 @@ public:
       const uint32_t ref_offset = 0) = 0;
   virtual int copy_output_row(const int64_t batch_idx, const ObTableIterParam &iter_param) = 0;
   virtual int copy_output_rows(const int64_t batch_idx, const ObTableIterParam &iter_param) = 0;
-  virtual int copy_single_output_row(sql::ObEvalCtx &ctx) = 0;
+  virtual int copy_single_output_row(const ObTableIterParam &iter_param, sql::ObEvalCtx &ctx) = 0;
   virtual int collect_result() = 0;
   virtual int add_distinct_null_value() = 0;
   virtual int extract_distinct() = 0;
   virtual int output_extra_group_by_result(int64_t &count, const ObTableIterParam &iter_param) = 0;
   virtual int pad_column_in_group_by(const int64_t row_cap) = 0;
   virtual int assign_agg_cells(const sql::ObExpr *col_expr, common::ObIArray<int32_t> &agg_idxs) = 0;
+  virtual int clear_agg_cell_assign_status() = 0;
   virtual int check_distinct_and_ref_valid();
+  virtual int clear_evaluated_infos() { return OB_SUCCESS; }
   OB_INLINE int64_t get_batch_size() const { return batch_size_; }
   OB_INLINE int32_t get_group_by_col_offset() const { return group_by_col_offset_; }
+  OB_INLINE const share::schema::ObColumnParam *get_group_by_col_param() const { return group_by_col_param_; }
   OB_INLINE ObObjDatumMapType get_obj_datum_map_type() const {return group_by_col_expr_->obj_datum_map_; }
   OB_INLINE virtual bool is_exceed_sql_batch() const { return true; }
   virtual common::ObDatum *get_group_by_col_datums_to_fill() = 0;
@@ -280,9 +305,14 @@ public:
   OB_INLINE void set_distinct_cnt(const int64_t distinct_cnt) { distinct_cnt_ = distinct_cnt; }
   OB_INLINE bool need_extract_distinct() const { return need_extract_distinct_; }
   OB_INLINE bool is_processing() const { return is_processing_; }
-  OB_INLINE void set_is_processing(const bool is_processing) { is_processing_ = is_processing; }
-  OB_INLINE void reset_projected_cnt() { projected_cnt_ = 0; }
+  OB_INLINE void set_is_processing(const bool is_processing)
+  {
+    is_processing_ = is_processing;
+    projected_cnt_ = 0;
+  }
   OB_INLINE void set_row_capacity(const int64_t row_capacity) { row_capacity_ = row_capacity; }
+  // When decide_use_group_by() return true, only can refresh table when the whole micro block is scanned.
+  OB_INLINE bool can_refresh() const { return !is_exceed_sql_batch() || (projected_cnt_ >= distinct_cnt_); }
   template <typename T>
   int decide_use_group_by(const int64_t row_cnt, const int64_t read_cnt, const int64_t distinct_cnt, const T *bitmap, bool &use_group_by)
   {
@@ -323,6 +353,7 @@ public:
                        K_(group_by_col_offset),
                        K_(need_extract_distinct),
                        K_(is_processing),
+                       K_(need_padding),
                        K_(distinct_projector_buf),
                        K(ObArrayWrap<uint32_t>(refs_buf_, ref_cnt_)));
 protected:
@@ -346,6 +377,7 @@ protected:
   int32_t group_by_col_offset_;
   bool need_extract_distinct_;
   bool is_processing_;
+  bool need_padding_;
   bool is_inited_;
 };
 
@@ -392,6 +424,7 @@ public:
   int64_t agg_row_num_;
   common::ObIAllocator &allocator_;
   common::ObArenaAllocator row_allocator_;
+  aggregate::ReuseAggCellMgr reuse_aggrow_mgr_;
 };
 
 class ObAggDatumBuf

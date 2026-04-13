@@ -29,7 +29,7 @@ public:
     ctx_(), create_tenant_schema_result_(), user_tenant_schema_(), meta_tenant_schema_() {}
   int execute(obrpc::UInt64 &tenant_id);
   int init(
-      obrpc::ObCreateTenantArg create_tenant_arg,
+      const obrpc::ObCreateTenantArg &create_tenant_arg,
       obrpc::ObSrvRpcProxy *rpc_proxy,
       obrpc::ObCommonRpcProxy *common_rpc,
       common::ObMySQLProxy *sql_proxy,
@@ -40,6 +40,7 @@ public:
       KP_(schema_service), KP_(lst_operator), KP_(location_service), K_(ctx),
       K_(create_tenant_schema_result), K(user_tenant_schema_), K(meta_tenant_schema_));
 private:
+  int save_data_version_in_palf_kv_();
   int create_user_ls_(ObParallelCreateNormalTenantProxy &proxy);
 
   int wait_all_(ObParallelCreateNormalTenantProxy &proxy, const int ret_code);
@@ -69,7 +70,6 @@ private:
 
   int create_tenant_sys_ls_();
   int create_tenant_sslog_();
-  int create_sslog_tablet_();
 
   int create_tenant_sys_ls_(const ObTenantSchema &tenant_schema,
       const ObIArray<share::ObResourcePoolName> &pool_list,
@@ -77,8 +77,15 @@ private:
       const palf::PalfBaseInfo &palf_base_info,
       const uint64_t source_tenant_id,
       const share::ObAllTenantInfo &tenant_info,
-      const bool is_sslog = false);
+      const share::ObLSID &ls_id = share::SYS_LS);
 
+#ifdef OB_BUILD_SHARED_STORAGE
+  int create_ss_ls_(
+      const uint64_t meta_tenant_id,
+      const ObIArray<share::ObResourcePoolName> &pools,
+      const palf::PalfBaseInfo &meta_palf_base_info,
+      const share::ObAllTenantInfo &tenant_info);
+#endif
   int create_tenant_user_ls_(ObParallelCreateNormalTenantProxy &proxy);
   int construct_tenant_info_(const uint64_t tenant_id, share::ObAllTenantInfo &tenant_info);
   share::SCN get_recovery_until_scn_();
@@ -86,6 +93,12 @@ private:
   bool get_create_ls_with_palf_();
 
   bool async_rpc_has_error(ObParallelCreateNormalTenantProxy &proxy);
+
+#ifdef OB_BUILD_TDE_SECURITY
+#ifdef OB_BUILD_SHARED_STORAGE
+  int upload_root_key_();
+#endif
+#endif
 private:
   // set by outside
   obrpc::ObCreateTenantArg create_tenant_arg_;

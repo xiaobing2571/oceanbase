@@ -45,10 +45,10 @@ private:
     }
     ObObj key1, key2, key3;
     ObObj value;
-    ObSEArray<ObITableEntity *, 16> entities;
+    ObSEArray<const ObITableEntity *, 16> entities;
     int32_t COLUMN_COUNT_1 = 8;
     int32_t COLUMN_COUNT_2 = 5;
-    ObSEArray<ObITableEntity *, 16> series_entities;
+    ObSEArray<const ObITableEntity *, 16> series_entities;
     ObSEArray<ObTabletID, 16> real_tablet_ids;
     entities.reset();
 
@@ -71,14 +71,14 @@ private:
       ASSERT_EQ(OB_SUCCESS, entity->set_property(V, value));
       ASSERT_EQ(OB_SUCCESS, entities.push_back(entity));
     }
-
-    ASSERT_EQ(OB_SUCCESS, adapter->convert_normal_to_series(entities, series_entities, real_tablet_ids));
+    bool is_inrow_series = false;
+    ASSERT_EQ(OB_SUCCESS, adapter->convert_normal_to_series(entities, series_entities, real_tablet_ids, is_inrow_series));
     ASSERT_EQ(1, series_entities.count());
     ASSERT_EQ(1, real_tablet_ids.count());
 
     {
       entity = NULL;
-      entity = series_entities.at(0);
+      entity = const_cast<ObITableEntity*>(series_entities.at(0));
       ASSERT_TRUE(NULL != entity);
       ObObj timestamp;
       ASSERT_EQ(OB_SUCCESS, entity->get_rowkey_value(1, timestamp));
@@ -137,7 +137,7 @@ TEST_F(TestSeriesConvert, htable_normal_convert_series)
   }  // end for
   ObObj key1, key2, key3;
   ObObj value;
-  ObSEArray<ObITableEntity *, 16> entities;
+  ObSEArray<const ObITableEntity *, 16> entities;
   int32_t COLUMN_COUNT_1 = 8;
   int32_t COLUMN_COUNT_2 = 5;
 
@@ -173,15 +173,16 @@ TEST_F(TestSeriesConvert, htable_normal_convert_series)
     ASSERT_EQ(OB_SUCCESS, entities.push_back(entity));
   }  // end for
 
-  ObSEArray<ObITableEntity *, 16> series_entities;
+  ObSEArray<const ObITableEntity *, 16> series_entities;
   ObSEArray<ObTabletID, 16> real_tablet_ids;
-  ASSERT_EQ(OB_SUCCESS, adapter->convert_normal_to_series(entities, series_entities, real_tablet_ids));
+  bool is_inrow_series = false;
+  ASSERT_EQ(OB_SUCCESS, adapter->convert_normal_to_series(entities, series_entities, real_tablet_ids, is_inrow_series));
   ASSERT_EQ(2, series_entities.count());
   ASSERT_EQ(2, real_tablet_ids.count());
 
   {
     entity = NULL;
-    entity = series_entities.at(0);
+    entity = const_cast<ObITableEntity*>(series_entities.at(0));
     ASSERT_TRUE(NULL != entity);
     ObObj timestamp;
     ASSERT_EQ(OB_SUCCESS, entity->get_rowkey_value(1, timestamp));
@@ -205,7 +206,7 @@ TEST_F(TestSeriesConvert, htable_normal_convert_series)
 
   {
     entity = NULL;
-    entity = series_entities.at(1);
+    entity = const_cast<ObITableEntity*>(series_entities.at(1));
     ASSERT_TRUE(NULL != entity);
     ObObj timestamp;
     ASSERT_EQ(OB_SUCCESS, entity->get_rowkey_value(1, timestamp));
@@ -255,14 +256,13 @@ TEST_F(TestSeriesConvert, htable_normal_convert_series)
     ASSERT_EQ(OB_SUCCESS, entity->set_property(V, value));
     ASSERT_EQ(OB_SUCCESS, entities.push_back(entity));
   }  // end for
-
-  ASSERT_EQ(OB_SUCCESS, adapter->convert_normal_to_series(entities, series_entities, real_tablet_ids));
+  ASSERT_EQ(OB_SUCCESS, adapter->convert_normal_to_series(entities, series_entities, real_tablet_ids, is_inrow_series));
   ASSERT_EQ(1, series_entities.count());
   ASSERT_EQ(1, real_tablet_ids.count());
 
   {
     entity = NULL;
-    entity = series_entities.at(0);
+    entity = const_cast<ObITableEntity*>(series_entities.at(0));
     ASSERT_TRUE(NULL != entity);
     ObObj timestamp;
     ASSERT_EQ(OB_SUCCESS, entity->get_rowkey_value(1, timestamp));
@@ -350,14 +350,13 @@ TEST_F(TestSeriesConvert, htable_normal_convert_series)
     ASSERT_EQ(OB_SUCCESS, entity->set_property(V, value));
     ASSERT_EQ(OB_SUCCESS, entities.push_back(entity));
   }
-
-  ASSERT_EQ(OB_SUCCESS, adapter->convert_normal_to_series(entities, series_entities, real_tablet_ids));
+  ASSERT_EQ(OB_SUCCESS, adapter->convert_normal_to_series(entities, series_entities, real_tablet_ids, is_inrow_series));
   ASSERT_EQ(1, series_entities.count());
   ASSERT_EQ(1, real_tablet_ids.count());
 
   {
     entity = NULL;
-    entity = series_entities.at(0);
+    entity = const_cast<ObITableEntity*>(series_entities.at(0));
     ASSERT_TRUE(NULL != entity);
     ObObj timestamp;
     ASSERT_EQ(OB_SUCCESS, entity->get_rowkey_value(1, timestamp));

@@ -58,11 +58,18 @@ private:
       const uint64_t tenant_id,
       common::ObArray<int64_t> &update_list,
       common::ObArray<int64_t> &add_list);
+  static int batch_update_sys_var_(
+             obrpc::ObCommonRpcProxy &rpc_proxy,
+             const uint64_t tenant_id,
+             const bool is_update,
+             common::ObArray<int64_t> &update_list);
   static int update_sys_var_(
              obrpc::ObCommonRpcProxy &rpc_proxy,
              const uint64_t tenant_id,
              const bool is_update,
              common::ObArray<int64_t> &update_list);
+  static int get_sys_param_(const uint64_t &tenant_id, const int64_t &var_store_idx,
+      share::schema::ObSysVarSchema &sys_var);
   /* upgrade sys variable end */
   static int filter_sys_stat(
       common::ObISQLClient &sql_client,
@@ -186,7 +193,7 @@ public:
              const uint64_t cluster_version,
              uint64_t &data_version);
 public:
-  static const int64_t DATA_VERSION_NUM = 32;
+  static const int64_t DATA_VERSION_NUM = 45;
   static const uint64_t UPGRADE_PATH[];
 };
 
@@ -198,9 +205,11 @@ public:
   virtual ~ObUpgradeForAllVersionProcessor() {}
   virtual int pre_upgrade() override { return common::OB_SUCCESS; }
   virtual int post_upgrade() override;
-  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
+  virtual int finish_upgrade() override;
 private:
   int flush_ncomp_dll_job();
+  int finish_upgrade_for_add_sys_priv();
+  int replace_unit_group_id_with_unit_list_();
 };
 
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 0, 0, 0)
@@ -263,6 +272,10 @@ DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 1)
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 2)
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 3)
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 4)
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 5)
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 6)
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 7)
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 2, 5, 8)
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 3, 0, 0)
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 3, 0, 1)
 
@@ -363,7 +376,74 @@ private:
 
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 3, 5, 3)
 
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 3, 5, 4)
+
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 3, 5, 5)
+
 DEF_SIMPLE_UPGRARD_PROCESSER(4, 4, 0, 0)
+
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 4, 0, 1)
+
+class ObUpgradeFor4410Processor : public ObBaseUpgradeProcessor
+{
+public:
+  ObUpgradeFor4410Processor() : ObBaseUpgradeProcessor() {}
+  virtual ~ObUpgradeFor4410Processor() {}
+  virtual int pre_upgrade() override { return common::OB_SUCCESS; }
+  virtual int post_upgrade() override;
+  virtual int finish_upgrade() override { return common::OB_SUCCESS; }
+private:
+  int post_upgrade_for_replace_tenant_();
+  int post_upgrade_for_scheduled_trigger_partition_balance();
+  int post_upgrade_for_scheduled_trigger_dump_data_dict();
+  int post_upgrade_for_upload_cluster_info_();
+};
+
+class ObUpgradeFor4420Processor : public ObBaseUpgradeProcessor
+{
+public:
+  ObUpgradeFor4420Processor() : ObBaseUpgradeProcessor() {}
+  virtual ~ObUpgradeFor4420Processor() {}
+  virtual int pre_upgrade() override { return common::OB_SUCCESS; }
+  virtual int post_upgrade() override;
+  virtual int finish_upgrade() override;
+private:
+  int post_upgrade_for_sys_schema_version();
+  int finish_upgrade_for_grant_sys_privs();
+  int grant_priv(const ObPrivSet user_priv_set,
+                 const ObPrivSet grant_priv_set,
+                 const char *grant_sql,
+                 const lib::Worker::CompatMode compat_mode);
+};
+
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 4, 2, 1)
+
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 5, 0, 0)
+
+class ObUpgradeFor4510Processor : public ObBaseUpgradeProcessor
+{
+public:
+  ObUpgradeFor4510Processor() : ObBaseUpgradeProcessor() {}
+  virtual ~ObUpgradeFor4510Processor() {}
+  virtual int pre_upgrade() override { return common::OB_SUCCESS; }
+  virtual int post_upgrade() override;
+  virtual int finish_upgrade() override;
+private:
+  int post_upgrade_for_metadata_ls_();
+  int insert_metadata_ls_status_(const uint64_t tenant_id);
+  int create_metadata_ls_(const uint64_t tenant_id);
+  int wait_metadata_ls_leader_(common::ObAddr &leader);
+  int create_tiered_metadata_tablet_(const common::ObAddr &leader);
+  int post_upgrade_for_set_paralllel_target_();
+  int finish_upgrade_for_daily_maintenance_window();
+  int finish_upgrade_for_grant_sys_privs();
+  int grant_priv(const ObPrivSet user_priv_set,
+                 const ObPrivSet grant_priv_set,
+                 const char *grant_sql,
+                 const lib::Worker::CompatMode compat_mode);
+};
+
+DEF_SIMPLE_UPGRARD_PROCESSER(4, 6, 0, 0)
 
 /* =========== special upgrade processor end   ============= */
 

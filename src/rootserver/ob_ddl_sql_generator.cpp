@@ -13,6 +13,7 @@
 #define USING_LOG_PREFIX RS
 #include "rootserver/ob_ddl_sql_generator.h"
 #include "share/ob_rpc_struct.h"
+#include "lib/encrypt/ob_encrypted_helper.h"
 
 namespace oceanbase
 {
@@ -130,6 +131,20 @@ int ObDDLSqlGenerator::get_priv_name(const int64_t priv, const char *&name)
       name = "CREATE CATALOG"; break;
     case OB_PRIV_USE_CATALOG:
       name = "USE CATALOG"; break;
+    case OB_PRIV_CREATE_LOCATION:
+      name = "CREATE LOCATION"; break;
+    case OB_PRIV_CREATE_AI_MODEL:
+      name = "CREATE AI MODEL"; break;
+    case OB_PRIV_ALTER_AI_MODEL:
+      name = "ALTER AI MODEL"; break;
+    case OB_PRIV_DROP_AI_MODEL:
+      name = "DROP AI MODEL"; break;
+    case OB_PRIV_ACCESS_AI_MODEL:
+      name = "ACCESS AI MODEL"; break;
+    case OB_PRIV_CREATE_SENSITIVE_RULE:
+      name = "CREATE SENSITIVE RULE"; break;
+    case OB_PRIV_PLAINACCESS:
+      name = "PLAINACCESS"; break;
     default: {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid priv", K(ret), K(priv));
@@ -140,7 +155,9 @@ int ObDDLSqlGenerator::get_priv_name(const int64_t priv, const char *&name)
 
 int ObDDLSqlGenerator::gen_create_user_sql(const ObAccountArg &account,
                                            const ObString &password,
-                                           ObSqlString &sql_string)
+                                           const ObString &plugin,
+                                           ObSqlString &sql_string,
+                                           const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
   sql_string.reset();
@@ -159,15 +176,15 @@ int ObDDLSqlGenerator::gen_create_user_sql(const ObAccountArg &account,
       char CREATE_USER_SQL[] = "CREATE USER %s `%.*s`";
       char NEW_CREATE_USER_SQL[] = "CREATE USER %s `%.*s`@`%.*s`";
       if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(CREATE_USER_SQL),
-                                          lib::is_oracle_mode() ? "" : IF_NOT_EXIST,
+        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(CREATE_USER_SQL, is_oracle_mode),
+                                          is_oracle_mode ? "" : IF_NOT_EXIST,
                                           account.user_name_.length(),
                                           account.user_name_.ptr()))) {
           LOG_WARN("append sql failed", K(account), K(password), K(ret));
         }
       } else {
-        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_CREATE_USER_SQL),
-                                          lib::is_oracle_mode() ? "" : IF_NOT_EXIST,
+        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_CREATE_USER_SQL, is_oracle_mode),
+                                          is_oracle_mode ? "" : IF_NOT_EXIST,
                                           account.user_name_.length(),
                                           account.user_name_.ptr(),
                                           account.host_name_.length(),
@@ -178,24 +195,28 @@ int ObDDLSqlGenerator::gen_create_user_sql(const ObAccountArg &account,
     }
   }
   // mysql mode 且密码不为空串
-  if (OB_SUCC(ret) && !lib::is_oracle_mode() && !password.empty()) {
-    if (OB_FAIL(sql_string.append_fmt(" IDENTIFIED BY PASSWORD '%.*s'",
-                                      password.length(),
-                                      password.ptr()))) {
+  ObCStringHelper helper;
+  const char *password_str = helper.convert(ObHexEscapeSqlStr(password.ptr(), false, false));
+  const char *plugin_str = helper.convert(ObHexEscapeSqlStr(plugin.ptr(), false, false));
+  if (OB_SUCC(ret) && !is_oracle_mode) {
+    if (OB_FAIL(sql_string.append_fmt(" IDENTIFIED WITH %.*s AS '%.*s'",
+                                      static_cast<int32_t>(strlen(plugin_str)),
+                                      plugin_str,
+                                      static_cast<int32_t>(strlen(password_str)),
+                                      password_str))) {
       LOG_WARN("append sql failed", K(password), K(ret), K(account));
     }
-  } else if (OB_SUCC(ret) && lib::is_oracle_mode() 
-             && !password.empty()) {
-    // oracle mode 且密码不为空串
-    if (OB_FAIL(sql_string.append_fmt(" IDENTIFIED BY VALUES \"%.*s\"",
-                                      password.length(),
-                                      password.ptr()))) {
-      LOG_WARN("append sql failed", K(password), K(ret), K(account));
+  } else if (OB_SUCC(ret) && is_oracle_mode && !password.empty()) {
+    if (OB_FAIL(sql_string.append_fmt(" IDENTIFIED WITH %.*s BY VALUES \"%.*s\"",
+                                      static_cast<int32_t>(strlen(plugin_str)),
+                                      plugin_str,
+                                      static_cast<int32_t>(strlen(password_str)),
+                                      password_str))) {
+      LOG_WARN("append sql failed", K(password), K(plugin), K(ret), K(account));
     }
-  } else if (OB_SUCC(ret) && lib::is_oracle_mode() 
-             && password.empty()) {
+  } else if (OB_SUCC(ret) && is_oracle_mode && password.empty()) {
     // oracle mode 且密码为空串
-    if (OB_FAIL(sql_string.append(" IDENTIFIED BY \"\""))) {
+    if (OB_FAIL(sql_string.append(" IDENTIFIED BY VALUES \"\""))) {
       LOG_WARN("append sql failed", K(ret), K(account));
     }
   }
@@ -284,36 +305,49 @@ int ObDDLSqlGenerator::append_ssl_info_sql(const ObSSLType &ssl_type,
   return ret;
 }
 
-
 int ObDDLSqlGenerator::gen_set_passwd_sql(const ObAccountArg &account,
                                           const ObString &password,
-                                          ObSqlString &sql_string)
+                                          ObSqlString &sql_string,
+                                          const ObString &plugin,
+                                          const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
-  char SET_PASSWD_SQL[] = "SET PASSWORD FOR `%.*s` = '%.*s'";
-  char NEW_SET_PASSWD_SQL[] = "SET PASSWORD FOR `%.*s`@`%.*s` = '%.*s'";
+  char ALTER_USER_WITH_PLUGIN_SQL[] = "ALTER USER `%.*s`@`%.*s` IDENTIFIED WITH %.*s AS '%.*s'";
+  char ALTER_USER_WITH_PLUGIN_ORACLE_SQL[] = "ALTER USER `%.*s`@`%.*s` IDENTIFIED WITH %.*s BY VALUES '%.*s'";
+  ObCStringHelper helper;
+  const char *password_str = helper.convert(ObHexEscapeSqlStr(password.ptr(), false, false));
+  const char *plugin_str = helper.convert(ObHexEscapeSqlStr(plugin.ptr(), false, false));
   if (OB_UNLIKELY(!account.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("username or password should not be null", K(account), K(password), K(ret));
+  } else if (plugin.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("plugin should not be empty", K(ret));
+  } else if (!is_oracle_mode) {
+    // ALTER USER ... IDENTIFIED WITH plugin AS ...
+    if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(ALTER_USER_WITH_PLUGIN_SQL, is_oracle_mode),
+                                      account.user_name_.length(),
+                                      account.user_name_.ptr(),
+                                      account.host_name_.length(),
+                                      account.host_name_.ptr(),
+                                      static_cast<int32_t>(strlen(plugin_str)),
+                                      plugin_str,
+                                      static_cast<int32_t>(strlen(password_str)),
+                                      password_str))) {
+      LOG_WARN("append sql failed", K(account), K(password), K(plugin), K(ret));
+    }
   } else {
-    if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(SET_PASSWD_SQL),
-                                        account.user_name_.length(),
-                                        account.user_name_.ptr(),
-                                        password.length(),
-                                        password.ptr()))) {
-        LOG_WARN("append sql failed", K(account), K(password), K(ret));
-      }
-    } else {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_SET_PASSWD_SQL),
-                                        account.user_name_.length(),
-                                        account.user_name_.ptr(),
-                                        account.host_name_.length(),
-                                        account.host_name_.ptr(),
-                                        password.length(),
-                                        password.ptr()))) {
-        LOG_WARN("append sql failed", K(account), K(password), K(ret));
-      }
+    // ALTER USER ... IDENTIFIED WITH plugin BY VALUES ...
+    if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(ALTER_USER_WITH_PLUGIN_ORACLE_SQL, is_oracle_mode),
+                                      account.user_name_.length(),
+                                      account.user_name_.ptr(),
+                                      account.host_name_.length(),
+                                      account.host_name_.ptr(),
+                                      static_cast<int32_t>(strlen(plugin_str)),
+                                      plugin_str,
+                                      static_cast<int32_t>(strlen(password_str)),
+                                      password_str))) {
+      LOG_WARN("append sql failed", K(account), K(password), K(ret));
     }
   }
   return ret;
@@ -322,7 +356,8 @@ int ObDDLSqlGenerator::gen_set_passwd_sql(const ObAccountArg &account,
 int ObDDLSqlGenerator::gen_set_max_connections_sql(const ObAccountArg &account,
                                                   const uint64_t max_connections_per_hour,
                                                   const uint64_t max_user_connections,
-                                                  ObSqlString &sql_string)
+                                                  ObSqlString &sql_string,
+                                                  const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
   bool set_max_connections_per_hour = max_connections_per_hour != OB_INVALID_ID;
@@ -337,7 +372,7 @@ int ObDDLSqlGenerator::gen_set_max_connections_sql(const ObAccountArg &account,
   } else {
     if (set_max_connections_per_hour) {
       if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(SET_MAX_CONNECTIONS_SQL),
+        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(SET_MAX_CONNECTIONS_SQL, is_oracle_mode),
                                           max_connections_per_hour_str.length(),
                                           max_connections_per_hour_str.ptr(),
                                           account.user_name_.length(),
@@ -346,7 +381,7 @@ int ObDDLSqlGenerator::gen_set_max_connections_sql(const ObAccountArg &account,
           LOG_WARN("append sql failed", K(account), K(ret));
         }
       } else {
-        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_SET_MAX_CONNECTIONS_SQL),
+        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_SET_MAX_CONNECTIONS_SQL, is_oracle_mode),
                                           max_connections_per_hour_str.length(),
                                           max_connections_per_hour_str.ptr(),
                                           account.user_name_.length(),
@@ -360,7 +395,7 @@ int ObDDLSqlGenerator::gen_set_max_connections_sql(const ObAccountArg &account,
     }
     if (OB_SUCC(ret) && set_max_user_connections) {
       if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(SET_MAX_CONNECTIONS_SQL),
+        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(SET_MAX_CONNECTIONS_SQL, is_oracle_mode),
                                           max_user_connections_str.length(),
                                           max_user_connections_str.ptr(),
                                           account.user_name_.length(),
@@ -369,7 +404,7 @@ int ObDDLSqlGenerator::gen_set_max_connections_sql(const ObAccountArg &account,
           LOG_WARN("append sql failed", K(account), K(ret));
         }
       } else {
-        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_SET_MAX_CONNECTIONS_SQL),
+        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_SET_MAX_CONNECTIONS_SQL, is_oracle_mode),
                                           max_user_connections_str.length(),
                                           max_user_connections_str.ptr(),
                                           account.user_name_.length(),
@@ -412,7 +447,8 @@ int ObDDLSqlGenerator::gen_alter_user_require_sql(const obrpc::ObAccountArg &acc
 }
 
 int ObDDLSqlGenerator::gen_drop_user_sql(const ObAccountArg &account,
-                                         ObSqlString &sql_string)
+                                         ObSqlString &sql_string,
+                                         const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
   sql_string.reset();
@@ -431,13 +467,13 @@ int ObDDLSqlGenerator::gen_drop_user_sql(const ObAccountArg &account,
       char DROP_USER_SQL[] = "DROP USER `%.*s`";
       char NEW_DROP_USER_SQL[] = "DROP USER `%.*s`@`%.*s`";
       if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(DROP_USER_SQL),
+        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(DROP_USER_SQL, is_oracle_mode),
                                           account.user_name_.length(),
                                           account.user_name_.ptr()))) {
           LOG_WARN("append sql failed", K(account), K(ret));
         }
       } else {
-        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_DROP_USER_SQL),
+        if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_DROP_USER_SQL, is_oracle_mode),
                                           account.user_name_.length(),
                                           account.user_name_.ptr(),
                                           account.host_name_.length(),
@@ -446,7 +482,7 @@ int ObDDLSqlGenerator::gen_drop_user_sql(const ObAccountArg &account,
         }
       }
     }
-    if (OB_SUCC(ret) && lib::is_oracle_mode() && !account.is_role_) {
+    if (OB_SUCC(ret) && is_oracle_mode && !account.is_role_) {
       if (OB_FAIL(sql_string.append_fmt(" CASCADE"))) {
         LOG_WARN("append sql failed", K(ret), K(account));
       }
@@ -457,7 +493,8 @@ int ObDDLSqlGenerator::gen_drop_user_sql(const ObAccountArg &account,
 
 int ObDDLSqlGenerator::gen_lock_user_sql(const obrpc::ObAccountArg &account,
                                          const bool locked,
-                                         ObSqlString &sql_string)
+                                         ObSqlString &sql_string,
+                                         const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
   char LOCK_USER_SQL[] = "ALTER USER `%.*s` ACCOUNT LOCK";
@@ -469,13 +506,13 @@ int ObDDLSqlGenerator::gen_lock_user_sql(const obrpc::ObAccountArg &account,
     LOG_WARN("user_namae is empty", K(ret), K(account));
   } else {
     if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(locked ? LOCK_USER_SQL : UNLOCK_USER_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(locked ? LOCK_USER_SQL : UNLOCK_USER_SQL, is_oracle_mode),
                                         account.user_name_.length(),
                                         account.user_name_.ptr()))) {
         LOG_WARN("append sql failed", K(account), K(ret), K(locked));
       }
     } else {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(locked ? NEW_LOCK_USER_SQL : NEW_UNLOCK_USER_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(locked ? NEW_LOCK_USER_SQL : NEW_UNLOCK_USER_SQL, is_oracle_mode),
                                         account.user_name_.length(),
                                         account.user_name_.ptr(),
                                         account.host_name_.length(),
@@ -489,7 +526,8 @@ int ObDDLSqlGenerator::gen_lock_user_sql(const obrpc::ObAccountArg &account,
 
 int ObDDLSqlGenerator::gen_rename_user_sql(const ObAccountArg &old_account,
                                            const ObAccountArg &new_account,
-                                           ObSqlString &sql_string)
+                                           ObSqlString &sql_string,
+                                           const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
   char RENAME_USER_SQL[] = "RENAME USER `%.*s` to `%.*s`";
@@ -500,7 +538,7 @@ int ObDDLSqlGenerator::gen_rename_user_sql(const ObAccountArg &old_account,
   } else {
     if (0 == old_account.host_name_.compare(OB_DEFAULT_HOST_NAME)
         && 0 == new_account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(RENAME_USER_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(RENAME_USER_SQL, is_oracle_mode),
                                         old_account.user_name_.length(),
                                         old_account.user_name_.ptr(),
                                         new_account.user_name_.length(),
@@ -508,7 +546,7 @@ int ObDDLSqlGenerator::gen_rename_user_sql(const ObAccountArg &old_account,
         LOG_WARN("append sql failed", K(old_account), K(new_account), K(ret));
       }
     } else {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_RENAME_USER_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_RENAME_USER_SQL, is_oracle_mode),
                                         old_account.user_name_.length(),
                                         old_account.user_name_.ptr(),
                                         old_account.host_name_.length(),
@@ -625,7 +663,7 @@ int ObDDLSqlGenerator::gen_table_priv_sql(const obrpc::ObAccountArg &account,
 
   if (OB_SUCC(ret)) {
     if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_TABLE_SQL : REVOKE_TABLE_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_TABLE_SQL : REVOKE_TABLE_SQL, false),
                                         priv_string.string().ptr(),
                                         need_priv.db_.length(),
                                         need_priv.db_.ptr(),
@@ -636,7 +674,7 @@ int ObDDLSqlGenerator::gen_table_priv_sql(const obrpc::ObAccountArg &account,
         LOG_WARN("append sql failed", K(ret));
       }
     } else {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_TABLE_SQL : NEW_REVOKE_TABLE_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_TABLE_SQL : NEW_REVOKE_TABLE_SQL, false),
                                         priv_string.string().ptr(),
                                         need_priv.db_.length(),
                                         need_priv.db_.ptr(),
@@ -666,7 +704,8 @@ int ObDDLSqlGenerator::gen_table_priv_sql(const obrpc::ObAccountArg &account,
 int ObDDLSqlGenerator::gen_column_priv_sql(const obrpc::ObAccountArg &account,
                                           const ObNeedPriv &need_priv,
                                           const bool is_grant,
-                                          ObSqlString &sql_string)
+                                          ObSqlString &sql_string,
+                                          const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
   sql_string.reset();
@@ -709,7 +748,7 @@ int ObDDLSqlGenerator::gen_column_priv_sql(const obrpc::ObAccountArg &account,
 
   if (OB_SUCC(ret)) {
     if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_COLUMN_SQL : REVOKE_COLUMN_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_COLUMN_SQL : REVOKE_COLUMN_SQL, is_oracle_mode),
                                         priv_string.string().ptr(),
                                         columns_string.string().length(),
                                         columns_string.string().ptr(),
@@ -722,7 +761,7 @@ int ObDDLSqlGenerator::gen_column_priv_sql(const obrpc::ObAccountArg &account,
         LOG_WARN("append sql failed", K(ret));
       }
     } else {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_COLUMN_SQL : NEW_REVOKE_COLUMN_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_COLUMN_SQL : NEW_REVOKE_COLUMN_SQL, is_oracle_mode),
                                         priv_string.string().ptr(),
                                         columns_string.string().length(),
                                         columns_string.string().ptr(),
@@ -779,7 +818,7 @@ int ObDDLSqlGenerator::gen_table_priv_sql_ora(const obrpc::ObAccountArg &account
   if (OB_SUCC(ret)) {
     if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
       if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_TABLE_SQL : 
-                                                                         REVOKE_TABLE_SQL),
+                                                                         REVOKE_TABLE_SQL, true),
                                         priv_string.string().ptr(),
                                         table_priv_key.db_.length(),
                                         table_priv_key.db_.ptr(),
@@ -791,7 +830,7 @@ int ObDDLSqlGenerator::gen_table_priv_sql_ora(const obrpc::ObAccountArg &account
       }
     } else {
       if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_TABLE_SQL : 
-                                                                         NEW_REVOKE_TABLE_SQL),
+                                                                         NEW_REVOKE_TABLE_SQL, true),
                                         priv_string.string().ptr(),
                                         table_priv_key.db_.length(),
                                         table_priv_key.db_.ptr(),
@@ -814,7 +853,8 @@ int ObDDLSqlGenerator::gen_table_priv_sql_ora(const obrpc::ObAccountArg &account
 int ObDDLSqlGenerator::gen_routine_priv_sql(const obrpc::ObAccountArg &account,
                                           const ObNeedPriv &need_priv,
                                           const bool is_grant,
-                                          ObSqlString &sql_string)
+                                          ObSqlString &sql_string,
+                                          const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
   char GRANT_PROCEDURE_SQL[] = "GRANT %s ON PROCEDURE `%.*s`.`%.*s` TO `%.*s`";
@@ -843,7 +883,7 @@ int ObDDLSqlGenerator::gen_routine_priv_sql(const obrpc::ObAccountArg &account,
   if (OB_SUCC(ret)) {
     if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
       if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? (need_priv.obj_type_ == ObObjectType::PROCEDURE ? GRANT_PROCEDURE_SQL : GRANT_FUNCTION_SQL)
-                                                                       : (need_priv.obj_type_ == ObObjectType::PROCEDURE ? REVOKE_PROCEDURE_SQL : REVOKE_FUNCTION_SQL)),
+                                                                       : (need_priv.obj_type_ == ObObjectType::PROCEDURE ? REVOKE_PROCEDURE_SQL : REVOKE_FUNCTION_SQL), is_oracle_mode),
                                         priv_string.string().ptr(),
                                         need_priv.db_.length(),
                                         need_priv.db_.ptr(),
@@ -855,7 +895,7 @@ int ObDDLSqlGenerator::gen_routine_priv_sql(const obrpc::ObAccountArg &account,
       }
     } else {
       if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? (need_priv.obj_type_ == ObObjectType::PROCEDURE ? NEW_GRANT_PROCEDURE_SQL : NEW_GRANT_FUNCTION_SQL)
-                                                                       : (need_priv.obj_type_ == ObObjectType::PROCEDURE ? NEW_REVOKE_PROCEDURE_SQL : NEW_REVOKE_FUNCTION_SQL)),
+                                                                       : (need_priv.obj_type_ == ObObjectType::PROCEDURE ? NEW_REVOKE_PROCEDURE_SQL : NEW_REVOKE_FUNCTION_SQL), is_oracle_mode),
                                         priv_string.string().ptr(),
                                         need_priv.db_.length(),
                                         need_priv.db_.ptr(),
@@ -882,10 +922,88 @@ int ObDDLSqlGenerator::gen_routine_priv_sql(const obrpc::ObAccountArg &account,
   return ret;
 }
 
+int ObDDLSqlGenerator::gen_sensitive_rule_priv_sql(const obrpc::ObAccountArg &account,
+                                                   const ObNeedPriv &need_priv,
+                                                   const bool is_grant,
+                                                   ObSqlString &sql_string,
+                                                   const bool is_oracle_mode)
+{
+  int ret = OB_SUCCESS;
+  char GRANT_SENSITIVE_RULE_SQL[] = "GRANT %s ON SENSITIVE RULE `%.*s` TO `%.*s`";
+  char REVOKE_SENSITIVE_RULE_SQL[] = "REVOKE %s ON SENSITIVE RULE `%.*s` FROM `%.*s`";
+  char NEW_GRANT_SENSITIVE_RULE_SQL[] = "GRANT %s ON SENSITIVE RULE `%.*s` TO `%.*s`@`%.*s`";
+  char NEW_REVOKE_SENSITIVE_RULE_SQL[] = "REVOKE %s ON SENSITIVE RULE `%.*s` FROM `%.*s`@`%.*s`";
+  ObSqlString priv_string;
+  if (OB_UNLIKELY(OB_UNLIKELY(!account.is_valid()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("db or user_name is empty", K(ret), K(need_priv), K(account));
+  } else if (need_priv.priv_level_ != OB_PRIV_SENSITIVE_RULE_LEVEL) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("priv level is invalid", K(need_priv), K(ret));
+  } else if (need_priv.priv_set_ & (~(OB_PRIV_SENSITIVE_RULE_ACC | OB_PRIV_GRANT))) {
+    ret = OB_ILLEGAL_GRANT_FOR_TABLE;
+    LOG_WARN("Grant/Revoke privilege than can not be used",
+              "priv_type", ObPrintPrivSet(need_priv.priv_set_), K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    if ((need_priv.priv_set_ & OB_PRIV_SENSITIVE_RULE_ACC) == OB_PRIV_SENSITIVE_RULE_ACC) {
+      if (OB_FAIL(priv_string.append("ALL PRIVILEGES"))) {
+        LOG_WARN("append sql failed", K(ret));
+      } else if (!is_grant) {
+        if ((need_priv.priv_set_ & OB_PRIV_GRANT)) {
+          if (OB_FAIL(priv_string.append(", GRANT OPTION"))) {
+            LOG_WARN("append sql failed", K(ret));
+          }
+        }
+      }
+    } else if (OB_FAIL(priv_to_name(need_priv.priv_set_, priv_string))) {
+      LOG_WARN("get priv to name failed", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObCStringHelper helper;
+    const char *priv_str = helper.convert(ObHexEscapeSqlStr(priv_string.string().ptr(), false, false));
+    const char *sensitive_rule_str = helper.convert(ObHexEscapeSqlStr(need_priv.sensitive_rule_.ptr(), false, false));
+    const char *user_name_str = helper.convert(ObHexEscapeSqlStr(account.user_name_.ptr(), false, false));
+    if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_SENSITIVE_RULE_SQL : REVOKE_SENSITIVE_RULE_SQL, is_oracle_mode),
+                                        priv_str,
+                                        static_cast<int32_t>(strlen(sensitive_rule_str)),
+                                        sensitive_rule_str,
+                                        static_cast<int32_t>(strlen(user_name_str)),
+                                        user_name_str))) {
+        LOG_WARN("append sql failed", K(ret));
+      }
+    } else {
+      const char *host_name_str = helper.convert(ObHexEscapeSqlStr(account.host_name_.ptr(), false, false));
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_SENSITIVE_RULE_SQL : NEW_REVOKE_SENSITIVE_RULE_SQL, is_oracle_mode),
+                                        priv_str,
+                                        static_cast<int32_t>(strlen(sensitive_rule_str)),
+                                        sensitive_rule_str,
+                                        static_cast<int32_t>(strlen(user_name_str)),
+                                        user_name_str,
+                                        static_cast<int32_t>(strlen(host_name_str)),
+                                        host_name_str))) {
+        LOG_WARN("append sql failed", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && is_grant) {
+    if (need_priv.priv_set_ & OB_PRIV_GRANT) {
+      if (OB_FAIL(sql_string.append(" WITH GRANT OPTION"))) {
+        LOG_WARN("append sql failed", K(ret));
+      }
+    }
+  }
+  LOG_DEBUG("gen sensitive rule priv sql", K(sql_string.string()), K(is_grant), K(need_priv));
+  return ret;
+}
+
 int ObDDLSqlGenerator::gen_catalog_priv_sql(const obrpc::ObAccountArg &account,
                                             const ObNeedPriv &need_priv,
                                             const bool is_grant,
-                                            ObSqlString &sql_string)
+                                            ObSqlString &sql_string,
+                                            const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
   char GRANT_CATALOG_SQL[] = "GRANT %s ON CATALOG `%.*s` TO `%.*s`";
@@ -921,7 +1039,7 @@ int ObDDLSqlGenerator::gen_catalog_priv_sql(const obrpc::ObAccountArg &account,
   }
   if (OB_SUCC(ret)) {
     if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_CATALOG_SQL : REVOKE_CATALOG_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_CATALOG_SQL : REVOKE_CATALOG_SQL, is_oracle_mode),
                                         priv_string.string().ptr(),
                                         need_priv.catalog_.length(),
                                         need_priv.catalog_.ptr(),
@@ -930,7 +1048,7 @@ int ObDDLSqlGenerator::gen_catalog_priv_sql(const obrpc::ObAccountArg &account,
         LOG_WARN("append sql failed", K(ret));
       }
     } else {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_CATALOG_SQL : NEW_REVOKE_CATALOG_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_CATALOG_SQL : NEW_REVOKE_CATALOG_SQL, is_oracle_mode),
                                         priv_string.string().ptr(),
                                         need_priv.catalog_.length(),
                                         need_priv.catalog_.ptr(),
@@ -956,7 +1074,8 @@ int ObDDLSqlGenerator::gen_catalog_priv_sql(const obrpc::ObAccountArg &account,
 int ObDDLSqlGenerator::gen_db_priv_sql(const obrpc::ObAccountArg &account,
                                        const ObNeedPriv &need_priv,
                                        const bool is_grant,
-                                       ObSqlString &sql_string)
+                                       ObSqlString &sql_string,
+                                       const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
   char GRANT_DB_SQL[] = "GRANT %s ON `%.*s`.* TO `%.*s`";
@@ -989,7 +1108,7 @@ int ObDDLSqlGenerator::gen_db_priv_sql(const obrpc::ObAccountArg &account,
   }
   if (OB_SUCC(ret)) {
     if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_DB_SQL : REVOKE_DB_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_DB_SQL : REVOKE_DB_SQL, is_oracle_mode),
                                         priv_string.string().ptr(),
                                         need_priv.db_.length(),
                                         need_priv.db_.ptr(),
@@ -998,7 +1117,7 @@ int ObDDLSqlGenerator::gen_db_priv_sql(const obrpc::ObAccountArg &account,
         LOG_WARN("append sql failed", K(ret));
       }
     } else {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_DB_SQL : NEW_REVOKE_DB_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_DB_SQL : NEW_REVOKE_DB_SQL, is_oracle_mode),
                                         priv_string.string().ptr(),
                                         need_priv.db_.length(),
                                         need_priv.db_.ptr(),
@@ -1022,8 +1141,71 @@ int ObDDLSqlGenerator::gen_db_priv_sql(const obrpc::ObAccountArg &account,
   return ret;
 }
 
+int ObDDLSqlGenerator::gen_object_priv_sql(const obrpc::ObAccountArg &account,
+                                          const ObNeedPriv &need_priv,
+                                          const bool is_grant,
+                                          ObSqlString &sql_string,
+                                          const bool is_oracle_mode)
+{
+  int ret = OB_SUCCESS;
+  char GRANT_OBJECT_SQL[] = "GRANT %s ON %s `%.*s`.* TO `%.*s`";
+  char REVOKE_OBJECT_SQL[] = "REVOKE %s ON %s `%.*s`.* FROM `%.*s`";
+  char NEW_GRANT_OBJECT_SQL[] = "GRANT %s ON %s `%.*s`.* TO `%.*s`@`%.*s`";
+  char NEW_REVOKE_OBJECT_SQL[] = "REVOKE %s ON %s `%.*s`.* FROM `%.*s`@`%.*s`";
+  ObSqlString priv_string;
+  if (OB_UNLIKELY(need_priv.table_.empty()) || OB_UNLIKELY(!account.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN(" or user_name is empty", K(ret), K(need_priv), K(account));
+  } else if (need_priv.priv_level_ != OB_PRIV_OBJECT_LEVEL) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("priv level is invalid", K(need_priv), K(ret));
+  } else if (need_priv.priv_set_ & (~(OB_PRIV_OBJECT_ACC | OB_PRIV_GRANT))) {
+    ret = OB_ILLEGAL_GRANT_FOR_TABLE;
+    LOG_WARN("Grant/Revoke privilege than can not be used",
+            "priv_type", ObPrintPrivSet(need_priv.priv_set_), K(ret));
+  } else if (OB_FAIL(priv_to_name(need_priv.priv_set_, priv_string))) {
+    LOG_WARN("get priv to name failed", K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_OBJECT_SQL : REVOKE_OBJECT_SQL, is_oracle_mode),
+        priv_string.string().ptr(),
+        ob_object_type_str(need_priv.obj_type_),
+        need_priv.table_.length(),
+        need_priv.table_.ptr(),
+        account.user_name_.length(),
+        account.user_name_.ptr()))) {
+        LOG_WARN("append sql failed", K(ret));
+      }
+    } else {
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_OBJECT_SQL : NEW_REVOKE_OBJECT_SQL, is_oracle_mode),
+        priv_string.string().ptr(),
+        ob_object_type_str(need_priv.obj_type_),
+        need_priv.table_.length(),
+        need_priv.table_.ptr(),
+        account.user_name_.length(),
+        account.user_name_.ptr(),
+        account.host_name_.length(),
+        account.host_name_.ptr()))) {
+        LOG_WARN("append sql failed", K(ret));
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && is_grant) {
+    if (need_priv.priv_set_ & OB_PRIV_GRANT) {
+      if (OB_FAIL(sql_string.append(" WITH GRANT OPTION"))) {
+        LOG_WARN("append sql failed", K(ret));
+      }
+    }
+  }
+  LOG_INFO("mingyin gen db priv sql", K(sql_string.string()), K(is_grant), K(need_priv));
+  return ret;
+}
+
 int ObDDLSqlGenerator::gen_revoke_all_sql(const obrpc::ObAccountArg &account,
-                                          ObSqlString &sql_string)
+                                          ObSqlString &sql_string,
+                                          const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
   char REVOKE_ALL_SQL[] = "REVOKE ALL PRIVILEGES, GRANT OPTION FROM `%.*s`";
@@ -1033,13 +1215,13 @@ int ObDDLSqlGenerator::gen_revoke_all_sql(const obrpc::ObAccountArg &account,
     LOG_WARN("account is empty", K(ret), K(account));
   } else {
     if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(REVOKE_ALL_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(REVOKE_ALL_SQL, is_oracle_mode),
                                         account.user_name_.length(),
                                         account.user_name_.ptr()))) {
         LOG_WARN("append sql failed", K(ret));
       }
     } else {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_REVOKE_ALL_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(NEW_REVOKE_ALL_SQL, is_oracle_mode),
                                         account.user_name_.length(),
                                         account.user_name_.ptr(),
                                         account.host_name_.length(),
@@ -1056,7 +1238,8 @@ int ObDDLSqlGenerator::gen_revoke_all_sql(const obrpc::ObAccountArg &account,
 int ObDDLSqlGenerator::gen_user_priv_sql(const obrpc::ObAccountArg &account,
                                          const ObNeedPriv &need_priv,
                                          const bool is_grant,
-                                         ObSqlString &sql_string)
+                                         ObSqlString &sql_string,
+                                         const bool is_oracle_mode)
 {
   int ret = OB_SUCCESS;
   char GRANT_USER_SQL[] = "GRANT %s ON *.* TO `%.*s`";
@@ -1089,14 +1272,14 @@ int ObDDLSqlGenerator::gen_user_priv_sql(const obrpc::ObAccountArg &account,
   }
   if (OB_SUCC(ret)) {
     if (0 == account.host_name_.compare(OB_DEFAULT_HOST_NAME)) {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_USER_SQL : REVOKE_USER_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? GRANT_USER_SQL : REVOKE_USER_SQL, is_oracle_mode),
                                         priv_string.string().ptr(),
                                         account.user_name_.length(),
                                         account.user_name_.ptr()))) {
         LOG_WARN("append sql failed", K(ret));
       }
     } else {
-      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_USER_SQL : NEW_REVOKE_USER_SQL),
+      if (OB_FAIL(sql_string.append_fmt(adjust_ddl_format_str(is_grant ? NEW_GRANT_USER_SQL : NEW_REVOKE_USER_SQL, is_oracle_mode),
                                         priv_string.string().ptr(),
                                         account.user_name_.length(),
                                         account.user_name_.ptr(),
@@ -1145,11 +1328,11 @@ int ObDDLSqlGenerator::gen_audit_stmt_sql(const ObString &username,
   return ret;
 }
 
-char *ObDDLSqlGenerator::adjust_ddl_format_str(char *ori_format_str)
+char *ObDDLSqlGenerator::adjust_ddl_format_str(char *ori_format_str, const bool is_oracle_mode)
 {
   if (OB_ISNULL(ori_format_str)) {
     //do nothing
-  } else if (lib::is_oracle_mode()) {
+  } else if (is_oracle_mode) {
     for (int i = 0; i < strlen(ori_format_str); ++i) {
       if (*(ori_format_str + i) == '`') {
         *(ori_format_str + i) = '"';

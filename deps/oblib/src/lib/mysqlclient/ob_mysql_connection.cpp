@@ -37,7 +37,8 @@ ObMySQLConnection::ObMySQLConnection() :
     mode_(OCEANBASE_MODE),
     db_name_(NULL),
     tenant_id_(OB_INVALID_ID),
-    read_consistency_(-1)
+    read_consistency_(-1),
+    is_dblink_revers_conn_(false)
 {
   memset(&mysql_, 0, sizeof(MYSQL));
 }
@@ -110,6 +111,7 @@ int ObMySQLConnection::connect(const char *user, const char *pass, const char *d
     close();
     LOG_INFO("connecting to mysql server", "ip", host_name, "port", port);
     mysql_init(&mysql_);
+    closed_ = false;
     timeout_ = timeout;
 #ifdef OB_BUILD_TDE_SECURITY
     int64_t ssl_enforce = 1;
@@ -141,11 +143,16 @@ int ObMySQLConnection::connect(const char *user, const char *pass, const char *d
 #ifdef OB_BUILD_TDE_SECURITY
     mysql_options(&mysql_, MYSQL_OPT_SSL_ENFORCE, &ssl_enforce);
 #endif
-    MYSQL *mysql = mysql = mysql_real_connect(&mysql_, host_name, user, pass, db, port, NULL, 0);
+    MYSQL *mysql = mysql_real_connect(&mysql_, host_name, user, pass, db, port, NULL, 0);
     if (OB_ISNULL(mysql)) {
       ret = -mysql_errno(&mysql_);
+      char errmsg[256] = {0};
+      const char *srcmsg = mysql_error(&mysql_);
+      MEMCPY(errmsg, srcmsg, MIN(255, STRLEN(srcmsg)));
       LOG_WARN("fail to connect to mysql server", K(get_sessid()), KCSTRING(host_name), KCSTRING(user), KCSTRING(db), K(port),
                "info", mysql_error(&mysql_), K(ret));
+      handler_dblink_error(ret, true, errmsg);
+      close();  // revoke close() to release resource
     } else {
       /*Note: mysql_real_connect() incorrectly reset the MYSQL_OPT_RECONNECT option
        * to its default value before MySQL 5.0.19. Therefore, prior to that version,
@@ -156,7 +163,6 @@ int ObMySQLConnection::connect(const char *user, const char *pass, const char *d
        */
       my_bool reconnect = 0; // in OB, do manual reconnect. xiaochu.yh
       mysql_options(&mysql_, MYSQL_OPT_RECONNECT, &reconnect);
-      closed_ = false;
       set_usable(true);
       tenant_id_ = OB_SYS_TENANT_ID;
       read_consistency_ = -1;
@@ -190,6 +196,7 @@ int ObMySQLConnection::connect(const char *user, const char *pass, const char *d
     LOG_INFO("connecting to mysql server", "ip", host, "port", root_->get_server().get_port(),
               "host_name", root_->get_host_name(), "host port", root_->get_port());
     mysql_init(&mysql_);
+    closed_ = false;
 #ifdef OB_BUILD_TDE_SECURITY
     int64_t ssl_enforce = 1;
     if (! use_ssl) {
@@ -238,20 +245,8 @@ int ObMySQLConnection::connect(const char *user, const char *pass, const char *d
       MEMCPY(errmsg, srcmsg, MIN(255, STRLEN(srcmsg)));
       LOG_WARN("fail to connect to mysql server", K(get_sessid()), KCSTRING(host), KCSTRING(user), KCSTRING(db), K(port),
                "info", errmsg, K(ret));
-      if (OB_INVALID_ID != get_dblink_id()) {
-        LOG_WARN("dblink connection error", K(ret),
-                                            KP(this),
-                                            K(get_dblink_id()),
-                                            K(get_sessid()),
-                                            K(usable()),
-                                            K(user),
-                                            K(db),
-                                            K(host),
-                                            K(port),
-                                            K(root_->get_host_name()),
-                                            K(errmsg));
-        TRANSLATE_CLIENT_ERR_2(ret, false, errmsg);
-      }
+      handler_dblink_error(ret, true, errmsg);
+      close();  // revoke close() to release resource
     } else {
       /*Note: mysql_real_connect() incorrectly reset the MYSQL_OPT_RECONNECT option
        * to its default value before MySQL 5.0.19. Therefore, prior to that version,
@@ -262,7 +257,6 @@ int ObMySQLConnection::connect(const char *user, const char *pass, const char *d
        */
       my_bool reconnect = 0; // in OB, do manual reconnect. xiaochu.yh
       mysql_options(&mysql_, MYSQL_OPT_RECONNECT, &reconnect);
-      closed_ = false;
       set_usable(true);
       db_name_ = db;
       tenant_id_ = OB_SYS_TENANT_ID;
@@ -279,7 +273,7 @@ void ObMySQLConnection::close()
     closed_ = true;
     sessid_ = 0;
     memset(&mysql_, 0, sizeof(MYSQL));
-    set_session_init_status(false);
+    reset_init_variables();
   }
 }
 
@@ -758,6 +752,19 @@ int ObMySQLConnection::execute_proc()
     LOG_WARN("failed to execute proc", K(ret));
   }
   return ret;
+}
+
+void ObMySQLConnection::handler_dblink_error(int &ret, bool is_connect, char *errmsg)
+{
+  if (OB_INVALID_ID != get_dblink_id() || is_dblink_reverse_conn()) {
+    LOG_WARN("dblink connection error", K(ret),
+                                        KP(this),
+                                        K(get_dblink_id()),
+                                        K(is_dblink_reverse_conn()),
+                                        K(get_sessid()),
+                                        K(usable()));
+    TRANSLATE_CLIENT_ERR_2(ret, is_connect ? false : lib::is_oracle_mode(), errmsg);
+  }
 }
 
 } // end namespace sqlclient

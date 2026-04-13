@@ -325,13 +325,12 @@ int ObInfoSchemaColumnsTable::iterate_column_schema_array(
       if (column_schema->is_hidden()) {
         continue;
       }
-      ++logical_index;
       // use const_column_iterator, if it's index table
       // so should use the physical position
       if (table_schema.is_index_table()) {
         ordinal_position = column_schema->get_column_id() - 15;
       } else {
-        ordinal_position = logical_index;
+        ordinal_position = logical_index + 1;
       }
       if (OB_FAIL(fill_row_cells(database_name, &table_schema,
                                  column_schema, ordinal_position))) {
@@ -352,6 +351,7 @@ int ObInfoSchemaColumnsTable::iterate_column_schema_array(
           SERVER_LOG(WARN, "fail to add row", K(ret), K(cur_row_));
         }
       }
+      ++logical_index;
     }
   }
   if (OB_FAIL(ret)) {
@@ -787,7 +787,8 @@ int ObInfoSchemaColumnsTable::fill_row_cells(const ObString &database_name,
             break;
           }
         case COLUMN_KEY: {
-            if (column_schema->is_original_rowkey_column() || column_schema->is_heap_table_primary_key_column()) {
+            if ((column_schema->is_original_rowkey_column() && !column_schema->is_heap_table_clustering_key_column())
+              || column_schema->is_heap_table_primary_key_column()) {
               cells[cell_idx].set_varchar("PRI");
               cells[cell_idx].set_collation_type(ObCharset::get_default_collation(
                     ObCharset::get_default_charset()));
@@ -1360,6 +1361,22 @@ int ObInfoSchemaColumnsTable::fill_row_cells(const common::ObString &database_na
             break;
           }
         case COLUMN_COMMENT: {
+            ObObjType column_type = ObMaxType;
+            const ObColumnSchemaV2 *tmp_column_schema = NULL;
+            cells[cell_idx].reset();
+            if (OB_ISNULL(table_schema_) ||
+                OB_ISNULL(tmp_column_schema = table_schema_->get_column_schema(col_id))) {
+              ret = OB_ERR_UNEXPECTED;
+              SERVER_LOG(WARN, "table or column schema is null", KR(ret), KP(table_schema_), KP(tmp_column_schema));
+            } else if (FALSE_IT(column_type = tmp_column_schema->get_meta_type().get_type())) {
+            } else {
+              cells[cell_idx].set_string(column_type, ObString(""));
+              cells[cell_idx].set_collation_type(ObCharset::get_default_collation(
+                                                    ObCharset::get_default_charset()));
+              if (OB_FAIL(ObTextStringResult::ob_convert_obj_temporay_lob(cells[cell_idx], *allocator_))) {
+                SERVER_LOG(WARN, "convert lob type obj fail", K(ret), K(cells[cell_idx]));
+              }
+            }
             break;
           }
         case GENERATION_EXPRESSION: {

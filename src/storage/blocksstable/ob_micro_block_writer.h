@@ -25,6 +25,24 @@ class ObNewRow;
 }
 namespace blocksstable
 {
+
+template<bool EnableNewFlatFormat>
+class ObMicroBufferFlatWriter : public ObMicroBufferWriter
+{
+public:
+  ObMicroBufferFlatWriter() = default;
+
+  virtual ~ObMicroBufferFlatWriter() = default;
+
+  int write_row(const ObDatumRow &row,
+                const int64_t rowkey_cnt,
+                const ObIArray<ObColDesc> *col_descs,
+                int64_t &len);
+
+private:
+  typename std::conditional<EnableNewFlatFormat, ObRowWriter, ObRowWriterV0>::type row_writer_;
+};
+
 // memory
 //  |- row data buffer
 //        |- ObMicroBlockHeader
@@ -39,6 +57,7 @@ namespace blocksstable
 //        |- row data
 //        |- RowIndex
 //        |- RowHashIndex(optional)
+template<bool EnableNewFlatFormat = true>
 class ObMicroBlockWriter : public ObIMicroBlockWriter
 {
   static const int64_t INDEX_ENTRY_SIZE = sizeof(int32_t);
@@ -49,11 +68,6 @@ public:
   ObMicroBlockWriter();
   virtual ~ObMicroBlockWriter();
   int init(const ObDataStoreDesc *data_store_desc);
-
-  int init(const int64_t micro_block_size_limit,
-           const int64_t rowkey_column_count,
-           const int64_t column_count);
-
   virtual int append_row(const ObDatumRow &row);
   virtual int build_block(char *&buf, int64_t &size);
   virtual void reuse();
@@ -65,16 +79,16 @@ public:
   virtual int append_hash_index(ObMicroBlockHashIndexBuilder& hash_index_builder);
   void reset();
 private:
+  int init(const int64_t micro_block_size_limit,
+           const int64_t rowkey_column_count,
+           const int64_t column_count);
   int inner_init();
   inline int64_t get_index_size() const;
   inline int64_t get_data_size() const;
   inline int64_t get_future_block_size() const;
   int try_to_append_row();
   int finish_row();
-  int reserve_header(
-      const int64_t column_count,
-      const int64_t rowkey_column_count,
-      const bool need_calc_column_chksum);
+  int reserve_header();
   bool is_exceed_limit();
   int64_t get_data_base_offset() const;
   int64_t get_index_base_offset() const;
@@ -88,11 +102,8 @@ private:
 
 private:
   int64_t micro_block_size_limit_;
-  int64_t column_count_;
-  int64_t rowkey_column_count_;
   const common::ObIArray<share::schema::ObColDesc> *col_desc_array_;
-  int64_t row_count_;
-  ObMicroBufferWriter data_buffer_;
+  ObMicroBufferFlatWriter<EnableNewFlatFormat> data_buffer_;
   ObMicroBufferWriter index_buffer_;
   ObMicroBlockHashIndexBuilder hash_index_builder_;
   bool reuse_hash_index_builder_;
@@ -100,15 +111,21 @@ private:
   bool is_inited_;
 };
 
-inline int64_t ObMicroBlockWriter::get_block_size() const
+
+template<bool EnableNewFlatFormat>
+inline int64_t ObMicroBlockWriter<EnableNewFlatFormat>::get_block_size() const
 {
   return get_data_size() + get_index_size();
 }
-inline int64_t ObMicroBlockWriter::get_row_count() const
+
+template<bool EnableNewFlatFormat>
+inline int64_t ObMicroBlockWriter<EnableNewFlatFormat>::get_row_count() const
 {
-  return row_count_;
+  return micro_header_.row_count_;
 }
-inline int64_t ObMicroBlockWriter::get_data_size() const
+
+template<bool EnableNewFlatFormat>
+inline int64_t ObMicroBlockWriter<EnableNewFlatFormat>::get_data_size() const
 {
   int64_t data_size = data_buffer_.length();
   if (data_size == 0) { // lazy allocate
@@ -116,11 +133,15 @@ inline int64_t ObMicroBlockWriter::get_data_size() const
   }
   return data_size;
 }
-inline int64_t ObMicroBlockWriter::get_column_count() const
+
+template<bool EnableNewFlatFormat>
+inline int64_t ObMicroBlockWriter<EnableNewFlatFormat>::get_column_count() const
 {
-  return column_count_;
+  return micro_header_.column_count_;
 }
-inline int64_t ObMicroBlockWriter::get_index_size() const
+
+template<bool EnableNewFlatFormat>
+inline int64_t ObMicroBlockWriter<EnableNewFlatFormat>::get_index_size() const
 {
   int64_t index_size = index_buffer_.length();
   if (index_size == 0) { // lazy allocate
@@ -129,7 +150,8 @@ inline int64_t ObMicroBlockWriter::get_index_size() const
   return index_size;
 }
 
-inline int64_t ObMicroBlockWriter::get_future_block_size() const
+template<bool EnableNewFlatFormat>
+inline int64_t ObMicroBlockWriter<EnableNewFlatFormat>::get_future_block_size() const
 {
   int64_t hash_index_size = 0;
   if (hash_index_builder_.is_valid()) {
@@ -138,21 +160,24 @@ inline int64_t ObMicroBlockWriter::get_future_block_size() const
   return get_data_size() + get_index_size() + INDEX_ENTRY_SIZE + hash_index_size;
 }
 
-inline int64_t ObMicroBlockWriter::get_data_base_offset() const
+template<bool EnableNewFlatFormat>
+inline int64_t ObMicroBlockWriter<EnableNewFlatFormat>::get_data_base_offset() const
 {
-  return ObMicroBlockHeader::get_serialize_size(column_count_, is_major_);
+  return micro_header_.get_serialize_size();
 }
 
-inline int64_t ObMicroBlockWriter::get_index_base_offset() const
+template<bool EnableNewFlatFormat>
+inline int64_t ObMicroBlockWriter<EnableNewFlatFormat>::get_index_base_offset() const
 {
   return sizeof(int32_t);
 }
 
-inline int64_t ObMicroBlockWriter::get_original_size() const
+template<bool EnableNewFlatFormat>
+inline int64_t ObMicroBlockWriter<EnableNewFlatFormat>::get_original_size() const
 {
   int64_t original_size = 0;
   if (data_buffer_.length() > 0) {
-    original_size = data_buffer_.length() - ObMicroBlockHeader::get_serialize_size(column_count_, is_major_);
+    original_size = data_buffer_.length() - micro_header_.get_serialize_size();
   }
   return original_size;
 }

@@ -26,7 +26,7 @@ namespace storage
 {
 namespace mds
 {
-class ObMdsTableMergeDagParam;
+class ObTabletMdsMiniMergeDagParam;
 }
 struct ObDDLTableMergeDagParam;
 struct ObTabletSplitParam;
@@ -37,10 +37,6 @@ class ObComplementDataDag;
 class ObTablet;
 }
 
-namespace share
-{
-class ObTenantDagScheduler;
-}
 namespace compaction
 {
 struct ObTabletMergeDagParam;
@@ -83,17 +79,13 @@ public:
       storage::ObTabletLobSplitDag *&dag,
       const bool is_emergency = false);
   static int schedule_mds_table_merge_dag(
-      storage::mds::ObMdsTableMergeDagParam &param,
+      storage::mds::ObTabletMdsMiniMergeDagParam &param,
       const bool is_emergency = false);
   static int schedule_batch_freeze_dag(
     const ObBatchFreezeTabletsParam &freeze_param);
 #ifdef OB_BUILD_SHARED_STORAGE
-  static int schedule_tablet_refresh_dag(
-      ObTabletsRefreshSSTableParam &param,
-      const bool is_emergency = false);
-  static int schedule_verify_ckm_dag(ObVerifyCkmParam &param);
-  static int schedule_update_skip_major_tablet_dag(const ObUpdateSkipMajorParam &param);
-  static int schedule_tablet_ss_minor_merge_dag(const ObTabletSSMinorMergeDagParam &param);
+  static int schedule_ss_attach_major_dag(
+    ObTabletMergeDagParam &param);
 #endif
 };
 

@@ -11,6 +11,7 @@
 #define OB_STORAGE_COMPACTION_PROGRESSIVE_MERGE_HELPER_H_
 #include "/usr/include/stdint.h"
 #include "lib/utility/ob_print_utils.h"
+#include "lib/container/ob_iarray.h"
 namespace oceanbase
 {
 namespace blocksstable
@@ -22,6 +23,7 @@ struct ObSSTableBasicMeta;
 }
 namespace storage
 {
+class ObITable;
 class ObStorageSchema;
 }
 namespace common
@@ -31,7 +33,7 @@ class ObTabletID;
 namespace compaction
 {
 struct ObMergeParameter;
-struct ObMacroBlockOp;
+struct ObBlockOp;
 
 class ObProgressiveMergeMgr final
 {
@@ -54,6 +56,11 @@ public:
   int64_t get_result_progressive_merge_step(const common::ObTabletID &tablet_id, const int64_t column_group_idx) const;
   bool need_calc_progressive_merge() const { return progressive_merge_round_ > 1 && progressive_merge_step_ < progressive_merge_num_; }
   void mark_progressive_round_unfinish();
+  // only used for check window compaction
+  static bool check_need_progressive_merge(
+    const int64_t schema_progressive_merge_num,
+    const int64_t schema_progressive_merge_round,
+    const blocksstable::ObSSTableBasicMeta &base_meta);
   static const int64_t INIT_PROGRESSIVE_MERGE_ROUND = 1;
 
   TO_STRING_KV(K_(progressive_merge_round), K_(progressive_merge_num), K_(progressive_merge_step), K_(data_version),
@@ -82,10 +89,11 @@ public:
       is_inited_(false)
     {}
   ~ObProgressiveMergeHelper() = default;
-  int init(const blocksstable::ObSSTable &sstable, const ObMergeParameter &merge_param, ObProgressiveMergeMgr *mgr);
+  int init(ObIArray<storage::ObITable*> &tables, const ObMergeParameter &merge_param, ObProgressiveMergeMgr *mgr);
+
   void reset();
   inline bool is_valid() const { return is_inited_; }
-  int check_macro_block_op(const blocksstable::ObMacroBlockDesc &macro_desc, ObMacroBlockOp &block_op);
+  int check_macro_block_op(const blocksstable::ObMacroBlockDesc &macro_desc, ObBlockOp &block_op);
   int64_t get_compare_progressive_round() const
   {
     return OB_NOT_NULL(mgr_) ? mgr_->get_progressive_merge_round() : -1;

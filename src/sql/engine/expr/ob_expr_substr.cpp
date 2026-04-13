@@ -157,9 +157,12 @@ int ObExprSubstr::calc_result_length_oracle(const ObExprResType *types_array,
   }
   if (OB_SUCC(ret) && 3 == param_num && !types_array[2].get_param().is_null()) {
     const ObObj len_obj = types_array[2].get_param();
-    if (OB_FAIL(ObExprUtil::get_trunc_int64(len_obj, expr_ctx, substr_len))) {
+    int64_t tmp_len = 0;
+    if (OB_FAIL(ObExprUtil::get_trunc_int64(len_obj, expr_ctx, tmp_len))) {
       ret = OB_SUCCESS;
       LOG_WARN("ignore failure when calc result type length oracle mode", K(ret));
+    } else {
+      substr_len = tmp_len;
     }
   }
   if (OB_SUCC(ret)) {
@@ -464,7 +467,7 @@ int ObExprSubstr::substr(common::ObString &varchar,
       } else {
         if (do_ascii_optimize_check) { // ObCharsetType is CHARSET_UTF8MB4 or CHARSET_GBK
           res_len = min(length, varchar.length() - start);
-          is_ascii = storage::is_ascii_str(varchar.ptr() + start, res_len);
+          is_ascii = storage::is_ascii_str(varchar.ptr(), start + res_len);
         }
         if (is_ascii) {
           varchar.assign_ptr(varchar.ptr() + start, static_cast<int32_t>(res_len));
@@ -763,7 +766,6 @@ int ObExprSubstr::eval_substr_batch(const ObExpr &expr, ObEvalCtx &ctx,
             continue;
           } else {
             results[j].set_null();
-            eval_flags.set(j);
           }
         }
       } else {
@@ -783,7 +785,6 @@ int ObExprSubstr::eval_substr_batch(const ObExpr &expr, ObEvalCtx &ctx,
             continue;
           } else if (datum_array[j].is_null()) {
             results[j].set_null();
-            eval_flags.set(j);
           } else if(!ob_is_text_tc(expr.args_[0]->datum_meta_.type_)) {
             if (OB_FAIL(substr(output, datum_array[j].get_string(), pos,
                                min(len, datum_array[j].get_string().length()),
@@ -797,7 +798,6 @@ int ObExprSubstr::eval_substr_batch(const ObExpr &expr, ObEvalCtx &ctx,
               } else {
                 results[j].set_string(output);
               }
-              eval_flags.set(j);
             }
           } else { // text tc
             const ObDatumMeta &input_meta = expr.args_[0]->datum_meta_;
@@ -823,8 +823,6 @@ int ObExprSubstr::eval_substr_batch(const ObExpr &expr, ObEvalCtx &ctx,
                                                 true,
                                                 j))) {
               LOG_WARN("eval substr text failed", K(ret));
-            } else {
-              eval_flags.set(j);
             }
           }
         }
@@ -881,7 +879,6 @@ int ObExprSubstr::vector_substr(VECTOR_EVAL_FUNC_ARG_DECL)
           continue;
         } else {
           res_vec->set_null(idx);
-          eval_flags.set(idx);
         }
       }
     } else {
@@ -905,7 +902,6 @@ int ObExprSubstr::vector_substr(VECTOR_EVAL_FUNC_ARG_DECL)
           continue;
         } else if (arg0_vec->is_null(idx)) {
           res_vec->set_null(idx);
-          eval_flags.set(idx);
         } else {
           // 2.1 deal with string tc
           if (!ob_is_text_tc(expr.args_[0]->datum_meta_.type_)) {
@@ -921,7 +917,6 @@ int ObExprSubstr::vector_substr(VECTOR_EVAL_FUNC_ARG_DECL)
               } else {
                 res_vec->set_string(idx, output);
               }
-              eval_flags.set(idx);
             }
           // 2.2 deal with text tc
           } else {
@@ -950,8 +945,6 @@ int ObExprSubstr::vector_substr(VECTOR_EVAL_FUNC_ARG_DECL)
                                                 true,
                                                 idx))) {
               LOG_WARN("eval substr text failed", K(ret));
-            } else {
-              eval_flags.set(idx);
             }
           }
         }

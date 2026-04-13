@@ -101,8 +101,10 @@ private:
   int try_convert_rollup(ObDMLStmt *&stmt, ObSelectStmt *select_stmt);
   int remove_single_item_groupingsets(ObSelectStmt &stmt, bool &trans_happened);
   int create_set_view_stmt(ObSelectStmt *stmt, TableItem *view_table_item);
-  int create_cte_for_groupby_items(ObSelectStmt &select_stmt);
+  int create_cte_for_groupby_items(ObSelectStmt &select_stmt, ObSelectStmt *&view_stmt);
   int expand_stmt_groupby_items(ObSelectStmt &select_stmt);
+
+  int trans_all_to_groping_sets(ObSelectStmt &stmt, bool &trans_happened);
 
   int is_subquery_correlated(const ObSelectStmt *stmt,
                              bool &is_correlated);
@@ -142,6 +144,10 @@ private:
                                               ObIArray<ObGroupbyExpr> &rollup_exprs_list);
   int simple_expand_grouping_sets_items(ObIArray<ObGroupingSetsItem> &grouping_sets_items,
                                         ObIArray<ObGroupingSetsItem> &simple_grouping_sets_items);
+  int init_simple_grouping_sets_items(ObIArray<ObGroupingSetsItem> &grouping_sets_items,
+                                      ObIArray<ObGroupingSetsItem> &simple_grouping_sets_items);
+  int init_expanded_grouping_sets_exprs(ObIArray<ObGroupingSetsItem> &grouping_sets_items,
+                                        ObIArray<ObGroupbyExpr> &grouping_sets_exprs);
   int create_child_stmts_for_groupby_sets(ObSelectStmt *origin_stmt,
                                           ObIArray<ObSelectStmt*> &child_stmts);
   int get_groupby_and_rollup_exprs_list(ObSelectStmt *origin_stmt,
@@ -504,6 +510,14 @@ private:
   // transform json object with star
   int transform_json_object_expr_with_star(const ObIArray<ObParentDMLStmt> &parent_stmts,
                                            ObDMLStmt *stmt, bool &trans_happened);
+  int transform_semantic_vector_dis_expr(ObDMLStmt *stmt, bool &trans_happened);
+  int add_semantic_vector_dis_params_to_new_expr(ObDMLStmt *stmt, ObRawExpr *semantic_expr, ObRawExpr *&new_semantic_expr);
+  int create_embedded_table_vector_col_ref(ObDMLStmt *stmt, TableItem *table_item, const share::schema::ObTableSchema *data_table_schema,
+    ObColumnRefRawExpr *chunk_col_ref, ObColumnRefRawExpr *&vector_col_ref);
+  int create_cast_query_vector_expr(ObRawExpr *query_vector, ObRawExpr *vector_col_ref, ObRawExpr *&cast_query_vector);
+  int create_distance_type_const_expr(ObDMLStmt *stmt, const share::schema::ObTableSchema *data_table_schema,
+    ObColumnRefRawExpr *chunk_col_ref, ObRawExpr *&dis_type);
+
   int transform_udt_columns(const common::ObIArray<ObParentDMLStmt> &parent_stmts, ObDMLStmt *stmt, bool &trans_happened);
    /*
    * following functions are used for transform rowid in subquery
@@ -621,9 +635,9 @@ private:
                                    const TableItem *table_item,
                                    ObSqlBitSet<> &rel_ids);
 
-  int formalize_limit_expr(ObDMLStmt &stmt);
-  int transform_rollup_exprs(ObDMLStmt *stmt, bool &trans_happened);
-  int get_rollup_const_exprs(ObSelectStmt *stmt,
+  int formalize_limit_expr(ObDMLStmt &stmt, bool formalize_oracle_limit);
+  int transform_rollup_groupset_exprs(ObDMLStmt *stmt, bool &trans_happened);
+  int get_rollup_or_grouping_const_exprs(ObIArray<ObRawExpr*> &replacing_exprs,
                              ObIArray<ObRawExpr*> &const_exprs,
                              ObIArray<ObRawExpr*> &const_remove_const_exprs,
                              ObIArray<ObRawExpr*> &exec_params,
@@ -633,7 +647,10 @@ private:
                              ObIArray<ObRawExpr*> &query_ref_exprs,
                              ObIArray<ObRawExpr*> &query_ref_remove_const_exprs,
                              bool &trans_happened);
+  int formalize_limit_expr_oracle(ObDMLStmt &stmt);
+  int formalize_limit_expr_mysql(ObDMLStmt &stmt);
   int replace_remove_const_exprs(ObSelectStmt *stmt,
+                                const bool replace_grouping_sets,
                                 ObIArray<ObRawExpr*> &const_exprs,
                                 ObIArray<ObRawExpr*> &const_remove_const_exprs,
                                 ObIArray<ObRawExpr*> &exec_params,
@@ -707,6 +724,24 @@ private:
                               ObLeadingTable &leading_table);
   int construct_leaf_leading_table(ObDMLStmt *stmt, TableItem *table, ObLeadingTable *&leading_table);
   int reset_view_base_and_transpose_item(ObDMLStmt *stmt);
+  int transform_generated_column(ObDMLStmt *stmt, bool &is_happened);
+  int collect_gen_cols_for_replace(ObDMLStmt *stmt,
+                                   ObIArray<ObColumnRefRawExpr*> &gen_cols_for_replace,
+                                   ObIArray<ObRawExpr*> &depend_exprs);
+  int collect_pullable_scopes_from_table(ObDMLStmt *stmt,
+                                        ObColumnRefRawExpr *gen_col,
+                                        ObRawExpr *depend_expr,
+                                        ObIArray<DmlStmtScope> &replace_scopes,
+                                        ObIArray<ObPCConstParamInfo> &constraints);
+  int check_gen_col_preds(ObIArray<ObRawExpr*> &relation_exprs,
+                          ObRawExpr *gen_col,
+                          ObIArray<ObRawExpr*> &depend_exprs,
+                          bool &pass_pred_check);
+  int check_gen_col_pred(ObRawExpr* root_expr,
+                        ObIArray<ObRawExpr*> &target_exprs,
+                        bool &pass_pred_check);
+  int transform_any_all_row(ObDMLStmt *stmt, bool &trans_happened);
+  int convert_any_all_row_expr(ObRawExpr *expr, ObRawExpr *&new_expr, bool &happened);
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTransformPreProcess);

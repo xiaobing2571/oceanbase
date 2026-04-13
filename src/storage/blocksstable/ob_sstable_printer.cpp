@@ -11,10 +11,14 @@
  */
 
 #include "ob_sstable_printer.h"
+#include "lib/utility/ob_macro_utils.h"
+#include "share/allocator/ob_shared_memory_allocator_mgr.h"
 #include "storage/tx_table/ob_tx_table_iterator.h"
 #include "storage/blocksstable/ob_macro_block_meta.h"
 #include "storage/blocksstable/index_block/ob_index_block_row_struct.h"
 #include "storage/blocksstable/cs_encoding/ob_column_encoding_struct.h"
+
+#define USING_LOG_PREFIX COMMON
 
 namespace oceanbase
 {
@@ -259,10 +263,10 @@ void ObSSTablePrinter::print_cell(const ObObj &cell)
   P_VALUE_STR_B(helper.convert(cell));
 }
 
-void ObSSTablePrinter::print_cell(const ObStorageDatum &datum)
+void ObSSTablePrinter::print_cell(const ObStorageDatum &datum, const int64_t hex_length)
 {
   ObCStringHelper helper;
-  ObStorageDatumWrapper wrapper(datum, true);
+  ObStorageDatumWrapper wrapper(datum, true, hex_length);
   P_VALUE_STR_B(helper.convert(wrapper));
 }
 
@@ -399,7 +403,7 @@ void ObSSTablePrinter::print_pre_agg_row(const int64_t column_cnt, ObAggRowReade
         P_VALUE_BINT(meta_type);
         P_COLON();
         P_NAME("value=");
-        print_cell(agg_datum);
+        print_cell(agg_datum, tools::ObDumpMacroBlockContext::DEFUALT_DUMP_HEX_LENGTH);
         P_COLON();
         P_NAME("is_min_max_prefix=");
         P_VALUE_INT(is_min_max_prefix);
@@ -434,6 +438,7 @@ void ObSSTablePrinter::print_macro_meta(const ObDataMacroBlockMeta *macro_meta)
   print_line("is_deleted", macro_meta->val_.is_deleted_);
   print_line("contain_uncommitted_row", macro_meta->val_.contain_uncommitted_row_);
   print_line("is_last_row_last_flag", macro_meta->val_.is_last_row_last_flag_);
+  print_line("is_first_row_first_flag_", macro_meta->val_.is_first_row_first_flag_);
   print_line("compressor_type", macro_meta->val_.compressor_type_);
   print_line("master_key_id", macro_meta->val_.master_key_id_);
   print_line("encrypt_id", macro_meta->val_.encrypt_id_);
@@ -464,6 +469,9 @@ void ObSSTablePrinter::print_micro_header(const ObMicroBlockHeader *micro_block_
   print_line("data_zlength", micro_block_header->data_zlength_);
   print_line("data_checksum", micro_block_header->data_checksum_);
   print_line("max_merged_trans_version", micro_block_header->max_merged_trans_version_);
+  if (ObRowStoreType::CS_ENCODING_ROW_STORE == micro_block_header->row_store_type_) {
+    print_line("has_row_header", micro_block_header->has_row_header_);
+  }
   if (micro_block_header->has_column_checksum_) {
     for (int64_t i = 0; i < micro_block_header->column_count_; ++i) {
       if (isatty(fileno(stderr)) > 0) {
@@ -529,10 +537,13 @@ void ObSSTablePrinter::print_bloom_filter_micro_block(const char* micro_block_bu
   P_END();
 }
 
+
+
 void ObSSTablePrinter::print_store_row(
     const ObDatumRow *row,
     const ObObjMeta *obj_metas,
     const int64_t type_array_column_cnt,
+    const int64_t print_hex_length,
     const bool is_index_block,
     const bool is_trans_sstable)
 {
@@ -548,22 +559,25 @@ void ObSSTablePrinter::print_store_row(
     int64_t pos = 0;
 
     if (OB_LIKELY(tx_id.get_id() != INT64_MAX)) {
-      ObMemAttr mem_attr;
-      mem_attr.label_ = "TX_DATA_TABLE";
-      void *p = op_alloc(ObTenantTxDataAllocator);
-      if (OB_NOT_NULL(p)) {
-        ObTenantTxDataAllocator *tx_data_allocator = new (p) ObTenantTxDataAllocator();
-
-        ObTxData tx_data;
-        tx_data.tx_id_ = tx_id;
-        if (OB_FAIL(tx_data_allocator->init("PRINT_TX_DATA_SST"))) {
-          STORAGE_LOG(WARN, "init tx data allocator failed", KR(ret), K(str));
-        } else if (OB_FAIL(tx_data.deserialize(str.ptr(), str.length(), pos, *tx_data_allocator))) {
-          STORAGE_LOG(WARN, "deserialize tx data failed", KR(ret), K(str));
-          hex_dump(str.ptr(), str.length(), true, OB_LOG_LEVEL_WARN);
-        } else {
-          ObTxData::print_to_stderr(tx_data);
-        }
+      void *slice_ptr = nullptr;
+      ObTxDataGuard tx_data_guard;
+      if (OB_ISNULL(slice_ptr = MTL(ObSharedMemAllocMgr *)->tx_data_allocator().alloc(false, 0))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        STORAGE_LOG(WARN, "allocate memory from slice_allocator fail.", KR(ret), KP(this));
+      } else {
+        ObTxData *tx_data = new (slice_ptr) ObTxData();
+        tx_data->tx_data_allocator_ = &MTL(ObSharedMemAllocMgr *)->tx_data_allocator();
+        tx_data->op_allocator_ = &MTL(share::ObSharedMemAllocMgr *)->tx_data_op_allocator();
+        tx_data_guard.init(tx_data);
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(tx_data_guard.tx_data()->deserialize(
+              str.ptr(), str.length(), pos, MTL(ObSharedMemAllocMgr *)->tx_data_allocator()))) {
+        STORAGE_LOG(WARN, "deserialize tx data failed", KR(ret), K(str));
+        hex_dump(str.ptr(), str.length(), true, OB_LOG_LEVEL_WARN);
+      } else {
+        ObTxData::print_to_stderr(*tx_data_guard.tx_data());
+        FLOG_INFO("print TxData", K(tx_data_guard));
       }
     } else {
       // pre-process data for upper trans version calculation
@@ -575,6 +589,7 @@ void ObSSTablePrinter::print_store_row(
         hex_dump(str.ptr(), str.length(), true, OB_LOG_LEVEL_WARN);
       } else {
         ObCommitVersionsArray::print_to_stderr(*commit_versions);
+        FLOG_INFO("print commit versions", KPC(commit_versions));
       }
     }
   } else {
@@ -599,7 +614,7 @@ void ObSSTablePrinter::print_store_row(
           print_cell(obj);
         }
       } else {
-        print_cell(row->storage_datums_[i]);
+        print_cell(row->storage_datums_[i], print_hex_length);
       }
     }
   }
@@ -685,15 +700,15 @@ void ObSSTablePrinter::print_cs_encoding_column_meta(
   } else if (ObCSColumnHeader::Type::SEMISTRUCT == type) {
     print_semistruct_column_meta(start, len, col_header, row_cnt);
   } else {
-    print_line("has_nullbitmap", (0 != len));
+    print_line("has_null_or_nop_bitmap", (0 != len));
   }
-  P_LBRACE();
-  if (hex_print_buf != nullptr) {
+  if (hex_print_buf != nullptr && hex_buf_size > 0) {
+    P_LBRACE();
     to_hex_cstr(start, len, hex_print_buf, hex_buf_size);
     P_VALUE_STR_B(hex_print_buf);
+    P_RBRACE();
+    P_END();
   }
-  P_RBRACE();
-  P_END();
   print_end_line();
 }
 
@@ -782,37 +797,62 @@ void ObSSTablePrinter::print_semistruct_column_meta(
     const ObCSColumnHeader &col_header,
     const uint32_t row_cnt)
 {
-  int ret = OB_SUCCESS;
-  HEAP_VAR(ObSemiStructSubSchema, sub_schema) {
-    ObSemiStructEncodeMetaDesc semistruct_desc;
-    int64_t pos = 0;
-    semistruct_desc.deserialize(col_header, row_cnt, start, len, pos);
-    print_line("semistruct_type", semistruct_desc.semistruct_header_->type_);
-    print_line("semistruct_header_len", semistruct_desc.semistruct_header_->header_len_);
-    print_line("has_nullbitmap", (0 != semistruct_desc.bitmap_size_));
-    print_line("sub_col_cnt", semistruct_desc.semistruct_header_->column_cnt_);
-    print_line("sub_stream_cnt", semistruct_desc.semistruct_header_->stream_cnt_);
-    print_line("sub_schema_len", semistruct_desc.semistruct_header_->schema_len_);
+  ObSemiStructEncodeMetaDesc semistruct_desc;
+  int64_t pos = 0;
+  semistruct_desc.deserialize(col_header, row_cnt, start, len, pos);
+  print_line("semistruct_type", semistruct_desc.semistruct_header_->type_);
+  print_line("semistruct_header_len", semistruct_desc.semistruct_header_->header_len_);
+  print_line("has_nullbitmap", (0 != semistruct_desc.bitmap_size_));
+  print_line("sub_col_cnt", semistruct_desc.semistruct_header_->column_cnt_);
+  print_line("sub_stream_cnt", semistruct_desc.semistruct_header_->stream_cnt_);
+  print_line("sub_schema_len", semistruct_desc.semistruct_header_->schema_len_);
+  pos = 0;
+  print_sub_schema(semistruct_desc);
 
-    pos = 0;
-    sub_schema.decode(semistruct_desc.sub_schema_data_ptr_, semistruct_desc.semistruct_header_->schema_len_, pos);
-    print_sub_schema(sub_schema);
-
-    for (int i = 0; i < semistruct_desc.semistruct_header_->column_cnt_; ++i) {
-      print_cs_encoding_column_header(semistruct_desc.sub_col_headers_[i], i);
-    }
+  for (int i = 0; i < semistruct_desc.semistruct_header_->column_cnt_; ++i) {
+    print_cs_encoding_column_header(semistruct_desc.sub_col_headers_[i], i);
   }
 }
 
-void ObSSTablePrinter::print_sub_schema(const ObSemiStructSubSchema &sub_schema)
+void ObSSTablePrinter::print_sub_schema(const ObSemiStructEncodeMetaDesc &semistruct_desc)
 {
+  int ret = OB_SUCCESS;
   print_title("SubSchema Information");
-  const ObIArray<ObSemiStructSubColumn>& freq_columns = sub_schema.get_freq_columns();
-  const ObIArray<ObSemiStructSubColumn>& spare_columns = sub_schema.get_spare_columns();
-  print_line("freq_sub_col_cnt", freq_columns.count());
-  print_line("spare_sub_col_cnt", spare_columns.count());
-  print_freq_column_info(freq_columns);
-  print_spare_column_info(spare_columns);
+  int64_t pos = 0;
+  if (*reinterpret_cast<const uint8_t *>(semistruct_desc.sub_schema_data_ptr_) == ObSemiStructSubSchema::SCHEMA_VERSION) {
+      HEAP_VAR(ObSemiStructSubSchema, sub_schema) {
+        sub_schema.decode(semistruct_desc.sub_schema_data_ptr_, semistruct_desc.semistruct_header_->schema_len_, pos);
+        print_line("sub_schema_version", sub_schema.get_version());
+        const ObIArray<ObSemiStructSubColumn>& freq_columns = sub_schema.get_freq_columns();
+        const ObIArray<ObSemiStructSubColumn>& spare_columns = sub_schema.get_spare_columns();
+        print_line("freq_sub_col_cnt", freq_columns.count());
+        print_line("spare_sub_col_cnt", spare_columns.count());
+        print_freq_column_info(freq_columns);
+        print_spare_column_info(spare_columns);
+    }
+  } else {
+    HEAP_VAR(ObSemiNewSchema, sub_schema) {
+      sub_schema.decode(semistruct_desc.sub_schema_data_ptr_, semistruct_desc.semistruct_header_->schema_len_, pos);
+      print_line("sub_schema_version", sub_schema.get_version());
+      print_line("semi_schema_header", sub_schema.get_schema_header());
+      const ObSemiSchemaInfo* semi_schema_infos = sub_schema.get_semi_schema_infos();
+      for (int i = 0; i < sub_schema.get_element_cnt(); ++i) {
+        P_TAB_LEVEL(1);
+        P_BAR();
+        P_LINE_NAME("schema info");
+        P_BAR();
+        FPRINTF("col_id {%d}, {json_type_: %d, obj_type_: %d, is_freq_column_: %d, prec_: %d, scale_: %d, reserved_: %d}",
+              i, semi_schema_infos[i].json_type_, semi_schema_infos[i].obj_type_, semi_schema_infos[i].is_freq_column_,
+                     semi_schema_infos[i].prec_, semi_schema_infos[i].scale_, semi_schema_infos[i].reserved_);
+        P_END();
+      }
+      ObJsonBuffer json_schema(&sub_schema.get_allocator());
+      ObJsonBin bin(sub_schema.get_schema_buf().ptr(), sub_schema.get_schema_buf().length());
+      bin.reset_iter();
+      bin.print(json_schema, true, 0);
+      print_line("json schema", json_schema.string().ptr());
+    }
+  }
   print_end_line();
 }
 

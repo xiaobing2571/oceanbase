@@ -23,6 +23,9 @@ namespace oceanbase
 namespace sql
 {
 
+template<typename R, typename C>
+class PlanVisitor;
+
 class ObLogGranuleIterator : public ObLogicalOperator
 {
 public:
@@ -34,9 +37,14 @@ public:
   hash_part_(false),
   bf_info_(),
   tablet_id_expr_(NULL),
+  slice_id_expr_(NULL),
   repartition_ref_table_id_(OB_INVALID_ID),
   used_by_external_table_(false),
-  px_rf_info_()
+  used_by_lake_table_(false),
+  px_rf_info_(),
+  enable_adaptive_task_splitting_(false),
+  controlled_tsc_(nullptr),
+  index_table_id_(OB_INVALID_ID)
   { }
   virtual ~ObLogGranuleIterator()
   { }
@@ -47,9 +55,6 @@ public:
   virtual int get_op_exprs(ObIArray<ObRawExpr*> &all_exprs) override;
   void set_tablet_size(int64_t tablet_size) { tablet_size_ = tablet_size; };
   int64_t get_tablet_size() { return tablet_size_; }
-  uint64_t get_flag() {
-    return gi_attri_flag_;
-  }
   void add_flag(uint64_t attri);
 
   bool partition_filter() const { return ObGranuleUtil::gi_has_attri(gi_attri_flag_, GI_USE_PARTITION_FILTER); }
@@ -66,12 +71,12 @@ public:
   virtual int compute_op_ordering() override;
   int set_range_order();
 
-  inline uint64_t get_gi_flags() { return gi_attri_flag_; }
+  inline uint64_t get_gi_flags() const { return gi_attri_flag_; }
   void set_partition_count(int64_t partition_count) { partition_count_ = partition_count; }
   void set_hash_part(bool v) { hash_part_ = v; }
   bool is_hash_part() { return hash_part_; }
 
-  int is_partition_gi(bool &partition_granule) const;
+  bool is_partition_gi() const;
 
   ObPxBFStaticInfo &get_join_filter_info() { return bf_info_; }
   void set_join_filter_info(ObPxBFStaticInfo &bf_info) { bf_info_ = bf_info; }
@@ -81,6 +86,8 @@ public:
 
   void set_tablet_id_expr(ObOpPseudoColumnRawExpr *tablet_id_expr) { tablet_id_expr_ = tablet_id_expr; }
   ObOpPseudoColumnRawExpr *get_tablet_id_expr() { return tablet_id_expr_; }
+  void set_ddl_slice_id_expr(ObRawExpr *slice_id_expr) { slice_id_expr_ = slice_id_expr; }
+  ObRawExpr *get_ddl_slice_id_expr() { return slice_id_expr_; }
   void set_repartition_ref_table_id(int64_t table_id) { repartition_ref_table_id_ = table_id; }
   int64_t get_repartition_ref_table_id() { return repartition_ref_table_id_; }
   virtual int get_plan_item_info(PlanText &plan_text,
@@ -89,6 +96,17 @@ public:
 
   void set_used_by_external_table() { used_by_external_table_ = true; }
   bool is_used_by_external_table() const { return used_by_external_table_; }
+  void set_used_by_lake_table() { used_by_lake_table_ = true; }
+  bool is_used_by_lake_table() const { return used_by_lake_table_; }
+  bool is_rescanable();
+  void set_enable_adaptive_task_splitting(bool value) { enable_adaptive_task_splitting_ = value; }
+  bool enable_adaptive_task_splitting() const { return enable_adaptive_task_splitting_; }
+  int check_adaptive_task_splitting(ObLogTableScan *tsc);
+  void set_index_table_id(uint64_t index_table_id) {index_table_id_ = index_table_id; }
+  uint64_t get_index_table_id() { return index_table_id_;}
+private:
+  int check_exist_deadlock_condition(const ObLogicalOperator *op, bool &exist);
+  int branch_has_exchange(const ObLogicalOperator *op, bool &has_exchange);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObLogGranuleIterator);
   int64_t tablet_size_;
@@ -97,9 +115,15 @@ private:
   bool hash_part_;
   ObPxBFStaticInfo bf_info_; // for join partition filter
   ObOpPseudoColumnRawExpr *tablet_id_expr_;
+  ObRawExpr *slice_id_expr_; // for FTS slice_id pseudo column
   int64_t repartition_ref_table_id_;
   bool used_by_external_table_;
+  bool used_by_lake_table_;
   ObPxRFStaticInfo px_rf_info_; // for runtime filter extract query range
+  bool enable_adaptive_task_splitting_;
+  ObLogicalOperator *controlled_tsc_; // only when gi is directly add above tsc.
+
+  uint64_t index_table_id_;
 };
 
 }

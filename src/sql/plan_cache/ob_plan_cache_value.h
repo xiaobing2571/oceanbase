@@ -91,7 +91,7 @@ struct PCVSchemaObj
     is_mv_container_table_(false) {}
 
   int init(const share::schema::ObTableSchema *schema);
-  int init_with_synonym(const ObSimpleSynonymSchema *schema);
+  int init_with_synonym(const ObSimpleSynonymSchema *schema, const ObSchemaObjVersion &table_version);
   int init_with_version_obj(const share::schema::ObSchemaObjVersion &schema_obj_version);
   int init_without_copy_name(const share::schema::ObSimpleTableSchemaV2 *schema);
   void set_allocator(common::ObIAllocator *alloc)
@@ -150,7 +150,7 @@ public:
   const static int64_t OB_INFLUENCE_PLAN_SYS_VAR_LEN = 512;
 
 public:
-  ObPlanCacheValue();
+  ObPlanCacheValue(uint64_t id);
   ~ObPlanCacheValue() { reset(); }
   int init(ObPCVSet *pcv_set, const ObILibCacheObject *cache_obj, ObPlanCacheCtx &pc_ctx);
 
@@ -198,14 +198,17 @@ public:
                                                ParamStore &param_store);
 
   static int check_multi_stmt_not_param_value(
+                                ObPlanCacheCtx &pc_ctx,
                                 const ObIArray<ObFastParserResult> &multi_stmt_fp_results,
                                 const ObIArray<NotParamInfo> &not_param_info,
                                 bool &is_same);
   static int check_insert_multi_values_param(ObPlanCacheCtx &pc_ctx, bool &is_same);
-  static int check_not_param_value(const ObIArray<ObPCParam *> &raw_params,
+  static int check_not_param_value(ObPlanCacheCtx &pc_ctx,
+                                   const ObIArray<ObPCParam *> &raw_params,
                                    const ObIArray<NotParamInfo> &not_param_info,
                                    bool &is_same);
-  static int check_not_param_value(const ObFastParserResult &fp_result,
+  static int check_not_param_value(ObPlanCacheCtx &pc_ctx,
+                                   const ObFastParserResult &fp_result,
                                    const ObIArray<NotParamInfo> &not_param_info,
                                    bool &is_same);
   static int get_one_group_params(int64_t pos, const ParamStore &src_params, ParamStore &dst_params);
@@ -217,11 +220,17 @@ public:
   // choose an appropriate physical plan
   int choose_plan(ObPlanCacheCtx &pc_ctx,
                   const common::ObIArray<PCVSchemaObj> &schema_array,
+                  const bool check_schema,
                   ObPlanCacheObject *&plan);
   // add a physical plan
   int add_plan(ObPlanCacheObject &cache_obj,
                const common::ObIArray<PCVSchemaObj> &schema_array,
                ObPlanCacheCtx &pc_ctx);
+  int add_to_plan_set(ObPlanCacheCtx &pc_ctx,
+                      ObPlanCacheObject &plan,
+                      int64_t outline_param_idx,
+                      bool is_multi_stmt_batch,
+                      bool add_last = true);
 
   int match_and_generate_ext_params(ObPlanSet *batch_plan_set,
                                     ObPlanCacheCtx &pc_ctx,
@@ -334,6 +343,9 @@ private:
 
   int create_new_plan_set(const ObPlanSetType plan_set_type,
                           ObPlanSet *&new_plan_set);
+
+  OB_INLINE uint64_t get_next_plan_set_id() { return __sync_add_and_fetch(&next_plan_set_id_, 1); }
+
   void free_plan_set(ObPlanSet *plan_set);
 
   int set_stored_schema_objs(const DependenyTableStore &dep_table_store,
@@ -345,7 +357,7 @@ private:
   int remove_mv_schema(const common::ObIArray<PCVSchemaObj> &schema_array,
                        common::ObIArray<PCVSchemaObj*> &stored_schema_objs);
 
-  int match_dep_schema(const ObPlanCacheCtx &pc_ctx,
+  int match_dep_schema(ObPlanCacheCtx &pc_ctx,
                        const common::ObIArray<PCVSchemaObj> &schema_array,
                        bool &is_same);
 
@@ -361,16 +373,20 @@ private:
                                 bool &need_check);
   int assign_udr_infos(ObPlanCacheCtx &pc_ctx);
   void reset_tpl_sql_const_cons();
-  int check_tpl_sql_const_cons(const ObFastParserResult &fp_result,
+  int check_tpl_sql_const_cons(ObPlanCacheCtx &pc_ctx,
+                               const ObFastParserResult &fp_result,
                                const TplSqlConstCons &tpl_cst_cons_list,
                                bool &is_same);
   int cmp_not_param_info(const NotParamInfoList &l_param_info_list,
                          const NotParamInfoList &r_param_info_list,
                          bool &is_equal);
+  int check_need_force_miss_match(const ObPlanCacheCtx &pc_ctx,
+                                  const ObPlanCacheObject &plan);
 
   friend class ::test::TestPlanSet_basic_Test;
   friend class ::test::TestPlanCacheValue_basic_Test;
 private:
+  uint64_t id_;
   //***********  for match **************
   //记录不需要参数化的常量信息及常量为负数的信息
   common::ObSEArray<NotParamInfo, 4> not_param_info_;
@@ -457,6 +473,9 @@ private:
   bool enable_rich_vector_format_;
   common::ObBitSet<> fmt_int_or_ch_decint_idx_;
   int64_t switchover_epoch_;
+  // Force miss match plan cache. e.g. contain lake table or mview
+  bool force_miss_match_;
+  uint64_t next_plan_set_id_;
 
   DISALLOW_COPY_AND_ASSIGN(ObPlanCacheValue);
 };

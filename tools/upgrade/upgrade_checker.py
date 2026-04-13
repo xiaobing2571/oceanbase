@@ -18,7 +18,7 @@ if sys.version_info.major == 3:
 
 class UpgradeParams:
   log_filename = 'upgrade_checker.log'
-  old_version = '4.2.5.1'
+  old_version = '4.3.0.0'
 
 class PasswordMaskingFormatter(logging.Formatter):
   def format(self, record):
@@ -381,33 +381,32 @@ def check_data_version(query_cur):
           fail_list.append('last barrier data version is 4.1.0.0. prohibit cluster upgrade from data version less than 4.1.0.0')
         else:
           # check target_data_version/current_data_version
-          sql = "select count(*) from oceanbase.__all_tenant"
+          sql = "select tenant_id from oceanbase.__all_tenant"
+          (desc, results) = query_cur.exec_query(sql)
+          tenant_ids = [_[0] for _ in results]
+          # check upgrade_begin_data_version
+          tenant_count = len(tenant_ids)
+          tenant_id_str = ','.join(map(str, tenant_ids))
+
+          sql = "select count(*) from __all_virtual_core_table where table_name = '__all_global_stat' and column_name in ('target_data_version', 'current_data_version') and column_value = {0} and tenant_id in ({1})".format(data_version, tenant_id_str)
           (desc, results) = query_cur.exec_query(sql)
           if len(results) != 1 or len(results[0]) != 1:
             fail_list.append('result cnt not match')
+          elif 2 * tenant_count != results[0][0]:
+            fail_list.append('target_data_version/current_data_version not match with {0}, tenant_cnt:{1}, result_cnt:{2}'.format(data_version_str, tenant_count, results[0][0]))
           else:
-            # check upgrade_begin_data_version
-            tenant_count = results[0][0]
+            logging.info("check data version success, all tenant's compatible/target_data_version/current_data_version is {0}".format(data_version_str))
 
-            sql = "select count(*) from __all_virtual_core_table where column_name in ('target_data_version', 'current_data_version') and column_value = {0}".format(data_version)
+          if data_version >= get_version("4.3.5.1"):
+            # check upgrade_begin_data_version
+            sql = "select count(*) from __all_virtual_core_table where table_name = '__all_global_stat' and column_name in ('upgrade_begin_data_version') and column_value = {0} and tenant_id in ({1})".format(data_version, tenant_id_str)
             (desc, results) = query_cur.exec_query(sql)
             if len(results) != 1 or len(results[0]) != 1:
               fail_list.append('result cnt not match')
-            elif 2 * tenant_count != results[0][0]:
-              fail_list.append('target_data_version/current_data_version not match with {0}, tenant_cnt:{1}, result_cnt:{2}'.format(data_version_str, tenant_count, results[0][0]))
+            elif tenant_count != results[0][0]:
+              fail_list.append('upgrade_begin_data_version not match with {0}, tenant_cnt:{1}, result_cnt:{2}'.format(data_version_str, tenant_count, results[0][0]))
             else:
-              logging.info("check data version success, all tenant's compatible/target_data_version/current_data_version is {0}".format(data_version_str))
-
-            if data_version >= get_version("4.3.5.1"):
-              # check upgrade_begin_data_version
-              sql = "select count(*) from __all_virtual_core_table where column_name in ('upgrade_begin_data_version') and column_value = {0}".format(data_version)
-              (desc, results) = query_cur.exec_query(sql)
-              if len(results) != 1 or len(results[0]) != 1:
-                fail_list.append('result cnt not match')
-              elif tenant_count != results[0][0]:
-                fail_list.append('upgrade_begin_data_version not match with {0}, tenant_cnt:{1}, result_cnt:{2}'.format(data_version_str, tenant_count, results[0][0]))
-              else:
-                logging.info("check data version success, all tenant's upgrade_begin_data_version is {0}".format(data_version_str))
+              logging.info("check data version success, all tenant's upgrade_begin_data_version is {0}".format(data_version_str))
 
 # 2. 检查paxos副本是否同步, paxos副本是否缺失
 def check_paxos_replica(query_cur):
@@ -436,9 +435,30 @@ def check_cluster_status(query_cur):
   (desc, results) = query_cur.exec_query("""select count(1) from CDB_OB_MAJOR_COMPACTION where (GLOBAL_BROADCAST_SCN > LAST_SCN or STATUS != 'IDLE')""")
   if results[0][0] > 0 :
     fail_list.append('{0} tenant is merging, please check'.format(results[0][0]))
-  (desc, results) = query_cur.exec_query("""select /*+ query_timeout(1000000000) */ count(1) from __all_virtual_tablet_compaction_info where max_received_scn > finished_scn and max_received_scn > 0""")
-  if results[0][0] > 0 :
-    fail_list.append('{0} tablet is merging, please check'.format(results[0][0]))
+
+  # check adaptive compaction
+  min_cluster_version = 0
+  sql = """select distinct value from GV$OB_PARAMETERS  where name='min_observer_version'"""
+  (desc, results) = query_cur.exec_query(sql)
+  if len(results) != 1:
+    fail_list.append('min_observer_version is not sync')
+  elif len(results[0]) != 1:
+    fail_list.append('column cnt not match')
+  else:
+    min_cluster_version = get_version(results[0][0])
+  if min_cluster_version < get_version("4.5.0.0"):
+    get_data_version_sql = """select distinct value from oceanbase.__all_virtual_tenant_parameter_info where name='compatible'"""
+    (desc, results) = query_cur.exec_query(sql)
+    if len(results) != 1:
+      fail_list.append('compatible is not sync')
+    elif len(results[0]) != 1:
+      fail_list.append('column cnt not match')
+    else:
+      data_version = get_version(results[0][0])
+      if (data_version < get_version("4.5.0.0")):
+        (desc, results) = query_cur.exec_query("""select /*+ query_timeout(1000000000) */ count(1) from __all_virtual_tablet_compaction_info where max_received_scn > finished_scn and max_received_scn > 0""")
+        if results[0][0] > 0 :
+          fail_list.append('{0} tablet is merging, please check'.format(results[0][0]))
   logging.info('check cluster status success')
 
 # 5. 检查是否有异常租户(creating，延迟删除，恢复中，租户unit有残留)
@@ -916,6 +936,26 @@ def check_direct_load_job_exist(cur, query_cur):
     fail_list.append("There are direct load task in progress")
   logging.info('check direct load task execut status success')
 
+# 检查是否开启了日志副本，如果开启了日志副本不允许升级到44x版本
+def check_enable_logonly_replica(cur, query_cur):
+  sql = """select count(1) from __all_virtual_tenant_parameter_stat where name like '%enable_logonly_replica%' and (tenant_id = 1 or tenant_id % 2 = 0) and value like '%true%'"""
+  (desc, results) = query_cur.exec_query(sql)
+  if 0 != results[0][0]:
+    fail_list.append("enable_logonly_replica should be false")
+    logging.info('check enable_logonly_replica failed, can not upgrade because enable_logonly_replica should be false')
+  else:
+    logging.info('check enable_logonly_replica success')
+
+# 检查是否开启了app_trace_id，如果开启了app_trace_id则不允许升级到44x版本
+def check_enable_record_trace_id(cur, query_cur):
+  sql = """select count(1) from GV$OB_PARAMETERS where name like '%enable_record_trace_id%' and value like '%true%'"""
+  (desc, results) = query_cur.exec_query(sql)
+  if 0 != results[0][0]:
+    fail_list.append("enable_record_trace_id should be false")
+    logging.info('check enable_record_trace_id failed, can not upgrade because enable_record_trace_id should be false')
+  else:
+    logging.info('check enable_record_trace_id success')
+
 # 检查cs_encoding格式是否兼容，对小于4.3.3版本的cpu不支持avx2指令集的集群，我们要求升级前schema上不存在cs_encoding的存储格式
 # 注意：这里对混布集群 / schema上row_format进行了ddl变更的场景无法做到完全的防御
 def check_cs_encoding_arch_dependency_compatiblity(query_cur, cpu_arch):
@@ -986,6 +1026,79 @@ def check_cs_encoding_arch_dependency_compatiblity(query_cur, cpu_arch):
   else:
     logging.info("check upgrade for arch-dependant cs_encoding format failed")
 
+# 由于 4.4 去除了 cos 驱动，不能再使用 cos:// 访问对象存储, 升级前需检查是否有使用 cos:// 前缀访问目的端的归档、备份和恢复任务
+# 后续使用 s3:// 访问 cos 对象存储
+def check_cos_archive_and_backup(query_cur):
+  can_upgrade = True
+  min_cluster_version = 0
+  sql = """select distinct value from GV$OB_PARAMETERS  where name='min_observer_version'"""
+  (desc, results) = query_cur.exec_query(sql)
+  if len(results) != 1:
+    fail_list.append('min_observer_version is not sync')
+  elif len(results[0]) != 1:
+    fail_list.append('column cnt not match')
+  else:
+    min_cluster_version = get_version(results[0][0])
+    if min_cluster_version < get_version("4.4.0.0"):
+      # 检查是否存在 cos:// 前缀的归档任务
+      (desc, results) = query_cur.exec_query("""select count(1) from CDB_OB_ARCHIVELOG WHERE STATUS != 'STOP' AND PATH LIKE "cos://%";""")
+      if len(results) != 1 or len(results[0]) != 1:
+        can_upgrade = False
+        fail_list.append("check cos:// prefix in archive task failed")
+      elif results[0][0] != 0:
+        can_upgrade = False
+        fail_list.append("exist archive job with cos:// prefix in archive dest, please checkin CDB_OB_ARCHIVELOG")
+
+      # 检查是否存在 cos:// 前缀的备份任务
+      (desc, results) = query_cur.exec_query("""select count(1) from CDB_OB_BACKUP_JOBS WHERE PATH LIKE "cos://%";""")
+      if len(results) != 1 or len(results[0]) != 1:
+        can_upgrade = False
+        fail_list.append("check cos:// prefix in backup task failed")
+      elif results[0][0] != 0:
+        can_upgrade = False
+        fail_list.append("exist backup job with cos:// prefix in backup dest, please check CDB_OB_BACKUP_JOBS")
+
+      # 检查是否存在 cos:// 前缀的恢复任务
+      (desc, results) = query_cur.exec_query("""select count(1) from CDB_OB_RESTORE_PROGRESS WHERE BACKUP_DEST LIKE "cos://%";""")
+      if len(results) != 1 or len(results[0]) != 1:
+        can_upgrade = False
+        fail_list.append("check cos:// prefix in restore task failed")
+      elif results[0][0] != 0:
+        can_upgrade = False
+        fail_list.append("exist restore job with cos:// prefix in restore dest, please check CDB_OB_RESTORE_PROGRESS")
+
+      # 检查是否存在 cos:// 前缀的归档目的端
+      (desc, results) = query_cur.exec_query("""select count(1) from CDB_OB_ARCHIVE_DEST WHERE VALUE LIKE "cos://%";""")
+      if len(results) != 1 or len(results[0]) != 1:
+        can_upgrade = False
+        fail_list.append("check cos:// prefix in archive dest failed")
+      elif results[0][0] != 0:
+        can_upgrade = False
+        fail_list.append("exist restore dest with cos:// prefix in archive dest, please check CDB_OB_ARCHIVE_DEST")
+
+      # 检查是否存在 cos:// 前缀的备份目的端
+      (desc, results) = query_cur.exec_query("""select count(1) from CDB_OB_BACKUP_PARAMETER WHERE VALUE LIKE "cos://%";""")
+      if len(results) != 1 or len(results[0]) != 1:
+        can_upgrade = False
+        fail_list.append("check cos:// prefix in backup parameter failed")
+      elif results[0][0] != 0:
+        can_upgrade = False
+        fail_list.append("exist restore dest with cos:// prefix in backup parameter, please check CDB_OB_BACKUP_PARAMETER")
+
+      # 检查是否存在 cos:// 前缀的恢复目的端
+      (desc, results) = query_cur.exec_query("""select count(1) from CDB_OB_LOG_RESTORE_SOURCE WHERE TYPE = 'LOCATION' AND VALUE LIKE "cos://%";""")
+      if len(results) != 1 or len(results[0]) != 1:
+        can_upgrade = False
+        fail_list.append("check cos:// prefix in restore source failed")
+      elif results[0][0] != 0:
+        can_upgrade = False
+        fail_list.append("exist restore source with cos:// prefix in restore source, please check CDB_OB_LOG_RESTORE_SOURCE")
+  if can_upgrade:
+    logging.info("check upgrade for cos:// prefix in archive, backup and restore task success")
+  else:
+    logging.info("check upgrade for cos:// prefix in archive, backup and restore task failed")
+
+
 # 开始升级前的检查
 def do_check(my_host, my_port, my_user, my_passwd, timeout, upgrade_params, cpu_arch):
   try:
@@ -1026,8 +1139,11 @@ def do_check(my_host, my_port, my_user, my_passwd, timeout, upgrade_params, cpu_
       check_oracle_standby_replication_exist(query_cur)
       check_disk_space_for_mds_sstable_compat(query_cur)
       check_cs_encoding_arch_dependency_compatiblity(query_cur, cpu_arch)
+      check_cos_archive_and_backup(query_cur)
       # all check func should execute before check_fail_list
       check_direct_load_job_exist(cur, query_cur)
+      check_enable_logonly_replica(cur, query_cur)
+      check_enable_record_trace_id(cur, query_cur)
       check_fail_list()
       modify_server_permanent_offline_time(cur)
     except Exception as e:

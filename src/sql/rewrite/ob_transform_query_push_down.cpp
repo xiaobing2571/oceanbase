@@ -289,7 +289,7 @@ int ObTransformQueryPushDown::check_transform_validity(ObSelectStmt *select_stmt
   } else if (!check_status) {
     can_transform = false;
     OPT_TRACE("can not pushdown where condition");
-  } else if ((select_stmt->has_group_by() || select_stmt->has_rollup())
+  } else if ((select_stmt->has_group_by() || select_stmt->has_rollup() || select_stmt->has_grouping_sets())
              && !view_stmt->is_spj()) {//判断6
     can_transform = false;
     OPT_TRACE("stmt has group by, but view is not spj");
@@ -308,6 +308,9 @@ int ObTransformQueryPushDown::check_transform_validity(ObSelectStmt *select_stmt
   } else if (select_stmt->has_order_by() && view_stmt->has_limit()) {//判断9
     can_transform = false;
     OPT_TRACE("stmt has order by, but view has limit ,can not pushdown");
+  } else if (select_stmt->is_unpivot_select() || view_stmt->is_unpivot_select()) {
+    can_transform = false;
+    OPT_TRACE("unpivot, can not transform");
   } else if (select_stmt->has_limit()) {//判断10
     can_transform = (!select_stmt->is_calc_found_rows()
                      && !view_stmt->is_contains_assignment()
@@ -551,6 +554,7 @@ int ObTransformQueryPushDown::check_rownum_push_down(ObSelectStmt *select_stmt,
              (select_stmt->get_condition_size() > 0 ||
               select_stmt->has_group_by() ||
               select_stmt->has_rollup() ||
+              select_stmt->has_grouping_sets() ||
               select_stmt->has_window_function() ||
               select_stmt->is_set_stmt() ||
               select_stmt->has_order_by())) { //判断2
@@ -585,7 +589,7 @@ int ObTransformQueryPushDown::check_select_item_push_down(ObSelectStmt *select_s
   if (OB_ISNULL(select_stmt) || OB_ISNULL(view_stmt)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("stmt is NULL", K(select_stmt), K(view_stmt), K(ret));
-  } else if (select_stmt->has_rollup()) {
+  } else if (select_stmt->has_rollup() || select_stmt->has_grouping_sets()) {
     can_be = false;
     OPT_TRACE("outer stmt has rollup, can not merge");
   } else if (OB_FAIL(check_select_item_subquery(*select_stmt, *view_stmt, check_status))) {
@@ -842,6 +846,8 @@ int ObTransformQueryPushDown::do_transform(ObSelectStmt *select_stmt,
                                           select_offset,
                                           const_select_items))) {
     LOG_WARN("push down stmt exprs failed", K(ret));
+  } else if (OB_FAIL(ObTransformUtils::adjust_pseudo_column_like_exprs(*view_stmt))) {
+    LOG_WARN("failed to adjust pseudo column like exprs", K(ret));
   } else {
     /* do nothing*/
   }
@@ -1008,7 +1014,7 @@ int ObTransformQueryPushDown::recursive_adjust_select_item(ObSelectStmt *select_
       ret = SMART_CALL(recursive_adjust_select_item(child_stmts.at(i), select_offset, const_select_items));
     }
     if (OB_SUCC(ret)) {
-      if (OB_FAIL(reset_set_stmt_select_list(select_stmt, select_offset))) {
+      if (OB_FAIL(reset_set_stmt_select_list(select_stmt, select_offset, const_select_items))) {
         LOG_WARN("failed to reset set stmt select list", K(ret));
       }
     }
@@ -1057,13 +1063,15 @@ int ObTransformQueryPushDown::recursive_adjust_select_item(ObSelectStmt *select_
 }
 
 int ObTransformQueryPushDown::reset_set_stmt_select_list(ObSelectStmt *select_stmt,
-                                                         ObIArray<int64_t> &select_offset)
+                                                         ObIArray<int64_t> &select_offset,
+                                                         ObIArray<SelectItem> &const_select_items)
 {
   int ret = OB_SUCCESS;
   ObSEArray<ObRawExpr*, 4> old_select_exprs;
   ObSEArray<ObRawExpr*, 4> adjust_old_select_exprs;
   ObSEArray<ObRawExpr*, 4> new_select_exprs;
   ObSEArray<ObRawExpr*, 4> adjust_new_select_exprs;
+  ObRawExpr* select_expr;
   if (OB_ISNULL(select_stmt) || OB_ISNULL(ctx_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("stmt is NULL", K(select_stmt), K(ctx_), K(ret));
@@ -1072,11 +1080,31 @@ int ObTransformQueryPushDown::reset_set_stmt_select_list(ObSelectStmt *select_st
   } else if (OB_FAIL(select_stmt->get_select_exprs(old_select_exprs))) {
     LOG_WARN("failed to get select exprs", K(ret));
   } else {
+    ObSEArray<ObExprResType, 8> res_types;
+    int64_t k = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < select_offset.count(); ++i) {
+      if (select_offset.at(i) == -1) {//-1 meanings upper stmt has const select item
+        if (OB_UNLIKELY(k >= const_select_items.count())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected error", K(ret), K(k), K(const_select_items.count()));
+        } else if (OB_FAIL(res_types.push_back(const_select_items.at(k).expr_->get_result_type()))) {
+          LOG_WARN("push back select item error", K(ret));
+        } else {
+          ++ k;
+        }
+      } else if (OB_ISNULL(select_expr = old_select_exprs.at(select_offset.at(i)))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("select expr is null", K(ret), K(select_expr));
+      } else if (OB_FAIL(res_types.push_back(select_expr->get_result_type()))) {
+        LOG_WARN("failed to pushback result type");
+      }
+    }
     select_stmt->get_select_items().reset();
-    if (OB_FAIL(ObOptimizerUtil::gen_set_target_list(ctx_->allocator_,
-                                                     ctx_->session_info_,
-                                                     ctx_->expr_factory_,
-                                                     select_stmt))) {
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ObTransformUtils::generate_select_list_for_set(ctx_->session_info_,
+                                                                      ctx_->expr_factory_,
+                                                                      select_stmt,
+                                                                      res_types))) {
       LOG_WARN("failed to create select list for union", K(ret));
     } else if (OB_FAIL(select_stmt->get_select_exprs(new_select_exprs))) {
       LOG_WARN("failed to get select exprs", K(ret));

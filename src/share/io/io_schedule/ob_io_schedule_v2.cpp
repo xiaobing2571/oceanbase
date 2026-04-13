@@ -30,7 +30,6 @@ int QSchedCallback::handle(TCRequest* tc_req)
 {
   int ret = OB_SUCCESS;
   ObDeviceChannel *device_channel = nullptr;
-  ObTimeGuard time_guard("submit_req", 100000); //100ms
   ObIORequest& req = *CONTAINER_OF(tc_req, ObIORequest, qsched_req_);
   ObIOResult* result = req.io_result_;
   if (OB_UNLIKELY(stop_submit_)) {
@@ -39,6 +38,7 @@ int QSchedCallback::handle(TCRequest* tc_req)
   } else if (OB_ISNULL(result)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("io result is null", K(ret), K(req));
+  } else if (FALSE_IT(result->time_log_.dequeue_ts_ = ObTimeUtility::fast_current_time())) {
   } else if (OB_UNLIKELY(req.is_canceled())) {
     ret = OB_CANCELED;
   } else {
@@ -48,20 +48,16 @@ int QSchedCallback::handle(TCRequest* tc_req)
       LOG_ERROR("fail to guard master condition", K(ret));
     } else if (OB_FAIL(req.prepare())) {
       LOG_WARN("prepare io request failed", K(ret), K(req));
-    } else if (FALSE_IT(time_guard.click("prepare_req"))) {
     } else if (OB_FAIL(OB_IO_MANAGER.get_device_channel(req, device_channel))) {
       LOG_WARN("get device channel failed", K(ret), K(req));
-    } else if (FALSE_IT(result->time_log_.dequeue_ts_ = ObTimeUtility::fast_current_time())) {
     } else if (OB_FAIL(device_channel->submit(req))) {
       LOG_WARN("submit io to device failed");
-    } else {
-      time_guard.click("device_submit");
+    } else if (REACH_TIME_INTERVAL(5 * 1000L * 1000L)) {
+      const int64_t submit_cost = ObTimeUtility::fast_current_time() - result->time_log_.dequeue_ts_;
+      if (submit_cost > 100 * 1000) {// 100ms
+        LOG_INFO("submit_request cost too much time", K(ret), K(req), K(submit_cost));
+      }
     }
-  }
-
-  if (time_guard.get_diff() > 100000) {// 100ms
-    //print req
-    LOG_INFO("submit_request cost too much time", K(ret), K(time_guard), K(req));
   }
   if (OB_FAIL(ret)) {
     if (ret == OB_EAGAIN) {
@@ -148,7 +144,7 @@ int ObIOManagerV2::set_default_net_tc_limits()
 }
 
 
-ObTenantIOSchedulerV2::ObTenantIOSchedulerV2(): tenant_id_(0)
+ObTenantIOSchedulerV2::ObTenantIOSchedulerV2(): rwlock_(common::ObLatchIds::OB_TENANT_IO_SCHEDULER_V2_DRW_LOCK), tenant_id_(0)
 {
   memset(top_qid_, -1, sizeof(top_qid_));
   memset(default_qid_, -1, sizeof(default_qid_));
@@ -284,7 +280,7 @@ static void fill_qsched_req(ObIORequest& req, int qid)
 {
   req.qsched_req_.qid_ = qid;
   req.qsched_req_.bytes_ = req.get_align_size();
-  req.qsched_req_.norm_bytes_ = req.is_object_device_req() ? req.qsched_req_.bytes_ : get_norm_bw(req.qsched_req_.bytes_, req.get_mode());
+  req.qsched_req_.norm_bytes_ = req.is_limit_net_bandwidth_req() ? req.qsched_req_.bytes_ : get_norm_bw(req.qsched_req_.bytes_, req.get_mode());
 }
 int64_t ObTenantIOSchedulerV2::get_qindex(ObIORequest& req)
 {
@@ -312,7 +308,7 @@ int64_t ObTenantIOSchedulerV2::get_qindex(ObIORequest& req)
 int ObTenantIOSchedulerV2::get_qid(int64_t index, ObIORequest& req, bool& is_default_q)
 {
   int qid = -1;
-  if (req.is_local_clog_not_isolated()) {
+  if (req.is_local_clog_io() && req.is_local_clog_not_isolated()) {
     qid = OB_IO_MANAGER_V2.get_root_qid();
   }  else if (index >= 0 && index < qid_.count()) {
     qid = qid_.at(index);
@@ -343,14 +339,15 @@ int ObTenantIOSchedulerV2::schedule_request(ObIORequest &req)
   if (OB_ISNULL(req.io_result_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("io result is null", K(ret), K(req));
-  } else if (FALSE_IT(req.io_result_->time_log_.enqueue_ts_ = ObTimeUtility::fast_current_time())) {
   } else if (OB_UNLIKELY(is_default_q)) {
-    if (0 != qsched_submit(root, &req.qsched_req_, assign_chan_id())) {
+    if (FALSE_IT(req.io_result_->time_log_.enqueue_ts_ = ObTimeUtility::fast_current_time())) {
+    } else if (0 != qsched_submit(root, &req.qsched_req_, assign_chan_id())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("qsched_submit fail", K(ret), K(req));
     }
   } else if (OB_FAIL(OB_IO_MANAGER.get_tc().register_bucket(req, qid))) {
     LOG_WARN("register bucket fail", K(ret), K(req));
+  } else if (FALSE_IT(req.io_result_->time_log_.enqueue_ts_ = ObTimeUtility::fast_current_time())) {
   } else if (0 != qsched_submit(root, &req.qsched_req_, assign_chan_id())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("qsched_submit fail", K(ret), K(req));

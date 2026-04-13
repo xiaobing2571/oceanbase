@@ -19,6 +19,7 @@
 #include "sql/optimizer/ob_log_update.h"
 #include "sql/optimizer/ob_log_exchange.h"
 #include "sql/optimizer/ob_log_link_dml.h"
+#include "sql/optimizer/ob_log_stat_collector.h"
 #include "sql/resolver/dml/ob_merge_stmt.h"
 #include "sql/rewrite/ob_transform_utils.h"
 
@@ -37,6 +38,32 @@ int ObDelUpdLogPlan::generate_normal_raw_plan()
 {
   int ret = OB_SUCCESS;
   /*do nothing*/
+  return ret;
+}
+
+int ObDelUpdLogPlan::check_pdml_interval_partition_supported(const uint64_t ref_table_id) const
+{
+  int ret = OB_SUCCESS;
+  const ObSimpleTableSchemaV2 *table_schema = nullptr;
+  ObSchemaGetterGuard *schema_guard = optimizer_context_.get_schema_guard();
+  ObSQLSessionInfo *session_info = optimizer_context_.get_session_info();
+  if (OB_ISNULL(schema_guard) || OB_ISNULL(session_info)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null ptr", K(ret), K(schema_guard), K(session_info));
+  } else if (OB_FAIL(schema_guard->get_simple_table_schema(session_info->get_effective_tenant_id(),
+                                                           ref_table_id,
+                                                           table_schema))) {
+    LOG_WARN("get table schema failed", K(ret), K(ref_table_id));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("table schema is null", K(ret), K(ref_table_id));
+  } else if (table_schema->is_interval_part()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("PDML on interval partition table is not supported",
+             K(ret), K(ref_table_id));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "PDML on interval partition table is");
+  }
   return ret;
 }
 
@@ -435,6 +462,9 @@ int ObDelUpdLogPlan::calculate_insert_table_location_and_sharding(ObTablePartiti
   } else if (del_upd_stmt->is_insert_stmt() &&
              !static_cast<const ObInsertStmt*>(del_upd_stmt)->value_from_select()) {
     /*do nothing*/
+  } else if (del_upd_stmt->is_merge_stmt() &&
+             !static_cast<const ObMergeStmt*>(del_upd_stmt)->has_insert_clause()) {
+    /*do nothing*/
   } else if (OB_FAIL(del_upd_stmt->get_dml_table_infos(dml_table_infos))) {
     LOG_WARN("failed to get dml table infos", K(ret));
   } else if (OB_UNLIKELY(dml_table_infos.count() != 1) || OB_ISNULL(dml_table_infos.at(0))) {
@@ -490,7 +520,7 @@ int ObDelUpdLogPlan::calculate_table_location_and_sharding(const ObDelUpdStmt &s
   } else {
     const ObArray<ObRawExpr*> empty_filters;
     const ObIArray<ObRawExpr*> &real_filters = get_optimizer_context().is_online_ddl() ? empty_filters : filters;
-    sharding_info = new(sharding_info) ObShardingInfo();
+    sharding_info = new(sharding_info) ObShardingInfo(allocator_);
     table_partition_info = new(table_partition_info) ObTablePartitionInfo(allocator_);
     ObTableLocationType location_type = OB_TBL_LOCATION_UNINITIALIZED;
     ObAddr &server = get_optimizer_context().get_local_server_addr();
@@ -501,7 +531,13 @@ int ObDelUpdLogPlan::calculate_table_location_and_sharding(const ObDelUpdStmt &s
                                          ref_table_id,
                                          part_ids,
                                          *table_partition_info))) {
-      LOG_WARN("failed to calculate table location", K(ret));
+      if (OB_NO_PARTITION_FOR_GIVEN_VALUE == ret) {
+        int tmp_ret = check_pdml_interval_partition_supported(ref_table_id);
+        if (OB_NOT_SUPPORTED == tmp_ret) {
+          ret = tmp_ret;
+        }
+      }
+      LOG_WARN("failed to calculate table location", KR(ret));
     } else if (OB_FAIL(table_partition_info->get_location_type(server, location_type))) {
       LOG_WARN("get location type failed", K(ret));
     } else if (FALSE_IT(sharding_info->set_location_type(location_type))) {
@@ -566,7 +602,6 @@ int ObDelUpdLogPlan::calculate_table_location(const ObDelUpdStmt &stmt,
   }
   return ret;
 }
-
 int ObDelUpdLogPlan::compute_exchange_info_for_pdml_del_upd(const ObShardingInfo &source_sharding,
                                                             const ObTablePartitionInfo &target_table_partition,
                                                             const IndexDMLInfo &index_dml_info,
@@ -605,17 +640,27 @@ int ObDelUpdLogPlan::compute_exchange_info_for_pdml_del_upd(const ObShardingInfo
     }
     bool can_use_random = !get_stmt()->is_merge_stmt() && !need_duplicate_date &&
           get_optimizer_context().is_pdml_heap_table() && !is_index_maintenance;
+    share::schema::ObPartitionFuncType part_func_type = source_sharding.get_part_func_type();
+    bool use_scatter_channel_for_pkey_hash = !(share::schema::PARTITION_FUNC_TYPE_HASH == part_func_type
+                            || share::schema::PARTITION_FUNC_TYPE_KEY == part_func_type
+                            || share::schema::PARTITION_FUNC_TYPE_KEY_IMPLICIT == part_func_type);
     if (share::schema::PARTITION_LEVEL_ONE == part_level) {
       exch_info.repartition_type_ = OB_REPARTITION_ONE_SIDE_ONE_LEVEL;
-      exch_info.dist_method_ = can_use_random
-                                ? ObPQDistributeMethod::PARTITION_RANDOM
-                                : ObPQDistributeMethod::PARTITION_HASH;
+      if (can_use_random)
+        exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_RANDOM;
+      else {
+        exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_HASH;
+        exch_info.use_scatter_channel_for_pkey_hash_ = use_scatter_channel_for_pkey_hash;
+      }
       LOG_TRACE("partition level is one, use pkey reshuffle method");
     } else if (share::schema::PARTITION_LEVEL_TWO == part_level) {
       exch_info.repartition_type_ = OB_REPARTITION_ONE_SIDE_TWO_LEVEL;
-      exch_info.dist_method_ = can_use_random
-                                ? ObPQDistributeMethod::PARTITION_RANDOM
-                                : ObPQDistributeMethod::PARTITION_HASH;
+      if (can_use_random)
+        exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_RANDOM;
+      else {
+        exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_HASH;
+        exch_info.use_scatter_channel_for_pkey_hash_ = use_scatter_channel_for_pkey_hash;
+      }
       LOG_TRACE("partition level is two, use pkey reshuffle method");
     } else if (share::schema::PARTITION_LEVEL_ZERO == part_level) {
       exch_info.repartition_type_ = OB_REPARTITION_NO_REPARTITION;
@@ -720,40 +765,50 @@ int ObDelUpdLogPlan::compute_exchange_info_for_pdml_insert(const ObShardingInfo 
       exch_info.repartition_table_name_ = index_dml_info.index_name_;
       exch_info.slice_count_ = target_sharding.get_part_cnt();
     }
+    share::schema::ObPartitionFuncType part_func_type = target_sharding.get_part_func_type();
+    bool use_scatter_channel_for_pkey_hash = !(share::schema::PARTITION_FUNC_TYPE_HASH == part_func_type
+                            || share::schema::PARTITION_FUNC_TYPE_KEY == part_func_type
+                            || share::schema::PARTITION_FUNC_TYPE_KEY_IMPLICIT == part_func_type);
+
     if (share::schema::PARTITION_LEVEL_ONE == part_level) {
-      // pdml op对应的表是分区表，分区内并行处理，使用pkey random shuffle方式
       exch_info.repartition_type_ = OB_REPARTITION_ONE_SIDE_ONE_LEVEL;
       if ((!get_stmt()->is_merge_stmt() || 
            !static_cast<const ObMergeStmt*>(get_stmt())->has_update_clause()) &&
            ((get_optimizer_context().is_online_ddl() && get_optimizer_context().is_heap_table_ddl())
            || (get_optimizer_context().is_pdml_heap_table() && !is_index_maintenance))) {
         exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_RANDOM;
+      } else if (get_optimizer_context().is_online_ddl() && session->get_ddl_info().is_partition_local_ddl()) {
+        exch_info.dist_method_ = ObPQDistributeMethod::NONE;
       } else if (get_optimizer_context().is_online_ddl()) {
         exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_RANGE;
       } else {
         exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_HASH;
+        exch_info.use_scatter_channel_for_pkey_hash_ = use_scatter_channel_for_pkey_hash;
       }
     } else if (share::schema::PARTITION_LEVEL_TWO == part_level) {
-      // pdml op对应的表是分区表，分区内并行处理，使用pkey random shuffle方式
       exch_info.repartition_type_ = OB_REPARTITION_ONE_SIDE_TWO_LEVEL;
       if ((!get_stmt()->is_merge_stmt() || 
            !static_cast<const ObMergeStmt*>(get_stmt())->has_update_clause()) &&
            ((get_optimizer_context().is_online_ddl() && get_optimizer_context().is_heap_table_ddl())
            || (get_optimizer_context().is_pdml_heap_table() && !is_index_maintenance))) {
         exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_RANDOM;
+      } else if (get_optimizer_context().is_online_ddl() && session->get_ddl_info().is_partition_local_ddl()) {
+        exch_info.dist_method_ = ObPQDistributeMethod::NONE;
       } else if (get_optimizer_context().is_online_ddl()) {
         exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_RANGE;
       } else {
         exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_HASH;
+        exch_info.use_scatter_channel_for_pkey_hash_ = use_scatter_channel_for_pkey_hash;
       }
     } else if (share::schema::PARTITION_LEVEL_ZERO == part_level) {
-      // pdml op对应的表是非分区表，分区内并行处理，使用random shuffle方式
       exch_info.repartition_type_ = OB_REPARTITION_NO_REPARTITION;
       if ((!get_stmt()->is_merge_stmt() || 
            !static_cast<const ObMergeStmt*>(get_stmt())->has_update_clause()) &&
           ((get_optimizer_context().is_online_ddl() && get_optimizer_context().is_heap_table_ddl())
            || (get_optimizer_context().is_pdml_heap_table() && !is_index_maintenance))) {
         exch_info.dist_method_ = ObPQDistributeMethod::RANDOM;
+      } else if (get_optimizer_context().is_online_ddl() && session->get_ddl_info().is_partition_local_ddl()) {
+        exch_info.dist_method_ = ObPQDistributeMethod::NONE;
       } else if (get_optimizer_context().is_online_ddl()) {
         exch_info.dist_method_ = ObPQDistributeMethod::RANGE;
       } else {
@@ -940,27 +995,105 @@ int ObDelUpdLogPlan::compute_hash_dist_exprs_for_pdml_insert(ObExchangeInfo &exc
   int ret = OB_SUCCESS;
   const ObDMLStmt *stmt;
   ObSEArray<ObRawExpr *, 8> rowkey_exprs;
-  if (OB_ISNULL(stmt = get_stmt()) ||
+  bool use_logic_pk = false;
+  ObArray<uint64_t> logic_pk_ids;
+  ObSQLSessionInfo *session = NULL;
+  share::schema::ObSchemaGetterGuard *schema_guard = NULL;
+  const share::schema::ObTableSchema *table_schema = NULL;
+  if (OB_ISNULL(stmt = get_stmt()) || OB_ISNULL(session = get_optimizer_context().get_session_info()) ||
+      OB_ISNULL(schema_guard = get_optimizer_context().get_schema_guard()) ||
       OB_UNLIKELY(dml_info.get_real_uk_cnt() > dml_info.column_convert_exprs_.count())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected error", K(dml_info.get_real_uk_cnt()),
              K(dml_info.column_convert_exprs_.count()), K(ret));
-  } else if (stmt->is_merge_stmt()) {
-    if (OB_FAIL(build_merge_stmt_hash_dist_exprs(dml_info,
-                                                 rowkey_exprs))) {
-      LOG_WARN("failed to build merge stmt hash dist exprs", K(ret));
-    }
   } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < dml_info.get_real_uk_cnt(); i++) {
-      ObRawExpr *raw_expr = NULL;
-      if (OB_ISNULL(raw_expr = dml_info.column_convert_exprs_.at(i))) {
+    // 当目标表为带逻辑主键的堆表时，优先使用逻辑主键列进行哈希分发，
+    // 避免使用物理 rowkey（隐藏列）导致同一逻辑主键无法落在同一 worker。
+    if (!stmt->is_merge_stmt()) {
+      if (OB_FAIL(schema_guard->get_table_schema(session->get_effective_tenant_id(),
+                                                 dml_info.ref_table_id_,
+                                                 table_schema))) {
+        LOG_WARN("failed to get table schema", K(ret), K(dml_info.ref_table_id_));
+      } else if (OB_ISNULL(table_schema)) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("get unexpected null", K(ret));
-      } else if (OB_FAIL(rowkey_exprs.push_back(raw_expr))) {
-        LOG_WARN("failed to push back expr", K(ret));
-      } else { /*do nothing*/ }
+        LOG_WARN("get unexpected null table schema", K(ret), K(dml_info.ref_table_id_));
+      } else {
+        bool has_logic_pk = false;
+        if (OB_FAIL(table_schema->is_table_with_logic_pk(*schema_guard, has_logic_pk))) {
+          LOG_WARN("failed to check logic pk", K(ret), K(dml_info.ref_table_id_));
+        } else if (has_logic_pk && table_schema->is_heap_organized_table()) {
+          if (OB_FAIL(table_schema->get_logic_pk_column_ids(schema_guard, logic_pk_ids))) {
+            LOG_WARN("failed to get logic pk column ids", K(ret), K(dml_info.ref_table_id_));
+          } else if (OB_UNLIKELY(logic_pk_ids.empty())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("logic pk column ids is empty", K(ret), K(dml_info.ref_table_id_));
+          } else {
+            use_logic_pk = true;
+          }
+        }
+      }
     }
-    
+
+    if (OB_FAIL(ret)) {
+    } else if (use_logic_pk) {
+      // 根据逻辑主键列 ID 在 column_convert_exprs_ 中定位对应的转换表达式
+      for (int64_t i = 0; OB_SUCC(ret) && i < logic_pk_ids.count(); ++i) {
+        const uint64_t pk_id = logic_pk_ids.at(i);
+        bool found = false;
+        for (int64_t j = 0; OB_SUCC(ret) && j < dml_info.column_exprs_.count(); ++j) {
+          ObColumnRefRawExpr *col_expr = dml_info.column_exprs_.at(j);
+          if (OB_ISNULL(col_expr)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("get unexpected null column expr", K(ret), K(j));
+          } else if (col_expr->get_column_id() == pk_id) {
+            if (OB_UNLIKELY(j >= dml_info.column_convert_exprs_.count())) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("convert expr not found for logic pk", K(ret), K(j), K(pk_id),
+                       K(dml_info.column_convert_exprs_.count()));
+            } else if (OB_FAIL(rowkey_exprs.push_back(dml_info.column_convert_exprs_.at(j)))) {
+              LOG_WARN("failed to push back logic pk expr", K(ret), K(pk_id));
+            } else {
+              found = true;
+            }
+            break;
+          }
+        }
+        if (OB_SUCC(ret) && !found) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("logic pk column not found in dml info", K(ret), K(pk_id));
+        }
+      }
+      // For heap tables with logical primary key, also need to set hidden_pk_expr_
+      // to ensure exchange passes it to the upper INSERT operator.
+      // This is needed for both partitioned and non-partitioned tables in PDML scenario.
+      // We use hidden_pk_expr_ instead of hash_dist_exprs_ to avoid affecting hash calculation.
+      if (OB_SUCC(ret)) {
+        for (int64_t i = 0; i < dml_info.column_convert_exprs_.count(); ++i) {
+          ObRawExpr *expr = dml_info.column_convert_exprs_.at(i);
+          if (OB_NOT_NULL(expr) &&
+              (expr->get_expr_type() == T_TABLET_AUTOINC_NEXTVAL ||
+               expr->get_expr_type() == T_PSEUDO_HIDDEN_CLUSTERING_KEY)) {
+            exch_info.hidden_pk_expr_ = expr;
+            break;
+          }
+        }
+      }
+    } else if (stmt->is_merge_stmt()) {
+      if (OB_FAIL(build_merge_stmt_hash_dist_exprs(dml_info,
+                                                   rowkey_exprs))) {
+        LOG_WARN("failed to build merge stmt hash dist exprs", K(ret));
+      }
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < dml_info.get_real_uk_cnt(); i++) {
+        ObRawExpr *raw_expr = NULL;
+        if (OB_ISNULL(raw_expr = dml_info.column_convert_exprs_.at(i))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected null", K(ret));
+        } else if (OB_FAIL(rowkey_exprs.push_back(raw_expr))) {
+          LOG_WARN("failed to push back expr", K(ret));
+        } else { /*do nothing*/ }
+      }
+    }
   }
   if (OB_SUCC(ret) &&
       OB_FAIL(exch_info.append_hash_dist_expr(rowkey_exprs))) {
@@ -980,7 +1113,8 @@ int ObDelUpdLogPlan::replace_assignment_expr_from_dml_info(const IndexDMLInfo &d
       LOG_WARN("get unexpected null", K(ret));
     } else if (expr == assignment.column_expr_
                && OB_NOT_NULL(assignment.expr_)
-               && assignment.expr_->get_expr_type() != T_TABLET_AUTOINC_NEXTVAL) {
+               && assignment.expr_->get_expr_type() != T_TABLET_AUTOINC_NEXTVAL
+               && assignment.expr_->get_expr_type() != T_PSEUDO_HIDDEN_CLUSTERING_KEY) {
       expr = assignment.expr_;
       break;
     } else { /*do nothing*/ }
@@ -1078,7 +1212,7 @@ int ObDelUpdLogPlan::candi_allocate_one_pdml_delete(bool is_index_maintain,
                      is_index_maintain ? dummy_filters : get_stmt()->get_condition_exprs(),
                      index_dml_info->loc_table_id_,
                      index_dml_info->ref_table_id_,
-                     NULL,
+                     &index_dml_info->part_ids_,
                      source_sharding,
                      source_table_partition))) {
     LOG_WARN("failed to calculate table location and sharding", K(ret));
@@ -1376,6 +1510,8 @@ int ObDelUpdLogPlan::create_online_ddl_plan(ObLogicalOperator *&top,
 {
   int ret = OB_SUCCESS;
   ObExchangeInfo final_exch_info;
+  ObSQLSessionInfo *session = optimizer_context_.get_session_info();
+  need_partition_id = session->get_ddl_info().is_partition_local_ddl() ? false : need_partition_id;
   if (OB_ISNULL(top) || OB_ISNULL(table_partition_info)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(top), K(table_partition_info), K(ret));
@@ -1394,13 +1530,20 @@ int ObDelUpdLogPlan::create_online_ddl_plan(ObLogicalOperator *&top,
       LOG_WARN("failed to allocate exchange as top", K(ret));
     }
   } else {
+    ObLogStatCollector *stat_collector = nullptr;
+    ObLogInsert *insert_op = nullptr;
     if (OB_FAIL(allocate_stat_collector_as_top(top,
         ObStatCollectorType::SAMPLE_SORT, sample_sort_keys,
         table_partition_info->get_part_level()))) {
       LOG_WARN("fail to allocate stat collector as top", K(ret));
-    } else if (OB_FAIL(allocate_exchange_as_top(top, exch_info))) {
+    } else if (OB_ISNULL(stat_collector = static_cast<ObLogStatCollector *>(top))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null stat collector", K(ret));
+    } else if (OB_FAIL(prepare_inverted_sort_keys(*stat_collector))) {
+      LOG_WARN("failed to prepare inverted sort keys", K(ret));
+    } else if (exch_info.need_exchange() && OB_FAIL(allocate_exchange_as_top(top, exch_info))) {
       LOG_WARN("failed to allocate exchange as top", K(ret));
-    } else if (OB_FAIL(allocate_sort_as_top(top, sort_keys))) {
+    } else if (exch_info.need_exchange() && OB_FAIL(allocate_sort_as_top(top, sort_keys))) {
       LOG_WARN("failed to allocate sort as top", K(ret));
     } else if (OB_FAIL(allocate_pdml_insert_as_top(top,
                                                    is_index_maintenance,
@@ -1419,6 +1562,103 @@ int ObDelUpdLogPlan::create_online_ddl_plan(ObLogicalOperator *&top,
                 px_coord_sort_keys))) {
       LOG_WARN("failed to assign sort keys", K(ret));
     } else { /*do nothing*/ }
+  }
+  return ret;
+}
+
+int ObDelUpdLogPlan::prepare_inverted_sort_keys(ObLogStatCollector &stat_collector)
+{
+  int ret = OB_SUCCESS;
+  const ObInsertStmt *insert_stmt = static_cast<const ObInsertStmt *>(get_stmt());
+  ObSchemaGetterGuard *schema_guard = optimizer_context_.get_schema_guard();
+  ObSQLSessionInfo *session = optimizer_context_.get_session_info();
+  if (OB_ISNULL(insert_stmt) || OB_ISNULL(schema_guard) || OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null ptr", K(ret), KP(insert_stmt), KP(schema_guard), KP(session));
+  } else {
+    const TableItem *insert_table = insert_stmt->get_table_item(0);
+    uint64_t tenant_id = session->get_effective_tenant_id();
+    const ObTableSchema *table_schema = nullptr;
+    if (OB_ISNULL(insert_table)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("insert table item is null", K(ret));
+    } else if (OB_FAIL(schema_guard->get_table_schema(tenant_id, insert_table->ddl_table_id_, table_schema))) {
+      LOG_WARN("failed to get table schema", K(ret));
+    } else if (OB_ISNULL(table_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null table schema", K(ret));
+    } else if (session->get_ddl_info().is_partition_local_ddl() && table_schema->is_fts_doc_word_aux()) { // fts doc word table data complement for fts index, build inverted sort keys
+      const ObString &fwd_table_name = table_schema->get_table_name_str();
+      const ObString suffix = ObString::make_string("_fts_doc_word");
+      ObString inverted_table_name;
+      const ObTableSchema *inverted_schema = nullptr;
+      if (OB_UNLIKELY(fwd_table_name.length() - suffix.length() <= 0)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected error, fwd table name length is less than suffix length", K(ret), K(fwd_table_name), K(suffix));
+      } else if (FALSE_IT(inverted_table_name.assign_ptr(fwd_table_name.ptr(), fwd_table_name.length() - suffix.length()))) {
+      } else if (OB_FAIL(schema_guard->get_table_schema(tenant_id,
+                                                 table_schema->get_database_id(),
+                                                 inverted_table_name,
+                                                 true /*is_index*/,
+                                                 inverted_schema,
+                                                 table_schema->is_offline_ddl_table() /*with_hidden_flag*/))) {
+        LOG_WARN("failed to get inverted index schema by name", K(ret), K(tenant_id), K(inverted_table_name), K(table_schema->get_database_id()));
+      } else if (OB_ISNULL(inverted_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null inverted schema", K(ret));
+      } else {
+        ObSEArray<OrderItem, 8> inverted_sort_keys;
+        if (OB_SUCC(ret)) {
+          if (OB_FAIL(build_rowkey_sort_keys_from_schema(*inverted_schema, *insert_stmt, inverted_sort_keys))) {
+            LOG_WARN("failed to build inverted rowkey sort keys", K(ret));
+          } else if (OB_FAIL(stat_collector.set_inverted_sort_keys(inverted_sort_keys))) {
+            LOG_WARN("failed to set inverted sort keys", K(ret));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDelUpdLogPlan::build_rowkey_sort_keys_from_schema(const ObTableSchema &index_schema,
+                                                        const ObInsertStmt &insert_stmt,
+                                                        ObIArray<OrderItem> &sort_keys)
+{
+  int ret = OB_SUCCESS;
+  sort_keys.reset();
+  const ObInsertTableInfo &table_info = insert_stmt.get_insert_table_info();
+  const ObIArray<ObColumnRefRawExpr*> &values_desc = table_info.values_desc_;
+  const ObIArray<ObRawExpr*> &column_conv_exprs = table_info.column_conv_exprs_;
+  const ObIArray<ObColumnRefRawExpr*> &column_exprs = table_info.column_exprs_;
+  const ObRowkeyInfo &rowkey_info = index_schema.get_rowkey_info();
+  for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_info.get_size(); ++i) {
+    const ObRowkeyColumn *rowkey_col = rowkey_info.get_column(i);
+    if (OB_ISNULL(rowkey_col)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to get rowkey column", K(ret), K(i));
+    } else {
+      const uint64_t column_id = rowkey_col->column_id_;
+      bool found = false;
+      for (int64_t j = 0; OB_SUCC(ret) && !found && j < column_exprs.count(); ++j) {
+        const ObColumnRefRawExpr *col_expr = column_exprs.at(j);
+        if (OB_ISNULL(col_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("column expr is null", K(ret), K(j));
+        } else if (column_id == col_expr->get_column_id()) {
+          OrderItem item;
+          item.expr_ = column_conv_exprs.at(j);
+          found = true;
+          if (OB_FAIL(sort_keys.push_back(item))) {
+            LOG_WARN("failed to push rowkey sort key", K(ret), K(item));
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !found) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("rowkey column not found in insert column list", K(ret), K(column_id));
+      }
+    }
   }
   return ret;
 }
@@ -1549,17 +1789,10 @@ int ObDelUpdLogPlan::allocate_pdml_insert_as_top(ObLogicalOperator *&top,
       if (insert_stmt->is_insert_up() && OB_FAIL(insert_op->get_insert_up_index_dml_infos().assign(
             static_cast<ObInsertLogPlan *>(this)->get_insert_up_index_upd_infos()))) {
         LOG_WARN("assign insert up index upd infos failed", K(ret));
-      } else if (OB_FAIL(insert_stmt->get_view_check_exprs(insert_op->get_view_check_exprs()))) {
-        LOG_WARN("failed to get view check exprs", K(ret));
       }
     } else if (get_stmt()->is_update_stmt()) {
       const ObUpdateStmt *update_stmt = static_cast<const ObUpdateStmt*>(get_stmt());
       insert_op->set_table_location_uncertain(true);
-      if (!is_index_maintenance) {
-        if (OB_FAIL(update_stmt->get_view_check_exprs(insert_op->get_view_check_exprs()))) {
-          LOG_WARN("failed to get view check exprs", K(ret));
-        }
-      }
     } else {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("get unexpected null", K(ret));
@@ -1597,7 +1830,7 @@ int ObDelUpdLogPlan::candi_allocate_one_pdml_update(bool is_index_maintenance,
                      is_index_maintenance ? dummy_filters : get_stmt()->get_condition_exprs(),
                      index_dml_info->loc_table_id_,
                      index_dml_info->ref_table_id_,
-                     NULL,
+                     &index_dml_info->part_ids_,
                      source_sharding,
                      source_table_partition))) {
     LOG_WARN("failed to calculate table location and sharding", K(ret));
@@ -1697,11 +1930,6 @@ int ObDelUpdLogPlan::allocate_pdml_update_as_top(ObLogicalOperator *&top,
     update_op->set_ignore(update_stmt->is_ignore());
     update_op->set_table_partition_info(table_partition_info);
     update_op->set_need_allocate_partition_id_expr(need_partition_id);
-    if (!is_index_maintenance) {
-      if (OB_FAIL(update_stmt->get_view_check_exprs(update_op->get_view_check_exprs()))) {
-        LOG_WARN("failed to get view check exprs", K(ret));
-      }
-    }
     if (FAILEDx(update_op->compute_property())) {
       LOG_WARN("failed to compute property", K(ret));
     } else {
@@ -1711,43 +1939,13 @@ int ObDelUpdLogPlan::allocate_pdml_update_as_top(ObLogicalOperator *&top,
   return ret;
 }
 
-int ObDelUpdLogPlan::check_need_exchange_for_pdml_del_upd(ObLogicalOperator *top,
-                                                          const ObExchangeInfo &exch_info,
-                                                          uint64_t table_id,
-                                                          bool &need_exchange)
-{
-  int ret = OB_SUCCESS;
-  bool is_equal = false;
-  ObShardingInfo *top_sharding = NULL;
-  ObShardingInfo *source_sharding = NULL;
-  ObTablePartitionInfo *source_table_part = NULL;
-  need_exchange = false;
-  if (OB_ISNULL(top) || OB_ISNULL(top_sharding = top->get_sharding())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get unexpected null", K(get_stmt()), K(top->get_sharding()), K(ret));
-  } else if (OB_FAIL(get_source_table_info(*top, table_id, source_sharding, source_table_part))) {
-    LOG_WARN("failed to get source sharding info", K(ret));
-  } else if (NULL == source_sharding) {
-    need_exchange = true;
-  } else if (OB_FAIL(ObShardingInfo::is_sharding_equal(top_sharding,
-                                                       source_sharding,
-                                                       top->get_output_equal_sets(),
-                                                       is_equal))) {
-    LOG_WARN("failed to check if sharding is equal", K(ret));
-  } else if (!is_equal) {
-    need_exchange = true;
-  } else {
-    need_exchange = false;
-  }
-  return ret;
-}
-
 int ObDelUpdLogPlan::split_update_index_dml_info(const IndexDMLInfo &upd_dml_info,
                                                  IndexDMLInfo *&del_dml_info,
                                                  IndexDMLInfo *&ins_dml_info)
 {
   int ret = OB_SUCCESS;
-  IndexDMLInfo tmp_dml_info;
+  ObArenaAllocator allocator(ObModIds::OB_SQL_COMPILE);
+  IndexDMLInfo tmp_dml_info(allocator);
   if (OB_FAIL(tmp_dml_info.assign_basic(upd_dml_info))) {
     LOG_WARN("assign tmp dml info failed", K(ret));
   } else if (OB_FAIL(tmp_dml_info.init_column_convert_expr(upd_dml_info.assignments_))) {
@@ -1772,11 +1970,11 @@ int ObDelUpdLogPlan::create_index_dml_info(const IndexDMLInfo &orgi_dml_info,
 {
   int ret = OB_SUCCESS;
   void *ptr= NULL;
-  if (OB_ISNULL(ptr = get_optimizer_context().get_allocator().alloc(sizeof(IndexDMLInfo)))) {
+  if (OB_ISNULL(ptr = get_allocator().alloc(sizeof(IndexDMLInfo)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate memory", K(ret));
   } else {
-    opt_dml_info = new (ptr) IndexDMLInfo();
+    opt_dml_info = new (ptr) IndexDMLInfo(get_allocator());
     if (OB_FAIL(opt_dml_info->assign_basic(orgi_dml_info))) {
       LOG_WARN("failed to assign dml info", K(ret));
     } else if (OB_FAIL(prune_virtual_column(*opt_dml_info))) {
@@ -1931,14 +2129,30 @@ int ObDelUpdLogPlan::collect_related_local_index_ids(IndexDMLInfo &primary_dml_i
     if (OB_FAIL(schema_guard->get_table_schema(tenant_id, index_tid_array[i], index_schema))) {
       LOG_WARN("get index schema failed", K(ret), K(index_tid_array[i]), K(i));
     } else if (index_schema->is_index_local_storage() || index_schema->is_mlog_table()) {
+      uint64_t tid = index_schema->get_table_id();
       //only need to attach local index and primary index in the same DAS Task
       if (primary_dml_info.assignments_.empty()) {
         //is insert or delete, need to add to the related index ids
-        if (OB_FAIL(primary_dml_info.related_index_ids_.push_back(index_schema->get_table_id()))) {
+        if (index_schema->is_search_def_index() && OB_FAIL(index_schema->get_search_data_index_tid(tid))) {
+          LOG_WARN("failed to get search data index tid", K(ret));
+        } else if (OB_FAIL(primary_dml_info.related_index_ids_.push_back(tid))) {
           LOG_WARN("add related index ids failed", K(ret));
         }
       } else if (primary_dml_info.is_update_part_key_ && (index_schema->is_fts_index() || index_schema->is_vec_index())) {
         // If part key is updated and it is fts index, need to be added into the related index ids.
+        if (OB_FAIL(primary_dml_info.related_index_ids_.push_back(tid))) {
+          LOG_WARN("add related index ids failed", K(ret));
+        }
+      } else if (primary_dml_info.is_vec_hnsw_index_vid_opt_) {
+        // need to add all the related index ids (use search_data tid for search index, not search_def)
+        if (index_schema->is_search_def_index() && OB_FAIL(index_schema->get_search_data_index_tid(tid))) {
+          LOG_WARN("failed to get search data index tid", K(ret));
+        } else if (OB_FAIL(primary_dml_info.related_index_ids_.push_back(tid))) {
+          LOG_WARN("add related index ids failed", K(ret));
+        }
+      } else if (index_schema->is_compaction_rowscn_ttl_di_table()) {
+        // if index schema is TTL table & delete insert merge engine, need to add all the related index ids
+        // because there is an rowscn-column-update
         if (OB_FAIL(primary_dml_info.related_index_ids_.push_back(index_schema->get_table_id()))) {
           LOG_WARN("add related index ids failed", K(ret));
         }
@@ -1955,7 +2169,9 @@ int ObDelUpdLogPlan::collect_related_local_index_ids(IndexDMLInfo &primary_dml_i
         }
         if (OB_SUCC(ret) && found_col) {
           //update clause will modify this local index, need to add it to related_index_ids_
-          if (OB_FAIL(primary_dml_info.related_index_ids_.push_back(index_schema->get_table_id()))) {
+          if (index_schema->is_search_def_index() && OB_FAIL(index_schema->get_search_data_index_tid(tid))) {
+            LOG_WARN("failed to get search data index tid", K(ret));
+          } else if (OB_FAIL(primary_dml_info.related_index_ids_.push_back(tid))) {
             LOG_WARN("store index id to related index ids failed", K(ret));
           }
         }
@@ -2002,23 +2218,24 @@ int ObDelUpdLogPlan::prepare_table_dml_info_basic(const ObDmlTableInfo& table_in
   int ret = OB_SUCCESS;
   void *ptr= NULL;
   IndexDMLInfo* index_dml_info = NULL;
+  ObSqlSchemaGuard* sql_schema_guard = optimizer_context_.get_sql_schema_guard();
   ObSchemaGetterGuard* schema_guard = optimizer_context_.get_schema_guard();
   ObSQLSessionInfo* session_info = optimizer_context_.get_session_info();
   const ObTableSchema* index_schema = NULL;
-  if (OB_ISNULL(schema_guard) || OB_ISNULL(session_info)) {
+  if (OB_ISNULL(sql_schema_guard) || OB_ISNULL(session_info)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get unexpected null",K(ret), K(schema_guard), K(session_info));
-  } else if (OB_ISNULL(ptr = get_optimizer_context().get_allocator().alloc(sizeof(IndexDMLInfo)))) {
+    LOG_WARN("get unexpected null",K(ret), K(sql_schema_guard), K(session_info));
+  } else if (OB_ISNULL(ptr = get_allocator().alloc(sizeof(IndexDMLInfo)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate memory", K(ret));
   } else {
-    table_dml_info = new (ptr) IndexDMLInfo();
+    table_dml_info = new (ptr) IndexDMLInfo(get_allocator());
     if (OB_FAIL(table_dml_info->assign(table_info))) {
       LOG_WARN("failed to assign table info", K(ret));
     } else if (has_tg) {
       table_dml_info->is_primary_index_ = true;
-    } else if (OB_FAIL(schema_guard->get_table_schema(session_info->get_effective_tenant_id(),
-                                                      table_info.ref_table_id_, index_schema))) {
+    } else if (OB_FAIL(sql_schema_guard->get_table_schema(session_info->get_effective_tenant_id(),
+                                                          table_info.ref_table_id_, index_schema))) {
       LOG_WARN("failed to get table schema", K(ret));
     } else if (OB_ISNULL(index_schema)) {
       ret = OB_ERR_UNEXPECTED;
@@ -2026,6 +2243,7 @@ int ObDelUpdLogPlan::prepare_table_dml_info_basic(const ObDmlTableInfo& table_in
     } else {
       table_dml_info->rowkey_cnt_ = index_schema->get_rowkey_column_num();
       table_dml_info->is_primary_index_ = true;
+      table_dml_info->is_compaction_scn_ttl_di_table_ = index_schema->is_compaction_rowscn_ttl_di_table();
       ObExecContext *exec_ctx = get_optimizer_context().get_exec_ctx();
       if (OB_ISNULL(exec_ctx)) {
         ret = OB_ERR_UNEXPECTED;
@@ -2074,11 +2292,14 @@ int ObDelUpdLogPlan::prepare_table_dml_info_basic(const ObDmlTableInfo& table_in
       } else if (OB_ISNULL(index_schema)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("failed to get table schema", K(index_tid[i]), K(ret));
-      } else if (OB_ISNULL(ptr = get_optimizer_context().get_allocator().alloc(sizeof(IndexDMLInfo)))) {
+      } else if ((index_schema->is_fts_index() || index_schema->is_multivalue_index())&& OB_FAIL(check_dml_table_write_dependency(
+          table_info.ref_table_id_, *index_schema))) {
+        LOG_WARN("failed to check dml table write dependency", K(ret));
+      } else if (OB_ISNULL(ptr = get_allocator().alloc(sizeof(IndexDMLInfo)))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_WARN("failed to allocate memory", K(ret));
       } else {
-        index_dml_info = new (ptr) IndexDMLInfo();
+        index_dml_info = new (ptr) IndexDMLInfo(get_allocator());
         if (OB_FAIL(index_schema->get_index_name(index_dml_info->index_name_))) {
           LOG_WARN("failed to get index name", K(ret));
         } else {
@@ -2089,6 +2310,7 @@ int ObDelUpdLogPlan::prepare_table_dml_info_basic(const ObDmlTableInfo& table_in
           index_dml_info->spk_cnt_ = index_schema->get_shadow_rowkey_column_num();
           // Trans_info_expr_ on the main table is recorded in all index_dml_info
           index_dml_info->trans_info_expr_ = table_dml_info->trans_info_expr_;
+          index_dml_info->is_compaction_scn_ttl_di_table_ = index_schema->is_compaction_rowscn_ttl_di_table();
           ObSchemaObjVersion table_version;
           table_version.object_id_ = index_tid[i];
           table_version.object_type_ = DEPENDENCY_TABLE;
@@ -2304,7 +2526,7 @@ int ObDelUpdLogPlan::generate_index_rowkey_exprs(uint64_t table_id,
   return ret;
 }
 
-int ObDelUpdLogPlan::check_index_update(ObAssignments assigns,
+int ObDelUpdLogPlan::check_index_update(const ObAssignments &assigns,
                                         const ObTableSchema& index_schema,
                                         const bool is_update_view,
                                         bool& need_update)
@@ -2438,7 +2660,8 @@ int ObDelUpdLogPlan::check_update_part_key(const ObTableSchema* index_schema,
   return ret;
 }
 
-int ObDelUpdLogPlan::check_update_primary_key(const ObTableSchema* index_schema,
+int ObDelUpdLogPlan::check_update_primary_key(ObSchemaGetterGuard &schema_guard,
+                                              const ObTableSchema* index_schema,
                                               IndexDMLInfo*& index_dml_info) const
 {
   int ret = OB_SUCCESS;
@@ -2463,6 +2686,54 @@ int ObDelUpdLogPlan::check_update_primary_key(const ObTableSchema* index_schema,
       } else if (has_exist_in_array(pk_ids, column_item->base_cid_)) {
         index_dml_info->is_update_primary_key_ = true;
         break;
+      }
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(check_vec_hnsw_index_vid_opt(schema_guard, stmt, index_schema, index_dml_info))) {
+    LOG_WARN("failed to check vec hnsw index vid opt", K(ret));
+  }
+
+  return ret;
+}
+
+
+int ObDelUpdLogPlan::check_vec_hnsw_index_vid_opt(
+    ObSchemaGetterGuard &schema_guard,
+    const ObDelUpdStmt *stmt,
+    const ObTableSchema* index_schema,
+    IndexDMLInfo*& index_dml_info) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(index_schema) || OB_ISNULL(index_dml_info) || OB_ISNULL(stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret), K(index_schema), K(index_dml_info));
+  } else if (index_schema->is_table_with_hidden_pk_column()) {
+    ObDocIDType vid_type = ObDocIDType::INVALID;
+    if (OB_FAIL(ObVectorIndexUtil::determine_vid_type(*index_schema, vid_type))) {
+      LOG_WARN("failed to determine vid type", K(ret), K(vid_type));
+    } else if (vid_type == ObDocIDType::HIDDEN_INC_PK) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < index_dml_info->assignments_.count()
+                          && !index_dml_info->is_vec_hnsw_index_vid_opt_; ++i) {
+        ObColumnRefRawExpr *col_expr = index_dml_info->assignments_.at(i).column_expr_;
+        ColumnItem *column_item = nullptr;
+        ObIndexType index_type = INDEX_TYPE_MAX;
+        bool is_col_has_vec_idx = false;
+        if (OB_ISNULL(col_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get null column expr", K(ret));
+        } else if (OB_ISNULL(column_item = stmt->get_column_item_by_id(col_expr->get_table_id(),
+                                                                       col_expr->get_column_id()))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get null column item", K(ret), KPC(col_expr));
+        } else if (OB_FAIL(ObVectorIndexUtil::check_column_has_vector_index(*index_schema, schema_guard, column_item->base_cid_,
+                                                                            is_col_has_vec_idx, index_type))) {
+          LOG_WARN("failed to check column has vector index", K(ret));
+        } else if (is_col_has_vec_idx && (index_type == ObIndexType::INDEX_TYPE_VEC_DELTA_BUFFER_LOCAL || index_type == INDEX_TYPE_HYBRID_INDEX_LOG_LOCAL)) {
+          index_dml_info->is_update_primary_key_ = true;
+          index_dml_info->is_vec_hnsw_index_vid_opt_ = true;
+        }
       }
     }
   }
@@ -2504,7 +2775,7 @@ int ObDelUpdLogPlan::replace_alias_ref_expr(ObRawExpr *&expr, bool &replace_happ
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid alias expr", K(ret), K(*alias));
     } else {
-      expr = alias->get_ref_expr();
+      expr = alias->get_ref_select_expr();
       replace_happened = true;
     }
   } else {
@@ -2522,10 +2793,12 @@ int ObDelUpdLogPlan::candi_allocate_subplan_filter_for_assignments(ObIArray<ObRa
   int ret = OB_SUCCESS;
   ObSEArray<ObRawExpr*, 4> normal_query_refs;
   ObSEArray<ObRawExpr*, 4> alias_query_refs;
+  ObSEArray<ObAliasRefRawExpr*, 4> project_ref_exprs;
   for (int64_t i = 0; OB_SUCC(ret) && i < assign_exprs.count(); ++i) {
     if (OB_FAIL(extract_assignment_subqueries(assign_exprs.at(i),
                                               normal_query_refs,
-                                              alias_query_refs))) {
+                                              alias_query_refs,
+                                              project_ref_exprs))) {
       LOG_WARN("failed to replace alias ref expr", K(ret));
     }
   }
@@ -2535,19 +2808,20 @@ int ObDelUpdLogPlan::candi_allocate_subplan_filter_for_assignments(ObIArray<ObRa
     // step. allocate subplan filter for "dml .. set c1 = (select)"
     LOG_WARN("failed to allocate subplan", K(ret));
   } else if (!alias_query_refs.empty() &&
-              OB_FAIL(candi_allocate_subplan_filter(alias_query_refs, NULL, true))) {
+              OB_FAIL(candi_allocate_subplan_filter(alias_query_refs, NULL, true, false, &project_ref_exprs))) {
     // step. allocate subplan filter for "dml .. set (a,b)=(select..), (c,d)=(select..)"
     LOG_WARN("failed to allocate subplan filter", K(ret));
   } else {
     LOG_TRACE("succeed to allocate subplan filter for assignment", K(ret),
-                          K(normal_query_refs.count()), K(alias_query_refs.count()));
+                          K(normal_query_refs.count()), K(alias_query_refs.count()), K(project_ref_exprs.count()));
   }
   return ret;
 }
 
 int ObDelUpdLogPlan::extract_assignment_subqueries(ObRawExpr *expr,
                                                    ObIArray<ObRawExpr*> &normal_query_refs,
-                                                   ObIArray<ObRawExpr*> &alias_query_refs)
+                                                   ObIArray<ObRawExpr*> &alias_query_refs,
+                                                   ObIArray<ObAliasRefRawExpr*> &project_ref_exprs)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(expr)) {
@@ -2569,15 +2843,128 @@ int ObDelUpdLogPlan::extract_assignment_subqueries(ObRawExpr *expr,
       LOG_WARN("invalid alias expr", K(ret), K(*alias));
     } else if (OB_FAIL(add_var_to_array_no_dup(alias_query_refs, alias->get_param_expr(0)))) {
       LOG_WARN("failed to add var to array with out duplicate", K(ret));
+    } else if (OB_FAIL(add_var_to_array_no_dup(project_ref_exprs, alias))) {
+      LOG_WARN("failed to add var to array with out duplicate", K(ret));
     }
   } else if (expr->has_flag(CNT_SUB_QUERY)) {
     for (int64_t i = 0; OB_SUCC(ret) && i < expr->get_param_count(); ++i) {
       if (OB_FAIL(SMART_CALL(extract_assignment_subqueries(expr->get_param_expr(i),
                                                            normal_query_refs,
-                                                           alias_query_refs)))) {
+                                                           alias_query_refs,
+                                                           project_ref_exprs)))) {
         LOG_WARN("failed to extract query ref expr", K(ret));
       }
     }
   }
+  return ret;
+}
+
+int ObDelUpdLogPlan::check_dml_table_write_dependency(
+    const uint64_t table_id,
+    const ObTableSchema &index_schema) const
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<uint64_t, 4> read_dependent_tables;
+  ObSchemaGetterGuard* schema_guard = optimizer_context_.get_schema_guard();
+  ObSQLSessionInfo* session_info = optimizer_context_.get_session_info();
+  uint64_t tenant_id = OB_INVALID_ID;
+  const ObTableSchema *table_schema = nullptr;
+  if (OB_ISNULL(schema_guard) || OB_ISNULL(session_info)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null" ,K(ret), KP(schema_guard), KP(session_info));
+  } else if (FALSE_IT(tenant_id = session_info->get_effective_tenant_id())) {
+  } else if (OB_FAIL(schema_guard->get_table_schema(tenant_id, table_id, table_schema))) {
+    LOG_WARN("failed to get table schema", K(ret));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null table schema", K(ret));
+  } else if (index_schema.is_fts_index() || index_schema.is_multivalue_index()) {
+    uint64_t rowkey_doc_id_tid = OB_INVALID_ID;
+    uint64_t doc_id_col_id = OB_INVALID_ID;
+    if (OB_FAIL(table_schema->get_docid_col_id(doc_id_col_id))) {
+      if (OB_UNLIKELY(OB_ERR_INDEX_KEY_NOT_FOUND != ret)) {
+        LOG_WARN("fail to get docid column", K(ret));
+      } else {
+        ret = OB_SUCCESS;
+      }
+    } else if (OB_FAIL(table_schema->get_rowkey_doc_tid(rowkey_doc_id_tid))) {
+      LOG_WARN("fail to get rowkey doc table id", K(ret), K(table_schema));
+    }
+    const bool need_check_rowkey_doc = (rowkey_doc_id_tid != OB_INVALID_ID)
+        && (index_schema.is_fts_index_aux()
+          || index_schema.is_multivalue_index_aux()
+          || index_schema.is_fts_doc_word_aux()
+          || index_schema.is_doc_id_rowkey());
+
+    if (OB_FAIL(ret)) {
+    } else if (need_check_rowkey_doc && OB_FAIL(read_dependent_tables.push_back(rowkey_doc_id_tid))) {
+      LOG_WARN("fail to append doc id rowkey tid to rependent array", K(ret));
+    } else if (index_schema.is_fts_index_aux()) {
+      // depend on valid forward index
+      const common::ObIArray<ObAuxTableMetaInfo> &index_infos = table_schema->get_simple_index_infos();
+      const ObString &inv_idx_name = index_schema.get_table_name_str();
+      bool found = false;
+      for (int64_t i = 0; OB_SUCC(ret) && i < index_infos.count() && !found; ++i) {
+        const ObAuxTableMetaInfo &index_info = index_infos.at(i);
+        const ObSimpleTableSchemaV2 *fwd_idx_schema = nullptr;
+        if (!share::schema::is_fts_doc_word_aux(index_info.index_type_)) {
+          // skip
+        } else if (OB_FAIL(schema_guard->get_simple_table_schema(tenant_id, index_info.table_id_, fwd_idx_schema))) {
+          LOG_WARN("failed to get fwd idx schema", K(ret), K(tenant_id), K(index_info));
+        } else if (OB_ISNULL(fwd_idx_schema)) {
+          // skip dropped fwd idx schema
+        } else if (!fwd_idx_schema->get_table_name_str().prefix_match(inv_idx_name)) {
+          // skip unmatched fwd idx
+        } else {
+          // found matched fwd idx
+          found = true;
+          if (OB_FAIL(read_dependent_tables.push_back(index_info.table_id_))) {
+            LOG_WARN("failed to append read dependent tables", K(ret), K(index_info));
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !found) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid invert index table for its forward index not exist", K(ret), K(index_schema));
+      }
+    }
+  }
+
+  for (int64_t i = 0; OB_SUCC(ret) && i < read_dependent_tables.count(); ++i) {
+    const ObTableSchema *depend_schema = nullptr;
+    const uint64_t depend_tid = read_dependent_tables.at(i);
+    if (OB_FAIL(schema_guard->get_table_schema(tenant_id, depend_tid, depend_schema))) {
+      LOG_WARN("failed to get depend table schema", K(ret), K(tenant_id), K(depend_tid));
+    } else if (OB_ISNULL(depend_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null depend schema for check", K(ret), K(tenant_id), K(depend_tid));
+    } else if (OB_UNLIKELY(!depend_schema->can_read_index() || !depend_schema->is_index_visible())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid index table for its dependent table is not readable", K(ret), K(index_schema), KPC(depend_schema));
+    }
+  }
+
+  return ret;
+}
+
+int ObDelUpdLogPlan::check_basic_sharding_for_dml_stmt(ObShardingInfo &target_sharding,
+                                                       ObLogicalOperator &child,
+                                                       bool &is_basic)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObShardingInfo*, 4> input_sharding;
+  ObAddr &local_addr = get_optimizer_context().get_local_server_addr();
+  is_basic = false;
+  if (OB_ISNULL(child.get_sharding())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else if (OB_FAIL(input_sharding.push_back(&target_sharding)) ||
+             OB_FAIL(input_sharding.push_back(child.get_sharding()))) {
+    LOG_WARN("failed to push back sharding info", K(ret));
+  } else if (OB_FAIL(ObOptimizerUtil::check_basic_sharding_info(local_addr,
+                                                                input_sharding,
+                                                                is_basic))) {
+    LOG_WARN("failed to check if it is basic sharding info", K(ret));
+  } else { /*do nothing*/ }
   return ret;
 }

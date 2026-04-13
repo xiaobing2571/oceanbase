@@ -35,6 +35,7 @@ public:
   int check_allow_retry(bool &allow_retry);
   void reuse();
   void reset();
+  void reset_result();
   int get_retry_count(int32_t &retry_count);
   int get_first_failed_task_id(share::ObTaskId &task_id);
   TO_STRING_KV(K_(result), K_(retry_count), K_(allow_retry), K_(failed_task_id_list));
@@ -63,6 +64,11 @@ public:
     BACKFILL_TX = 5,
     TRANSFER_BACKFILL_TX = 6,
     REBUILD_TABLET = 7,
+    SS_LS_MIGRATION = 8,
+    SS_TRANSFER_BACKFILL_TX = 9,
+    SS_MACRO_COPY = 10,
+    SS_MACRO_DELETE = 11,
+    SS_LS_RESTORE = 12,
     MAX
   };
 
@@ -78,6 +84,7 @@ public:
   int get_result(int32_t &result);
   void reuse();
   void reset();
+  void reset_result();
   int check_is_in_retry(bool &is_in_retry);
   int get_retry_count(int32_t &retry_count);
   int get_first_failed_task_id(share::ObTaskId &task_id);
@@ -107,6 +114,7 @@ public:
   { return consumer_group_id_; }
   ObIHADagNetCtx *get_ha_dag_net_ctx() const { return ha_dag_net_ctx_; }
   virtual bool is_ha_dag() const override { return true; }
+  bool is_failed() const { return result_mgr_.is_failed(); }
 
   INHERIT_TO_STRING_KV("ObIDag", ObIDag, KPC_(ha_dag_net_ctx), K_(result_mgr));
 protected:
@@ -114,21 +122,6 @@ protected:
   ObStorageHAResultMgr result_mgr_;
   lib::Worker::CompatMode compat_mode_;
   DISALLOW_COPY_AND_ASSIGN(ObStorageHADag);
-};
-
-class ObStorageHADagUtils
-{
-public:
-  static int deal_with_fo(
-      const int err,
-      share::ObIDag *dag,
-      const bool allow_retry = true);
-  static int get_ls(
-      const share::ObLSID &ls_id,
-      ObLSHandle &ls_handle);
-  static int check_self_is_valid_member(
-      const share::ObLSID &ls_id,
-      bool &is_valid_member);
 };
 
 class ObHATabletGroupCtx
@@ -141,7 +134,7 @@ public:
     MAX_TYPE
   };
 public:
-  ObHATabletGroupCtx(const TabletGroupCtxType type = TabletGroupCtxType::NORMAL_TYPE);
+  explicit ObHATabletGroupCtx(const TabletGroupCtxType type);
   virtual ~ObHATabletGroupCtx();
   int init(const common::ObIArray<ObLogicTabletID> &tablet_id_array);
   int get_next_tablet_id(ObLogicTabletID &logic_tablet_id);
@@ -160,6 +153,59 @@ protected:
   TabletGroupCtxType type_;
   DISALLOW_COPY_AND_ASSIGN(ObHATabletGroupCtx);
 };
+
+struct ObMigrationCtx;
+class ObStorageHADagUtils
+{
+public:
+  static int deal_with_fo(
+      const int err,
+      share::ObIDag *dag,
+      const bool allow_retry = true);
+  static int get_ls(
+      const share::ObLSID &ls_id,
+      ObLSHandle &ls_handle);
+  static int check_self_is_valid_member(
+      const share::ObLSID &ls_id,
+      bool &is_valid_member);
+  static int check_self_is_valid_member_after_inc_config_version(
+      const share::ObLSID &ls_id,
+      const bool with_leader,
+      bool &is_valid_member);
+  static int inc_member_list_config_version(
+      const share::ObLSID &ls_id,
+      const bool with_leader);
+  static int get_migration_src_info(
+      const ObMigrationOpArg &arg,
+      const uint64_t tenant_id,
+      const share::SCN &local_clog_checkpoint_scn,
+      storage::ObStorageRpc *storage_rpc,
+      ObStorageHASrcInfo &src_info);
+  static int deal_with_non_migrated_tablet(
+      const ObLSHandle &ls_handle,
+      const ObLogicTabletID &logic_tablet_id,
+      ObHATabletGroupCtx *tablet_group_ctx,
+      ObMigrationCtx *ctx,
+      ObTabletHandle &tablet_handle,
+      bool &need_migrate);
+
+#ifdef OB_BUILD_SHARED_STORAGE
+  static int check_self_is_valid_member_with_log_service(
+      const share::ObLSID &ls_id,
+      bool &is_valid_member);
+  static int inc_config_version_with_log_service(
+      const share::ObLSID &ls_id);
+#endif
+
+private:
+  static int inner_check_self_is_valid_member_(
+      const share::ObLSID &ls_id,
+      const common::ObMemberList &member_list,
+      const common::GlobalLearnerList &learner_list,
+      bool &is_valid_member);
+};
+
+
 
 class ObHATabletGroupMgr
 {
@@ -201,7 +247,6 @@ public:
       const ObMigrationSSTableParam &param,
       const bool is_leader_restore,
       bool &need_copy);
-
 private:
   static int check_major_sstable_need_copy_(
       const ObMigrationSSTableParam &param,
@@ -215,6 +260,11 @@ private:
       bool &need_copy);
 
   static int check_ddl_sstable_need_copy_(
+      const ObMigrationSSTableParam &param,
+      ObTabletHandle &tablet_handle,
+      bool &need_copy);
+
+  static int check_inc_major_ddl_sstable_need_copy_(
       const ObMigrationSSTableParam &param,
       ObTabletHandle &tablet_handle,
       bool &need_copy);

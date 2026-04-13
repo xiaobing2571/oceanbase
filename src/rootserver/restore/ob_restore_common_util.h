@@ -85,8 +85,15 @@ public:
                                 const ObString &tde_method,
                                 const ObString &kms_info);
   static int rebuild_master_key_version(obrpc::ObCommonRpcProxy *rpc_proxy,
-                                        const uint64_t tenant_id);
-
+                                        const uint64_t tenant_id,
+                                        bool need_wait = true);
+  static int restore_root_key(
+    const share::ObPhysicalRestoreJob &job_info,
+    common::ObIAllocator &alloc,
+    share::ObRootKey &root_key);
+  static int activate_master_key_version(obrpc::ObCommonRpcProxy *rpc_proxy,
+                                         const uint64_t tenant_id,
+                                         bool need_wait);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObRestoreCommonUtil);
 };

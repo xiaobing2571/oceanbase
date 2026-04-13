@@ -4,12 +4,15 @@ project(objit
   VERSION 1.0.0
   LANGUAGES C CXX)
 
-  message(STATUS "${DEP_3RD_DIR}")
-  if (NOT DEP_3RD_DIR)
-    message(FATAL_ERROR "DEP_3RD_DIR not set")
-  endif()
+if(NOT DEP_DIR OR NOT DEVTOOLS_DIR)
+  message(FATAL_ERROR "DEP_DIR and DEVTOOLS_DIR must be set")
+endif()
 
-set(LLVM_DIR "${DEP_3RD_DIR}/usr/local/oceanbase/devtools/lib/cmake/llvm")
+set(ZLIB_LIBRARY "${DEP_DIR}/lib64/libz.a")
+set(Terminfo_LINKABLE "${DEP_DIR}/lib/libtinfo.a")
+set(Terminfo_LIBRARIES "${DEP_DIR}/lib/libtinfo.a")
+list(APPEND CMAKE_INCLUDE_PATH "${DEP_DIR}/include")
+set(LLVM_DIR "${DEVTOOLS_DIR}/lib/cmake/llvm")
 find_package(LLVM REQUIRED CONFIG)
 
 include(cmake/libutils.cmake)
@@ -20,9 +23,6 @@ message(STATUS "This is SOURCE dir " ${PROJECT_SOURCE_DIR})
 
 include_directories(${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
-if(NOT CPP_STANDARD_20)
-  add_definitions(-D_GLIBCXX_USE_CXX11_ABI=0)
-endif()
 add_definitions(-g -O2 -frtti)
 
 # Find the libraries that correspond to the LLVM components

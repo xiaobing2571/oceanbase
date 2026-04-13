@@ -1065,10 +1065,13 @@ int ObLogPartTransParser::check_row_need_ignore_(
   if (OB_FAIL(check_row_need_rollback_(part_trans_task, row, need_rollback))) {
     LOG_ERROR("check_row_need_rollback_ failed", KR(ret), K(part_trans_task), K(redo_log_entry_task), K(row));
   } else if (need_rollback) {
-    LOG_DEBUG("rollback row by RollbackToSavepoint",
+    LOG_TRACE("rollback row by RollbackToSavepoint",
         "tls_id", part_trans_task.get_tls_id(),
         "trans_id", part_trans_task.get_trans_id(),
         "row_seq_no", row.get_seq_no());
+  } else if (OB_UNLIKELY(tablet_id.is_ls_inner_tablet())) {
+    need_filter = true;
+    filter_reason = "LS_INNER_TABLET";
   } else if (OB_FAIL(get_table_info_of_tablet_(tenant, part_trans_task, tablet_id, table_info))) {
     LOG_ERROR("get_table_info_of_tablet_ failed", KR(ret), K(tablet_id), K(part_trans_task), K(redo_log_entry_task), K(row));
   } else if (table_info.is_index_table()) {
@@ -1138,7 +1141,7 @@ int ObLogPartTransParser::parse_ext_info_log_mutator_row_(
   } else if (OB_FAIL(check_row_need_rollback_(part_trans_task, *row, need_rollback))) {
     LOG_ERROR("check_row_need_rollback_ failed", KR(ret), K(part_trans_task), K(redo_log_entry_task), KPC(row));
   } else if (need_rollback) {
-    LOG_DEBUG("rollback row by RollbackToSavepoint",
+    LOG_TRACE("rollback row by RollbackToSavepoint",
         "tls_id", part_trans_task.get_tls_id(),
         "trans_id", part_trans_task.get_trans_id(),
         "row_seq_no", row->seq_no_);

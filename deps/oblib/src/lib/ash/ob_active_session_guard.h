@@ -34,6 +34,11 @@ namespace observer
 class ObVirtualASH;
 }
 
+namespace sql
+{
+class ObQueryRetryASHDiagInfo;
+}
+
 namespace common
 {
 class ObDiagnoseSessionInfo;
@@ -97,7 +102,9 @@ public:
         proxy_sid_(0),
         client_sid_(INVALID_SESSID),
         delta_read_(0),
-        delta_write_(0)
+        delta_write_(0),
+        weight_(1),
+        is_wr_weight_sample_(false)
   {
     sql_id_[0] = '\0';
     top_level_sql_id_[0] = '\0';
@@ -162,6 +169,7 @@ public:
       uint64_t in_rewrite_ : 1;
       uint64_t in_duplicate_conflict_resolve_ : 1;
       uint64_t in_foreign_key_cascading_ : 1;
+      uint64_t in_extract_query_range_ : 1;
     };
   };
 
@@ -188,6 +196,8 @@ public:
   uint32_t client_sid_; //client session id
   ObIOData delta_read_;
   ObIOData delta_write_;
+  int64_t weight_;
+  bool is_wr_weight_sample_;
   char program_[ASH_PROGRAM_STR_LEN];
   char module_[ASH_MODULE_STR_LEN];
   char action_[ASH_ACTION_STR_LEN];
@@ -203,7 +213,8 @@ public:
 #if !defined(NDEBUG)
       K_(bt),
 #endif
-      K_(group_id), K_(tid), K_(plan_hash), K_(tx_id), K_(stmt_type), K_(tablet_id), K_(block_sessid), K_(delta_read), K_(delta_write)) ;
+      K_(group_id), K_(tid), K_(plan_hash), K_(tx_id), K_(stmt_type), K_(tablet_id), K_(block_sessid),
+      K_(delta_read), K_(delta_write), K_(weight), K_(is_wr_weight_sample)) ;
 };
 
 // record run-time stat for each OB session
@@ -239,7 +250,8 @@ public:
         flags_(0),
         mysql_cmd_(-1),
         fixup_index_(-1),
-        fixup_ash_buffer_()
+        fixup_ash_buffer_(),
+        query_retry_ash_diag_info_ptr_(nullptr)
   {}
   ~ObActiveSessionStat() = default;
   void fixup_last_stat(const ObWaitEventDesc &desc);
@@ -256,7 +268,10 @@ public:
     fixup_index_ = index;
   }
   inline void check_fixup_ash_buffer() const {
-    OB_ASSERT(fixup_ash_buffer_.is_valid());
+    if (!fixup_ash_buffer_.is_valid()) {
+      int ret = OB_ERR_UNEXPECTED;
+      OB_LOG(WARN, "fixup ash buffer is invalid", K(*this), K(ret));
+    }
   }
 
   void set_event(int64_t event_no, uint64_t p1, uint64_t p2, uint64_t p3)
@@ -338,8 +353,8 @@ public:
     plan_hash_ = 0;
     plan_id_ = 0;
     stmt_type_ = 0;
+    plan_line_id_ = 0;
   }
-
   static void cal_delta_io_data(ObDiagnosticInfo *di);
 private:
   static void update_last_stat_desc(ObActiveSessionStatItem &last_stat, ObWaitEventDesc &desc);
@@ -393,6 +408,7 @@ private:
   // So we collect the wait time after the event finish
   int64_t fixup_index_;
   common::ObSharedGuard<ObAshBuffer> fixup_ash_buffer_;
+  sql::ObQueryRetryASHDiagInfo* query_retry_ash_diag_info_ptr_;
 };
 
 class ObAshBuffer
@@ -406,6 +422,7 @@ public:
   const ObActiveSessionStatItem &get(int64_t pos) const;
   int64_t copy_from_ash_buffer(const ObActiveSessionStatItem &stat);
   int64_t append(const ObActiveSessionStat &stat);
+  int64_t append_item(ObActiveSessionStatItem &stat);//only used for wait in queue
   void fixup_stat(int64_t index, const ObWaitEventDesc &desc);
   void fixup_stat(int64_t index,
                   const ObCurTraceId::TraceId &trace_id,
@@ -458,6 +475,22 @@ private:
   ObBackgroundSessionIdGenerator *generator_;
   volatile uint64_t local_seq_;
 };
+
+#define ACTIVE_SESSION_RETRY_DIAG_INFO_GETTER(filed)                                              \
+  ({                                                                                              \
+    int64_t ret = 0;                                                                              \
+    if (OB_NOT_NULL(ObActiveSessionGuard::get_stat().get_retry_ash_diag_info_ptr())) {            \
+      ret = ObActiveSessionGuard::get_stat().get_retry_ash_diag_info_ptr()->filed;                \
+    }                                                                                             \
+    ret;                                                                                          \
+  })
+
+#define ACTIVE_SESSION_RETRY_DIAG_INFO_SETTER(filed, value)                                       \
+do {                                                                                              \
+  if (OB_NOT_NULL(ObActiveSessionGuard::get_stat().get_retry_ash_diag_info_ptr())) {              \
+    ObActiveSessionGuard::get_stat().get_retry_ash_diag_info_ptr()->filed = value;                \
+  }                                                                                               \
+} while(0)
 
 struct ObQueryRetryAshInfo {
 public:

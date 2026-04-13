@@ -15,6 +15,7 @@
 
 #include "storage/memtable/mvcc/ob_tx_callback_functor.h"
 #include "storage/memtable/ob_memtable_util.h"
+#include "ob_tx_callback_hash_holder_helper.h"
 namespace oceanbase
 {
 namespace memtable
@@ -73,18 +74,20 @@ public:
                                        const transaction::ObTxSEQ from_seq,
                                        const share::SCN replay_scn);
 
-  // reverse_search_callback_by_seq_no will search callback from back to front
-  // until callbacks smaller or equal than the seq_no
-  int reverse_search_callback_by_seq_no(const transaction::ObTxSEQ seq_no, ObITransCallback *search_res);
-
-  // get_memtable_key_arr_w_timeout get all memtable key until timeout
-  int get_memtable_key_arr_w_timeout(transaction::ObMemtableKeyArray &memtable_key_arr);
+  // get_memtable_key_arr__timeout get all memtable key until timeout
+  int get_memtable_key_arr_w_timeout(transaction::ObMemtableKeyArray &memtable_key_arr, const int64_t timeout);
 
   // clean_unlog_callbacks will remove all unlogged callbacks. Which is called
   // when switch to follower forcely.
   int clean_unlog_callbacks(int64_t &removed_cnt, common::ObFunction<void()> &before_remove);
   int fill_log(ObITransCallback* log_cursor, ObTxFillRedoCtx &ctx, ObITxFillRedoFunctor &functor);
   int submit_log_succ(const ObCallbackScope &callbacks);
+  // mark callback list has submitted log but relative callbacks not marked as submitted
+  // execute sync log succ/fail callback must wait this flag cleared
+  int prepare_log_submitted();
+  // clear prepared log submitted flag
+  void clear_prepared_log_submitted();
+  // sync log succ will update sync_scn and synced_
   int sync_log_succ(const share::SCN scn, int64_t sync_cnt);
   // sync_log_fail will remove all callbacks that not sync successfully. Which
   // is called when callback is on failure.
@@ -133,6 +136,12 @@ public:
 
   // is logging blocked: test current list can fill log
   bool is_logging_blocked() const;
+
+  // check if the callback list has pending log for freeze
+  bool has_pending_log_for_freeze(const uint32_t freeze_clock) const;
+
+  // get callback list id
+  int16_t get_id() const { return id_; }
 private:
   union LockState {
     LockState() : v_(0) {}
@@ -169,8 +178,9 @@ private:
                 const ObCallbackScope &callbacks,
                 const LockState lock_state);
   int callback_(ObITxCallbackFunctor &func,
-                ObITransCallback *start,
+                ObITransCallback *start, /*inclusive*/
                 ObITransCallback *end,
+                const bool end_inclusive,
                 const LockState lock_state);
   int64_t calc_need_remove_count_for_fast_commit_();
   void ensure_checksum_(const share::SCN scn);
@@ -178,7 +188,7 @@ private:
 public:
   ObITransCallback *get_guard() { return &head_; }
   ObITransCallback *get_tail() { return head_.get_prev(); }
-  ObITransCallback *get_log_cursor() const { return log_cursor_; }
+  ObITransCallback *get_log_cursor() const { return ATOMIC_LOAD(&log_cursor_); }
   int64_t get_log_epoch() const;
   share::SCN get_sync_scn() const { return sync_scn_; }
   bool check_all_redo_flushed(const bool quite = true) const;
@@ -186,6 +196,7 @@ public:
   {
     return log_latch_.try_lock() ? &log_latch_ : NULL;
   }
+  bool is_logging_locked() const { return log_latch_.is_locked(); }
   bool empty() const { return head_.get_next() == &head_; }
   int64_t get_appended() const { return appended_; }
   int64_t get_length() const { return length_; }
@@ -207,14 +218,14 @@ public:
   transaction::ObPartTransCtx *get_trans_ctx() const;
   bool pending_log_too_large(const int64_t limit) const
   {
-    return ATOMIC_LOAD(&data_size_) - ATOMIC_LOAD(&logged_data_size_) > limit;
+    return ATOMIC_LOAD(&data_size_) - ATOMIC_LOAD(&logged_data_size_) - ATOMIC_LOAD(&unlogged_and_rollbacked_data_size_) > limit;
   }
   // *NOTICE* this _only_ account MvccRowCallback on memtable
   bool has_pending_log() const {
-    return ATOMIC_LOAD(&data_size_) - ATOMIC_LOAD(&logged_data_size_) > 0;
+    return ATOMIC_LOAD(&data_size_) - ATOMIC_LOAD(&logged_data_size_) - ATOMIC_LOAD(&unlogged_and_rollbacked_data_size_) > 0;
   }
   int64_t get_pending_log_size() const {
-    return data_size_ - logged_data_size_;
+    return ATOMIC_LOAD(&data_size_) - ATOMIC_LOAD(&logged_data_size_) - ATOMIC_LOAD(&unlogged_and_rollbacked_data_size_);
   }
   int64_t get_logged_data_size() const {
     return logged_data_size_;
@@ -222,12 +233,14 @@ public:
   DECLARE_TO_STRING;
 private:
   void set_log_cursor_(ObITransCallback *log_cursor);
+  int check_freeze_clock_order_(ObITransCallback *callback);
 private:
   const int16_t id_;
   // callback list sentinel
   ObITransCallback head_;
   ObITransCallback *log_cursor_;
   int64_t log_epoch_;
+  uint32_t log_freeze_clock_;
   ObITransCallback *parallel_start_pos_;
   int64_t length_;
   // stats
@@ -239,6 +252,7 @@ private:
   int64_t branch_removed_;
   int64_t data_size_;
   int64_t logged_data_size_;
+  int64_t unlogged_and_rollbacked_data_size_;
   // the max scn of synced callback
   // fast commit remove callback should not cross this
   share::SCN sync_scn_;
@@ -268,6 +282,8 @@ private:
   mutable common::ObByteLock append_latch_;
   // used to serialize fill and flush log of this list
   mutable common::ObByteLock log_latch_;
+  // used to prevent log sync succ callback be called after log submitted callback
+  mutable common::ObByteLock log_submitted_pending_latch_;
   // used to serialize operates on synced callbacks
   mutable common::ObByteLock iter_synced_latch_;
   DISALLOW_COPY_AND_ASSIGN(ObTxCallbackList);

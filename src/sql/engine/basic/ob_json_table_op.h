@@ -27,6 +27,9 @@
 #include "sql/engine/expr/ob_expr_json_utils.h"
 #include "sql/engine/expr/ob_expr_xml_func_helper.h"
 #include "deps/oblib/src/lib/xml/ob_xml_util.h"
+#include "share/search_index/ob_search_index_generator.h"
+#include "lib/ai_split_document/ob_ai_split_document.h"
+#include "lib/ai_split_document/ob_ai_split_document_util.h"
 
 namespace oceanbase
 {
@@ -49,6 +52,8 @@ enum table_type : int8_t {
   OB_XML_TABLE = 2,
   OB_RB_ITERATE_TABLE = 3,
   OB_UNNEST_TABLE = 4,
+  OB_AI_SPLIT_DOCUMENT_TABLE = 5,
+  OB_INDEX_DATA_GEN_TABLE = 6,
 };
 
 typedef enum JtNodeType {
@@ -130,11 +135,16 @@ public:
       alloc_(&alloc),
       cols_def_(alloc),
       table_type_(MulModeTableType::OB_ORA_JSON_TABLE_TYPE),
-      namespace_def_(alloc) {}
+      namespace_def_(alloc),
+      inc_pk_proj_(0),
+      index_column_cnt_(0),
+      search_idx_included_cid_idxes_(alloc),
+      column_comments_(alloc) {}
 
   int dup_origin_column_defs(common::ObIArray<ObJtColBaseInfo*>& columns);
   int construct_tree(common::ObArray<ObMultiModeTableNode*> all_nodes, JoinNode* parent);
   int construct_tree(common::ObArray<ObMultiModeTableNode*> all_nodes, UnionNode* parent);
+  int gen_gin_included_cid_idxes();
   common::ObFixedArray<ObExpr*, common::ObIAllocator> value_exprs_;
   common::ObFixedArray<ObExpr*, common::ObIAllocator> column_exprs_; // 列输出表达式
   common::ObFixedArray<ObExpr*, common::ObIAllocator> emp_default_exprs_;
@@ -145,6 +155,10 @@ public:
   common::ObFixedArray<ObJtColInfo*, common::ObIAllocator> cols_def_;
   MulModeTableType table_type_;
   common::ObFixedArray<ObString, common::ObIAllocator> namespace_def_;
+  int64_t inc_pk_proj_;
+  int64_t index_column_cnt_;
+  common::ObFixedArray<int32_t, common::ObIAllocator> search_idx_included_cid_idxes_;
+  common::ObFixedArray<ObString, common::ObIAllocator> column_comments_;
 };
 
 class ObJsonTableOp;
@@ -170,6 +184,14 @@ struct JtScanCtx {
 
   bool is_unnest_table_func() {
     return spec_ptr_->table_type_ == OB_UNNEST_TABLE_TYPE;
+  }
+
+  bool is_index_data_gen_table_func() {
+    return spec_ptr_->table_type_ == OB_INDEX_DATA_GEN_TABLE_TYPE;
+  }
+
+  bool is_ai_split_document_table_func() {
+    return spec_ptr_->table_type_ == OB_AI_SPLIT_DOCUMENT_TABLE_TYPE;
   }
 
   ObJsonTableSpec* spec_ptr_;
@@ -200,6 +222,8 @@ struct JtScanCtx {
 class ObJsonTableOp : public ObOperator
 {
 public:
+  static const int64_t DEFAULT_GEN_ROW_COUNT = 32;
+  typedef common::ObSEArray<blocksstable::ObDatumRow*, DEFAULT_GEN_ROW_COUNT> ObIndexGenRow;
   ObJsonTableOp(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOpInput *input)
     : ObOperator(exec_ctx, spec, input),
       def_root_(nullptr),
@@ -210,7 +234,11 @@ public:
       input_(nullptr),
       j_null_(),
       j_arr_(allocator_),
-      j_obj_(allocator_)
+      j_obj_(allocator_),
+      row_idx_(0),
+      row_(),
+      rows_(),
+      row_generator_()
   {
     const ObJsonTableSpec* spec_ptr = reinterpret_cast<const ObJsonTableSpec*>(&spec);
     col_count_ = spec_ptr->column_exprs_.count();
@@ -241,6 +269,10 @@ private:
   int generate_table_exec_tree(ObIAllocator* allocator, const JtColTreeNode& orig_col,
                                JoinNode*& join_col);
   int inner_get_next_row_jt();  // json table function inner
+  int get_next_index_gen_row();
+  int init_row_generator();
+  int generate_index_gen_rows();
+  int fill_index_gen_column_exprs(blocksstable::ObDatumRow &row);
 
 private:
   JtColTreeNode* def_root_;
@@ -259,6 +291,12 @@ private:
   ObJsonNull j_null_;
   ObJsonArray j_arr_;
   ObJsonObject j_obj_;
+
+private:
+  uint32_t row_idx_;
+  blocksstable::ObDatumRow row_;
+  ObIndexGenRow rows_;
+  share::ObSearchIndexRowGenerator row_generator_;
 };
 
 class MulModeTableFunc {
@@ -351,6 +389,22 @@ public:
   int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
   int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
 };
+
+
+class AiSplitDocumentTableFunc : public MulModeTableFunc {
+public:
+  AiSplitDocumentTableFunc()
+  : MulModeTableFunc() {}
+  ~AiSplitDocumentTableFunc() {}
+
+  int init_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
+  int eval_input(ObJsonTableOp &jt, JtScanCtx& ctx, ObEvalCtx &eval_ctx);
+  int reset_path_iter(ObRegCol &scan_node, void* in, JtScanCtx*& ctx, ScanType init_flag, bool &is_null_value);
+  int get_iter_value(ObRegCol &col_node, JtScanCtx* ctx, bool &is_null_value);
+  int reset_ctx(ObRegCol &scan_node, JtScanCtx*& ctx);
+};
+
+
 
 class ObMultiModeTableNode {
 public:
@@ -537,6 +591,7 @@ public:
   static int eval_xml_scalar_col(ObRegCol &col_node, JtScanCtx* ctx, ObExpr* col_expr);
   static int eval_xml_type_col(ObRegCol &col_node, JtScanCtx* ctx, ObExpr* col_expr);
   static int eval_unnest_col(ObRegCol &col_node, void* in, JtScanCtx* ctx, ObExpr* col_expr);
+  static int eval_ai_split_document_col(ObRegCol &col_node, void* in, JtScanCtx* ctx, ObExpr* col_expr);
   static void proc_query_on_error(JtScanCtx* ctx, ObRegCol &col_node, int& ret, bool& is_null);
   static int check_default_val_cast_allowed(JtScanCtx* ctx, ObMultiModeTableNode &col_node, ObExpr* expr)  { return 0; }  // check type of default value
   static int set_val_on_empty(JtScanCtx* ctx, ObRegCol &col_node, bool& need_cast_res, bool& is_null);

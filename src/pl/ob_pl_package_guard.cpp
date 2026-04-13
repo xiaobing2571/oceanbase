@@ -19,6 +19,7 @@ namespace oceanbase
 {
 namespace pl
 {
+
 ObPLPackageGuard::~ObPLPackageGuard()
 {
   if (map_.created()) {

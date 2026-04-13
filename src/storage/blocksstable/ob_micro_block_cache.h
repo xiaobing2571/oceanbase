@@ -26,6 +26,10 @@
 
 namespace oceanbase
 {
+namespace common
+{
+  class ObTabletID;
+}
 namespace storage
 {
 class ObMicroBlockDataHandle;
@@ -99,7 +103,7 @@ class ObMicroBlockCacheValue : public common::ObIKVCacheValue
 {
 public:
   ObMicroBlockCacheValue();
-  ObMicroBlockCacheValue(
+  int init(
       const char *buf,
       const int64_t size,
       const char *extra_buf = NULL,
@@ -409,14 +413,16 @@ public:
       const MacroBlockId &macro_id,
       const ObMicroIndexInfo& idx_row,
       const bool use_cache,
+      const common::ObTabletID &effective_tablet_id,
       ObStorageObjectHandle &macro_handle,
       ObIAllocator *allocator,
-      const bool is_major_macro_preread = false);
+      const bool is_preread = false);
   virtual int load_block(
       const ObMicroBlockId &micro_block_id,
       const ObMicroBlockDesMeta &des_meta,
       const ObLogicMicroBlockId &logic_micro_id,
       const int64_t data_checksum,
+      const common::ObTabletID &effective_tablet_id,
       ObMacroBlockReader *macro_reader,
       ObMicroBlockData &block_data,
       ObIAllocator *allocator) = 0;
@@ -450,14 +456,16 @@ protected:
       const uint64_t tenant_id,
       const MacroBlockId &macro_id,
       const ObMicroIndexInfo& idx_row,
+      const common::ObTabletID &effective_tablet_id,
       ObStorageObjectHandle &macro_handle,
       ObIMicroBlockIOCallback &callback,
-      const bool is_major_macro_preread = false);
+      const bool is_preread = false);
   int prefetch(
       const uint64_t tenant_id,
       const MacroBlockId &macro_id,
       const ObMultiBlockIOParam &io_param,
       const bool use_cache,
+      const common::ObTabletID &effective_tablet_id,
       ObStorageObjectHandle &macro_handle,
       ObIMicroBlockIOCallback &callback);
 private:
@@ -479,12 +487,14 @@ public:
       const MacroBlockId &macro_id,
       const ObMultiBlockIOParam &io_param,
       const bool use_cache,
+      const common::ObTabletID &effective_tablet_id,
       ObStorageObjectHandle &macro_handle);
   int load_block(
       const ObMicroBlockId &micro_block_id,
       const ObMicroBlockDesMeta &des_meta,
       const ObLogicMicroBlockId &logic_micro_id,
       const int64_t data_checksum,
+      const common::ObTabletID &effective_tablet_id,
       ObMacroBlockReader *macro_reader,
       ObMicroBlockData &block_data,
       ObIAllocator *allocator) override;
@@ -513,7 +523,8 @@ public:
 private:
   int64_t calc_value_size(const int64_t data_length, const ObRowStoreType &type, bool &need_decoder);
   int write_extra_buf(
-      const ObRowStoreType row_store_type,
+      const ObRowStoreType &row_store_type,
+      const ObMicroBlockHeader &micro_header,
       const char *block_buf,
       const int64_t block_size,
       char *extra_buf,
@@ -535,6 +546,7 @@ public:
       const ObMicroBlockDesMeta &des_meta,
       const ObLogicMicroBlockId &logic_micro_id,
       const int64_t data_checksum,
+      const common::ObTabletID &effective_tablet_id,
       ObMacroBlockReader *macro_reader,
       ObMicroBlockData &block_data,
       ObIAllocator *allocator) override;

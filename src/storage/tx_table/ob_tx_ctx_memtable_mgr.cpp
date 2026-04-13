@@ -27,7 +27,7 @@ namespace storage
 
 ObTxCtxMemtableMgr::ObTxCtxMemtableMgr()
   : ls_id_(),
-    lock_def_()
+    lock_def_(common::ObLatchIds::OB_TX_CTX_MEMTABLE_MGR_LOCK)
 {
   lock_.lock_type_ = LockType::OB_SPIN_RWLOCK;
   lock_.lock_ = &lock_def_;
@@ -209,6 +209,18 @@ int ObTxCtxMemtableMgr::release_head_memtable_(ObIMemtable *imemtable,
   }
   return ret;
 }
+
+int ObTxCtxMemtableMgr::reuse()
+{
+  int ret = OB_SUCCESS;
+  ls_id_.reset();
+  freezer_ = nullptr;
+  t3m_ = nullptr;
+  is_inited_ = false;
+
+  return ret;
+}
+
 
 }  // namespace storage
 }  // namespace oceanbase

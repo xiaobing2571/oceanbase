@@ -38,7 +38,7 @@ namespace logservice
 using namespace oceanbase::storage;
 ObLogRestoreNetDriver::ObLogRestoreNetDriver() :
   ObLogRestoreDriverBase(),
-  lock_(),
+  lock_(common::ObLatchIds::OB_LOG_RESTORE_NET_DRIVER_LOCK),
   stop_flag_(false),
   source_(),
   restore_function_(),
@@ -109,6 +109,8 @@ void ObLogRestoreNetDriver::destroy()
 int ObLogRestoreNetDriver::start()
 {
   // fetcher will be build and start on demand
+  WLockGuard guard(lock_);
+  stop_flag_ = false;
   return OB_SUCCESS;
 }
 

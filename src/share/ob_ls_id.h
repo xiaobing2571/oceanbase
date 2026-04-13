@@ -28,6 +28,7 @@ public:
   static const int64_t INVALID_LS_ID = -1;               // INVALID LS
   static const int64_t SYS_LS_ID = 1;                    // SYS LS for every Tenant
   static const int64_t SSLOG_LS_ID = 1001;               // SSLOG LS for meta or sys tenant
+  static const int64_t METADATA_LS_ID = 1002;            // METADATA LS for meta tenant
   static const int64_t VT_LS_ID = SYS_LS_ID;             // LS for virtual table
   static const int64_t IDS_LS_ID = SYS_LS_ID;            // LS for Trans GTS service
   static const int64_t LOCK_SERVICE_LS_ID = SYS_LS_ID;   // LS for Lock Service
@@ -57,18 +58,18 @@ public:
   // LS attribute interface
   bool is_sys_ls() const { return SYS_LS_ID == id_; }
   bool is_sslog_ls() const { return SSLOG_LS_ID == id_; }
+  bool is_metadata_ls() const { return METADATA_LS_ID == id_; }
   bool is_user_ls() const { return id_ > MIN_USER_LS_ID && SCHEDULER_LS_ID != id_; }
   bool is_scheduler_ls() const { return SCHEDULER_LS_ID == id_; }
   bool is_valid() const { return INVALID_LS_ID != id_; }
   bool is_valid_with_tenant(const uint64_t tenant_id) const
   {
     // 1. User tenant have SYS LS and User LS
-    // 2. SYS tenant and Meta tenant have SYS LS
-    // 3. Meta tenant have SSLOG LS
-    // TODO:jinqian.zzy, in future, sys tenant has SSLOG LS
+    // 2. SYS tenant and Meta tenant have SYS LS and SSLOG LS.
+    // 3. Meta tenant have METADATA LS.
     return (is_user_tenant(tenant_id) && (is_sys_ls() || is_user_ls()))
-        || ((is_sys_tenant(tenant_id) || is_meta_tenant(tenant_id)) && is_sys_ls())
-        || (is_meta_tenant(tenant_id) && is_sslog_ls());
+        || ((is_sys_tenant(tenant_id) || is_meta_tenant(tenant_id)) && (is_sys_ls() || is_sslog_ls()))
+        || (is_meta_tenant(tenant_id) && is_metadata_ls());
   }
 
   // compare operator
@@ -104,14 +105,13 @@ static const ObLSID IDS_LS(ObLSID::IDS_LS_ID);
 static const ObLSID GTS_LS(ObLSID::IDS_LS_ID);
 static const ObLSID GTI_LS(ObLSID::IDS_LS_ID);
 static const ObLSID SSLOG_LS(ObLSID::SSLOG_LS_ID);
+static const ObLSID METADATA_LS(ObLSID::METADATA_LS_ID);
 static const ObLSID GAIS_LS(ObLSID::GAIS_LS_ID);
 static const ObLSID SCHEDULER_LS(ObLSID::SCHEDULER_LS_ID);
 static const ObLSID LOCK_SERVICE_LS(ObLSID::LOCK_SERVICE_LS_ID);
 static const ObLSID DAS_ID_LS(ObLSID::DAS_ID_LS_ID);
 static const ObLSID MAJOR_FREEZE_LS(ObLSID::MAJOR_FREEZE_LS_ID);
 static const ObLSID WRS_LS_ID(ObLSID::WRS_LS_ID);
-
-bool is_tenant_sslog_ls(const uint64_t tenant_id, const share::ObLSID &ls_id);
 
 static const int64_t OB_DEFAULT_LS_COUNT = 3;
 typedef common::ObSEArray<share::ObLSID, OB_DEFAULT_LS_COUNT> ObLSArray;

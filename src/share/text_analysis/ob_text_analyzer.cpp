@@ -22,8 +22,8 @@ namespace share
 void ObITextAnalyzer::reset()
 {
   for (int64_t i = analyze_pipeline_.count() - 1; i >= 0; --i) {
-    ObITokenStream *cur_ts = analyze_pipeline_.at(i);
-    cur_ts->~ObITokenStream();
+    ObIFTTokenStream *cur_ts = analyze_pipeline_.at(i);
+    cur_ts->~ObIFTTokenStream();
     if (nullptr != allocator_) {
       allocator_->free(cur_ts);
     }
@@ -39,7 +39,7 @@ int ObITextAnalyzer::init(const ObTextAnalysisCtx &ctx, ObIAllocator &allocator)
   int ret = OB_SUCCESS;
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
-    LOG_WARN("double init", K(ret));
+    LOG_WARN("the text analyzer has been initialized", K(ret));
   } else if (OB_UNLIKELY(!ctx.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid text analysis ctx", K(ret), K(ctx));
@@ -64,7 +64,7 @@ int ObITextAnalyzer::add_tokenizer(const ObTextTokenizer::TokenizerType &type)
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("there is already an tokenizer in analyse pipeline", K(ret));
   } else {
-    ObITokenStream *token_stream = nullptr;
+    ObIFTTokenStream *token_stream = nullptr;
     switch (type) {
     case ObTextTokenizer::WHITESPACE: {
       if (OB_FAIL(add_token_stream<ObTextWhitespaceTokenizer>(token_stream))) {
@@ -94,9 +94,9 @@ int ObITextAnalyzer::add_normalizer(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("cannot add a normalizer to an empty analyse pipeline", K(ret), K(type));
   } else {
-    ObITokenStream *token_stream = nullptr;
+    ObIFTTokenStream *token_stream = nullptr;
     switch (type) {
-    case ObTokenNormalizer::STOPWORD_FILTER: {
+    case ObTokenNormalizer::STOP_TOKEN_FILTER: {
       if (OB_FAIL(add_token_stream<ObTokenStopWordNormalizer>(token_stream))) {
         LOG_WARN("failed to add token stop word filter", K(ret));
       }
@@ -133,8 +133,7 @@ int ObITextAnalyzer::add_normalizer(
   return ret;
 }
 
-template<typename T>
-int ObITextAnalyzer::add_token_stream(ObITokenStream *&token_stream)
+template <typename T> int ObITextAnalyzer::add_token_stream(ObIFTTokenStream *&token_stream)
 {
   int ret = OB_SUCCESS;
   char *buf = nullptr;
@@ -147,10 +146,10 @@ int ObITextAnalyzer::add_token_stream(ObITokenStream *&token_stream)
   return ret;
 }
 
-ObITokenStream *ObITextAnalyzer::get_tail_token_stream()
+ObIFTTokenStream *ObITextAnalyzer::get_tail_token_stream()
 {
   OB_ASSERT(!analyze_pipeline_.empty());
-  ObITokenStream *tail_stream = analyze_pipeline_.at(analyze_pipeline_.count() - 1);
+  ObIFTTokenStream *tail_stream = analyze_pipeline_.at(analyze_pipeline_.count() - 1);
   OB_ASSERT(nullptr != tail_stream);
   return tail_stream;
 }
@@ -158,10 +157,10 @@ ObITokenStream *ObITextAnalyzer::get_tail_token_stream()
 int ObEnglishTextAnalyzer::inner_init(const ObTextAnalysisCtx &ctx, ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  UNUSEDx(ctx); // TODO: generate specific analyse pipeline by ctx
+  UNUSED(allocator);
   if (OB_FAIL(add_tokenizer(ObTextTokenizer::WHITESPACE))) {
     LOG_WARN("failed to add white space tokenizer", K(ret));
-  } else if (ctx.filter_stopword_ && OB_FAIL(add_normalizer(ObTokenNormalizer::STOPWORD_FILTER, ctx))) {
+  } else if (ctx.filter_stop_token_ && OB_FAIL(add_normalizer(ObTokenNormalizer::STOP_TOKEN_FILTER, ctx))) {
     LOG_WARN("failed to add stop word filter", K(ret));
   } else if (OB_FAIL(add_normalizer(ObTokenNormalizer::ENG_BASIC_NORM, ctx))) {
     LOG_WARN("failed to add basic english normalizer", K(ret));
@@ -171,7 +170,7 @@ int ObEnglishTextAnalyzer::inner_init(const ObTextAnalysisCtx &ctx, ObIAllocator
   return ret;
 }
 
-int ObEnglishTextAnalyzer::analyze(const ObDatum &document, ObITokenStream *&token_stream)
+int ObEnglishTextAnalyzer::analyze(const ObDatum &document, ObIFTTokenStream *&token_stream)
 {
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {

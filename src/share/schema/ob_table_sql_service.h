@@ -43,6 +43,25 @@ public:
                            const common::ObString *ddl_stmt_str = NULL,
                            const bool need_sync_schema_version = true,
                            const bool is_truncate_table = false);
+  static int gen_table_dml_without_check(
+      const uint64_t exec_tenant_id,
+      const ObTableSchema &table,
+      const bool update_object_status_ignore_version,
+      const int64_t data_version,
+      share::ObDMLSqlSplicer &dml,
+      const bool used_for_unittest = false);
+  static int gen_column_dml_without_check(
+      const uint64_t exec_tenant_id,
+      const ObColumnSchemaV2 &column,
+      const uint64_t data_version,
+      const lib::Worker::CompatMode compat_mode,
+      share::ObDMLSqlSplicer &dml,
+      const bool used_for_unittest = false);
+  virtual int batch_create_table(ObIArray<ObTableSchema> &tables,
+                           common::ObISQLClient &sql_client,
+                           const common::ObString *ddl_stmt_str = NULL,
+                           const bool sync_schema_version_for_last_table = true,
+                           const bool is_truncate_table = false);
   //update table option
   int update_table_options(common::ObISQLClient &sql_client,
                           const ObTableSchema &table_schema,
@@ -94,6 +113,9 @@ public:
                                 common::ObISQLClient &sql_client,
                                 const common::ObString *ddl_stmt_str = NULL);
   virtual int log_core_operation(common::ObISQLClient &sql_client,
+                                 const uint64_t tenant_id,
+                                 const int64_t schema_version);
+  virtual int log_sys_operation(common::ObISQLClient &sql_client,
                                  const uint64_t tenant_id,
                                  const int64_t schema_version);
 
@@ -148,6 +170,11 @@ public:
                         const int64_t new_schema_version,
                         const common::ObString *ddl_stmt_str,
                         common::ObISQLClient &sql_client);
+  int update_mlog_status(const ObTableSchema &data_table_schema,
+                         const uint64_t mlog_table_id,
+                         const char *new_name,
+                         const int64_t new_schema_version,
+                         common::ObISQLClient &sql_client);
 
   virtual int update_mview_status(const ObTableSchema &mview_table_schema,
                                  common::ObISQLClient &sql_client);
@@ -266,6 +293,12 @@ public:
                                        const uint64_t data_table_id,
                                        const bool in_offline_ddl_white_list,
                                        int64_t new_schema_version = common::OB_INVALID_VERSION);
+  int batch_insert_ori_schema_version(
+      common::ObISQLClient &sql_client,
+      const uint64_t tenant_id,
+      const ObIArray<uint64_t> &table_id,
+      const int64_t &ori_schema_version);
+
   int insert_ori_schema_version(
       common::ObISQLClient &sql_client,
       const uint64_t tenant_id,
@@ -303,12 +336,23 @@ public:
       const ObConstraint &cst);
 
 private:
+  // just modify __all_core_table/__all_table/__all_column/__all_table_history/__all_column_history/__all_ddl_operation
+  int inner_create_sys_table(ObTableSchema &table,
+      ObSchemaOperation &opt,
+      const bool need_sync_schema_version,
+      common::ObISQLClient &sql_client);
+  bool table_need_sync_schema_version(const ObTableSchema &table);
   int inner_update_table_options_(ObISQLClient &sql_client,
                                   const ObTableSchema &new_table_schema);
 
   int add_table(common::ObISQLClient &sql_client, const ObTableSchema &table,
                 const bool update_object_status_ignore_version,
                 const bool only_history = false);
+  // just add single line, the caller should call finish_row
+  int add_table_dml(const ObTableSchema &table,
+      const bool update_object_status_ignore_version,
+      ObDMLSqlSplicer &all_table_dml);
+  int batch_add_table_for_create_table(common::ObISQLClient &sql_client, const ObIArray<ObTableSchema> &tables);
   int delete_from_all_table(common::ObISQLClient &sql_client,
                             const uint64_t tenant_id,
                             const uint64_t table_id);
@@ -342,11 +386,29 @@ private:
   int delete_table_part_info(const ObTableSchema &table_schema,
                              const int64_t new_schema_version,
                              common::ObISQLClient &sql_client);
+  int exec_dml(common::ObISQLClient &sql_client,
+      const uint64_t tenant_id,
+      const char *table_name,
+      const ObDMLSqlSplicer &dml,
+      const int64_t target_affected_row_count = -1, // -1 means not check
+      const bool insert_ignore = false);
   int add_columns(common::ObISQLClient &sql_client, const ObTableSchema &table);
+  int add_columns_dml(const ObTableSchema &table,
+      share::ObDMLSqlSplicer &all_column_dml,
+      int64_t &column_count);
+  int batch_add_columns_for_create_table(common::ObISQLClient &sql_client,
+      const ObIArray<ObTableSchema> &table);
+  int batch_add_column_groups_for_create_table(common::ObISQLClient &sql_client,
+      const ObIArray<ObTableSchema> &table);
   int add_columns_for_core(common::ObISQLClient &sql_client, const ObTableSchema &table);
   int add_columns_for_not_core(common::ObISQLClient &sql_client, const ObTableSchema &table);
   int add_constraints(common::ObISQLClient &sql_client, const ObTableSchema &table);
   int add_constraints_for_not_core(common::ObISQLClient &sql_client, const ObTableSchema &table);
+  int batch_add_constraints_for_create_table(common::ObISQLClient &sql_client, const ObIArray<ObTableSchema> &tables);
+  int add_constraints_dml(const ObTableSchema &table,
+      ObDMLSqlSplicer &cst_dml,
+      ObDMLSqlSplicer &cst_col_dml,
+      int64_t &cst_col_count);
   // deal_whih_csts_when_drop_table_to_recyclebin
   int rename_csts_in_inner_table(common::ObISQLClient &sql_client,
                                  const ObTableSchema &table_schema,
@@ -354,25 +416,44 @@ private:
   int delete_constraint(common::ObISQLClient &sql_client,
                         const ObTableSchema &table_schema,
                         const int64_t new_schema_version);
+  int batch_add_sequence_for_create_table(
+      common::ObISQLClient &sql_client,
+      const ObIArray<ObTableSchema> &tables);
   int add_sequence(common::ObISQLClient &sql_client,
                    const uint64_t tenant_id,
                    const uint64_t table_id,
                    const uint64_t column_id,
                    const uint64_t auto_increment,
                    const int64_t truncate_version);
-  int add_transition_point_val(share::ObDMLSqlSplicer &dml,
+  int add_sequence_dml(share::ObDMLSqlSplicer &dml,
+      const uint64_t tenant_id,
+      const uint64_t table_id,
+      const uint64_t column_id,
+      const uint64_t auto_increment,
+      const int64_t truncate_version);
+  static int add_transition_point_val(share::ObDMLSqlSplicer &dml,
                                const ObTableSchema &table);
-  int add_interval_range_val(share::ObDMLSqlSplicer &dml,
+  static int add_interval_range_val(share::ObDMLSqlSplicer &dml,
                                const ObTableSchema &table);
   int gen_mview_dml(const uint64_t exec_tenant_id, const ObTableSchema &table,
                     share::ObDMLSqlSplicer &dml);
-  int gen_table_dml(const uint64_t exec_tenant_id, const ObTableSchema &table,
+  static int gen_table_dml(const uint64_t exec_tenant_id, const ObTableSchema &table,
                     const bool update_object_status_ignore_version, share::ObDMLSqlSplicer &dml);
+  static int check_tenant_data_version_in_gen_table_dml(
+      const uint64_t exec_tenant_id,
+      const ObTableSchema &table,
+      uint64_t &data_version);
   int gen_table_options_dml(const uint64_t exec_tenant_id,
                             const ObTableSchema &table,
                             const bool update_object_status_ignore_version,
                             share::ObDMLSqlSplicer &dml);
-  int gen_column_dml(const uint64_t exec_tenant_id, const ObColumnSchemaV2 &column, share::ObDMLSqlSplicer &dml);
+  static int gen_column_dml(const uint64_t exec_tenant_id, const ObColumnSchemaV2 &column,
+      share::ObDMLSqlSplicer &dml);
+  static int check_tenant_in_gen_column_dml(
+      const uint64_t exec_tenant_id,
+      const ObColumnSchemaV2 &column,
+      uint64_t &data_version,
+      lib::Worker::CompatMode &compat_mode);
   int gen_constraint_dml(const uint64_t exec_tenant_id, const ObConstraint &constraint, share::ObDMLSqlSplicer &dml);
   int gen_constraint_column_dml(
       const uint64_t exec_tenant_id,
@@ -397,6 +478,7 @@ private:
   int add_column(common::ObISQLClient &sql_client, const ObTableSchema &table);
 
   int add_table_part_info(common::ObISQLClient &sql_client, const ObTableSchema &table);
+  int batch_add_table_part_info(common::ObISQLClient &sql_client, const ObIArray<ObTableSchema> &tables);
   int delete_foreign_key(common::ObISQLClient &sql_client,
       const ObTableSchema &table_schema,
       const int64_t new_schema_version,
@@ -420,9 +502,7 @@ private:
                                  uint64_t tenant_id, uint64_t foreign_key_id,
                                  uint64_t child_column_id, uint64_t parent_column_id,
                                  int64_t position, share::ObDMLSqlSplicer &dml);
-  int check_table_options(const share::schema::ObTableSchema &table_schema);
-  int add_single_column(common::ObISQLClient &sql_client, const ObColumnSchemaV2 &column,
-                        const bool only_history = false);
+  static int check_table_options(const share::schema::ObTableSchema &table_schema);
 
   int delete_from_all_column_usage(ObISQLClient &sql_client,
                                    const uint64_t tenant_id,
@@ -437,6 +517,13 @@ private:
   int update_partition_option_(ObISQLClient &sql_client,
                                const ObTableSchema &table,
                                ObDMLSqlSplicer &dml);
+  int update_index_status_(const uint64_t tenant_id,
+                           const uint64_t index_table_id,
+                           const ObIndexStatus status,
+                           const int64_t new_schema_version,
+                           const bool in_offline_ddl_white_list,
+                           common::ObISQLClient &sql_client,
+                           const common::ObString *ddl_stmt_str);
 
 public:
   int insert_column_ids_into_column_group(ObISQLClient &sql_client,
@@ -450,9 +537,12 @@ public:
                         const int64_t schema_version,
                         const bool only_history = false);
   int insert_temp_table_info(common::ObISQLClient &trans, const ObTableSchema &table_schema);
+  int batch_insert_temp_table_info(common::ObISQLClient &trans, const ObIArray<ObTableSchema> &tables);
   int delete_from_all_temp_table(common::ObISQLClient &sql_client,
                                  const uint64_t tenant_id,
                                  const uint64_t table_id);
+  int truncate_table_stats_info(ObISQLClient &sql_client,
+                                const ObTableSchema &table_schema);
   int update_single_column_group(ObISQLClient &sql_client,
                                  const ObTableSchema &new_table_schema,
                                  const ObColumnGroupSchema &ori_cg_schema,
@@ -462,16 +552,18 @@ public:
                                                  const int64_t insert_schema_version,
                                                  const ObTableSchema &orig_table_schema,
                                                  const ObTableSchema &new_table_schema);
-private:
-  int log_operation_wrapper(
-      ObSchemaOperation &opt,
-      common::ObISQLClient &sql_client);
   int exec_update(common::ObISQLClient &sql_client,
                   const uint64_t tenant_id,
                   const uint64_t table_id,
                   const char *table_name,
                   share::ObDMLSqlSplicer &dml,
                   int64_t &affected_rows);
+  int add_single_column(common::ObISQLClient &sql_client, const ObColumnSchemaV2 &column,
+                        const bool only_history = false);
+private:
+  int log_operation_wrapper(
+      ObSchemaOperation &opt,
+      common::ObISQLClient &sql_client);
   int exec_insert(common::ObISQLClient &sql_client,
                   const uint64_t tenant_id,
                   const uint64_t table_id,
@@ -489,9 +581,9 @@ private:
                                 const ObColumnSchemaV2 &column);
   bool is_user_partition_table(const ObTableSchema &table_schema);
   bool is_user_subpartition_table(const ObTableSchema &table);
-  int check_ddl_allowed(const ObSimpleTableSchemaV2 &table_schema);
+  static int check_ddl_allowed(const ObSimpleTableSchemaV2 &table_schema);
 
-  int check_column_store_valid(const ObTableSchema &table,
+  static int check_column_store_valid(const ObTableSchema &table,
                                const uint64_t data_version);
   int exec_insert_column_group(common::ObISQLClient &sql_client,
                                const ObTableSchema &table,
@@ -507,6 +599,14 @@ private:
                                        const ObColumnGroupSchema &column_group,
                                        const ObIArray<uint64_t> &column_ids,
                                        const bool is_history);
+  int append_column_group_dml_for_create_table(const ObTableSchema &table,
+                                               const uint64_t data_version,
+                                               ObDMLSqlSplicer &cg_dml,
+                                               ObDMLSqlSplicer &cg_history_dml,
+                                               ObDMLSqlSplicer &mapping_dml,
+                                               ObDMLSqlSplicer &mapping_history_dml,
+                                               int64_t &column_group_cnt,
+                                               int64_t &mapping_cnt);
 
   int delete_column_group(ObISQLClient &sql_clinet,
                           const ObTableSchema &table,

@@ -53,6 +53,7 @@ select_hint_begin       (select{space}*(\/\*([^+*]|\*+[^*\/])*\*+\/{space}*)*(\/
 update_hint_begin       (update{space}*(\/\*([^+*]|\*+[^*\/])*\*+\/{space}*)*(\/\*\+({space}*hint{space}+)?))
 delete_hint_begin       (delete{space}*(\/\*([^+*]|\*+[^*\/])*\*+\/{space}*)*(\/\*\+({space}*hint{space}+)?))
 insert_hint_begin       (insert{space}*(\/\*([^+*]|\*+[^*\/])*\*+\/{space}*)*(\/\*\+({space}*hint{space}+)?))
+merge_hint_begin        (merge{space}*(\/\*([^+*]|\*+[^*\/])*\*+\/{space}*)*(\/\*\+({space}*hint{space}+)?))
 replace_hint_begin      (replace{space}*(\/\*([^+*]|\*+[^*\/])*\*+\/{space}*)*(\/\*\+({space}*hint{space}+)?))
 load_data_hint_begin    (load{space}+data{space}*(\/\*([^+*]|\*+[^*\/])*\*+\/{space}*)*(\/\*\+({space}*hint{space}+)?))
 create_hint_begin    (create{space}*(\/\*([^+*]|\*+[^*\/])*\*+\/{space}*)*(\/\*\+({space}*hint{space}+)?))
@@ -962,6 +963,12 @@ Timestamp{whitespace}?\"[^\"]*\" {
   p->is_ignore_token_ = p->is_ignore_hint_;
   return INSERT_HINT_BEGIN;
 }
+{merge_hint_begin} {
+  BEGIN(hint);
+  ParseResult *p = (ParseResult *)yyextra;
+  p->is_ignore_token_ = p->is_ignore_hint_;
+  return MERGE_HINT_BEGIN;
+}
 {replace_hint_begin} {
   BEGIN(hint);
   ParseResult *p = (ParseResult *)yyextra;
@@ -1007,6 +1014,11 @@ Timestamp{whitespace}?\"[^\"]*\" {
 <hint>INDEX_DESC { return INDEX_DESC_HINT; }
 <hint>NO_INDEX { return NO_INDEX_HINT; }
 <hint>UNION_MERGE { return UNION_MERGE_HINT; }
+<hint>INDEX_MERGE { return INDEX_MERGE_HINT; }
+<hint>NO_INDEX_MERGE { return NO_INDEX_MERGE_HINT; }
+<hint>PRE_FILTER { return PRE_FILTER; }
+<hint>POST_FILTER { return POST_FILTER; }
+<hint>VECTOR_INDEX { return VECTOR_INDEX_HINT; }
 <hint>USE_DAS { return USE_DAS_HINT; }
 <hint>NO_USE_DAS { return NO_USE_DAS_HINT; }
 <hint>INDEX_SS { return INDEX_SS_HINT; }
@@ -1023,6 +1035,9 @@ Timestamp{whitespace}?\"[^\"]*\" {
 <hint>WEAK  { return WEAK; }
 <hint>STRONG  { return STRONG; }
 <hint>FROZEN  { return FROZEN; }
+<hint>EXCLUSIVE { return EXCLUSIVE; }
+<hint>SHARE { return SHARE; }
+<hint>ROW { return ROW; }
 <hint>NONE  { return NONE; }
 <hint>DEFAULT  { return DEFAULT; }
 <hint>MAX_CONCURRENT { return MAX_CONCURRENT; }
@@ -1204,6 +1219,9 @@ Timestamp{whitespace}?\"[^\"]*\" {
 <hint>PX_NODE_POLICY {return PX_NODE_POLICY; }
 <hint>PX_NODE_ADDRS {return PX_NODE_ADDRS; }
 <hint>PX_NODE_COUNT {return PX_NODE_COUNT; }
+<hint>DISABLE_OP_RICH_FORMAT { return DISABLE_OP_RICH_FORMAT; }
+<hint>DISABLE_TRIGGER { return DISABLE_TRIGGER; }
+<hint>TABLE_LOCK_MODE { return TABLE_LOCK_MODE; }
 <hint>{identifier} {
   if (!(IS_FAST_PARAMETERIZE)) {
     check_value(yylval);

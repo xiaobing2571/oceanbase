@@ -281,7 +281,7 @@ int ObBackupTaskIndexRebuilderMgr::check_is_last_item_for_table_key_(
 
 ObBackupTabletIndexBlockBuilderMgr::ObBackupTabletIndexBlockBuilderMgr()
   : is_inited_(false),
-    mutex_(),
+    mutex_(common::ObLatchIds::BACKUP_TABLET_INDEX_BLOCK_BUILDER_MUTEX),
     tenant_id_(OB_INVALID_ID),
     ls_id_(),
     sstable_builder_map_()
@@ -679,7 +679,7 @@ int ObBackupTabletIndexBlockBuilderMgr::remove_sstable_index_builder(const commo
 
 ObBackupTabletSSTableIndexBuilderMgr::ObBackupTabletSSTableIndexBuilderMgr()
   : is_inited_(false),
-    mutex_(),
+    mutex_(common::ObLatchIds::BACKUP_TABLET_SS_TABLE_INDEX_BUILDER_MUTEX),
     tablet_id_(),
     table_keys_(),
     builders_(),
@@ -877,9 +877,13 @@ int ObBackupTabletSSTableIndexBuilderMgr::get_merge_type_(
     LOG_WARN("table key is not valid", K(ret), K(table_key));
   } else if (table_key.is_major_sstable()) {
     merge_type = compaction::ObMergeType::MAJOR_MERGE;
+  } else if (table_key.is_inc_major_type_sstable()) {
+    merge_type = compaction::ObMergeType::MAJOR_MERGE;
   } else if (table_key.is_minor_sstable()) {
     merge_type = compaction::ObMergeType::MINOR_MERGE;
   } else if (table_key.is_ddl_dump_sstable()) {
+    merge_type = compaction::ObMergeType::MAJOR_MERGE;
+  } else if (table_key.is_inc_major_ddl_dump_sstable()) {
     merge_type = compaction::ObMergeType::MAJOR_MERGE;
   } else if (table_key.is_mds_mini_sstable()) {
     merge_type = compaction::ObMergeType::MDS_MINI_MERGE;
@@ -900,7 +904,7 @@ int ObBackupTabletSSTableIndexBuilderMgr::prepare_data_store_desc_(const share::
   data_store_desc.reset();
   compaction::ObMergeType merge_type;
   ObTablet *tablet = NULL;
-
+  int32_t private_transfer_epoch = -1;
   if (!ls_id.is_valid() || !tablet_handle.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("get invalid args", K(ret), K(ls_id), K(tablet_handle));
@@ -909,6 +913,8 @@ int ObBackupTabletSSTableIndexBuilderMgr::prepare_data_store_desc_(const share::
   } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet should not be NULL", K(ret), K(tablet_handle));
+  } else if (OB_FAIL(tablet->get_private_transfer_epoch(private_transfer_epoch))) {
+    LOG_WARN("failed to get private transfer epoch", K(ret), "tablet_meta", tablet->get_tablet_meta());
   } else {
     if (is_mds_merge(merge_type)) {
       const ObStorageSchema *storage_schema = ObMdsSchemaHelper::get_instance().get_storage_schema();
@@ -926,7 +932,8 @@ int ObBackupTabletSSTableIndexBuilderMgr::prepare_data_store_desc_(const share::
                                               tablet->get_snapshot_version(),
                                               0/*cluster_version*/,
                                               false/*micro_index_clustered*/,
-                                              tablet->get_transfer_seq(),
+                                              private_transfer_epoch,
+                                              0/*concurrent_cnt*/,
                                               tablet->get_reorganization_scn(),
                                               table_key.get_end_scn()))) {
         LOG_WARN("failed to init static desc", K(ret), KPC(storage_schema));
@@ -958,7 +965,8 @@ int ObBackupTabletSSTableIndexBuilderMgr::prepare_data_store_desc_(const share::
                                         tablet->get_snapshot_version(),
                                         0/*cluster_version*/,
                                         false/*micro_index_clustered*/,
-                                        tablet->get_transfer_seq(),
+                                        private_transfer_epoch,
+                                        0/*concurrent_cnt*/,
                                         tablet->get_reorganization_scn(),
                                         table_key.get_end_scn(),
                                         cg_schema,
@@ -968,6 +976,9 @@ int ObBackupTabletSSTableIndexBuilderMgr::prepare_data_store_desc_(const share::
           int64_t column_cnt = sstable_meta_handle.get_sstable_meta().get_basic_meta().column_cnt_;
           if (OB_FAIL(data_store_desc.get_col_desc().mock_valid_col_default_checksum_array(column_cnt))) {
             LOG_WARN("fail to mock valid col default checksum array", K(ret));
+          } else if (OB_FAIL(data_store_desc.get_desc().update_basic_info_from_macro_meta(
+                                    sstable_meta_handle.get_sstable_meta().get_basic_meta()))) {
+            LOG_WARN("failed to update basic info from macro meta", K(ret));
           }
         }
       }

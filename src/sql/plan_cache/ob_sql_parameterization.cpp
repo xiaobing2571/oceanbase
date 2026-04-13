@@ -25,7 +25,9 @@ SqlInfo::SqlInfo() :
   last_active_time_(0),
   hit_count_(0),
   ps_need_parameterized_(true),
-  need_check_fp_(false)
+  need_check_fp_(false),
+  origin_pl_param_count_(0),
+  enable_pl_sql_parameterize_(false)
 {
 }
 
@@ -59,7 +61,10 @@ struct TransformTreeCtx
   const ObIArray<FixedParamValue> *udr_fixed_params_;
   bool ignore_scale_check_;
   bool is_from_pl_;
+  bool enable_pl_sql_parameterize_;
   ObItemType parent_type_;
+  int64_t ps_question_num_;
+  int64_t pl_param_count_;
   TransformTreeCtx();
 };
 
@@ -122,7 +127,10 @@ TransformTreeCtx::TransformTreeCtx() :
  udr_fixed_params_(NULL),
  ignore_scale_check_(false),
  is_from_pl_(false),
- parent_type_(T_INVALID)
+  enable_pl_sql_parameterize_(false),
+ parent_type_(T_INVALID),
+ ps_question_num_(0),
+ pl_param_count_(0)
 {
 }
 
@@ -179,9 +187,13 @@ int ObSqlParameterization::transform_syntax_tree(ObIAllocator &allocator,
     ctx.mode_ = execution_mode;
     ctx.assign_father_level_ = NO_VALUES;
     ctx.is_from_pl_ = is_from_pl;
+    ctx.enable_pl_sql_parameterize_ = sql_info.enable_pl_sql_parameterize_;
     ctx.parent_type_ = T_INVALID;
+    ctx.pl_param_count_ = sql_info.origin_pl_param_count_;
 
-    if (OB_FAIL(transform_tree(ctx, session))) {
+    if (OB_FAIL(ret)) {
+      // do nothing
+    } else if (OB_FAIL(transform_tree(ctx, session))) {
       if (OB_NOT_SUPPORTED != ret) {
         SQL_PC_LOG(WARN, "fail to transform syntax tree", K(ret));
       }
@@ -219,7 +231,7 @@ int ObSqlParameterization::transform_syntax_tree(ObIAllocator &allocator,
         } // for end
       }
     }
-    SQL_PC_LOG(DEBUG, "after transform_tree",
+    SQL_PC_LOG(DEBUG, "after transform_tree", K(ctx.mode_),
                "result_tree_", SJ(ObParserResultPrintWrapper(*tree)));
   }
   return ret;
@@ -256,6 +268,7 @@ int ObSqlParameterization::is_fast_parse_const(TransformTreeCtx &ctx)
           || (T_IEEE754_NAN == ctx.tree_->type_ && true == ctx.tree_->is_hidden_const_)
           || (T_SFU_INT == ctx.tree_->type_ && true == ctx.tree_->is_hidden_const_)
           || (T_FLOAT == ctx.tree_->type_ && true == ctx.tree_->is_hidden_const_)
+          || (IS_DATATYPE_OP(ctx.tree_->type_) && true == ctx.tree_->is_hidden_const_)
           || true == ctx.tree_->is_forbid_parameter_) {
         ctx.is_fast_parse_const_ = false;
       } else {
@@ -366,6 +379,10 @@ bool ObSqlParameterization::is_tree_not_param(const ParseNode *tree)
   } else if (T_CHAR_CHARSET == tree->type_) {
     ret_bool = true;
   } else if (T_WIN_NAMED_WINDOWS == tree->type_) {//name window无法参数化，因为无法保证其参数化顺序
+    ret_bool = true;
+  } else if (T_VEC_INDEX_PARAMS == tree->type_) {
+    ret_bool = true;
+  } else if (T_INDEX_DATA_GEN_EXPRESSION == tree->type_) {
     ret_bool = true;
   } else {
     // do nothing
@@ -506,6 +523,8 @@ int ObSqlParameterization::transform_tree(TransformTreeCtx &ctx,
   } else if (OB_FAIL(ObSQLUtils::check_enable_mysql_compatible_dates(&session_info, false/*is_ddl*/,
                        enable_mysql_compatible_dates))) {
     LOG_WARN("fail to check enable mysql compatible dates", K(ret));
+  } else if (OB_FAIL(mark_special_hidden_const_node(*ctx.tree_))) {
+    LOG_WARN("fail to mark special hidden const node", K(ret));
   } else {
     ParseNode *func_name_node = NULL;
     if (T_WHERE_SCOPE == ctx.expr_scope_ && T_FUN_SYS == ctx.tree_->type_) {
@@ -535,6 +554,9 @@ int ObSqlParameterization::transform_tree(TransformTreeCtx &ctx,
       // do nothing
     }
     if (OB_SUCC(ret)) {
+      if (T_QUESTIONMARK == ctx.tree_->type_) {
+        ctx.ps_question_num_++;
+      }
       ObObjParam value;
       ObAccuracy tmp_accuracy;
       bool is_fixed = true;
@@ -591,6 +613,7 @@ int ObSqlParameterization::transform_tree(TransformTreeCtx &ctx,
                               compat_type,
                               enable_mysql_compatible_dates,
                               session_info.get_min_const_integer_precision(),
+                              session_info.get_exec_min_cluster_version(),
                               ctx.is_from_pl_,
                               fmt_int_or_ch_decint))) {
             SQL_PC_LOG(WARN, "fail to resolve const", K(ret));
@@ -608,6 +631,12 @@ int ObSqlParameterization::transform_tree(TransformTreeCtx &ctx,
                 if (OB_FAIL(ctx.sql_info_->no_check_type_offsets_.push_back(ctx.tree_->value_))) {
                   SQL_PC_LOG(WARN, "failed to add no check type offsets", K(ret));
                 }
+              } else if(ctx.is_from_pl_ && ctx.enable_pl_sql_parameterize_) {
+                // for pl sql parameterize, if the param in value vector is not question mark, it should not check type
+                // because the param were already generated in fast parse, so just use the no_check_type_offsets_
+                if (OB_FAIL(ctx.sql_info_->no_check_type_offsets_.push_back(ctx.question_num_))) {
+                  SQL_PC_LOG(WARN, "failed to add no check type offsets", K(ret));
+                }
               } else {
                 value.set_need_to_check_type(false);
               }
@@ -615,6 +644,10 @@ int ObSqlParameterization::transform_tree(TransformTreeCtx &ctx,
               if (T_QUESTIONMARK == ctx.tree_->type_) {
                 if (OB_FAIL(ctx.sql_info_->need_check_type_param_offsets_.add_member(ctx.tree_->value_))) {
                   SQL_PC_LOG(WARN, "failed to add member", K(ctx.tree_->value_));
+                }
+              } else if(ctx.is_from_pl_ && ctx.enable_pl_sql_parameterize_) {
+                if (OB_FAIL(ctx.sql_info_->need_check_type_param_offsets_.add_member(ctx.question_num_))) {
+                  SQL_PC_LOG(WARN, "failed to add no check type offsets", K(ret));
                 }
               } else {
                 value.set_need_to_check_type(true); 
@@ -655,14 +688,20 @@ int ObSqlParameterization::transform_tree(TransformTreeCtx &ctx,
             // so the constant cannot be resolved as a question mark, and there is no need to
             // add it to the param store.
             ObItemType node_type;
-            if (!is_execute_mode(ctx.mode_)) {
+            if (!is_execute_mode(ctx.mode_) || (ctx.is_from_pl_ && ctx.enable_pl_sql_parameterize_)) {
               node_type = ctx.tree_->type_;
               ctx.tree_->type_ = T_QUESTIONMARK;
               ctx.tree_->raw_param_idx_ = ctx.sql_info_->total_;
-              ctx.tree_->value_ = ctx.question_num_;
+              if (ctx.is_from_pl_ && ctx.enable_pl_sql_parameterize_) {
+                ctx.tree_->value_ = ctx.sql_info_->total_;
+              } else {
+                ctx.tree_->value_ = ctx.question_num_;
+              }
             }
+
             ctx.question_num_++;
             ctx.sql_info_->total_++;
+
             if (1 == ctx.tree_->is_num_must_be_pos_ && OB_SUCC(ret)
                 && OB_FAIL(ctx.sql_info_->must_be_positive_index_.add_member(ctx.tree_->raw_param_idx_))) {
               LOG_WARN("failed to add bitset member", K(ret));
@@ -698,12 +737,18 @@ int ObSqlParameterization::transform_tree(TransformTreeCtx &ctx,
               //do nothing
             } else if (!is_execute_mode(ctx.mode_) && OB_FAIL(ctx.params_->push_back(value))) {
               SQL_PC_LOG(WARN, "fail to push into params", K(ret));
-            } else if (is_udr_not_param(ctx) && OB_FAIL(add_not_param_flag(ctx.tree_, *ctx.sql_info_))) {
+            } else if (is_udr_not_param(ctx) && OB_FAIL(add_not_param_flag(ctx.tree_, *ctx.sql_info_, ctx.mode_))) {
               SQL_PC_LOG(WARN, "fail to add not param flag", K(ret));
             }
           }
-        } else if (OB_FAIL(add_not_param_flag(ctx.tree_, *ctx.sql_info_))) { //not param
+        } else if (OB_FAIL(add_not_param_flag(ctx.tree_, *ctx.sql_info_, ctx.mode_))) { //not param
           SQL_PC_LOG(WARN, "fail to add not param flag", K(ret));
+        } else {
+          if (PL_EXECUTE_MODE == ctx.mode_ &&
+              T_QUESTIONMARK == ctx.tree_->type_ &&
+              ctx.enable_pl_sql_parameterize_) {
+            ctx.question_num_++;
+          }
         }
         if (ctx.sql_info_->need_check_fp_ && ret == OB_NOT_SUPPORTED) {
           LOG_WARN("print tree", K(session_info.get_current_query_string()),
@@ -881,7 +926,7 @@ int ObSqlParameterization::transform_tree(TransformTreeCtx &ctx,
           }
 
           if (OB_SUCC(ret)) {
-            if (OB_FAIL(mark_tree(ctx.tree_ , *ctx.sql_info_))) {
+            if (OB_FAIL(mark_tree(ctx, ctx.tree_ , *ctx.sql_info_))) {
               SQL_PC_LOG(WARN, "fail to mark function tree", K(ctx.tree_), K(ret));
             }
           }
@@ -925,7 +970,10 @@ int ObSqlParameterization::transform_tree(TransformTreeCtx &ctx,
               // select a + 1 as 'a'，'a'不能被参数化，但是它在raw_params数组内的下标必须是计算了1的下标之后才能得到
               // alias node只有一个或者0个参数
               for (int64_t param_cnt = 0; OB_SUCC(ret) && param_cnt < root->param_num_; param_cnt++) {
-                if (OB_FAIL(ctx.sql_info_->not_param_index_.add_member(ctx.sql_info_->total_++))) {
+                if (PL_EXECUTE_MODE == ctx.mode_ && ctx.sql_info_->enable_pl_sql_parameterize_ &&
+                    OB_FAIL(ctx.sql_info_->ps_not_param_offsets_.push_back(ctx.sql_info_->total_))) {
+                  LOG_WARN("pushback offset failed", K(ctx.sql_info_->total_));
+                } else if (OB_FAIL(ctx.sql_info_->not_param_index_.add_member(ctx.sql_info_->total_++))) {
                   SQL_PC_LOG(WARN, "failed to add member", K(ctx.sql_info_->total_), K(ret));
                 } else if (OB_FAIL(add_varchar_charset(root, *ctx.sql_info_))) {
                   SQL_PC_LOG(WARN, "fail to add varchar charset", K(ret));
@@ -962,6 +1010,43 @@ int ObSqlParameterization::transform_tree(TransformTreeCtx &ctx,
     }
     if (is_project_list_scope) {
       ctx.is_project_list_scope_ = false;
+    }
+  }
+  return ret;
+}
+
+int ObSqlParameterization::mark_array_hidden_const_node(ParseNode *root)
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(root)) {
+    root->is_hidden_const_ = 1;
+    for (int64_t i = 0; OB_SUCC(ret) && i < root->num_child_; ++i) {
+      if (OB_ISNULL(root->children_)) {
+        // do nothing
+      } else if (OB_FAIL(SMART_CALL(mark_array_hidden_const_node(root->children_[i])))) {
+        SQL_PC_LOG(WARN, "failed to mark array hidden const node", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSqlParameterization::mark_special_hidden_const_node(ParseNode &root)
+{
+  int ret = OB_SUCCESS;
+  if (T_CAST_ARGUMENT == root.type_ && T_COLLECTION == root.int16_values_[OB_NODE_CAST_TYPE_IDX]) {
+    /**
+     * CAST AS ARRAY(SMALLINT)
+     * CAST AS ARRAY(varchar(64))
+     * CAST AS ARRAY(ARRAY(INT))
+     */
+    for (int64_t i = 0; OB_SUCC(ret) && i < root.num_child_; ++i) {
+      if (OB_ISNULL(root.children_)) {
+        ret = OB_INVALID_ARGUMENT;
+        SQL_PC_LOG(WARN, "invalid argument", K(root.children_), K(ret));
+      } else if (OB_FAIL(mark_array_hidden_const_node(root.children_[i]))) {
+        SQL_PC_LOG(WARN, "failed to mark array hidden const node", K(ret));
+      }
     }
   }
   return ret;
@@ -1067,6 +1152,8 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
   if (OB_SUCCESS != tmp_ret) {
     sql_info.need_check_fp_ = true;
   }
+  sql_info.origin_pl_param_count_ = pc_ctx.sql_ctx_.origin_pl_param_count_;
+  sql_info.enable_pl_sql_parameterize_ = pc_ctx.sql_ctx_.enable_pl_sql_parameterize_;
   int64_t reserved_cnt = 0;
   if (OB_ISNULL(session = pc_ctx.exec_ctx_.get_my_session())) {
     ret = OB_ERR_UNEXPECTED;
@@ -1079,14 +1166,19 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
     fp_ctx.is_format_ = false;
   }
 
+  // is_from_pl: used for identify whether to use the PL SQL parameterization logic
+  const bool is_from_pl = ((PC_PL_MODE == pc_ctx.mode_) && is_execute_mode(mode)
+                              && sql_info.enable_pl_sql_parameterize_);
+
   if (OB_FAIL(ret)) {
   } else if (is_prepare_mode(mode)
-            || is_transform_outline
-            || (is_text_mode(mode) && pc_ctx.force_enable_plan_tracing_)
+            || (is_text_mode(mode)
+                && (is_transform_outline
+                    || pc_ctx.force_enable_plan_tracing_
 #ifdef OB_BUILD_SPM
-            || pc_ctx.sql_ctx_.spm_ctx_.is_retry_for_spm_
+                    || pc_ctx.sql_ctx_.spm_ctx_.is_retry_for_spm_
 #endif
-            ) {
+            ))) {
     // if so, faster parser is needed
     // otherwise, fast parser has been done before
     pc_ctx.fp_result_.reset();
@@ -1097,6 +1189,7 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
     } else if (pc_ctx.exec_ctx_.has_dynamic_values_table()) {
       raw_sql = pc_ctx.new_raw_sql_;
     }
+
     if (OB_FAIL(fast_parser(allocator,
                             fp_ctx,
                             raw_sql,
@@ -1114,22 +1207,35 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
              || OB_FAIL(sql_info.fixed_param_idx_.reserve(reserved_cnt)))) {
     LOG_WARN("failed to reserve array", K(ret));
   } else if (OB_FAIL(transform_syntax_tree(allocator,
-                                           *session,
-                                           is_execute_mode(mode) ? NULL : &pc_ctx.fp_result_.raw_params_,
-                                           tree,
-                                           sql_info,
-                                           params,
-                                           is_prepare_mode(mode) ? NULL : &pc_ctx.select_item_param_infos_,
-                                           fix_param_store,
-                                           is_transform_outline,
-                                           mode,
-                                           &pc_ctx.fixed_param_info_list_))) {
+                                      *session,
+                                      (PS_EXECUTE_MODE == mode || (PL_EXECUTE_MODE == mode && !is_from_pl)) ?
+                                          NULL : &pc_ctx.fp_result_.raw_params_,
+                                      tree,
+                                      sql_info,
+                                      params,
+                                      is_prepare_mode(mode) ? NULL : &pc_ctx.select_item_param_infos_,
+                                      fix_param_store,
+                                      is_transform_outline,
+                                      mode,
+                                      &pc_ctx.fixed_param_info_list_,
+                                      is_from_pl))) {
     if (OB_NOT_SUPPORTED != ret) {
       SQL_PC_LOG(WARN, "fail to normal parameterized parser tree", K(ret));
     }
   } else {
-    need_parameterized = (!(PC_PS_MODE == pc_ctx.mode_ || PC_PL_MODE == pc_ctx.mode_)
+    need_parameterized = (!(PC_PS_MODE == pc_ctx.mode_ || (PC_PL_MODE == pc_ctx.mode_ && !is_from_pl))
                           || (is_prepare_mode(mode) && sql_info.ps_need_parameterized_));
+    if (!is_prepare_mode(mode)) {
+      // build ObPCParamConstraint
+      for (int i = 0; OB_SUCC(ret) && i < sql_info.params_constraint_.count(); ++i) {
+        if (OB_FAIL(sql_info.params_constraint_.at(i)->build(params, NULL))) {
+          LOG_WARN("failed to build param constraint", K(ret), K(i), KP(sql_info.params_constraint_.at(i)));
+        }
+      }
+      if (OB_SUCC(ret) && sql_info.params_constraint_.count() > 0){
+        OZ(pc_ctx.params_constraint_.assign(sql_info.params_constraint_));
+      }
+    }
   }
 
   if (OB_FAIL(ret)) {
@@ -1137,7 +1243,32 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
     LOG_WARN("failed to get related session vars", K(ret));
   } else if (OB_FAIL(pc_ctx.sql_ctx_.set_related_user_var_names(user_var_names, allocator))) {
     LOG_WARN("failed to set related user var names for sql ctx", K(ret));
-  } else if (is_execute_mode(mode)) {
+  } else if (is_execute_mode(mode) && is_from_pl) {
+    if (OB_FAIL(gen_ps_not_param_var(sql_info.ps_not_param_offsets_, params, pc_ctx))) {
+      SQL_PC_LOG(WARN, "fail to gen ps not param var", K(ret));
+    } else if (OB_FAIL(construct_no_check_type_params(sql_info.no_check_type_offsets_,
+                                                      sql_info.need_check_type_param_offsets_,
+                                                      params))) {
+      SQL_PC_LOG(WARN, "fail to construct no check type params", K(ret));
+    } else {
+      if (OB_FAIL(pc_ctx.not_param_index_.add_members2(sql_info.not_param_index_))) {
+        LOG_WARN("fail to add not param index members", K(ret));
+      } else if (OB_FAIL(pc_ctx.neg_param_index_.add_members2(sql_info.neg_param_index_))) {
+        LOG_WARN("fail to add neg param index members", K(ret));
+      } else if (OB_FAIL(pc_ctx.neg_param_index_.add_members2(sql_info.trans_from_minus_index_))) {
+        LOG_WARN("failed to add trans from minus index members", K(ret));
+      } else if (OB_FAIL(pc_ctx.param_charset_type_.assign(sql_info.param_charset_type_))) {
+        LOG_WARN("fail to assign param charset type", K(ret));
+      } else if (OB_FAIL(pc_ctx.fixed_param_idx_.assign(sql_info.fixed_param_idx_))) {
+        LOG_WARN("fail to assign fixed param idx", K(ret));
+      } else if (OB_FAIL(pc_ctx.must_be_positive_index_.add_members2(sql_info.must_be_positive_index_))) {
+        LOG_WARN("failed to add bitset members", K(ret));
+      } else if (OB_FAIL(pc_ctx.fmt_int_or_ch_decint_idx_.add_members2(sql_info.fmt_int_or_ch_decint_idx_))){
+        LOG_WARN("failed to add bitset members", K(ret));
+      }
+    }
+  }
+  else if (is_execute_mode(mode) && PC_PL_MODE != pc_ctx.mode_) {
     if (OB_FAIL(gen_ps_not_param_var(sql_info.ps_not_param_offsets_, params, pc_ctx))) {
       SQL_PC_LOG(WARN, "fail to gen ps not param var", K(ret));
     } else if (OB_FAIL(construct_no_check_type_params(sql_info.no_check_type_offsets_,
@@ -1239,6 +1370,7 @@ int ObSqlParameterization::gen_ps_not_param_var(const ObIArray<int64_t> &offsets
                                                 ObPlanCacheCtx &pc_ctx)
 {
   int ret = OB_SUCCESS;
+
   pc_ctx.not_param_var_.set_capacity(offsets.count());
   for (int i = 0; OB_SUCC(ret) && i < offsets.count(); ++i) {
     const int64_t offset = offsets.at(i);
@@ -1331,6 +1463,9 @@ int ObSqlParameterization::construct_not_param(const ObString &no_param_sql,
   if (OB_ISNULL(pc_param)) {
     ret = OB_INVALID_ARGUMENT;
     SQL_PC_LOG(WARN, "invalid argument", K(ret));
+  } else if (OB_ISNULL(no_param_sql.ptr()) || no_param_sql.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_PC_LOG(WARN, "no_param_sql is empty or null", K(ret), K(no_param_sql), K(lbt()));
   } else {
     int32_t len = (int32_t)pc_param->node_->pos_ - idx;
     if (len > buf_len - pos) {
@@ -1975,13 +2110,67 @@ int ObSqlParameterization::add_param_flag(const ParseNode *node, SqlInfo &sql_in
   return ret;
 }
 
-int ObSqlParameterization::add_not_param_flag(const ParseNode *node, SqlInfo &sql_info)
+int ObSqlParameterization::get_cast_array_basic_type(const ParseNode *root, const ParseNode *&basic_type_node)
+{
+  int ret = OB_SUCCESS;
+  basic_type_node = nullptr;
+  if (OB_ISNULL(root)) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_PC_LOG(WARN, "invalid argument", K(ret));
+  } else if (root->type_ != T_CAST_ARGUMENT && root->type_ != T_COLLECTION) {
+    basic_type_node = root;
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < root->num_child_; ++i) {
+      if (OB_ISNULL(root->children_) || OB_ISNULL(root->children_[i])) {
+      } else if (OB_FAIL(SMART_CALL(get_cast_array_basic_type(root->children_[i], basic_type_node)))) {
+        SQL_PC_LOG(WARN, "failed get cast array basic type", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSqlParameterization::add_varchar_charset_and_fp_check(const ParseNode *node, SqlInfo &sql_info)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(node)) {
     ret = OB_INVALID_ARGUMENT;
     SQL_PC_LOG(WARN, "invalid argument", K(ret));
+  } else if (OB_FAIL(add_varchar_charset(node, sql_info))) {
+    SQL_PC_LOG(WARN, "fail to add varchar charset", K(ret));
+  }
+  if (sql_info.need_check_fp_) {
+    ObPCParseInfo p_info;
+    p_info.param_idx_ = sql_info.total_ - 1;
+    p_info.flag_ = NOT_PARAM;
+    p_info.raw_text_pos_ = node->sql_str_off_;
+    if (node->sql_str_off_ == -1) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("invalid str off", K(lbt()), K(node),
+          K(node->raw_param_idx_), K(get_type_name(node->type_)));
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(sql_info.parse_infos_.push_back(p_info))) {
+      SQL_PC_LOG(WARN, "fail to push parser info", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObSqlParameterization::add_not_param_flag(const ParseNode *node, SqlInfo &sql_info, SQL_EXECUTION_MODE mode)
+{
+  int ret = OB_SUCCESS;
+  bool pl_sql_parameterize = sql_info.enable_pl_sql_parameterize_ && PL_EXECUTE_MODE == mode;
+  if (OB_ISNULL(node)) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_PC_LOG(WARN, "invalid argument", K(ret));
   } else if (T_QUESTIONMARK == node->type_) {
+    if (pl_sql_parameterize) {
+      ParseNode *mutable_node = const_cast<ParseNode *>(node);
+      mutable_node->value_ = sql_info.total_;
+      mutable_node->raw_param_idx_ = sql_info.total_;
+      sql_info.total_++;
+    }
     if (OB_FAIL(sql_info.ps_not_param_offsets_.push_back(node->value_))) {
       LOG_WARN("pushback offset failed", K(node->value_));
     } else if (OB_FAIL(sql_info.not_param_index_.add_member(node->value_))) {
@@ -1991,50 +2180,38 @@ int ObSqlParameterization::add_not_param_flag(const ParseNode *node, SqlInfo &sq
              || T_COLLATION == node->type_
              || T_NULLX_CLAUSE == node->type_ // deal null clause on json expr
              || T_WEIGHT_STRING_LEVEL_PARAM == node->type_) {
-    for (int i = 0; OB_SUCC(ret) && i < node->param_num_; ++i) {
-      if (OB_FAIL(sql_info.not_param_index_.add_member(sql_info.total_++))) {
-        SQL_PC_LOG(WARN, "failed to add member", K(sql_info.total_));
-      } else if (OB_FAIL(add_varchar_charset(node, sql_info))) {
-        SQL_PC_LOG(WARN, "fail to add varchar charset", K(ret));
-      }
-      if (sql_info.need_check_fp_) {
-        ObPCParseInfo p_info;
-        p_info.param_idx_ = sql_info.total_ - 1;
-        p_info.flag_ = NOT_PARAM;
-        p_info.raw_text_pos_ = node->sql_str_off_;
-        if (node->sql_str_off_ == -1) {
-          ret = OB_NOT_SUPPORTED;
-          LOG_WARN("invalid str off", K(lbt()), K(node),
-              K(node->raw_param_idx_), K(get_type_name(node->type_)));
-        }
-        if (OB_FAIL(ret)) {
-
-        } else if (OB_FAIL(sql_info.parse_infos_.push_back(p_info))) {
-          SQL_PC_LOG(WARN, "fail to push parser info", K(ret));
+    const ParseNode *basic_node = node;
+    if (T_CAST_ARGUMENT == node->type_ && T_COLLECTION == node->int16_values_[OB_NODE_CAST_TYPE_IDX]
+      && OB_FAIL(get_cast_array_basic_type(node, basic_node))) {
+      LOG_WARN("failed to get cast array basic type", K(ret));
+    } else {
+      for (int i = 0; OB_SUCC(ret) && i < basic_node->param_num_; ++i) {
+        if (pl_sql_parameterize && OB_FAIL(sql_info.ps_not_param_offsets_.push_back(sql_info.total_))) {
+          LOG_WARN("pushback offset failed", K(sql_info.total_));
+        } else if (OB_FAIL(sql_info.not_param_index_.add_member(sql_info.total_++))) {
+          SQL_PC_LOG(WARN, "failed to add member", K(sql_info.total_));
+        } else if (OB_FAIL(add_varchar_charset_and_fp_check(basic_node, sql_info))) {
+          LOG_WARN("failed to add varchar charset and fp check", K(ret));
         }
       }
     }
   } else {
-    if (OB_FAIL(sql_info.not_param_index_.add_member(sql_info.total_++))) {
+    if (IS_DATATYPE_OP(node->type_) && node->param_num_ > 1) {
+      for (int i = 0; OB_SUCC(ret) && i < node->param_num_; ++i) {
+        if (pl_sql_parameterize && OB_FAIL(sql_info.ps_not_param_offsets_.push_back(sql_info.total_++))) {
+          LOG_WARN("pushback offset failed", K(node->value_));
+        } else if (PL_EXECUTE_MODE != mode && OB_FAIL(sql_info.not_param_index_.add_member(sql_info.total_++))) {
+          SQL_PC_LOG(WARN, "failed to add member", K(sql_info.total_));
+        } else if (OB_FAIL(add_varchar_charset_and_fp_check(node, sql_info))) {
+          LOG_WARN("failed to add varchar charset and fp check", K(ret));
+        }
+      }
+    } else if (pl_sql_parameterize && OB_FAIL(sql_info.ps_not_param_offsets_.push_back(sql_info.total_++))) {
+      LOG_WARN("pushback offset failed", K(node->value_));
+    } else if (PL_EXECUTE_MODE != mode && OB_FAIL(sql_info.not_param_index_.add_member(sql_info.total_++))) {
       SQL_PC_LOG(WARN, "failed to add member", K(sql_info.total_));
-    } else if (OB_FAIL(add_varchar_charset(node, sql_info))) {
-      SQL_PC_LOG(WARN, "fail to add varchar charset", K(ret));
-    }
-    if (sql_info.need_check_fp_) {
-      ObPCParseInfo p_info;
-      p_info.param_idx_ = sql_info.total_ - 1;
-      p_info.flag_ = NOT_PARAM;
-      p_info.raw_text_pos_ = node->sql_str_off_;
-      if (node->sql_str_off_ == -1) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_WARN("invalid str off", K(lbt()), K(node),
-            K(node->raw_param_idx_), K(get_type_name(node->type_)));
-      }
-      if (OB_FAIL(ret)) {
-
-      } else if (OB_FAIL(sql_info.parse_infos_.push_back(p_info))) {
-        SQL_PC_LOG(WARN, "fail to push parser info", K(ret));
-      }
+    } else if (OB_FAIL(add_varchar_charset_and_fp_check(node, sql_info))) {
+      LOG_WARN("failed to add varchar charset and fp check", K(ret));
     }
   }
 
@@ -2079,7 +2256,7 @@ int ObSqlParameterization::mark_args(ParseNode *arg_tree,
 // After mark this node, it has following mechanism:
 //       If a node is marked as cannot be parameterized,
 //       CUREENT NODE AND ALL NODES OF IT'S SUBTREE cannot be parameterized.
-int ObSqlParameterization::mark_tree(ParseNode *tree ,SqlInfo &sql_info)
+int ObSqlParameterization::mark_tree(TransformTreeCtx &ctx, ParseNode *tree ,SqlInfo &sql_info)
 {
   int ret = OB_SUCCESS;
   if (NULL == tree) {
@@ -2093,11 +2270,37 @@ int ObSqlParameterization::mark_tree(ParseNode *tree ,SqlInfo &sql_info)
       SQL_PC_LOG(WARN, "invalid argument", K(ret), K(node));
     } else {
       ObString func_name(node[0]->str_len_, node[0]->str_value_);
-      if ((0 == func_name.case_compare("USERENV")
-           || 0 == func_name.case_compare("UNIX_TIMESTAMP"))
+      // UNIX_TIMESTAMP结果精度受参数控制,对于其参数化过程特殊处理。
+      if (0 == func_name.case_compare("UNIX_TIMESTAMP") || 0 == func_name.case_compare("toUnixTimestamp")) {
+        if (1 == node[1]->num_child_) {
+          // EXECUTE模式但是子节点不为QUESTIONMARK 或 父节点已经判断不可参数化
+          if ((is_execute_mode(ctx.mode_) && node[1]->children_[0]->type_ != T_QUESTIONMARK) || ctx.not_param_ || is_tree_not_param(tree)) {
+            const int64_t ARGS_NUMBER_ONE = 1;
+            bool mark_arr[ARGS_NUMBER_ONE] = {1}; //0表示参数化, 1 表示不参数化
+            if (OB_FAIL(mark_args(node[1], mark_arr, ARGS_NUMBER_ONE, sql_info))) {
+              SQL_PC_LOG(WARN, "fail to mark arg", K(ret));
+            }
+          } else {
+            // UNIX_TIMESTAMP(literal) 可参数化为 UNIX_TIMESTAMP(?),但需要生成对应的参数约束，在计划匹配时检查
+            if (!is_prepare_mode(ctx.mode_) &&
+                node[1]->children_[0]->type_ > T_INVALID &&
+                node[1]->children_[0]->type_ < T_MAX_CONST) {
+              void *buf = ctx.allocator_->alloc(sizeof(ObPCUnixTimestampParamConstraint));
+              if (OB_ISNULL(buf)) {
+                ret = OB_ALLOCATE_MEMORY_FAILED;
+              } else {
+                ObPCUnixTimestampParamConstraint *constraint = new(buf)ObPCUnixTimestampParamConstraint((is_execute_mode(ctx.mode_) ? ctx.ps_question_num_ : ctx.question_num_));
+                sql_info.params_constraint_.push_back(constraint);
+              }
+            } else {
+              // UNIX_TIMESTAMP(EXPR) 可以正常参数化,这类sql可以共用一个计划,结果精度为6.
+              /*do nothing*/
+            }
+          }
+        }
+      } else if (0 == func_name.case_compare("USERENV")
           && (1 == node[1]->num_child_)) {
         // USERENV函数的返回类型是由参数的具体值来决定，如果参数化后，无法拿到具体值，所以暂时不进行参数化
-        // UNIX_TIMESTAMP(param_str)，结果的精度和param_str有关，不能参数化
         const int64_t ARGS_NUMBER_ONE = 1;
         bool mark_arr[ARGS_NUMBER_ONE] = {1}; //0表示参数化, 1 表示不参数化
         if (OB_FAIL(mark_args(node[1], mark_arr, ARGS_NUMBER_ONE, sql_info))) {
@@ -2132,7 +2335,9 @@ int ObSqlParameterization::mark_tree(ParseNode *tree ,SqlInfo &sql_info)
           SQL_PC_LOG(WARN, "fail to mark substr arg", K(ret));
         }
       } else if ((0 == func_name.case_compare("str_to_date") // STR_TO_DATE(str,format)
+                  || (lib::is_mysql_mode() && 0 == func_name.case_compare("to_date") ) // TO_DATE(str,format) - MySQL mode cannot parameterize, need deduce type depend on format
                   || 0 == func_name.case_compare("date_format") //DATE_FORMAT(date,format)
+                  || 0 == func_name.case_compare("formatDateTime") //formatDateTime(date,format)
                   || 0 == func_name.case_compare("from_unixtime")//FROM_UNIXTIME(unix_timestamp), FROM_UNIXTIME(unix_timestamp,format)
                   || 0 == func_name.case_compare("round")        //ROUND(X), ROUND(X,D)
                   || 0 == func_name.case_compare("left") // the length of result should be set with the value of the second param
@@ -2168,28 +2373,14 @@ int ObSqlParameterization::mark_tree(ParseNode *tree ,SqlInfo &sql_info)
         }
       } else if ((0 == func_name.case_compare("json_member_of"))) {
         sql_info.ps_need_parameterized_ = false;
-        if (2 == tree->num_child_) {
-          const int64_t ARGS_NUMBER_TWO = 2;
-          bool mark_arr[ARGS_NUMBER_TWO] = {0, 1}; //0表示参数化, 1 表示不参数化
-          if (OB_FAIL(mark_args(tree, mark_arr, ARGS_NUMBER_TWO, sql_info))) {
-            SQL_PC_LOG(WARN, "fail to mark substr arg", K(ret));
-          }
-        }
       } else if ((0 == func_name.case_compare("json_contains"))) {
         sql_info.ps_need_parameterized_ = false;
-        for (int64_t i = 0; OB_SUCC(ret) && i < tree->num_child_; i++) {
-          if (OB_ISNULL(tree->children_[i])) {
-            ret = OB_INVALID_ARGUMENT;
-            SQL_PC_LOG(WARN, "invalid argument", K(ret), K(tree->children_[i]));
-          } else if (1 != 1) {
-            tree->children_[i]->is_tree_not_param_ = true;
+        if (3 == node[1]->num_child_) {
+          const int64_t ARGS_NUMBER_THREE = 3;
+          bool mark_arr[ARGS_NUMBER_THREE] = {0, 0, 1}; // 第3个参数为path, 不能参数化
+          if (OB_FAIL(mark_args(node[1], mark_arr, ARGS_NUMBER_THREE, sql_info))) {
+            SQL_PC_LOG(WARN, "fail to mark arg", K(ret));
           }
-        }
-      } else if ((0 == func_name.case_compare("json_overlaps"))) {
-        const int64_t ARGS_NUMBER_TWO = 2;
-        bool mark_arr[ARGS_NUMBER_TWO] = {1, 1};
-        if (OB_FAIL(mark_args(node[1], mark_arr, ARGS_NUMBER_TWO, sql_info))) {
-          SQL_PC_LOG(WARN, "fail to mark arg", K(ret));
         }
       } else if ((0 == func_name.case_compare("json_schema_valid"))
                 || (0 == func_name.case_compare("json_schema_validation_report"))) {
@@ -2198,12 +2389,18 @@ int ObSqlParameterization::mark_tree(ParseNode *tree ,SqlInfo &sql_info)
         if (OB_FAIL(mark_args(node[1], mark_arr, ARGS_NUMBER_TWO, sql_info))) {
           SQL_PC_LOG(WARN, "fail to mark arg", K(ret));
         }
+      } else if (0 == func_name.case_compare("max_pt")) {
+        const int64_t ARGS_NUMBER_ONE = 1;
+        bool mark_arr[ARGS_NUMBER_ONE] = {1}; //0表示参数化, 1 表示不参数化
+        if (OB_FAIL(mark_args(node[1], mark_arr, ARGS_NUMBER_ONE, sql_info))) {
+          SQL_PC_LOG(WARN, "fail to mark arg", K(ret));
+        }
       }
     }
   } else if (T_OP_LIKE == tree->type_) {
     if (3 == tree->num_child_) {   // child[0] like child[1] escape child[2]
       const int64_t ARGS_NUMBER_THREE = 3;
-      bool mark_arr[ARGS_NUMBER_THREE] = {0, 1, 1}; //0表示参数化, 1 表示不参数化
+      bool mark_arr[ARGS_NUMBER_THREE] = {0, 0, 1}; //0表示参数化, 1 表示不参数化
       if (OB_FAIL(mark_args(tree, mark_arr, ARGS_NUMBER_THREE, sql_info))) {
         SQL_PC_LOG(WARN, "fail to mark substr arg", K(ret));
       }
@@ -2217,14 +2414,38 @@ int ObSqlParameterization::mark_tree(ParseNode *tree ,SqlInfo &sql_info)
       }
     } else { /*do nothing*/ }
   } else if(T_FUN_SYS_JSON_VALUE == tree->type_) {
-    if (10 != tree->num_child_) {
+    if (11 != tree->num_child_) {
       ret = OB_INVALID_ARGUMENT;
       SQL_PC_LOG(WARN, "invalid json value expr argument", K(ret), K(tree->num_child_)); 
     } else {
-      const int64_t ARGS_NUMBER_TEN = 10;
-      bool mark_arr[ARGS_NUMBER_TEN] = {0, 1, 1, 1, 1, 1, 1, 1, 1, 1};
-      if (OB_FAIL(mark_args(tree, mark_arr, ARGS_NUMBER_TEN, sql_info))) {
+      const int64_t ARGS_NUMBER_ELEVEN = 11;
+      bool mark_arr[ARGS_NUMBER_ELEVEN] = {0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+      if (OB_FAIL(mark_args(tree, mark_arr, ARGS_NUMBER_ELEVEN, sql_info))) {
         SQL_PC_LOG(WARN, "fail to mark substr arg", K(ret));
+      }
+    }
+  } else if(T_FUN_SYS_JSON_EXTRACT == tree->type_) {
+    if (2 != tree->num_child_) {
+      ret = OB_INVALID_ARGUMENT;
+      SQL_PC_LOG(WARN, "invalid json extract expr argument", K(ret), K(tree->num_child_));
+    } else {
+      sql_info.ps_need_parameterized_ = false;
+
+      if (OB_NOT_NULL(tree->children_[1])) {
+        tree->children_[1]->is_tree_not_param_ = true;
+      }
+
+      if (OB_SUCC(ret) && OB_NOT_NULL(tree->children_[0])
+          && T_EXPR_LIST == tree->children_[0]->type_) {
+        ParseNode *expr_list = tree->children_[0];
+        for (int64_t i = 1; OB_SUCC(ret) && i < expr_list->num_child_; i++) {
+          if (OB_ISNULL(expr_list->children_[i])) {
+            ret = OB_INVALID_ARGUMENT;
+            SQL_PC_LOG(WARN, "invalid argument", K(ret), K(expr_list->children_[i]));
+          } else {
+            expr_list->children_[i]->is_tree_not_param_ = true;
+          }
+        }
       }
     }
   } else if(T_FUN_SYS_JSON_OBJECT == tree->type_) {
@@ -2335,6 +2556,17 @@ int ObSqlParameterization::mark_tree(ParseNode *tree ,SqlInfo &sql_info)
       bool mark_arr[ARGS_NUMBER_TWO] = {1, 0};
       if (OB_FAIL(mark_args(tree, mark_arr, ARGS_NUMBER_TWO, sql_info))) {
         SQL_PC_LOG(WARN, "fail to mark treat arg", K(ret));
+      }
+    }
+  } else if (T_HYBRID_SEARCH == tree->type_) {
+    if (2 != tree->num_child_) {
+      ret = OB_INVALID_ARGUMENT;
+      SQL_PC_LOG(WARN, "invalid hybrid search expr argument", K(ret), K(tree->num_child_));
+    } else {
+      const int64_t ARGS_NUMBER_TWO = 2;
+      bool mark_arr[ARGS_NUMBER_TWO] = {1, 1};
+      if (OB_FAIL(mark_args(tree, mark_arr, ARGS_NUMBER_TWO, sql_info))) {
+        SQL_PC_LOG(WARN, "fail to mark hybrid search arg", K(ret));
       }
     }
   } else { /*do nothing*/ }
@@ -2598,7 +2830,7 @@ int ObSqlParameterization::resolve_paramed_const(SelectItemTraverseCtx &ctx)
   return ret;
 }
 
-int ObSqlParameterization::transform_minus_op(ObIAllocator &alloc, ParseNode *tree, bool is_from_pl)
+int ObSqlParameterization::transform_minus_op(ObIAllocator &alloc, ParseNode *tree, bool is_from_pl, bool enable_pl_sql_parameterize)
 {
   int ret = OB_SUCCESS;
   if (T_OP_MINUS != tree->type_) {
@@ -2619,7 +2851,7 @@ int ObSqlParameterization::transform_minus_op(ObIAllocator &alloc, ParseNode *tr
                  && tree->children_[1]->value_ >= 0)) {
     ParseNode *child = tree->children_[1];
     tree->type_ = T_OP_ADD;
-    if (!is_from_pl) {
+    if (!is_from_pl || enable_pl_sql_parameterize) {
       if (T_INT == child->type_) {
         child->value_ = -child->value_;
       }
@@ -2815,7 +3047,9 @@ bool ObSqlParameterization::is_vector_index_query(const ParseNode *tree)
             ObString func_name(curr->str_len_, curr->str_value_);
             bret = func_name.case_compare("l2_distance") == 0
                    || func_name.case_compare("negative_inner_product") == 0
-                   || func_name.case_compare("cosine_distance") == 0;
+                   || func_name.case_compare("cosine_distance") == 0
+                   || func_name.case_compare("semantic_distance") == 0
+                   || func_name.case_compare("semantic_vector_distance") == 0;
           }
         }
       }

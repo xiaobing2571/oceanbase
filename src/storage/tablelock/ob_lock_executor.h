@@ -57,6 +57,7 @@ public:
     has_inner_dml_write_ = false;
     have_saved_session_ = false;
     has_autonomous_tx_ = false;
+    is_inner_session_ = false;
     old_worker_timeout_ts_ = 0;
     old_phy_plan_timeout_ts_ = 0;
     last_insert_id_ = 0;
@@ -84,7 +85,8 @@ private:
   int open_inner_conn_();
   int close_inner_conn_();
   static void register_for_deadlock_(sql::ObSQLSessionInfo &session_info,
-                                     const transaction::ObTransID &parent_tx_id);
+                                     const transaction::ObTransID &parent_tx_id,
+                                     const int64_t parent_tx_start_ts);
   static int implicit_end_trans_(sql::ObSQLSessionInfo &session,
                                  sql::ObExecContext &ctx,
                                  bool is_rollback,
@@ -95,6 +97,7 @@ private:
   bool has_inner_dml_write_;
   bool have_saved_session_;
   bool has_autonomous_tx_;
+  bool is_inner_session_;
   int64_t old_worker_timeout_ts_;
   int64_t old_phy_plan_timeout_ts_;
   uint64_t last_insert_id_;

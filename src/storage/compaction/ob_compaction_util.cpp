@@ -66,9 +66,10 @@ const char *merge_level_to_str(const ObMergeLevel &merge_level)
 
 const static char * ObExecModeStr[] = {
   "EXEC_MODE_LOCAL",
-  "EXEC_MODE_CALC_CKM",
   "EXEC_MODE_OUTPUT",
-  "EXEC_MODE_VALIDATE"
+  "EXEC_MODE_VALIDATE",
+  "EXEC_MODE_LOCAL_WITH_SHARED_BLOCK",
+  "EXEC_MODE_UPLOAD_MINOR",
 };
 
 const char *exec_mode_to_str(const ObExecMode &exec_mode)
@@ -81,11 +82,6 @@ const char *exec_mode_to_str(const ObExecMode &exec_mode)
     str = "invalid_exec_mode";
   }
   return str;
-}
-
-bool is_valid_get_macro_seq_stage(const ObGetMacroSeqStage stage)
-{
-  return stage >= BUILD_INDEX_TREE && stage < MACRO_SEQ_TYPE_MAX;
 }
 
 } // namespace compaction

@@ -117,6 +117,12 @@ int ObExprDateFormat::calc_date_format(const ObExpr &expr, ObEvalCtx &ctx, ObDat
     if (CM_IS_WARN_ON_FAIL(cast_mode) && OB_ALLOCATE_MEMORY_FAILED != ret) {
       ret = OB_SUCCESS;
       expr_datum.set_null();
+    } else if (OB_UNLIKELY(ret == OB_INVALID_DATE_VALUE)) {
+      ObObjTypeClass obj_type = ob_obj_type_class(expr.args_[0]->datum_meta_.type_);
+      if (obj_type == ObTextTC || obj_type == ObStringTC) {
+        const ObString && date_str = date->get_string();
+        LOG_USER_ERROR(OB_INVALID_DATE_VALUE, date_str.length(), date_str.ptr(), "");
+      }
     }
   } else if (OB_UNLIKELY(format->get_string().empty())) {
     expr_datum.set_null();
@@ -445,7 +451,7 @@ int ObExprDateFormat::analyze_format(
           }
         } break;
         // MODE_YEAR_MONTH
-        case 'b': case 'c': case 'D': case 'd': case 'e': case 'M': case 'm': {
+        case 'b': case 'c': case 'D': case 'd': case 'e': case 'M': case 'm': case 'Q': {
           if (MODE_WEEK_ONLY == mode || MODE_YEAR_WEEK == mode) {
             mode = MODE_YEAR_MONTH_WEEK;
           } else if (MODE_YEAR_MONTH_WEEK != mode) {
@@ -463,7 +469,7 @@ int ObExprDateFormat::analyze_format(
           }
         } break;
         // MODE_YEAR_WEEK
-        case 'U': case 'u': case 'X': case 'x': case 'V': case 'v': {
+        case 'U': case 'u': case 'X': case 'x': case 'V': case 'v': case 'G': {
           if (MODE_YEAR_MONTH == mode) {
             mode = MODE_YEAR_MONTH_WEEK;
           } else if (MODE_YEAR_MONTH_WEEK != mode) {
@@ -547,7 +553,6 @@ int ObExprDateFormat::vector_date_format(const ObExpr &expr,
     for (int64_t idx = bound.start(); OB_SUCC(ret) && idx < bound.end(); ++idx) {
       if (skip.at(idx) || eval_flags.at(idx)) { continue; }
       res_vec->set_null(idx);
-      eval_flags.set(idx);
     }
   } else {
     const ObTimeZoneInfo *local_tz_info = (ObTimestampType == expr.args_[0]->datum_meta_.type_) ? tz_info : NULL;
@@ -655,6 +660,8 @@ int ObExprDateFormat::vector_date_format(const ObExpr &expr,
                 PROCESS_FORMAT_CASE('x', ObExprDateFormat::get_from_format_x);
                 PROCESS_FORMAT_CASE('V', ObExprDateFormat::get_from_format_V);
                 PROCESS_FORMAT_CASE('v', ObExprDateFormat::get_from_format_v);
+                PROCESS_FORMAT_CASE('Q', ObExprDateFormat::get_from_format_Q);
+                PROCESS_FORMAT_CASE('G', ObExprDateFormat::get_from_format_G);
                 default: {
                   if (no_skip_no_null) {
                     for (int64_t idx = bound.start(); OB_SUCC(ret) && idx < bound.end(); ++idx) {
@@ -689,18 +696,15 @@ int ObExprDateFormat::vector_date_format(const ObExpr &expr,
             for (int64_t idx = bound.start(); OB_SUCC(ret) && idx < bound.end(); ++idx) {
               res_vec->set_payload_shallow(idx, buf[idx], len[idx]);
             }
-            eval_flags.set_all(bound.start(), bound.end());
           } else {
             for (int64_t idx = bound.start(); OB_SUCC(ret) && idx < bound.end(); ++idx) {
               if (skip.at(idx) || eval_flags.at(idx)) {
                 continue;
               } else if (arg_vec->is_null(idx) || res_null[idx]) {
                 res_vec->set_null(idx);
-                eval_flags.set(idx);
                 continue;
               }
               res_vec->set_payload_shallow(idx, buf[idx], len[idx]);
-              eval_flags.set(idx);
             }
           }
         }
@@ -800,9 +804,17 @@ OB_INLINE int ObExprDateFormat::calc_year_only(COMMON_PART_FORMAT_FUNC_ARG_DECL)
     LOG_WARN("get date and usec from vec failed", K(ret));
   } else if (OB_UNLIKELY(ObTimeConverter::ZERO_DATE == date)) {
     year = dt_yday = usec = hour = minute = sec = fsec = 0; // USEC_ONLY, YEAR_ONLY
-  } else {
+  } else if (ObTimeConverter::could_calc_days_to_year_quickly(date)) {
     ObTimeConverter::days_to_year(date, year);
     calc_time_parts(usec);
+  } else {
+    ObTime ob_time(DT_TYPE_DATE);
+    if (OB_FAIL(ObTimeConverter::date_to_ob_time(date, ob_time))) {
+      LOG_WARN("failed to convert date to ob_time", K(ret), K(date));
+    } else {
+      year = ob_time.parts_[DT_YEAR];
+      calc_time_parts(usec);
+    }
   }
   return ret;
 }
@@ -818,9 +830,18 @@ OB_INLINE int ObExprDateFormat::calc_yday_only(COMMON_PART_FORMAT_FUNC_ARG_DECL)
     LOG_WARN("get date and usec from vec failed", K(ret));
   } else if (OB_UNLIKELY(ObTimeConverter::ZERO_DATE == date)) {
     year = dt_yday = usec = hour = minute = sec = fsec =  0; // USEC_ONLY, YEAR_ONLY, YDAY_ONLY
-  } else {
+  } else if (ObTimeConverter::could_calc_days_to_year_quickly(date)) {
     ObTimeConverter::days_to_year_ydays(date, year, dt_yday);
     calc_time_parts(usec);
+  } else {
+    ObTime ob_time_tmp(DT_TYPE_DATE);
+    if (OB_FAIL(ObTimeConverter::date_to_ob_time(date, ob_time_tmp))) {
+      LOG_WARN("failed to convert date to ob_time", K(ret), K(date));
+    } else {
+      year = ob_time_tmp.parts_[DT_YEAR];
+      dt_yday = ob_time_tmp.parts_[DT_YDAY];
+      calc_time_parts(usec);
+    }
   }
   return ret;
 }
@@ -852,10 +873,21 @@ OB_INLINE int ObExprDateFormat::calc_year_month(COMMON_PART_FORMAT_FUNC_ARG_DECL
     LOG_WARN("get date and usec from vec failed", K(ret));
   } else if (OB_UNLIKELY(ObTimeConverter::ZERO_DATE == date)) {
     year = month = usec = dt_yday = dt_mday = hour = minute = sec = fsec = 0;  // USEC_ONLY, YEAR_ONLY, YEAR_MONTH
-  } else {
+  } else if (ObTimeConverter::could_calc_days_to_year_quickly(date)) {
     ObTimeConverter::days_to_year_ydays(date, year, dt_yday);
     ObTimeConverter::ydays_to_month_mdays(year, dt_yday, month, dt_mday);
     calc_time_parts(usec);
+  } else {
+    ObTime ob_time_tmp(DT_TYPE_DATE);
+    if (OB_FAIL(ObTimeConverter::date_to_ob_time(date, ob_time_tmp))) {
+      LOG_WARN("failed to convert date to ob_time", K(ret), K(date));
+    } else {
+      year = ob_time_tmp.parts_[DT_YEAR];
+      dt_yday = ob_time_tmp.parts_[DT_YDAY];
+      month = ob_time_tmp.parts_[DT_MON];
+      dt_mday = ob_time_tmp.parts_[DT_MDAY];
+      calc_time_parts(usec);
+    }
   }
   return ret;
 }
@@ -870,10 +902,20 @@ OB_INLINE int ObExprDateFormat::calc_year_week(COMMON_PART_FORMAT_FUNC_ARG_DECL)
     LOG_WARN("get date and usec from vec failed", K(ret));
   } else if (OB_UNLIKELY(ObTimeConverter::ZERO_DATE == date)) {
     year = date = usec = dt_yday = dt_wday = hour = minute = sec = fsec = 0; // USEC_ONLY, YEAR_ONLY, WEEK_ONLY, YEAR_WEEK
-  } else {
+  } else if (ObTimeConverter::could_calc_days_to_year_quickly(date)) {
     dt_wday = WDAY_OFFSET[date % DAYS_PER_WEEK][4];
     ObTimeConverter::days_to_year_ydays(date, year, dt_yday);
     calc_time_parts(usec);
+  } else {
+    ObTime ob_time_tmp(DT_TYPE_DATE);
+    if (OB_FAIL(ObTimeConverter::date_to_ob_time(date, ob_time_tmp))) {
+      LOG_WARN("failed to convert date to ob_time", K(ret), K(date));
+    } else {
+      dt_wday = WDAY_OFFSET[date % DAYS_PER_WEEK][4];
+      year = ob_time_tmp.parts_[DT_YEAR];
+      dt_yday = ob_time_tmp.parts_[DT_YDAY];
+      calc_time_parts(usec);
+    }
   }
   return ret;
 }
@@ -889,11 +931,23 @@ OB_INLINE int ObExprDateFormat::calc_year_month_week(COMMON_PART_FORMAT_FUNC_ARG
   } else if (OB_UNLIKELY(ObTimeConverter::ZERO_DATE == date)) {
     // USEC_ONLY, YEAR_ONLY, YEAR_MONTH, WEEK_ONLY, YEAR_WEEK, YEAR_MONTH_WEEK
     year = month = date = usec = dt_yday = dt_mday = dt_wday = hour = minute = sec = fsec = 0;
-  } else {
+  } else if (ObTimeConverter::could_calc_days_to_year_quickly(date)) {
     dt_wday = WDAY_OFFSET[date % DAYS_PER_WEEK][4];
     ObTimeConverter::days_to_year_ydays(date, year, dt_yday);
     ObTimeConverter::ydays_to_month_mdays(year, dt_yday, month, dt_mday);
     calc_time_parts(usec);
+  } else {
+    ObTime ob_time_tmp(DT_TYPE_DATE);
+    if (OB_FAIL(ObTimeConverter::date_to_ob_time(date, ob_time_tmp))) {
+      LOG_WARN("failed to convert date to ob_time", K(ret), K(date));
+    } else {
+      dt_wday = WDAY_OFFSET[date % DAYS_PER_WEEK][4];
+      year = ob_time_tmp.parts_[DT_YEAR];
+      dt_yday = ob_time_tmp.parts_[DT_YDAY];
+      month = ob_time_tmp.parts_[DT_MON];
+      dt_mday = ob_time_tmp.parts_[DT_MDAY];
+      calc_time_parts(usec);
+    }
   }
   return ret;
 }
@@ -1098,6 +1152,32 @@ OB_INLINE int ObExprDateFormat::get_from_format_v(FORMAT_FUNC_ARG_DECL)
   }
   memcpy(res_buf, &ObFastFormatInt::DIGITS[week_monday << 1], 2);
   len += 2;
+  return ret;
+}
+OB_INLINE int ObExprDateFormat::get_from_format_Q(FORMAT_FUNC_ARG_DECL)
+{
+  int ret = OB_SUCCESS;
+  // Calculate quarter: (month + 2) / 3, result is 1-4
+  int32_t quarter = (month + 2) / 3;
+  *res_buf = quarter + '0';
+  len += 1;
+  return ret;
+}
+OB_INLINE int ObExprDateFormat::get_from_format_G(FORMAT_FUNC_ARG_DECL)
+{
+  int ret = OB_SUCCESS;
+  // ISO week year (4-digit), similar to %x but 4 digits instead of 2
+  // Use WEEK_MODE[3] which is ISO-8601 standard week (Monday as first day, first week must contain at least 4 days)
+  if (-2 == delta_monday) {
+    ObTimeConverter::to_week(WEEK_MODE[3], year, dt_yday, dt_wday, week_monday, delta_monday);
+  }
+  year += (int32_t)(delta_monday);
+  if (OB_UNLIKELY(-1 == year)) {
+    year = 0;
+  }
+  memcpy(res_buf, &ObFastFormatInt::DIGITS[(year / 100) * 2], 2);
+  memcpy(res_buf + 2, &ObFastFormatInt::DIGITS[(year % 100) * 2], 2);
+  len += 4;
   return ret;
 }
 OB_INLINE int ObExprDateFormat::get_from_format_f(FORMAT_FUNC_ARG_DECL) {

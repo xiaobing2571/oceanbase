@@ -48,6 +48,24 @@ int collect_user_level_priv_in_roles(const ObPrivMgr &priv_mgr,
   return ret;
 }
 
+int collect_sensitive_rule_level_priv_in_roles(const ObPrivMgr &priv_mgr,
+                                               const ObUserInfo &role_info,
+                                               const ObNeedPriv &need_priv,
+                                               ObNeedPriv &collected_priv)
+{
+  int ret = OB_SUCCESS;
+  ObPrivSet role_priv_set = OB_PRIV_SET_EMPTY;
+  ObSensitiveRulePrivSortKey sensitive_rule_priv_key(role_info.get_tenant_id(),
+                                                     role_info.get_user_id(),
+                                                     need_priv.sensitive_rule_);
+  if (OB_FAIL(priv_mgr.get_sensitive_rule_priv_set(sensitive_rule_priv_key, role_priv_set))) {
+    LOG_WARN("get sensitive_rule priv set failed", KR(ret), K(role_priv_set));
+  } else {
+    collected_priv.priv_set_ |= role_priv_set;
+  }
+  return ret;
+}
+
 int collect_catalog_level_priv_in_roles(const ObPrivMgr &priv_mgr,
                                         const ObUserInfo &role_info,
                                         const ObNeedPriv &need_priv,
@@ -172,6 +190,21 @@ int collect_column_level_all_priv_in_roles(const ObPrivMgr &priv_mgr,
     } else if (priv_set != OB_PRIV_SET_EMPTY) {
       collected_priv.priv_set_ |= priv_set;
     }
+  }
+  return ret;
+}
+
+int collect_user_sensitive_rule_level_priv_in_roles(const ObPrivMgr &priv_mgr,
+                                                    const ObUserInfo &role_info,
+                                                    const ObNeedPriv &need_priv,
+                                                    ObNeedPriv &collected_priv)
+{
+  int ret = OB_SUCCESS;
+  ObPrivSet role_priv_set = role_info.get_priv_set();
+  if (OB_FAIL(collect_sensitive_rule_level_priv_in_roles(priv_mgr, role_info, need_priv, collected_priv))) {
+    LOG_WARN("get sensitive rule level priv set failed", KR(ret), K(role_priv_set));
+  } else {
+    collected_priv.priv_set_ |= role_priv_set;
   }
   return ret;
 }
@@ -642,7 +675,6 @@ int ObSchemaGetterGuard::check_user_priv(const ObSessionPrivInfo &session_priv,
   const ObSchemaMgr *mgr = NULL;
   ObPrivSet user_priv_set = session_priv.user_priv_set_;
   bool is_oracle_mode = false;
-
   if (OB_FAIL(check_tenant_schema_guard(tenant_id))) {
     LOG_WARN("fail to check tenant schema guard", KR(ret), K(tenant_id), K_(tenant_id));
   } else if (OB_FAIL(check_lazy_guard(tenant_id, mgr))) {
@@ -1145,6 +1177,137 @@ int ObSchemaGetterGuard::check_routine_priv(const ObSessionPrivInfo &session_pri
   return ret;
 }
 
+int ObSchemaGetterGuard::check_sensitive_rule_priv(const ObSessionPrivInfo &session_priv,
+                                                   const common::ObIArray<uint64_t> &enable_role_id_array,
+                                                   const ObNeedPriv &need_priv,
+                                                   ObPrivSet &user_sensitive_rule_priv_set)
+{
+  int ret = OB_SUCCESS;
+  uint64_t tenant_id = session_priv.tenant_id_;
+  const ObSchemaMgr *mgr = NULL;
+  ObPrivSet sensitive_rule_priv_set = OB_PRIV_SET_EMPTY;
+  ObPrivSet total_sensitive_rule_priv_set_role = OB_PRIV_SET_EMPTY;
+  bool is_oracle_mode = false;
+  if (OB_INVALID_ID == session_priv.tenant_id_ || OB_INVALID_ID == session_priv.user_id_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("Invalid arguments", "tenant_id", session_priv.tenant_id_,
+             "user_id", session_priv.user_id_, K(ret));
+  } else if (OB_FAIL(check_tenant_schema_guard(tenant_id))) {
+    LOG_WARN("fail to check tenant schema guard", K(ret), K(tenant_id), K_(tenant_id));
+  } else if (OB_FAIL(check_lazy_guard(tenant_id, mgr))) {
+    LOG_WARN("fail to check lazy guard", K(ret), K(tenant_id));
+  } else if (OB_FAIL(ObCompatModeGetter::check_is_oracle_mode_with_tenant_id(tenant_id, is_oracle_mode))) {
+    LOG_WARN("fail to get compat mode", K(ret));
+  } else {
+    const ObPrivMgr &priv_mgr = mgr->priv_mgr_;
+    ObSensitiveRulePrivSortKey sensitive_rule_priv_key(session_priv.tenant_id_, session_priv.user_id_, need_priv.sensitive_rule_);
+    // get user privs
+    if (OB_FAIL(priv_mgr.get_sensitive_rule_priv_set(sensitive_rule_priv_key, sensitive_rule_priv_set))) {
+      LOG_WARN("get sensitive_rule priv set failed", K(sensitive_rule_priv_key), K(ret));
+    }
+    // get role privs
+    if (OB_FAIL(ret)) {
+    } else if (!is_oracle_mode) {
+      ObNeedPriv collected_privs("",
+                                 "",
+                                 OB_PRIV_SENSITIVE_RULE_LEVEL,
+                                 OB_PRIV_SET_EMPTY,
+                                 false,
+                                 false,
+                                 OB_PRIV_CHECK_ALL,
+                                 need_priv.sensitive_rule_);
+      bool check_succ = false;
+      if (OB_FAIL(collect_priv_in_roles(mgr->priv_mgr_,
+                                        session_priv,
+                                        enable_role_id_array,
+                                        *this,
+                                        need_priv,
+                                        collect_user_sensitive_rule_level_priv_in_roles,
+                                        collected_privs,
+                                        check_succ))) {
+        LOG_WARN("fail to collect privs in roles", K(ret));
+      } else {
+        total_sensitive_rule_priv_set_role |= collected_privs.priv_set_;
+      }
+    } else if (is_oracle_mode) {
+      const ObUserInfo *user_info = NULL;
+      if (OB_FAIL(get_user_info(tenant_id, session_priv.user_id_, user_info))) {
+        LOG_WARN("failed to get user info", K(ret), K(tenant_id), K(session_priv.user_id_));
+      } else if (OB_ISNULL(user_info)) {
+        ret = OB_USER_NOT_EXIST;
+        LOG_WARN("user info is null", K(ret), K(session_priv.user_id_));
+      } else {
+        const ObSEArray<uint64_t, 8> &role_id_array = user_info->get_role_id_array();
+        for (int i = 0; OB_SUCC(ret) && i < role_id_array.count(); ++i) {
+          const ObUserInfo *role_info = NULL;
+          if (OB_FAIL(get_user_info(tenant_id, role_id_array.at(i), role_info))) {
+            LOG_WARN("failed to get role info", K(ret), K(tenant_id), K(role_id_array.at(i)));
+          } else if (OB_ISNULL(role_info)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("role info is null", K(ret), K(role_id_array.at(i)));
+          } else {
+            ObPrivSet role_sensitive_rule_priv_set = OB_PRIV_SET_EMPTY;
+            ObSensitiveRulePrivSortKey role_sensitive_rule_priv_key(session_priv.tenant_id_,
+                                                                    role_info->get_user_id(),
+                                                                    need_priv.sensitive_rule_);
+            if (OB_FAIL(priv_mgr.get_sensitive_rule_priv_set(role_sensitive_rule_priv_key, role_sensitive_rule_priv_set))) {
+              if (OB_ENTRY_NOT_EXIST == ret) {
+                // Role doesn't have privileges on this sensitive rule, continue
+                ret = OB_SUCCESS;
+              } else {
+                LOG_WARN("get sensitive rule priv set failed for role", K(ret), K(role_sensitive_rule_priv_key));
+              }
+            } else {
+              total_sensitive_rule_priv_set_role |= role_sensitive_rule_priv_set;
+            }
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      user_sensitive_rule_priv_set = session_priv.user_priv_set_
+                                     | sensitive_rule_priv_set
+                                     | total_sensitive_rule_priv_set_role;
+      if (!OB_TEST_PRIVS(user_sensitive_rule_priv_set, need_priv.priv_set_)) {
+        ObPrivSet lack_priv_set = need_priv.priv_set_ & (~user_sensitive_rule_priv_set);
+        const ObPrivMgr &priv_mgr = mgr->priv_mgr_;
+        const char *priv_name = priv_mgr.get_first_priv_name(lack_priv_set);
+        if (OB_ISNULL(priv_name)) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("Invalid priv type", "priv_set", lack_priv_set);
+        } else {
+          ret = OB_ERR_NO_SENSITIVE_RULE_PRIVILEGE;
+          LOG_USER_ERROR(OB_ERR_NO_SENSITIVE_RULE_PRIVILEGE,
+                         (int)strlen(priv_name), priv_name,
+                         session_priv.user_name_.length(), session_priv.user_name_.ptr(),
+                         session_priv.host_name_.length(), session_priv.host_name_.ptr(),
+                         need_priv.sensitive_rule_.length(), need_priv.sensitive_rule_.ptr());
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSchemaGetterGuard::check_sensitive_rule_priv(const ObSessionPrivInfo &session_priv,
+                                                   const common::ObIArray<uint64_t> &enable_role_id_array,
+                                                   const ObNeedPriv &need_priv)
+{
+  int ret = OB_SUCCESS;
+  uint64_t tenant_id = session_priv.tenant_id_;
+  if (OB_FAIL(check_tenant_schema_guard(tenant_id))) {
+    LOG_WARN("failed to check tenant schema guard", K(ret), K(tenant_id), K_(tenant_id));
+  } else if (!OB_TEST_PRIVS(session_priv.user_priv_set_, need_priv.priv_set_)) {
+    ObPrivSet user_sensitive_rule_priv_set = 0;
+    if (OB_FAIL(check_sensitive_rule_priv(session_priv, enable_role_id_array,
+                                          need_priv, user_sensitive_rule_priv_set))) {
+      LOG_WARN("No sensitive rule priv", "tenant_id", session_priv.tenant_id_,
+                "user_id", session_priv.user_id_, K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObSchemaGetterGuard::check_catalog_priv(const ObSessionPrivInfo &session_priv,
                                             const common::ObIArray<uint64_t> &enable_role_id_array,
                                             const ObNeedPriv &need_priv,
@@ -1216,6 +1379,97 @@ int ObSchemaGetterGuard::check_catalog_priv(const ObSessionPrivInfo &session_pri
     if (OB_FAIL(check_catalog_priv(session_priv, enable_role_id_array, need_priv, user_catalog_priv_set))) {
       LOG_WARN("No catalog priv", "tenant_id", session_priv.tenant_id_,
                 "user_id", session_priv.user_id_, K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObSchemaGetterGuard::check_obj_mysql_priv(const ObSessionPrivInfo &session_priv,
+                        const common::ObIArray<uint64_t> &enable_role_id_array,
+                        const ObNeedPriv &obj_mysql_need_priv)
+{
+  int ret = OB_SUCCESS;
+  uint64_t tenant_id = session_priv.tenant_id_;
+  const ObSchemaMgr *mgr = NULL;
+  if (OB_INVALID_ID == session_priv.tenant_id_ || OB_INVALID_ID == session_priv.user_id_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("Invalid arguments", "tenant_id", session_priv.tenant_id_,
+        "user_id", session_priv.user_id_,
+        KR(ret));
+  } else if (OB_FAIL(check_tenant_schema_guard(tenant_id))) {
+    LOG_WARN("fail to check tenant schema guard", KR(ret), K(tenant_id), K_(tenant_id));
+  } else if (OB_FAIL(check_lazy_guard(tenant_id, mgr))) {
+    LOG_WARN("fail to check lazy guard", KR(ret), K(tenant_id));
+  } else if (!sql::ObOraSysChecker::is_super_user(session_priv.user_id_)) {
+    const ObPrivMgr &priv_mgr = mgr->priv_mgr_;
+    //1. fetch obj priv
+    const ObObjMysqlPriv *obj_mysql_priv = NULL;
+    ObPrivSet obj_mysql_priv_set = 0;
+    bool is_obj_mysql_priv_empty = true;
+    ObObjMysqlPrivSortKey obj_mysql_priv_key(session_priv.tenant_id_,
+                                      session_priv.user_id_,
+                                      obj_mysql_need_priv.table_,
+                                      static_cast<uint64_t>(obj_mysql_need_priv.obj_type_));
+    if (OB_FAIL(priv_mgr.get_obj_mysql_priv(obj_mysql_priv_key, obj_mysql_priv))) {
+      LOG_WARN("get obj mysql priv failed", KR(ret), K(obj_mysql_priv_key) );
+    } else if (NULL != obj_mysql_priv) {
+      obj_mysql_priv_set = obj_mysql_priv->get_priv_set();
+      is_obj_mysql_priv_empty = false;
+    }
+
+    if (OB_SUCC(ret)) {
+      //2. fetch roles privs
+      const ObUserInfo *user_info = NULL;
+      if (OB_FAIL(get_user_info(tenant_id, session_priv.user_id_, user_info))) {
+        LOG_WARN("failed to get user info", KR(ret), K(tenant_id), K(session_priv.user_id_));
+      } else if (NULL == user_info) {
+        ret = OB_USER_NOT_EXIST;
+        LOG_WARN("user info is null", KR(ret), K(session_priv.user_id_));
+      } else {
+        const ObSEArray<uint64_t, 8> &role_id_array = user_info->get_role_id_array();
+        for (int i = 0; OB_SUCC(ret) && i < role_id_array.count(); ++i) {
+          const ObUserInfo *role_info = NULL;
+          const ObObjMysqlPriv *role_obj_mysql_priv = NULL;
+          if (OB_FAIL(get_user_info(tenant_id, role_id_array.at(i), role_info))) {
+            LOG_WARN("failed to get role ids", KR(ret), K(tenant_id), K(role_id_array.at(i)));
+          } else if (NULL == role_info) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("role info is null", KR(ret), K(role_id_array.at(i)));
+          } else {
+            ObObjMysqlPrivSortKey role_obj_mysql_priv_key(session_priv.tenant_id_,
+                                                      role_info->get_user_id(),
+                                                      obj_mysql_need_priv.table_,
+                                                      static_cast<uint64_t>(obj_mysql_need_priv.obj_type_));
+            if (OB_FAIL(priv_mgr.get_obj_mysql_priv(role_obj_mysql_priv_key, role_obj_mysql_priv))) {
+              LOG_WARN("get obj mysql priv failed", KR(ret), K(role_obj_mysql_priv_key) );
+            } else if (NULL != role_obj_mysql_priv) {
+              is_obj_mysql_priv_empty = false;
+              // append additional role
+              obj_mysql_priv_set |= role_obj_mysql_priv->get_priv_set();
+            }
+          }
+        }
+      }
+    }
+
+    //3. check privs
+    if (OB_SUCC(ret)) {
+      if (is_obj_mysql_priv_empty) {
+        if (obj_mysql_need_priv.obj_type_ == ObObjectType::LOCATION) {
+          ret = OB_ERR_LOCATION_ACCESS_DENIED;
+        }
+        LOG_WARN("No privilege, cannot find location priv info",
+                 "tenant_id", session_priv.tenant_id_,
+                 "user_id", session_priv.user_id_, K(obj_mysql_need_priv));
+      } else if (!OB_TEST_PRIVS(obj_mysql_priv_set, obj_mysql_need_priv.priv_set_)) {
+        if (obj_mysql_need_priv.obj_type_ == ObObjectType::LOCATION) {
+          ret = OB_ERR_LOCATION_ACCESS_DENIED;
+        }
+        LOG_WARN("No privilege", "tenant_id", session_priv.tenant_id_,
+            "user_id", session_priv.user_id_,
+            K(obj_mysql_need_priv),
+            K(obj_mysql_priv_set));
+      }
     }
   }
   return ret;
@@ -1546,9 +1800,34 @@ int ObSchemaGetterGuard::check_priv(const ObSessionPrivInfo &session_priv,
           }
           break;
         }
+        case OB_PRIV_OBJECT_LEVEL: {
+          if (OB_ISNULL(this)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("schema guard is null", K(ret));
+          } else if (OB_FAIL(check_obj_mysql_priv(session_priv, enable_role_id_array, need_priv))) {
+            LOG_WARN("No privilege", "tenant_id", session_priv.tenant_id_,
+                "user_id", session_priv.user_id_,
+                "need_priv", need_priv.priv_set_,
+                "table", need_priv.table_,
+                "db", need_priv.db_,
+                "user_priv", session_priv.user_priv_set_,
+                KR(ret));//need print priv
+          }
+          break;
+        }
         case OB_PRIV_DB_ACCESS_LEVEL: {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("Privilege checking of database access should not use this function", KR(ret));
+          break;
+        }
+        case OB_PRIV_SENSITIVE_RULE_LEVEL: {
+          if (OB_FAIL(check_sensitive_rule_priv(session_priv, enable_role_id_array, need_priv))) {
+            LOG_WARN("No privilege", "tenant_id", session_priv.tenant_id_,
+                     "user_id", session_priv.user_id_,
+                     "need_priv", need_priv.priv_set_,
+                     "user_priv", session_priv.user_priv_set_,
+                     KR(ret)); //need print priv
+          }
           break;
         }
         default: {
@@ -1832,6 +2111,115 @@ int ObSchemaGetterGuard::check_priv_or(const ObSessionPrivInfo &session_priv,
   } else {
     ret = OB_INVALID_ARGUMENT;
   }
+  return ret;
+}
+
+int ObSchemaGetterGuard::check_location_access(const ObSessionPrivInfo &session_priv,
+                                               const common::ObIArray<uint64_t> &enable_role_id_array,
+                                               const ObString &location_name,
+                                               const bool is_need_write_priv)
+{
+  int ret = OB_SUCCESS;
+  ObNeedPriv tmp_need_priv;
+  tmp_need_priv.db_ = session_priv.db_;
+  tmp_need_priv.table_ = location_name;
+  tmp_need_priv.priv_level_ = OB_PRIV_OBJECT_LEVEL;
+  tmp_need_priv.priv_set_ = is_need_write_priv ? OB_PRIV_WRITE : OB_PRIV_READ;
+  tmp_need_priv.obj_type_ = ObObjectType::LOCATION;
+
+  const ObSchemaMgr *mgr = NULL;
+  const ObLocationSchema *location_schema = NULL;
+  lib::Worker::CompatMode compat_mode = lib::Worker::CompatMode::INVALID;
+
+  if (!session_priv.is_valid() || 0 == location_name.length()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("Invalid arguments", K(session_priv), K(ret));
+  } else if (OB_FAIL(get_tenant_compat_mode(session_priv.tenant_id_, compat_mode))) {
+    LOG_WARN("fail to get compat mode", K(ret));
+  } else if (OB_FAIL(check_tenant_schema_guard(session_priv.tenant_id_))) {
+    LOG_WARN("fail to check tenant schema guard", K(ret));
+  } else if (OB_FAIL(check_lazy_guard(session_priv.tenant_id_, mgr))) {
+    LOG_WARN("fail to check lazy guard", K(ret));
+  } else if (compat_mode == lib::Worker::CompatMode::MYSQL) {
+    if (OB_FAIL(check_obj_mysql_priv(session_priv, enable_role_id_array, tmp_need_priv))) {
+      LOG_WARN("No privilege to access location", K(session_priv), K(location_name), K(ret));
+    }
+  } else if (compat_mode == lib::Worker::CompatMode::ORACLE) {
+    if (OB_FAIL(get_location_schema_by_name(session_priv.tenant_id_, location_name, location_schema))) {
+      LOG_WARN("failed to get location schema", K(ret));
+    } else if (OB_ISNULL(location_schema)) {
+      ret = OB_LOCATION_OBJ_NOT_EXIST;
+      LOG_WARN("location not exist", K(ret), K(location_name));
+    } else if (OB_FAIL(sql::ObOraSysChecker::check_ora_obj_priv(*this,
+                                                                session_priv.tenant_id_,
+                                                                session_priv.user_id_,
+                                                                "",
+                                                                location_schema->get_location_id(),
+                                                                OBJ_LEVEL_FOR_TAB_PRIV,
+                                                                static_cast<uint64_t>(ObObjectType::LOCATION),
+                                                                is_need_write_priv ? OBJ_PRIV_ID_WRITE : OBJ_PRIV_ID_READ,
+                                                                CHECK_FLAG_NORMAL,
+                                                                OB_ORA_SYS_USER_ID,
+                                                                enable_role_id_array))) {
+      LOG_WARN("failed to check ora obj priv", K(ret));
+    }
+  }
+
+  return ret;
+}
+
+int ObSchemaGetterGuard::check_location_show(const ObSessionPrivInfo &session_priv,
+                                             const common::ObIArray<uint64_t> &enable_role_id_array,
+                                             const common::ObString &location_name,
+                                             bool &allow_show)
+{
+  int ret = OB_SUCCESS;
+  int tmp_ret = check_location_access(session_priv, enable_role_id_array, location_name);
+  allow_show = (tmp_ret == OB_ERR_LOCATION_ACCESS_DENIED) ? false : true;
+  ret = (tmp_ret == OB_ERR_LOCATION_ACCESS_DENIED || tmp_ret == OB_SUCCESS) ? OB_SUCCESS : tmp_ret;
+  return ret;
+}
+
+int ObSchemaGetterGuard::get_sensitive_rule_priv_set(const ObSensitiveRulePrivSortKey &sensitive_rule_priv_key,
+                                                     ObPrivSet &priv_set)
+{
+  int ret = OB_SUCCESS;
+  const ObSchemaMgr *mgr = NULL;
+  uint64_t tenant_id = sensitive_rule_priv_key.tenant_id_;
+  if (OB_FAIL(check_tenant_schema_guard(tenant_id))) {
+    LOG_WARN("fail to check tenant schema guard", KR(ret), K(tenant_id), K_(tenant_id));
+  } else if (OB_FAIL(check_lazy_guard(tenant_id, mgr))) {
+    LOG_WARN("fail to check lazy guard", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(mgr->priv_mgr_.get_sensitive_rule_priv_set(sensitive_rule_priv_key, priv_set))) {
+    LOG_WARN("fail to get sensitive_rule priv set", KR(ret), K(sensitive_rule_priv_key));
+  }
+  return ret;
+}
+
+
+int ObSchemaGetterGuard::get_sensitive_rule_priv_with_user_id(const uint64_t tenant_id,
+                                                              const uint64_t user_id,
+                                                              ObIArray<const ObSensitiveRulePriv *> &sensitive_rule_privs)
+{
+  int ret = OB_SUCCESS;
+  const ObSchemaMgr *mgr = NULL;
+  sensitive_rule_privs.reset();
+
+  if (!check_inner_stat()) {
+    ret = OB_INNER_STAT_ERROR;
+    LOG_WARN("inner stat error", KR(ret));
+  } else if (OB_INVALID_ID == tenant_id
+             || OB_INVALID_ID == user_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(tenant_id), K(user_id));
+  } else if (OB_FAIL(check_tenant_schema_guard(tenant_id))) {
+    LOG_WARN("fail to check tenant schema guard", KR(ret), K(tenant_id), K_(tenant_id));
+  } else if (OB_FAIL(check_lazy_guard(tenant_id, mgr))) {
+    LOG_WARN("fail to check lazy guard", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(mgr->priv_mgr_.get_sensitive_rule_privs_in_user(tenant_id, user_id, sensitive_rule_privs))) {
+    LOG_WARN("get sensitive_rule priv with user_id failed", KR(ret), K(tenant_id), K(user_id));
+  }
+
   return ret;
 }
 

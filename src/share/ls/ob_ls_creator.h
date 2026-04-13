@@ -69,11 +69,12 @@ public:
   ObLSCreator(obrpc::ObSrvRpcProxy &rpc_proxy,
                      const int64_t tenant_id,
                      const share::ObLSID &id,
+                     const uint64_t data_version,
                      ObMySQLProxy *proxy = NULL)
     :
       create_ls_proxy_(rpc_proxy, &obrpc::ObSrvRpcProxy::create_ls),
       set_member_list_proxy_(rpc_proxy, &obrpc::ObSrvRpcProxy::set_member_list),
-      tenant_id_(tenant_id), id_(id), proxy_(proxy) {}
+      tenant_id_(tenant_id), id_(id), data_version_(data_version), proxy_(proxy) {}
   virtual ~ObLSCreator() {}
   int create_tenant_sys_ls(const ObZone &primary_zone,
               const share::schema::ZoneLocalityIArray &zone_locality,
@@ -86,7 +87,6 @@ public:
               const uint64_t source_tenant_id,
               const ObAllTenantInfo &tenant_info);
   int create_user_ls(const share::ObLSStatusInfo &status_info,
-                     const int64_t paxos_replica_num,
                      const share::schema::ZoneLocalityIArray &zone_locality,
                      const SCN &create_scn,
                      const common::ObCompatibilityMode &compat_mode,
@@ -95,6 +95,10 @@ public:
                      const uint64_t source_tenant_id);
   int create_sys_tenant_ls(const obrpc::ObServerInfoList &rs_list,
       const common::ObIArray<share::ObUnit> &unit_array);
+  int create_metadata_ls_for_upgrade(const share::schema::ZoneLocalityIArray &zone_locality,
+                                     const ObIArray<share::ObResourcePoolName> &pool_list,
+                                     const int64_t paxos_replica_num,
+                                     const common::ObCompatibilityMode &compat_mode);
   bool is_valid();
 
 private:
@@ -163,7 +167,8 @@ private:
      const common::ObIArray<share::ObUnit> &unit_info_array,
      const bool is_sys_ls,
      const bool is_duplicate_ls,
-     ObILSAddr &ls_addr);
+     ObILSAddr &ls_addr,
+     int64_t &paxos_replica_num);
 
  int alloc_sys_ls_addr(const uint64_t tenant_id,
                        const ObIArray<share::ObResourcePoolName> &pools,
@@ -171,12 +176,13 @@ private:
                        const bool is_duplicate_ls,
                        common::ObIArray<ObLSReplicaAddr> &addrs);
 
- int alloc_user_ls_addr(const uint64_t tenant_id, const uint64_t unit_group_id,
+ int alloc_user_ls_addr(const uint64_t tenant_id,
+                        const share::ObLSStatusInfo &ls_info,
                         const share::schema::ZoneLocalityIArray &zone_locality,
-                        common::ObIArray<ObLSReplicaAddr> &addrs);
+                        common::ObIArray<ObLSReplicaAddr> &addrs,
+                        int64_t &paxos_replica_num);
 
- int alloc_zone_ls_addr(const bool is_sys_ls,
-                        const share::ObZoneReplicaAttrSet &zone_locality,
+ int alloc_zone_ls_addr(const share::ObZoneReplicaAttrSet &zone_locality,
                         const common::ObIArray<share::ObUnit> &unit_info_array,
                         ObLSReplicaAddr &ls_replica_addr);
 #ifdef OB_BUILD_ARBITRATION
@@ -198,13 +204,15 @@ private:
                                   const int64_t paxos_replica_num);
 
   // alloc ls addr for duplicate log stream
-  // @params[in]  tenant_id, which tenant's log stream
+  // @params[in]  status_info, ls status info
   // @params[in]  zone_locality_array, locality describtion
   // @params[out] ls_addr, which server to create this log stream
+  // @params[out] paxos_replica_num, the quorum of this ls
   int alloc_duplicate_ls_addr_(
-      const uint64_t tenant_id,
+      const share::ObLSStatusInfo &status_info,
       const share::schema::ZoneLocalityIArray &zone_locality_array,
-      ObILSAddr &ls_addr);
+      ObILSAddr &ls_addr,
+      int64_t &paxos_replica_num);
 
   // compensate readonly replica for duplicate ls
   // @params[in]  zlocality, locality describtion in one zone
@@ -217,11 +225,20 @@ private:
       const common::ObIArray<share::ObUnit> &unit_info_array,
       ObILSAddr &ls_addr);
 
+  // construct unit for duplicate log stream
+  // @params[in]  status_info, ls status info
+  // @params[out] unit_list_array, units in unit list
+  // @params[out] valid_unit_array, units to create replica for dup ls
+  int construct_units_for_duplicate_ls_(
+      const share::ObLSStatusInfo &status_info,
+      common::ObIArray<share::ObUnit> &unit_list_array,
+      common::ObIArray<share::ObUnit> &valid_unit_array);
 private:
   rootserver::ObLSCreatorProxy create_ls_proxy_;
   rootserver::ObSetMemberListProxy set_member_list_proxy_;
   const int64_t tenant_id_;
   const share::ObLSID id_;
+  uint64_t data_version_;
   ObMySQLProxy *proxy_;
 };
 }

@@ -22,6 +22,7 @@
 #include "sql/engine/cmd/ob_load_data_rpc.h"
 #include "sql/dtl/ob_dtl_rpc_processor.h"
 #include "sql/das/ob_das_rpc_processor.h"
+#include "storage/lock_wait_mgr/ob_lock_wait_mgr_rpc.h"
 #include "observer/ob_inner_sql_rpc_processor.h"
 #include "logservice/palf/log_rpc_processor.h"
 #include "logservice/logrpc/ob_log_rpc_processor.h"
@@ -39,6 +40,10 @@
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/incremental/ob_sswriter_rpc.h"
 #include "storage/incremental/ob_shared_meta_rpc_common.h"
+#include "storage/incremental/sslog/ob_sslog_uid_rpc.h"
+#include "storage/incremental/garbage_collector/ob_ss_garbage_collector_rpc.h"
+#include "storage/incremental/ob_ss_checkpoint_rpc.h"
+#include "storage/tx_table/ob_ss_tx_table_rpc.h"
 #endif
 
 using namespace oceanbase;
@@ -48,12 +53,14 @@ using namespace oceanbase::rpc;
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
 using namespace oceanbase::transaction;
+using namespace oceanbase::memtable;
 using namespace oceanbase::obrpc;
 using namespace oceanbase::obmysql;
 
 void oceanbase::observer::init_srv_xlator_for_sys(ObSrvRpcXlator *xlator) {
   RPC_PROCESSOR(ObRpcGetRoleP, gctx_);
   RPC_PROCESSOR(ObRpcDetectMasterRsLSP, gctx_);
+  RPC_PROCESSOR(ObRpcDetectSSlogLSP, gctx_);
   RPC_PROCESSOR(ObRpcSetConfigP, gctx_);
   RPC_PROCESSOR(ObRpcGetConfigP, gctx_);
   RPC_PROCESSOR(ObRpcSetTenantConfigP, gctx_);
@@ -64,8 +71,10 @@ void oceanbase::observer::init_srv_xlator_for_sys(ObSrvRpcXlator *xlator) {
   RPC_PROCESSOR(ObInitTenantConfigP, gctx_);
   RPC_PROCESSOR(ObGetLeaderLocationsP, gctx_);
   RPC_PROCESSOR(ObBatchBroadcastSchemaP, gctx_);
+  RPC_PROCESSOR(ObCheckTabletExistP, gctx_);
   RPC_PROCESSOR(ObRpcSendHeartbeatP, gctx_);
   RPC_PROCESSOR(ObRpcNotifySwitchLeaderP, gctx_);
+  RPC_PROCESSOR(ObRpcGetUnitInfoP, gctx_);
 
   // interrupt
   RPC_PROCESSOR(obrpc::ObInterruptProcessor);
@@ -150,6 +159,10 @@ void oceanbase::observer::init_srv_xlator_for_transaction(ObSrvRpcXlator *xlator
   RPC_PROCESSOR(ObTxAskStateRespP);
   RPC_PROCESSOR(ObTxCollectStateP);
   RPC_PROCESSOR(ObTxCollectStateRespP);
+  RPC_PROCESSOR(ObTxSbyAskUpstreamReqP);
+  RPC_PROCESSOR(ObTxSbyAskDownstreamReqP);
+  RPC_PROCESSOR(ObTxSbyStateResultP);
+
   // for tx free route
   RPC_PROCESSOR(ObTxFreeRouteCheckAliveP);
   RPC_PROCESSOR(ObTxFreeRouteCheckAliveRespP);
@@ -157,10 +170,10 @@ void oceanbase::observer::init_srv_xlator_for_transaction(ObSrvRpcXlator *xlator
   // for tx state check of 4377
   RPC_PROCESSOR(ObAskTxStateFor4377P);
   // for lock wait mgr
-  // RPC_PROCESSOR(ObLockWaitMgrDstEnqueueP);
-  // RPC_PROCESSOR(ObLockWaitMgrDstEnqueueRespP);
-  // RPC_PROCESSOR(ObLockWaitMgrLockReleaseP);
-  // RPC_PROCESSOR(ObLockWaitMgrWakeUpP);
+  RPC_PROCESSOR(ObLockWaitMgrDstEnqueueP);
+  RPC_PROCESSOR(ObLockWaitMgrDstEnqueueRespP);
+  RPC_PROCESSOR(ObLockWaitMgrLockReleaseP);
+  RPC_PROCESSOR(ObLockWaitMgrWakeUpP);
 #ifdef OB_BUILD_SHARED_STORAGE
   RPC_PROCESSOR(ObSSWriterGrantP);
   RPC_PROCESSOR(ObSSWriterLeaseReqP);
@@ -169,6 +182,11 @@ void oceanbase::observer::init_srv_xlator_for_transaction(ObSrvRpcXlator *xlator
   RPC_PROCESSOR(ObSSWriterLocationReqP);
   RPC_PROCESSOR(ObSSWriterLocationRespP);
   RPC_PROCESSOR(ObSharedRpcP, gctx_);
+  RPC_PROCESSOR(ObSSLogUIDP);
+  RPC_PROCESSOR(ObSSPreciseGCP);
+  RPC_PROCESSOR(ObSSGCCheckLSP);
+  RPC_PROCESSOR(ObSSCkptRpcP);
+  RPC_PROCESSOR(ObSSTxTableRpcP);
 #endif
 }
 
@@ -204,6 +222,10 @@ void oceanbase::observer::init_srv_xlator_for_logservice(ObSrvRpcXlator *xlator)
   RPC_PROCESSOR(logservice::LogProbeRsP);
 #endif
   RPC_PROCESSOR(logservice::LogGetCkptReqP);
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+  RPC_PROCESSOR(logservice::LogReportReplayReachingMachineP);
+  RPC_PROCESSOR(logservice::LogNotifyFollowerMoveOutFromRTOGroupP);
+#endif // OB_BUILD_SHARED_LOG_SERVICE
 }
 
 void oceanbase::observer::init_srv_xlator_for_palfenv(ObSrvRpcXlator *xlator)

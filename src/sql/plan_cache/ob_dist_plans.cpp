@@ -61,11 +61,13 @@ int ObDistPlans::get_plan(ObPlanCacheCtx &pc_ctx,
       dist_plans_.at(0)->set_dynamic_ref_handle(pc_ctx.handle_id_);
       plan = dist_plans_.at(0);
       is_matched = true;
+      bool need_check_on_same_server = true;
 
       // fill table location for single plan using px
       // for single dist plan without px, we already fill the phy locations while calculating plan type
       // for multi table px plan, physical location is calculated in match step
-      ObArray<ObCandiTableLoc> candi_table_locs;
+      ObArenaAllocator tmp_allocator(ObModIds::OB_SQL_COMPILE);
+      ObSqlArray<ObCandiTableLoc, true> candi_table_locs(tmp_allocator);
       if (OB_ISNULL(plan_set_)) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("invalid null plan set", K(ret), K(plan_set_));
@@ -73,12 +75,13 @@ int ObDistPlans::get_plan(ObPlanCacheCtx &pc_ctx,
         // do nothing
       } else if (OB_FAIL(ObPhyLocationGetter::get_phy_locations(plan->get_table_locations(),
                                                                 pc_ctx,
-                                                                candi_table_locs))) {
+                                                                candi_table_locs,
+                                                                need_check_on_same_server))) {
         LOG_WARN("failed to get physical table locations", K(ret));
       } else if (candi_table_locs.empty()) {
         // do nothing.
       } else if (!pc_ctx.try_get_plan_
-                 && OB_FAIL(ObPhyLocationGetter::build_candi_table_locs(
+                 && OB_FAIL(ObPhyLocationGetter::build_table_locs(
                       pc_ctx.exec_ctx_.get_das_ctx(), plan->get_table_locations(),
                       candi_table_locs))) {
         LOG_WARN("fail to init table locs", K(ret));
@@ -87,7 +90,8 @@ int ObDistPlans::get_plan(ObPlanCacheCtx &pc_ctx,
   }
 
   ObPlanMatchHelper helper(plan_set_);
-  ObArray<ObCandiTableLoc> phy_tbl_infos;
+  ObArenaAllocator allocator(ObModIds::OB_SQL_COMPILE);
+  ObSqlArray<ObCandiTableLoc, true> phy_tbl_infos(allocator);
   ObArray<ObTableLocation> out_tbl_locations;
   for (int64_t i = 0; OB_SUCC(ret) && !is_matched && i < dist_plans_.count();
        i++) {
@@ -126,7 +130,8 @@ int ObDistPlans::add_evolution_plan(ObPhysicalPlan &plan, ObPlanCacheCtx &pc_ctx
   int ret = OB_SUCCESS;
   bool is_matched = false;
   ObPlanMatchHelper helper(plan_set_);
-  ObArray<ObCandiTableLoc> phy_tbl_infos;
+  ObArenaAllocator allocator(ObModIds::OB_SQL_COMPILE);
+  ObSqlArray<ObCandiTableLoc, true> phy_tbl_infos(allocator);
   ObArray<ObTableLocation> out_tbl_locations;
   for (int64_t i = 0; OB_SUCC(ret) && !is_matched && i < dist_plans_.count(); i++) {
     const ObPhysicalPlan *tmp_plan = dist_plans_.at(i);
@@ -157,7 +162,8 @@ int ObDistPlans::add_plan(ObPhysicalPlan &plan,
   int ret = OB_SUCCESS;
   bool is_matched = false;
   ObPlanMatchHelper helper(plan_set_);
-  ObArray<ObCandiTableLoc> phy_tbl_infos;
+  ObArenaAllocator allocator(ObModIds::OB_SQL_COMPILE);
+  ObSqlArray<ObCandiTableLoc, true> phy_tbl_infos(allocator);
   ObArray<ObTableLocation> out_tbl_locations;
 
   for (int64_t i = 0; OB_SUCC(ret) && !is_matched && i < dist_plans_.count(); i++) {
@@ -194,6 +200,7 @@ int ObDistPlans::add_plan(ObPhysicalPlan &plan,
 bool ObDistPlans::is_plan_available(const ObPhysicalPlan &plan, ObPlanCacheCtx &pc_ctx) const
 {
   bool can_use = true;
+  MATCH_GUARD(plan.get_plan_id(), pc_ctx);
   if (pc_ctx.try_get_plan_) {
     if (pc_ctx.compare_plan_->get_plan_hash_value() != plan.get_plan_hash_value()) {
       can_use = false;
@@ -202,6 +209,9 @@ bool ObDistPlans::is_plan_available(const ObPhysicalPlan &plan, ObPlanCacheCtx &
     if (!plan.is_active_status()) {
       can_use = false;
       pc_ctx.has_inactive_plan_ = true;
+      RECORD_CACHE_MISS(FORCE_HARD_PARSE, pc_ctx,
+                            "The execution time is far greater than the plan generation time.",
+                            K(plan.stat_.adaptive_pc_info_));
     } else {
       pc_ctx.has_inactive_plan_ = false;
     }

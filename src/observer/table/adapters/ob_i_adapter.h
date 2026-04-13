@@ -29,11 +29,14 @@ class ObIHbaseAdapter
 public:
   ObIHbaseAdapter()
       : allocator_("HbaseAdapAloc", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID())
-  {}
+  {
+    lob_inrow_threshold_ = OB_DEFAULT_LOB_INROW_THRESHOLD;
+  }
 
   virtual ~ObIHbaseAdapter() {}
   virtual int put(ObTableExecCtx &ctx, const ObITableEntity &cell) = 0;
-  virtual int multi_put(ObTableExecCtx &ctx, const ObIArray<ObITableEntity *> &cells) = 0;
+  virtual int put(ObTableCtx &ctx, const ObHCfRows &rows) = 0;
+  virtual int multi_put(ObTableExecCtx &ctx, const ObIArray<const ObITableEntity *> &cells) = 0;
   virtual int del(ObTableExecCtx &ctx, const ObITableEntity &cell) = 0;
   virtual int scan(ObIAllocator &alloc, ObTableExecCtx &ctx, const ObTableQuery &query, ObHbaseICellIter *&iter) = 0;
   virtual void reuse();
@@ -48,7 +51,7 @@ protected:
 
 protected:
   common::ObArenaAllocator allocator_;
-
+  int64_t lob_inrow_threshold_;
   // disallow copy
   DISALLOW_COPY_AND_ASSIGN(ObIHbaseAdapter);
 };

@@ -22,7 +22,7 @@ namespace oceanbase
 namespace common
 {
 
-const char *OB_STORAGE_TYPES_STR[] = {"OSS", "FILE", "COS", "LOCAL", "S3", "LOCAL_CACHE", "HDFS"};
+const char *OB_STORAGE_TYPES_STR[] = {"OSS", "FILE", "LOCAL", "S3", "LOCAL_CACHE", "HDFS", "AZBLOB", "TABLE"};
 
 void print_access_storage_log(
     const char *msg,
@@ -53,10 +53,10 @@ int validate_uri_type(const common::ObString &uri)
 {
   int ret = OB_SUCCESS;
   if (!uri.prefix_match(OB_OSS_PREFIX) &&
-      !uri.prefix_match(OB_COS_PREFIX) &&
       !uri.prefix_match(OB_S3_PREFIX) &&
       !uri.prefix_match(OB_FILE_PREFIX) &&
-      !uri.prefix_match(OB_HDFS_PREFIX)) {
+      !uri.prefix_match(OB_HDFS_PREFIX) &&
+      !uri.prefix_match(OB_AZBLOB_PREFIX)) {
     ret = OB_INVALID_BACKUP_DEST;
     STORAGE_LOG(ERROR, "invalid backup uri", KR(ret), KS(uri));
   }
@@ -70,14 +70,39 @@ int get_storage_type_from_path(const common::ObString &uri, ObStorageType &type)
 
   if (uri.prefix_match(OB_OSS_PREFIX)) {
     type = OB_STORAGE_OSS;
-  } else if (uri.prefix_match(OB_COS_PREFIX)) {
-    type = OB_STORAGE_COS;
   } else if (uri.prefix_match(OB_S3_PREFIX)) {
     type = OB_STORAGE_S3;
   } else if (uri.prefix_match(OB_FILE_PREFIX)) {
     type = OB_STORAGE_FILE;
   } else if (uri.prefix_match(OB_HDFS_PREFIX)) {
     type = OB_STORAGE_HDFS;
+  } else if (uri.prefix_match(OB_AZBLOB_PREFIX)) {
+    type = OB_STORAGE_AZBLOB;
+  } else {
+    ret = OB_INVALID_BACKUP_DEST;
+    STORAGE_LOG(ERROR, "invalid backup uri", K(ret), K(uri));
+  }
+  return ret;
+}
+
+int get_storage_type_from_path_for_external_table(const common::ObString &uri, ObStorageType &type)
+{
+  int ret = OB_SUCCESS;
+  type = OB_STORAGE_MAX_TYPE;
+  if (uri.prefix_match(OB_OSS_PREFIX)) {
+    type = OB_STORAGE_OSS;
+  } else if (uri.prefix_match(OB_COS_PREFIX)) {
+    type = OB_STORAGE_S3;
+  } else if (uri.prefix_match(OB_S3_PREFIX)
+             || uri.prefix_match(OB_S3A_PREFIX)
+             || uri.prefix_match(OB_S3N_PREFIX)) {
+    type = OB_STORAGE_S3;
+  } else if (uri.prefix_match(OB_FILE_PREFIX)) {
+    type = OB_STORAGE_FILE;
+  } else if (uri.prefix_match(OB_HDFS_PREFIX)) {
+    type = OB_STORAGE_HDFS;
+  } else if (uri.prefix_match(OB_AZBLOB_PREFIX)) {
+    type = OB_STORAGE_AZBLOB;
   } else {
     ret = OB_INVALID_BACKUP_DEST;
     STORAGE_LOG(ERROR, "invalid backup uri", KR(ret), KS(uri));
@@ -98,10 +123,10 @@ const char *get_storage_type_str(const ObStorageType &type)
 bool is_storage_type_match(const common::ObString &uri, const ObStorageType &type)
 {
   return (OB_STORAGE_OSS == type && uri.prefix_match(OB_OSS_PREFIX))
-      || (OB_STORAGE_COS == type && uri.prefix_match(OB_COS_PREFIX))
       || (OB_STORAGE_S3 == type && uri.prefix_match(OB_S3_PREFIX))
       || (OB_STORAGE_FILE == type && uri.prefix_match(OB_FILE_PREFIX))
-      || (OB_STORAGE_HDFS == type && uri.prefix_match(OB_HDFS_PREFIX));
+      || (OB_STORAGE_HDFS == type && uri.prefix_match(OB_HDFS_PREFIX))
+      || (OB_STORAGE_AZBLOB == type && uri.prefix_match(OB_AZBLOB_PREFIX));
 }
 
 bool is_object_storage_type(const ObStorageType &type)
@@ -115,7 +140,6 @@ bool is_adaptive_append_mode(const ObObjectStorageInfo &storage_info)
   const ObStorageType type = storage_info.get_type();
   const bool enable_worm = storage_info.is_enable_worm();
   return ObStorageType::OB_STORAGE_S3 == type
-      || (ObStorageType::OB_STORAGE_COS == type && is_use_obdal())
       || (ObStorageType::OB_STORAGE_OSS == type && enable_worm);
 }
 
@@ -164,9 +188,12 @@ int build_full_dir_path(const char *dir_path, char *dir_path_buf, const int64_t 
 int ListAppendableObjectFragmentOp::func(const dirent *entry)
 {
   int ret = OB_SUCCESS;
-  ObString fragment_name(entry->d_name);
+  ObString fragment_name(OB_ISNULL(entry) ? "" : entry->d_name);
   ObAppendableFragmentMeta fragment_meta;
-  if (OB_FAIL(fragment_meta.parse_from(fragment_name))) {
+  if (OB_ISNULL(entry)) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "entry is NULL", K(ret), KP(entry));
+  } else if (OB_FAIL(fragment_meta.parse_from(fragment_name))) {
     OB_LOG(WARN, "fail to parse fragment name", K(ret), K(entry->d_name));
   } else if (OB_LIKELY(fragment_meta.is_valid())) {
     if (fragment_meta.is_format_meta()) {
@@ -174,7 +201,7 @@ int ListAppendableObjectFragmentOp::func(const dirent *entry)
     } else if (fragment_meta.is_seal_meta()) {
       exist_seal_meta_ = true;
     } else if (fragment_meta.is_data()) {
-      if (need_get_file_size()) {
+      if (need_get_file_meta()) {
         if (get_size() != fragment_meta.get_length()) {
           ret = OB_ERR_UNEXPECTED;
           OB_LOG(WARN, "fragment file size is not equal to the fragment name range", K(ret), "file_size",
@@ -275,170 +302,6 @@ int DelAppendableObjectFragmentOp::func(const dirent *entry)
 }
 
 /**
- * ------------------------------ObTopNMinimumDirEntryWithMarkerOperator------------------------------
- */
-
-// return true when lsh is smaller than or equal to rhs
-bool less_than(const char *lhs, const char *rhs)
-{
-  bool bool_ret = false;
-  if (OB_NOT_NULL(lhs) && OB_NOT_NULL(rhs)) {
-    int strcmp_ret = strcmp(lhs, rhs);
-    bool_ret = (0 >= strcmp_ret ? true : false);
-  }
-  return bool_ret;
-}
-
-ObTopNMinimumDirEntryWithMarkerOperator::ObTopNMinimumDirEntryWithMarkerOperator(
-    const int64_t num,
-    const char *marker,
-    const bool need_size)
-    : ObBaseDirEntryOperator(), n_(num), marker_(marker), need_size_(need_size),
-      less_than_(), heap_(less_than_), allocator_("TopNDir")
-{
-}
-
-ObTopNMinimumDirEntryWithMarkerOperator::~ObTopNMinimumDirEntryWithMarkerOperator()
-{
-  n_ = -1;
-  heap_.reset();
-  allocator_.reset();
-}
-
-bool ObTopNMinimumDirEntryWithMarkerOperator::TopNCompElement::operator()(const Entry &lhs,
-                                                                          const Entry &rhs)
-{
-  return less_than(lhs.obj_name_, rhs.obj_name_);
-}
-
-int ObTopNMinimumDirEntryWithMarkerOperator::TopNCompElement::get_error_code()
-{
-  return OB_SUCCESS;
-}
-
-bool ObTopNMinimumDirEntryWithMarkerOperator::need_get_file_size() const
-{
-  return need_size_;
-}
-
-int ObTopNMinimumDirEntryWithMarkerOperator::func(const dirent *entry)
-{
-  int ret = OB_SUCCESS;
-  const char *d_name = nullptr;
-  Entry tmp_entry;
-  if (OB_UNLIKELY(n_ <= 0) || OB_ISNULL(entry) || OB_ISNULL(entry->d_name)) {
-    ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "invalid argument", K(ret), K_(n), KP(entry));
-  } else if (FALSE_IT(d_name = entry->d_name)) {
-    // filter each dirent whose name is smaller than or equal to marker_
-  } else if (less_than(d_name, marker_)) {
-  } else if (heap_.count() < n_) {
-    if (OB_FAIL(alloc_and_init_(d_name, tmp_entry))) {
-      STORAGE_LOG(WARN, "alloc_and_init_ failed", K(ret), K(d_name));
-    } else if (OB_FAIL(heap_.push(tmp_entry))) {
-      STORAGE_LOG(WARN, "push failed", K(ret), K(d_name), K(tmp_entry));
-    } else {}
-
-    if (OB_FAIL(ret)) {
-      free_memory_(tmp_entry);
-    }
-  } else if (OB_FAIL(try_replace_top_(d_name))) {
-    STORAGE_LOG(WARN, "try_replace_top_ failed", K(ret), K(d_name), K(heap_.top()), K(tmp_entry));
-  }
-
-  return ret;
-}
-
-int ObTopNMinimumDirEntryWithMarkerOperator::handle_each_dir_entry(
-    common::ObBaseDirEntryOperator &op)
-{
-  int ret = OB_SUCCESS;
-  int64_t index = 0;
-  Entry top_data;
-  ObArray<Entry> entry_list;
-  while (!heap_.empty() && OB_SUCC(ret)) {
-    if (OB_FAIL(entry_list.push_back(heap_.top()))) {
-      STORAGE_LOG(WARN, "fail to push entry to entry_list", K(ret), K(entry_list.size()));
-    } else if (OB_FAIL(heap_.pop())) {
-      STORAGE_LOG(WARN, "pop failed", K(ret));
-    }
-  }
-  // Data obtained using a max heap is in descending order.
-  // To maintain consistency with the results returned by object storage,
-  // the obtained data is processed in reverse order.
-  for (int64_t i = entry_list.count() - 1; OB_SUCC(ret) && i >= 0; i--) {
-    if (OB_ISNULL(entry_list[i].obj_name_)) {
-      ret = OB_ERR_UNEXPECTED;
-      STORAGE_LOG(WARN, "obj_name_ is NULL", K(ret), K(entry_list[i]), K(i));
-    } else if (OB_FAIL(handle_listed_object(op, entry_list[i].obj_name_,
-                                            strlen(entry_list[i].obj_name_),
-                                            entry_list[i].obj_size_))) {
-      OB_LOG(WARN, "fail to handle listed object", K(ret), K(entry_list[i]), K(i));
-    } else {
-      free_memory_(entry_list[i]);
-    }
-  }
-  return ret;
-}
-
-int ObTopNMinimumDirEntryWithMarkerOperator::alloc_and_init_(
-    const char *d_name,
-    Entry &out_entry)
-{
-  int ret = OB_SUCCESS;
-  char *out_ptr = nullptr;
-  int64_t buf_size = -1;
-  if (OB_ISNULL(d_name)) {
-    ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "invalid argument", K(ret), KP(d_name));
-  } else if (FALSE_IT(buf_size = strlen(d_name) + 1)) {
-  } else if (OB_ISNULL(out_ptr = static_cast<char*>(allocator_.alloc(buf_size)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    STORAGE_LOG(WARN, "fail to alloc mem for out ptr", K(ret), K(buf_size), K(d_name));
-  } else {
-    strncpy(out_ptr, d_name, buf_size - 1);
-    out_ptr[buf_size - 1] = '\0';
-    out_entry.obj_name_ = out_ptr;
-    if (need_size_) {
-      out_entry.obj_size_ = get_size();
-    }
-  }
-  return ret;
-}
-
-void ObTopNMinimumDirEntryWithMarkerOperator::free_memory_(Entry &out_entry)
-{
-  if (OB_NOT_NULL(out_entry.obj_name_)) {
-    allocator_.free(out_entry.obj_name_);
-    out_entry.obj_name_ = nullptr;
-  }
-  out_entry.obj_size_ = -1;
-}
-
-int ObTopNMinimumDirEntryWithMarkerOperator::try_replace_top_(const char *d_name)
-{
-  int ret = OB_SUCCESS;
-  // inner func, do not check heap_ whether is empty
-  Entry top_data = heap_.top();
-  Entry new_entry;
-  if (OB_ISNULL(d_name)) {
-    ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "invalid argument", K(ret), KP(d_name));
-  } else if (less_than(top_data.obj_name_, d_name)) {
-  } else if (OB_FAIL(alloc_and_init_(d_name, new_entry))) {
-    STORAGE_LOG(WARN, "alloc_and_cp_ failed", K(ret), K(d_name), K(top_data));
-  } else {
-    free_memory_(top_data);
-    if (OB_FAIL(heap_.replace_top(new_entry))) {
-      free_memory_(new_entry);
-      STORAGE_LOG(WARN, "TopNDir replace_top failed", K(ret), K(new_entry), K(top_data));
-    }
-  }
-
-  return ret;
-}
-
-/**
  * ------------------------------ObStorageGlobalIns------------------------------
  */
 ObStorageGlobalIns::ObStorageGlobalIns()
@@ -513,16 +376,18 @@ ObExternalIOCounterGuard::~ObExternalIOCounterGuard()
  * ------------------------------ObStorageUtil------------------------------
  */
 ObStorageUtil::ObStorageUtil()
-  : file_util_(),
-    oss_util_(),
-    cos_util_(),
-    s3_util_(),
-    hdfs_util_(),
+  : util_union_(),
     util_(NULL),
     storage_info_(NULL),
     init_state(false),
-    device_type_(ObStorageType::OB_STORAGE_MAX_TYPE)
+    device_type_(ObStorageType::OB_STORAGE_MAX_TYPE),
+    handle_type_(OB_STORAGE_HANDLE_MAX_TYPE)
 {
+}
+
+ObStorageUtil::~ObStorageUtil()
+{
+  reset();
 }
 
 /*this fun just like the get_util*/
@@ -539,22 +404,25 @@ int ObStorageUtil::open(common::ObObjectStorageInfo *storage_info)
     STORAGE_LOG(WARN, "invalid arguments", K(ret), KPC(storage_info));
   } else if (OB_FALSE_IT(device_type_ = storage_info->get_type())) {
   } else if (OB_STORAGE_FILE == device_type_) {
-    util_ = &file_util_;
+    new (&util_union_.file_util_) ObStorageFileUtil();
+    util_ = &util_union_.file_util_;
+    handle_type_ = OB_STORAGE_HANDLE_FILE;
   } else if (OB_STORAGE_HDFS == device_type_) {
-    util_ = &hdfs_util_;
-  } else if (is_use_obdal()) {
-    if (OB_UNLIKELY(storage_info->is_enable_worm())) {
-      ret = OB_NOT_SUPPORTED;
-      STORAGE_LOG(WARN, "obdal do not support worm", K(ret), KPC(storage_info));
-    } else {
-      util_ = &obdal_util_;
-    }
+    new (&util_union_.hdfs_util_) ObStorageHdfsJniUtil();
+    util_ = &util_union_.hdfs_util_;
+    handle_type_ = OB_STORAGE_HANDLE_HDFS;
+  } else if (is_use_obdal() || OB_STORAGE_AZBLOB == device_type_) {
+    new (&util_union_.obdal_util_) ObStorageObDalUtil();
+    util_ = &util_union_.obdal_util_;
+    handle_type_ = OB_STORAGE_HANDLE_OBDAL;
   } else if (OB_STORAGE_OSS == device_type_) {
-    util_ = &oss_util_;
-  } else if (OB_STORAGE_COS == device_type_) {
-    util_ = &cos_util_;
+    new (&util_union_.oss_util_) ObStorageOssUtil();
+    util_ = &util_union_.oss_util_;
+    handle_type_ = OB_STORAGE_HANDLE_OSS;
   } else if (OB_STORAGE_S3 == device_type_) {
-    util_ = &s3_util_;
+    new (&util_union_.s3_util_) ObStorageS3Util();
+    util_ = &util_union_.s3_util_;
+    handle_type_ = OB_STORAGE_HANDLE_S3;
   } else {
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "Invalid device type", K(ret), K_(device_type));
@@ -578,11 +446,38 @@ void ObStorageUtil::close()
   OBJECT_STORAGE_GUARD(storage_info_, "", IO_HANDLED_SIZE_ZERO);
   if (NULL != util_) {
     util_->close();
-    util_ = NULL;
-    storage_info_ = NULL;
-    init_state = false;
-    device_type_ = OB_STORAGE_MAX_TYPE;
   }
+  reset();
+}
+
+void ObStorageUtil::reset()
+{
+  switch (handle_type_) {
+    case OB_STORAGE_HANDLE_FILE:
+      util_union_.file_util_.~ObStorageFileUtil();
+      break;
+    case OB_STORAGE_HANDLE_OSS:
+      util_union_.oss_util_.~ObStorageOssUtil();
+      break;
+    case OB_STORAGE_HANDLE_S3:
+      util_union_.s3_util_.~ObStorageS3Util();
+      break;
+    case OB_STORAGE_HANDLE_HDFS:
+      util_union_.hdfs_util_.~ObStorageHdfsJniUtil();
+      break;
+    case OB_STORAGE_HANDLE_OBDAL:
+      util_union_.obdal_util_.~ObStorageObDalUtil();
+      break;
+    case OB_STORAGE_HANDLE_MAX_TYPE:
+    default:
+      break;
+  }
+
+  util_ = nullptr;
+  storage_info_ = nullptr;
+  init_state = false;
+  device_type_ = OB_STORAGE_MAX_TYPE;
+  handle_type_ = OB_STORAGE_HANDLE_MAX_TYPE;
 }
 
 // inner func
@@ -851,6 +746,76 @@ int ObStorageUtil::get_file_length(const common::ObString &uri, const bool is_ad
   return ret;
 }
 
+int ObStorageUtil::get_file_stat(
+    const common::ObString &uri, const bool is_adaptive, ObIODFileStat &statbuf)
+{
+  int ret = OB_SUCCESS;
+  const int64_t start_ts = ObTimeUtility::current_time();
+  ObStorageObjectMeta obj_meta;
+  OBJECT_STORAGE_GUARD(storage_info_, uri, IO_HANDLED_SIZE_ZERO);
+
+#ifdef ERRSIM
+  ret = OB_E(EventTable::EN_BACKUP_IO_GET_FILE_LENGTH) OB_SUCCESS;
+#endif
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(!is_storage_type_match(uri, device_type_))) {
+    ret = OB_INVALID_BACKUP_DEST;
+    STORAGE_LOG(WARN, "uri prefix does not match the expected device type",
+        K(ret), K(uri), K(device_type_));
+  } else if (OB_FAIL(detect_storage_obj_meta(uri, is_adaptive, true/*need_fragment_meta*/, obj_meta))) {
+    OB_LOG(WARN, "fail to detect storage obj type", K(ret), K(uri), K(is_adaptive));
+  } else if (!obj_meta.is_exist_) {
+    ret = OB_OBJECT_NOT_EXIST;
+    OB_LOG(INFO, "cannot get file stat for not exist file", K(ret), K(uri));
+  } else if (OB_UNLIKELY(obj_meta.length_ < 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    OB_LOG(WARN, "this file length is invalid", K(ret), K(uri), K(obj_meta));
+  } else {
+    statbuf.size_ = obj_meta.length_;
+    statbuf.mtime_s_ = obj_meta.mtime_s_;
+  }
+
+  return ret;
+}
+
+int ObStorageUtil::get_file_content_digest(
+    const common::ObString &uri, char *digest_buf, const int64_t digest_buf_len)
+{
+  int ret = OB_SUCCESS;
+  const int64_t start_ts = ObTimeUtility::current_time();
+  ObStorageObjectMeta obj_meta;
+  OBJECT_STORAGE_GUARD(storage_info_, uri, IO_HANDLED_SIZE_ZERO);
+
+#ifdef ERRSIM
+  ret = OB_E(EventTable::EN_BACKUP_IO_GET_FILE_LENGTH) OB_SUCCESS;
+#endif
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(!is_storage_type_match(uri, device_type_))) {
+    ret = OB_INVALID_BACKUP_DEST;
+    STORAGE_LOG(WARN, "uri prefix does not match the expected device type",
+        K(ret), K(uri), K(device_type_));
+  } else if (OB_ISNULL(digest_buf) || OB_UNLIKELY(digest_buf_len <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "invalid argument", K(ret), K(uri), KP(digest_buf), K(digest_buf_len));
+  } else if (OB_FAIL(head_object_meta_(uri, obj_meta))) {
+    OB_LOG(WARN, "fail to head object meta", K(ret), K(uri));
+  } else if (OB_UNLIKELY(!obj_meta.is_exist_)) {
+    ret = OB_OBJECT_NOT_EXIST;
+    OB_LOG(WARN, "cannot get file stat for not exist file", K(ret), K(uri));
+  } else if (OB_UNLIKELY(obj_meta.digest_.empty())) {
+    // do not set error, because not all object storage systems guarantee to return digest
+    MEMSET(digest_buf, 0, digest_buf_len);
+    OB_LOG(WARN, "file content digest not exist", K(ret), K(uri), K(obj_meta));
+  } else {
+    if (OB_FAIL(databuff_printf(digest_buf, digest_buf_len,
+        "%.*s", obj_meta.digest_.length(), obj_meta.digest_.ptr()))) {
+      OB_LOG(WARN, "fail to copy digest", K(ret),
+          K(uri), K(obj_meta), KP(digest_buf), K(digest_buf_len));
+    }
+  }
+  return ret;
+}
+
 int ObStorageUtil::del_file(const common::ObString &uri, const bool is_adaptive)
 {
   int ret = OB_SUCCESS;
@@ -967,7 +932,7 @@ int ObStorageUtil::list_adaptive_files(
   ObStorageListFilesCtx list_file_ctx;
   ObStorageListCtxBase *list_ctx = NULL;
   bool is_obj_storage = (OB_STORAGE_FILE != device_type_);
-  const bool need_get_size = op.need_get_file_size();
+  const bool need_meta = op.need_get_file_meta();
 
   ObString bucket;
   ObString dir_path;
@@ -985,47 +950,16 @@ int ObStorageUtil::list_adaptive_files(
   } else if (OB_FAIL(build_bucket_and_object_name(allocator, uri, bucket, dir_path))) {
     OB_LOG(WARN, "fail to build bucket and object name", K(ret), K(uri));
   }
-  const char *marker = op.get_marker();
   if (OB_FAIL(ret)) {
-  } else if (op.is_marker_scan() && OB_ISNULL(marker)) {
-    ret = OB_INVALID_ARGUMENT;
-    OB_LOG(WARN, "marker should not be null for marker scan", K(ret), KP(marker));
   } else if (is_obj_storage) {
-    if (OB_FAIL(list_obj_ctx.init(allocator, OB_STORAGE_LIST_MAX_NUM, need_get_size))) {
-      OB_LOG(WARN, "fail to init list_obj_ctx", K(ret), K(need_get_size));
+    if (OB_FAIL(list_obj_ctx.init(allocator, OB_STORAGE_LIST_MAX_NUM, need_meta))) {
+      OB_LOG(WARN, "fail to init list_obj_ctx", K(ret), K(need_meta));
     } else {
       list_ctx = &list_obj_ctx;
     }
-
-    if (op.is_marker_scan()) {
-      if (!is_null_or_end_with_slash(dir_path.ptr())) {
-        ret = OB_INVALID_ARGUMENT;
-        OB_LOG(WARN, "dir_path not end with '/'", K(ret), K(uri), K(marker), K(dir_path));
-      } else if (marker[0] != '\0') {
-        int64_t pos = 0;
-        char marker_buf[OB_MAX_URI_LENGTH];
-        // if we want to list bucket, the maker should equal to the original name, else we need to concat dir_path and original marker
-        // e.g. marker = "a/b/c", dir_path = "d/e/", then the next marker should be "d/e/a/b/c"
-        // e.g. maker = "a/b/c", dir_path = "", then the next marker should be "a/b/c"
-        if (!dir_path.empty() && OB_FAIL(databuff_printf(marker_buf, sizeof(marker_buf), pos, "%s%s",
-                                    dir_path.ptr(), marker))) {
-          OB_LOG(WARN, "fail to construct next token", K(ret), K(uri), K(dir_path), K(marker));
-        } else if (dir_path.empty() && OB_FAIL(databuff_printf(marker_buf, sizeof(marker_buf), pos, "%s", marker))) {
-          OB_LOG(WARN, "fail to construct next token", K(ret), K(uri), K(dir_path), K(marker));
-        } else if (OB_FAIL(list_obj_ctx.set_next_token(true/*has_next*/, marker_buf, pos))) {
-          OB_LOG(WARN, "fail to set next token", K(ret), K(uri), K(marker), K(marker_buf));
-        } else if (OB_FAIL(list_obj_ctx.set_marker(marker))) {
-          OB_LOG(WARN, "fail to set list ctx marker", K(ret), K(uri), K(marker));
-        }
-      }
-
-      if (OB_SUCC(ret)) {
-        list_obj_ctx.set_total_list_limit(op.get_scan_count());
-      }
-    }
   } else {
-    if (OB_FAIL(list_file_ctx.init(allocator, OB_STORAGE_LIST_MAX_NUM, need_get_size))) {
-      OB_LOG(WARN, "fail to init list_file_ctx", K(ret), K(need_get_size));
+    if (OB_FAIL(list_file_ctx.init(allocator, OB_STORAGE_LIST_MAX_NUM, need_meta))) {
+      OB_LOG(WARN, "fail to init list_file_ctx", K(ret), K(need_meta));
     } else {
       list_ctx = &list_file_ctx;
     }
@@ -1121,7 +1055,7 @@ int ObStorageUtil::handle_listed_objs(
 
         // use @op to handle current normal object name
         if (OB_SUCC(ret) && !list_ctx->has_reached_list_limit()) {
-          const int64_t size = op.need_get_file_size() ? list_ctx->size_arr_[i] : -1;
+          const int64_t size = op.need_get_file_meta() ? list_ctx->size_arr_[i] : -1;
           if (OB_FAIL(handle_listed_object(op, cur_obj_path.ptr() + full_dir_path_len,
                                            cur_obj_path.length() - full_dir_path_len,
                                            size))) {
@@ -1163,29 +1097,7 @@ int ObStorageUtil::handle_listed_appendable_obj(
   const int64_t appendable_full_path_len = strlen(list_ctx->cur_appendable_full_obj_path_);
   int64_t appendable_file_len = 0;
 
-  // Assuming the file hierarchy is:
-  // base_dir/
-  // ├── a
-  // ├── b_appendable
-  // │    ├── 0-100
-  // │    └── FORMAT_META
-  // └── c
-  // 'b_appendable' is 'SIMULATE_APPEND' type.
-  // If the marker is 'b_appendable', the expected result is ["c"].
-  // However, fragments of the 'b_appendable' have a greater lexicographical order than the marker.
-  // Therefore, fragments of 'b_appendable' are included in the listed results
-  // and are ultimately aggregated under the logical object name 'b_appendable',
-  // which is necessary to be filtered out.
-  if (op.is_marker_scan() && OB_NOT_NULL(list_ctx->marker_)) {
-    // list_ctx->cur_appendable_full_obj_path_ is equal to full_dir_path + logic_apendable_obj_name + '/'
-    list_ctx->cur_appendable_full_obj_path_[appendable_full_path_len - 1] = '\0';
-    if (less_than(list_ctx->cur_appendable_full_obj_path_ + full_dir_path_len, list_ctx->marker_)) {
-      need_handle_file = false;
-    }
-    list_ctx->cur_appendable_full_obj_path_[appendable_full_path_len - 1] = '/';
-  }
-
-  if (need_handle_file && op.need_get_file_size()) {
+  if (need_handle_file && op.need_get_file_meta()) {
     char append_obj_uri[OB_MAX_URI_LENGTH] = {0};
     // uri is equal to "prefix + bucket + '/' + dir_path"
     const int64_t uri_prefix_len = uri.length() - dir_path_len;
@@ -1247,7 +1159,7 @@ int ObStorageUtil::handle_listed_fs(
       // if the file's suffix is '/', that means this is a 'appendable' file. otherwise it is a normal file
       if (list_ctx->name_arr_[i][name_len - 1] == '/') {
         list_ctx->name_arr_[i][name_len - 1] = '\0';
-        if (op.need_get_file_size()) {
+        if (op.need_get_file_meta()) {
           if (OB_FAIL(databuff_printf(tmp_uri, OB_MAX_URI_LENGTH, "%s%s%s", uri.ptr(), slash_delimiter,
               list_ctx->name_arr_[i]))) {
             STORAGE_LOG(WARN, "fail to build appendable file uri", K(ret), K(i), K(uri), K(is_slash_end),
@@ -1257,7 +1169,7 @@ int ObStorageUtil::handle_listed_fs(
           }
         }
       } else {
-        if (op.need_get_file_size()) {
+        if (op.need_get_file_meta()) {
           size = list_ctx->size_arr_[i];
         }
       }
@@ -1340,51 +1252,6 @@ int ObStorageUtil::is_exist(const common::ObString &uri, bool &exist)
         K(ret), K(uri), K_(device_type));
   } else if (OB_FAIL(util_->is_exist(uri, exist))) {
     STORAGE_LOG(WARN, "failed to check is exist", K(ret), K(uri));
-  }
-
-  if (OB_FAIL(ret)) {
-    EVENT_INC(ObStatEventIds::OBJECT_STORAGE_IO_HEAD_FAIL_COUNT);
-  }
-  EVENT_INC(ObStatEventIds::OBJECT_STORAGE_IO_HEAD_COUNT);
-  return ret;
-}
-
-int ObStorageUtil::get_file_length(const common::ObString &uri, int64_t &file_length)
-{
-  int ret = OB_SUCCESS;
-  const int64_t start_ts = ObTimeUtility::current_time();
-  file_length = -1;
-  OBJECT_STORAGE_GUARD(storage_info_, uri, IO_HANDLED_SIZE_ZERO);
-
-#ifdef ERRSIM
-  ret = OB_E(EventTable::EN_BACKUP_IO_GET_FILE_LENGTH) OB_SUCCESS;
-#endif
-  if (OB_FAIL(ret)) {
-  } else if (OB_UNLIKELY(!is_init())) {
-    ret = OB_NOT_INIT;
-    STORAGE_LOG(WARN, "util is not inited", K(ret), K(uri));
-  } else if (ObStorageGlobalIns::get_instance().is_io_prohibited()) {
-    ret = OB_BACKUP_IO_PROHIBITED;
-    STORAGE_LOG(WARN, "current observer backup io is prohibited", K(ret), K(uri));
-  } else if (OB_UNLIKELY(!is_storage_type_match(uri, device_type_))) {
-    ret = OB_INVALID_BACKUP_DEST;
-    STORAGE_LOG(WARN, "uri prefix does not match the expected device type",
-        K(ret), K(uri), K_(device_type));
-  } else if (OB_FAIL(util_->get_file_length(uri, file_length))) {
-    if (OB_OBJECT_NOT_EXIST == ret) {
-      STORAGE_LOG(INFO, "cannot get file length for not exist file", K(ret), K(uri));
-    } else {
-      STORAGE_LOG(WARN, "failed to get_file_length", K(ret), K(uri));
-    }
-  }
-
-  if (OB_SUCC(ret)) {
-    if (file_length == 0) {
-      STORAGE_LOG(INFO, "this file is empty", K(ret), K(uri), K(file_length));
-    } else if (file_length < 0) {
-      ret = OB_ERR_UNEXPECTED;
-      STORAGE_LOG(WARN, "this file length is invalid", K(ret), K(uri), K(file_length));
-    }
   }
 
   if (OB_FAIL(ret)) {
@@ -1565,6 +1432,10 @@ int ObStorageUtil::batch_del_files(
               K(object_start), K(cur_deleted_pos), K(files_to_delete_map.size()));
         } else {
           cur_deleted_pos++;
+
+          if (ObObjectStorageGuard::is_connectivity_check_file(cur_uri)) {
+            STORAGE_LOG(ERROR, "batch delete connectivity check file", K(cur_uri));
+          }
         }
       }
 
@@ -1814,51 +1685,6 @@ int ObStorageUtil::is_tagging(const common::ObString &uri, bool &is_tagging)
 }
 
 
-int ObStorageUtil::list_files_with_marker(const common::ObString &uri, common::ObBaseDirEntryOperator &op)
-{
-  int ret = OB_SUCCESS;
-  OBJECT_STORAGE_GUARD(storage_info_, uri, IO_HANDLED_SIZE_ZERO);
-  const char *marker = op.get_marker();
-  char uri_buf[OB_MAX_URI_LENGTH] = {0};
-  const int64_t start_ts = ObTimeUtility::current_time();
-
-  if (OB_UNLIKELY(!is_init())) {
-    ret = OB_NOT_INIT;
-    STORAGE_LOG(WARN, "util is not inited", K(ret), K(uri));
-  } else if (OB_UNLIKELY(uri.empty() || !op.is_marker_scan()) || OB_ISNULL(marker)) {
-    ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "marker ptr should not be nullptr or op type invalid", K(ret), K(uri), K(marker));
-  } else if (ObStorageGlobalIns::get_instance().is_io_prohibited()) {
-    ret = OB_BACKUP_IO_PROHIBITED;
-    STORAGE_LOG(WARN, "current observer backup io is prohibited", K(ret), K(uri));
-  } else if (OB_FAIL(validate_uri_type(uri))) {
-    STORAGE_LOG(WARN, "fail to validate uri!", K(uri));
-  } else if (OB_FAIL(build_full_dir_path(uri.ptr(), uri_buf, sizeof(uri_buf)))) {
-    OB_LOG(WARN, "fail to make uri end with '/'", K(ret), K(uri));
-  } else {}
-
-  if (OB_FAIL(ret)) {
-  } else if (OB_STORAGE_FILE != device_type_) {
-    if (OB_FAIL(list_adaptive_files(uri_buf, op))) {
-      STORAGE_LOG(WARN, "failed to list adaptive files with marker",
-          K(ret), K(uri), K(uri_buf), K(marker));
-    }
-  } else {
-    const int64_t scan_count = (op.get_scan_count() <= 0 ? INT64_MAX : op.get_scan_count());
-    ObTopNMinimumDirEntryWithMarkerOperator top_n_op(scan_count, marker, op.need_get_file_size());
-
-    if (OB_FAIL(list_adaptive_files(uri_buf, top_n_op))) {
-      STORAGE_LOG(WARN, "failed to list adaptive files with marker",
-          K(ret), K(uri), K(uri_buf), K(marker), K(scan_count));
-    } else if (OB_FAIL(top_n_op.handle_each_dir_entry(op))) {
-      STORAGE_LOG(WARN, "failed to handle_each_dir_entry", K(ret), K(uri), K(scan_count));
-    }
-  }
-
-
-  return ret;
-}
-
 int ObStorageUtil::del_unmerged_parts(const common::ObString &uri)
 {
   int ret = OB_NOT_SUPPORTED;
@@ -1944,10 +1770,8 @@ void ObStorageAccesser::dec_ref()
 ObStorageReader::ObStorageReader()
   : file_length_(-1),
     reader_(NULL),
-    file_reader_(),
-    oss_reader_(),
-    cos_reader_(),
-    s3_reader_(),
+    reader_union_(),
+    handle_type_(OB_STORAGE_HANDLE_MAX_TYPE),
     start_ts_(0),
     has_meta_(false),
     storage_info_(nullptr)
@@ -1960,6 +1784,7 @@ ObStorageReader::~ObStorageReader()
   if (NULL != reader_) {
     STORAGE_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "reader not closed", KCSTRING(uri_));
   }
+  reset();
 }
 
 int ObStorageReader::open(const common::ObString &uri,
@@ -1993,22 +1818,25 @@ int ObStorageReader::open(const common::ObString &uri,
     STORAGE_LOG(WARN, "failed to fill uri", K(ret), K(uri));
   } else if (FALSE_IT(storage_info_ = storage_info)) {
   } else if (OB_STORAGE_FILE == type) {
-    reader_ = &file_reader_;
+    new (&reader_union_.file_reader_) ObStorageFileReader();
+    reader_ = &reader_union_.file_reader_;
+    handle_type_ = OB_STORAGE_HANDLE_FILE;
   } else if (OB_STORAGE_HDFS == type) {
-    reader_ = &hdfs_reader_;
-  } else if (is_use_obdal()) {
-    if (OB_UNLIKELY(storage_info->is_enable_worm())) {
-      ret = OB_NOT_SUPPORTED;
-      STORAGE_LOG(WARN, "obdal do not support worm", K(ret), KPC(storage_info));
-    } else {
-      reader_ = &obdal_reader_;
-    }
+    new (&reader_union_.hdfs_reader_) ObStorageHdfsReader();
+    reader_ = &reader_union_.hdfs_reader_;
+    handle_type_ = OB_STORAGE_HANDLE_HDFS;
+  } else if (is_use_obdal() || OB_STORAGE_AZBLOB == type) {
+    new (&reader_union_.obdal_reader_) ObStorageObDalReader();
+    reader_ = &reader_union_.obdal_reader_;
+    handle_type_ = OB_STORAGE_HANDLE_OBDAL;
   } else if (OB_STORAGE_OSS == type) {
-    reader_ = &oss_reader_;
-  } else if (OB_STORAGE_COS == type) {
-    reader_ = &cos_reader_;
+    new (&reader_union_.oss_reader_) ObStorageOssReader();
+    reader_ = &reader_union_.oss_reader_;
+    handle_type_ = OB_STORAGE_HANDLE_OSS;
   } else if (OB_STORAGE_S3 == type) {
-    reader_ = &s3_reader_;
+    new (&reader_union_.s3_reader_) ObStorageS3Reader();
+    reader_ = &reader_union_.s3_reader_;
+    handle_type_ = OB_STORAGE_HANDLE_S3;
   } else {
     ret = OB_ERR_SYS;
     STORAGE_LOG(ERROR, "unkown storage type", K(ret), K(uri));
@@ -2065,9 +1893,12 @@ int ObStorageReader::pread(char *buf, const int64_t buf_size, int64_t offset, in
   } else if (OB_ISNULL(reader_)) {
     ret = OB_NOT_INIT;
     STORAGE_LOG(WARN, "not opened", K(ret));
-  } else if (OB_ISNULL(buf) || OB_UNLIKELY(offset < 0 || (has_meta_ && offset > file_length_))) {
+  } else if (OB_ISNULL(buf) || OB_UNLIKELY(offset < 0)) {
     ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "invalid args", K(ret), KP(buf), K(offset), K_(has_meta), K_(file_length));
+    STORAGE_LOG(WARN, "invalid args", K(ret), KP(buf), K(offset));
+  } else if (OB_UNLIKELY(has_meta_ && (offset > file_length_))) {
+    ret = OB_DATA_OUT_OF_RANGE;
+    STORAGE_LOG(WARN, "offset is larger than file_length", KR(ret), K_(has_meta), K_(file_length), K(offset));
   } else if (OB_FAIL(reader_->pread(buf, buf_size, offset, read_size))) {
     EVENT_INC(ObStatEventIds::BACKUP_IO_READ_FAIL_COUNT);
     STORAGE_LOG(WARN, "failed to read file", K(ret));
@@ -2092,13 +1923,40 @@ int ObStorageReader::close()
   } else if (OB_FAIL(reader_->close())) {
     STORAGE_LOG(WARN, "failed to close reader", K(ret));
   }
+  reset();
+  return ret;
+}
+
+void ObStorageReader::reset()
+{
+  switch (handle_type_) {
+    case OB_STORAGE_HANDLE_FILE:
+      reader_union_.file_reader_.~ObStorageFileReader();
+      break;
+    case OB_STORAGE_HANDLE_OSS:
+      reader_union_.oss_reader_.~ObStorageOssReader();
+      break;
+    case OB_STORAGE_HANDLE_S3:
+      reader_union_.s3_reader_.~ObStorageS3Reader();
+      break;
+    case OB_STORAGE_HANDLE_HDFS:
+      reader_union_.hdfs_reader_.~ObStorageHdfsReader();
+      break;
+    case OB_STORAGE_HANDLE_OBDAL:
+      reader_union_.obdal_reader_.~ObStorageObDalReader();
+      break;
+    case OB_STORAGE_HANDLE_MAX_TYPE:
+    default:
+      break;
+  }
+
   reader_  = NULL;
+  handle_type_ = OB_STORAGE_HANDLE_MAX_TYPE;
   file_length_ = -1;
   start_ts_ = 0;
   uri_[0] = '\0';
   has_meta_ = false;
   storage_info_ = nullptr;
-  return ret;
 }
 
 ObStorageAdaptiveReader::ObStorageAdaptiveReader()
@@ -2107,11 +1965,8 @@ ObStorageAdaptiveReader::ObStorageAdaptiveReader()
       bucket_(),
       object_(),
       reader_(NULL),
-      file_reader_(),
-      oss_reader_(),
-      cos_reader_(),
-      s3_reader_(),
-      hdfs_reader_(),
+      reader_union_(),
+      handle_type_(OB_STORAGE_HANDLE_MAX_TYPE),
       start_ts_(0),
       storage_info_(NULL)
 {
@@ -2123,6 +1978,7 @@ ObStorageAdaptiveReader::~ObStorageAdaptiveReader()
   if (NULL != reader_) {
     STORAGE_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "adaptive reader not closed", KCSTRING(uri_));
   }
+  reset();
 }
 
 template<typename ReaderType>
@@ -2145,16 +2001,16 @@ static int alloc_reader(ObIAllocator &allocator, const ObStorageType &type, ObIS
 {
   int ret = OB_SUCCESS;
   reader = nullptr;
-  if (OB_STORAGE_OSS == type) {
-    ret = alloc_reader_type<ObStorageOssReader>(allocator, reader);
-  } else if (OB_STORAGE_COS == type) {
-    ret = alloc_reader_type<ObStorageCosReader>(allocator, reader);
-  } else if (OB_STORAGE_S3 == type) {
-    ret = alloc_reader_type<ObStorageS3Reader>(allocator, reader);
-  } else if (OB_STORAGE_FILE == type) {
+  if (OB_STORAGE_FILE == type) {
     ret = alloc_reader_type<ObStorageFileReader>(allocator, reader);
   } else if (OB_STORAGE_HDFS == type) {
     ret = alloc_reader_type<ObStorageHdfsReader>(allocator, reader);
+  } else if (is_use_obdal() || OB_STORAGE_AZBLOB == type) {
+    ret = alloc_reader_type<ObStorageObDalReader>(allocator, reader);
+  } else if (OB_STORAGE_OSS == type) {
+    ret = alloc_reader_type<ObStorageOssReader>(allocator, reader);
+  } else if (OB_STORAGE_S3 == type) {
+    ret = alloc_reader_type<ObStorageS3Reader>(allocator, reader);
   } else {
     ret = OB_INVALID_ARGUMENT;
   }
@@ -2197,22 +2053,25 @@ int ObStorageAdaptiveReader::open(const common::ObString &uri,
     STORAGE_LOG(WARN, "failed to fill uri", K(ret), K(uri));
   } else if (FALSE_IT(storage_info_ = storage_info)) {
   } else if (OB_STORAGE_FILE == type) {
-    reader_ = &file_reader_;
+    new (&reader_union_.file_reader_) ObStorageFileReader();
+    reader_ = &reader_union_.file_reader_;
+    handle_type_ = OB_STORAGE_HANDLE_FILE;
   } else if (OB_STORAGE_HDFS == type) {
-    reader_ = &hdfs_reader_;
-  } else if (is_use_obdal()) {
-    if (OB_UNLIKELY(storage_info->is_enable_worm())) {
-      ret = OB_NOT_SUPPORTED;
-      STORAGE_LOG(WARN, "obdal do not support worm", K(ret), KPC(storage_info));
-    } else {
-      reader_ = &obdal_reader_;
-    }
+    new (&reader_union_.hdfs_reader_) ObStorageHdfsReader();
+    reader_ = &reader_union_.hdfs_reader_;
+    handle_type_ = OB_STORAGE_HANDLE_HDFS;
+  } else if (is_use_obdal() || OB_STORAGE_AZBLOB == type) {
+    new (&reader_union_.obdal_reader_) ObStorageObDalReader();
+    reader_ = &reader_union_.obdal_reader_;
+    handle_type_ = OB_STORAGE_HANDLE_OBDAL;
   } else if (OB_STORAGE_OSS == type) {
-    reader_ = &oss_reader_;
-  } else if (OB_STORAGE_COS == type) {
-    reader_ = &cos_reader_;
+    new (&reader_union_.oss_reader_) ObStorageOssReader();
+    reader_ = &reader_union_.oss_reader_;
+    handle_type_ = OB_STORAGE_HANDLE_OSS;
   } else if (OB_STORAGE_S3 == type) {
-    reader_ = &s3_reader_;
+    new (&reader_union_.s3_reader_) ObStorageS3Reader();
+    reader_ = &reader_union_.s3_reader_;
+    handle_type_ = OB_STORAGE_HANDLE_S3;
   } else {
     ret = OB_ERR_SYS;
     STORAGE_LOG(ERROR, "unkown storage type", K(ret), K(uri));
@@ -2342,6 +2201,11 @@ int ObStorageAdaptiveReader::pread(char *buf,
         read_size = cur_read_size;
       }
     }
+
+    if (OB_NOT_NULL(tmp_reader)) {
+      tmp_reader->~ObIStorageReader();
+      // tmp_reader is alloced by allocator, no need actively free
+    }
   } else {
     ret = OB_ERR_SYS;
     OB_LOG(ERROR, "unkown object type", K(ret), K_(meta));
@@ -2366,21 +2230,46 @@ int ObStorageAdaptiveReader::close()
   } else if (OB_FAIL(reader_->close())) {
     STORAGE_LOG(WARN, "failed to close reader", K(ret));
   }
+  reset();
+  return ret;
+}
+
+void ObStorageAdaptiveReader::reset()
+{
+  switch (handle_type_) {
+    case OB_STORAGE_HANDLE_FILE:
+      reader_union_.file_reader_.~ObStorageFileReader();
+      break;
+    case OB_STORAGE_HANDLE_OSS:
+      reader_union_.oss_reader_.~ObStorageOssReader();
+      break;
+    case OB_STORAGE_HANDLE_S3:
+      reader_union_.s3_reader_.~ObStorageS3Reader();
+      break;
+    case OB_STORAGE_HANDLE_HDFS:
+      reader_union_.hdfs_reader_.~ObStorageHdfsReader();
+      break;
+    case OB_STORAGE_HANDLE_OBDAL:
+      reader_union_.obdal_reader_.~ObStorageObDalReader();
+      break;
+    case OB_STORAGE_HANDLE_MAX_TYPE:
+    default:
+      break;
+  }
+
   reader_  = NULL;
+  handle_type_ = OB_STORAGE_HANDLE_MAX_TYPE;
   start_ts_ = 0;
   uri_[0] = '\0';
   allocator_.clear();
   meta_.reset();
   storage_info_ = NULL;
-  return ret;
 }
 
 ObStorageWriter::ObStorageWriter()
   : writer_(NULL),
-    file_writer_(),
-    oss_writer_(),
-    cos_writer_(),
-    s3_writer_(),
+    writer_union_(),
+    handle_type_(OB_STORAGE_HANDLE_MAX_TYPE),
     start_ts_(0),
     storage_info_(nullptr)
 {
@@ -2392,6 +2281,7 @@ ObStorageWriter::~ObStorageWriter()
   if (NULL != writer_) {
     STORAGE_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "writer not close");
   }
+  reset();
 }
 
 int ObStorageWriter::open(const common::ObString &uri, common::ObObjectStorageInfo *storage_info)
@@ -2424,20 +2314,25 @@ int ObStorageWriter::open(const common::ObString &uri, common::ObObjectStorageIn
     STORAGE_LOG(WARN, "failed to fill uri", K(ret), K(uri));
   } else if (FALSE_IT(storage_info_ = storage_info)) {
   } else if (OB_STORAGE_FILE == type) {
-    writer_ = &file_writer_;
-  } else if (is_use_obdal()) {
-    if (OB_UNLIKELY(storage_info->is_enable_worm())) {
-      ret = OB_NOT_SUPPORTED;
-      STORAGE_LOG(WARN, "obdal do not support worm", K(ret), KPC(storage_info));
-    } else {
-      writer_ = &obdal_writer_;
-    }
+    new (&writer_union_.file_writer_) ObStorageFileSingleWriter();
+    writer_ = &writer_union_.file_writer_;
+    handle_type_ = OB_STORAGE_HANDLE_FILE;
+  } else if (OB_STORAGE_HDFS == type) {
+    new (&writer_union_.hdfs_writer_) ObStorageHdfsWriter();
+    writer_ = &writer_union_.hdfs_writer_;
+    handle_type_ = OB_STORAGE_HANDLE_HDFS;
+  } else if (is_use_obdal() || OB_STORAGE_AZBLOB == type) {
+    new (&writer_union_.obdal_writer_) ObStorageObDalWriter();
+    writer_ = &writer_union_.obdal_writer_;
+    handle_type_ = OB_STORAGE_HANDLE_OBDAL;
   } else if (OB_STORAGE_OSS == type) {
-    writer_ = &oss_writer_;
-  } else if (OB_STORAGE_COS == type) {
-    writer_ = &cos_writer_;
+    new (&writer_union_.oss_writer_) ObStorageOssWriter();
+    writer_ = &writer_union_.oss_writer_;
+    handle_type_ = OB_STORAGE_HANDLE_OSS;
   } else if (OB_STORAGE_S3 == type) {
-    writer_ = &s3_writer_;
+    new (&writer_union_.s3_writer_) ObStorageS3Writer();
+    writer_ = &writer_union_.s3_writer_;
+    handle_type_ = OB_STORAGE_HANDLE_S3;
   } else {
     ret = OB_ERR_SYS;
     STORAGE_LOG(ERROR, "unkown storage type", K(ret), K(uri));
@@ -2503,39 +2398,66 @@ int ObStorageWriter::close()
   } else if (OB_FAIL(writer_->close())) {
     STORAGE_LOG(WARN, "failed to close writer", K(ret));
   }
+  reset();
+  return ret;
+}
+
+void ObStorageWriter::reset()
+{
+  switch (handle_type_) {
+    case OB_STORAGE_HANDLE_FILE:
+      writer_union_.file_writer_.~ObStorageFileSingleWriter();
+      break;
+    case OB_STORAGE_HANDLE_OSS:
+      writer_union_.oss_writer_.~ObStorageOssWriter();
+      break;
+    case OB_STORAGE_HANDLE_S3:
+      writer_union_.s3_writer_.~ObStorageS3Writer();
+      break;
+    case OB_STORAGE_HANDLE_HDFS:
+      writer_union_.hdfs_writer_.~ObStorageHdfsWriter();
+      break;
+    case OB_STORAGE_HANDLE_OBDAL:
+      writer_union_.obdal_writer_.~ObStorageObDalWriter();
+      break;
+    case OB_STORAGE_HANDLE_MAX_TYPE:
+    default:
+      break;
+  }
+
   writer_  = NULL;
+  handle_type_ = OB_STORAGE_HANDLE_MAX_TYPE;
   start_ts_ = 0;
   uri_[0] = '\0';
   storage_info_ = nullptr;
-  return ret;
 }
 
 ObStorageAppender::ObStorageAppender()
   : appender_(NULL),
-    file_appender_(),
-    oss_appender_(),
-    cos_appender_(),
-    s3_appender_(),
+    appender_union_(),
+    handle_type_(OB_STORAGE_HANDLE_MAX_TYPE),
     start_ts_(0),
     is_opened_(false),
-    storage_info_(),
+    storage_info_(nullptr),
     allocator_(APPENDABLE_OBJECT_ALLOCATOR),
-    type_(OB_STORAGE_MAX_TYPE)
+    type_(OB_STORAGE_MAX_TYPE),
+    open_mode_(StorageOpenMode::CREATE_OPEN_LOCK),
+    is_adaptive_appendable_(false)
 {
     uri_[0] = '\0';
 }
 
 ObStorageAppender::ObStorageAppender(StorageOpenMode mode)
   : appender_(NULL),
-    file_appender_(mode),
-    oss_appender_(),
-    cos_appender_(),
-    s3_appender_(),
+    appender_union_(),
+    handle_type_(OB_STORAGE_HANDLE_MAX_TYPE),
     start_ts_(0),
     is_opened_(false),
     storage_info_(nullptr),
     allocator_(APPENDABLE_OBJECT_ALLOCATOR),
-    type_(OB_STORAGE_MAX_TYPE)
+    type_(OB_STORAGE_MAX_TYPE),
+    open_mode_(mode),
+    is_adaptive_appendable_(false)
 {
     uri_[0] = '\0';
 }
@@ -2545,6 +2467,7 @@ ObStorageAppender::~ObStorageAppender()
   if (is_opened_ && NULL != appender_) {
     STORAGE_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "appender not close");
   }
+  reset();
 }
 
 int ObStorageAppender::open(
@@ -2578,23 +2501,27 @@ int ObStorageAppender::open(
     STORAGE_LOG(WARN, "failed to fill uri", K(ret), K(uri));
   } else if (FALSE_IT(storage_info_ = storage_info)) {
   } else if (OB_STORAGE_FILE == type_) {
-    appender_ = &file_appender_;
-  } else if (is_use_obdal()) {
-    if (OB_UNLIKELY(storage_info->is_enable_worm())) {
-      ret = OB_NOT_SUPPORTED;
-      STORAGE_LOG(WARN, "obdal do not support worm", K(ret), KPC(storage_info));
-    } else {
-      appender_ = &obdal_appender_;
-    }
+    new (&appender_union_.file_appender_) ObStorageFileAppender(open_mode_);
+    appender_ = &appender_union_.file_appender_;
+    handle_type_ = OB_STORAGE_HANDLE_FILE;
+  } else if (OB_STORAGE_HDFS == type_) {
+    new (&appender_union_.hdfs_appender_) ObStorageHdfsAppendWriter();
+    appender_ = &appender_union_.hdfs_appender_;
+    handle_type_ = OB_STORAGE_HANDLE_HDFS;
+  } else if (is_use_obdal() || OB_STORAGE_AZBLOB == type_) {
+    new (&appender_union_.obdal_appender_) ObStorageObDalAppendWriter();
+    appender_ = &appender_union_.obdal_appender_;
+    handle_type_ = OB_STORAGE_HANDLE_OBDAL;
   } else if (OB_STORAGE_OSS == type_ ||
-             OB_STORAGE_COS == type_ ||
              OB_STORAGE_S3 == type_) {
     if (OB_STORAGE_OSS == type_) {
-      appender_ = &oss_appender_;
-    } else if (OB_STORAGE_COS == type_) {
-      appender_ = &cos_appender_;
+      new (&appender_union_.oss_appender_) ObStorageOssAppendWriter();
+      appender_ = &appender_union_.oss_appender_;
+      handle_type_ = OB_STORAGE_HANDLE_OSS;
     } else if (OB_STORAGE_S3 == type_) {
-      appender_ = &s3_appender_;
+      new (&appender_union_.s3_appender_) ObStorageS3AppendWriter();
+      appender_ = &appender_union_.s3_appender_;
+      handle_type_ = OB_STORAGE_HANDLE_S3;
     }
   } else {
     ret = OB_ERR_SYS;
@@ -2607,6 +2534,19 @@ int ObStorageAppender::open(
       STORAGE_LOG(WARN, "appender_ is null", K(ret), K(uri));
     } else if (OB_FAIL(appender_->open(uri, storage_info))) {
       STORAGE_LOG(WARN, "failed to open writer", K(ret), K(uri));
+    } else if (is_adaptive_append_mode(*storage_info)) {
+      bool is_exist = false;
+      ObStorageUtil util;
+      if (OB_FAIL(util.open(storage_info))) {
+        STORAGE_LOG(WARN, "failed to open util", K(ret));
+      } else if (OB_FAIL(util.is_exist(uri, false/*is_adaptive*/, is_exist))) {
+        STORAGE_LOG(WARN, "failed to check if exist", K(ret));
+      } else if (!is_exist) {
+        is_adaptive_appendable_ = true;
+      }
+    }
+
+    if (OB_FAIL(ret)) {
     } else {
       is_opened_ = true;
     }
@@ -2692,13 +2632,16 @@ int ObStorageAppender::pwrite(const char *buf, const int64_t size, const int64_t
   } else if (OB_ISNULL(appender_)) {
     ret = OB_NOT_INIT;
     STORAGE_LOG(WARN, "not opened", K(ret));
+  } else if (is_adaptive_append_mode(*storage_info_) && !is_adaptive_appendable_) {
+    ret = OB_OBJECT_STORAGE_INVALID_OBJECT_TYPE;
+    STORAGE_LOG(WARN, "object is not adaptive appendable", K(ret), K_(uri), K_(is_adaptive_appendable));
   } else if (OB_FAIL(appender_->pwrite(buf, size, offset))) {
     STORAGE_LOG(WARN, "failed to write", K(ret));
   }
 
   // no need to adjust the function repeatable_pwrite_
   // because S3 will not return OB_OBJECT_STORAGE_PWRITE_OFFSET_NOT_MATCH
-  if (OB_OBJECT_STORAGE_PWRITE_OFFSET_NOT_MATCH == ret && appender_ != &s3_appender_) {
+  if (OB_OBJECT_STORAGE_PWRITE_OFFSET_NOT_MATCH == ret && handle_type_ != OB_STORAGE_HANDLE_S3) {
     if (OB_FAIL(repeatable_pwrite_(buf, size, offset))) {
       STORAGE_LOG(WARN, "failed to repeatable_pwrite", K(ret));
     } else {
@@ -2761,12 +2704,40 @@ int ObStorageAppender::close()
   } else if (OB_FAIL(appender_->close())) {
     STORAGE_LOG(WARN, "failed to close writer", K(ret));
   }
+  reset();
+  return ret;
+}
+
+void ObStorageAppender::reset()
+{
+  switch (handle_type_) {
+    case OB_STORAGE_HANDLE_FILE:
+      appender_union_.file_appender_.~ObStorageFileAppender();
+      break;
+    case OB_STORAGE_HANDLE_OSS:
+      appender_union_.oss_appender_.~ObStorageOssAppendWriter();
+      break;
+    case OB_STORAGE_HANDLE_S3:
+      appender_union_.s3_appender_.~ObStorageS3AppendWriter();
+      break;
+    case OB_STORAGE_HANDLE_HDFS:
+      appender_union_.hdfs_appender_.~ObStorageHdfsAppendWriter();
+      break;
+    case OB_STORAGE_HANDLE_OBDAL:
+      appender_union_.obdal_appender_.~ObStorageObDalAppendWriter();
+      break;
+    case OB_STORAGE_HANDLE_MAX_TYPE:
+    default:
+      break;
+  }
+
   appender_  = NULL;
+  handle_type_ = OB_STORAGE_HANDLE_MAX_TYPE;
   start_ts_ = 0;
   uri_[0] = '\0';
   is_opened_ = false;
   storage_info_ = nullptr;
-  return ret;
+  is_adaptive_appendable_ = false;
 }
 
 int ObStorageAppender::seal_for_adaptive()
@@ -2833,10 +2804,8 @@ int ObStorageAppender::seal_for_adaptive()
 
 ObStorageMultiPartWriter::ObStorageMultiPartWriter()
     : multipart_writer_(NULL),
-      file_multipart_writer_(),
-      cos_multipart_writer_(),
-      oss_multipart_writer_(),
-      s3_multipart_writer_(),
+      multipart_writer_union_(),
+      handle_type_(OB_STORAGE_HANDLE_MAX_TYPE),
       start_ts_(0),
       is_opened_(false),
       storage_info_(nullptr),
@@ -2850,6 +2819,7 @@ ObStorageMultiPartWriter::~ObStorageMultiPartWriter()
   if (is_opened_ && NULL != multipart_writer_) {
     STORAGE_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "multipart_writer not close");
   }
+  reset();
 }
 
 int ObStorageMultiPartWriter::open(
@@ -2880,23 +2850,23 @@ int ObStorageMultiPartWriter::open(
     STORAGE_LOG(WARN, "failed to fill uri", K(ret), K(uri));
   } else if (FALSE_IT(storage_info_ = storage_info)) {
   } else if (OB_STORAGE_FILE == type) {
-    multipart_writer_ = &file_multipart_writer_;
-  } else if (is_use_obdal()) {
-    if (OB_UNLIKELY(storage_info->is_enable_worm())) {
-      ret = OB_NOT_SUPPORTED;
-      STORAGE_LOG(WARN, "obdal do not support worm", K(ret), KPC(storage_info));
-    } else {
-      multipart_writer_ = &obdal_multipart_writer_;
-    }
+    new (&multipart_writer_union_.file_multipart_writer_) ObStorageFileMultiPartWriter();
+    multipart_writer_ = &multipart_writer_union_.file_multipart_writer_;
+    handle_type_ = OB_STORAGE_HANDLE_FILE;
+  } else if (is_use_obdal() || OB_STORAGE_AZBLOB == type) {
+    new (&multipart_writer_union_.obdal_multipart_writer_) ObStorageObDalMultiPartWriter();
+    multipart_writer_ = &multipart_writer_union_.obdal_multipart_writer_;
+    handle_type_ = OB_STORAGE_HANDLE_OBDAL;
   } else if (OB_STORAGE_OSS == type ||
-             OB_STORAGE_COS == type ||
              OB_STORAGE_S3 == type) {
     if (OB_STORAGE_OSS == type) {
-      multipart_writer_ = &oss_multipart_writer_;
-    } else if (OB_STORAGE_COS == type) {
-      multipart_writer_ = &cos_multipart_writer_;
+      new (&multipart_writer_union_.oss_multipart_writer_) ObStorageOssMultiPartWriter();
+      multipart_writer_ = &multipart_writer_union_.oss_multipart_writer_;
+      handle_type_ = OB_STORAGE_HANDLE_OSS;
     } else if (OB_STORAGE_S3 == type) {
-      multipart_writer_ = &s3_multipart_writer_;
+      new (&multipart_writer_union_.s3_multipart_writer_) ObStorageS3MultiPartWriter();
+      multipart_writer_ = &multipart_writer_union_.s3_multipart_writer_;
+      handle_type_ = OB_STORAGE_HANDLE_S3;
     }
   } else {
     ret = OB_ERR_SYS;
@@ -3055,13 +3025,37 @@ int ObStorageMultiPartWriter::close()
   } else if (OB_FAIL(multipart_writer_->close())) {
     STORAGE_LOG(WARN, "failed to close multipart writer", K(ret));
   }
+  reset();
+  return ret;
+}
+
+void ObStorageMultiPartWriter::reset()
+{
+  switch (handle_type_) {
+    case OB_STORAGE_HANDLE_FILE:
+      multipart_writer_union_.file_multipart_writer_.~ObStorageFileMultiPartWriter();
+      break;
+    case OB_STORAGE_HANDLE_OSS:
+      multipart_writer_union_.oss_multipart_writer_.~ObStorageOssMultiPartWriter();
+      break;
+    case OB_STORAGE_HANDLE_S3:
+      multipart_writer_union_.s3_multipart_writer_.~ObStorageS3MultiPartWriter();
+      break;
+    case OB_STORAGE_HANDLE_OBDAL:
+      multipart_writer_union_.obdal_multipart_writer_.~ObStorageObDalMultiPartWriter();
+      break;
+    case OB_STORAGE_HANDLE_MAX_TYPE:
+    default:
+      break;
+  }
+
   multipart_writer_  = NULL;
+  handle_type_ = OB_STORAGE_HANDLE_MAX_TYPE;
   start_ts_ = 0;
   uri_[0] = '\0';
   is_opened_ = false;
   cur_max_offset_ = 0;
   storage_info_ = nullptr;
-  return ret;
 }
 
 /**
@@ -3069,10 +3063,8 @@ int ObStorageMultiPartWriter::close()
  */
 ObStorageParallelMultiPartWriterBase::ObStorageParallelMultiPartWriterBase()
     : multipart_writer_(nullptr),
-      file_multipart_writer_(),
-      cos_multipart_writer_(),
-      oss_multipart_writer_(),
-      s3_multipart_writer_(),
+      multipart_writer_union_(),
+      handle_type_(OB_STORAGE_HANDLE_MAX_TYPE),
       start_ts_(0),
       is_opened_(false),
       storage_info_(nullptr)
@@ -3086,8 +3078,27 @@ ObStorageParallelMultiPartWriterBase::~ObStorageParallelMultiPartWriterBase()
 
 void ObStorageParallelMultiPartWriterBase::reset()
 {
+  switch (handle_type_) {
+    case OB_STORAGE_HANDLE_FILE:
+      multipart_writer_union_.file_multipart_writer_.~ObStorageParallelFileMultiPartWriter();
+      break;
+    case OB_STORAGE_HANDLE_OSS:
+      multipart_writer_union_.oss_multipart_writer_.~ObStorageParallelOssMultiPartWriter();
+      break;
+    case OB_STORAGE_HANDLE_S3:
+      multipart_writer_union_.s3_multipart_writer_.~ObStorageParallelS3MultiPartWriter();
+      break;
+    case OB_STORAGE_HANDLE_OBDAL:
+      multipart_writer_union_.obdal_multipart_writer_.~ObStorageParallelObDalMultiPartWriter();
+      break;
+    case OB_STORAGE_HANDLE_MAX_TYPE:
+    default:
+      break;
+  }
+
   is_opened_ = false;
   multipart_writer_ = nullptr;
+  handle_type_ = OB_STORAGE_HANDLE_MAX_TYPE;
   start_ts_ = 0;
   uri_[0] = '\0';
   storage_info_ = nullptr;
@@ -3118,20 +3129,21 @@ int ObStorageParallelMultiPartWriterBase::open(
   } else if (OB_FAIL(databuff_printf(uri_, sizeof(uri_), "%.*s", uri.length(), uri.ptr()))) {
     STORAGE_LOG(WARN, "failed to fill uri", K(ret), K(uri));
   } else if (OB_STORAGE_FILE == type) {
-    multipart_writer_ = &file_multipart_writer_;
-  } else if (is_use_obdal()) {
-    if (OB_UNLIKELY(storage_info->is_enable_worm())) {
-      ret = OB_NOT_SUPPORTED;
-      STORAGE_LOG(WARN, "obdal do not support worm", K(ret), KPC(storage_info));
-    } else {
-      multipart_writer_ = &obdal_multipart_writer_;
-    }
+    new (&multipart_writer_union_.file_multipart_writer_) ObStorageParallelFileMultiPartWriter();
+    multipart_writer_ = &multipart_writer_union_.file_multipart_writer_;
+    handle_type_ = OB_STORAGE_HANDLE_FILE;
+  } else if (is_use_obdal() || OB_STORAGE_AZBLOB == type) {
+    new (&multipart_writer_union_.obdal_multipart_writer_) ObStorageParallelObDalMultiPartWriter();
+  multipart_writer_ = &multipart_writer_union_.obdal_multipart_writer_;
+    handle_type_ = OB_STORAGE_HANDLE_OBDAL;
   } else if (OB_STORAGE_OSS == type) {
-    multipart_writer_ = &oss_multipart_writer_;
-  } else if (OB_STORAGE_COS == type) {
-    multipart_writer_ = &cos_multipart_writer_;
+    new (&multipart_writer_union_.oss_multipart_writer_) ObStorageParallelOssMultiPartWriter();
+    multipart_writer_ = &multipart_writer_union_.oss_multipart_writer_;
+    handle_type_ = OB_STORAGE_HANDLE_OSS;
   } else if (OB_STORAGE_S3 == type) {
-    multipart_writer_ = &s3_multipart_writer_;
+    new (&multipart_writer_union_.s3_multipart_writer_) ObStorageParallelS3MultiPartWriter();
+    multipart_writer_ = &multipart_writer_union_.s3_multipart_writer_;
+    handle_type_ = OB_STORAGE_HANDLE_S3;
   } else {
     ret = OB_ERR_SYS;
     STORAGE_LOG(ERROR, "unkown storage type", K(ret), K(uri), K(type));

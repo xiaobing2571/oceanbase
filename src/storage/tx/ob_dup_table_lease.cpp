@@ -42,7 +42,7 @@ int ObDupTableLSLeaseMgr::init(ObDupTableLSHandler *dup_ls_handle)
 int ObDupTableLSLeaseMgr::offline()
 {
   int ret = OB_SUCCESS;
-  SpinWLockGuard guard(lease_lock_);
+  TCRWLock::WLockGuard guard(lease_lock_);
   follower_lease_info_.reset();
   leader_lease_map_.clear();
   return ret;
@@ -67,7 +67,7 @@ void ObDupTableLSLeaseMgr::reset()
 int ObDupTableLSLeaseMgr::receive_lease_request(const ObDupTableLeaseRequest &lease_req)
 {
   int ret = OB_SUCCESS;
-  SpinWLockGuard guard(lease_lock_);
+  TCRWLock::WLockGuard guard(lease_lock_);
 
   DupTableLeaderLeaseInfo tmp_lease_info;
 
@@ -113,7 +113,7 @@ int ObDupTableLSLeaseMgr::prepare_serialize(int64_t &max_ser_size,
   common::ObAddr tmp_addr;
   DupTableTsInfo local_ts_info;
 
-  SpinWLockGuard guard(lease_lock_);
+  TCRWLock::WLockGuard guard(lease_lock_);
 
   if (ATOMIC_LOAD(&is_stopped_)) {
     ret = OB_NOT_INIT;
@@ -196,7 +196,7 @@ int ObDupTableLSLeaseMgr::deserialize_lease_log(DupTableLeaseItemArray &lease_he
 
   lease_header_array.reuse();
 
-  SpinWLockGuard guard(lease_lock_);
+  TCRWLock::WLockGuard guard(lease_lock_);
 
   if (OB_ISNULL(buf) || data_len <= 0 || pos <= 0) {
     ret = OB_INVALID_ARGUMENT;
@@ -408,7 +408,7 @@ int ObDupTableLSLeaseMgr::follower_handle()
   } else if (OB_FAIL(dup_ls_handle_ptr_->get_local_ts_info(local_ts_info))) {
     DUP_TABLE_LOG(WARN, "get local ts info failed", K(ret));
   } else {
-    SpinWLockGuard guard(lease_lock_);
+    TCRWLock::WLockGuard guard(lease_lock_);
 
     ObILocationAdapter *location_adapter = MTL(ObTransService *)->get_location_adapter();
     const share::ObLSID cur_ls_id = ls_id_;
@@ -477,8 +477,10 @@ int ObDupTableLSLeaseMgr::follower_try_acquire_lease(const share::SCN &lease_log
         < tmp_leader_lease_info.confirmed_lease_info_.lease_interval_us_
               + tmp_leader_lease_info.confirmed_lease_info_.request_ts_) {
       follower_lease_info_.last_lease_scn_ = lease_log_scn;
-      const bool acquire_new_lease = tmp_leader_lease_info.confirmed_lease_info_.request_ts_
-                                     > follower_lease_info_.lease_expired_ts_;
+      const bool acquire_new_lease =
+          tmp_leader_lease_info.confirmed_lease_info_.request_ts_
+              > follower_lease_info_.lease_expired_ts_
+          || tmp_leader_lease_info.confirmed_lease_info_.flag_.flag_bit_.is_new_lease_;
       if (acquire_new_lease) {
         follower_lease_info_.lease_acquire_scn_ = lease_log_scn;
       }
@@ -511,7 +513,7 @@ int ObDupTableLSLeaseMgr::get_lease_valid_array(LeaseAddrArray &lease_array)
 {
   int ret = OB_SUCCESS;
 
-  SpinRLockGuard guard(lease_lock_);
+  TCRWLock::RLockGuard guard(lease_lock_);
   GetLeaseValidAddrFunctor functor(lease_array);
 
   if (ATOMIC_LOAD(&is_stopped_)) {
@@ -528,7 +530,7 @@ int ObDupTableLSLeaseMgr::leader_takeover(bool is_resume)
 {
   int ret = OB_SUCCESS;
 
-  SpinWLockGuard guard(lease_lock_);
+  TCRWLock::WLockGuard guard(lease_lock_);
 
   // clear follower lease info
   follower_lease_info_.reset();
@@ -552,7 +554,7 @@ int ObDupTableLSLeaseMgr::leader_revoke()
 {
   int ret = OB_SUCCESS;
 
-  SpinWLockGuard guard(lease_lock_);
+  TCRWLock::WLockGuard guard(lease_lock_);
 
   // only can reset follower lease,
   // can not reset leader lease list
@@ -566,7 +568,7 @@ bool ObDupTableLSLeaseMgr::is_follower_lease_valid()
 {
   bool is_follower_lease = false;
 
-  SpinRLockGuard guard(lease_lock_);
+  TCRWLock::RLockGuard guard(lease_lock_);
   is_follower_lease = follower_lease_info_.lease_expired_ts_ > ObTimeUtility::current_time();
   if (!is_follower_lease) {
     DUP_TABLE_LOG(INFO, DUP_TABLET_LIFE_PREFIX "lease is expired", K(follower_lease_info_));
@@ -578,7 +580,7 @@ bool ObDupTableLSLeaseMgr::is_follower_lease_valid()
 bool ObDupTableLSLeaseMgr::check_follower_lease_serving(const bool is_election_leader,
                                                         const share::SCN &max_replayed_scn)
 {
-  SpinRLockGuard guard(lease_lock_);
+  TCRWLock::RLockGuard guard(lease_lock_);
   bool follower_lease_serving = false;
   if (is_election_leader && is_master()) {
     follower_lease_serving = true;
@@ -597,7 +599,7 @@ bool ObDupTableLSLeaseMgr::check_follower_lease_serving(const bool is_election_l
 
 void ObDupTableLSLeaseMgr::print_lease_diag_info_log(const bool is_master)
 {
-  SpinRLockGuard guard(lease_lock_);
+  TCRWLock::RLockGuard guard(lease_lock_);
   int ret = OB_SUCCESS;
 
   const uint64_t LEASE_PRINT_BUF_LEN =
@@ -660,7 +662,7 @@ int ObDupTableLSLeaseMgr::get_lease_mgr_stat(FollowerLeaseMgrStatArr &collect_ar
   const int64_t tenant_id = MTL_ID();
   const ObAddr leader_addr = GCTX.self_addr();
   const int64_t cur_time = ObTimeUtility::current_time();
-  SpinRLockGuard r_lock(lease_lock_);
+  TCRWLock::RLockGuard r_lock(lease_lock_);
 
   if (OB_FAIL(collect_arr.prepare_allocate(leader_lease_map_.size()))) {
     DUP_TABLE_LOG(WARN, "pre allocate failed", K(ret));
@@ -681,7 +683,7 @@ int ObDupTableLSLeaseMgr::recover_lease_from_ckpt(
 {
   int ret = OB_SUCCESS;
 
-  SpinWLockGuard guard(lease_lock_);
+  TCRWLock::WLockGuard guard(lease_lock_);
 
   if (!dup_ls_meta.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
@@ -768,6 +770,11 @@ bool ObDupTableLSLeaseMgr::LeaseReqCacheHandler::operator()(
   }
 
   if (!will_remove) {
+    if (hash_pair.second.lease_expired_ts_ <= loop_start_time_
+        || hash_pair.second.lease_expired_ts_ < 0
+        || !hash_pair.second.confirmed_lease_info_.is_valid()) {
+      item.durable_lease_.flag_.flag_bit_.is_new_lease_ = true;
+    }
     DupTableDurableLeaseLogBody durable_log_body(item.durable_lease_);
     max_ser_size_ += item.log_header_.get_serialize_size() + durable_log_body.get_serialize_size();
     if (OB_FAIL(lease_item_array_.push_back(item))) {

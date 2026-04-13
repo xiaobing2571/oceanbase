@@ -16,9 +16,15 @@
 #include "ob_schema_struct.h"
 #include "ob_table_schema.h"
 #include "share/schema/ob_table_param.h"
+#include "share/schema/ob_schema_struct_fts.h"
 
 namespace oceanbase
 {
+namespace common
+{
+class ObCollectionArrayType;
+}
+
 namespace share
 {
 namespace schema
@@ -33,6 +39,9 @@ public:
   typedef common::ObFixedArray<int32_t, common::ObIAllocator> Projector;
   typedef common::ObFixedArray<int32_t, common::ObIAllocator> ColumnsIndex;
   typedef common::ObFixedArray<ObColDesc, common::ObIAllocator> ObColDescArray;
+  typedef common::ObFixedArray<uint64_t, common::ObIAllocator> ColumnIdArray;
+  typedef common::ObFixedArray<common::ObCollectionArrayType*, common::ObIAllocator> ArrayTypeArray;
+  typedef common::ObFixedArray<ObString, common::ObIAllocator> ColumnConfigArray;
 
   explicit ObTableSchemaParam(common::ObIAllocator &allocator);
   virtual ~ObTableSchemaParam();
@@ -53,15 +62,20 @@ public:
   OB_INLINE int64_t get_data_table_rowkey_column_num() const { return data_table_rowkey_column_num_; }
   OB_INLINE void set_data_table_rowkey_column_num(int64_t cnt) { data_table_rowkey_column_num_ = cnt; }
   OB_INLINE int64_t get_doc_id_col_id() const { return doc_id_col_id_; }
+  int get_typed_doc_id_col_id(uint64_t &doc_id_col_id, ObDocIDType &type) const;
+  ObDocIDType get_multivalue_doc_id_type() const;
   OB_INLINE int64_t get_fulltext_col_id() const { return fulltext_col_id_; }
   OB_INLINE const common::ObString &get_fts_parser_name() const { return fts_parser_name_; }
   OB_INLINE const common::ObString &get_fts_parser_property() const { return fts_parser_properties_; }
+  OB_INLINE ObFTSIndexType get_fts_index_type() const { return fts_index_type_; }
   OB_INLINE uint64_t get_spatial_geo_col_id() const { return spatial_geo_col_id_; }
   OB_INLINE uint64_t get_spatial_cellid_col_id() const { return spatial_cellid_col_id_; }
   OB_INLINE uint64_t get_spatial_mbr_col_id() const { return spatial_mbr_col_id_; }
   OB_INLINE int64_t get_multivalue_col_id() const { return multivalue_col_id_; }
   OB_INLINE int64_t get_multivalue_array_col_id() const { return multivalue_arr_col_id_; }
   OB_INLINE int64_t get_vec_id_col_id() const { return vec_id_col_id_; }
+  OB_INLINE int64_t get_vec_chunk_col_id() const { return vec_chunk_col_id_; }
+  OB_INLINE int64_t get_embedded_vec_col_id() const { return vec_embedded_col_id_; }
   OB_INLINE int64_t get_vec_vector_col_id() const { return vec_vector_col_id_; }
   OB_INLINE ObString get_vec_index_param() const { return vec_index_param_; }
   OB_INLINE int64_t get_vec_dim() const { return vec_dim_; }
@@ -69,6 +83,16 @@ public:
   OB_INLINE int64_t get_column_count() const { return columns_.count(); }
   OB_INLINE const Columns &get_columns() const { return columns_; }
   OB_INLINE const ColumnMap &get_col_map() const { return col_map_; }
+  OB_INLINE const common::ObIArray<uint64_t> &get_search_index_included_cids() const { return search_idx_included_cids_; }
+  OB_INLINE const common::ObIArray<int32_t> &get_search_index_included_cid_idxes() const { return search_idx_included_cid_idxes_; }
+  OB_INLINE const common::ObIArray<common::ObCollectionArrayType*> &get_search_index_arr_types() const { return search_idx_arr_types_; }
+  OB_INLINE const common::ObIArray<ObString> &get_search_index_column_comments() const { return search_idx_column_comments_; }
+  int set_search_index_column_comments(const common::ObIArray<ObString> &column_comments);
+  int set_search_index_included_cids(const common::ObIArray<uint64_t> &cids);
+  int set_search_index_included_cid_idxes(const common::ObIArray<int32_t> &cid_idxes);
+  int set_search_index_arr_types(const common::ObIArray<common::ObCollectionArrayType*> &arr_types);
+  OB_INLINE void set_inc_pk_doc_id_col_id(const int32_t col_id) { inc_pk_doc_id_col_id_ = col_id; }
+  OB_INLINE int32_t get_inc_pk_doc_id_col_id() const { return inc_pk_doc_id_col_id_; }
   OB_INLINE bool is_index_table() const { return share::schema::is_index_table(table_type_); }
   OB_INLINE bool is_lob_meta_table() const { return share::schema::is_aux_lob_meta_table(table_type_); }
   OB_INLINE bool is_materialized_view() const
@@ -94,6 +118,9 @@ public:
   OB_INLINE bool is_vector_index() const { return share::schema::is_vec_index(index_type_); }
   OB_INLINE bool is_sparse_vector_index() const { return share::schema::is_vec_spiv_index(index_type_); }
   OB_INLINE bool is_ivf_vector_index() const { return share::schema::is_vec_ivf_index(index_type_); }
+  OB_INLINE bool is_hybrid_vector_index() const { return share::schema::is_local_hybrid_vec_index(index_type_); }
+  OB_INLINE bool is_hybrid_vector_index_log() const { return share::schema::is_hybrid_vec_index_log_type(index_type_); }
+  OB_INLINE bool is_hybrid_vector_index_embedded() const { return share::schema::is_hybrid_vec_index_embedded_type(index_type_); }
   OB_INLINE bool is_no_need_update_vector_index() const
   {
     return share::schema::is_vec_index_id_type(index_type_) ||
@@ -104,10 +131,15 @@ public:
            share::schema::is_vec_ivfpq_centroid_index(index_type_) ||
            share::schema::is_vec_ivfpq_pq_centroid_index(index_type_);
   }
+  OB_INLINE bool is_search_index() const { return share::schema::is_search_index(index_type_); }
+  OB_INLINE bool is_search_def_index() const { return share::schema::is_search_def_index(index_type_); }
+  OB_INLINE bool is_search_data_index() const { return share::schema::is_search_data_index(index_type_); }
   int is_rowkey_column(const uint64_t column_id, bool &is_rowkey) const;
   int is_column_nullable_for_write(const uint64_t column_id, bool &is_nullable_for_write) const;
   OB_INLINE ObMvMode get_mv_mode() const { return mv_mode_; }
-  OB_INLINE bool is_delete_insert() const { return is_delete_insert_; }
+  OB_INLINE bool is_delete_insert() const { return static_cast<ObMergeEngineType>(merge_engine_type_) == ObMergeEngineType::OB_MERGE_ENGINE_DELETE_INSERT; }
+  OB_INLINE bool is_append_only() const { return static_cast<ObMergeEngineType>(merge_engine_type_) == ObMergeEngineType::OB_MERGE_ENGINE_APPEND_ONLY; }
+  OB_INLINE bool is_rowscn_ttl_table() const { return is_rowscn_ttl_table_; }
   OB_INLINE const common::ObString &get_index_name() const { return index_name_; }
 
   const ObColumnParam * get_column(const uint64_t column_id) const;
@@ -146,6 +178,7 @@ private:
   common::ObString index_name_;
   common::ObString fts_parser_name_;
   common::ObString fts_parser_properties_;
+  ObFTSIndexType fts_index_type_;
   //generated storage param from columns_ids_ in ObTableModify, for performance improvement
   Columns columns_;
   ColumnMap col_map_;
@@ -164,6 +197,15 @@ private:
   uint64_t vec_vector_col_id_;
   ObMvMode mv_mode_;
   bool is_delete_insert_;
+  bool is_rowscn_ttl_table_;
+  ObMergeEngineType merge_engine_type_;
+  uint64_t inc_pk_doc_id_col_id_;
+  uint64_t vec_chunk_col_id_;
+  uint64_t vec_embedded_col_id_;
+  ColumnIdArray search_idx_included_cids_;
+  Projector search_idx_included_cid_idxes_;
+  ArrayTypeArray search_idx_arr_types_;
+  ColumnConfigArray search_idx_column_comments_;
 };
 
 class ObTableDMLParam

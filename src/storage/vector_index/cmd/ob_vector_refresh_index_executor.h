@@ -14,6 +14,7 @@
 
 #include "share/schema/ob_schema_struct.h"
 #include "sql/resolver/ob_schema_checker.h"
+#include "storage/vector_index/ob_vector_index_refresh.h"
 
 namespace oceanbase {
 namespace pl {
@@ -66,12 +67,15 @@ public:
   static constexpr double DEFAULT_REBUILD_THRESHOLD = 0.2;
   ObVectorRebuildIndexArg()
       : delta_rate_threshold_(DEFAULT_REBUILD_THRESHOLD),
-        idx_parallel_creation_(1) {}
+        idx_parallel_creation_(1),
+        attribute_(),
+        value_() {}
   bool is_valid() const { return !idx_name_.empty() && !table_name_.empty(); }
   TO_STRING_KV(K_(idx_name), K_(table_name), K_(idx_vector_col),
                K_(delta_rate_threshold), K_(idx_organization),
                K_(idx_distance_metrics), K_(idx_parameters),
-               K_(idx_parallel_creation));
+               K_(idx_parallel_creation),
+               K_(attribute), K_(value));
 
 public:
   ObString idx_name_;
@@ -85,6 +89,8 @@ public:
   ObString idx_distance_metrics_; // DEFAULT: EUCLIDEAN
   ObString idx_parameters_; // parameters for different vector-index algorithm
   int64_t idx_parallel_creation_; // DEFAULT: 1
+  ObString attribute_;
+  ObString value_;
 };
 
 struct ObVectorRebuildIndexInnerArg {
@@ -115,6 +121,9 @@ public:
 class ObVectorRefreshIndexExecutor {
 public:
   static const int MAX_REFRESH_RETRY_THRESHOLD = 3;
+  static const int64_t REFRESH_TRIGGER_THRESHOLD_LOWER_LIMIT = 1000;
+  static const int64_t REBUILD_TIME_INTERVAL_SECOND_LOWER_LIMIT = 1 * 60 * 60; // 3600s / 1h
+  static const int64_t REFRESH_TIME_INTERVAL_SECOND_LOWER_LIMIT = 30; // 30s
 
   enum class VectorIndexAuxType : int8_t {
     DOMAIN_INDEX = 0,   // FARM COMPAT WHITELIST
@@ -134,15 +143,23 @@ public:
                       const ObVectorRebuildIndexArg &arg);
   int execute_rebuild_inner(pl::ObPLExecCtx &ctx,
                       const ObVectorRebuildIndexInnerArg &arg);
+  int execute_flush(pl::ObPLExecCtx &ctx,
+                    const ObVectorRefreshIndexArg &arg);
+  int execute_compact(pl::ObPLExecCtx &ctx,
+                      const ObVectorRefreshIndexArg &arg);
+
+
+  int set_attribute(pl::ObPLExecCtx &ctx, const ObVectorRebuildIndexArg &arg);
+
+  static int resolve_table_name(const ObCollationType cs_type,
+                                const ObNameCaseMode case_mode,
+                                const bool is_oracle_mode, const ObString &name,
+                                ObString &database_name, ObString &table_name);
 
 private:
   static int check_min_data_version(const uint64_t tenant_id,
                                     const uint64_t min_data_version,
                                     const char *errmsg);
-  static int resolve_table_name(const ObCollationType cs_type,
-                                const ObNameCaseMode case_mode,
-                                const bool is_oracle_mode, const ObString &name,
-                                ObString &database_name, ObString &table_name);
   static void upper_db_table_name(const ObNameCaseMode case_mode,
                                   const bool is_oracle_mode, ObString &name);
   static int to_refresh_method(const ObString &arg_refresh_method,
@@ -158,6 +175,17 @@ private:
   static int get_vector_index_column_name(
       const share::schema::ObTableSchema *base_table_schema,
       const share::schema::ObTableSchema *index_id_schema, ObString &col_name);
+
+  int copy_string(common::ObIAllocator &allocator, const ObString &src, ObString &dst);
+  int reset_new_job_action(const ObString &new_job_name, const ObString &old_job_action);
+  int get_target_dbms_job_name(const ObString &attribute, const int64_t domain_table_id, ObSqlString &target_job_name);
+  int set_rebuild_parallel(common::ObISQLClient &trans, dbms_scheduler::ObDBMSSchedJobInfo &job_info, const ObString &value);
+  int set_rebuild_repeat_interval(common::ObISQLClient &trans, dbms_scheduler::ObDBMSSchedJobInfo &job_info, const ObString &value);
+  int set_refresh_trigger_threshold(common::ObISQLClient &trans, dbms_scheduler::ObDBMSSchedJobInfo &job_info, const ObString &value);
+  int set_rebuild_trigger_percentage(common::ObISQLClient &trans, dbms_scheduler::ObDBMSSchedJobInfo &job_info, const ObString &value);
+  int parse_string_value_to_int(const ObString &parallel_str, int64_t &parallel_int);
+  int check_time_interval_is_valid(const int64_t tenant_id, const ObString &value, const bool is_rebuild);
+  int set_attribute_inner(const ObString &rebuild_job_name, const ObString &attribute, const ObString &value);
   int generate_vector_aux_index_name(VectorIndexAuxType index_type,
                                      const uint64_t data_table_id,
                                      const ObString &index_name,
@@ -184,7 +212,8 @@ private:
       const ObString &idx_col_name,
       const share::schema::ObTableSchema *&base_table_schema,
       const share::schema::ObTableSchema *&delta_buf_table_schema,
-      const share::schema::ObTableSchema *&index_id_table_schema);
+      const share::schema::ObTableSchema *&index_id_table_schema,
+      const bool skip_col_name_check = false);
   int resolve_table_id_and_check_table_valid(
       const int64_t idx_table_id,
       const share::schema::ObTableSchema *&base_table_schema,
@@ -198,6 +227,7 @@ private:
   int resolve_rebuild_inner_arg(const ObVectorRebuildIndexInnerArg &arg,
                                 bool& in_recycle_bin);
 
+  int do_freeze_tablet();
   int do_refresh();
   int do_refresh_with_retry();
   int do_rebuild();
@@ -221,6 +251,7 @@ private:
 
   double delta_rate_threshold_; // for rebuild index
   int64_t refresh_threshold_;   // for refresh index
+  ObArenaAllocator allocator_;
 };
 
 } // namespace storage

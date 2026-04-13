@@ -125,6 +125,9 @@ int ObServerSchemaService::init_tenant_basic_schema(const uint64_t tenant_id)
     } else if (is_shared_storage_sslog_exist()
                && OB_FAIL(fill_sslog_table_schema(tenant_id, *schema_mgr_for_cache))) {
       LOG_WARN("init add sslog table schema failed", KR(ret), K(tenant_id));
+    } else if (GCTX.is_shared_storage_mode()
+               && OB_FAIL(fill_tiered_metadata_store_table_schema(tenant_id, *schema_mgr_for_cache))) {
+      LOG_WARN("init add tiered metadata store table schema failed", KR(ret), K(tenant_id));
 #endif
     } else if (is_sys_tenant(tenant_id)) {
       // only sys tenant rely on root user schema
@@ -346,10 +349,14 @@ void ObServerSchemaService::AllSchemaKeys::reset()
   del_sys_priv_keys_.clear();
   new_obj_priv_keys_.clear();
   del_obj_priv_keys_.clear();
+  new_obj_mysql_priv_keys_.clear();
+  del_obj_mysql_priv_keys_.clear();
   new_dblink_keys_.clear();
   del_dblink_keys_.clear();
   new_directory_keys_.clear();
   del_directory_keys_.clear();
+  new_location_keys_.clear();
+  del_location_keys_.clear();
   new_context_keys_.clear();
   del_context_keys_.clear();
   new_mock_fk_parent_table_keys_.clear();
@@ -364,6 +371,16 @@ void ObServerSchemaService::AllSchemaKeys::reset()
   del_catalog_keys_.clear();
   new_catalog_priv_keys_.clear();
   del_catalog_priv_keys_.clear();
+  new_external_resource_keys_.clear();
+  del_external_resource_keys_.clear();
+  new_ai_model_keys_.clear();
+  del_ai_model_keys_.clear();
+  new_ccl_rule_keys_.clear();
+  del_ccl_rule_keys_.clear();
+  new_sensitive_rule_keys_.clear();
+  del_sensitive_rule_keys_.clear();
+  new_sensitive_rule_priv_keys_.clear();
+  del_sensitive_rule_priv_keys_.clear();
 }
 
 int ObServerSchemaService::AllSchemaKeys::create(int64_t bucket_size)
@@ -490,6 +507,10 @@ int ObServerSchemaService::AllSchemaKeys::create(int64_t bucket_size)
     LOG_WARN("failed to create new_obj_priv_keys hashset", K(bucket_size), K(ret));
   } else if (OB_FAIL(del_obj_priv_keys_.create(bucket_size))) {
     LOG_WARN("failed to create del_obj_priv_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(new_obj_mysql_priv_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create new_obj_mysql_priv_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(del_obj_mysql_priv_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create del_obj_mysql_priv_keys hashset", K(bucket_size), K(ret));
   } else if (OB_FAIL(new_dblink_keys_.create(bucket_size))) {
     LOG_WARN("failed to create new_dblink_keys hashset", K(bucket_size), K(ret));
   } else if (OB_FAIL(del_dblink_keys_.create(bucket_size))) {
@@ -498,6 +519,10 @@ int ObServerSchemaService::AllSchemaKeys::create(int64_t bucket_size)
     LOG_WARN("failed to create new_directory_keys hashset", K(bucket_size), K(ret));
   } else if (OB_FAIL(del_directory_keys_.create(bucket_size))) {
     LOG_WARN("failed to create del_directory_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(new_location_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create new_location_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(del_location_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create del_location_keys hashset", K(bucket_size), K(ret));
   } else if (OB_FAIL(new_context_keys_.create(bucket_size))) {
     LOG_WARN("failed to create new_context_keys hashset", K(bucket_size), K(ret));
   } else if (OB_FAIL(del_context_keys_.create(bucket_size))) {
@@ -526,6 +551,26 @@ int ObServerSchemaService::AllSchemaKeys::create(int64_t bucket_size)
     LOG_WARN("failed to create add_catalog_priv_keys hashset", K(bucket_size), K(ret));
   } else if (OB_FAIL(del_catalog_priv_keys_.create(bucket_size))) {
     LOG_WARN("failed to create del_catalog_priv_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(new_external_resource_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create new_external_resource_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(del_external_resource_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create del_external_resource_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(new_ai_model_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create new_ai_model_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(del_ai_model_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create del_ai_model_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(new_ccl_rule_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create new_ccl_rule_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(del_ccl_rule_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create del_ccl_rule_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(new_sensitive_rule_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create new_sensitive_rule_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(del_sensitive_rule_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create del_sensitive_rule_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(new_sensitive_rule_priv_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create new_sensitive_rule_priv_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(del_sensitive_rule_priv_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create del_sensitive_rule_priv_keys hashset", K(bucket_size), K(ret));
   }
   return ret;
 }
@@ -628,9 +673,15 @@ int ObServerSchemaService::del_tenant_operation(
              new_flag ? schema_keys.new_obj_priv_keys_ : schema_keys.del_obj_priv_keys_))) {
     LOG_WARN("fail to del obj_priv operation", KR(ret), K(tenant_id));
   } else if (OB_FAIL(del_operation(tenant_id,
+             new_flag ? schema_keys.new_obj_mysql_priv_keys_ : schema_keys.del_obj_mysql_priv_keys_))) {
+    LOG_WARN("fail to del obj_mysql_priv operation", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(del_operation(tenant_id,
              new_flag ? schema_keys.new_directory_keys_ : schema_keys.del_directory_keys_))) {
     LOG_WARN("fail to del directory operation", KR(ret), K(tenant_id));
   } else if (OB_FAIL(del_operation(tenant_id,
+             new_flag ? schema_keys.new_location_keys_ : schema_keys.del_location_keys_))) {
+    LOG_WARN("fail to del location operation", KR(ret), K(tenant_id));
+  }  else if (OB_FAIL(del_operation(tenant_id,
              new_flag ? schema_keys.new_context_keys_ : schema_keys.del_context_keys_))) {
     LOG_WARN("fail to del context operation", KR(ret), K(tenant_id));
   } else if (OB_FAIL(del_operation(tenant_id,
@@ -651,6 +702,21 @@ int ObServerSchemaService::del_tenant_operation(
   } else if (OB_FAIL(del_operation(tenant_id,
              new_flag ? schema_keys.new_catalog_priv_keys_ : schema_keys.del_catalog_priv_keys_))) {
     LOG_WARN("fail to del catalog_priv operation", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(del_operation(tenant_id,
+             new_flag ? schema_keys.new_external_resource_keys_ : schema_keys.del_external_resource_keys_))) {
+    LOG_WARN("fail to del external_resource operation", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(del_operation(tenant_id,
+             new_flag ? schema_keys.new_ai_model_keys_ : schema_keys.del_ai_model_keys_))) {
+    LOG_WARN("fail to del ai_model operation", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(del_operation(tenant_id,
+             new_flag ? schema_keys.new_ccl_rule_keys_ : schema_keys.del_ccl_rule_keys_))) {
+    LOG_WARN("fail to del ccl_rule operation", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(del_operation(tenant_id,
+             new_flag ? schema_keys.new_sensitive_rule_keys_ : schema_keys.del_sensitive_rule_keys_))) {
+    LOG_WARN("fail to del sensitive_rule operation", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(del_operation(tenant_id,
+             new_flag ? schema_keys.new_sensitive_rule_priv_keys_ : schema_keys.del_sensitive_rule_priv_keys_))) {
+    LOG_WARN("fail to del sensitive_rule_priv operation", KR(ret), K(tenant_id));
   }
   return ret;
 }
@@ -2401,6 +2467,104 @@ int ObServerSchemaService::get_increment_obj_priv_keys_reversely(
   return ret;
 }
 
+int ObServerSchemaService::get_increment_obj_mysql_priv_keys(
+  const ObSchemaMgr &schema_mgr,
+  const ObSchemaOperation &schema_operation,
+  AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+
+  if (!(schema_operation.op_type_ > OB_DDL_OBJ_MYSQL_PRIV_OPERATION_BEGIN
+        && schema_operation.op_type_ < OB_DDL_OBJ_MYSQL_PRIV_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    const uint64_t tenant_id = schema_operation.tenant_id_;
+    const uint64_t user_id = schema_operation.user_id_;
+    const ObString &obj_name = schema_operation.obj_name_;
+    const int64_t obj_type = schema_operation.obj_type_;
+    const int64_t schema_version = schema_operation.schema_version_;
+    int hash_ret = OB_SUCCESS;
+    SchemaKey obj_mysql_priv_key;
+    obj_mysql_priv_key.tenant_id_ = tenant_id;
+    obj_mysql_priv_key.user_id_ = user_id;
+    obj_mysql_priv_key.obj_name_ = obj_name;
+    obj_mysql_priv_key.obj_type_ = obj_type;
+    obj_mysql_priv_key.schema_version_ = schema_version;
+    if (OB_DDL_DEL_OBJ_MYSQL_PRIV == schema_operation.op_type_) { //delete
+      hash_ret = schema_keys.new_obj_mysql_priv_keys_.erase_refactored(obj_mysql_priv_key);
+      if (OB_SUCCESS != hash_ret && OB_HASH_NOT_EXIST != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Failed to del obj_mysql_priv_key from new_obj_mysql_priv_keys", KR(ret));
+      } else {
+        const ObObjMysqlPriv *obj_mysql_priv = NULL;
+        if (OB_FAIL(schema_mgr.priv_mgr_.get_obj_mysql_priv(
+          ObObjMysqlPrivSortKey(tenant_id, user_id, obj_name, obj_type), obj_mysql_priv))) {
+          LOG_WARN("get obj mysql priv failed", KR(ret));
+        } else if (NULL != obj_mysql_priv) {
+          hash_ret = schema_keys.del_obj_mysql_priv_keys_.set_refactored_1(obj_mysql_priv_key, 1);
+          if (OB_SUCCESS != hash_ret) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("Failed to add obj_mysql_priv_key to del_obj_mysql_priv_keys", KR(ret));
+          }
+        }
+      }
+    } else {
+      hash_ret = schema_keys.new_obj_mysql_priv_keys_.set_refactored_1(obj_mysql_priv_key, 1);
+      if (OB_SUCCESS != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Failed to add new obj_mysql_priv_key", KR(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_obj_mysql_priv_keys_reversely(
+  const ObSchemaMgr &schema_mgr,
+  const ObSchemaOperation &schema_operation,
+  AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  if (!(schema_operation.op_type_ > OB_DDL_OBJ_MYSQL_PRIV_OPERATION_BEGIN
+        && schema_operation.op_type_ < OB_DDL_OBJ_MYSQL_PRIV_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    const uint64_t tenant_id = schema_operation.tenant_id_;
+    const uint64_t user_id = schema_operation.user_id_;
+    const ObString &obj_name = schema_operation.obj_name_;
+    const int64_t obj_type = schema_operation.obj_type_;
+    const int64_t schema_version = schema_operation.schema_version_;
+    int hash_ret = OB_SUCCESS;
+    SchemaKey obj_mysql_priv_key;
+    obj_mysql_priv_key.tenant_id_ = tenant_id;
+    obj_mysql_priv_key.user_id_ = user_id;
+    obj_mysql_priv_key.obj_name_ = obj_name;
+    obj_mysql_priv_key.obj_type_ = obj_type;
+    obj_mysql_priv_key.schema_version_ = schema_version;
+
+    bool is_delete = (OB_DDL_GRANT_OBJ_MYSQL_PRIV == schema_operation.op_type_);
+    bool is_exist = false;
+    const ObObjMysqlPriv *obj_mysql_priv = NULL;
+    if (OB_FAIL(schema_mgr.priv_mgr_.get_obj_mysql_priv(obj_mysql_priv_key.get_obj_mysql_priv_key(),
+                                                    obj_mysql_priv))) {
+      LOG_WARN("get obj_mysql_priv failed",
+               "obj_mysql_priv_key", obj_mysql_priv_key.get_obj_mysql_priv_key(),
+               KR(ret));
+    } else if (NULL != obj_mysql_priv) {
+      is_exist = true;
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(REPLAY_OP(obj_mysql_priv_key, schema_keys.del_obj_mysql_priv_keys_,
+          schema_keys.new_obj_mysql_priv_keys_, is_delete, is_exist))) {
+        LOG_WARN("replay operation failed", KR(ret));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObServerSchemaService::get_increment_udf_keys(
   const ObSchemaMgr &schema_mgr,
   const ObSchemaOperation &schema_operation,
@@ -3664,6 +3828,89 @@ int ObServerSchemaService::get_increment_directory_keys_reversely(
   return ret;
 }
 
+int ObServerSchemaService::get_increment_location_keys(
+  const ObSchemaMgr &schema_mgr,
+  const ObSchemaOperation &schema_operation,
+  AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  if (!(schema_operation.op_type_ > OB_DDL_LOCATION_OPERATION_BEGIN
+        && schema_operation.op_type_ < OB_DDL_LOCATION_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    uint64_t tenant_id = schema_operation.tenant_id_;
+    uint64_t location_id = schema_operation.location_id_;
+    int64_t schema_version = schema_operation.schema_version_;
+    int hash_ret = OB_SUCCESS;
+    SchemaKey schema_key;
+    schema_key.tenant_id_ = tenant_id;
+    schema_key.location_id_ = location_id;
+    schema_key.schema_version_ = schema_version;
+    if (schema_operation.op_type_ == OB_DDL_DROP_LOCATION) {
+      hash_ret = schema_keys.new_location_keys_.erase_refactored(schema_key);
+      if (OB_SUCCESS != hash_ret && OB_HASH_NOT_EXIST != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to del dropped location id", K(hash_ret), KR(ret));
+      } else {
+        const ObLocationSchema *schema = NULL;
+        if (OB_FAIL(schema_mgr.location_mgr_.get_location_schema_by_id(location_id, schema))) {
+          LOG_WARN("failed to get location schema", K(location_id), KR(ret));
+        } else if (NULL != schema) {
+          hash_ret = schema_keys.del_location_keys_.set_refactored_1(schema_key, 1);
+          if (OB_SUCCESS != hash_ret) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("failed to add del location id", K(hash_ret), KR(ret));
+          }
+        }
+      }
+    } else {
+      hash_ret = schema_keys.new_location_keys_.set_refactored_1(schema_key, 1);
+      if (OB_SUCCESS != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to add new location id", K(hash_ret), KR(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_location_keys_reversely(
+  const ObSchemaMgr &schema_mgr,
+  const ObSchemaOperation &schema_operation,
+  AllSchemaKeys &schema_keys)
+{
+int ret = OB_SUCCESS;
+if (!(schema_operation.op_type_ > OB_DDL_LOCATION_OPERATION_BEGIN
+      && schema_operation.op_type_ < OB_DDL_LOCATION_OPERATION_END)) {
+  ret = OB_ERR_UNEXPECTED;
+  LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+} else {
+  const uint64_t tenant_id = schema_operation.tenant_id_;
+  const uint64_t location_id = schema_operation.location_id_;
+  const int64_t schema_version = schema_operation.schema_version_;
+  SchemaKey schema_key;
+  schema_key.tenant_id_ = tenant_id;
+  schema_key.location_id_ = location_id;
+  schema_key.schema_version_ = schema_version;
+  bool is_delete = (OB_DDL_CREATE_LOCATION == schema_operation.op_type_);
+  bool is_exist = false;
+  const ObLocationSchema *location_schema = NULL;
+  if (OB_FAIL(schema_mgr.location_mgr_.get_location_schema_by_id(location_id, location_schema))) {
+    LOG_WARN("get location schema failed", K(location_id), KR(ret));
+  } else if (NULL != location_schema) {
+    is_exist = true;
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(REPLAY_OP(schema_key, schema_keys.del_location_keys_,
+        schema_keys.new_location_keys_, is_delete, is_exist))) {
+      LOG_WARN("replay operation failed", KR(ret));
+    }
+  }
+}
+return ret;
+}
+
 int ObServerSchemaService::get_increment_rls_policy_keys(
     const ObSchemaMgr &schema_mgr,
     const ObSchemaOperation &schema_operation,
@@ -4087,6 +4334,430 @@ int ObServerSchemaService::get_increment_catalog_priv_keys_reversely(
   return ret;
 }
 
+int ObServerSchemaService::get_increment_external_resource_keys(
+    const ObSchemaMgr &schema_guard,
+    const ObSchemaOperation &schema_operation,
+    AllSchemaKeys &schema_ids)
+{
+  int ret = OB_SUCCESS;
+
+  if (!(schema_operation.op_type_ > OB_DDL_EXTERNAL_RESOURCE_OPERATION_BEGIN &&
+        schema_operation.op_type_ < OB_DDL_EXTERNAL_RESOURCE_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    uint64_t tenant_id = schema_operation.tenant_id_;
+    uint64_t resource_id = schema_operation.external_resource_id_;
+    int64_t schema_version = schema_operation.schema_version_;
+    int hash_ret = OB_SUCCESS;
+    SchemaKey schema_key;
+    schema_key.tenant_id_ = tenant_id;
+    schema_key.database_id_ = schema_operation.database_id_;
+    schema_key.external_resource_id_ = resource_id;
+    schema_key.schema_version_ = schema_version;
+
+    if (OB_DDL_DROP_EXTERNAL_RESOURCE == schema_operation.op_type_) {
+      hash_ret = schema_ids.new_external_resource_keys_.erase_refactored(schema_key);
+      if (OB_SUCCESS != hash_ret && OB_HASH_NOT_EXIST != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to del dropped external_resource id", K(hash_ret), K(ret));
+      } else {
+        const ObSimpleExternalResourceSchema *schema = nullptr;
+        if (OB_FAIL(schema_guard.external_resource_mgr_.get_external_resource_schema(resource_id, schema))) {
+          LOG_WARN("failed to get external_resource schema", K(resource_id), K(ret));
+        } else if (OB_NOT_NULL(schema)) {
+          hash_ret = schema_ids.del_external_resource_keys_.set_refactored_1(schema_key, 1);
+          if (OB_SUCCESS != hash_ret) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("failed to add del external_resource id", K(hash_ret), K(ret));
+          }
+        }
+      }
+    } else {
+      hash_ret = schema_ids.new_external_resource_keys_.set_refactored_1(schema_key, 1);
+      if (OB_SUCCESS != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to add new external_resource id", K(hash_ret), K(ret));
+      }
+    }
+  }
+
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_external_resource_keys_reversely(
+    const ObSchemaMgr &schema_guard,
+    const ObSchemaOperation &schema_operation,
+    AllSchemaKeys &schema_ids)
+{
+  int ret = OB_SUCCESS;
+
+  if (!(schema_operation.op_type_ > OB_DDL_EXTERNAL_RESOURCE_OPERATION_BEGIN &&
+        schema_operation.op_type_ < OB_DDL_EXTERNAL_RESOURCE_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    uint64_t tenant_id = schema_operation.tenant_id_;
+    uint64_t resource_id = schema_operation.external_resource_id_;
+    int64_t schema_version = schema_operation.schema_version_;
+    SchemaKey schema_key;
+    schema_key.tenant_id_ = tenant_id;
+    schema_key.external_resource_id_ = resource_id;
+    schema_key.schema_version_ = schema_version;
+    bool is_delete = (OB_DDL_CREATE_EXTERNAL_RESOURCE == schema_operation.op_type_);
+    bool is_exist = false;
+    const ObSimpleExternalResourceSchema *schema = nullptr;
+    if (OB_FAIL(schema_guard.external_resource_mgr_.get_external_resource_schema(resource_id, schema))) {
+      LOG_WARN("failed to get_external_resource_schema", K(resource_id), KR(ret));
+    } else if (OB_NOT_NULL(schema)) {
+      is_exist = true;
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(REPLAY_OP(schema_key, schema_ids.del_external_resource_keys_,
+          schema_ids.new_external_resource_keys_, is_delete, is_exist))) {
+        LOG_WARN("replay operation failed", KR(ret));
+      }
+    }
+  }
+
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_ai_model_keys(
+  const ObSchemaMgr &schema_mgr,
+  const ObSchemaOperation &schema_operation,
+  AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  if (!(schema_operation.op_type_ > OB_DDL_AI_MODEL_OPERATION_BEGIN &&
+        schema_operation.op_type_ < OB_DDL_AI_MODEL_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    uint64_t tenant_id = schema_operation.tenant_id_;
+    uint64_t ai_model_id = schema_operation.ai_model_id_;
+    int64_t schema_version = schema_operation.schema_version_;
+    int hash_ret = OB_SUCCESS;
+    SchemaKey schema_key;
+    schema_key.tenant_id_ = tenant_id;
+    schema_key.ai_model_id_ = ai_model_id;
+    schema_key.schema_version_ = schema_version;
+
+    if (OB_DDL_DROP_AI_MODEL == schema_operation.op_type_) {
+      hash_ret = schema_keys.new_ai_model_keys_.erase_refactored(schema_key);
+      if (OB_SUCCESS != hash_ret && OB_HASH_NOT_EXIST != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to del schema key from new_ai_model_keys_", K(ret), K(schema_key));
+      } else {
+        const ObAiModelSchema *schema = nullptr;
+        if (OB_FAIL(schema_mgr.ai_model_mgr_.get_ai_model_schema(ai_model_id, schema))) {
+          LOG_WARN("failed to get ai_model schema", K(ai_model_id), K(ret));
+        } else if (OB_NOT_NULL(schema)) {
+          hash_ret = schema_keys.del_ai_model_keys_.set_refactored_1(schema_key, 1);
+          if (OB_SUCCESS != hash_ret) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("failed to add del ai_model id", K(hash_ret), K(ret));
+          }
+        }
+      }
+    } else {
+      hash_ret = schema_keys.new_ai_model_keys_.set_refactored_1(schema_key, 1);
+      if (OB_SUCCESS != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to add new ai_model id", K(hash_ret), K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_ai_model_keys_reversely(
+  const ObSchemaMgr &schema_mgr,
+  const ObSchemaOperation &schema_operation,
+  AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  if (!(schema_operation.op_type_ > OB_DDL_AI_MODEL_OPERATION_BEGIN &&
+        schema_operation.op_type_ < OB_DDL_AI_MODEL_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    uint64_t tenant_id = schema_operation.tenant_id_;
+    uint64_t ai_model_id = schema_operation.ai_model_id_;
+    int64_t schema_version = schema_operation.schema_version_;
+    SchemaKey schema_key;
+    schema_key.tenant_id_ = tenant_id;
+    schema_key.ai_model_id_ = ai_model_id;
+    schema_key.schema_version_ = schema_version;
+    bool is_delete = (OB_DDL_CREATE_AI_MODEL == schema_operation.op_type_);
+    bool is_exist = false;
+    const ObAiModelSchema *schema = nullptr;
+    if (OB_FAIL(schema_mgr.ai_model_mgr_.get_ai_model_schema(ai_model_id, schema))) {
+      LOG_WARN("failed to get ai_model schema", K(ai_model_id), K(ret));
+    } else if (OB_NOT_NULL(schema)) {
+      is_exist = true;
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(REPLAY_OP(schema_key, schema_keys.del_ai_model_keys_,
+          schema_keys.new_ai_model_keys_, is_delete, is_exist))) {
+        LOG_WARN("replay operation failed", KR(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_ccl_rule_keys(
+    const ObSchemaMgr &schema_mgr,
+    const ObSchemaOperation &schema_operation,
+    AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  if (!(schema_operation.op_type_ > OB_DDL_CCL_RULE_OPERATION_BEGIN
+        && schema_operation.op_type_ < OB_DDL_CCL_RULE_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), K(ret));
+  } else {
+    uint64_t tenant_id = schema_operation.tenant_id_;
+    uint64_t ccl_rule_id = schema_operation.ccl_rule_id_;
+    int64_t schema_version = schema_operation.schema_version_;
+    int hash_ret = OB_SUCCESS;
+    SchemaKey schema_key;
+    schema_key.tenant_id_ = tenant_id;
+    schema_key.ccl_rule_id_ = ccl_rule_id;
+    schema_key.schema_version_ = schema_version;
+    if (schema_operation.op_type_ == OB_DDL_DROP_CCL_RULE) {
+      hash_ret = schema_keys.new_ccl_rule_keys_.erase_refactored(schema_key);
+      if (OB_SUCCESS != hash_ret && OB_HASH_NOT_EXIST != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to del dropped ccl_rule id", K(hash_ret), K(ret));
+      } else {
+        const ObSimpleCCLRuleSchema *schema = NULL;
+        if (OB_FAIL(schema_mgr.ccl_rule_mgr_.get_schema_by_id(ccl_rule_id, schema))) {
+          LOG_WARN("failed to get ccl_rule schema", K(ccl_rule_id), K(ret));
+        } else if (NULL != schema) {
+          hash_ret = schema_keys.del_ccl_rule_keys_.set_refactored_1(schema_key, 1);
+          if (OB_SUCCESS != hash_ret) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("failed to add del ccl_rule id", K(hash_ret), K(ret));
+          }
+        }
+      }
+    } else {
+      hash_ret = schema_keys.new_ccl_rule_keys_.set_refactored_1(schema_key, 1);
+      if (OB_SUCCESS != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to add new ccl_rule id", K(hash_ret), K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_ccl_rule_keys_reversely(
+    const ObSchemaMgr &schema_mgr,
+    const ObSchemaOperation &schema_operation,
+    AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  if (!(schema_operation.op_type_ > OB_DDL_CCL_RULE_OPERATION_BEGIN
+        && schema_operation.op_type_ < OB_DDL_CCL_RULE_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    const uint64_t tenant_id = schema_operation.tenant_id_;
+    const uint64_t ccl_rule_id = schema_operation.ccl_rule_id_;
+    const int64_t schema_version = schema_operation.schema_version_;
+    SchemaKey schema_key;
+    schema_key.tenant_id_ = tenant_id;
+    schema_key.ccl_rule_id_ = ccl_rule_id;
+    schema_key.schema_version_ = schema_version;
+    bool is_delete = (OB_DDL_CREATE_CCL_RULE == schema_operation.op_type_);
+    bool is_exist = false;
+    const ObSimpleCCLRuleSchema *simple_ccl_rule_schema = NULL;
+    if (OB_FAIL(schema_mgr.ccl_rule_mgr_.get_schema_by_id(ccl_rule_id, simple_ccl_rule_schema))) {
+      LOG_WARN("get ccl_rule schema failed", K(ccl_rule_id), KR(ret));
+    } else if (NULL != simple_ccl_rule_schema) {
+      is_exist = true;
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(REPLAY_OP(schema_key, schema_keys.del_ccl_rule_keys_,
+          schema_keys.new_ccl_rule_keys_, is_delete, is_exist))) {
+        LOG_WARN("replay operation failed", KR(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_sensitive_rule_keys(const ObSchemaMgr &schema_mgr,
+                                                             const ObSchemaOperation &schema_operation,
+                                                             AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  if (!(schema_operation.op_type_ > OB_DDL_SENSITIVE_RULE_OPERATION_BEGIN
+        && schema_operation.op_type_ < OB_DDL_SENSITIVE_RULE_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    uint64_t tenant_id = schema_operation.tenant_id_;
+    uint64_t sensitive_rule_id = schema_operation.sensitive_rule_id_;
+    int64_t schema_version = schema_operation.schema_version_;
+    int hash_ret = OB_SUCCESS;
+    SchemaKey schema_key;
+    schema_key.tenant_id_ = tenant_id;
+    schema_key.sensitive_rule_id_ = sensitive_rule_id;
+    schema_key.schema_version_ = schema_version;
+    if (schema_operation.op_type_ == OB_DDL_DROP_SENSITIVE_RULE) {
+      hash_ret = schema_keys.new_sensitive_rule_keys_.erase_refactored(schema_key);
+      if (OB_SUCCESS != hash_ret && OB_HASH_NOT_EXIST != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to del dropped sensitive_rule id", K(hash_ret), KR(ret));
+      } else {
+        const ObSensitiveRuleSchema *schema = NULL;
+        if (OB_FAIL(schema_mgr.sensitive_rule_mgr_.get_schema_by_id(sensitive_rule_id, schema))) {
+          LOG_WARN("failed to get label security sensitive_rule schema", K(sensitive_rule_id), KR(ret));
+        } else if (NULL != schema) {
+          hash_ret = schema_keys.del_sensitive_rule_keys_.set_refactored_1(schema_key, 1);
+          if (OB_SUCCESS != hash_ret) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("failed to add del sensitive_rule id", K(hash_ret), KR(ret));
+          }
+        }
+      }
+    } else {
+      hash_ret = schema_keys.new_sensitive_rule_keys_.set_refactored_1(schema_key, 1);
+      if (OB_SUCCESS != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to add new sensitive_rule id", K(hash_ret), KR(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_sensitive_rule_keys_reversely(const ObSchemaMgr &schema_mgr,
+                                                                       const ObSchemaOperation &schema_operation,
+                                                                       AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  if (!(schema_operation.op_type_ > OB_DDL_SENSITIVE_RULE_OPERATION_BEGIN
+        && schema_operation.op_type_ < OB_DDL_SENSITIVE_RULE_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    const uint64_t tenant_id = schema_operation.tenant_id_;
+    const int64_t schema_version = schema_operation.schema_version_;
+    SchemaKey schema_key;
+    schema_key.tenant_id_ = tenant_id;
+    schema_key.sensitive_rule_id_ = schema_operation.sensitive_rule_id_;
+    schema_key.schema_version_ = schema_version;
+    bool is_delete = (OB_DDL_CREATE_SENSITIVE_RULE == schema_operation.op_type_);
+    bool is_exist = false;
+    const ObSensitiveRuleSchema *schema = NULL;
+    if (OB_FAIL(schema_mgr.sensitive_rule_mgr_.get_schema_by_id(schema_key.sensitive_rule_id_, schema))) {
+      LOG_WARN("failed to get schema", K(schema_key), KR(ret));
+    } else if (NULL != schema) {
+      is_exist = true;
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(REPLAY_OP(schema_key, schema_keys.del_sensitive_rule_keys_,
+          schema_keys.new_sensitive_rule_keys_, is_delete, is_exist))) {
+        LOG_WARN("replay operation failed", KR(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_sensitive_rule_priv_keys(const ObSchemaMgr &schema_mgr,
+                                                                  const ObSchemaOperation &schema_operation,
+                                                                  AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  if (!(schema_operation.op_type_ > OB_DDL_SENSITIVE_RULE_PRIV_OPERATION_BEGIN
+        && schema_operation.op_type_ < OB_DDL_SENSITIVE_RULE_PRIV_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    const uint64_t tenant_id = schema_operation.tenant_id_;
+    const uint64_t user_id = schema_operation.user_id_;
+    const ObString &sensitive_rule_name = schema_operation.sensitive_rule_name_;
+    const int64_t schema_version = schema_operation.schema_version_;
+    int hash_ret = OB_SUCCESS;
+    SchemaKey schema_key;
+    schema_key.tenant_id_ = tenant_id;
+    schema_key.user_id_ = user_id;
+    schema_key.sensitive_rule_name_ = sensitive_rule_name;
+    schema_key.schema_version_ = schema_version;
+    if (OB_DDL_DEL_SENSITIVE_RULE_PRIV == schema_operation.op_type_) { //delete
+      hash_ret = schema_keys.new_sensitive_rule_priv_keys_.erase_refactored(schema_key);
+      if (OB_SUCCESS != hash_ret && OB_HASH_NOT_EXIST != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Failed to del sensitive_rule_priv_key from new_sensitive_rule_priv_keys", KR(ret));
+      } else {
+        const ObSensitiveRulePriv *sensitive_rule_priv = NULL;
+        if (OB_FAIL(schema_mgr.priv_mgr_.get_sensitive_rule_priv(
+            ObSensitiveRulePrivSortKey(tenant_id, user_id, sensitive_rule_name), sensitive_rule_priv))) {
+          LOG_WARN("get sensitive_rule priv set failed", KR(ret));
+        } else if (NULL != sensitive_rule_priv) {
+          hash_ret = schema_keys.del_sensitive_rule_priv_keys_.set_refactored_1(schema_key, 1);
+          if (OB_SUCCESS != hash_ret) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("Failed to add sensitive_rule_priv_key to del_sensitive_rule_priv_keys", K(hash_ret), KR(ret));
+          }
+        }
+      }
+    } else {
+      hash_ret = schema_keys.new_sensitive_rule_priv_keys_.set_refactored_1(schema_key, 1);
+      if (OB_SUCCESS != hash_ret) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Failed to add new sensitive_rule_priv_key", K(hash_ret), KR(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_sensitive_rule_priv_keys_reversely(const ObSchemaMgr &schema_mgr,
+                                                                            const ObSchemaOperation &schema_operation,
+                                                                            AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  if (!(schema_operation.op_type_ > OB_DDL_SENSITIVE_RULE_PRIV_OPERATION_BEGIN
+        && schema_operation.op_type_ < OB_DDL_SENSITIVE_RULE_PRIV_OPERATION_END)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid argument", K(schema_operation.op_type_), KR(ret));
+  } else {
+    const uint64_t tenant_id = schema_operation.tenant_id_;
+    const uint64_t user_id = schema_operation.user_id_;
+    const ObString &sensitive_rule_name = schema_operation.sensitive_rule_name_;
+    const int64_t schema_version = schema_operation.schema_version_;
+    SchemaKey schema_key;
+    schema_key.tenant_id_ = tenant_id;
+    schema_key.user_id_ = user_id;
+    schema_key.sensitive_rule_name_ = sensitive_rule_name;
+    schema_key.schema_version_ = schema_version;
+    bool is_delete = (OB_DDL_GRANT_REVOKE_SENSITIVE_RULE == schema_operation.op_type_);
+    bool is_exist = false;
+    const ObSensitiveRulePriv *sensitive_rule_priv = NULL;
+    if (OB_FAIL(schema_mgr.priv_mgr_.get_sensitive_rule_priv(schema_key.get_sensitive_rule_priv_key(), sensitive_rule_priv))) {
+      LOG_WARN("get sensitive_rule_priv failed",
+              "sensitive_rule_priv_key", schema_key.get_sensitive_rule_priv_key(),
+              KR(ret));
+    } else if (NULL != sensitive_rule_priv) {
+      is_exist = true;
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(REPLAY_OP(schema_key, schema_keys.del_sensitive_rule_priv_keys_,
+          schema_keys.new_sensitive_rule_priv_keys_, is_delete, is_exist))) {
+        LOG_WARN("replay operation failed", KR(ret));
+      }
+    }
+  }
+  return ret;
+}
+
 // Currently only the full tenant schema of the system tenant is cached
 int ObServerSchemaService::add_tenant_schemas_to_cache(const TenantKeys &tenant_keys,
                                                        ObISQLClient &sql_client)
@@ -4243,7 +4914,9 @@ int ObServerSchemaService::fetch_increment_schemas(
   GET_BATCH_SCHEMAS(audit, ObSAuditSchema, AuditKeys);
   GET_BATCH_SCHEMAS(sys_priv, ObSysPriv, SysPrivKeys);
   GET_BATCH_SCHEMAS(obj_priv, ObObjPriv, ObjPrivKeys);
+  GET_BATCH_SCHEMAS(obj_mysql_priv, ObObjMysqlPriv, ObjMysqlPrivKeys);
   GET_BATCH_SCHEMAS(column_priv, ObColumnPriv, ColumnPrivKeys);
+  GET_BATCH_SCHEMAS(sensitive_rule_priv, ObSensitiveRulePriv, SensitiveRulePrivKeys);
 
   // After the schema is split, because the operation_type has not been updated,
   // the OB_DDL_TENANT_OPERATION is still reused
@@ -4253,12 +4926,17 @@ int ObServerSchemaService::fetch_increment_schemas(
   GET_BATCH_SCHEMAS(sys_variable, ObSimpleSysVariableSchema, SysVariableKeys);
   GET_BATCH_SCHEMAS(dblink, ObDbLinkSchema, DbLinkKeys);
   GET_BATCH_SCHEMAS(directory, ObDirectorySchema, DirectoryKeys);
+  GET_BATCH_SCHEMAS(location, ObLocationSchema, LocationKeys);
   GET_BATCH_SCHEMAS(context, ObContextSchema, ContextKeys);
   GET_BATCH_SCHEMAS(mock_fk_parent_table, ObSimpleMockFKParentTableSchema, MockFKParentTableKeys);
   GET_BATCH_SCHEMAS(rls_policy, ObRlsPolicySchema, RlsPolicyKeys);
   GET_BATCH_SCHEMAS(rls_group, ObRlsGroupSchema, RlsGroupKeys);
   GET_BATCH_SCHEMAS(rls_context, ObRlsContextSchema, RlsContextKeys);
   GET_BATCH_SCHEMAS(catalog, ObCatalogSchema, CatalogKeys);
+  GET_BATCH_SCHEMAS(external_resource, ObSimpleExternalResourceSchema, ExternalResourceKeys);
+  GET_BATCH_SCHEMAS(ai_model, ObAiModelSchema, AiModelKeys);
+  GET_BATCH_SCHEMAS(ccl_rule, ObSimpleCCLRuleSchema, CCLRuleKeys);
+  GET_BATCH_SCHEMAS(sensitive_rule, ObSensitiveRuleSchema, SensitiveRuleKeys);
 
   // After the schema is split, ordinary tenants do not refresh the tenant schema and system table schema
   const uint64_t tenant_id = schema_status.tenant_id_;
@@ -4389,6 +5067,9 @@ int ObServerSchemaService::apply_increment_schema_to_cache(
   } else if (OB_FAIL(apply_obj_priv_schema_to_cache(
              tenant_id, all_keys, simple_incre_schemas, schema_mgr.priv_mgr_))) {
     LOG_WARN("fail to apply obj_priv schema to cache", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(apply_obj_mysql_priv_schema_to_cache(
+            tenant_id, all_keys, simple_incre_schemas, schema_mgr.priv_mgr_))) {
+    LOG_WARN("fail to apply obj_priv schema to cache", KR(ret), K(tenant_id));
   } else if (OB_FAIL(apply_dblink_schema_to_cache(
              tenant_id, all_keys, simple_incre_schemas, schema_mgr.dblink_mgr_))) {
     LOG_WARN("fail to apply dblink schema to cache", KR(ret), K(tenant_id));
@@ -4413,7 +5094,26 @@ int ObServerSchemaService::apply_increment_schema_to_cache(
   } else if (OB_FAIL(apply_catalog_schema_to_cache(
              tenant_id, all_keys, simple_incre_schemas, schema_mgr))) {
     LOG_WARN("fail to apply catalog schema to cache", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(apply_ccl_rule_schema_to_cache(
+             tenant_id, all_keys, simple_incre_schemas, schema_mgr))) {
+    LOG_WARN("fail to apply rls_context schema to cache", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(apply_sensitive_rule_schema_to_cache(
+             tenant_id, all_keys, simple_incre_schemas, schema_mgr))) {
+    LOG_WARN("fail to apply sensitive_rule schema to cache", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(apply_sensitive_rule_priv_schema_to_cache(
+             tenant_id, all_keys, simple_incre_schemas, schema_mgr.priv_mgr_))) {
+    LOG_WARN("fail to apply sensitive_rule schema to cache", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(apply_external_resource_schema_to_cache(
+             tenant_id, all_keys, simple_incre_schemas, schema_mgr.external_resource_mgr_))) {
+    LOG_WARN("fail to apply external_resource schema to cache", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(apply_location_schema_to_cache(
+             tenant_id, all_keys, simple_incre_schemas, schema_mgr))) {
+    LOG_WARN("fail to apply location schema to cache", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(apply_ai_model_schema_to_cache(
+             tenant_id, all_keys, simple_incre_schemas, schema_mgr))) {
+    LOG_WARN("fail to apply ai_model schema to cache", KR(ret), K(tenant_id));
   }
+
   return ret;
 }
 
@@ -4561,14 +5261,21 @@ APPLY_SCHEMA_TO_CACHE_IMPL(ObProfileMgr, profile, ObProfileSchema, ProfileKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObSAuditMgr, audit, ObSAuditSchema, AuditKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObPrivMgr, sys_priv, ObSysPriv, SysPrivKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObPrivMgr, obj_priv, ObObjPriv, ObjPrivKeys);
+APPLY_SCHEMA_TO_CACHE_IMPL(ObPrivMgr, obj_mysql_priv, ObObjMysqlPriv, ObjMysqlPrivKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObDbLinkMgr, dblink, ObDbLinkSchema, DbLinkKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObDirectoryMgr, directory, ObDirectorySchema, DirectoryKeys);
+APPLY_SCHEMA_TO_CACHE_IMPL(ObSchemaMgr, location, ObLocationSchema, LocationKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObContextMgr, context, ObContextSchema, ContextKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObMockFKParentTableMgr, mock_fk_parent_table, ObSimpleMockFKParentTableSchema, MockFKParentTableKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObRlsPolicyMgr, rls_policy, ObRlsPolicySchema, RlsPolicyKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObRlsGroupMgr, rls_group, ObRlsGroupSchema, RlsGroupKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObRlsContextMgr, rls_context, ObRlsContextSchema, RlsContextKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObSchemaMgr, catalog, ObCatalogSchema, CatalogKeys);
+APPLY_SCHEMA_TO_CACHE_IMPL(ObExternalResourceMgr, external_resource, ObSimpleExternalResourceSchema, ExternalResourceKeys);
+APPLY_SCHEMA_TO_CACHE_IMPL(ObSchemaMgr, ai_model, ObAiModelSchema, AiModelKeys);
+APPLY_SCHEMA_TO_CACHE_IMPL(ObSchemaMgr, ccl_rule, ObSimpleCCLRuleSchema, CCLRuleKeys);
+APPLY_SCHEMA_TO_CACHE_IMPL(ObSchemaMgr, sensitive_rule, ObSensitiveRuleSchema, SensitiveRuleKeys);
+APPLY_SCHEMA_TO_CACHE_IMPL(ObPrivMgr, sensitive_rule_priv, ObSensitiveRulePriv, SensitiveRulePrivKeys);
 
 int ObServerSchemaService::update_schema_mgr(ObISQLClient &sql_client,
                                              const ObRefreshSchemaStatus &schema_status,
@@ -4983,6 +5690,11 @@ int ObServerSchemaService::replay_log(
                                                   schema_operation, schema_keys))) {
             LOG_WARN("fail to get increment obj priv keys", K(ret));
           }
+        } else if (schema_operation.op_type_ > OB_DDL_OBJ_MYSQL_PRIV_OPERATION_BEGIN
+                   && schema_operation.op_type_ < OB_DDL_OBJ_MYSQL_PRIV_OPERATION_END) {
+            if (OB_FAIL(get_increment_obj_mysql_priv_keys(schema_mgr, schema_operation, schema_keys))) {
+              LOG_WARN("fail to get increment obj mysql priv id", K(ret));
+            }
         } else if (schema_operation.op_type_ > OB_DDL_DBLINK_OPERATION_BEGIN &&
             schema_operation.op_type_ < OB_DDL_DBLINK_OPERATION_END) {
           if (OB_FAIL(get_increment_dblink_keys(schema_mgr, schema_operation, schema_keys))) {
@@ -4992,6 +5704,11 @@ int ObServerSchemaService::replay_log(
             schema_operation.op_type_ < OB_DDL_DIRECTORY_OPERATION_END) {
           if (OB_FAIL(get_increment_directory_keys(schema_mgr, schema_operation, schema_keys))) {
             LOG_WARN("fail to get increment directory id", K(ret));
+          }
+        } else if (schema_operation.op_type_ > OB_DDL_LOCATION_OPERATION_BEGIN
+                   && schema_operation.op_type_ < OB_DDL_LOCATION_OPERATION_END) {
+          if (OB_FAIL(get_increment_location_keys(schema_mgr, schema_operation, schema_keys))) {
+            LOG_WARN("fail to get increment location id", K(ret));
           }
         } else if (schema_operation.op_type_ > OB_DDL_CONTEXT_OPERATION_BEGIN
                    && schema_operation.op_type_ < OB_DDL_CONTEXT_OPERATION_END) {
@@ -5032,6 +5749,31 @@ int ObServerSchemaService::replay_log(
             schema_operation.op_type_ < OB_DDL_CATALOG_PRIV_OPERATION_END) {
           if (OB_FAIL(get_increment_catalog_priv_keys(schema_mgr, schema_operation, schema_keys))) {
             LOG_WARN("fail to get increment catalog id", K(ret));
+          }
+        } else if (schema_operation.op_type_ > OB_DDL_EXTERNAL_RESOURCE_OPERATION_BEGIN &&
+            schema_operation.op_type_ < OB_DDL_EXTERNAL_RESOURCE_OPERATION_END) {
+          if (OB_FAIL(get_increment_external_resource_keys(schema_mgr, schema_operation, schema_keys))) {
+            LOG_WARN("fail to get increment external resource keys", KR(ret));
+          }
+        } else if (schema_operation.op_type_ > OB_DDL_AI_MODEL_OPERATION_BEGIN &&
+            schema_operation.op_type_ < OB_DDL_AI_MODEL_OPERATION_END) {
+          if (OB_FAIL(get_increment_ai_model_keys(schema_mgr, schema_operation, schema_keys))) {
+            LOG_WARN("fail to get increment ai_model id", K(ret));
+          }
+        } else if (schema_operation.op_type_ > OB_DDL_CCL_RULE_OPERATION_BEGIN &&
+            schema_operation.op_type_ < OB_DDL_CCL_RULE_OPERATION_END) {
+          if (OB_FAIL(get_increment_ccl_rule_keys(schema_mgr, schema_operation, schema_keys))) {
+            LOG_WARN("fail to get increment ccl rule id", K(ret));
+          }
+        } else if (schema_operation.op_type_ > OB_DDL_SENSITIVE_RULE_OPERATION_BEGIN &&
+            schema_operation.op_type_ < OB_DDL_SENSITIVE_RULE_OPERATION_END) {
+          if (OB_FAIL(get_increment_sensitive_rule_keys(schema_mgr, schema_operation, schema_keys))) {
+            LOG_WARN("fail to get increment sensitive rule id", K(ret));
+          }
+        } else if (schema_operation.op_type_ > OB_DDL_SENSITIVE_RULE_PRIV_OPERATION_BEGIN &&
+            schema_operation.op_type_ < OB_DDL_SENSITIVE_RULE_PRIV_OPERATION_END) {
+          if (OB_FAIL(get_increment_sensitive_rule_priv_keys(schema_mgr, schema_operation, schema_keys))) {
+            LOG_WARN("fail to get increment sensitive rule priv id", K(ret));
           }
         }
       }
@@ -5196,6 +5938,11 @@ int ObServerSchemaService::replay_log_reversely(
         if (OB_FAIL(get_increment_obj_priv_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
           LOG_WARN("fail to get increment obj_priv keys reversely", KR(ret));
         }
+      } else if (schema_operation.op_type_ > OB_DDL_OBJ_MYSQL_PRIV_OPERATION_BEGIN
+                 && schema_operation.op_type_ < OB_DDL_OBJ_MYSQL_PRIV_OPERATION_END) {
+        if (OB_FAIL(get_increment_obj_mysql_priv_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
+          LOG_WARN("fail to get increment obj_mysql_priv keys reversely", KR(ret));
+        }
       } else if (schema_operation.op_type_ > OB_DDL_DBLINK_OPERATION_BEGIN &&
                  schema_operation.op_type_ < OB_DDL_DBLINK_OPERATION_END) {
         if (OB_FAIL(get_increment_dblink_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
@@ -5205,6 +5952,11 @@ int ObServerSchemaService::replay_log_reversely(
                  schema_operation.op_type_ < OB_DDL_DIRECTORY_OPERATION_END) {
         if (OB_FAIL(get_increment_directory_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
           LOG_WARN("fail to get increment directory keys reversely", KR(ret));
+        }
+      } else if (schema_operation.op_type_ > OB_DDL_LOCATION_OPERATION_BEGIN &&
+                 schema_operation.op_type_ < OB_DDL_LOCATION_OPERATION_END) {
+        if (OB_FAIL(get_increment_location_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
+          LOG_WARN("fail to get increment location keys reversely", KR(ret));
         }
       } else if (schema_operation.op_type_ > OB_DDL_CONTEXT_OPERATION_BEGIN
                  && schema_operation.op_type_ < OB_DDL_CONTEXT_OPERATION_END) {
@@ -5245,6 +5997,31 @@ int ObServerSchemaService::replay_log_reversely(
                  && schema_operation.op_type_ < OB_DDL_CATALOG_PRIV_OPERATION_END) {
         if (OB_FAIL(get_increment_catalog_priv_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
           LOG_WARN("fail to get increment catalog keys reversely", KR(ret));
+        }
+      } else if (schema_operation.op_type_ > OB_DDL_EXTERNAL_RESOURCE_OPERATION_BEGIN &&
+                 schema_operation.op_type_ < OB_DDL_EXTERNAL_RESOURCE_OPERATION_END) {
+        if (OB_FAIL(get_increment_external_resource_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
+          LOG_WARN("fail to get increment external resource keys reversely", KR(ret));
+        }
+      } else if (schema_operation.op_type_ > OB_DDL_AI_MODEL_OPERATION_BEGIN &&
+                 schema_operation.op_type_ < OB_DDL_AI_MODEL_OPERATION_END) {
+        if (OB_FAIL(get_increment_ai_model_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
+          LOG_WARN("fail to get increment ai_model keys reversely", KR(ret));
+        }
+      } else if (schema_operation.op_type_ > OB_DDL_CCL_RULE_OPERATION_BEGIN &&
+                 schema_operation.op_type_ < OB_DDL_CCL_RULE_OPERATION_END) {
+        if (OB_FAIL(get_increment_ccl_rule_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
+          LOG_WARN("fail to get increment ccl rule keys reversely", KR(ret));
+        }
+      } else if (schema_operation.op_type_ > OB_DDL_SENSITIVE_RULE_OPERATION_BEGIN
+                 && schema_operation.op_type_ < OB_DDL_SENSITIVE_RULE_OPERATION_END) {
+        if (OB_FAIL(get_increment_sensitive_rule_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
+          LOG_WARN("fail to get increment sensitive_rule keys reversely", KR(ret));
+        }
+      } else if (schema_operation.op_type_ > OB_DDL_SENSITIVE_RULE_PRIV_OPERATION_BEGIN
+                 && schema_operation.op_type_ < OB_DDL_SENSITIVE_RULE_PRIV_OPERATION_END) {
+        if (OB_FAIL(get_increment_sensitive_rule_priv_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
+          LOG_WARN("fail to get increment sensitive_rule_priv keys reversely", KR(ret));
         }
       } else {
         // ingore other operaton.
@@ -5547,7 +6324,7 @@ bool ObServerSchemaService::need_construct_aux_infos_(
      const ObTableSchema &table_schema)
 {
   bool bret = true;
-  if (table_schema.is_index_table()
+  if ((table_schema.is_index_table() && !table_schema.is_search_def_index())
       || (table_schema.is_view_table()
            && !table_schema.is_materialized_view())
        || table_schema.is_aux_vp_table()
@@ -5594,7 +6371,11 @@ int ObServerSchemaService::construct_aux_infos_(
           LOG_WARN("add aux vp table id failed", KR(ret), K(tenant_id), K(aux_table_meta));
         }
       } else if (MATERIALIZED_VIEW_LOG == aux_table_meta.table_type_) {
-        table_schema.set_mlog_tid(aux_table_meta.table_id_);
+        if (aux_table_meta.is_tmp_mlog_) {
+          table_schema.set_tmp_mlog_tid(aux_table_meta.table_id_);
+        } else {
+          table_schema.set_mlog_tid(aux_table_meta.table_id_);
+        }
       }
     } // end FOREACH_CNT_X
   }
@@ -5692,32 +6473,34 @@ int ObServerSchemaService::fill_all_core_table_schema(
 }
 
 #ifdef OB_BUILD_SHARED_STORAGE
-int ObServerSchemaService::fill_sslog_table_schema(
-    const uint64_t tenant_id,
-    ObSchemaMgr &schema_mgr_for_cache)
-{
-  int ret = OB_SUCCESS;
-  ObTableSchema sslog_table_schema;
-  ObSimpleTableSchemaV2 sslog_table_schema_simple;
 
-  if (!check_inner_stat()) {
-    ret = OB_INNER_STAT_ERROR;
-    LOG_WARN("inner stat error", K(ret));
-  } else if (common::is_user_tenant(tenant_id)) {
-    // do nothing
-  } else if (OB_FAIL(schema_service_->get_sslog_table_schema(sslog_table_schema))) {
-    LOG_WARN("failed to init schema service, ret=[%d]", K(ret));
-  } else if (!is_sys_tenant(tenant_id)
-             && OB_FAIL(ObSchemaUtils::construct_tenant_space_full_table(tenant_id, sslog_table_schema))) {
-    LOG_WARN("fail to construct __all_core_table schema", KR(ret), K(tenant_id));
-  } else if (OB_FAIL(convert_to_simple_schema(sslog_table_schema, sslog_table_schema_simple))) {
-    LOG_WARN("failed to add table schema into the schema manager, ret=[%d]", K(ret));
-  } else if (OB_FAIL(schema_mgr_for_cache.add_table(sslog_table_schema_simple))) {
-    LOG_WARN("failed to add table schema into the schema manager, ret=[%d]", K(ret));
-  }
+#define FILL_TABLE_SCHEMA_FUNC_DEFINE(TABLE_NAME)                                                                                         \
+int ObServerSchemaService::fill_##TABLE_NAME##_table_schema(                                                                              \
+    const uint64_t tenant_id,                                                                                                             \
+    ObSchemaMgr &schema_mgr_for_cache)                                                                                                    \
+{                                                                                                                                         \
+  int ret = OB_SUCCESS;                                                                                                                   \
+  ObTableSchema table_schema;                                                                                                             \
+  ObSimpleTableSchemaV2 table_schema_simple;                                                                                              \
+  if (!check_inner_stat()) {                                                                                                              \
+    ret = OB_INNER_STAT_ERROR;                                                                                                            \
+    LOG_WARN("inner stat error", K(ret));                                                                                                 \
+  } else if (common::is_user_tenant(tenant_id)) {                                                                                         \
+  } else if (OB_FAIL(schema_service_->get_##TABLE_NAME##_table_schema(table_schema))) {                                                   \
+    LOG_WARN("failed to init schema service", KR(ret));                                                                          \
+  } else if (!is_sys_tenant(tenant_id) && OB_FAIL(ObSchemaUtils::construct_tenant_space_full_table(tenant_id, table_schema))) {           \
+    LOG_WARN("fail to construct schema", KR(ret), K(tenant_id));                                                                          \
+  } else if (OB_FAIL(convert_to_simple_schema(table_schema, table_schema_simple))) {                                                      \
+    LOG_WARN("failed to add table schema into the schema manager", KR(ret));                                                     \
+  } else if (OB_FAIL(schema_mgr_for_cache.add_table(table_schema_simple))) {                                                              \
+    LOG_WARN("failed to add table schema into the schema manager", KR(ret));                                                     \
+  }                                                                                                                                       \
+  return ret;                                                                                                                             \
+}                                                                                                                                         \
 
-  return ret;
-}
+FILL_TABLE_SCHEMA_FUNC_DEFINE(sslog)
+FILL_TABLE_SCHEMA_FUNC_DEFINE(tiered_metadata_store)
+
 #endif
 
 // new schema refresh
@@ -5861,10 +6644,7 @@ int ObServerSchemaService::refresh_full_schema(
             sys_schema_change = true;
             LOG_WARN("core schema version change, try again",
                      KR(ret), K(schema_status), K(core_schema_version), K(schema_version));
-          } else if (OB_FAIL(check_sys_schema_change(sql_client, schema_status,
-              local_schema_version, schema_version, sys_schema_change))) {
-            LOG_WARN("check_sys_schema_change failed", KR(ret), K(schema_status), K(schema_version));
-          } else if (sys_schema_change) {
+          } else {
             // for sys table schema, we publish as sys_temp_version
             const int64_t sys_formal_version = std::max(core_schema_version, schema_version);
             int64_t publish_version = 0;
@@ -5949,9 +6729,23 @@ int ObServerSchemaService::refresh_full_schema(
         } else if (OB_ISNULL(schema_mgr_for_cache)) {
           tmp_ret = OB_ERR_UNEXPECTED;
           LOG_ERROR("schema mgr for cache is null", KR(ret), K(tmp_ret), K(schema_status));
-        } else if (FALSE_IT(schema_mgr_for_cache->reset())) {
-        } else if (OB_SUCCESS != (tmp_ret = init_tenant_basic_schema(tenant_id))) {
-          LOG_ERROR("init basic schema failed", KR(ret), K(tmp_ret), K(schema_status));
+        } else {
+          bool reset_schema_mgr_for_cache = true;
+          // When creating a new tenant, heartbeat may trigger schema refresh after broadcasting schema version 2.
+          // If we do not ignore reset schema_mgr_for_cache, we will lose schema version 2's sys table schemas.
+          // With small sys tenant memory and multiple tenants, refresh schema will trigger to read __all_aux_stat table
+          // rather than read from kv cache. Reading __all_aux_stat table will raise table not exist
+          // error, creating tenant will fail.
+          if (OB_CORE_SCHEMA_VERSION + 1 == core_schema_version) {
+            reset_schema_mgr_for_cache = false;
+            LOG_WARN("ignore reset schema_mgr_for_cache", KR(ret), K(schema_status), K(core_schema_version));
+          }
+          if (reset_schema_mgr_for_cache) {
+            schema_mgr_for_cache->reset();
+            if (OB_SUCCESS != (tmp_ret = init_tenant_basic_schema(tenant_id))) {
+              LOG_ERROR("init basic schema failed", KR(ret), K(tmp_ret), K(schema_status));
+            }
+          }
         }
       }
     }
@@ -6047,10 +6841,162 @@ int ObServerSchemaService::init_schema_struct(uint64_t tenant_id)
   return ret;
 }
 
+int ObServerSchemaService::check_need_refresh_increment_sys_schema_(
+      const uint64_t tenant_id,
+      ObISQLClient &sql_client,
+      const int64_t &local_schema_version,
+      int64_t &core_schema_version,
+      bool &core_schema_change,
+      bool &sys_schema_change)
+{
+  int ret = OB_SUCCESS;
+  int64_t sys_schema_version = 0;
+  core_schema_change = true;
+  sys_schema_change = true;
+  if (OB_ISNULL(schema_service_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("pointer is null", K(ret), KP(schema_service_));
+  } else if (OB_FAIL(schema_service_->get_core_and_sys_version(sql_client, tenant_id,
+          core_schema_version, sys_schema_version))) {
+    LOG_WARN("failed to get core and sys version", KR(ret), K(tenant_id));
+  }
+  if (OB_FAIL(ret)) {
+  } else if (core_schema_version <= local_schema_version) {
+    core_schema_change = false;
+  }
+  if (OB_FAIL(ret)) {
+  } else if (0 == sys_schema_version || OB_INVALID_VERSION == sys_schema_version) {
+    // in upgrade mode, sys_schema_version is not initialized
+    sys_schema_change = true;
+  } else if (core_schema_version > sys_schema_version) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sys_schema_version is invalid", KR(ret), K(sys_schema_version), K(core_schema_version));
+  } else if (sys_schema_version <= local_schema_version) {
+    sys_schema_change = false;
+    LOG_INFO("skip refresh core and sys schema", KR(ret), K(sys_schema_version),
+        K(core_schema_version), K(local_schema_version));
+  }
+  return ret;
+}
+
+int ObServerSchemaService::refresh_increment_core_schema_(
+    const ObRefreshSchemaStatus &schema_status,
+    ObISQLClient &sql_client,
+    const int64_t &local_schema_version,
+    const int64_t &core_schema_version)
+{
+  int ret = OB_SUCCESS;
+  bool core_schema_change = false;
+  if (core_schema_version <= OB_CORE_SCHEMA_VERSION + 1) {
+    ret = OB_EAGAIN;
+    LOG_WARN("schema may be not persisted, try again",
+        KR(ret), K(schema_status), K(core_schema_version));
+  } else if (core_schema_version <= local_schema_version) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("core_schema_version should be larger than local_schema_version", KR(ret),
+        K(core_schema_version), K(local_schema_version));
+  } else {
+    int64_t publish_version = OB_INVALID_INDEX;
+    if (OB_FAIL(ObSchemaService::gen_core_temp_version(
+            core_schema_version, publish_version))) {
+      LOG_WARN("gen_core_temp_version failed", KR(ret), K(schema_status), K(core_schema_version));
+    } else if (OB_FAIL(try_fetch_publish_core_schemas(schema_status,
+            core_schema_version, publish_version, sql_client, core_schema_change))) {
+      LOG_WARN("try_fetch_publish_core_schemas failed", KR(ret), K(schema_status),
+          K(core_schema_version), K(publish_version));
+    }
+  }
+  return ret;
+}
+int ObServerSchemaService::refresh_increment_sys_schema_(
+    const ObRefreshSchemaStatus &schema_status,
+    ObISQLClient &sql_client,
+    const int64_t &local_schema_version,
+    const int64_t &core_schema_version,
+    const int64_t &schema_version_in_inner_table)
+{
+  int ret = OB_SUCCESS;
+  bool core_schema_change = false;
+  bool sys_schema_change = false;
+  if (schema_version_in_inner_table < local_schema_version) {
+    if (local_schema_version <= OB_CORE_SCHEMA_VERSION + 1) {
+      ret = OB_EAGAIN;
+      LOG_WARN("schema may be not persisted, try again",
+          KR(ret), K(schema_status), K(schema_version_in_inner_table), K(local_schema_version));
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_ERROR("schema version fallback, unexpected",
+          KR(ret), K(schema_status), K(schema_version_in_inner_table), K(local_schema_version));
+    }
+  } else if (core_schema_version > schema_version_in_inner_table) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("schema version fallback, unexpected",
+        KR(ret), K(schema_status), K(core_schema_version), K(schema_version_in_inner_table));
+  } else {
+    int64_t publish_version = 0;
+    if (OB_FAIL(ObSchemaService::gen_sys_temp_version(schema_version_in_inner_table, publish_version))) {
+      LOG_WARN("gen_sys_temp_version failed", KR(ret), K(schema_status), K(schema_version_in_inner_table));
+    } else if (OB_FAIL(try_fetch_publish_sys_schemas(schema_status, schema_version_in_inner_table,
+            publish_version, sql_client, sys_schema_change))) {
+      LOG_WARN("try_fetch_publish_sys_schemas failed", KR(ret), K(schema_status),
+          K(schema_version_in_inner_table), K(publish_version));
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::refresh_increment_all_schema_(
+      const ObRefreshSchemaStatus &schema_status,
+      ObISQLClient &sql_client,
+      const int64_t &core_schema_version,
+      const int64_t &schema_version_in_inner_table,
+      const int64_t &local_schema_version,
+      ObSchemaMgr *&schema_mgr_for_cache)
+{
+  int ret = OB_SUCCESS;
+  const int64_t fetch_version = std::max(core_schema_version, schema_version_in_inner_table);
+  const uint64_t tenant_id = schema_status.tenant_id_;
+  ObSchemaService::SchemaOperationSetWithAlloc schema_operations;
+  if (OB_ISNULL(schema_service_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("pointer is null", K(ret), KP(schema_service_));
+  } else if (OB_FAIL(schema_mgr_for_cache_map_.get_refactored(tenant_id, schema_mgr_for_cache))) {
+    LOG_WARN("fail to get schema_mgr_for_cache", KR(ret), K(schema_status));
+  } else if (OB_ISNULL(schema_mgr_for_cache)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("schema mgr for cache is null", KR(ret));
+  } else if (OB_FAIL(schema_service_->get_increment_schema_operations(schema_status,
+          local_schema_version, fetch_version, sql_client, schema_operations))) {
+    LOG_WARN("get_increment_schema_operations failed", KR(ret), K(schema_status),
+        K(local_schema_version), K(fetch_version));
+  } else if (schema_operations.count() > 0) {
+    // new cache
+    SMART_VAR(AllSchemaKeys, all_keys) {
+      if (OB_FAIL(replay_log(*schema_mgr_for_cache, schema_operations, all_keys))) {
+        LOG_WARN("replay_log failed", KR(ret), K(schema_status), K(schema_operations));
+      } else if (OB_FAIL(update_schema_mgr(sql_client, schema_status,
+              *schema_mgr_for_cache, fetch_version, all_keys))){
+        LOG_WARN("update schema mgr failed", KR(ret), K(schema_status));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    schema_mgr_for_cache->set_schema_version(fetch_version);
+    if (OB_FAIL(publish_schema(tenant_id))) {
+      LOG_WARN("publish_schema failed", KR(ret), K(schema_status));
+    } else {
+      LOG_INFO("change schema version", K(schema_status),
+          K(schema_version_in_inner_table), K(core_schema_version));
+    }
+  }
+  return ret;
+}
+
 int ObServerSchemaService::refresh_increment_schema(
     const ObRefreshSchemaStatus &schema_status)
 {
   int ret = OB_SUCCESS;
+  int tmp_ret = OB_SUCCESS;
   const uint64_t tenant_id = schema_status.tenant_id_;
   ObSchemaMgr *schema_mgr_for_cache = NULL;
   if (!check_inner_stat()) {
@@ -6061,8 +7007,9 @@ int ObServerSchemaService::refresh_increment_schema(
   } else if (OB_ISNULL(schema_mgr_for_cache)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("schema mgr for cache is null", KR(ret), K(schema_status));
+  } else if (OB_FAIL(check_schema_slot_available(tenant_id))) {
+    LOG_WARN("fail to check_schema_slot_available", KR(ret));
   } else {
-    ObSchemaService::SchemaOperationSetWithAlloc schema_operations;
     bool core_schema_change = true;
     bool sys_schema_change = true;
     int64_t local_schema_version = schema_mgr_for_cache->get_schema_version();
@@ -6080,7 +7027,6 @@ int ObServerSchemaService::refresh_increment_schema(
         break;
       } else if (retry_count > 0) {
         LOG_WARN("refresh_increment_schema failed", K(retry_count), K(schema_status));
-
         const int64_t current_ts = ObTimeUtility::current_time();
         if (current_ts >= abs_timeout) {
           // ret will be overwrite when core/system table schemas were changed in the meantime.
@@ -6089,139 +7035,53 @@ int ObServerSchemaService::refresh_increment_schema(
           LOG_WARN("already timeout", KR(ret), K(start_ts), K(abs_timeout), K(current_ts), K(abs_timeout));
           break;
         }
-
       }
       ObISQLClient &sql_client = *sql_proxy_;
-      if (OB_SUCC(ret) && core_schema_change) {
-        if (OB_FAIL(schema_service_->get_core_version(
-            sql_client, schema_status, core_schema_version))) {
-          LOG_WARN("get_core_version failed", KR(ret), K(schema_status));
-        } else if (core_schema_version <= OB_CORE_SCHEMA_VERSION + 1) {
-          ret = OB_EAGAIN;
-          LOG_WARN("schema may be not persisted, try again",
-                   KR(ret), K(schema_status), K(core_schema_version));
-        } else if (core_schema_version > local_schema_version) {
-          int64_t publish_version = OB_INVALID_INDEX;
-          if (OB_FAIL(ObSchemaService::gen_core_temp_version(
-              core_schema_version, publish_version))) {
-            LOG_WARN("gen_core_temp_version failed", KR(ret), K(schema_status), K(core_schema_version));
-          } else if (OB_FAIL(try_fetch_publish_core_schemas(schema_status,
-                     core_schema_version, publish_version, sql_client, core_schema_change))) {
-            LOG_WARN("try_fetch_publish_core_schemas failed", KR(ret), K(schema_status),
-                     K(core_schema_version), K(publish_version));
-          } else {}
-        } else {
-          core_schema_change = false;
-        }
+      if (OB_FAIL(check_need_refresh_increment_sys_schema_(schema_status.tenant_id_, sql_client,
+              local_schema_version, core_schema_version, core_schema_change, sys_schema_change))) {
+        LOG_WARN("failed to check need refresh increment sys schema", KR(ret), K(schema_status),
+            K(local_schema_version));
+      } else if (core_schema_change && OB_FAIL(refresh_increment_core_schema_(schema_status,
+              sql_client, local_schema_version, core_schema_version))) {
+        LOG_WARN("failed to refresh core schema", KR(ret), K(schema_status), K(local_schema_version),
+              K(core_schema_version), K(core_schema_change));
+      } else if (OB_FAIL(get_schema_version_in_inner_table(sql_client, schema_status, schema_version))) {
+        LOG_WARN("fail to get schema version in inner table", KR(ret), K(schema_status));
+      } else if ((core_schema_change || sys_schema_change) && OB_FAIL(refresh_increment_sys_schema_(
+              schema_status, sql_client, local_schema_version, core_schema_version, schema_version))) {
+        LOG_WARN("failed to refresh sys schema", KR(ret), K(schema_status), K(local_schema_version),
+            K(core_schema_version), K(schema_version), K(core_schema_change), K(sys_schema_change));
+      } else if (OB_FAIL(check_core_schema_change_(sql_client, schema_status, core_schema_version, core_schema_change))) {
+        LOG_WARN("failed to check core schema change", KR(ret), K(schema_status), K(core_schema_version));
+      } else if (core_schema_change) {
+        // the first two stage refresh rely on core schema
+        // make sure core schema not changed in the first two stage
+        ret = OB_EAGAIN;
+        LOG_WARN("core schema change", KR(ret), K(schema_status), K(core_schema_version),
+            K(core_schema_change));
+      } else if (OB_FAIL(refresh_increment_all_schema_(schema_status, sql_client, core_schema_version,
+                 schema_version, local_schema_version, schema_mgr_for_cache))) {
+        LOG_WARN("failed to refresh user schema", KR(ret), K(schema_status), K(core_schema_change),
+                 K(schema_version), K(local_schema_version));
+      } else {
+        break;
       }
-
-      if (OB_SUCC(ret) && !core_schema_change && sys_schema_change) {
-        if (OB_FAIL(get_schema_version_in_inner_table(sql_client, schema_status, schema_version))) {
-          LOG_WARN("fail to get schema version in inner table", KR(ret), K(schema_status));
-        } else if (schema_version < local_schema_version) {
-          if (local_schema_version <= OB_CORE_SCHEMA_VERSION + 1) {
-            ret = OB_EAGAIN;
-            LOG_WARN("schema may be not persisted, try again",
-                     KR(ret), K(schema_status), K(schema_version), K(local_schema_version));
-          } else {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_ERROR("schema version fallback, unexpected",
-                      KR(ret), K(schema_status), K(schema_version), K(local_schema_version));
-          }
-        } else if (core_schema_version > schema_version) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_ERROR("schema version fallback, unexpected",
-                    KR(ret), K(schema_status), K(core_schema_version), K(schema_version));
-        } else if (OB_FAIL(check_core_schema_change_(sql_client, schema_status,
-                   core_schema_version, core_schema_change))) {
-           LOG_WARN("fail to check core schema version change", KR(ret), K(schema_status), K(core_schema_version));
-        } else if (core_schema_change) {
-          sys_schema_change = true;
-          LOG_WARN("core schema version change, try again",
-                   KR(ret), K(schema_status), K(core_schema_version), K(schema_version));
-        } else if (OB_FAIL(check_sys_schema_change(sql_client, schema_status,
-                   local_schema_version, schema_version, sys_schema_change))) {
-          LOG_WARN("check_sys_schema_change failed", KR(ret), K(schema_status), K(schema_version));
-        } else if (sys_schema_change) {
-          const int64_t sys_formal_version = std::max(core_schema_version, schema_version);
-          int64_t publish_version = 0;
-          if (OB_FAIL(ObSchemaService::gen_sys_temp_version(sys_formal_version, publish_version))) {
-            LOG_WARN("gen_sys_temp_version failed", KR(ret), K(schema_status), K(sys_formal_version));
-          } else if (OB_FAIL(try_fetch_publish_sys_schemas(schema_status, schema_version,
-                     publish_version, sql_client, sys_schema_change))) {
-            LOG_WARN("try_fetch_publish_sys_schemas failed", KR(ret), K(schema_status),
-                     K(schema_version), K(publish_version));
-          } else {}
-        }
-
-        if (OB_FAIL(ret)) {
-          // check whether failed because of core table schema change, go to suitable pos
-          int temp_ret = OB_SUCCESS;
-          if (OB_SUCCESS != (temp_ret = check_core_schema_change_(
-              sql_client, schema_status, core_schema_version, core_schema_change))) {
-            LOG_WARN("get_core_version failed", KR(ret), KR(temp_ret), K(schema_status), K(core_schema_version));
-          } else if (core_schema_change) {
-            sys_schema_change = true;
-            LOG_WARN("core schema version change, try again",
-                     KR(ret), K(schema_status), K(core_schema_version), K(schema_version));
-            ret = OB_SUCCESS;
-          }
-        }
-      }
-
-      if (OB_SUCC(ret) && !core_schema_change && !sys_schema_change) {
-        const int64_t fetch_version = std::max(core_schema_version, schema_version);
-        if (OB_FAIL(schema_mgr_for_cache_map_.get_refactored(tenant_id, schema_mgr_for_cache))) {
-          LOG_WARN("fail to get schema_mgr_for_cache", KR(ret), K(schema_status));
-        } else if (OB_ISNULL(schema_mgr_for_cache)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("schema mgr for cache is null", KR(ret));
-        } else if (OB_FAIL(schema_service_->get_increment_schema_operations(schema_status,
-            local_schema_version, fetch_version, sql_client, schema_operations))) {
-          LOG_WARN("get_increment_schema_operations failed", KR(ret), K(schema_status),
-              K(local_schema_version), K(fetch_version));
-        } else if (schema_operations.count() > 0) {
-          // new cache
-          SMART_VAR(AllSchemaKeys, all_keys) {
-            if (OB_FAIL(replay_log(*schema_mgr_for_cache, schema_operations, all_keys))) {
-              LOG_WARN("replay_log failed", KR(ret), K(schema_status), K(schema_operations));
-            } else if (OB_FAIL(update_schema_mgr(sql_client, schema_status,
-                       *schema_mgr_for_cache, fetch_version, all_keys))){
-              LOG_WARN("update schema mgr failed", KR(ret), K(schema_status));
-            }
-          }
-        } else {}
-
-
-        if (OB_SUCC(ret)) {
-          schema_mgr_for_cache->set_schema_version(fetch_version);
-          if (OB_FAIL(publish_schema(tenant_id))) {
-            LOG_WARN("publish_schema failed", KR(ret), K(schema_status));
-          } else {
-            LOG_INFO("change schema version", K(schema_status), K(schema_version), K(core_schema_version));
-            break;
-          }
-        }
-
-        if (OB_FAIL(ret)) {
-          // check whether failed because of sys table schema change, go to suitable pos,
-          // if during check core table schema change, go to suitable pos
-          int temp_ret = OB_SUCCESS;
-          if (OB_SUCCESS != (temp_ret = check_core_or_sys_schema_change(sql_client, schema_status,
-              core_schema_version, schema_version, core_schema_change, sys_schema_change))) {
-            LOG_WARN("check_core_or_sys_schema_change failed, need retry", KR(ret), KR(temp_ret),
-                     K(schema_status), K(core_schema_version), K(schema_version));
-          } else if (core_schema_change || sys_schema_change) {
-            ret = OB_SUCCESS;
-          }
+      if (OB_FAIL(ret)) {
+        // check whether failed because of sys table schema change, go to suitable pos,
+        // if during check core table schema change, go to suitable pos
+        if (OB_TMP_FAIL(check_core_or_sys_schema_change(sql_client, schema_status,
+                core_schema_version, schema_version, core_schema_change, sys_schema_change))) {
+          LOG_WARN("check_core_or_sys_schema_change failed, need retry", KR(ret), KR(tmp_ret),
+              K(schema_status), K(core_schema_version), K(schema_version));
+        } else if (core_schema_change || sys_schema_change) {
+          ret = OB_SUCCESS;
         }
       }
       ++retry_count;
     } // end while
 
     if (OB_FAIL(ret)) {
-      int tmp_ret = OB_SUCCESS;
-      if (OB_SUCCESS != (tmp_ret = schema_mgr_for_cache_map_.get_refactored(tenant_id, schema_mgr_for_cache))) {
+      if (OB_TMP_FAIL(schema_mgr_for_cache_map_.get_refactored(tenant_id, schema_mgr_for_cache))) {
         LOG_ERROR("fail to get schema_mgr_for_cache", KR(ret), K(tmp_ret), K(schema_status));
       } else if (OB_ISNULL(schema_mgr_for_cache)) {
         tmp_ret = OB_ERR_UNEXPECTED;
@@ -6557,6 +7417,7 @@ int ObServerSchemaService::refresh_tenant_full_normal_schema(
       INIT_ARRAY(ObRoutinePriv, routine_privs);
       INIT_ARRAY(ObColumnPriv, column_privs);
       INIT_ARRAY(ObObjPriv, obj_privs);
+      INIT_ARRAY(ObObjMysqlPriv, obj_mysql_privs);
       INIT_ARRAY(ObSimpleUDFSchema, simple_udfs);
       INIT_ARRAY(ObSimpleUDTSchema, simple_udts);
       INIT_ARRAY(ObSequenceSchema, simple_sequences);
@@ -6570,12 +7431,18 @@ int ObServerSchemaService::refresh_tenant_full_normal_schema(
       INIT_ARRAY(ObTablespaceSchema, simple_tablespaces);
       INIT_ARRAY(ObDbLinkSchema, simple_dblinks);
       INIT_ARRAY(ObDirectorySchema, simple_directories);
+      INIT_ARRAY(ObLocationSchema, simple_locations);
       INIT_ARRAY(ObContextSchema, simple_contexts);
       INIT_ARRAY(ObSimpleMockFKParentTableSchema, simple_mock_fk_parent_tables);
       INIT_ARRAY(ObRlsPolicySchema, simple_rls_policys);
       INIT_ARRAY(ObRlsGroupSchema, simple_rls_groups);
       INIT_ARRAY(ObRlsContextSchema, simple_rls_contexts);
       INIT_ARRAY(ObCatalogSchema, simple_catalogs);
+      INIT_ARRAY(ObSimpleExternalResourceSchema, simple_external_resources);
+      INIT_ARRAY(ObAiModelSchema, simple_ai_models);
+      INIT_ARRAY(ObSimpleCCLRuleSchema, simple_ccl_rules);
+      INIT_ARRAY(ObSensitiveRuleSchema, simple_sensitive_rules);
+      INIT_ARRAY(ObSensitiveRulePriv, sensitive_rule_privs);
       #undef INIT_ARRAY
       ObSimpleSysVariableSchema simple_sys_variable;
 
@@ -6754,6 +7621,90 @@ int ObServerSchemaService::refresh_tenant_full_normal_schema(
         }
       }
 
+      if (OB_SUCC(ret)) {
+        const ObSimpleTableSchemaV2 *tmp_table = NULL;
+        if (OB_FAIL(schema_mgr_for_cache->get_table_schema(tenant_id, OB_ALL_TENANT_LOCATION_HISTORY_TID, tmp_table))) {
+          LOG_WARN("fail to get table schema", KR(ret), K(tenant_id));
+        } else if (OB_ISNULL(tmp_table)) {
+          // for compatibility
+        } else if (OB_FAIL(schema_service_->get_all_locations(
+          sql_client, schema_status, schema_version, tenant_id, simple_locations))) {
+          LOG_WARN("get all location schema failed", K(ret), K(schema_version), K(tenant_id));
+        }
+      }
+
+      if (OB_SUCC(ret)) {
+        const ObSimpleTableSchemaV2 *tmp_table = NULL;
+        if (OB_FAIL(schema_mgr_for_cache->get_table_schema(tenant_id, OB_ALL_TENANT_OBJAUTH_MYSQL_HISTORY_TID, tmp_table))) {
+          LOG_WARN("fail to get table schema", KR(ret), K(tenant_id));
+        } else if (OB_ISNULL(tmp_table)) {
+          // for compatibility
+        } else if (OB_FAIL(schema_service_->get_all_obj_mysql_privs(
+          sql_client, schema_status, schema_version, tenant_id, obj_mysql_privs))) {
+          LOG_WARN("get all obj mysql priv failed", K(ret), K(schema_version), K(tenant_id));
+        }
+      }
+
+      if (OB_SUCC(ret)) {
+        const ObSimpleTableSchemaV2 *tmp_table = NULL;
+        if (OB_FAIL(schema_mgr_for_cache->get_table_schema(tenant_id, OB_ALL_EXTERNAL_RESOURCE_HISTORY_TID, tmp_table))) {
+          LOG_WARN("fail to get table schema", KR(ret), K(tenant_id));
+        } else if (OB_ISNULL(tmp_table)) {
+          // for compatibility
+        } else if (OB_FAIL(schema_service_->get_all_external_resources(
+          sql_client, schema_status, schema_version, tenant_id, simple_external_resources))) {
+          LOG_WARN("get all external_resources failed", K(ret), K(schema_version), K(tenant_id));
+        }
+      }
+
+      if (OB_SUCC(ret)) {
+        const ObSimpleTableSchemaV2 *tmp_table = NULL;
+        if (OB_FAIL(schema_mgr_for_cache->get_table_schema(tenant_id, OB_ALL_AI_MODEL_HISTORY_TID, tmp_table))) {
+          LOG_WARN("fail to get table schema", KR(ret), K(tenant_id));
+        } else if (OB_ISNULL(tmp_table)) {
+          // for compatibility
+        } else if (OB_FAIL(schema_service_->get_all_ai_models(
+          sql_client, schema_status, schema_version, tenant_id, simple_ai_models))) {
+          LOG_WARN("get all ai_models failed", K(ret), K(schema_version), K(tenant_id));
+        }
+      }
+
+      if (OB_SUCC(ret)) {
+        const ObSimpleTableSchemaV2 *tmp_table = NULL;
+        if (OB_FAIL(schema_mgr_for_cache->get_table_schema(tenant_id, OB_ALL_CCL_RULE_HISTORY_TID, tmp_table))) {
+          LOG_WARN("fail to get table schema", KR(ret), K(tenant_id));
+        } else if (OB_ISNULL(tmp_table)) {
+          // for compatibility
+        } else if (OB_FAIL(schema_service_->get_all_ccl_rules(
+          sql_client, schema_status, schema_version, tenant_id, simple_ccl_rules))) {
+          LOG_WARN("get all table priv failed", K(ret), K(schema_version), K(tenant_id));
+        }
+      }
+
+      if (OB_SUCC(ret)) {
+        const ObSimpleTableSchemaV2 *tmp_table = NULL;
+        if (OB_FAIL(schema_mgr_for_cache->get_table_schema(tenant_id, OB_ALL_SENSITIVE_RULE_HISTORY_TID, tmp_table))) {
+          LOG_WARN("fail to get table schema", KR(ret), K(tenant_id));
+        } else if (OB_ISNULL(tmp_table)) {
+          // for compatibility
+        } else if (OB_FAIL(schema_service_->get_all_sensitive_rules(
+          sql_client, schema_status, schema_version, tenant_id, simple_sensitive_rules))) {
+          LOG_WARN("get all sensitive_rule schema failed", K(ret), K(schema_version), K(tenant_id));
+        }
+      }
+
+      if (OB_SUCC(ret)) {
+        const ObSimpleTableSchemaV2 *tmp_table = NULL;
+        if (OB_FAIL(schema_mgr_for_cache->get_table_schema(tenant_id, OB_ALL_SENSITIVE_RULE_PRIVILEGE_HISTORY_TID, tmp_table))) {
+          LOG_WARN("fail to get table schema", KR(ret), K(tenant_id));
+        } else if (OB_ISNULL(tmp_table)) {
+          // for compatibility
+        } else if (OB_FAIL(schema_service_->get_all_sensitive_rule_privs(
+          sql_client, schema_status, schema_version, tenant_id, sensitive_rule_privs))) {
+          LOG_WARN("get all sensitive_rule priv failed", K(ret), K(schema_version), K(tenant_id));
+        }
+      }
+
       const bool refresh_full_schema = true;
       // add simple schema for cache
       if (OB_FAIL(ret)) {
@@ -6788,6 +7739,8 @@ int ObServerSchemaService::refresh_tenant_full_normal_schema(
         LOG_WARN("add table privs failed", K(ret));
       } else if (OB_FAIL(schema_mgr_for_cache->priv_mgr_.add_obj_privs(obj_privs))) {
         LOG_WARN("add obj privs failed", K(ret));
+      } else if (OB_FAIL(schema_mgr_for_cache->priv_mgr_.add_obj_mysql_privs(obj_mysql_privs))) {
+        LOG_WARN("add obj mysql privs failed", K(ret));
       } else if (OB_FAIL(schema_mgr_for_cache->udf_mgr_.add_udfs(simple_udfs))) {
         LOG_WARN("add udfs privs failed", K(ret));
       } else if (OB_FAIL(schema_mgr_for_cache->udt_mgr_.add_udts(simple_udts))) {
@@ -6833,6 +7786,18 @@ int ObServerSchemaService::refresh_tenant_full_normal_schema(
         LOG_WARN("add column privs failed", K(ret));
       } else if (OB_FAIL(schema_mgr_for_cache->add_catalogs(simple_catalogs))) {
         LOG_WARN("add catalogs failed", K(ret));
+      } else if (OB_FAIL(schema_mgr_for_cache->external_resource_mgr_.add_external_resources(simple_external_resources))) {
+        LOG_WARN("add external_resources failed", K(ret));
+      } else if (OB_FAIL(schema_mgr_for_cache->add_locations(simple_locations))) {
+        LOG_WARN("add locations failed", K(ret));
+      } else if (OB_FAIL(schema_mgr_for_cache->add_ai_models(simple_ai_models))) {
+        LOG_WARN("add ai_models failed", K(ret));
+      } else if (OB_FAIL(schema_mgr_for_cache->add_ccl_rules(simple_ccl_rules))) {
+        LOG_WARN("add ccl rules failed", K(ret));
+      } else if (OB_FAIL(schema_mgr_for_cache->add_sensitive_rules(simple_sensitive_rules))) {
+        LOG_WARN("add sensitive_rules failed", K(ret));
+      } else if (OB_FAIL(schema_mgr_for_cache->priv_mgr_.add_sensitive_rule_privs(sensitive_rule_privs))) {
+        LOG_WARN("add sensitive_rule_privs failed", K(ret));
       }
 
       LOG_INFO("add schemas for tenant finish",
@@ -6861,13 +7826,18 @@ int ObServerSchemaService::refresh_tenant_full_normal_schema(
       LOG_INFO("add schemas for tenant finish",
                K(tenant_id), K(schema_version), K(schema_status),
                "sys_privs", sys_privs.count(),
+               "obj_mysql_privs", obj_mysql_privs.count(),
                "dblinks", simple_dblinks.count(),
                "directories", simple_directories.count(),
+               "locations", simple_locations.count(),
                "rls_policys", simple_rls_policys.count(),
                "rls_groups", simple_rls_groups.count(),
                "rls_contexts", simple_rls_contexts.count(),
                "catalogs", simple_catalogs.count(),
-               "catalog_privs", catalog_privs.count()
+               "catalog_privs", catalog_privs.count(),
+               "ccl_rules", simple_ccl_rules.count(),
+               "sensitive_rules", simple_sensitive_rules.count(),
+               "sensitive_rule_privs", sensitive_rule_privs.count()
               );
     }
 
@@ -7017,7 +7987,8 @@ int ObServerSchemaService::get_table_ids(
     if (OB_FAIL(schema_creators[i](schema))) {
       LOG_WARN("create table schema failed", KR(ret), K(tenant_id));
 #ifdef OB_BUILD_SHARED_STORAGE
-    } else if (is_shared_storage_sslog_table(schema.get_table_id())) {
+    } else if (is_shared_storage_sslog_table(schema.get_table_id())
+            || is_ss_tiered_metadata_store_table(schema.get_table_id())) {
       // do_nothing
 #endif
     } else if (OB_FAIL(table_ids.push_back(schema.get_table_id()))) {

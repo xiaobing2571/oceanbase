@@ -349,7 +349,6 @@ int ObMockSSTableSecMetaIterator::get_next(ObDataMacroBlockMeta &macro_meta)
     meta.val_.logic_id_.tablet_id_ = 1;
     meta.val_.logic_id_.logic_version_ = 1;
     meta.val_.macro_id_.set_block_index(100);
-    meta.val_.version_ = ObDataBlockMetaVal::DATA_BLOCK_META_VAL_VERSION;
     meta.val_.compressor_type_ = ObCompressorType::NONE_COMPRESSOR;
     meta.val_.row_store_type_ = ObRowStoreType::FLAT_ROW_STORE;
     ++macro_block_idx_;
@@ -476,7 +475,7 @@ int ObMockIncrementalIterator::init()
     share::schema::ObColDesc col_desc;
     col_desc.col_id_ = 1;
     col_desc.col_type_.set_int();
-    col_desc.col_order_ = ASC;
+    col_desc.col_order_ = ObOrderType::ASC;
 
     if (row_.init(allocator_, ObMockDatumRowkey::COLUMN_NUM)) {
       STORAGE_LOG(WARN, "failed to init datum row", KR(ret));
@@ -706,7 +705,7 @@ void TestPartitionIncrementalRangeSliter::SetUp()
     ObStorageRowkeyColumnSchema rowkey_col;
     rowkey_col.column_idx_ = 1 + common::OB_APP_MIN_COLUMN_ID;
     rowkey_col.meta_type_.set_int();
-    rowkey_col.order_ = ASC;
+    rowkey_col.order_ = ObOrderType::ASC;
     ASSERT_EQ(OB_SUCCESS, storage_schema_.rowkey_array_.push_back(rowkey_col));
 
     // major sstable

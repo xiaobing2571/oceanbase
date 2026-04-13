@@ -113,6 +113,7 @@ public:
   int print_order_by();
   int print_approx();
   int print_limit();
+  int print_vector_index_query_param();
   int print_fetch();
   int print_returning();
   int print_json_table(const TableItem *table_item);
@@ -150,12 +151,10 @@ public:
   int print_search_and_cycle(const ObSelectStmt *sub_select_stmt);
   bool is_root_stmt() const { return is_root_; }
   int print_with();
-  void set_is_print_view_definition(bool is_print_view_definition) {
-    print_params_.print_view_definition_ = is_print_view_definition;
-  }
-  bool is_print_view_definition() { return print_params_.print_view_definition_; }
   bool need_print_catalog_name(const ObString& catalog_name);
+  int print_flashback_info(const TableItem *table_item);
 private:
+  int print_hybrid_search_table(const TableItem *table_item);
   // added for json table
   int print_json_table_nested_column(const TableItem *table_item, const ObDmlJtColDef& col_def);
   int print_json_return_type(int64_t value, ObDataType data_type);

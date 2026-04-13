@@ -249,6 +249,7 @@ int ObExprMultiSet::calc_ms_one_distinct(common::ObIAllocator *coll_allocator,
     }
     CK (res_cnt > 0);
     if (OB_SUCC(ret)) {
+      int64_t n = 0;
       data_arr = static_cast<ObObj *>(coll_allocator->alloc(res_cnt * sizeof(ObObj)));
       if (OB_ISNULL(data_arr)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -264,10 +265,25 @@ int ObExprMultiSet::calc_ms_one_distinct(common::ObIAllocator *coll_allocator,
           } else if (OB_FAIL(deep_copy_obj(*coll_allocator, objs[i], data_arr[i]))) {
             LOG_WARN("copy obobj failed.", K(ret));
           }
+          OX (n++);
         }
       }
       elem_count = res_cnt;
+      if (OB_FAIL(ret) &&
+          OB_NOT_NULL(data_arr)) {
+        int ret = OB_SUCCESS;
+        for (int k = 0; k <= n; k++) {
+          if (OB_FAIL(pl::ObUserDefinedType::destruct_objparam(*coll_allocator, data_arr[k]))) {
+            LOG_WARN("failed to destruct dirty table", K(ret), K(k));
+          }
+        }
+        coll_allocator->free(data_arr);
+        data_arr = nullptr;
+      }
     }
+  }
+  if (dmap_c.created()) {
+    dmap_c.destroy();
   }
   return ret;
 }
@@ -824,16 +840,16 @@ int ObExprMultiSet::eval_multiset_composite(ObExecContext &exec_ctx,
       DEDUP_COLLECTION(obj1, lhs_distinct_params, lhs_obj);
       DEDUP_COLLECTION(obj2, rhs_distinct_params, rhs_obj);
     } else {
-      if (OB_FAIL(lhs.deep_copy(c1, nullptr))) {
+      if (OB_FAIL(lhs.deep_copy(c1, nullptr, false))) {
         LOG_WARN("failed too deep copy c1", K(ret), K(lhs), KPC(c1));
-      } else if (OB_FAIL(rhs.deep_copy(c2, nullptr))) {
+      } else if (OB_FAIL(rhs.deep_copy(c2, nullptr, false))) {
         LOG_WARN("failed too deep copy c2", K(ret), K(rhs), KPC(c2));
       }
     }
 
     if (OB_FAIL(ret)) {
       // do nothing
-    } else if (OB_FAIL(buffer.deep_copy(reinterpret_cast<pl::ObPLNestedTable*>(lhs_obj.get_ext()), nullptr))) {
+    } else if (OB_FAIL(buffer.deep_copy(reinterpret_cast<pl::ObPLNestedTable*>(lhs_obj.get_ext()), nullptr, false))) {
       LOG_WARN("failed to deep copy lhs to buffer", K(lhs_obj), K(buffer));
     } else if (OB_FAIL(params.push_back(lhs_obj))) {
       LOG_WARN("failed to push back lhs_obj", K(ret), K(lhs_obj), K(params));
@@ -874,7 +890,7 @@ int ObExprMultiSet::eval_multiset_composite(ObExecContext &exec_ctx,
 
     if (OB_FAIL(ret)) {
       // do nothing
-    } else if (OB_FAIL(res_coll->deep_copy(eval_result, nullptr))) {
+    } else if (OB_FAIL(res_coll->deep_copy(eval_result, nullptr, false))) {
       LOG_WARN("failed too deep copy eval_result", K(ret), KPC(eval_result), K(res_coll));
     } else {
       result.set_extend(reinterpret_cast<int64_t>(res_coll), res_coll->get_type());
@@ -1064,17 +1080,13 @@ int ObExprMultiSet::eval_multiset(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &r
       OZ(res.from_obj(result, expr.obj_datum_map_));
       //Collection constructed here must be recorded and destructed at last
       if (OB_NOT_NULL(coll) && OB_NOT_NULL(coll->get_allocator())) {
-        int tmp_ret = OB_SUCCESS;
-        if (OB_ISNULL(ctx.exec_ctx_.get_pl_ctx())) {
-          tmp_ret = ctx.exec_ctx_.init_pl_ctx();
-        }
-        if (OB_SUCCESS == tmp_ret && OB_NOT_NULL(ctx.exec_ctx_.get_pl_ctx())) {
-          tmp_ret = ctx.exec_ctx_.get_pl_ctx()->add(result);
-        }
+        sql::ObPLComplexTypeMgr *pl_complex_type_mgr = ctx.exec_ctx_.get_pl_complex_type_lazy_mgr().get_pl_complex_type_mgr();
+        int tmp_ret = pl_complex_type_mgr->complex_type_objects_.push_back(result);
         if (OB_SUCCESS != tmp_ret) {
-          LOG_ERROR("fail to collect pl collection allocator, may be exist memory issue", K(tmp_ret));
+          int tmp = pl::ObUserDefinedType::destruct_obj(result, nullptr);
+          LOG_WARN("fail to collect pl collection allocator, try to free memory", K(tmp_ret), K(tmp));
+          ret = OB_SUCCESS == ret ? tmp_ret : ret;
         }
-        ret = OB_SUCCESS == ret ? tmp_ret : ret;
       }
     }
   }

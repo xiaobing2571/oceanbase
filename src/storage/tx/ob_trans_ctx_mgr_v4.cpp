@@ -623,9 +623,9 @@ int ObLSTxCtxMgr::retry_apply_start_working_log()
     ret = on_start_working_log_cb_succ(retry_start_working_ts);
   }
 
-  if (OB_TMP_FAIL(log_cb_pool_mgr_.clear_log_cb_pool(false /*for_replay*/))) {
-    TRANS_LOG(WARN, "clear log cb pool failed", K(ret), K(ls_id_), K(log_cb_pool_mgr_));
-  }
+  // if (OB_TMP_FAIL(log_cb_pool_mgr_.clear_log_cb_pool(false /*for_replay*/))) {
+  //   TRANS_LOG(WARN, "clear log cb pool failed", K(ret), K(ls_id_), K(log_cb_pool_mgr_));
+  // }
   return ret;
 }
 
@@ -781,8 +781,10 @@ int ObLSTxCtxMgr::try_wait_gts_and_inc_max_commit_ts_()
   if (!is_leader_serving_) {
     SCN gts;
     MonotonicTs receive_gts_ts(0);
+    const bool is_sslog = need_sslog_trans_service(tenant_id_, ls_id_);
+    const uint64_t gts_tenant_id = !is_sslog ? tenant_id_ : get_sslog_gts_tenant_id(tenant_id_);
 
-    if (OB_FAIL(ts_mgr_->get_gts(tenant_id_,
+    if (OB_FAIL(ts_mgr_->get_gts(gts_tenant_id,
                                  leader_takeover_ts_,
                                  nullptr,
                                  gts,
@@ -798,12 +800,18 @@ int ObLSTxCtxMgr::try_wait_gts_and_inc_max_commit_ts_()
         ret = OB_NOT_MASTER;
       } else {
         is_leader_serving_ = true;
-        txs_->get_tx_version_mgr().update_max_commit_ts(gts, false);
+        if (!is_sslog) {
+          txs_->get_tx_version_mgr().update_max_commit_ts(gts, false);
+        } else {
+          // for sslog
+          txs_->get_tx_version_mgr_for_sslog().update_max_commit_ts(gts, false);
+          TRANS_LOG(INFO, "update max commit ts for sslog", K(gts), K_(ls_id));
+        }
         TRANS_LOG(INFO, "skip waiting gts when takeover",
             K(ls_id_), K(tenant_id_), K(max_replay_commit_version_), K(gts));
       }
     }
-    TRANS_LOG(INFO, "try wait gts", KR(ret), K_(ls_id), K_(tenant_id),
+    TRANS_LOG(INFO, "try wait gts", KR(ret), K_(ls_id), K_(tenant_id), K(gts_tenant_id),
         K_(max_replay_commit_version), K(gts));
   }
   return ret;
@@ -1350,21 +1358,23 @@ int ObLSTxCtxMgr::del_tx_ctx(ObTransCtx *ctx)
 int ObLSTxCtxMgr::traverse_tx_to_submit_redo_log(ObTransID &fail_tx_id, const uint32_t freeze_clock)
 {
   int ret = OB_SUCCESS;
+  int64_t start_time = ObClockGenerator::getClock();
   RLockGuard guard(rwlock_);
   ObTxSubmitLogFunctor fn(ObTxSubmitLogFunctor::SUBMIT_REDO_LOG, freeze_clock);
   if (is_follower_()) {
     // quit submit log because this is a follower
   } else if (OB_FAIL(ls_tx_ctx_map_.for_each(fn))) {
-    if (OB_SUCCESS != fn.get_result()) {
-      // get real ret code
-      ret = fn.get_result();
-    }
-    TRANS_LOG(WARN, "failed to submit log", K(ret));
+    const int64_t cost_time = ObClockGenerator::getClock() - start_time;
+    TRANS_LOG(WARN, "failed to submit log", K(ret), K(freeze_clock), K(fn), K(cost_time));
   } else {
-    TRANS_LOG(INFO, "traverse tx to submit redo log finish", K(ret), K(freeze_clock));
+    const int64_t cost_time = ObClockGenerator::getClock() - start_time;
+    TRANS_LOG(INFO, "traverse tx to submit redo log finish", K(ret), K(freeze_clock), K(fn), K(cost_time));
   }
 
   fail_tx_id = fn.get_fail_tx_id();
+  if (OB_SUCC(ret)) {
+    ret = fn.get_result();
+  }
 
   return ret;
 }
@@ -1372,14 +1382,20 @@ int ObLSTxCtxMgr::traverse_tx_to_submit_redo_log(ObTransID &fail_tx_id, const ui
 int ObLSTxCtxMgr::traverse_tx_to_submit_next_log()
 {
   int ret = OB_SUCCESS;
+  int64_t start_time = ObClockGenerator::getClock();
   RLockGuard guard(rwlock_);
   ObTxSubmitLogFunctor fn(ObTxSubmitLogFunctor::SUBMIT_NEXT_LOG);
-  if (!is_follower_() && OB_FAIL(ls_tx_ctx_map_.for_each(fn))) {
-    if (OB_SUCCESS != fn.get_result()) {
-      // get real ret code
-      ret = fn.get_result();
-    }
-    TRANS_LOG(WARN, "failed to submit log", K(ret));
+  if (is_follower_()) {
+  } else if (OB_FAIL(ls_tx_ctx_map_.for_each(fn))) {
+    const int64_t cost_time = ObClockGenerator::getClock() - start_time;
+    TRANS_LOG(WARN, "failed to submit log", K(ret), K(fn), K(cost_time));
+  } else {
+    const int64_t cost_time = ObClockGenerator::getClock() - start_time;
+    TRANS_LOG(INFO, "traverse tx to submit next log finish", K(ret), K(fn), K(cost_time));
+  }
+
+  if (OB_SUCC(ret)) {
+    ret = fn.get_result();
   }
 
   return ret;

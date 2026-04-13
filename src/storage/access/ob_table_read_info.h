@@ -17,6 +17,7 @@
 #include "storage/meta_mem/ob_meta_obj_struct.h"
 #include "storage/blocksstable/ob_datum_row.h"
 #include "storage/ob_storage_schema.h"
+#include "storage/ob_micro_block_format_version_helper.h"
 
 namespace oceanbase {
 namespace share {
@@ -124,6 +125,7 @@ public:
   virtual int64_t get_group_idx_col_index() const = 0;
   virtual int64_t get_mview_old_new_col_index() const = 0;
   virtual int64_t get_trans_col_index() const = 0;
+  virtual int64_t get_extra_rowkey_count() const = 0;
   virtual const common::ObIArray<ObColDesc> &get_columns_desc() const = 0;
   virtual const ObColumnIndexArray &get_columns_index() const = 0;
   virtual const ObColumnIndexArray &get_memtable_columns_index() const = 0;
@@ -136,6 +138,13 @@ public:
   virtual bool need_truncate_filter() const = 0;
   virtual bool is_valid() const = 0;
   virtual void reset() = 0;
+
+  virtual bool has_ttl_definition() const
+  {
+    OB_ASSERT_MSG(false, "ObITableReadInfo dose not promise ttl definition");
+    return false;
+  }
+
   DECLARE_PURE_VIRTUAL_TO_STRING;
 };
 
@@ -148,16 +157,19 @@ public:
       is_oracle_mode_(false),
       allocator_(nullptr),
       schema_column_count_(0),
-      compat_version_(READ_INFO_VERSION_V4),
+      compat_version_(READ_INFO_VERSION_LATEST),
       is_cs_replica_compat_(false),
       is_delete_insert_table_(false),
+      is_mv_major_refresh_tablet_(false),
+      has_ttl_definition_(false),
       reserved_(0),
       schema_rowkey_cnt_(0),
       rowkey_cnt_(0),
       cols_desc_(),
       cols_index_(rowkey_mode, false/*for_memtable*/),
       memtable_cols_index_(rowkey_mode, true/*for_memtable*/),
-      datum_utils_()
+      datum_utils_(),
+      micro_block_format_version_(ObMicroBlockFormatVersionHelper::DEFAULT_VERSION)
   {}
   virtual ~ObReadInfoStruct() { reset(); }
   virtual bool is_valid() const override
@@ -197,6 +209,7 @@ public:
     OB_ASSERT_MSG(false, "ObReadInfoStruct dose not promise trans col index");
     return OB_INVALID_INDEX;
   }
+  OB_INLINE virtual int64_t get_extra_rowkey_count() const override { return 0; }
   OB_INLINE virtual int64_t get_seq_read_column_count() const override
   {
     OB_ASSERT_MSG(false, "ObReadInfoStruct dose not promise seq read column count");
@@ -232,8 +245,11 @@ public:
     OB_ASSERT_MSG(false, "ObReadInfoStruct dose not promise need truncate filter");
     return false;
   }
+  virtual bool has_ttl_definition() const override { return has_ttl_definition_; }
   OB_INLINE bool is_cs_replica_compat() const { return is_cs_replica_compat_; }
   OB_INLINE bool is_delete_insert_table() const { return is_delete_insert_table_; }
+  OB_INLINE bool is_mv_major_refresh_tablet() const { return is_mv_major_refresh_tablet_; }
+  OB_INLINE int64_t get_micro_block_format_version() const { return micro_block_format_version_; }
   DECLARE_VIRTUAL_TO_STRING;
   int generate_for_column_store(ObIAllocator &allocator,
                                 const ObColDesc &desc,
@@ -243,7 +259,11 @@ public:
                        const bool is_oracle_mode,
                        const bool is_cg_sstable,
                        const bool is_cs_replica_compat,
-                       const bool is_delete_insert_table);
+                       const bool is_delete_insert_table,
+                       const bool is_global_index_table,
+                       const int64_t micro_block_format_version,
+                       const bool is_mv_major_refresh_tablet,
+                       const bool has_ttl_definition);
   int prepare_arrays(common::ObIAllocator &allocator,
                      const common::ObIArray<ObColDesc> &cols_desc,
                      const int64_t col_cnt);
@@ -254,20 +274,27 @@ protected:
   static const int64_t READ_INFO_VERSION_V2 = 2;
   static const int64_t READ_INFO_VERSION_V3 = 3;
   static const int64_t READ_INFO_VERSION_V4 = 4;
+  static const int64_t READ_INFO_VERSION_V5 = 5; // after V4.3.5 bp3
+  static const int64_t READ_INFO_VERSION_V6 = 6; // after V4.4.1
+  static const int64_t READ_INFO_VERSION_V7 = 7; // after COMPACTION_TTL_CMP_DATA_VERSION
+  static const int64_t READ_INFO_VERSION_LATEST = READ_INFO_VERSION_V7;
   static const int32_t READ_INFO_ONE_BIT = 1;
-  static const int32_t READ_INFO_RESERVED_BITS = 14;
+  static const int32_t READ_INFO_RESERVED_BITS = 11;
 
   bool is_inited_;
   bool is_oracle_mode_;
   ObIAllocator *allocator_;
   // distinguish schema changed by schema column count
-  union {
+  union { //FARM COMPAT WHITELIST
     uint64_t info_;
     struct {
       uint32_t schema_column_count_;
       uint16_t compat_version_;
       uint16_t is_cs_replica_compat_   : READ_INFO_ONE_BIT; // only used for rowkey_read_info in ObTablet
       uint16_t is_delete_insert_table_ : READ_INFO_ONE_BIT;
+      uint16_t is_global_index_table_  : READ_INFO_ONE_BIT; // only used for rowkey_read_info in ObTablet
+      uint16_t is_mv_major_refresh_tablet_  : READ_INFO_ONE_BIT; // only used for rowkey_read_info in ObTablet
+      uint16_t has_ttl_definition_     : READ_INFO_ONE_BIT; // only used for rowkey_read_info in ObTablet
       uint16_t reserved_               : READ_INFO_RESERVED_BITS;
     };
   };
@@ -277,6 +304,7 @@ protected:
   ObColumnIndexArray cols_index_; // col index in sstable
   ObColumnIndexArray memtable_cols_index_; // there is no multi verison rowkey col in memtable
   blocksstable::ObStorageDatumUtils datum_utils_;
+  int64_t micro_block_format_version_;
 };
 
 class ObTableReadInfo : public ObReadInfoStruct
@@ -306,7 +334,9 @@ public:
       const bool has_all_column_group = true,
       const bool is_cg_sstable = false,
       const bool need_truncate_filter = false,
-      const bool is_delete_insert_table = false);
+      const bool is_delete_insert_table = false,
+      const int64_t micro_block_format_version = ObMicroBlockFormatVersionHelper::DEFAULT_VERSION,
+      const bool has_ttl_definition = false);
   int mock_for_sstable_query(
     common::ObIAllocator &allocator,
     const int64_t schema_column_count,
@@ -325,6 +355,10 @@ public:
   }
   OB_INLINE virtual int64_t get_trans_col_index() const override
   { return trans_col_index_; }
+  OB_INLINE virtual int64_t get_extra_rowkey_count() const override
+  {
+    return trans_col_index_ == OB_INVALID_INDEX ? 0 : 1;  // currently, read_info_ only support trans_version column in extra rowkey column
+  }
   OB_INLINE int64_t get_group_idx_col_index() const
   { return group_idx_col_index_; }
   OB_INLINE int64_t get_mview_old_new_col_index() const
@@ -414,14 +448,24 @@ public:
       const bool is_cg_sstable = false,
       const bool use_default_compat_version = false,
       const bool is_cs_replica_compat = false,
-      const bool is_delete_insert_table = false);
+      const bool is_delete_insert_table = false,
+      const bool is_global_index = false,
+      const int64_t micro_block_format_version = ObMicroBlockFormatVersionHelper::DEFAULT_VERSION,
+      const bool is_mv_major_refresh_tablet = false,
+      const bool has_ttl_definition = false);
   OB_INLINE virtual int64_t get_seq_read_column_count() const override
   { return get_request_count(); }
   OB_INLINE virtual int64_t get_trans_col_index() const override
   { return schema_rowkey_cnt_; }
+  OB_INLINE virtual int64_t get_extra_rowkey_count() const override
+  { return rowkey_cnt_ - schema_rowkey_cnt_; }
   virtual int64_t get_request_count() const override;
   OB_INLINE bool is_access_rowkey_only() const override
   { return false; }
+  OB_INLINE bool is_ttl_definition_valid() const { return compat_version_ >= READ_INFO_VERSION_V7; }
+  OB_INLINE bool is_global_index_valid() const { return compat_version_ >= READ_INFO_VERSION_V5; }
+   // accurate when is_global_index_valid() = true
+  OB_INLINE bool is_global_index_table() const { return is_global_index_table_; }
   int deep_copy(char *buf, const int64_t buf_len, ObRowkeyReadInfo *&value) const;
   int64_t get_deep_copy_size() const;
   int deserialize(
@@ -502,6 +546,7 @@ public:
     OB_ASSERT_MSG(false, "ObCGReadInfo dose not promise trans col index");
     return OB_INVALID_INDEX;
   }
+  OB_INLINE virtual int64_t get_extra_rowkey_count() const override { return 0; }
   virtual int64_t get_seq_read_column_count() const
   {
     return CG_COL_CNT;
@@ -561,6 +606,7 @@ public:
     return OB_INVALID_INDEX;
   }
   virtual int64_t get_trans_col_index() const override { return rowkey_read_info_.get_trans_col_index(); }
+  OB_INLINE virtual int64_t get_extra_rowkey_count() const override { return rowkey_read_info_.get_extra_rowkey_count(); }
   virtual const common::ObIArray<ObColDesc> &get_columns_desc() const override
   {
     return rowkey_read_info_.get_columns_desc();

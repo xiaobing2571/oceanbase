@@ -15,7 +15,8 @@
 #include "ob_th_worker.h"
 #include "ob_tenant.h"
 #include "observer/ob_server.h"
-#include "storage/memtable/ob_lock_wait_mgr.h"
+#include "storage/lock_wait_mgr/ob_lock_wait_mgr.h"
+#include "sql/session/ob_sql_session_info.h"
 #include "sql/executor/ob_memory_tracker.h"
 #include "lib/stat/ob_diagnostic_info_container.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
@@ -59,6 +60,15 @@ int create_worker(ObThWorker* &worker, ObTenant *tenant, uint64_t group_id,
     worker->set_worker_level(level);
     worker->set_group(group);
     worker->set_numa_info(tenant->id(), GCONF._enable_numa_aware, group_index);
+    if (OBCG_DEFAULT == group_id) {
+      worker->set_thread_group_id(OB_THREAD_GROUP_DEFAULT);
+    } else if (OBCG_OLAP_ASYNC_JOB == group_id) {
+      worker->set_thread_group_id(OB_THREAD_GROUP_OLAP_ASYNC);
+    } else if (OBCG_DBMS_SCHED_JOB == group_id) {
+      worker->set_thread_group_id(OB_THREAD_GROUP_DBMS_SCHE);
+    } else if (OBCG_LQ == group_id) {
+      worker->set_thread_group_id(OB_THREAD_GROUP_LARGE_QUERY);
+    }
     if (OB_FAIL(worker->start())) {
       ob_delete(worker);
       worker = nullptr;
@@ -94,11 +104,11 @@ ObThWorker::ObThWorker()
       is_inited_(false), tenant_(nullptr),
       run_cond_(),
       pause_flag_(false), large_query_(false),
-      priority_limit_(RQ_LOW), is_lq_yield_(false),
+      priority_limit_(RQ_LOW),
       query_start_time_(0), last_check_time_(0),
       can_retry_(true), need_retry_(false),
       last_wakeup_ts_(0), blocking_ts_(nullptr),
-      idle_us_(0)
+      idle_us_(0), is_doing_ddl_(nullptr), is_running_(false)
 {
   module_name_[0] = '\0';
 }
@@ -236,12 +246,11 @@ inline void ObThWorker::process_request(rpc::ObRequest &req)
   reset_sql_throttle_current_priority();
   set_req_flag(&req);
 
-  MTL(memtable::ObLockWaitMgr*)->setup(req.get_lock_wait_node(), req.get_receive_timestamp());
-  memtable::advance_tlocal_request_lock_wait_stat(rpc::RequestLockWaitStat::RequestStat::EXECUTE);
+  MTL(lockwaitmgr::ObLockWaitMgr*)->setup(req.get_lock_wait_node(), req.get_receive_timestamp());
   if (OB_FAIL(procor_.process(req))) {
     LOG_WARN("process request fail", K(ret));
   }
-  bool wait_succ = MTL(memtable::ObLockWaitMgr*)->post_process(need_retry_, need_wait_lock);
+  bool wait_succ = MTL(lockwaitmgr::ObLockWaitMgr*)->post_process(need_retry_, need_wait_lock);
   if (OB_LIKELY(wait_succ)) {
     need_retry_ = false;
   }
@@ -303,8 +312,10 @@ inline void ObThWorker::process_request(rpc::ObRequest &req)
 void ObThWorker::set_th_worker_thread_name()
 {
   char buf[32];
-  if (serving_tenant_id_ != tenant_->id()) {
+  static thread_local uint64_t last_group_id = UINT64_MAX;
+  if (serving_tenant_id_ != tenant_->id() || last_group_id != get_group_id()) {
     serving_tenant_id_ = tenant_->id();
+    last_group_id = get_group_id();
     snprintf(buf, sizeof(buf), "L%d_G%ld", get_worker_level(), get_group_id());
     lib::set_thread_name(buf);
   }
@@ -319,28 +330,21 @@ void ObThWorker::worker(int64_t &tenant_id, int64_t &req_recv_timestamp, int32_t
   procor_.th_created();
   blocking_ts_ = &Thread::blocking_ts_;
   ObDisableDiagnoseGuard disable_guard;
+  is_doing_ddl_ = &Thread::is_doing_ddl_;
 
   ObTLTaGuard ta_guard(tenant_->id());
   ObMemVersionNodeGuard mem_version_node_guard;
   // Avoid adding and deleting entities from the root node for every request, the parameters are meaningless
   CREATE_WITH_TEMP_ENTITY(RESOURCE_OWNER, OB_SERVER_TENANT_ID) {
-    auto *pm = common::ObPageManager::thread_local_instance();
     if (this->get_worker_level() == INT32_MAX) {
       this->set_worker_level(0);
     }
     snprintf(module_name_, MAX_MODULE_NAME_LEN, "ReqWorker(Level:%d)", get_worker_level());
+    ATOMIC_STORE(&is_running_, true);
     while (!has_set_stop()) {
       worker_level = get_worker_level();
       if (OB_NOT_NULL(tenant_)) {
         tenant_id = tenant_->id();
-      }
-      if (OB_NOT_NULL(pm)) {
-        if (pm->get_used() != 0) {
-          LOG_ERROR("page manager's used should be 0, unexpected!!!", KP(pm));
-        } else {
-          // Ignore the above warning
-          ret = pm->set_tenant_ctx(tenant_->id(), ObCtxIds::DEFAULT_CTX_ID);
-        }
       }
       CLEAR_INTERRUPTABLE();
       set_th_worker_thread_name();
@@ -387,6 +391,9 @@ void ObThWorker::worker(int64_t &tenant_id, int64_t &req_recv_timestamp, int32_t
                     req->get_type() == ObRequest::OB_MYSQL
                         ? reinterpret_cast<ObSMConnection *>(SQL_REQ_OP.get_sql_session(req))->get_diagnostic_info()
                         : req->get_diagnostic_info();
+                if (OB_SUCCESS != acquire_diagnostic_info(di, req)) {
+                  // ignore diagnostic info error
+                }
                 ObDiagnosticInfoSwitchGuard guard(di);
                 if (di) {
                   di->end_wait_event(ObWaitEventIds::NETWORK_QUEUE_WAIT, false);
@@ -424,7 +431,6 @@ void ObThWorker::worker(int64_t &tenant_id, int64_t &req_recv_timestamp, int32_t
             if (this->get_worker_level() != 0) {
               // nesting workers not allowed to calling check_worker_count
             } else if (!is_group_worker()) {
-              tenant_->lq_end(*this);
               tenant_->check_worker_count(*this);
             } else {
               ObResourceGroup *group = static_cast<ObResourceGroup *>(group_);
@@ -435,6 +441,7 @@ void ObThWorker::worker(int64_t &tenant_id, int64_t &req_recv_timestamp, int32_t
       }
     }
   }
+  ATOMIC_STORE(&is_running_, false);
   procor_.th_destroy();
 }
 
@@ -503,6 +510,63 @@ int ObThWorker::check_status()
         ret = OB_KILLED_BY_THROTTLING;
       }
     }
+  }
+  return ret;
+}
+
+int ObThWorker::acquire_diagnostic_info(ObDiagnosticInfo *&di, rpc::ObRequest *req)
+{
+  int ret = OB_SUCCESS;
+  if (di != nullptr) {
+    //do nothing
+  } else if (req->get_type() == ObRequest::OB_RPC && oceanbase::lib::is_diagnose_info_enabled()) {
+    int64_t session_id = ObBackgroundSessionIdGenerator::get_instance().get_next_rpc_session_id();
+    const obrpc::ObRpcPacket &pkt
+        = reinterpret_cast<const obrpc::ObRpcPacket &>(req->get_packet());
+    const uint64_t tenant_id = pkt.get_tenant_id();
+    const uint64_t group_id = pkt.get_group_id();
+    if (OB_INVALID_TENANT_ID != tenant_id && OB_DTL_TENANT_ID != tenant_id) {
+      MTL_SWITCH(tenant_id)
+      {
+        if (OB_FAIL(MTL(common::ObDiagnosticInfoContainer *)
+                        ->acquire_diagnostic_info(tenant_id, group_id, session_id, di))) {
+          OB_ASSERT(di == nullptr);
+          LOG_WARN("failed to acquire diagnostic info", K(ret), K(tenant_id), K(group_id), K(session_id));
+        } else {
+          OB_ASSERT(di != nullptr);
+          di->get_ash_stat().pcode_ = pkt.get_pcode();
+          di->get_ash_stat().session_type_ = ObActiveSessionStatItem::SessionType::BACKGROUND;
+          snprintf(di->get_ash_stat().program_, ASH_PROGRAM_STR_LEN, "T%ld_RPC_REQUEST", tenant_id);
+          di->get_ash_stat().module_[0] = '\0';
+          di->get_ash_stat().action_[0] = '\0';
+          di->get_ash_stat().trace_id_ = req->generate_trace_id(GCTX.self_addr());
+          req->set_diagnostic_info(di);
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObThWorker::try_add_stream_rpc_session_wait_cnt(int cnt)
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(tenant_)) {
+    if (cnt <= 0) {
+      IGNORE_RETURN ATOMIC_FAA(&tenant_->stream_rpc_wait_cnt_, cnt);
+    } else {
+      int64_t cur_wait_cnt = ATOMIC_FAA(&tenant_->stream_rpc_wait_cnt_, cnt);
+      int64_t limit = ATOMIC_LOAD(&tenant_->stream_rpc_wait_cnt_limit_);
+      if (cur_wait_cnt > limit) {
+        ret = OB_EAGAIN;
+        ATOMIC_FAA(&tenant_->stream_rpc_wait_cnt_, -cnt);
+        LOG_WARN("current stream rpc wait thread count is over the limit,",
+                "need to expand the max_cpu of tenant config or reduce the concurrency of remote sql"
+                K(tenant_->id()), K(cur_wait_cnt), K(limit));
+      }
+    }
+  } else {
+    LOG_ERROR_RET(OB_ERR_UNEXPECTED, "tenant is NULL, unexpected");
   }
   return ret;
 }

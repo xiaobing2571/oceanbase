@@ -22,7 +22,7 @@ endfunction()
 
 function(ob_ha_unittest_observer case)
   ob_unittest(${ARGV})
-  target_link_libraries(${case} PRIVATE -static-libstdc++ gtest gmock observer_test oceanbase)
+  target_link_libraries(${case} PRIVATE gtest gmock observer_test oceanbase)
 endfunction()
 
 function(errsim_ha_unittest_observer case)
@@ -75,12 +75,16 @@ ob_offline_observer(test_collect_mv mv/test_collect_mv.cpp)
 ob_unittest_observer(test_transfer_no_kill_tx test_transfer_tx.cpp)
 ob_unittest_observer(test_ls_recover test_ls_recover.cpp)
 ob_unittest_observer(test_ob_simple_cluster test_ob_simple_cluster.cpp)
-ob_unittest_observer(test_ob_partition_balance test_ob_partition_balance.cpp)
+ob_unittest_observer(test_ai_model_privilege test_ai_model_privilege.cpp)
+ob_unittest_observer(test_ls_balance test_ls_balance.cpp)
+ob_unittest_observer(test_ls_group_matrix test_ls_group_matrix.cpp)
 ob_unittest_observer(test_mds_table_checkpoint test_mds_table_checkpoint.cpp)
 ob_unittest_observer(test_ob_black_list_service test_ob_black_list_service.cpp)
 ob_unittest_observer(test_ob_queuing_table test_ob_queuing_table.cpp)
 ob_unittest_observer(test_ob_table_lock_service test_ob_table_lock_service.cpp)
 ob_unittest_observer(test_ob_obj_lock_garbage_collector test_ob_obj_lock_garbage_collector.cpp)
+ob_unittest_observer(test_ob_window_compaction_controller test_ob_window_compaction_controller.cpp)
+ob_unittest_observer(test_ob_compaction_resource_manager test_ob_compaction_resource_manager.cpp)
 ob_unittest_observer(test_observer_expand_shrink test_observer_expand_shrink.cpp)
 ob_unittest_observer(test_replay_from_middle test_replay_from_middle.cpp)
 ob_unittest_observer(test_special_tablet_flush test_special_tablet_flush.cpp)
@@ -92,12 +96,14 @@ ob_unittest_observer(test_lock_table_persistence test_lock_table_persistence.cpp
 ob_unittest_observer(test_tx_recover test_tx_recovery.cpp)
 ob_unittest_observer(test_tx_recover2 test_tx_recovery2.cpp)
 ob_unittest_observer(test_tx_recover3 test_tx_recovery3.cpp)
+ob_unittest_observer(test_ls_recovery_stat_handler test_ls_recovery_stat_handler.cpp)
 ob_unittest_observer(test_mds_tx_ctx_recover_mem_leak test_mds_tx_ctx_recover_mem_leak.cpp)
 ob_unittest_observer(test_role_change_service test_role_change_service.cpp)
 ob_unittest_observer(test_big_tx_data test_big_tx_data.cpp)
 ob_unittest_observer(test_fast_commit_report fast_commit_report.cpp)
 #ob_unittest_observer(test_mvcc_gc test_mvcc_gc.cpp)
 ob_unittest_observer(test_ob_simple_rto test_ob_simple_rto.cpp)
+ob_unittest_observer(test_create_gracle_gtt test_create_gracle_gtt.cpp)
 ob_unittest_observer(test_ddl_task test_ddl_task.cpp)
 ob_unittest_observer(test_lock_table_with_tx test_lock_table_with_tx.cpp)
 ob_unittest_observer(test_ob_detect_manager_in_simple_server test_ob_detect_manager_in_simple_server.cpp)
@@ -116,6 +122,9 @@ ob_unittest_observer(test_transfer_rollback_to test_transfer_between_rollback_to
 ob_unittest_observer(test_memtable_new_safe_to_destroy test_memtable_new_safe_to_destroy.cpp)
 ob_unittest_observer(test_tablet_to_ls_cache test_tablet_to_ls_cache.cpp)
 ob_unittest_observer(test_update_tablet_directly_when_mini test_update_tablet_directly_when_mini.cpp)
+ob_unittest_observer(test_ai_service test_ai_service.cpp)
+ob_unittest_observer(test_fulltext_index_create test_fulltext_index_create.cpp)
+ob_unittest_observer(test_fts_sample_pipeline test_fts_sample_pipeline.cpp)
 
 ####### freeze case #######
 #ob_freeze_observer(test_frequently_freeze freeze/test_frequently_freeze.cpp)
@@ -126,16 +135,17 @@ ob_unittest_observer(test_update_tablet_directly_when_mini test_update_tablet_di
 
 # TODO(muwei.ym): open later
 ob_ha_unittest_observer(test_transfer_handler storage_ha/test_transfer_handler.cpp)
+ob_ha_unittest_observer(test_transfer_handler_oracle_gtt storage_ha/test_transfer_handler_oracle_gtt.cpp)
 ob_ha_unittest_observer(test_transfer_and_restart_basic storage_ha/test_transfer_and_restart_basic.cpp)
 ob_ha_unittest_observer(test_transfer_start_stage_restart_without_mds_flush storage_ha/test_transfer_start_stage_restart_without_mds_flush.cpp)
 ob_ha_unittest_observer(test_transfer_doing_stage_restart_without_mds_flush storage_ha/test_transfer_doing_stage_restart_without_mds_flush.cpp)
 ob_ha_unittest_observer(test_transfer_complete_restart_without_mds_flush storage_ha/test_transfer_complete_restart_without_mds_flush.cpp)
 ob_ha_unittest_observer(test_transfer_doing_stage_restart_with_mds_flush storage_ha/test_transfer_doing_stage_restart_with_mds_flush.cpp)
 ob_ha_unittest_observer(test_transfer_complete_restart_with_mds_flush storage_ha/test_transfer_complete_restart_with_mds_flush.cpp)
-ob_ha_unittest_observer(test_transfer_with_empty_shell storage_ha/test_transfer_with_empty_shell.cpp)
+#ob_ha_unittest_observer(test_transfer_with_empty_shell storage_ha/test_transfer_with_empty_shell.cpp)
 ob_ha_unittest_observer(test_mds_transaction test_mds_transaction.cpp)
-ob_ha_unittest_observer(test_member_table_basic storage_ha/test_member_table_basic.cpp)
-ob_ha_unittest_observer(test_member_table_mini_and_minor storage_ha/test_member_table_mini_and_minor.cpp)
+ob_ha_unittest_observer(test_reorg_info_table_basic storage_ha/test_reorg_info_table_basic.cpp)
+ob_ha_unittest_observer(test_reorg_info_table_mini_and_minor storage_ha/test_reorg_info_table_mini_and_minor.cpp)
 errsim_ha_unittest_observer(errsim_test_transfer_handler errsim/storage_ha/errsim_test_transfer_handler.cpp)
 
 ob_farm_observer(test_collect_mv_farm mv/test_collect_mv.cpp)
@@ -162,12 +172,40 @@ ob_unittest_observer(test_tenant_transfer_service rootservice/test_tenant_transf
 ob_unittest_observer(test_transfer_partition_task rootservice/test_transfer_partition_task.cpp)
 ob_unittest_observer(test_dup_table_partition_balance rootservice/test_dup_table_partition_balance.cpp)
 ob_unittest_observer(test_transfer_task_operator rootservice/test_transfer_task_operator.cpp)
+ob_unittest_observer(test_ss_ha_macro_block_task_idempotency rootservice/test_ss_ha_macro_block_task_idempotency.cpp)
+ob_unittest_observer(test_ss_ha_macro_block_task_operator rootservice/test_ss_ha_macro_block_task_operator.cpp)
+ob_unittest_observer(test_ss_ha_macro_block_task_for_each rootservice/test_ss_ha_macro_block_task_for_each.cpp)
 ob_unittest_observer(test_ob_parallel_migration_mode rootservice/test_ob_parallel_migration_mode.cpp)
 ob_unittest_observer(test_ls_status_operator rootservice/test_ls_status_operator.cpp)
+ob_unittest_observer(test_external_resource_schema rootservice/test_external_resource_schema.cpp)
+ob_unittest_observer(test_location_schema_refresh rootservice/test_location_schema_refresh.cpp)
+ob_unittest_observer(test_create_tenant_compare rootservice/test_create_tenant_compare.cpp)
+ob_unittest_observer(test_sensitive_rule_schema rootservice/test_sensitive_rule_schema.cpp)
+ob_unittest_observer(test_bootstrap_hang rootservice/test_bootstrap_hang.cpp)
+ob_unittest_observer(test_ob_partition_balance rootservice/test_ob_partition_balance.cpp)
+ob_unittest_observer(test_object_balance_weight rootservice/test_object_balance_weight.cpp)
+ob_unittest_observer(test_max_id_cache rootservice/test_max_id_cache.cpp)
 ####### rootservice case #########
 
 
 ####### truncate case #########
 ob_truncate_case(test_truncate_partition_filter test_truncate_partition_filter.cpp)
 ob_truncate_case(test_truncate_info_service test_truncate_info_service.cpp)
+ob_truncate_case(test_ttl_schema_service test_ttl_schema_service.cpp)
+ob_truncate_case(test_ttl_filter test_ttl_filter.cpp)
+ob_truncate_case(test_mds_filter_mgr test_mds_filter_mgr.cpp)
+ob_truncate_case(test_mds_cache_valid test_mds_cache_valid.cpp)
+ob_truncate_case(test_min_merged_trans_version test_min_merged_trans_version.cpp)
 ####### truncate case #########
+
+####### sort case #########
+add_subdirectory(sort)
+ob_unittest_observer(test_merge_sort_op test_merge_sort_op.cpp)
+####### sort case #########
+####### vector index case #########
+set(VECTOR_INDEX_TEST_SHARE
+        vector_index/test_vector_index_utils.cpp
+        )
+ob_unittest_observer(test_vector_index_freeze vector_index/test_vector_index_freeze.cpp ${VECTOR_INDEX_TEST_SHARE})
+ob_unittest_observer(test_vector_index_freeze_with_base vector_index/test_vector_index_freeze_with_base.cpp ${VECTOR_INDEX_TEST_SHARE})
+####### vector index case #########

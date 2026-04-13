@@ -16,7 +16,6 @@
 #include "sql/engine/cmd/ob_load_data_utils.h"
 #include "storage/direct_load/ob_direct_load_datum_row.h"
 #include "storage/direct_load/ob_direct_load_dml_row_handler.h"
-#include "storage/direct_load/ob_direct_load_insert_table_ctx.h"
 #include "storage/direct_load/ob_direct_load_row_iterator.h"
 
 namespace oceanbase
@@ -33,10 +32,11 @@ ObDirectLoadInsertTableRowIterator::ObDirectLoadInsertTableRowIterator()
     row_iters_(nullptr),
     dml_row_handler_(nullptr),
     job_stat_(nullptr),
+    is_delete_full_row_(false),
     rowkey_column_count_(0),
     column_count_(0),
     pos_(0),
-    row_count_(0),
+    insert_table_result_(),
     is_inited_(false)
 {
 }
@@ -47,7 +47,8 @@ int ObDirectLoadInsertTableRowIterator::init(
   ObDirectLoadInsertTabletContext *insert_tablet_ctx,
   const ObIArray<ObDirectLoadIStoreRowIterator *> &row_iters,
   ObDirectLoadDMLRowHandler *dml_row_handler,
-  ObLoadDataStat *job_stat)
+  ObLoadDataStat *job_stat,
+  bool is_delete_full_row)
 {
   int ret = OB_SUCCESS;
   if (IS_INIT) {
@@ -84,6 +85,7 @@ int ObDirectLoadInsertTableRowIterator::init(
       job_stat_ = job_stat;
       rowkey_column_count_ = insert_tablet_ctx->get_rowkey_column_count();
       column_count_ = insert_tablet_ctx->get_column_count();
+      is_delete_full_row_ = is_delete_full_row;
       is_inited_ = true;
     }
   }
@@ -118,7 +120,11 @@ int ObDirectLoadInsertTableRowIterator::get_next_row(const bool skip_lob,
       LOG_WARN("fail to handle row", KR(ret));
     } else {
       result_row = datum_row;
-      ++row_count_;
+      if (datum_row->row_flag_.is_delete()) {
+        insert_table_result_.delete_row_count_++;
+      } else {
+        insert_table_result_.insert_row_count_++;
+      }
       ATOMIC_AAF(&job_stat_->store_.merge_stage_write_rows_, 1);
     }
   }
@@ -162,7 +168,8 @@ int ObDirectLoadInsertTableRowIterator::inner_get_next_row(ObDatumRow *&result_r
           }
         }
         // normal cols
-        if (OB_SUCC(ret) && !datum_row->is_delete_) {
+        if (OB_SUCC(ret) &&
+            (is_delete_full_row_ || !datum_row->is_delete_)) {
           for (int64_t
                  i = row_iter->get_row_flag().uncontain_hidden_pk_ ? 0 : rowkey_column_count_,
                  j = rowkey_column_count_ + ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt();
@@ -197,7 +204,7 @@ int ObDirectLoadInsertTableRowIterator::close()
   } else if (OB_FAIL(row_handler_.close())) {
     LOG_WARN("fail to close row handler", KR(ret));
   } else {
-    insert_tablet_ctx_->inc_row_count(row_count_);
+    insert_tablet_ctx_->update_insert_table_result(insert_table_result_);
   }
   return ret;
 }

@@ -86,6 +86,8 @@ enum ObRoutineFlag
   SP_FLAG_HAS_SEQUENCE = SP_FLAG_RPS * 2,
   SP_FLAG_HAS_OUT_PARAM = SP_FLAG_HAS_SEQUENCE * 2,
   SP_FLAG_EXTERNAL_STATE = SP_FLAG_HAS_OUT_PARAM * 2,
+  SP_FLAG_MYSQL_UDTF = SP_FLAG_EXTERNAL_STATE * 2,
+  SP_FLAG_SQL_TRANSPILER_ELIGIBLE = SP_FLAG_MYSQL_UDTF * 2,
 };
 
 namespace oceanbase
@@ -108,7 +110,15 @@ enum class ObExternalRoutineType
   INTERNAL_ROUTINE = 0,
   EXTERNAL_JAVA_UDF_FROM_URL = 1,
   EXTERNAL_JAVA_UDF_FROM_RES = 2,
+  EXTERNAL_PY_UDF_FROM_URL = 3,
+  EXTERNAL_PY_UDF_FROM_RES = 4,
 };
+
+OB_INLINE bool is_java_external_routine(ObExternalRoutineType type)
+{
+  return type == ObExternalRoutineType::EXTERNAL_JAVA_UDF_FROM_URL
+           || type == ObExternalRoutineType::EXTERNAL_JAVA_UDF_FROM_RES;
+}
 
 class ObIRoutineParam
 {
@@ -181,6 +191,7 @@ public:
   virtual uint64_t get_dblink_id() const { return OB_INVALID_ID; }
   virtual uint64_t get_routine_id() const = 0;
   virtual bool is_function() const = 0;
+  virtual bool is_sql_transpiler_eligible() const = 0;
   TO_STRING_EMPTY();
 };
 
@@ -456,6 +467,10 @@ public:
   OB_INLINE uint64_t get_dblink_id() const { return dblink_id_; }
   OB_INLINE const common::ObString &get_dblink_db_name() const { return dblink_db_name_; }
   OB_INLINE const common::ObString &get_dblink_pkg_name() const { return dblink_pkg_name_; }
+  OB_INLINE ObExternalRoutineType get_external_routine_type() const { return external_routine_type_; }
+  OB_INLINE const common::ObString &get_external_routine_entry() const { return external_routine_entry_; }
+  OB_INLINE const common::ObString &get_external_routine_url() const { return external_routine_url_; }
+  OB_INLINE const common::ObString &get_external_routine_resource() const { return external_routine_resource_;}
 
   // setter
   OB_INLINE void set_tenant_id(uint64_t tenant_id) { tenant_id_ = tenant_id; }
@@ -486,6 +501,12 @@ public:
   OB_INLINE int set_dblink_db_name(const common::ObString &db_name) { return deep_copy_str(db_name, dblink_db_name_); }
   OB_INLINE int set_dblink_pkg_name(const common::ObString &pkg_name)
                   { return deep_copy_str(pkg_name, dblink_pkg_name_); }
+
+  OB_INLINE void set_external_routine_type(ObExternalRoutineType type) { external_routine_type_ = type; }
+  OB_INLINE int set_external_routine_entry(const common::ObString &entry) { return deep_copy_str(entry, external_routine_entry_); }
+  OB_INLINE int set_external_routine_url(const common::ObString &url) { return deep_copy_str(url, external_routine_url_); }
+  OB_INLINE int set_external_routine_resource(const common::ObString &resource) { return deep_copy_str(resource, external_routine_resource_); }
+
   OB_INLINE void set_routine_invalid() { flag_ |= SP_FLAG_INVALID; }
   OB_INLINE void set_noneditionable() { flag_ |= SP_FLAG_NONEDITIONABLE; }
   OB_INLINE void set_deterministic() { flag_ |= SP_FLAG_DETERMINISTIC; }
@@ -524,6 +545,7 @@ public:
     flag_ &= ~(uint64_t)SP_FLAG_HAS_SEQUENCE;
     flag_ &= ~(uint64_t)SP_FLAG_HAS_OUT_PARAM;
     flag_ &= ~(uint64_t)SP_FLAG_EXTERNAL_STATE;
+    flag_ &= ~(uint64_t)SP_FLAG_SQL_TRANSPILER_ELIGIBLE;
   }
 
   OB_INLINE bool is_wps() const { return SP_FLAG_WPS == (flag_ & SP_FLAG_WPS); }
@@ -536,7 +558,8 @@ public:
   OB_INLINE void set_rps() { flag_ |= SP_FLAG_RPS;}
   OB_INLINE void set_has_sequence() { flag_ |= SP_FLAG_HAS_SEQUENCE;}
   OB_INLINE void set_has_out_param() { flag_ |= SP_FLAG_HAS_OUT_PARAM;}
-  OB_INLINE void set_external_state() { flag_ |= SP_FLAG_EXTERNAL_STATE;}
+  OB_INLINE void set_external_state() { flag_ |= SP_FLAG_EXTERNAL_STATE; }
+  OB_INLINE void set_mysql_udtf() { flag_ |= SP_FLAG_MYSQL_UDTF; }
 
   OB_INLINE bool is_aggregate() const { return SP_FLAG_AGGREGATE == (flag_ & SP_FLAG_AGGREGATE); }
 
@@ -600,8 +623,24 @@ public:
     return is_udt_routine() && SP_FLAG_STATIC == (flag_ & SP_FLAG_STATIC);
   }
 
+  OB_INLINE bool is_mysql_udtf() const {
+    return SP_FLAG_MYSQL_UDTF == (flag_ & SP_FLAG_MYSQL_UDTF);
+  }
+
   OB_INLINE bool is_dblink_routine() const {
     return dblink_id_ != OB_INVALID_ID;
+  }
+
+  OB_INLINE bool is_py_external_routine() const {
+    return ObExternalRoutineType::EXTERNAL_PY_UDF_FROM_URL == external_routine_type_
+           || ObExternalRoutineType::EXTERNAL_PY_UDF_FROM_RES == external_routine_type_;
+  }
+
+  OB_INLINE void set_sql_transpiler_eligible() { flag_ |= SP_FLAG_SQL_TRANSPILER_ELIGIBLE; }
+
+  bool is_sql_transpiler_eligible() const override
+  {
+    return SP_FLAG_SQL_TRANSPILER_ELIGIBLE == (flag_ & SP_FLAG_SQL_TRANSPILER_ELIGIBLE);
   }
 
   TO_STRING_KV(K_(tenant_id),

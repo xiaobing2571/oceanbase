@@ -98,25 +98,32 @@ public:
   void reset();
   void reuse();
   static int get_micro_metas(
+      const char *block,
+      const int64_t block_size,
       const ObMicroBlockHeader *&header,
       const ObColumnHeader *&col_header,
-      const char *&meta_data,
-      const char *block,
-      const int64_t block_size);
+      const char *&meta_data);
 protected:
   int prepare(const int64_t column_cnt);
-  int do_init(const ObMicroBlockData &block_data, const int64_t request_cnt);
-  int init_decoders();
-  int add_decoder(const int64_t store_idx, const common::ObObjMeta &obj_meta,
-                  int64_t &decoders_buf_pos, ObColumnDecoder &dest);
-  int acquire(const int64_t store_idx, int64_t &decoders_buf_pos, const ObIColumnDecoder *&decoder);
-  int setup_row(const uint64_t row_id, int64_t &row_len, const char *&row_data);
-  int alloc_decoders_buf(int64_t &decoders_buf_pos);
+  int do_init(
+    const ObMicroBlockData &block_data,
+    const ObMicroBlockHeader &micro_header,
+    const int64_t request_cnt);
+  int init_decoders(const ObMicroBlockHeader &micro_header);
+  int add_decoder(
+    const ObMicroBlockHeader &micro_header,
+    const int64_t store_idx, const common::ObObjMeta &obj_meta,
+    int64_t &decoders_buf_pos, ObColumnDecoder &dest);
+  int acquire(
+    const ObMicroBlockHeader &micro_header,
+    const int64_t store_idx, int64_t &decoders_buf_pos, const ObIColumnDecoder *&decoder);
+  int setup_row(const ObMicroBlockHeader &micro_header, const uint64_t row_id, int64_t &row_len, const char *&row_data);
+  int alloc_decoders_buf(const ObMicroBlockHeader &micro_header, int64_t &decoders_buf_pos);
 protected:
   static const int64_t DEFAULT_DECODER_CNT = 16;
 
+  ObMicroBlockAddr block_addr_;
   int64_t request_cnt_; // request column count
-  const ObMicroBlockHeader *header_;
   const ObColumnHeader *col_header_;
   const ObBlockCachedDecoderHeader *cached_decoder_;
   const char *meta_data_;
@@ -138,7 +145,6 @@ protected:
   common::ObObjMeta *column_type_array_;
   int64_t default_store_ids_[DEFAULT_DECODER_CNT];
   common::ObObjMeta default_column_types_[DEFAULT_DECODER_CNT];
-  bool need_cast_;
   static ObNoneExistColumnDecoder none_exist_column_decoder_;
   static ObColumnDecoderCtx none_exist_column_decoder_ctx_;
 };
@@ -150,10 +156,18 @@ public:
   ObEncodeBlockGetReader() = default;
   virtual ~ObEncodeBlockGetReader() = default;
   virtual int get_row(
+      const ObMicroBlockAddr &block_addr,
       const ObMicroBlockData &block_data,
       const ObDatumRowkey &rowkey,
       const ObITableReadInfo &read_info,
       ObDatumRow &row) final;
+  virtual int get_row_and_trans_version(
+      const ObMicroBlockAddr &block_addr,
+      const ObMicroBlockData &block_data,
+      const ObDatumRowkey &rowkey,
+      const ObITableReadInfo &read_info,
+      ObDatumRow &row,
+      int64_t &trans_version) final { return OB_NOT_SUPPORTED; }
   virtual int exist_row(
       const ObMicroBlockData &block_data,
       const ObDatumRowkey &rowkey,
@@ -161,11 +175,13 @@ public:
       bool &exist,
       bool &found);
   virtual int get_row(
+      const ObMicroBlockAddr &block_addr,
       const ObMicroBlockData &block_data,
       const ObITableReadInfo &read_info,
       const uint32_t row_idx,
       ObDatumRow &row) final;
-  int get_row_id(
+  virtual int get_row_id(
+      const ObMicroBlockAddr &block_addr,
       const ObMicroBlockData &block_data,
       const ObDatumRowkey &rowkey,
       const ObITableReadInfo &read_info,
@@ -178,8 +194,10 @@ protected:
       ObDatumRow &row);
 private:
   int init_by_read_info(
+      const ObMicroBlockAddr &block_addr,
       const ObMicroBlockData &block_data,
       const storage::ObITableReadInfo &read_info);
+  int init_if_need(const ObMicroBlockAddr &block_addr, const ObMicroBlockData &block_data, const ObITableReadInfo &read_info);
   int init_by_columns_desc(
       const ObMicroBlockData &block_data,
       const int64_t schema_rowkey_cnt,
@@ -225,20 +243,12 @@ public:
   //when the incoming datum_utils is nullptr, it indicates not calling locate_range or find_bound
   virtual int init(const ObMicroBlockData &block_data, const ObStorageDatumUtils *datum_utils) override;
   virtual int get_row(const int64_t index, ObDatumRow &row) override;
-  virtual int get_row_header(
-      const int64_t row_idx,
-      const ObRowHeader *&row_header) override;
   virtual int get_row_count(int64_t &row_count) override;
-  virtual int get_multi_version_info(
-      const int64_t row_idx,
-      const int64_t schema_rowkey_cnt,
-      const ObRowHeader *&row_header,
-      int64_t &trans_version,
-      int64_t &sql_sequence);
   virtual int compare_rowkey(
       const ObDatumRowkey &rowkey,
       const int64_t index,
-      int32_t &compare_result) override;
+      int32_t &compare_result,
+      const int64_t common_prefix_len = 0) override;
   virtual int compare_rowkey(
       const ObDatumRange &range,
       const int64_t index,
@@ -271,6 +281,16 @@ public:
       sql::ObPushdownFilterExecutor &filter,
       const sql::PushdownFilterInfo &pd_filter_info,
       common::ObBitmap &result_bitmap) override;
+  virtual int filter_pushdown_ttl_filter(
+      const sql::ObPushdownFilterExecutor *parent,
+      sql::ObPushdownFilterExecutor &filter,
+      const sql::PushdownFilterInfo &pd_filter_info,
+      common::ObBitmap &result_bitmap) override;
+  virtual int filter_pushdown_base_version_filter(
+      const sql::ObPushdownFilterExecutor *parent,
+      sql::ObPushdownFilterExecutor &filter,
+      const sql::PushdownFilterInfo &pd_filter_info,
+      common::ObBitmap &result_bitmap) override;
 
   virtual int get_rows(
       const common::ObIArray<int32_t> &cols,
@@ -299,13 +319,9 @@ public:
       storage::ObAggCell &agg_cell) override;
   virtual int64_t get_column_count() const override
   {
-    OB_ASSERT(nullptr != header_);
-    return header_->column_count_;
+    return micro_header_->column_count_;
   }
-  virtual int get_column_datum(
-      const ObTableIterParam &iter_param,
-      const ObTableAccessContext &context,
-      const share::schema::ObColumnParam &col_param,
+  virtual int get_raw_column_datum(
       const int32_t col_offset,
       const int64_t row_index,
       ObStorageDatum &datum) override;
@@ -318,7 +334,7 @@ public:
   {
     return 1 == col_offsets.count() &&
         (decoders_[col_offsets.at(0)].decoder_->is_new_column() || ObColumnHeader::DICT == decoders_[col_offsets.at(0)].ctx_->col_header_->type_) &&
-        header_->all_lob_in_row_;
+        micro_header_->all_lob_in_row_;
   }
   virtual int get_distinct_count(const int32_t group_by_col, int64_t &distinct_cnt) const override;
   virtual int read_distinct(
@@ -332,11 +348,15 @@ public:
       const int64_t row_cap,
       storage::ObGroupByCellBase &group_by_cell) const override;
   virtual int get_group_by_aggregate_result(
+      const ObTableIterParam &iter_param,
+      const ObTableAccessContext &context,
       const int32_t *row_ids,
       const char **cell_datas,
       const int64_t row_cap,
       storage::ObGroupByCell &group_by_cell) override;
   virtual int get_group_by_aggregate_result(
+      const ObTableIterParam &iter_param,
+      const ObTableAccessContext &context,
       const int32_t *row_ids,
       const char **cell_datas,
       const int64_t row_cap,
@@ -344,7 +364,8 @@ public:
       const common::ObIArray<blocksstable::ObStorageDatum> &default_datums,
       uint32_t *len_array,
       sql::ObEvalCtx &eval_ctx,
-      storage::ObGroupByCellVec &group_by_cell) override;
+      storage::ObGroupByCellVec &group_by_cell,
+      const bool enable_rich_format) override;
   virtual int get_rows(
       const common::ObIArray<int32_t> &cols,
       const common::ObIArray<const share::schema::ObColumnParam *> &col_params,
@@ -359,7 +380,7 @@ public:
       sql::ObExprPtrIArray &exprs,
       const bool need_init_vector) override;
   virtual bool has_lob_out_row() const override final
-  { return nullptr != header_ && header_->has_lob_out_row(); }
+  { return micro_header_->has_lob_out_row(); }
 
 private:
   // use inner_reset to reuse the decoder buffer
@@ -391,10 +412,6 @@ private:
     return rh;
   }
   static const ObRowHeader init_major_store_row_header();
-  static int get_micro_metas(
-      const ObMicroBlockHeader *&header, const ObColumnHeader *&col_header,
-      const char *&meta_data, const char *block, const int64_t block_size);
-
   template <typename Allocator>
   static int acquire(
       Allocator &allocator,
@@ -413,9 +430,16 @@ private:
       ObStorageDatum &decoded_datum,
       common::ObBitmap &result_bitmap);
   int get_col_data(const int32_t col_id, ObVectorDecodeCtx &vector_ctx);
+  virtual const ObMicroBlockHeader* get_micro_header() const override final
+  {
+    return micro_header_;
+  }
+  int filter_pushdown_single_column_mds_filter(const sql::ObPushdownFilterExecutor *parent,
+                                               sql::ObPushdownFilterExecutor &filter,
+                                               const sql::PushdownFilterInfo &pd_filter_info,
+                                               common::ObBitmap &result_bitmap);
 
 private:
-  const ObMicroBlockHeader *header_;
   int64_t request_cnt_; // request column count
   const ObColumnHeader *col_header_;
   const char *meta_data_;
@@ -425,7 +449,6 @@ private:
   const ObBlockCachedDecoderHeader *cached_decoder_;
   ObIRowIndex *row_index_;
   ObColumnDecoder *decoders_;
-  ObRowReader flat_row_reader_;
   ObColumnDecoderCtx *ctxs_;
   static ObNoneExistColumnDecoder none_exist_column_decoder_;
   static ObColumnDecoderCtx none_exist_column_decoder_ctx_;

@@ -44,6 +44,12 @@ public:
     destroy();
   }
 
+  void reuse()
+  {
+    destroy();
+    map_.reuse();
+  }
+
   int add(const Key &key, const Value &value)
   {
     int ret = common::OB_SUCCESS;
@@ -109,6 +115,8 @@ public:
     return ret;
   }
 
+  bool empty() const { return map_.empty(); }
+
 private:
   DISALLOW_COPY_AND_ASSIGN(ObDirectLoadMultiMapNoLock);
   void destroy()
@@ -133,8 +141,7 @@ template<class Key, class Value>
 class ObDirectLoadMultiMap
 {
 public:
-  ObDirectLoadMultiMap()
-  {
+  ObDirectLoadMultiMap() : mutex_(common::ObLatchIds::OB_DIRECT_LOAD_MULTI_MAP_MUTEX)  {
   }
 
   int init()

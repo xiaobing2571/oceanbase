@@ -33,7 +33,10 @@
 
 #ifdef OB_BUILD_SHARED_LOG_SERVICE
 #include "close_modules/shared_log_service/logservice/libpalf/libpalf_proposer_config_mgr.h"
-#endif
+#include "logservice/replayservice/ob_log_replay_reporter.h"
+#include "logservice/ob_log_submit_log_rate_limiter.h"
+#include "logservice/logrpc/ob_log_rpc_proxy.h"
+#endif // OB_BUILD_SHARED_LOG_SERVICE
 
 namespace oceanbase
 {
@@ -128,16 +131,18 @@ public:
 
   virtual int get_max_scn(share::SCN &scn) const = 0;
   virtual int get_end_scn(share::SCN &scn) const = 0;
-  virtual int get_paxos_member_list(common::ObMemberList &member_list, int64_t &paxos_replica_num) const = 0;
+  virtual int get_paxos_member_list(common::ObMemberList &member_list, int64_t &paxos_replica_num, const bool &filter_logonly_replica = false) const = 0;
   virtual int get_paxos_member_list_and_learner_list(common::ObMemberList &member_list,
                                                      int64_t &paxos_replica_num,
-                                                     common::GlobalLearnerList &learner_list) const = 0;
+                                                     common::GlobalLearnerList &learner_list,
+                                                     const bool &filter_logonly_replica = false) const = 0;
   virtual int get_global_learner_list(common::GlobalLearnerList &learner_list) const = 0;
   virtual int get_leader_config_version(palf::LogConfigVersion &config_version) const = 0;
   virtual int get_stable_membership(palf::LogConfigVersion &config_version,
                                     common::ObMemberList &member_list,
                                     int64_t &paxos_replica_num,
-                                    common::GlobalLearnerList &learner_list) const = 0;
+                                    common::GlobalLearnerList &learner_list,
+                                    const bool &filter_logonly_replica = false) const = 0;
   //  get leader from election, used only for non_palf_leader rebuilding.
   virtual int get_election_leader(common::ObAddr &addr) const = 0;
   virtual int get_parent(common::ObAddr &parent) const = 0;
@@ -148,6 +153,7 @@ public:
   virtual int force_set_as_single_replica() = 0;
   virtual int force_set_as_single_replica(const palf::LogConfigVersion &config_version, const int64_t timeout_us) = 0;
   virtual int force_set_member_list(const common::ObMemberList &new_member_list, const int64_t new_replica_num) = 0;
+  virtual int inc_config_version(int64_t timeout_us) = 0;
   virtual int add_member(const common::ObMember &member,
                          const int64_t paxos_replica_num,
                          const palf::LogConfigVersion &config_version,
@@ -199,6 +205,7 @@ public:
   virtual int enable_replay(const palf::LSN &initial_lsn, const share::SCN &initial_scn) = 0;
   virtual int disable_replay() = 0;
   virtual int get_max_decided_scn(share::SCN &scn) = 0;
+  virtual int get_max_decided_scn_snapshot(share::SCN &scn, const bool is_force_refresh) = 0;
   virtual int pend_submit_replay_log() = 0;
   virtual int restore_submit_replay_log() = 0;
   virtual bool is_replay_enabled() const = 0;
@@ -207,7 +214,7 @@ public:
   virtual int register_rebuild_cb(palf::PalfRebuildCb *rebuild_cb) = 0;
   virtual int unregister_rebuild_cb() = 0;
   virtual int offline() = 0;
-  virtual int online(const palf::LSN &lsn, const share::SCN &scn) = 0;
+  virtual int online(const palf::LSN &lsn, const share::SCN &scn, const bool is_logonly_replica = false) = 0;
   virtual bool is_offline() const = 0;
   virtual int is_replay_fatal_error(bool &has_fatal_error) = 0;
 };
@@ -225,6 +232,9 @@ public:
            ObRoleChangeService *rc_service,
            ipalf::IPalfEnv *palf_env,
            palf::PalfLocationCacheCb *lc_cb,
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+           ObLogLSSubmitLogRateLimiter *shared_log_submit_log_rate_limiter,
+#endif // OB_BUILD_SHARED_LOG_SERVICE
            obrpc::ObLogServiceRpcProxy *rpc_proxy,
            common::ObILogAllocator *alloc_mgr);
   bool is_valid() const;
@@ -476,14 +486,15 @@ public:
   // @brief, get paxos member list of this paxos group
   // @param[out] common::ObMemberList&
   // @param[out] int64_t&
-  int get_paxos_member_list(common::ObMemberList &member_list, int64_t &paxos_replica_num) const override final;
+  int get_paxos_member_list(common::ObMemberList &member_list, int64_t &paxos_replica_num, const bool &filter_logonly_replica = false) const override final;
   // @brief, get paxos member list and global list of this paxos group atomically
   // @param[out] common::ObMemberList&
   // @param[out] int64_t&
   // @param[out] common::GlobalLearnerList&
   int get_paxos_member_list_and_learner_list(common::ObMemberList &member_list,
                                              int64_t &paxos_replica_num,
-                                             common::GlobalLearnerList &learner_list) const override final;
+                                             common::GlobalLearnerList &learner_list,
+                                             const bool &filter_logonly_replica = false) const override final;
   // @brief, get global learner list of this paxos group
   // @param[out] common::GlobalLearnerList&
   int get_global_learner_list(common::GlobalLearnerList &learner_list) const override final;
@@ -500,7 +511,8 @@ public:
   int get_stable_membership(palf::LogConfigVersion &config_version,
                             common::ObMemberList &member_list,
                             int64_t &paxos_replica_num,
-                            common::GlobalLearnerList &learner_list) const override final;
+                            common::GlobalLearnerList &learner_list,
+                            const bool &filter_logonly_replica = false) const override final;
   // @brief, get leader from election, used only for non_palf_leader rebuilding
   // @param[out] addr: address of leader
   // retval:
@@ -528,6 +540,8 @@ public:
   // So if advance_base_info returns OB_SUCCESS, that means log sync and replay_status have been disabled.
   int advance_base_info(const palf::PalfBaseInfo &palf_base_info, const bool is_rebuild) override final;
   // check if palf is in sync state or need rebuild
+  // in SN, we compare follower's log_sync_scn with leader's log_sync_scn.
+  // in SS, we compare follower's replayed_scn with leader's log_sync_scn, because follower has no log_sync_scn.
   // @param [out] is_log_sync: if the log of this replica is sync with leader's,
   //    - false: leader's max_scn  - local max_scn > 3s + keepalive_interval
   //    - true:  leader's max_scn  - local max_scn < 3s + keepalive_interval
@@ -583,6 +597,9 @@ public:
   // - OB_INVALID_ARGUMENT: invalid argument
   // - other: bug
   virtual int force_set_member_list(const common::ObMemberList &new_member_list, const int64_t new_replica_num) override final;
+  // increment member info config version
+  // update porposer_id if proposal_id in member info is not latest, otherwise inc config_seq in member_info
+  virtual int inc_config_version(int64_t timeout_us) override final;
   // @brief, add a member to paxos group, can be called in any member
   // @param[in] common::ObMember &member: member which will be added
   // @param[in] const int64_t paxos_replica_num: replica number of paxos group after adding 'member'
@@ -818,6 +835,14 @@ public:
   // OB_STATE_NOT_MATCH: ls is offline or stopped
   // OB_SUCCESS
   int get_max_decided_scn(share::SCN &scn) override final;
+  // @brief, just for check dup tablet readable, get max decided scn considering both apply and replay, priority use snapshot.
+  // @param[out] int64_t&, max decided scn.
+  // @param[in] const bool is_force_refresh: whether to force refresh the snapshot.
+  // @return
+  // OB_NOT_INIT: not inited
+  // OB_STATE_NOT_MATCH: ls is offline or stopped
+  // OB_SUCCESS
+  int get_max_decided_scn_snapshot(share::SCN &scn, const bool is_force_refresh) override final;
   // @brief: store a persistent flag which means this paxos replica  can not reply ack when receiving logs.
   // By default, paxos replica can reply ack.
   // @param[in] need_check_log_missing: for rebuildinng caused by log missing, need check whether log
@@ -838,7 +863,7 @@ public:
   int diagnose_palf(palf::PalfDiagnoseInfo &diagnose_info) const;
   TO_STRING_KV(K_(role), K_(proposal_id), KP(palf_handle_), KP(palf_env_), K(is_in_stop_state_), K(is_inited_), K(id_));
   int offline() override final;
-  int online(const palf::LSN &lsn, const share::SCN &scn) override final;
+  int online(const palf::LSN &lsn, const share::SCN &scn, const bool is_logonly_replica = false) override final;
   bool is_offline() const override final;
   // @brief: check there's a fatal error in replay service.
   // @param[out] has_fatal_error.
@@ -847,13 +872,10 @@ public:
   // OB_NOT_RUNNING: in stop state
   // OB_EAGAIN: try lock failed, need retry.
   int is_replay_fatal_error(bool &has_fatal_error);
-  int handle_config_change_cmd(
+  int handle_config_change_cmd_rpc(
       const LogConfigChangeCmd &req,
       LogConfigChangeCmdResp &resp);
   int stat(palf::PalfStat &palf_stat) const;
-#ifdef OB_BUILD_SHARED_LOG_SERVICE
-  void refresh_proposer_member_info() const;
-#endif
   template<typename StartPoint, typename IteratorType>
   friend int init_log_iterator(
     ObLogHandler *log_handler,
@@ -870,6 +892,9 @@ private:
   int submit_config_change_cmd_(const LogConfigChangeCmd &req);
   int submit_config_change_cmd_(const LogConfigChangeCmd &req,
                                 LogConfigChangeCmdResp &resp);
+  int handle_config_change_cmd_(
+      const LogConfigChangeCmd &req,
+      LogConfigChangeCmdResp &resp);
 
   int append_(const void *buffer,
               const int64_t nbytes,
@@ -891,7 +916,7 @@ private:
   template <class StartPoint>
   int seek_log_iterator_dispatch_(const StartPoint &start_point,
                                   const int64_t suggested_read_buf_size,
-                                  ipalf::IPalfLogIterator &iterator);
+                                  ipalf::IPalfIterator<ipalf::ILogEntry> &iterator);
   int advance_base_lsn_impl_(const palf::LSN &lsn);
   DISALLOW_COPY_AND_ASSIGN(ObLogHandler);
 private:
@@ -912,9 +937,22 @@ private:
   ObLogCompressorWrapper compressor_wrapper_;
 #endif
 #ifdef OB_BUILD_SHARED_LOG_SERVICE
+public:
+  void refresh_proposer_member_info() const;
+  // @brief: whether election is allowed with ignoring proposer list.
+  // @return:
+  // OB_NOT_INIT: not inited
+  // OB_NOT_RUNNING: in stop state
+  // OB_ERR_UNEXPECTED: ffi is null
+  // OB_INVALID_ARGUMENT: ffi is invalid
+  int set_allow_election_without_memlist(const bool allow_election_without_memlist);
+  int report_replica_replay_process(const common::ObAddr &replica, const share::ObLSID &ls_id, const LSReplicaReplayReachingMachine &replay_reaching_machine);
+private:
   libpalf::LibPalfProposerConfigMgr libpalf_proposer_config_mgr_;
-#endif
-  mutable int64_t get_max_decided_scn_debug_time_;
+  ObLogLSSubmitLogRateLimiter *shared_log_submit_log_rate_limiter_;
+#endif // OB_BUILD_SHARED_LOG_SERVICE
+mutable int64_t get_max_decided_scn_debug_time_;
+mutable SCN max_decided_scn_snapshot_;
 };
 
 struct ObLogStat
@@ -1030,7 +1068,7 @@ int ObLogHandler::seek_log_iterator_dispatch_(const StartPoint &start_point,
 template <class StartPoint>
 int ObLogHandler::seek_log_iterator_dispatch_(const StartPoint &start_point,
                                               const int64_t suggested_read_buf_size,
-                                              ipalf::IPalfLogIterator &iterator)
+                                              ipalf::IPalfIterator<ipalf::ILogEntry> &iterator)
 {
   int ret = OB_SUCCESS;
   RLockGuard guard(lock_);
@@ -1090,7 +1128,7 @@ template<typename StartPoint, typename IteratorType>
 int seek_log_iterator_for_cdc(const share::ObLSID &ls_id,
                               const StartPoint &start_point,
                               const int64_t suggested_read_buf_size,
-                              palf::PalfIterator<IteratorType> &iterator)
+                              ipalf::IPalfIterator<IteratorType> &iterator)
 {
   return init_log_iterator_(ls_id, start_point, suggested_read_buf_size, iterator);
 }

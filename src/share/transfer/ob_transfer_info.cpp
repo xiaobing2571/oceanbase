@@ -376,6 +376,14 @@ int ObTransferPartInfo::to_display_str(char *buf, const int64_t len, int64_t &po
   return ret;
 }
 
+int ObTransferPartInfo::hash(uint64_t &hash_val) const
+{
+  hash_val = 0;
+  hash_val = murmurhash(&table_id_, sizeof(table_id_), hash_val);
+  hash_val = murmurhash(&part_object_id_, sizeof(part_object_id_), hash_val);
+  return OB_SUCCESS;
+}
+
 bool ObTransferPartInfo::operator==(const ObTransferPartInfo &other) const
 {
   return other.table_id_ == table_id_
@@ -423,6 +431,7 @@ static const char* TRANSFER_TASK_COMMENT_ARRAY[] =
   "Wait for learner list to be same",
   "Unable to process task due to all partitions being locked",
   "Unable to process task due to partitions being locked or non-existent",
+  "Wait to retry due to abnormal replay scn in member list",
   "Unknow"/*MAX_COMMENT*/
 };
 

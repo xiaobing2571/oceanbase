@@ -101,7 +101,7 @@ int ObTableLoadMergeDataTableOp::inner_init()
         break;
       // 增量
       case ObDirectLoadMethod::INCREMENTAL:
-        if (store_table_ctx->schema_->is_table_without_pk_) {
+        if (store_table_ctx->schema_->is_table_with_hidden_pk_column_) {
           inner_ctx_.merge_mode_ = ObDirectLoadMergeMode::NORMAL;
         } else {
           switch (ctx_->param_.insert_mode_) {

@@ -129,7 +129,7 @@ TEST_F(TestObSimpleLogReplayFunc, basic_replay)
   ObReplayStatus *rp_st = NULL;
   PalfEnv *palf_env;
   EXPECT_EQ(OB_SUCCESS, get_palf_env(leader_idx, palf_env));
-  rp_sv.init(palf_env, &ls_adapter, get_cluster()[0]->get_allocator());
+  rp_sv.init(palf_env, NULL, &ls_adapter, get_cluster()[0]->get_allocator());
   rp_sv.start();
   get_cluster()[0]->get_tenant_base()->update_thread_cnt(10);
   EXPECT_EQ(OB_SUCCESS, rp_sv.add_ls(ls_id));
@@ -229,7 +229,7 @@ TEST_F(TestObSimpleLogReplayFunc, test_flashback_to_padding)
   ObReplayStatus *rp_st = NULL;
   PalfEnv *palf_env;
   EXPECT_EQ(OB_SUCCESS, get_palf_env(leader_idx, palf_env));
-  rp_sv.init(palf_env, &ls_adapter, get_cluster()[0]->get_allocator());
+  rp_sv.init(palf_env, NULL, &ls_adapter, get_cluster()[0]->get_allocator());
   rp_sv.start();
   get_cluster()[0]->get_tenant_base()->update_thread_cnt(10);
   LSN iterator_end_lsn(0);
@@ -246,7 +246,7 @@ TEST_F(TestObSimpleLogReplayFunc, test_flashback_to_padding)
     rp_st = guard.get_replay_status();
     ls_adapter.rp_st_ = rp_st;
   }
-  ipalf::IPalfLogIterator &iterator = rp_st->submit_log_task_.iterator_;
+  ipalf::IPalfIterator<ipalf::ILogEntry> &iterator = rp_st->submit_log_task_.iterator_;
   iterator.palf_iterator_.iterator_storage_.get_file_end_lsn_ = get_file_end_lsn;
   // 停止拉日志
   rp_st->block_submit();
@@ -381,7 +381,7 @@ TEST_F(TestObSimpleLogReplayFunc, test_wait_replay_done)
   ObReplayStatus *rp_st = NULL;
   PalfEnv *palf_env;
   EXPECT_EQ(OB_SUCCESS, get_palf_env(leader_idx, palf_env));
-  rp_sv.init(palf_env, &ls_adapter, get_cluster()[0]->get_allocator());
+  rp_sv.init(palf_env, NULL, &ls_adapter, get_cluster()[0]->get_allocator());
   rp_sv.start();
   get_cluster()[0]->get_tenant_base()->update_thread_cnt(10);
   LSN iterator_end_lsn(0);
@@ -399,7 +399,7 @@ TEST_F(TestObSimpleLogReplayFunc, test_wait_replay_done)
     rp_st = guard.get_replay_status();
     ls_adapter.rp_st_ = rp_st;
   }
-  ipalf::IPalfLogIterator &iterator = rp_st->submit_log_task_.iterator_;
+  ipalf::IPalfIterator<ipalf::ILogEntry> &iterator = rp_st->submit_log_task_.iterator_;
   iterator.palf_iterator_.iterator_storage_.get_file_end_lsn_ = get_file_end_lsn;
   EXPECT_EQ(OB_SUCCESS, submit_log(leader, 31, leader_idx, log_entry_size));
   EXPECT_EQ(OB_SUCCESS, wait_until_has_committed(leader, leader.get_palf_handle_impl()->get_max_lsn()));
@@ -441,7 +441,7 @@ TEST_F(TestObSimpleLogReplayFunc, replay_big_log)
   ObReplayStatus *rp_st = NULL;
   PalfEnv *palf_env;
   EXPECT_EQ(OB_SUCCESS, get_palf_env(leader_idx, palf_env));
-  rp_sv.init(palf_env, &ls_adapter, get_cluster()[0]->get_allocator());
+  rp_sv.init(palf_env, NULL, &ls_adapter, get_cluster()[0]->get_allocator());
   rp_sv.start();
   get_cluster()[0]->get_tenant_base()->update_thread_cnt(10);
   EXPECT_EQ(OB_SUCCESS, rp_sv.add_ls(ls_id));

@@ -52,7 +52,7 @@ struct ObStorageSnapshotInfo
   };
   ObStorageSnapshotInfo();
   ~ObStorageSnapshotInfo() { reset(); }
-  OB_INLINE void reset() {
+OB_INLINE void reset() {
     snapshot_type_ = SNAPSHOT_MAX;
     snapshot_ = 0;
   }
@@ -67,8 +67,8 @@ struct ObStorageSnapshotInfo
   }
   void update_by_smaller_snapshot(const uint64_t snapshot_type, const int64_t snapshot);
   static const char *ObSnapShotTypeStr[];
-  const char *get_snapshot_type_str() const;
-  TO_STRING_KV("type", get_snapshot_type_str(), K_(snapshot));
+  static const char *get_snapshot_type_str(const uint64_t snapshot_type);
+  TO_STRING_KV("type", get_snapshot_type_str(snapshot_type_), K_(snapshot));
   uint64_t snapshot_type_;
   int64_t snapshot_;
 };
@@ -116,7 +116,8 @@ public:
   int get_min_reserved_snapshot(
       const ObTabletID &tablet_id,
       const int64_t merged_version,
-      ObStorageSnapshotInfo &snapshot_info);
+      ObStorageSnapshotInfo &snapshot_info,
+      const bool skip_undo_retention = false);
 
   int get_min_dependent_freeze_info(share::ObFreezeInfo &freeze_info);
   int64_t get_snapshot_gc_ts();
@@ -163,7 +164,6 @@ private:
     int init();
     virtual void runTimerTask();
     int refresh_merge_info();
-
   private:
     bool inited_;
     bool check_tenant_status_;

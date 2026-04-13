@@ -19,6 +19,7 @@
 #include "sql/engine/expr/ob_expr.h"
 #include "sql/ob_sql_context.h"
 #include "share/vector_index/ob_vector_index_util.h"
+#include "share/ob_fts_index_builder_util.h"
 
 namespace oceanbase
 {
@@ -33,27 +34,40 @@ bool ObDomainIdUtils::is_domain_id_index_col(const void *col_schema)
     bret = col->is_doc_id_column() ||
            col->is_vec_hnsw_vid_column() ||
            col->is_vec_ivf_center_id_column() ||
-           col->is_vec_ivf_pq_center_ids_column();
+           col->is_vec_ivf_pq_center_ids_column() ||
+           col->is_hybrid_embedded_vec_column();
   }
   return bret;
 }
 
-bool ObDomainIdUtils::check_table_need_column_ref_in_ddl(const void *table_schema)
+bool ObDomainIdUtils::check_table_no_need_column_ref_in_ddl(share::schema::ObSchemaGetterGuard &schema_guard,
+                                                         const void *data_table_schema, const void *table_schema,
+                                                         const ObColumnSchemaV2 *col_schema)
 {
+  // true: no need column_ref, need generate an expression
+  // false: need column_ref
+  int ret = OB_SUCCESS;
   bool bret = false;
-  const schema::ObTableSchema *table = reinterpret_cast<const schema::ObTableSchema*>(table_schema);
+  const schema::ObTableSchema *table = reinterpret_cast<const schema::ObTableSchema *>(table_schema);
   if (OB_NOT_NULL(table)) {
-    bret = table->is_rowkey_doc_id() ||
-           table->is_vec_rowkey_vid_type() ||
-           table->is_vec_ivfflat_rowkey_cid_index() ||
-          // TODO(liyao): use the expression calculation currently.
-          //              use the merge_iter after the split post build step.
-          //  table->is_vec_ivfflat_centroid_index() ||
-           table->is_vec_ivfflat_cid_vector_index() ||
-           table->is_vec_ivfsq8_cid_vector_index() ||
-           table->is_vec_ivfsq8_rowkey_cid_index() ||
-           table->is_vec_ivfpq_code_index() ||
-           table->is_vec_ivfpq_rowkey_cid_index();
+       if (table->is_vec_ivfflat_cid_vector_index() || table->is_vec_ivfsq8_cid_vector_index() ||
+        table->is_vec_ivfpq_code_index()) {
+      bret = true;
+      // If the table rowkey_cid does not exist, the expr needs to be generated, and return true.
+      if (OB_NOT_NULL(data_table_schema)) {
+        const schema::ObTableSchema *data_table = reinterpret_cast<const schema::ObTableSchema *>(data_table_schema);
+        bool readable = false;
+        if (OB_FAIL(ObVectorIndexUtil::check_rowkey_cid_table_readable(schema_guard, *data_table, *table, readable))) {
+          LOG_WARN("fail to check rowkey cid table", K(ret), KPC(data_table));
+        } else if (readable) {
+          bret = false;
+        }
+      }
+    } else {
+      // if is_vec_ivf_index but not (is_vec_ivfflat_cid_vector_index && is_vec_ivfsq8_cid_vector_index && is_vec_ivfpq_code_index), need column_ref
+      bret = table->is_rowkey_doc_id() || table->is_vec_rowkey_vid_type() || table->is_vec_ivf_index() ||
+             (col_schema->is_hybrid_embedded_vec_column() && table->is_hybrid_vec_index_embedded_type());
+    }
   }
   return bret;
 }
@@ -70,7 +84,9 @@ bool ObDomainIdUtils::is_domain_id_index_table(const void *table_schema)
   return bret;
 }
 
-int ObDomainIdUtils::check_table_need_domain_id_merge(ObDomainIDType type, const void *table_schema, bool &res)
+int ObDomainIdUtils::check_table_need_domain_id_merge(ObDomainIDType type, ObSchemaGetterGuard &schema_guard,
+                                                      const ObTableSchema &data_table_schema, const void *table_schema,
+                                                      bool &res)
 {
   int ret = OB_SUCCESS;
   res = false;
@@ -81,40 +97,81 @@ int ObDomainIdUtils::check_table_need_domain_id_merge(ObDomainIDType type, const
   } else {
     switch (type) {
       case ObDomainIDType::DOC_ID: {
-        if (ddl_table_schema->is_doc_id_rowkey() ||
+        uint64_t docid_col_id = OB_INVALID_ID;
+        if (OB_FAIL(ddl_table_schema->get_docid_col_id(docid_col_id)) && OB_ERR_INDEX_KEY_NOT_FOUND != ret) {
+          LOG_WARN("failed to determine docid type", K(ret), KPC(ddl_table_schema));
+        } else if (OB_ERR_INDEX_KEY_NOT_FOUND == ret) {
+          // no such docid column, so no need to merge
+          ret = OB_SUCCESS;
+          res = false;
+        } else if (ddl_table_schema->is_doc_id_rowkey() ||
             ddl_table_schema->is_fts_index_aux() ||
             ddl_table_schema->is_fts_doc_word_aux() ||
-            ddl_table_schema->is_multivalue_index_aux()) {
+            ddl_table_schema->is_multivalue_index_aux() ||
+            ddl_table_schema->is_vec_spiv_index_aux()) {
           res = true;
         }
         break;
       }
       case ObDomainIDType::VID: {
-        if (ddl_table_schema->is_vec_vid_rowkey_type() ||
+        uint64_t vid_col_id = OB_INVALID_ID;
+        if (OB_FAIL(ddl_table_schema->get_vec_index_vid_col_id(vid_col_id)) && OB_ERR_INDEX_KEY_NOT_FOUND != ret) {
+          LOG_WARN("failed to determine vid type", K(ret), KPC(ddl_table_schema));
+        } else if (OB_ERR_INDEX_KEY_NOT_FOUND == ret) {
+          // no such vid column, so no need to merge
+          ret = OB_SUCCESS;
+          res = false;
+        } else if (ddl_table_schema->is_vec_vid_rowkey_type() ||
             ddl_table_schema->is_vec_delta_buffer_type() ||
             ddl_table_schema->is_vec_index_id_type() ||
-            ddl_table_schema->is_vec_index_snapshot_data_type()) {
+            ddl_table_schema->is_vec_index_snapshot_data_type() ||
+            ddl_table_schema->is_hybrid_vec_index_embedded_type() ||
+            ddl_table_schema->is_hybrid_vec_index_log_type()) {
           res = true;
         }
         break;
       }
       case ObDomainIDType::IVFFLAT_CID: {
-        // TODO(@liyao): 使用merge_iter补cid_vector
-        // if (ddl_table_schema->is_vec_ivfflat_cid_vector_index()) {
-        //   res = true;
-        // }
+        if (ddl_table_schema->is_vec_ivfflat_cid_vector_index()) {
+          bool readable = false;
+          if (OB_FAIL(ObVectorIndexUtil::check_rowkey_cid_table_readable(schema_guard, data_table_schema, *ddl_table_schema, readable))) {
+            LOG_WARN("fail to check rowkey cid table", K(ret), KPC(ddl_table_schema));
+          } else if (readable) {
+            res = true;
+          }
+        }
         break;
       }
       case ObDomainIDType::IVFSQ_CID: {
-        // if (ddl_table_schema->is_vec_ivfsq8_cid_vector_index()) {
-        //   res = true;
-        // }
+        if (ddl_table_schema->is_vec_ivfsq8_cid_vector_index()) {
+          bool readable = false;
+          if (OB_FAIL(ObVectorIndexUtil::check_rowkey_cid_table_readable(schema_guard, data_table_schema, *ddl_table_schema, readable))) {
+            LOG_WARN("fail to check rowkey cid table", K(ret), KPC(ddl_table_schema));
+          } else if (readable) {
+            res = true;
+          }
+        }
         break;
       }
       case ObDomainIDType::IVFPQ_CID: {
-        // if (ddl_table_schema->is_vec_ivf_pq_code_index()) {
-        //   res = true;
-        // }
+        if (ddl_table_schema->is_vec_ivfpq_code_index()) {
+          bool readable = false;
+          if (OB_FAIL(ObVectorIndexUtil::check_rowkey_cid_table_readable(schema_guard, data_table_schema, *ddl_table_schema, readable))) {
+            LOG_WARN("fail to check rowkey cid table", K(ret), KPC(ddl_table_schema));
+          } else if (readable) {
+            res = true;
+          }
+        }
+        break;
+      }
+      case ObDomainIDType::EMB_VEC: {
+        bool is_aux_table_has_hybrid_column;
+        if (OB_FAIL(ObVectorIndexUtil::check_index_table_has_hybrid_vec_column(*ddl_table_schema, is_aux_table_has_hybrid_column))) {
+          LOG_WARN("fail to check the index table has hybrid vec column", K(ret), K(type), KPC(ddl_table_schema));
+        } else if (is_aux_table_has_hybrid_column &&
+                   (ddl_table_schema->is_vec_index_id_type() || ddl_table_schema->is_vec_index_snapshot_data_type())) {
+          res = true;
+        }
         break;
       }
       default: {
@@ -131,6 +188,7 @@ int ObDomainIdUtils::check_column_need_domain_id_merge(
     const ObDomainIDType type,
     const void *col_expr,
     const ObIndexType index_type,
+    sql::ObSqlSchemaGuard &schema_guard,
     bool &res)
 {
   int ret = OB_SUCCESS;
@@ -143,16 +201,11 @@ int ObDomainIdUtils::check_column_need_domain_id_merge(
     switch (type) {
       case ObDomainIDType::DOC_ID: {
         if (expr->is_doc_id_column()) {
-          ObSEArray<ObAuxTableMetaInfo, 16> simple_index_infos;
-          if (OB_FAIL(table_schema.get_simple_index_infos(simple_index_infos))) {
-            LOG_WARN("fail to get simple index infos", K(ret), K(table_schema));
+          bool has_valid_index = false;
+          if (OB_FAIL(ObFtsIndexBuilderUtil::check_has_valid_fts_or_multivalue_index(table_schema, schema_guard, has_valid_index))) {
+            LOG_WARN("failed to check has valid fts or multivalue index", K(ret));
           } else {
-            for (int64_t i = 0; OB_SUCC(ret) && !res && i < simple_index_infos.count(); ++i) {
-              const ObIndexType index_type = simple_index_infos.at(i).index_type_;
-              if (schema::is_fts_or_multivalue_index(index_type) && !schema::is_rowkey_doc_aux(index_type)) {
-                res = true;
-              }
-            }
+            res = has_valid_index;
           }
         }
         break;
@@ -171,6 +224,10 @@ int ObDomainIdUtils::check_column_need_domain_id_merge(
       }
       case ObDomainIDType::IVFSQ_CID: {
         res = expr->is_vec_cid_column() && index_type == ObIndexType::INDEX_TYPE_VEC_IVFSQ8_CENTROID_LOCAL;
+        break;
+      }
+      case ObDomainIDType::EMB_VEC: {
+        res = expr->is_hybrid_embedded_vec_column();
         break;
       }
       default: {
@@ -210,6 +267,30 @@ int ObDomainIdUtils::get_domain_tid_table_by_type(ObDomainIDType type,
         }
         break;
       }
+      case ObDomainIDType::EMB_VEC: {
+        if (OB_FAIL(data_table->get_embedded_vec_tid(domain_id_table_id))) {
+          LOG_WARN("fail to get embedded vec table id", K(ret), KPC(data_table));
+        }
+        break;
+      }
+      case ObDomainIDType::IVFFLAT_CID: {
+        if (OB_FAIL(data_table->get_rowkey_cid_tid(domain_id_table_id, INDEX_TYPE_VEC_IVFFLAT_ROWKEY_CID_LOCAL))) {
+          LOG_WARN("fail to get rowkey cid table id", K(ret), KPC(data_table));
+        }
+        break;
+      }
+      case ObDomainIDType::IVFSQ_CID: {
+        if (OB_FAIL(data_table->get_rowkey_cid_tid(domain_id_table_id, INDEX_TYPE_VEC_IVFSQ8_ROWKEY_CID_LOCAL))) {
+          LOG_WARN("fail to get rowkey cid table id", K(ret), KPC(data_table));
+        }
+        break;
+      }
+      case ObDomainIDType::IVFPQ_CID: {
+        if (OB_FAIL(data_table->get_rowkey_cid_tid(domain_id_table_id, INDEX_TYPE_VEC_IVFPQ_ROWKEY_CID_LOCAL))) {
+          LOG_WARN("fail to get rowkey cid table id", K(ret), KPC(data_table));
+        }
+        break;
+      }
       default: {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected domain id type", K(ret), K(type));
@@ -246,29 +327,36 @@ int ObDomainIdUtils::get_domain_tid_table_by_cid(
         break;
       }
       case ObDomainIDType::VID: {
-        if (OB_FAIL(data_table->get_rowkey_vid_tid(tid))) {
+        if (OB_FAIL(ObVectorIndexUtil::check_rowkey_tid_table_readable(sql_schema_guard->get_schema_guard(), *data_table, tid))) {
           LOG_WARN("fail to get rowkey vid table id", K(ret), KPC(data_table));
         }
         break;
       }
       case ObDomainIDType::IVFFLAT_CID: {
-        if (OB_FAIL(ObVectorIndexUtil::get_vector_index_tid(
+        if (OB_FAIL(ObVectorIndexUtil::get_vector_index_tid_check_valid(
             sql_schema_guard, *data_table, INDEX_TYPE_VEC_IVFFLAT_ROWKEY_CID_LOCAL, domain_col_id, tid))) {
           LOG_WARN("failed to get rowkey cid table", K(ret), KPC(data_table));
         }
         break;
       }
       case ObDomainIDType::IVFSQ_CID: {
-        if (OB_FAIL(ObVectorIndexUtil::get_vector_index_tid(
+        if (OB_FAIL(ObVectorIndexUtil::get_vector_index_tid_check_valid(
             sql_schema_guard, *data_table, INDEX_TYPE_VEC_IVFSQ8_ROWKEY_CID_LOCAL, domain_col_id, tid))) {
           LOG_WARN("failed to get rowkey cid table", K(ret), KPC(data_table));
         }
         break;
       }
       case ObDomainIDType::IVFPQ_CID: {
-        if (OB_FAIL(ObVectorIndexUtil::get_vector_index_tid(
+        if (OB_FAIL(ObVectorIndexUtil::get_vector_index_tid_check_valid(
             sql_schema_guard, *data_table, INDEX_TYPE_VEC_IVFPQ_ROWKEY_CID_LOCAL, domain_col_id, tid))) {
           LOG_WARN("failed to get rowkey cid table", K(ret), KPC(data_table));
+        }
+        break;
+      }
+      case ObDomainIDType::EMB_VEC: {
+        if (OB_FAIL(ObVectorIndexUtil::get_hybrid_embedded_vector_tid_check_valid(
+            sql_schema_guard, *data_table, INDEX_TYPE_HYBRID_INDEX_EMBEDDED_LOCAL, domain_col_id, tid))) {
+          LOG_WARN("failed to get hybrid embedded table", K(ret), KPC(data_table));
         }
         break;
       }
@@ -349,6 +437,15 @@ int ObDomainIdUtils::get_domain_id_col(
         }
         break;
       }
+      case ObDomainIDType::EMB_VEC: {
+        uint64_t vec_cid_col_id = OB_INVALID_ID;
+        if (OB_FAIL(table->get_hybrid_vec_embedded_column_id(vec_cid_col_id))) { // table schema must be index table here
+          LOG_WARN("fail to get vec index column ids", K(ret), KPC(table));
+        } else if (OB_FAIL(col_id.push_back(vec_cid_col_id))) {
+          LOG_WARN("fail to push back col id", K(ret));
+        }
+        break;
+      }
       default: {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected domain id type", K(ret), K(type));
@@ -387,7 +484,8 @@ bool ObDomainIdUtils::is_domain_id_index_col_expr(const void *col_expr)
     bret = expr->is_doc_id_column() ||
            expr->is_vec_hnsw_vid_column() ||
            expr->is_vec_cid_column() ||
-           expr->is_vec_pq_cids_column();
+           expr->is_vec_pq_cids_column() ||
+           expr->is_hybrid_embedded_vec_column();
   }
   return bret;
 }
@@ -410,6 +508,8 @@ int64_t ObDomainIdUtils::get_domain_type_by_col_expr(const void *col_expr, ObInd
     }
   } else if (expr->is_vec_pq_cids_column()) {
     type = ObDomainIDType::IVFPQ_CID;
+  } else if (expr->is_hybrid_embedded_vec_column()) {
+    type = ObDomainIDType::EMB_VEC;
   }
   return type;
 }
@@ -447,6 +547,8 @@ int ObDomainIdUtils::check_has_domain_index(const void *table_schema, ObIArray<i
         domain_type = ObDomainIDType::IVFSQ_CID; // not only one
       } else if (is_vec_ivfpq_rowkey_cid_index(simple_index_infos.at(i).index_type_)) {
         domain_type = ObDomainIDType::IVFPQ_CID; // not only one
+      } else if (is_hybrid_vec_index_embedded_type(simple_index_infos.at(i).index_type_)) {
+        domain_type = ObDomainIDType::EMB_VEC; // not only one
       }
       if (OB_SUCC(ret) && (ObDomainIDType::DOC_ID <= domain_type && domain_type < ObDomainIDType::MAX)) {
         if (OB_FAIL(domain_types.push_back(domain_type))) {
@@ -532,6 +634,21 @@ int ObDomainIdUtils::get_domain_id_col_by_tid(
         }
         break;
       }
+      case ObDomainIDType::EMB_VEC: {
+        uint64_t embedded_col_id = OB_INVALID_ID;
+        const ObTableSchema *embedded_table_schema = nullptr;
+        if (OB_FAIL(sql_schema_guard->get_table_schema(domain_tid, embedded_table_schema))) {
+          LOG_WARN("failed to get table schema", K(ret), K(domain_tid));
+        } else if (OB_ISNULL(embedded_table_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected nullptr to table schema", K(ret));
+        } else if (OB_FAIL(embedded_table_schema->get_hybrid_vec_embedded_column_id(embedded_col_id))) {
+          LOG_WARN("fail to get embedded vector index column ids", K(ret), KPC(embedded_table_schema));
+        } else if (OB_FAIL(col_ids.push_back(embedded_col_id))) {
+          LOG_WARN("fail to push back col id", K(ret), K(embedded_col_id));
+        }
+        break;
+      }
       default: {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected domain id type", K(ret), K(type));
@@ -581,6 +698,22 @@ int ObDomainIdUtils::fill_domain_id_datum(ObDomainIDType type, void *expr, void 
           } else {
             int64_t vid = *reinterpret_cast<const int64_t*>(domain_id.ptr());
             dst_datum.set_int(vid);
+          }
+        }
+        break;
+      }
+      case ObDomainIDType::EMB_VEC: {
+        if (set_null) {
+          dst_datum.set_null();
+        } else {
+          // ? is set a id or a full vec str
+          char *buf = nullptr;
+          if (OB_ISNULL(buf = static_cast<char *>(domain_id_expr->get_str_res_mem(*ctx, domain_id.length())))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("fail to allocate memory", K(ret), KP(buf), K(domain_id.length()));
+          } else {
+            memcpy(buf, domain_id.ptr(), domain_id.length());
+            dst_datum.set_string(reinterpret_cast<char*>(buf), domain_id.length());
           }
         }
         break;
@@ -664,6 +797,37 @@ int ObDomainIdUtils::fill_batch_domain_id_datum(ObDomainIDType type, void *expr,
           } else {
             int64_t vid = *reinterpret_cast<const int64_t*>(domain_ids.at(i).at(idx).ptr());
             datums[i].set_int(vid);
+          }
+        }
+        break;
+      }
+      case ObDomainIDType::EMB_VEC: {
+        char *buf = nullptr;
+        uint64_t buf_pos = 0;
+        uint64_t total_len = 0;
+        // calc total buf len
+        for (int64_t i = 0; OB_SUCC(ret) && i < domain_ids.count(); i++) {
+          if (idx < 0 || idx > domain_ids.at(i).count()) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected idx", K(ret), K(idx), K(domain_ids.at(i).count()));
+          } else {
+            total_len += domain_ids.at(i).at(idx).length();
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (total_len != 0 && OB_ISNULL(buf = static_cast<char *>(domain_id_expr->get_str_res_mem(*ctx, total_len)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("fail to allocate memory", K(ret), KP(buf), K(total_len));
+        } else {
+          for (int64_t i = 0; OB_SUCC(ret) && i < domain_ids.count(); ++i) {
+            if (domain_ids.at(i).at(idx).length() == 0) {
+              datums[i].set_null();
+            } else {
+              memcpy(buf + buf_pos, domain_ids.at(i).at(idx).ptr(), domain_ids.at(i).at(idx).length());
+              datums[i].set_string(buf + buf_pos, domain_ids.at(i).at(idx).length());
+              buf_pos += domain_ids.at(i).at(idx).length();
+            }
+            LOG_TRACE("Domain id merge fill a domain id", KP(buf + buf_pos), K(domain_ids.at(i).at(idx).length()), K(i));
           }
         }
         break;

@@ -17,6 +17,10 @@
 #include "storage/blocksstable/ob_storage_cache_suite.h"
 #include "storage/blocksstable/ob_storage_cache_suite.h"
 #include "storage/meta_mem/ob_tenant_meta_mem_mgr.h"
+#include "storage/meta_mem/ob_aggregated_storage_meta_io.h"
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "close_modules/shared_storage/storage/tiered_metadata_store/ob_tiered_metadata_store.h"
+#endif
 
 namespace oceanbase
 {
@@ -234,7 +238,7 @@ int ObStorageMetaValue::process_sstable(
     ObStorageMetaCacheValue *cache_value = handle.get_cache_value();
     ObStorageMetaValue value(MetaType::SSTABLE, tiny_meta);
     if (OB_FAIL(OB_STORE_CACHE.get_storage_meta_cache().put_and_fetch(key, value, cache_value->value_, cache_value->cache_handle_))) {
-      LOG_WARN("fail to put and fetch value into storage meta cache", K(ret), K(key), K(value), K(cache_value));
+      LOG_WARN("fail to put and fetch value into storage meta cache", K(ret), K(key), K(value), KPC(cache_value));
     } else {
       LOG_DEBUG("succeed to process sstable", K(ret), K(value), KPC(cache_value));
     }
@@ -279,6 +283,44 @@ int ObStorageMetaValue::process_co_sstable(
   if (OB_NOT_NULL(tiny_meta)) {
     tiny_meta->~ObIStorageMetaObj();
   }
+  return ret;
+}
+
+int ObStorageMetaValue::process_aggregated_storage_meta(
+  ObAggregatedStorageMetaIOInfo &aggr_io_info,
+  const char *buf,
+  const int64_t size)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(buf) || OB_UNLIKELY(size <= 0) || OB_UNLIKELY(!aggr_io_info.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(ret), K(aggr_io_info));
+  } else {
+    uint64_t first_meta_offset = aggr_io_info.first_meta_offset_;
+    for (int64_t i = 0; OB_SUCC(ret) && i < aggr_io_info.aggr_params_.count(); ++i) {
+      ObStorageMetaValueHandle &handle = aggr_io_info.aggr_params_.at(i).cache_handle_;
+      const ObStorageMetaKey &key = aggr_io_info.aggr_params_.at(i).meta_key_;
+      const ObStorageMetaValue::MetaType &type = aggr_io_info.aggr_params_.at(i).meta_type_;
+
+      switch (type) {
+        case ObStorageMetaValue::MetaType::SSTABLE:
+          if (OB_FAIL(process_sstable(handle, key, buf + key.get_meta_addr().offset() - first_meta_offset, key.get_meta_addr().size(), nullptr))) {
+            LOG_WARN("fail to process sstable", K(ret), K(type), K(key), K(handle));
+          }
+          break;
+        case ObStorageMetaValue::MetaType::CO_SSTABLE:
+          if (OB_FAIL(process_co_sstable(handle, key, buf + key.get_meta_addr().offset() - first_meta_offset, key.get_meta_addr().size(), nullptr))) {
+            LOG_WARN("fail to process co sstable", K(ret), K(type), K(key), K(handle));
+          }
+          break;
+        default:
+          ret = OB_ERR_UNEXPECTED;
+          LOG_ERROR("fail to process unexpected meta type", K(ret), K(type), K(key), K(handle));
+          break;
+      }
+    }
+  }
+
   return ret;
 }
 
@@ -350,6 +392,9 @@ int ObStorageMetaValueHandle::new_value(common::ObIAllocator &allocator)
     LOG_WARN("fail to allocate memory", K(ret), K(size), KP(allocator_));
   } else {
     cache_value_->inc_ref();
+  }
+  if (OB_FAIL(ret)) {
+    reset();
   }
   return ret;
 }
@@ -437,6 +482,11 @@ bool ObStorageMetaHandle::is_valid() const
   const bool valid_cache_handle = phy_addr_.is_valid() && cache_handle_.is_valid();
   const bool valid_io_handle = phy_addr_.is_block() && io_handle_.is_valid();
   return valid_cache_handle || valid_io_handle;
+}
+
+bool ObStorageMetaHandle::has_sent_io() const
+{
+  return !io_handle_.is_empty();
 }
 
 int ObStorageMetaHandle::wait()
@@ -550,6 +600,30 @@ int ObStorageMetaCache::get_meta(
   return ret;
 }
 
+int ObStorageMetaCache::get_meta_without_prefetch(
+    const ObStorageMetaValue::MetaType type,
+    const ObStorageMetaKey &key,
+    ObStorageMetaHandle &meta_handle) {
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!key.is_valid() || type >= ObStorageMetaValue::MAX)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(ret), K(key), K(type));
+  } else if (OB_FAIL(meta_handle.cache_handle_.new_value(MTL(ObTenantMetaMemMgr *)->get_meta_cache_io_allocator()))) {
+    LOG_WARN("fail to new cache handle value", K(ret));
+  } else if (OB_FAIL(get(key, meta_handle.cache_handle_.get_cache_value()->value_,
+      meta_handle.cache_handle_.get_cache_value()->cache_handle_))) {
+    if (OB_UNLIKELY(OB_ENTRY_NOT_EXIST != ret)) {
+      LOG_WARN("fail to get storage meta from cache", K(ret), K(type), K(key));
+    } else {
+      EVENT_INC(ObStatEventIds::STORAGE_META_CACHE_MISS);
+    }
+  } else {
+    meta_handle.phy_addr_ = key.get_meta_addr();
+    EVENT_INC(ObStatEventIds::STORAGE_META_CACHE_HIT);
+  }
+  return ret;
+}
+
 int ObStorageMetaCache::bypass_get_meta(
     const ObStorageMetaValue::MetaType type,
     const ObStorageMetaKey &key,
@@ -605,6 +679,64 @@ int ObStorageMetaCache::batch_get_meta_and_bypass_cache(
   return ret;
 }
 
+// these meta must be in the same block
+// meta_handle.cache_handle_ must be created before calling this function
+int ObStorageMetaCache::get_meta_aggregated(
+    const common::ObIArray<AggregatedInfo> &aggr_infos)
+{
+  int ret = OB_SUCCESS;
+  ObAggregatedStorageMetaIOInfo aggr_io_info;
+  if (OB_FAIL(aggr_io_info.init(aggr_infos))) {
+    LOG_WARN("fail to init aggr_io_info", K(ret), K(aggr_infos), K(aggr_io_info));
+  } else if (OB_UNLIKELY(!aggr_io_info.is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid aggr_io_info", K(ret), K(aggr_io_info));
+  } else {
+    ObMetaDiskAddr meta_addr;
+    meta_addr.set_block_addr(aggr_io_info.macro_id_,
+      aggr_io_info.first_meta_offset_,
+      aggr_io_info.total_meta_size_,
+      aggr_io_info.disk_type_);
+
+    // create ObAggregatedStorageMetaIOCallback
+    void *buf = nullptr;
+    common::ObIAllocator &io_allocator = MTL(ObTenantMetaMemMgr *)->get_meta_cache_io_allocator();
+    ObAggregatedStorageMetaIOCallback *callback = nullptr;
+    if (OB_ISNULL(buf = io_allocator.alloc(sizeof(ObAggregatedStorageMetaIOCallback)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate callback memory failed", K(ret));
+    } else {
+      callback = new (buf) ObAggregatedStorageMetaIOCallback(&io_allocator, aggr_io_info, meta_addr);
+
+      ObSharedObjectReadInfo read_info;
+      read_info.addr_ = meta_addr;
+      read_info.io_callback_ = callback;
+      read_info.io_desc_.set_mode(ObIOMode::READ);
+      read_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_DATA_READ);
+      read_info.io_timeout_ms_ = GCONF._data_storage_io_timeout / 1000L;
+      read_info.ls_epoch_ = 0; /* ls_epoch for share storage */
+
+      // send aggregated IO request
+      if (OB_FAIL(ObSharedObjectReaderWriter::async_read(read_info, aggr_infos.at(0).element<1>()->io_handle_))) {
+        LOG_WARN("fail to async read", K(ret), K(read_info));
+      }
+
+      // for async IO, we need to set the io handle to the same as the first meta handle
+      for (int64_t i = 1; OB_SUCC(ret) && i < aggr_infos.count(); ++i) {
+        aggr_infos.at(i).element<1>()->io_handle_ = aggr_infos.at(0).element<1>()->io_handle_;
+      }
+
+      // avoid double_free with io_handle
+      if (OB_FAIL(ret) && OB_NOT_NULL(callback->get_allocator())) {
+        callback->~ObAggregatedStorageMetaIOCallback();
+        io_allocator.free(callback);
+      }
+    }
+  }
+
+  return ret;
+}
+
 int ObStorageMetaCache::prefetch(
     const ObStorageMetaValue::MetaType type,
     const ObStorageMetaKey &key,
@@ -628,7 +760,7 @@ int ObStorageMetaCache::prefetch(
                                                    key,
                                                    meta_handle.cache_handle_,
                                                    tablet,
-                                                   nullptr/*bypass_cache if nullptr*/);
+                                                   nullptr/*bypass_cache if not nullptr*/);
       if (OB_FAIL(read_io(key.get_meta_addr(), *callback, meta_handle))) {
         LOG_WARN("fail to read storage meta from io", K(ret), K(key), K(meta_handle));
       }
@@ -640,6 +772,74 @@ int ObStorageMetaCache::prefetch(
   }
   return ret;
 }
+
+#ifdef OB_BUILD_SHARED_STORAGE
+int ObStorageMetaCache::get_table_store_and_prewarm_sstable_meta(
+    const ObStorageMetaKey &table_store_key,
+    const int32_t end_seq,
+    const ObTablet &tablet,
+    /* out */ObStorageMetaHandle &meta_handle)
+{
+
+  int ret = OB_SUCCESS;
+  const ObStorageMetaValue::MetaType type = ObStorageMetaValue::TABLE_STORE;
+  MacroBlockId start_block_id; // block id of table store
+  int32_t final_end_seq = -1;
+
+  if (OB_UNLIKELY(!table_store_key.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid meta key", K(ret), K(table_store_key));
+  } else if (OB_FAIL(table_store_key.get_meta_addr().get_macro_block_id(start_block_id))) {
+    LOG_WARN("failed to table store's macro block id", K(ret), K(table_store_key));
+  } else if (OB_UNLIKELY(!start_block_id.is_shared_tablet_sub_meta_in_table())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("table store must be SHARED_TABLET_SUB_META_IN_TABLE", K(ret), "table_store_block_id",
+      start_block_id);
+  } else if (OB_UNLIKELY(end_seq < start_block_id.get_macro_seq())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid end seq", K(ret), K(end_seq), K(start_block_id));
+  }
+  // adjust end seq
+  else if (end_seq - start_block_id.get_macro_seq() > MAX_PREWARM_SSTABLE_META_CNT) {
+    final_end_seq = start_block_id.get_macro_seq() + MAX_PREWARM_SSTABLE_META_CNT;
+  } else {
+    final_end_seq = end_seq;
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(meta_handle.cache_handle_.new_value(MTL(ObTenantMetaMemMgr *)->get_meta_cache_io_allocator()))) {
+    LOG_WARN("failed to new cache handle value", K(ret));
+  } else if (OB_FAIL(get(table_store_key,
+                         meta_handle.cache_handle_.get_cache_value()->value_,
+                         meta_handle.cache_handle_.get_cache_value()->cache_handle_))) {
+    if (OB_UNLIKELY(OB_ENTRY_NOT_EXIST != ret)) {
+      LOG_WARN("failed to get storage meta from cache", K(ret), K(type), K(table_store_key));
+    } else if (OB_UNLIKELY(final_end_seq < start_block_id.get_macro_seq()
+                         || final_end_seq - start_block_id.get_macro_seq() > MAX_PREWARM_SSTABLE_META_CNT)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid final end seq", K(ret), K(final_end_seq));
+    } else if (OB_UNLIKELY(final_end_seq == start_block_id.get_macro_seq())) {
+      // there is no sstable in table store, fetch table store directly
+      if (OB_FAIL(prefetch(type, table_store_key, meta_handle, &tablet))) {
+        LOG_WARN("failed to prefetch table store", K(ret), K(table_store_key));
+      } else {
+        EVENT_INC(ObStatEventIds::STORAGE_META_CACHE_MISS);
+      }
+    } else if (OB_FAIL(inner_prefetch_table_store_and_sstable_meta(table_store_key,
+                                                                   final_end_seq,
+                                                                   tablet,
+                                                                   meta_handle))) {
+      LOG_WARN("failed to prefetch table store and sstable meta", K(ret), K(table_store_key), K(final_end_seq));
+    } else {
+      EVENT_INC(ObStatEventIds::STORAGE_META_CACHE_MISS);
+    }
+  } else {
+    meta_handle.phy_addr_ = table_store_key.get_meta_addr();
+    EVENT_INC(ObStatEventIds::STORAGE_META_CACHE_HIT);
+  }
+  return ret;
+}
+#endif
 
 int ObStorageMetaCache::get_meta_and_bypass_cache(
     const ObStorageMetaValue::MetaType type,
@@ -666,7 +866,7 @@ int ObStorageMetaCache::get_meta_and_bypass_cache(
                                                    key,
                                                    handle.cache_handle_,
                                                    nullptr/*tablet*/,
-                                                   &allocator/*bypass_cache if nullptr*/);
+                                                   &allocator/*bypass_cache if not nullptr*/);
       if (OB_FAIL(read_io(key.get_meta_addr(), *callback, handle))) {
         LOG_WARN("fail to read storage meta from io", K(ret), K(key), K(handle));
       }
@@ -706,6 +906,281 @@ int ObStorageMetaCache::read_io(
   }
   return ret;
 }
+
+#ifdef OB_BUILD_SHARED_STORAGE
+static int process_sstable_array(
+    const ObSSTableArray &sst_array,
+    /* out */hash::ObHashSet<MacroBlockId> &normal_sst_ids,
+    /* out */hash::ObHashSet<MacroBlockId> &co_sst_ids)
+{
+  int ret = OB_SUCCESS;
+
+  if (!sst_array.empty()) {
+    ObSSTable *sstable = nullptr;
+    MacroBlockId block_id;
+    for (int i = 0; OB_SUCC(ret) && i < sst_array.count(); ++i) {
+      block_id.reset();
+      if (OB_ISNULL(sstable = sst_array.at(i))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null sstable", K(ret), KP(sstable));
+      } else if (!sstable->get_addr().is_disked()) {
+        LOG_DEBUG("sstable is not disked, skip it", K(ret), KPC(sstable));
+      } else if (OB_FAIL(sstable->get_addr().get_macro_block_id(block_id))) {
+        LOG_WARN("failed to get sstable macro block id", K(ret), KPC(sstable));
+      } else if (!block_id.is_shared_tablet_sub_meta_in_table()) {
+        LOG_DEBUG("sstable is not in tiered metadata store, skip it", K(ret), K(block_id));
+      } else if (!sstable->is_co_sstable() && OB_FAIL(normal_sst_ids.set_refactored(block_id, /* overwrite */0))) {
+        LOG_WARN("failed to add block id to normal_sst_ids", K(ret), K(block_id));
+      } else if (sstable->is_co_sstable() && OB_FAIL(co_sst_ids.set_refactored(block_id, /* overwrite */0))) {
+        LOG_WARN("failed to add block id to co_sst_ids", K(ret), K(block_id));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObStorageMetaCache::classify_sst_block_ids_by_table_store(
+    const ObTabletTableStore &table_store,
+    /* out */hash::ObHashSet<MacroBlockId> &normal_sst_ids,
+    /* out */hash::ObHashSet<MacroBlockId> &co_sst_ids)
+{
+  int ret = OB_SUCCESS;
+  const ObMemAttr mem_attr(MTL_ID(), "ClassTblStore");
+  const int64_t bkt_cnt = 16;
+  // ObTableStoreIterator::add_tables will read sstable meta, which might
+  // cause extra IO.
+  if (OB_UNLIKELY(!table_store.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid table store", K(ret), K(table_store));
+  } else if (OB_FAIL(normal_sst_ids.create(bkt_cnt, mem_attr))) {
+    LOG_WARN("failed to create hash set", K(ret), K(bkt_cnt));
+  } else if (OB_FAIL(co_sst_ids.create(bkt_cnt, mem_attr))) {
+    LOG_WARN("failed to create hash set", K(ret), K(bkt_cnt));
+  } else if (OB_FAIL(process_sstable_array(table_store.get_major_sstables(),
+                                           /* out */normal_sst_ids,
+                                           /* out */co_sst_ids))) {
+    LOG_WARN("failed to process major sstables", K(ret));
+  } else if (OB_FAIL(process_sstable_array(table_store.get_inc_major_sstables(),
+                                           /* out */normal_sst_ids,
+                                           /* out */co_sst_ids))) {
+    LOG_WARN("failed to process inc major sstables", K(ret));
+  } else if (OB_FAIL(process_sstable_array(table_store.get_minor_sstables(),
+                                           /* out */normal_sst_ids,
+                                           /* out */co_sst_ids))) {
+    LOG_WARN("failed to process minor sstables", K(ret));
+  } else if (OB_FAIL(process_sstable_array(table_store.get_ddl_sstables(),
+                                           /* out */normal_sst_ids,
+                                           /* out */co_sst_ids))) {
+    LOG_WARN("failed to process ddl sstables", K(ret));
+  } else if (OB_FAIL(process_sstable_array(table_store.get_inc_major_ddl_sstables(),
+                                           /* out */normal_sst_ids,
+                                           /* out */co_sst_ids))) {
+    LOG_WARN("failed to process inc major ddl sstables", K(ret));
+  } else if (OB_FAIL(process_sstable_array(table_store.get_mds_sstables(),
+                                           /* out */normal_sst_ids,
+                                           /* out */co_sst_ids))) {
+    LOG_WARN("failed to process mds sstables", K(ret));
+  } else if (OB_FAIL(process_sstable_array(table_store.get_meta_major_sstables(),
+                                           /* out */normal_sst_ids,
+                                           /* out */co_sst_ids))) {
+    LOG_WARN("failed to process meta major sstables", K(ret));
+  }
+  return ret;
+}
+
+int ObStorageMetaCache::process_one_sstable_meta(
+    const MacroBlockId &sst_block_id,
+    const ObString &meta_raw_buf,
+    const hash::ObHashSet<MacroBlockId> &normal_sst_ids,
+    const hash::ObHashSet<MacroBlockId> &co_sst_ids,
+    /* out */int64_t &prewarm_sst_cnt,
+    /* out */ObStorageMetaValueHandle &handle)
+{
+  int ret = OB_SUCCESS;
+  ObMetaDiskAddr sst_phy_addr;
+
+  if (OB_UNLIKELY(!sst_block_id.is_valid()
+                  || !sst_block_id.is_shared_tablet_sub_meta_in_table())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid sstable block id", K(ret), K(sst_block_id));
+  } else if (OB_UNLIKELY(!handle.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid handle", K(ret), K(handle));
+  } else if (OB_FAIL(sst_phy_addr.set_block_addr(sst_block_id,
+                                                 /* offset */0,
+                                                 meta_raw_buf.length(),
+                                                 ObMetaDiskAddr::DiskType::RAW_BLOCK))) {
+    LOG_WARN("failed to set sst_phy_addr", K(ret), K(sst_block_id));
+  } else {
+    const ObStorageMetaKey key(MTL_ID(), sst_phy_addr);
+    ObStorageMetaValue::MetaType type = ObStorageMetaValue::MAX;
+    // check if is a normal sstable
+    if (OB_FAIL(normal_sst_ids.exist_refactored(sst_block_id))) {
+      if (OB_HASH_EXIST == ret) {
+        ret = OB_SUCCESS;
+        type = ObStorageMetaValue::SSTABLE;
+      } else if (OB_HASH_NOT_EXIST == ret) {
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to do exist_refactored", K(ret), K(sst_block_id));
+      }
+    }
+    // check if is a co sstable
+    if (OB_FAIL(ret)) {
+    } else if (type != ObStorageMetaValue::MAX) {
+      // is normal sstable
+    } else if (OB_FAIL(co_sst_ids.exist_refactored(sst_block_id))) {
+      if (OB_HASH_EXIST == ret) {
+        ret = OB_SUCCESS;
+        type = ObStorageMetaValue::CO_SSTABLE;
+      } else if (OB_HASH_NOT_EXIST == ret) {
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to do exist_refactored", K(ret), K(sst_block_id));
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+    } else if (ObStorageMetaValue::MAX == type) {
+      // might be a cg sstable, skip it
+    } else if (OB_FAIL(get(key, handle.get_cache_value()->value_, handle.get_cache_value()->cache_handle_))) {
+      if (OB_UNLIKELY(OB_ENTRY_NOT_EXIST != ret)) {
+        LOG_WARN("failed to get sstable meta from cache", K(ret), K(type), K(key));
+      }
+      // meta not exist, process and put
+      else if (OB_FAIL(ObStorageMetaValue::processor[type](handle,
+                                                           key,
+                                                           meta_raw_buf.ptr(),
+                                                           meta_raw_buf.length(),
+                                                           /* tablet */ nullptr))) {
+        LOG_WARN("failed to process sstable meta", K(ret), K(key), K(meta_raw_buf));
+      } else {
+        ++prewarm_sst_cnt;
+        EVENT_INC(ObStatEventIds::STORAGE_META_CACHE_MISS);
+      }
+    } else {
+      EVENT_INC(ObStatEventIds::STORAGE_META_CACHE_HIT);
+    }
+  }
+  return ret;
+}
+
+int ObStorageMetaCache::inner_prefetch_table_store_and_sstable_meta(
+    const ObStorageMetaKey &table_store_key,
+    const int32_t final_end_seq,
+    const ObTablet &tablet,
+    /* out */ObStorageMetaHandle &meta_handle)
+{
+  TIMEGUARD_INIT(STORAGE, 10_ms);
+  int ret = OB_SUCCESS;
+  const ObStorageMetaValue::MetaType type = ObStorageMetaValue::TABLE_STORE;
+  MacroBlockId table_store_block_id;
+  int64_t prewarm_sst_cnt = 0;
+
+  if (OB_UNLIKELY(!table_store_key.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid table store key", K(ret), K(table_store_key));
+  } else if (OB_UNLIKELY(!meta_handle.cache_handle_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid meta cache handle", K(ret), K(meta_handle));
+  } else if (OB_FAIL(table_store_key.get_meta_addr().get_macro_block_id(table_store_block_id))) {
+    LOG_WARN("failed to get macro block id", K(ret), K(table_store_key));
+  } else {
+    hash::ObHashSet<MacroBlockId> normal_sst_ids;
+    hash::ObHashSet<MacroBlockId> co_sst_ids;
+    MacroBlockId end_block_id = table_store_block_id;
+    end_block_id.set_third_id((table_store_block_id.get_op_id() << 32) + final_end_seq);
+    ObTieredMetadataStore *tiered_metadata_store = MTL(ObTieredMetadataStore *);
+    ObTieredMetadataIterator iterator;
+    ObStorageMetaValueHandle dummy_handle; // dummy handle for process sstable meta
+
+    // range read[start_seq, final_end_seq]
+    if (OB_ISNULL(tiered_metadata_store)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null tiered metadata store", K(ret), KP(tiered_metadata_store));
+    } else if (CLICK_FAIL(tiered_metadata_store->get_tiered_metadata_iter(table_store_block_id,
+                                                                       end_block_id,
+                                                                       /* out */iterator))) {
+      LOG_WARN("failed to get tiered metadata iter", K(ret), "start_block_id", table_store_block_id,
+        K(end_block_id));
+    }
+
+    // process table store
+    MacroBlockId meta_block_id;
+    ObString meta_raw_buf;
+    const ObStorageMetaValue *tmp_val_ptr = nullptr;
+    const ObTabletTableStore *table_store_ptr = nullptr;
+    if (CLICK_FAIL(ret)) {
+    } else if (OB_FAIL(iterator.get_next(meta_block_id, meta_raw_buf))) {
+      LOG_WARN("failed to get next", K(ret));
+    } else if (OB_UNLIKELY(meta_block_id != table_store_block_id)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("tablet table store must be present in the first iteration", K(ret), K(meta_block_id),
+        K(table_store_block_id));
+    } else if (CLICK_FAIL(ObStorageMetaValue::process_table_store(meta_handle.cache_handle_,
+                                                                  table_store_key,
+                                                                  meta_raw_buf.ptr(),
+                                                                  meta_raw_buf.length(),
+                                                                  &tablet))) {
+      LOG_WARN("failed to process table store", K(ret), K(table_store_key), K(meta_raw_buf));
+    } else if (OB_FAIL(meta_handle.get_value(tmp_val_ptr))) {
+      LOG_WARN("failed to get value from meta handle", K(ret), K(meta_handle));
+    } else if (OB_ISNULL(tmp_val_ptr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null secondary meta value", K(ret), K(meta_handle));
+    } else if (OB_FAIL(tmp_val_ptr->get_table_store(table_store_ptr))) {
+      LOG_WARN("failed to get table store", K(ret));
+    } else if (OB_ISNULL(table_store_ptr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null table store ptr", K(ret), K(meta_handle));
+    }
+    // build sstable block ids set
+    else if (CLICK_FAIL(classify_sst_block_ids_by_table_store(*table_store_ptr,
+                                                          /* out */normal_sst_ids,
+                                                          /* out */co_sst_ids))) {
+      LOG_WARN("failed to class sstable block ids", K(ret));
+    } else if (CLICK_FAIL(dummy_handle.new_value(MTL(ObTenantMetaMemMgr *)->get_meta_cache_io_allocator()))) {
+      LOG_WARN("failed to new value", K(ret));
+    }
+
+    // process sstables(exclude cg sstable)
+    int64_t iter_cnt = 0;
+    while (OB_SUCC(ret) && iter_cnt < MAX_PREWARM_SSTABLE_META_CNT) {
+      meta_block_id.reset();
+      meta_raw_buf.reset();
+
+      if (OB_FAIL(iterator.get_next(meta_block_id, meta_raw_buf))) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          LOG_WARN("failed to get next", K(ret));
+        } else {
+          ret = OB_SUCCESS;
+          break;
+        }
+      } else if (OB_FAIL(process_one_sstable_meta(meta_block_id,
+                                                  meta_raw_buf,
+                                                  normal_sst_ids,
+                                                  co_sst_ids,
+                                                  /* out */prewarm_sst_cnt,
+                                                  /* out */dummy_handle))) {
+        LOG_WARN("failed to process sstable meta", K(ret), K(meta_block_id), K(meta_raw_buf));
+      } else {
+        ++iter_cnt;
+      }
+    }
+
+    CLICK();
+    dummy_handle.reset();
+    iterator.reset();
+  }
+
+  if (OB_SUCC(ret)) {
+    meta_handle.phy_addr_ = table_store_key.get_meta_addr();
+    LOG_INFO("prefetch table store and prewarm sstable meta completed", K(ret), K(table_store_key),
+      K(final_end_seq), K(prewarm_sst_cnt));
+  }
+  return ret;
+}
+#endif
 
 ObStorageMetaCache::ObStorageMetaCache()
 {

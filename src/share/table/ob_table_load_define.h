@@ -21,12 +21,11 @@
 #include "share/rc/ob_tenant_base.h"
 #include "sql/resolver/cmd/ob_load_data_stmt.h"
 
+
 namespace oceanbase
 {
 namespace table
 {
-
-static constexpr uint64_t OB_STORAGE_ID_DDL = 2000;
 
 struct ObTableLoadConfig final
 {

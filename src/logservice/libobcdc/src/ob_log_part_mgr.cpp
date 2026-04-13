@@ -27,6 +27,10 @@
 #include "ob_log_tenant.h"                            // ObLogTenant
 #include "ob_log_tic_update_info.h"                   // TICUpdateInfo
 
+#include "logservice/data_dictionary/ob_data_dict_service.h" // ObDataDictService
+#include "storage/tablet/ob_tablet_to_global_temporary_table_operator.h" // ObTabletToGlobalTmpTableOperator
+#include "storage/tablet/ob_session_tablet_info_map.h"
+
 #define _STAT(level, fmt, args...) _OBLOG_LOG(level, "[STAT] [PartMgr] " fmt, ##args)
 #define STAT(level, fmt, args...) OBLOG_LOG(level, "[STAT] [PartMgr] " fmt, ##args)
 #define _ISTAT(fmt, args...) _STAT(INFO, fmt, ##args)
@@ -153,10 +157,25 @@ int ObLogPartMgr::add_all_user_tablets_and_tables_info(const int64_t timeout)
     for (int i = 0; OB_SUCC(ret) && i < table_schemas.count(); i++) {
       const ObSimpleTableSchemaV2 *table_schema = table_schemas.at(i);
       ObArray<common::ObTabletID> tablet_ids;
+      bool is_oracle_tmp_table_v2 = false;
       if (OB_ISNULL(table_schema)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_ERROR("get invalid table_schema", KR(ret), K_(tenant_id), K_(cur_schema_version));
-      } else if (table_schema->has_tablet()) {
+      } else if (table_schema->is_index_table() || table_schema->is_aux_lob_table()) {
+        const ObSimpleTableSchemaV2 *data_table_schema = nullptr;
+        if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, table_schema->get_data_table_id(), data_table_schema, timeout))) {
+          LOG_ERROR("get_table_schema failed", KR(ret), K_(tenant_id), K_(cur_schema_version));
+        } else if (OB_ISNULL(data_table_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_ERROR("get invalid data_table_schema", KR(ret), K_(tenant_id), K_(cur_schema_version));
+        } else {
+          is_oracle_tmp_table_v2 = data_table_schema->is_oracle_tmp_table_v2();
+        }
+      } else {
+        is_oracle_tmp_table_v2 = table_schema->is_oracle_tmp_table_v2();
+      }
+      if (OB_FAIL(ret)) {
+      } else if (table_schema->has_tablet() && !is_oracle_tmp_table_v2) {
         if (OB_FAIL(table_schema->get_tablet_ids(tablet_ids))) {
           LOG_ERROR("get_tablet_ids failed", KR(ret), K_(tenant_id), K_(cur_schema_version));
         } else {
@@ -164,6 +183,23 @@ int ObLogPartMgr::add_all_user_tablets_and_tables_info(const int64_t timeout)
             LOG_ERROR("insert_tablet_table_info_ failed", KR(ret), K_(tenant_id),
                 KPC(table_schema));
           }
+        }
+      } else if (is_oracle_tmp_table_v2) {
+        common::ObMySQLProxy &sql_proxy = TCTX.get_sql_proxy();
+        const uint64_t table_id = table_schema->get_table_id();
+        ObArray<common::ObTabletID> tablet_ids;
+        if (OB_FAIL(share::ObTabletToGlobalTmpTableOperator::get_tablet_ids_by_table_id_with_schema_version(sql_proxy,
+                                                                             cur_schema_version_,
+                                                                             tenant_id_,
+                                                                             table_id,
+                                                                             tablet_ids))) {
+          if (OB_ENTRY_NOT_EXIST != ret) {
+            LOG_WARN("get_by_table_id failed", KR(ret), K(tenant_id_), K(table_id), K(cur_schema_version_));
+          } else {
+            ret = OB_SUCCESS;
+          }
+        } else if (OB_FAIL(insert_tablet_table_info_(*table_schema, tablet_ids))) {
+          LOG_ERROR("insert_tablet_table_info_ failed", KR(ret), K_(tenant_id), KPC(table_schema), K(tablet_ids));
         }
       }
 
@@ -923,6 +959,40 @@ int ObLogPartMgr::rename_table(const uint64_t table_id,
     }
   } else {
     TICUpdateInfo tic_update_info(TICUpdateInfo::TICUpdateReason::RENAME_TABLE_ADD,
+        database_id, table_id);
+    PartTransTask &part_trans_task = ddl_stmt.get_host();
+    if (OB_FAIL(part_trans_task.push_tic_update_info(tic_update_info))) {
+      LOG_ERROR("push tic update info failed", KR(ret), K(new_schema_version), K(tic_update_info),
+          K(tenant_name), K(database_name), K(table_name));
+    } else {
+      ISTAT("set tic update info success", K(new_schema_version), K(tic_update_info),
+          K(tenant_name), K(database_name), K(table_name));
+    }
+  }
+  return ret;
+}
+
+int ObLogPartMgr::recover_table_end(const uint64_t table_id,
+    DdlStmtTask &ddl_stmt,
+    const int64_t new_schema_version,
+    const int64_t timeout)
+{
+  int ret = OB_SUCCESS;
+  const char *tenant_name = nullptr;
+  const char *database_name = nullptr;
+  const char *table_name = nullptr;
+  bool is_user_table = false;
+  bool chosen = false;
+  uint64_t database_id = OB_INVALID_ID;
+  if (OB_FAIL(table_match_(table_id, new_schema_version, tenant_name, database_name,
+      table_name, is_user_table, chosen, database_id, timeout))) {
+    LOG_ERROR("table_match_ failed", KR(ret), K(new_schema_version), K(table_id));
+  } else if (!is_user_table) {
+  } else if (!chosen) {
+    ISTAT("table is not chosen", K(new_schema_version), K(table_id), K(tenant_name),
+        K(database_name), K(table_name));
+  } else {
+    TICUpdateInfo tic_update_info(TICUpdateInfo::TICUpdateReason::RECOVER_TABLE_END,
         database_id, table_id);
     PartTransTask &part_trans_task = ddl_stmt.get_host();
     if (OB_FAIL(part_trans_task.push_tic_update_info(tic_update_info))) {

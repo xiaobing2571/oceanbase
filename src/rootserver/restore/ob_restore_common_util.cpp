@@ -14,6 +14,7 @@
 
 #include "ob_restore_common_util.h"
 #include "rootserver/ob_ls_service_helper.h"
+#include "rootserver/ob_tenant_info_loader.h"
 #include "rootserver/standby/ob_tenant_role_transition_service.h"
 #include "src/share/ob_schema_status_proxy.h"
 #include "rootserver/ob_ddl_service.h"
@@ -21,6 +22,7 @@
 #ifdef OB_BUILD_TDE_SECURITY
 #include "share/ob_master_key_getter.h"
 #endif
+#include "share/backup/ob_backup_path.h"
 
 using namespace oceanbase::share::schema;
 using namespace oceanbase::rootserver;
@@ -85,6 +87,7 @@ int ObRestoreCommonUtil::create_all_ls(
   int ret = OB_SUCCESS;
   ObLSStatusOperator status_op;
   ObLSStatusInfo status_info;
+  ObAllTenantInfo tenant_info;
   if (OB_UNLIKELY(!is_user_tenant(tenant_id)
                   || !tenant_schema.is_valid()
                   || ls_attr_array.empty()
@@ -92,6 +95,11 @@ int ObRestoreCommonUtil::create_all_ls(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(tenant_schema),
                                               K(ls_attr_array), KP(sql_proxy));
+  } else if (OB_FAIL(ObAllTenantInfoProxy::load_tenant_info(tenant_id, sql_proxy, false, tenant_info))) {
+    LOG_WARN("failed to load tenant info", KR(ret), K(tenant_id));
+  } else if (OB_UNLIKELY(!tenant_info.is_normal_status())) {
+    ret = OB_NEED_RETRY;
+    LOG_WARN("the tenant's switchover status should be NORMAL", KR(ret), K(tenant_info));
   } else {
     common::ObMySQLTransaction trans;
     const int64_t exec_tenant_id = ObLSLifeIAgent::get_exec_tenant_id(tenant_id);
@@ -115,8 +123,8 @@ int ObRestoreCommonUtil::create_all_ls(
           LOG_WARN("failed to get ls status info", KR(ret), K(tenant_id), K(ls_info));
         } else if (OB_FAIL(ObLSServiceHelper::create_new_ls_in_trans(
                    ls_info.get_ls_id(), ls_info.get_ls_group_id(), ls_info.get_create_scn(),
-                   share::NORMAL_SWITCHOVER_STATUS, tenant_stat, trans, ls_flag, source_tenant_id))) {
-          LOG_WARN("failed to add new ls status info", KR(ret), K(ls_info), K(source_tenant_id));
+                   tenant_info.get_switchover_epoch(), tenant_stat, trans, ls_flag, source_tenant_id))) {
+          LOG_WARN("failed to add new ls status info", KR(ret), K(ls_info), K(source_tenant_id), K(tenant_info));
         }
         LOG_INFO("create init ls", KR(ret), K(ls_info), K(source_tenant_id));
       }
@@ -355,8 +363,7 @@ int ObRestoreCommonUtil::set_tde_parameters(common::ObMySQLProxy *sql_proxy,
     // do nothing
   } else if (FALSE_IT(sql.reset())) {
   } else if (OB_UNLIKELY(kms_info.empty())) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("kms_info should not be empty", KR(ret));
+    // allow to be empty. since source tenant may not set kms_info
   } else if (OB_FAIL(sql.assign_fmt("ALTER SYSTEM SET external_kms_info= '%.*s'",
                                                     kms_info.length(), kms_info.ptr()))) {
     LOG_WARN("failed to assign fmt", KR(ret));
@@ -367,12 +374,37 @@ int ObRestoreCommonUtil::set_tde_parameters(common::ObMySQLProxy *sql_proxy,
   return ret;
 }
 
-int ObRestoreCommonUtil::rebuild_master_key_version(obrpc::ObCommonRpcProxy *rpc_proxy, const uint64_t tenant_id)
+int ObRestoreCommonUtil::rebuild_master_key_version(obrpc::ObCommonRpcProxy *rpc_proxy,
+    const uint64_t tenant_id, bool need_wait)
 {
   int ret = OB_SUCCESS;
 #ifdef OB_BUILD_TDE_SECURITY
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
   if (OB_UNLIKELY(!is_user_tenant(tenant_id)
                   || NULL == rpc_proxy)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id), KP(rpc_proxy));
+  } else if (!tenant_config.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid tenant config", K(ret), K(tenant_id));
+  } else if (!ObTdeMethodUtil::is_valid(ObString(tenant_config->tde_method.get_value()))) {
+    //do nothing
+  } else if (OB_FAIL(activate_master_key_version(rpc_proxy, tenant_id, need_wait))) {
+    LOG_WARN("fail to activate master key version", K(ret), KP(rpc_proxy), K(tenant_id), K(need_wait));
+  }
+#endif
+  return ret;
+}
+
+
+int ObRestoreCommonUtil::activate_master_key_version(
+    obrpc::ObCommonRpcProxy *rpc_proxy,
+    const uint64_t tenant_id,
+    bool need_wait)
+{
+  int ret = OB_SUCCESS;
+#ifdef OB_BUILD_TDE_SECURITY
+  if (OB_UNLIKELY(!is_user_tenant(tenant_id) || NULL == rpc_proxy)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(tenant_id), KP(rpc_proxy));
   } else {
@@ -380,9 +412,11 @@ int ObRestoreCommonUtil::rebuild_master_key_version(obrpc::ObCommonRpcProxy *rpc
     obrpc::ObReloadMasterKeyArg arg;
     obrpc::ObReloadMasterKeyResult result;
     arg.tenant_id_ = tenant_id;
+    // standby switchover or failover to primary only do reload master key, no need
+    // wait master key active
     if (OB_FAIL(rpc_proxy->timeout(DEFAULT_TIMEOUT).reload_master_key(arg, result))) {
       LOG_WARN("fail to reload master key", KR(ret), K(arg), K(DEFAULT_TIMEOUT));
-    } else if (result.master_key_id_ > 0 ) {
+    } else if (result.master_key_id_ > 0  && need_wait) {
       bool is_active = false;
       const int64_t SLEEP_US = 5 * 1000 * 1000L; // 5s
       const int64_t MAX_WAIT_US = 60 * 1000 * 1000L; // 60s
@@ -394,19 +428,61 @@ int ObRestoreCommonUtil::rebuild_master_key_version(obrpc::ObCommonRpcProxy *rpc
         if (ObTimeUtility::current_time() - start > MAX_WAIT_US) {
           ret = OB_TIMEOUT;
           LOG_WARN("use too much time", KR(ret), "cost_us", ObTimeUtility::current_time() - start);
-        } else if (OB_FAIL(ObMasterKeyGetter::get_active_master_key(tenant_id, master_key,
-                                                                OB_MAX_MASTER_KEY_LENGTH,
-                                                                master_key_len, master_key_id))) {
+        } else if (OB_FAIL(ObMasterKeyGetter::get_active_master_key(tenant_id,
+                                                                    master_key,
+                                                                    OB_MAX_MASTER_KEY_LENGTH,
+                                                                    master_key_len,
+                                                                    master_key_id))) {
           if (OB_KEYSTORE_OPEN_NO_MASTER_KEY == ret) {
             ret = OB_SUCCESS;
             LOG_INFO("master key is not active, need wait", K(tenant_id));
-            usleep(SLEEP_US);
+            ob_usleep(SLEEP_US);
           } else {
             LOG_WARN("fail to get active master key", KR(ret), K(tenant_id));
           }
         } else {
           is_active = true;
         }
+      }
+    }
+  }
+#endif
+  return ret;
+}
+
+int ObRestoreCommonUtil::restore_root_key(
+  const share::ObPhysicalRestoreJob &job_info,
+  common::ObIAllocator &alloc,
+  ObRootKey &root_key)
+{
+  int ret = OB_SUCCESS;
+#ifdef OB_BUILD_TDE_SECURITY
+  if (!job_info.is_valid()) {
+  ret = OB_INVALID_ARGUMENT;
+  LOG_WARN("invalid job info ", KR(ret), K(job_info));
+  } else {
+    int64_t idx = job_info.get_multi_restore_path_list().get_backup_set_path_list().count() - 1;
+    if (idx < 0) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid job info", K(ret), K(idx), K(job_info));
+    } else {
+      ObBackupDest backup_set_dest;
+      share::ObBackupPath root_key_path;
+      ObString encrypt_key("");
+      const share::ObBackupSetPath &backup_set_path = job_info.get_multi_restore_path_list().get_backup_set_path_list().at(idx);
+      if (OB_FAIL(backup_set_dest.set(backup_set_path))) {
+        LOG_WARN("fail to set backup set dest", K(ret));
+      } else if (OB_FAIL(ObBackupPathUtil::get_backup_root_key_path(backup_set_dest, root_key_path))) {
+        LOG_WARN("fail to get backup root key path", K(ret), K(backup_set_dest));
+      } else if (OB_FAIL(ObMasterKeyUtil::read_root_key_from_backup(root_key_path.get_obstr(),
+                                                                    backup_set_dest.get_storage_info(),
+                                                                    encrypt_key,
+                                                                    alloc,
+                                                                    root_key))) {
+        LOG_WARN("fail to restore root key", K(ret), K(root_key_path), K(backup_set_dest));
+      } else if (OB_UNLIKELY(obrpc::RootKeyType::INVALID == root_key.key_type_) || root_key.key_.empty()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid root key", K(ret), K(root_key));
       }
     }
   }

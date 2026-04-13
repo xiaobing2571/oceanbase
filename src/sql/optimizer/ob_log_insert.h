@@ -15,13 +15,15 @@
 #include "ob_logical_operator.h"
 #include "ob_log_del_upd.h"
 #include "sql/resolver/dml/ob_insert_stmt.h"
-#include "sql/optimizer/ob_log_plan.h"
+#include "sql/optimizer/ob_del_upd_log_plan.h"
 
 namespace oceanbase
 {
 namespace sql
 {
 class ObSelectLogPlan;
+template<typename R, typename C>
+class PlanVisitor;
 
 class ObLogInsert : public ObLogDelUpd
 {
@@ -30,10 +32,13 @@ public:
       : ObLogDelUpd(plan),
         is_replace_(false),
         is_overwrite_(false),
+        index_replace_infos_(plan.get_allocator()),
+        index_upd_infos_(plan.get_allocator()),
         insert_up_(false),
         is_insert_select_(false),
         append_table_id_(0),
-        constraint_infos_(NULL)
+        constraint_infos_(NULL),
+        in_filter_expr_(nullptr)
   {
   }
 
@@ -68,6 +73,7 @@ public:
   {
     return insert_up_;
   }
+  ObRawExpr *get_in_filter_expr() const { return in_filter_expr_; }
   void set_is_insert_select(bool v) { is_insert_select_ = v; }
   bool is_insert_select() const { return is_insert_select_; }
   virtual bool is_single_value() const override
@@ -115,11 +121,11 @@ public:
     append_table_id_ = append_table_id;
   }
   inline uint64_t get_append_table_id() const { return append_table_id_; }
-  void set_constraint_infos(const common::ObIArray<ObUniqueConstraintInfo> *constraint_infos)
+  void set_constraint_infos(const common::ObIArray<ObUniqueConstraintInfo*> *constraint_infos)
   {
     constraint_infos_ = constraint_infos;
   }
-  const common::ObIArray<ObUniqueConstraintInfo> *get_constraint_infos() const
+  const common::ObIArray<ObUniqueConstraintInfo*> *get_constraint_infos() const
   {
     return constraint_infos_;
   }
@@ -134,17 +140,19 @@ protected:
   virtual int generate_rowid_expr_for_trigger() override;
   virtual int generate_part_id_expr_for_foreign_key(ObIArray<ObRawExpr*> &all_exprs) override;
   virtual int generate_multi_part_partition_id_expr() override;
+  int generate_in_filter_for_insertup_opt();
 protected:
   bool is_replace_;
   bool is_overwrite_;
-  common::ObArray<IndexDMLInfo *, common::ModulePageAllocator, true> index_replace_infos_;
+  ObSqlArray<IndexDMLInfo *> index_replace_infos_;
   // for insert_up update caluse
-  common::ObArray<IndexDMLInfo *, common::ModulePageAllocator, true> index_upd_infos_;
+  ObSqlArray<IndexDMLInfo *> index_upd_infos_;
   bool insert_up_; // insert on duplicate update statement
   //for SPM Pruning
   bool is_insert_select_;
   uint64_t append_table_id_;
-  const common::ObIArray<ObUniqueConstraintInfo> *constraint_infos_;
+  const common::ObIArray<ObUniqueConstraintInfo*> *constraint_infos_;
+  ObRawExpr *in_filter_expr_;
 };
 
 }

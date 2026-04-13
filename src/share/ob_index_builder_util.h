@@ -78,11 +78,16 @@ public:
       const ObString &src_column_name,
       const uint64_t src_column_id,
       ObColumnSchemaV2 &shadow_column_schema);
+  static int check_index_for_if_not_exist(const uint64_t tenant_id,
+                                          const uint64_t index_id,
+                                          int64_t &task_id);
+
 private:
   static const int SPATIAL_MBR_COLUMN_MAX_LENGTH = 32;
   static int generate_prefix_column(
       const obrpc::ObColumnSortItem &sort_item,
       const ObSQLMode sql_mode,
+      sql::ObSQLSessionInfo &session,
       share::schema::ObTableSchema &data_schema,
       share::schema::ObColumnSchemaV2 *&prefix_col);
   static int adjust_ordinary_index_column_args(
@@ -116,6 +121,9 @@ private:
     share::schema::ObColumnSchemaV2 &col_schema,
     share::schema::ObTableSchema &data_schema,
     share::schema::ObColumnSchemaV2 *&mbr_col);
+  static int add_skip_index_for_hidden_pk(const share::schema::ObColumnSchemaV2 &original_column,
+                                          share::schema::ObColumnSchemaV2 &modified_column,
+                                          const share::schema::ObColumnSchemaV2* &output_column);
 };
 }//end namespace rootserver
 }//end namespace oceanbase

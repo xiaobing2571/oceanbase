@@ -30,6 +30,7 @@ namespace sql
 
 struct ObHashTableSharedTableInfo
 {
+  ObHashTableSharedTableInfo() : lock_(common::ObLatchIds::OB_HASH_TABLE_SHARED_TABLE_INFO_LOCK), cond_(common::ObWaitEventIds::OB_HASH_TABLE_SHARED_TABLE_INFO_COND) {}
   int64_t sqc_thread_count_;
 
   ObSpinLock lock_;
@@ -924,9 +925,8 @@ private:
   // **** for vectorized *****
   int fill_partition_batch(int64_t &num_left_rows);
   int fill_partition_batch_opt(int64_t &num_left_rows);
-  int get_next_left_row_batch(bool is_from_row_store,
-                              const ObBatchRows *&child_brs);
-  int get_next_left_row_batch_na(bool is_from_row_store, const ObBatchRows *&child_brs);
+  int get_next_left_row_batch(bool is_from_row_store);
+  int get_next_left_row_batch_na(bool is_from_row_store);
   int get_next_right_batch();
   int get_next_right_batch_na();
   int calc_hash_value_batch(const ObIArray<ObExpr*> &join_keys,
@@ -1092,6 +1092,9 @@ private:
                                     const int64_t batch_size,
                                     bool &has_null,
                                     const ObBatchRows *child_brs);
+  int prepare_part_rows_array(uint64_t row_num);
+  void free_part_rows_array();
+
 private:
   typedef int (ObHashJoinOp::*ReadFunc)();
   typedef int (ObHashJoinOp::*state_function_func_type)();
@@ -1099,8 +1102,7 @@ private:
   typedef int (ObHashJoinOp::*Get_next_right_row)();
   typedef int (ObHashJoinOp::*Get_next_left_row)();
   typedef int (ObHashJoinOp::*Get_next_right_batch)();
-  typedef int (ObHashJoinOp::*Get_next_left_batch)(bool is_from_row_store,
-                                                   const ObBatchRows *&child_brs);
+  typedef int (ObHashJoinOp::*Get_next_left_batch)(bool is_from_row_store);
   static const int64_t RATIO_OF_BUCKETS = 2;
   // min row count for estimated row count
   static const int64_t MIN_ROW_COUNT = 10000;
@@ -1176,7 +1178,6 @@ private:
   bool tuple_need_join_;  // for left_semi, left_anti_semi
   bool first_get_row_;
   HashJoinDrainMode drain_mode_;
-  int64_t cur_bkid_; // for left,anti
   int64_t remain_data_memory_size_;
   int64_t nth_nest_loop_;
   int64_t cur_nth_row_;
@@ -1275,6 +1276,13 @@ private:
   bool skip_left_null_;
   bool skip_right_null_;
   ObChunkDatumStore::IterationAge iter_age_;
+  // used for need left output join
+  using PartRowsArray = common::ObSegmentArray<const ObHashJoinStoredJoinRow *,
+                                               OB_MALLOC_MIDDLE_BLOCK_SIZE,
+                                               common::ModulePageAllocator>;
+  uint64_t cur_row_idx_;
+  ModulePageAllocator *part_rows_alloc_;
+  PartRowsArray *left_part_rows_;
 };
 
 inline int ObHashJoinOp::init_mem_context(uint64_t tenant_id)

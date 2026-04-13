@@ -32,23 +32,6 @@ ObString extract_user_name(const ObString &in);
 int extract_user_tenant(const ObString &in, ObString &user_name, ObString &tenant_name);
 int extract_tenant_id(const ObString &tenant_name, uint64_t &tenant_id);
 
-class AuthSwitchResonseMemPool : public obmysql::ObICSMemPool
-{
-public:
-  explicit AuthSwitchResonseMemPool(ObIAllocator *allocator)
-      : allocator_(allocator)
-  {}
-
-  virtual ~AuthSwitchResonseMemPool() {}
-
-  void *alloc(int64_t size) override
-  {
-    return allocator_->alloc(size);
-  }
-private:
-  ObIAllocator *allocator_;
-};
-
 class ObMPConnect
     : public ObMPBase
 {
@@ -126,9 +109,15 @@ private:
                                        const bool is_login_succ,
                                        bool &is_locked_now);
   bool is_connection_control_enabled(const uint64_t tenant_id);
-  int get_connection_control_stat(const uint64_t tenant_id, const int64_t current_failed_login_num,
-                                  const int64_t last_failed_login_timestamp,
-                                  bool &need_lock, bool &is_locked);
+  int get_connection_control_stat_mysql(const uint64_t tenant_id,
+                                        const int64_t current_failed_login_num,
+                                        const int64_t last_failed_login_timestamp,
+                                        bool &is_locked);
+  int is_need_lock_user_mysql(const uint64_t tenant_id,
+                              const int64_t current_failed_login_num,
+                              const int64_t last_failed_login_timestamp,
+                              bool &need_lock);
+
 
   int unlock_user_if_time_is_up(const uint64_t tenant_id,
                                 share::schema::ObSchemaGetterGuard &schema_guard,
@@ -155,6 +144,8 @@ private:
   int get_proxy_user_name(ObString &real_user);
   int execute_trigger(const uint64_t tenant_id,
                       sql::ObSQLSessionInfo &session);
+
+
 private:
   DISALLOW_COPY_AND_ASSIGN(ObMPConnect);
   obmysql::OMPKHandshakeResponse hsr_;

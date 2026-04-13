@@ -23,7 +23,6 @@
 #include "storage/meta_store/ob_server_storage_meta_service.h"
 #include "share/ash/ob_active_sess_hist_list.h"
 #ifdef OB_BUILD_SHARED_STORAGE
-#include "storage/compaction/ob_tenant_ls_merge_scheduler.h"
 #include "share/compaction/ob_shared_storage_compaction_util.h"
 #include "storage/shared_storage/ob_disk_space_manager.h"
 #endif
@@ -132,9 +131,7 @@ int ObServerReloadConfig::operator()()
   {
 #ifdef OB_BUILD_SHARED_STORAGE
     if (GCTX.is_shared_storage_mode()) {
-      OB_SERVER_DISK_SPACE_MGR.reload_config(GCONF);
-      // OB_SERVER_DISK_SPACE_MGR.reload_ss_cache_max_percentage_config(GCONF);
-      // OB_SERVER_DISK_SPACE_MGR.reload_ss_cache_maxsize_percpu_config(GCONF);
+      OB_SERVER_DISK_SPACE_MGR.reload_hidden_sys_data_disk_config(GCONF);
     }
 #endif
     enable_malloc_v2(GCONF._enable_malloc_v2);
@@ -238,6 +235,7 @@ int ObServerReloadConfig::operator()()
     if (0 != STRNCMP(last_storage_check_mod, GCONF._storage_leak_check_mod.str(), sizeof(last_storage_check_mod))) {
       ObKVGlobalCache::get_instance().set_storage_leak_check_mod(GCONF._storage_leak_check_mod.str());
       STRNCPY(last_storage_check_mod, GCONF._storage_leak_check_mod.str(), sizeof(last_storage_check_mod));
+      last_storage_check_mod[sizeof(last_storage_check_mod) - 1] = '\0';
     }
   }
 #ifndef ENABLE_SANITY
@@ -290,6 +288,8 @@ int ObServerReloadConfig::operator()()
       GCONF.syslog_io_bandwidth_limit.get_value());
   share::ObTaskController::get().set_diag_per_error_limit(
       GCONF.diag_syslog_per_error_limit.get_value());
+  common::ObPLogFileStruct::set_sync_size_threshold(
+      GCONF.syslog_sync_size_threshold.get_value());
 
   lib::g_runtime_enabled = true;
 
@@ -305,6 +305,8 @@ int ObServerReloadConfig::operator()()
     } else if (OB_TMP_FAIL(SERVER_STORAGE_META_SERVICE.get_reserved_size(reserved_size))) {
       LOG_WARN("fail to get reserved size", KR(tmp_ret), K(reserved_size));
     } else if (OB_TMP_FAIL(OB_STORAGE_OBJECT_MGR.resize_local_device(
+        OB_STORAGE_OBJECT_MGR.get_total_macro_block_count()
+            * OB_STORAGE_OBJECT_MGR.get_macro_block_size(),
         data_disk_size, data_disk_percentage, reserved_size))) {
       LOG_WARN("fail to resize file", KR(tmp_ret),
           K(data_disk_size), K(data_disk_percentage), K(reserved_size));
@@ -340,12 +342,6 @@ void ObServerReloadConfig::reload_tenant_scheduler_config_()
     auto f = [] () {
       (void) MTL(ObTenantDagScheduler *)->reload_config();
       (void) MTL(compaction::ObTenantTabletScheduler *)->reload_tenant_config();
-#ifdef OB_BUILD_SHARED_STORAGE
-    if (GCTX.is_shared_storage_mode()) {
-      (void) MTL(compaction::ObTenantLSMergeScheduler *)->reload_tenant_config();
-    }
-#endif
-
       return OB_SUCCESS;
     };
     omt->operate_in_each_tenant(f);

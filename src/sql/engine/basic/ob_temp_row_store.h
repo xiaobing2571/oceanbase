@@ -98,6 +98,8 @@ public:
                              int64_t &size);
     int32_t rows() const { return cnt_; }
     int get_store_row(int64_t &cur_pos, const ObCompactRow *&sr);
+    int get_store_rows(int64_t &cur_pos, const ObCompactRow **stored_rows, const int64_t max_rows,
+                       int64_t &read_rows);
     int get_row(const int64_t row_id, const ObCompactRow *&sr) const;
 
   private:
@@ -246,7 +248,8 @@ public:
            uint32_t row_extra_size,
            const common::ObCompressorType compressor_type,
            const bool reorder_fixed_expr = true,
-           const bool enable_trunc = false);
+           const bool enable_trunc = false,
+           int64_t tempstore_read_alignment_size = 0);
 
   int init(const RowMeta &row_meta,
            const int64_t max_batch_size,
@@ -254,7 +257,8 @@ public:
            const int64_t mem_limit,
            bool enable_dump,
            const common::ObCompressorType compressor_type,
-           const bool enable_trunc = false);
+           const bool enable_trunc = false,
+           int64_t tempstore_read_alignment_size = 0);
 
   int init_batch_ctx(const ObExprPtrIArray *exprs = NULL);
 
@@ -312,7 +316,7 @@ public:
   inline int ensure_write_blk(const int64_t mem_size)
   {
     int ret = common::OB_SUCCESS;
-    if (NULL == blk_ || mem_size > blk_buf_.remain()) {
+    if (need_new_block(mem_size)) {
       if (OB_FAIL(new_block(mem_size))) {
         SQL_ENG_LOG(WARN, "fail to new block", K(ret), K(mem_size));
       }
@@ -320,6 +324,10 @@ public:
     return ret;
   }
 
+  inline bool need_new_block(const int64_t mem_size)
+  {
+    return NULL == blk_ || mem_size > blk_buf_.remain();
+  }
   virtual int prepare_blk_for_switch(Block *blk) override
   {
     int ret = OB_SUCCESS;

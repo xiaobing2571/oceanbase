@@ -26,6 +26,8 @@ namespace oceanbase
 namespace share
 {
 
+ERRSIM_POINT_DEF(ERRSIM_HOLD_TENANT_READABLE_SCN);
+
 bool is_valid_tenant_scn(
   const SCN &sync_scn,
   const SCN &replayable_scn,
@@ -136,6 +138,8 @@ void ObAllTenantInfo::assign(const ObAllTenantInfo &other)
     log_mode_ = other.log_mode_;
     max_ls_id_ = other.max_ls_id_;
     restore_data_mode_ = other.restore_data_mode_;
+    protection_mode_ = other.protection_mode_;
+    protection_level_ = other.protection_level_;
   }
   return ;
 }
@@ -157,6 +161,8 @@ void ObAllTenantInfo::reset()
   // They need be reset to the VALID default value.
   // Consider serialization compatibility for old binary RPC packet.
   restore_data_mode_ = NORMAL_RESTORE_DATA_MODE;
+  protection_mode_ = MAXIMUM_PERFORMANCE_MODE;
+  protection_level_ = MAXIMUM_PERFORMANCE_LEVEL;
 }
 
 OB_SERIALIZE_MEMBER(ObAllTenantInfo, tenant_id_, tenant_role_,
@@ -164,7 +170,8 @@ OB_SERIALIZE_MEMBER(ObAllTenantInfo, tenant_id_, tenant_role_,
                     replayable_scn_,
                     readable_scn_,   // FARM COMPAT WHITELIST
                     recovery_until_scn_, log_mode_,
-                    max_ls_id_, restore_data_mode_);
+                    max_ls_id_, restore_data_mode_,
+                    protection_mode_, protection_level_);
 
 ObAllTenantInfo& ObAllTenantInfo::operator= (const ObAllTenantInfo &other)
 {
@@ -358,7 +365,6 @@ int ObAllTenantInfoProxy::load_tenant_info(const uint64_t tenant_id,
   return ret;
 }
 
-
 int ObAllTenantInfoProxy::load_tenant_info(const uint64_t tenant_id,
                                            ObISQLClient *proxy,
                                            const bool for_update,
@@ -376,8 +382,24 @@ int ObAllTenantInfoProxy::load_tenant_info(const uint64_t tenant_id,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(tenant_id));
   } else if (!is_user_tenant(tenant_id)) {
+    int tmp_ret = OB_SUCCESS;
     //sys and meta tenant is primary
-    if (OB_FAIL(tenant_info.init(tenant_id, share::PRIMARY_TENANT_ROLE))) {
+    ObLSRecoveryStatOperator ls_recovery_op;
+    SCN sync_scn;
+    SCN readable_scn;
+    SCN recovery_until_scn;
+    recovery_until_scn.set_max();
+    if (OB_TMP_FAIL(ls_recovery_op.get_meta_tenant_recovery_stat(tenant_id, *proxy, sync_scn,
+            readable_scn, ora_rowscn))) {
+      // when creating ls in creating tenant, ls_recovery_stat is not initialized
+      LOG_WARN("failed to get tenant sync_scn and readable_scn, use default", KR(ret), K(tenant_id));
+      sync_scn.set_base();
+      readable_scn.set_base();
+      ora_rowscn = 1;
+    }
+    if (OB_FAIL(tenant_info.init(tenant_id, share::PRIMARY_TENANT_ROLE, NORMAL_SWITCHOVER_STATUS,
+            ObAllTenantInfo::INITIAL_SWITCHOVER_EPOCH, sync_scn,
+            sync_scn/*replayable_scn*/, readable_scn, recovery_until_scn))) {
       LOG_WARN("failed to init tenant info", KR(ret), K(tenant_id));
     }
   } else {
@@ -424,6 +446,7 @@ int ObAllTenantInfoProxy::load_pure_tenant_info_(const uint64_t tenant_id,
     } else if(for_update && OB_FAIL(sql.append(" for update"))) {
       LOG_WARN("failed to assign sql", KR(ret), K(sql));
     } else {
+      DEBUG_SYNC(BEFORE_GET_TENANT_INFO);
       HEAP_VAR(ObMySQLProxy::MySQLResult, res) {
         common::sqlclient::ObMySQLResult *result = NULL;
         if (OB_FAIL(proxy->read(res, exec_tenant_id, sql.ptr()))) {
@@ -459,9 +482,13 @@ int ObAllTenantInfoProxy::update_tenant_recovery_status_in_trans(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("meta tenant no need init tenant info", KR(ret), K(tenant_id));
   } else {
+    SCN real_readable_scn = readable_scn;
+    if (ERRSIM_HOLD_TENANT_READABLE_SCN) {
+      real_readable_scn = old_tenant_info.get_readable_scn();
+    }
     SCN new_sync_scn = gen_new_sync_scn(old_tenant_info.get_sync_scn(), sync_scn, old_tenant_info.get_recovery_until_scn());
     SCN new_replayable_scn = gen_new_replayable_scn(old_tenant_info.get_replayable_scn(), replay_scn, new_sync_scn);
-    SCN new_readable_scn = gen_new_readable_scn(old_tenant_info.get_readable_scn(), readable_scn, new_replayable_scn);
+    SCN new_readable_scn = gen_new_readable_scn(old_tenant_info.get_readable_scn(), real_readable_scn, new_replayable_scn);
 
     omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
     if (OB_UNLIKELY(!tenant_config.is_valid())) {
@@ -480,7 +507,6 @@ int ObAllTenantInfoProxy::update_tenant_recovery_status_in_trans(
           && new_replayable_scn.is_valid()
           && new_readable_scn_plus_gap.is_valid()
           && new_replayable_scn > new_readable_scn_plus_gap
-          && new_readable_scn_plus_gap >= old_tenant_info.get_replayable_scn()
           && old_tenant_info.get_readable_scn() > SCN::base_scn()) {
         // condition: !old_tenant_info.get_max_ls_id().is_sys_ls()
         // If max_ls_id is sys ls, this logic is not needed.
@@ -491,7 +517,12 @@ int ObAllTenantInfoProxy::update_tenant_recovery_status_in_trans(
         // sys ls's readable_scn starts from base_scn
         // replayable_scn cannot start from base_scn, it's too slow when we restore tenant
         // At the beginning time, replayable_scn should be sync_scn
-        new_replayable_scn = new_readable_scn_plus_gap;
+        if (new_readable_scn_plus_gap >= old_tenant_info.get_replayable_scn()) {
+          new_replayable_scn = new_readable_scn_plus_gap;
+        } else {
+          // When the gap is tightened, keep replayable_scn stable until readable_scn catches up.
+          new_replayable_scn = old_tenant_info.get_replayable_scn();
+        }
       }
     }
 

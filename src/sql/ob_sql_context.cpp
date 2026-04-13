@@ -15,8 +15,12 @@
 
 #include "share/catalog/ob_cached_catalog_meta_getter.h"
 #include "share/external_table/ob_external_object_ctx.h"
+#include "share/schema/ob_iceberg_table_schema.h"
 #include "sql/optimizer/ob_log_plan.h"
 #include "sql/ob_sql_mock_schema_utils.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "sql/dblink/ob_dblink_utils.h"
+#include "src/storage/tx/ob_trans_define_v4.h"
 
 using namespace ::oceanbase::common;
 namespace oceanbase
@@ -171,7 +175,10 @@ ObSqlCtx::ObSqlCtx()
     exec_type_(InvalidType),
     is_prepare_protocol_(false),
     is_pre_execute_(false),
+    is_prepare_with_params_(false),
     is_prepare_stage_(false),
+    parse_result_(nullptr),
+    prepare_params_(nullptr),
     is_dynamic_sql_(false),
     is_dbms_sql_(false),
     is_cursor_(false),
@@ -181,7 +188,6 @@ ObSqlCtx::ObSqlCtx()
     is_restore_(false),
     need_late_compile_(false),
     all_plan_const_param_constraints_(nullptr),
-    all_possible_const_param_constraints_(nullptr),
     all_equal_param_constraints_(nullptr),
     all_pre_calc_constraints_(nullptr),
     all_expr_constraints_(nullptr),
@@ -203,6 +209,10 @@ ObSqlCtx::ObSqlCtx()
     is_bulk_(false),
     ins_opt_ctx_(),
     flags_(0),
+    ccl_rule_id_(0),
+    ccl_match_time_(0),
+    origin_pl_param_count_(0),
+    enable_pl_sql_parameterize_(false),
     reroute_info_(nullptr)
 {
   sql_id_[0] = '\0';
@@ -229,13 +239,15 @@ void ObSqlCtx::reset()
   exec_type_ = InvalidType;
   is_prepare_protocol_ = false;
   is_pre_execute_ = false;
+  is_prepare_with_params_ = false;
   is_prepare_stage_ = false;
+  parse_result_ = nullptr;
+  prepare_params_ = nullptr;
   is_dynamic_sql_ = false;
   is_remote_sql_ = false;
   is_restore_ = false;
   need_late_compile_ = false;
   all_plan_const_param_constraints_ = nullptr;
-  all_possible_const_param_constraints_ = nullptr;
   all_equal_param_constraints_ = nullptr;
   all_pre_calc_constraints_ = nullptr;
   all_expr_constraints_ = nullptr;
@@ -268,6 +280,12 @@ void ObSqlCtx::reset()
   enable_user_defined_rewrite_ = false;
   is_bulk_ = false;
   ins_opt_ctx_.reset();
+  ccl_rule_id_ = 0;
+  ccl_match_time_ = 0;
+  matched_ccl_rule_level_values_.reset();
+  matched_ccl_format_sqlid_level_values_.reset();
+  origin_pl_param_count_ = 0;
+  enable_pl_sql_parameterize_ = false;
 }
 
 //release dynamic allocated memory
@@ -293,11 +311,14 @@ void ObSqlSchemaGuard::reset()
 {
   mocked_database_schemas_.reset();
   table_schemas_.reset();
+  lake_table_metadatas_.reset();
   schema_guard_ = NULL;
   allocator_.reset();
   next_link_table_id_ = 1;
   dblink_scn_.reuse();
   mocked_schema_id_counter_ = OB_MIN_EXTERNAL_OBJECT_ID;
+  dblink_ids_under_oracle12c_.reset();
+  allocator_.set_attr(ObMemAttr(MTL_ID(), "SqlSchemaGuard", ObCtxIds::DEFAULT_CTX_ID));
 }
 
 TableItem *ObSqlSchemaGuard::get_table_item_by_ref_id(const ObDMLStmt *stmt, uint64_t ref_table_id)
@@ -388,6 +409,7 @@ int ObSqlSchemaGuard::get_table_schema(uint64_t dblink_id,
     OV (OB_NOT_NULL(schema_guard_), OB_NOT_INIT);
     uint64_t current_scn = OB_INVALID_ID;
     uint64_t *scn = NULL;
+    bool is_under_oracle12c = false;
     if (OB_SUCC(ret)) {
       if (OB_ISNULL(session_info)) {
         ret = OB_ERR_UNEXPECTED;
@@ -413,13 +435,17 @@ int ObSqlSchemaGuard::get_table_schema(uint64_t dblink_id,
                                              session_info,
                                              dblink_name,
                                              is_reverse_link,
-                                             scn));
+                                             scn,
+                                             is_under_oracle12c));
     if (OB_SUCC(ret) && (NULL != scn)) {
       if (OB_FAIL(dblink_scn_.set_refactored(dblink_id, *scn))) {
         LOG_WARN("set refactored failed", K(ret));
       } else {
         LOG_TRACE("set dblink current scn", K(dblink_id), K(*scn));
       }
+    }
+    if (OB_SUCC(ret) && is_under_oracle12c && OB_FAIL(dblink_ids_under_oracle12c_.push_back(dblink_id))) {
+      LOG_WARN("failed to save dblink id which is OCI type and version of Oracle is under 12c", K(ret));
     }
     OV (OB_NOT_NULL(tmp_schema));
     OX (tmp_schema->set_table_id(next_link_table_id_++));
@@ -432,12 +458,44 @@ int ObSqlSchemaGuard::get_table_schema(uint64_t dblink_id,
   return ret;
 }
 
+bool ObSqlSchemaGuard::check_is_under_oracle12c(uint64_t dblink_id)
+{
+  bool ret = false;
+  for (int64_t i = 0; i < dblink_ids_under_oracle12c_.count(); ++i) {
+    if (dblink_id == dblink_ids_under_oracle12c_.at(i)) {
+      ret = true;
+      break;
+    }
+  }
+  return ret;
+}
+
 int ObSqlSchemaGuard::add_mocked_table_schema(const ObTableSchema &table_schema)
 {
   int ret = OB_SUCCESS;
-  ObTableSchema *temp_schema = NULL;
-  OZ (ObSchemaUtils::alloc_schema(allocator_, table_schema, temp_schema));
-  OZ (table_schemas_.push_back(temp_schema));
+  if (OB_FAIL(add_mocked_table_schema(&table_schema))) {
+    LOG_WARN("failed to add mocked table schema", K(ret));
+  }
+  return ret;
+}
+
+int ObSqlSchemaGuard::add_mocked_table_schema(const share::schema::ObTableSchema *table_schema)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(table_schema)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("table schema is null", K(ret));
+  } else if (ObLakeTableFormat::ICEBERG == table_schema->get_lake_table_format()) {
+    ObIcebergTableSchema *temp_schema = NULL;
+    const share::schema::ObIcebergTableSchema *iceberg_table_schema
+        = down_cast<const share::schema::ObIcebergTableSchema *>(table_schema);
+    OZ(ObSchemaUtils::alloc_schema(allocator_, *iceberg_table_schema, temp_schema));
+    OZ(table_schemas_.push_back(temp_schema));
+  } else {
+    ObTableSchema *temp_schema = NULL;
+    OZ(ObSchemaUtils::alloc_schema(allocator_, *table_schema, temp_schema));
+    OZ(table_schemas_.push_back(temp_schema));
+  }
   return ret;
 }
 
@@ -692,13 +750,17 @@ int ObSqlSchemaGuard::get_catalog_database_schema(const uint64_t tenant_id,
 
   if (OB_SUCC(ret) && OB_ISNULL(database_schema)) {
     // not found from local, find from catalog and push into catalog_database_schemas_
-    ObDatabaseSchema tmp_schema;
-    ObCachedCatalogMetaGetter catalog_meta_getter{*schema_guard_, allocator_};
-    // assign database id first
-    tmp_schema.set_database_id(get_next_mocked_schema_id());
-    if (OB_FAIL(catalog_meta_getter.fetch_namespace_schema(tenant_id, catalog_id, database_name, case_mode, tmp_schema))) {
+    ObArenaAllocator tmp_allocator;
+    ObDatabaseSchema *tmp_schema;
+    ObCachedCatalogMetaGetter catalog_meta_getter{*schema_guard_, tmp_allocator};
+    if (OB_FAIL(catalog_meta_getter.fetch_namespace_schema(tenant_id,
+                                                           catalog_id,
+                                                           get_next_mocked_schema_id(),
+                                                           database_name,
+                                                           case_mode,
+                                                           tmp_schema))) {
       LOG_WARN("failed to fetch_namespace_schema", K(ret));
-    } else if (OB_FAIL(add_mocked_database_schema(tmp_schema))) {
+    } else if (OB_FAIL(add_mocked_database_schema(*tmp_schema))) {
       LOG_WARN("failed to add_mocked_schema", K(ret));
     } else {
       // retrieve ObDatabaseSchema from mocked_database_schemas_
@@ -733,7 +795,8 @@ int ObSqlSchemaGuard::get_catalog_table_schema(const uint64_t tenant_id,
                                                const uint64_t database_id,
                                                const ObString &database_name,
                                                const ObString &tbl_name,
-                                               const ObTableSchema *&table_schema)
+                                               const ObTableSchema *&table_schema,
+                                               const share::ObTimeTravelInfo *time_travel_info)
 {
   int ret = OB_SUCCESS;
   ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
@@ -743,41 +806,72 @@ int ObSqlSchemaGuard::get_catalog_table_schema(const uint64_t tenant_id,
     LOG_WARN("get unexpected null", K(ret));
   } else if (OB_FAIL(schema_guard_->get_tenant_name_case_mode(tenant_id, case_mode))) {
     LOG_WARN("failed to get case mode", K(ret));
-  } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < table_schemas_.count(); i++) {
-      const ObTableSchema *&tmp_schema = table_schemas_.at(i);
-      if (OB_ISNULL(tmp_schema)) {
-        // 忽略本次 null，继续循环
-        // ignore ret
-        LOG_WARN("get unexpected null", K(ret));
-      } else if (tenant_id == tmp_schema->get_tenant_id() && catalog_id == tmp_schema->get_catalog_id()
-                 && database_id == tmp_schema->get_database_id()
-                 && ObCharset::case_mode_equal(case_mode, tbl_name, tmp_schema->get_table_name())) {
-        table_schema = tmp_schema;
-        break;
-      }
+  }
+
+  std::optional<int64_t> snapshot_id = std::nullopt;
+  std::optional<int32_t> schema_id = std::nullopt;
+  ObILakeTableMetadata *lake_table_metadata = NULL;
+  if (OB_SUCC(ret) && OB_NOT_NULL(time_travel_info)) {
+    if (OB_FAIL(get_lake_table_metadata(tenant_id,
+                                        catalog_id,
+                                        database_id,
+                                        database_name,
+                                        tbl_name,
+                                        case_mode,
+                                        lake_table_metadata))) {
+      LOG_WARN("failed to get lake table metadata", K(ret));
+    } else if (OB_FAIL(lake_table_metadata->resolve_time_travel_info(time_travel_info,
+                                                                     schema_id,
+                                                                     snapshot_id))) {
+      LOG_WARN("failed to get time travel snapshot id", K(ret));
+    }
+  }
+
+  for (int64_t i = 0; OB_SUCC(ret) && i < table_schemas_.count(); i++) {
+    const ObTableSchema *&tmp_schema = table_schemas_.at(i);
+    if (OB_ISNULL(tmp_schema)) {
+      // 忽略本次 null，继续循环
+      // ignore ret
+      LOG_WARN("get unexpected null", K(ret));
+    } else if (tenant_id == tmp_schema->get_tenant_id()
+               && catalog_id == tmp_schema->get_catalog_id()
+               && database_id == tmp_schema->get_database_id()
+               && ObCharset::case_mode_equal(case_mode, tbl_name, tmp_schema->get_table_name())
+               && (!snapshot_id.has_value() // for table not support time travel
+                   || (snapshot_id.has_value()
+                       && tmp_schema->get_lake_table_snapshot_id() == snapshot_id.value()))) {
+      table_schema = tmp_schema;
+      break;
     }
   }
 
   if (OB_SUCC(ret) && OB_ISNULL(table_schema)) {
     // not found local, fetch from remote
-    ObTableSchema tmp_schema;
-    int64_t schema_version = 0;
-    ObCachedCatalogMetaGetter catalog_meta_getter{*schema_guard_, allocator_};
-    tmp_schema.set_database_id(database_id);
-    tmp_schema.set_table_id(get_next_mocked_schema_id());
-    if (OB_FAIL(catalog_meta_getter.fetch_table_schema(tenant_id, catalog_id, database_name, tbl_name, case_mode, tmp_schema))) {
-      LOG_WARN("failed to fetch_table_schema", K(ret));
-    } else if (OB_FAIL(schema_guard_->get_schema_version(tenant_id, schema_version))) {
-      LOG_WARN("get schema version failed", K(ret));
-    } else if (FALSE_IT(tmp_schema.set_schema_version(schema_version))) {
+    ObTableSchema *tmp_schema = NULL;
+
+    if (OB_ISNULL(lake_table_metadata) // no time travel info
+        && OB_FAIL(get_lake_table_metadata(tenant_id,
+                                           catalog_id,
+                                           database_id,
+                                           database_name,
+                                           tbl_name,
+                                           case_mode,
+                                           lake_table_metadata))) {
+      LOG_WARN("failed to get lake table metadata", K(ret));
+    } else if (OB_ISNULL(lake_table_metadata)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get null lake_table_metadata", K(ret));
+    } else if (OB_FAIL(
+                   lake_table_metadata->build_table_schema(schema_id, snapshot_id, tmp_schema))) {
+      LOG_WARN("failed to build table schema", K(ret));
     } else if (OB_FAIL(add_mocked_table_schema(tmp_schema))) {
       LOG_WARN("add mocked table schema failed", K(ret));
+    } else if (OB_FAIL(lake_table_metadatas_.push_back(lake_table_metadata))) {
+      LOG_WARN("failed to add lake table metadata", K(ret));
     } else {
       table_schema = table_schemas_.at(table_schemas_.count() - 1);
     }
   }
-
   return ret;
 }
 
@@ -790,7 +884,11 @@ int ObSqlSchemaGuard::get_catalog_table_id(const uint64_t tenant_id,
   int ret = OB_SUCCESS;
   table_id = OB_INVALID_ID;
   const ObTableSchema *table_schema = NULL;
-  if (OB_FAIL(get_catalog_table_schema(tenant_id, catalog_id, database_id, tbl_name, table_schema))) {
+  if (OB_FAIL(get_catalog_table_schema(tenant_id,
+                                       catalog_id,
+                                       database_id,
+                                       tbl_name,
+                                       table_schema))) {
     LOG_WARN("get_catalog_table_schema failed", K(ret));
   } else if (OB_ISNULL(table_schema)) {
     ret = OB_ERR_UNEXPECTED;
@@ -803,7 +901,8 @@ int ObSqlSchemaGuard::get_catalog_table_schema(const uint64_t tenant_id,
                                                const uint64_t catalog_id,
                                                const uint64_t database_id,
                                                const ObString &tbl_name,
-                                               const ObTableSchema *&table_schema)
+                                               const ObTableSchema *&table_schema,
+                                               const share::ObTimeTravelInfo *time_travel_info)
 {
   int ret = OB_SUCCESS;
   const ObDatabaseSchema *database_schema = NULL;
@@ -818,11 +917,31 @@ int ObSqlSchemaGuard::get_catalog_table_schema(const uint64_t tenant_id,
                                               database_id,
                                               database_schema->get_database_name(),
                                               tbl_name,
-                                              table_schema))) {
+                                              table_schema,
+                                              time_travel_info))) {
     LOG_WARN("get table schema failed", K(ret));
   } else if (OB_ISNULL(table_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get table schema failed", K(ret));
+  }
+  return ret;
+}
+
+int ObSqlSchemaGuard::get_lake_table_metadata(
+    const uint64_t table_id,
+    share::ObILakeTableMetadata *&lake_table_metadata) const
+{
+  int ret = OB_SUCCESS;
+  lake_table_metadata = NULL;
+  for (int64_t i = 0; NULL == lake_table_metadata && i < lake_table_metadatas_.count(); i++) {
+    if (OB_NOT_NULL(lake_table_metadatas_[i]) && table_id == lake_table_metadatas_[i]->table_id_) {
+      lake_table_metadata = lake_table_metadatas_[i];
+    }
+  }
+
+  if (OB_ISNULL(lake_table_metadata)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get null lake_table_metadata", K(ret), K(table_id));
   }
   return ret;
 }
@@ -1005,6 +1124,66 @@ common::ObIArray<const share::schema::ObTableSchema *> &ObSqlSchemaGuard::get_mo
   return table_schemas_;
 }
 
+const share::ObILakeTableMetadata* ObSqlSchemaGuard::get_table_metadata(int64_t table_id)
+{
+  const share::ObILakeTableMetadata *metadata = NULL;
+  for (int64_t i = 0; i < lake_table_metadatas_.count(); i++) {
+    if (lake_table_metadatas_.at(i)->table_id_ == table_id) {
+      metadata = lake_table_metadatas_.at(i);
+      break;
+    }
+  }
+  return metadata;
+}
+
+int ObSqlSchemaGuard::get_lake_table_metadata(const uint64_t tenant_id,
+                                              const uint64_t table_id,
+                                              const share::ObILakeTableMetadata *&lake_table_metadata)
+{
+  int ret = OB_SUCCESS;
+  bool found = false;
+  for (int64_t i = 0; OB_SUCC(ret) && !found && i < lake_table_metadatas_.count(); i++) {
+    const ObILakeTableMetadata *tmp_lake_table_metadata = lake_table_metadatas_.at(i);
+    if (OB_ISNULL(tmp_lake_table_metadata)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null", K(ret));
+    } else if (tenant_id == tmp_lake_table_metadata->tenant_id_
+               && table_id == tmp_lake_table_metadata->table_id_) {
+      lake_table_metadata = tmp_lake_table_metadata;
+      found = true;
+    }
+  }
+  return ret;
+}
+
+int ObSqlSchemaGuard::get_lake_table_metadata(const uint64_t tenant_id,
+                                              const uint64_t catalog_id,
+                                              const uint64_t database_id,
+                                              const ObString &database_name,
+                                              const ObString &tbl_name,
+                                              const ObNameCaseMode case_mode,
+                                              share::ObILakeTableMetadata *&lake_table_metadata)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator tmp_allocator;
+  ObCachedCatalogMetaGetter catalog_meta_getter{*schema_guard_, tmp_allocator};
+  if (OB_FAIL(catalog_meta_getter.fetch_lake_table_metadata(allocator_,
+                                                            tenant_id,
+                                                            catalog_id,
+                                                            database_id,
+                                                            get_next_mocked_schema_id(),
+                                                            database_name,
+                                                            tbl_name,
+                                                            case_mode,
+                                                            lake_table_metadata))) {
+    LOG_WARN("failed to fetch_lake_table_metadata", K(ret));
+  } else if (OB_ISNULL(lake_table_metadata)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get null lake_table_metadata", K(ret));
+  }
+  return ret;
+}
+
 int ObSqlCtx::set_partition_infos(const ObTablePartitionInfoArray &info, ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
@@ -1158,6 +1337,11 @@ int ObQueryCtx::get_local_session_vars(const int64_t idx, const ObLocalSessionVa
     local_session_var = &all_local_session_vars_.at(idx);
   }
   return ret;
+}
+
+void ObQueryCtx::init_type_ctx(const ObSQLSessionInfo *session)
+{
+  ObSQLUtils::init_type_ctx(session, initial_type_ctx_);
 }
 
 }

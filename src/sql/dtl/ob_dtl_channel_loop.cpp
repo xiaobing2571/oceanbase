@@ -369,16 +369,9 @@ int ObDtlChannelLoop::process_channels(ObIDltChannelLoopPred *pred, int64_t &nth
       }
     }
     if (first_data_get_) {
-      // 第一次命中后的miss计数
-      // ObSqlMonitorStatIds::DTL_LOOP_TOTAL_MISS_AFTER_DATA;
-      // The statistics of otherstat_6_value_ will affect all statistics of other operators that use otherstat_6_value_.
-      // For now, comment out the DTL.
-      // ++op_monitor_info_.otherstat_5_value_;
+      INC_METRIC_VAL(ObMetricId::DTL_LOOP_TOTAL_MISS_AFTER_DATA, 1);
     }
-    // ObSqlMonitorStatIds::DTL_LOOP_TOTAL_MISS;
-    // The statistics of otherstat_6_value_ will affect all statistics of other operators that use otherstat_6_value_.
-    // For now, comment out the DTL.
-    // ++op_monitor_info_.otherstat_6_value_;
+    INC_METRIC_VAL(ObMetricId::DTL_LOOP_TOTAL_MISS, 1);
   }
   return ret;
 }
@@ -409,7 +402,7 @@ int ObDtlChannelLoop::process_channel(int64_t &nth_channel)
         LOG_WARN("worker interrupt", K(tmp_ret), K(ret));
         break;
       }
-      ob_usleep<ObWaitEventIds::DTL_PROCESS_CHANNEL_SLEEP>(1);
+      ob_usleep(1, cond_.get_event_no(), 0, 0, 0);
     }
     ++loop_times_;
     if (ignore_interrupt_) {

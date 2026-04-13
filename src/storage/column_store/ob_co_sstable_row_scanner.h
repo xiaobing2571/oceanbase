@@ -9,15 +9,18 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PubL v2 for more details.
  */
+
 #ifndef OB_STORAGE_COLUMN_STORE_OB_CO_SSTABLE_ROW_SCANNER_H_
 #define OB_STORAGE_COLUMN_STORE_OB_CO_SSTABLE_ROW_SCANNER_H_
+
+#include "sql/engine/basic/ob_pushdown_filter.h"
 #include "storage/access/ob_sstable_row_scanner.h"
 #include "storage/access/ob_block_batched_row_store.h"
-#include "storage/access/ob_pushdown_aggregate_vec.h"
 #include "ob_column_store_util.h"
 #include "ob_co_sstable_rows_filter.h"
 #include "ob_i_cg_iterator.h"
 #include "ob_cg_iter_param_pool.h"
+#include "storage/column_store/ob_column_oriented_sstable.h"
 
 namespace oceanbase
 {
@@ -58,18 +61,22 @@ public:
      return can_blockscan() &&
             !access_ctx_->is_mview_query() &&
             iter_param_->vectorized_enabled_ &&
-            iter_param_->enable_pd_filter();
+            iter_param_->enable_pd_filter() &&
+            support_pd_rowscn_filter_if_contain(*table_, block_row_store_);
   }
   virtual int get_next_rows() override;
-  int get_next_rowkey(blocksstable::ObDatumRowkey& rowkey,
-                       int64_t &curr_scan_index,
-                       blocksstable::ObDatumRowkey &border_rowkey,
-                       common::ObIAllocator &allocator,
-                       bool need_set_border_rowkey);
+  virtual int get_next_rowkey(int64_t &curr_scan_index,
+                              blocksstable::ObDatumRowkey& rowkey,
+                              common::ObIAllocator &allocator) final;
+  virtual int get_next_border_rowkey(const blocksstable::ObDatumRowkey *&border_rowkey) const override final
+  {
+    return row_scanner_->get_next_border_rowkey(border_rowkey);
+  }
   TO_STRING_KV(K_(range_idx),
                K_(is_new_group),
                K_(reverse_scan),
                K_(is_limit_end),
+               K_(use_row_store_projector),
                K_(state),
                K_(blockscan_state),
                K_(group_by_project_idx),
@@ -95,6 +102,14 @@ public:
 protected:
   virtual int inner_get_next_row(const ObDatumRow *&store_row) override;
   virtual int refresh_blockscan_checker(const blocksstable::ObDatumRowkey &rowkey) override;
+  virtual int get_blockscan_border_rowkey(blocksstable::ObDatumRowkey &border_rowkey) override final
+  {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(row_scanner_->get_blockscan_border_rowkey(border_rowkey))) {
+      STORAGE_LOG(WARN, "fail to get blockscan border rowkey", K(ret));
+    }
+    return ret;
+  }
 private:
   static const ScanState STATE_TRANSITION[BlockScanState::MAX_STATE];
   virtual int init_row_scanner(
@@ -173,16 +188,40 @@ private:
   {
     return T_PSEUDO_GROUP_ID == e->type_;
   }
+  OB_INLINE bool has_rows_filter() const
+  {
+    // switch context maybe make rows_filter_ is not nullptr, but filter_ is nullptr
+    return rows_filter_ != nullptr && rows_filter_->filter_ != nullptr;
+  }
+
+  static OB_INLINE bool is_support_locate_cs_range(const ObITable &table)
+  {
+    return table.is_co_sstable() && !table.is_ddl_merge_sstable();
+  }
+
+  static OB_INLINE bool support_pd_rowscn_filter_if_contain(const ObITable &table, ObBlockRowStore *block_row_store)
+  {
+    return (block_row_store != nullptr && block_row_store->get_pd_filter_info().contain_rowscn_)
+               ? is_support_locate_cs_range(table)
+               : true;
+  }
+
 protected:
   ObSSTableRowScanner<ObCOPrefetcher> *row_scanner_;
   int32_t range_idx_;
 private:
   int init_group_by_info(ObTableAccessContext &context);
   int push_group_by_processor(ObICGIterator *cg_iterator);
+  bool use_row_store_projector(const ObTableIterParam& row_param, const ObTableAccessContext& context, const ObCOSSTableV2& co_sstable);
+
+  // use row store projector
+  // when projected column count is larger than this
+  static constexpr int64_t ROW_STORE_PROJECTION_THRESHOLD = 32;
 
   bool is_new_group_;
   bool reverse_scan_;
   bool is_limit_end_;
+  mutable bool use_row_store_projector_;
   ScanState state_;
   BlockScanState blockscan_state_;
   int32_t group_by_project_idx_;

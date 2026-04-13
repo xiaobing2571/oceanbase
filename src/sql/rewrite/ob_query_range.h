@@ -119,7 +119,7 @@ private:
     bool phy_rowid_for_table_loc_;
     bool ignore_calc_failure_;
     int64_t range_optimizer_max_mem_size_;
-    common::ObSEArray<ObRangeExprItem, 4, common::ModulePageAllocator, true> precise_range_exprs_;
+    common::ObSEArray<ObRangeExprItem, 4> precise_range_exprs_;
     ObExecContext *exec_ctx_;
     ObQueryCtx *query_ctx_;
     ExprConstrantArray *expr_constraints_;
@@ -246,7 +246,9 @@ private:
         valid_offsets_(NULL),
         allocator_(allocator),
         range_set_(),
-        is_phy_rowid_range_(false)
+        is_phy_rowid_range_(false),
+        force_no_use_start_(false),
+        force_no_use_end_(false)
     {
     }
 
@@ -307,6 +309,8 @@ private:
     common::ObIAllocator &allocator_;
     common::hash::ObHashSet<ObRangeWrapper, common::hash::NoPthreadDefendMode> range_set_;
     bool is_phy_rowid_range_;
+    bool force_no_use_start_;
+    bool force_no_use_end_;
   };
 
   struct ObRangeGraph
@@ -421,7 +425,8 @@ public:
                                       const bool phy_rowid_for_table_loc = false,
                                       const bool ignore_calc_failure = true,
                                       const bool use_in_optimization = false,
-                                      const int64_t index_prefix = -1);
+                                      const int64_t index_prefix = -1,
+                                      const bool ignore_fake_const_udf = false);
 
   //  final_extract_query_range extracts the final query range of its physical plan.
   //  It will get the real-time value of some const which are unknown during physical plan generating.
@@ -461,6 +466,7 @@ public:
                                          common::ObIAllocator &allocator,
                                          ObExecContext &exec_ctx,
                                          const ParamStore &param_store,
+                                         int64_t range_buffer_idx,
                                          void *range_buffer,
                                          ObQueryRangeArray &ranges,
                                          const common::ObDataTypeCastParams &dtc_params) const;
@@ -513,7 +519,8 @@ public:
 
   static bool can_be_extract_range(ObItemType cmp_type, const ObRawExprResType &col_type,
                             const ObObjMeta &calc_meta, common::ObObjType data_type,
-                            bool &always_true);
+                            bool &always_true,
+                            bool is_search_index = false);
   static bool can_domain_be_extract_range(const ObDomainOpType &op_type, const ObRawExprResType &col_type,
                                           const ObObjMeta &res_type, common::ObObjType data_type,
                                           bool &always_true);
@@ -532,6 +539,7 @@ public:
                                   bool &is_inconsistent_rowid,
                                   ObIAllocator *allocator = NULL) const;
   virtual bool inline has_exec_param() const { return has_exec_param_; }
+  virtual bool inline has_fake_const_udf() const { return false; } // old query range doesn't deal with fake deterministic udf
   bool inline get_is_equal_and() const { return is_equal_and_; }
   void inline set_is_equal_and(int64_t is_equal_and) { is_equal_and_ = is_equal_and; }
   const common::ObIArray<ObEqualOff> &get_raw_equal_offs() const { return equal_offs_; }
@@ -548,6 +556,7 @@ public:
   virtual bool is_contain_geo_filters() const { return contain_geo_filters_; }
   virtual int get_prefix_info(int64_t &equal_prefix_count,
                               int64_t &range_prefix_count,
+                              int64_t &ss_range_prefix_count,
                               bool &contain_always_false) const;
   void inner_get_prefix_info(const ObKeyPart *key_part,
                              int64_t &equal_prefix_count,
@@ -559,6 +568,7 @@ public:
                                     const ObString &escape_str,
                                     const ObString &pattern_str,
                                     int32_t &pattern_prefix_len);
+  bool is_equal_range() const override { return table_graph_.is_equal_range_; }
 private:
 
   int init_query_range_ctx(common::ObIAllocator &allocator,
@@ -803,11 +813,15 @@ private:
   // find all single range
   int and_first_search(ObSearchState &search_state,
                        ObKeyPart *cur,
+                       bool force_use_start,
+                       bool force_use_end,
                        ObQueryRangeArray &ranges,
                        bool &all_single_value_ranges,
                        const common::ObDataTypeCastParams &dtc_params);
   int and_first_in_key(ObSearchState &search_state,
                        ObKeyPart *cur,
+                       bool force_use_start,
+                       bool force_use_end,
                        ObQueryRangeArray &ranges,
                        bool &all_single_value_ranges,
                        const ObDataTypeCastParams &dtc_params);
@@ -1017,7 +1031,7 @@ private:
                                     uint64_t &table_id,
                                     uint64_t &part_column_id);
   int get_calculable_expr_val(const ObRawExpr *expr, ObObj &val, bool &is_valid, const bool ignore_error = true);
-  int add_precise_constraint(const ObRawExpr *expr, bool is_precise);
+  int add_precise_constraint(const ObRawExpr *expr, bool is_precise, char escape);
   int add_prefix_pattern_constraint(const ObRawExpr *expr);
   int get_final_expr_val(const ObRawExpr *expr, ObObj &val);
   int generate_expr_final_info();
@@ -1029,6 +1043,7 @@ private:
                                bool &use_ori_cmp_type);
 
   virtual int get_total_range_sizes(common::ObIArray<uint64_t> &total_range_sizes) const;
+  virtual bool enable_new_false_range() const { return false; }
 private:
   static const int64_t RANGE_BUCKET_SIZE = 1000;
   static const int64_t MAX_RANGE_SIZE_OLD = 10000;

@@ -42,7 +42,7 @@ ObArchiveFetcher::ObArchiveFetcher() :
   ls_mgr_(NULL),
   round_mgr_(NULL),
   task_queue_(),
-  fetch_cond_()
+  fetch_cond_(ObCond::SPIN_WAIT_NUM, common::ObWaitEventIds::ARCHIVE_FETCHER_COND_WAIT)
 {}
 
 ObArchiveFetcher::~ObArchiveFetcher()
@@ -197,6 +197,7 @@ int ObArchiveFetcher::submit_log_fetch_task(ObArchiveLogFetchTask *task)
     ret = OB_INVALID_ARGUMENT;
     ARCHIVE_LOG(WARN, "invalid argument", K(ret), KPC(task));
   } else {
+    task->push_fetch_queue_ts_ = ObTimeUtility::fast_current_time();
     RETRY_FUNC_ON_ERROR(OB_SIZE_OVERFLOW, has_set_stop(), task_queue_, push, task);
   }
   if (OB_SUCC(ret)) {
@@ -340,7 +341,8 @@ int ObArchiveFetcher::handle_log_fetch_task_(ObArchiveLogFetchTask &task)
   bool need_delay = false;
   bool submit_log = false;
   const ObLSID id = task.get_ls_id();
-  PalfGroupBufferIterator iter;
+  // PalfGroupBufferIterator iter;
+  ipalf::IPalfIterator<ipalf::IGroupEntry> iter;
   TmpMemoryHelper helper(unit_size_, allocator_);
   ObArchiveSendTask *send_task = NULL;
   const ArchiveWorkStation &station = task.get_station();
@@ -449,6 +451,9 @@ int ObArchiveFetcher::check_need_delay_(const ObArchiveLogFetchTask &task,
   palf::LSN max_no_limit_lsn;
   storage::ObLSHandle handle;
   share::SCN offline_scn;
+  // check if the file id is exist in dest set
+  int64_t cur_file_id = cal_archive_file_id(start_lsn, MAX_ARCHIVE_FILE_SIZE);
+  bool file_id_exist_in_dest_set = false;
 
   if (OB_FAIL(MTL(storage::ObLSService*)->get_ls(id, handle, ObLSGetMod::ARCHIVE_MOD))) {
     ARCHIVE_LOG(WARN, "get ls failed", K(id));
@@ -466,6 +471,11 @@ int ObArchiveFetcher::check_need_delay_(const ObArchiveLogFetchTask &task,
         need_delay = true;
         ARCHIVE_LOG(TRACE, "send_task_count exceed threshold, need delay",
             K(id), K(station), K(send_task_count));
+      } else if (OB_FAIL(ls_archive_task->check_ref_file_id_exist(cur_file_id, file_id_exist_in_dest_set))) {
+        ARCHIVE_LOG(WARN, "check_issue_file_id_exist failed", K(id), K(cur_file_id));
+      } else if (0 < send_task_count && file_id_exist_in_dest_set) {
+        need_delay = true;
+        ARCHIVE_LOG(TRACE, "same ref file id", K(id), K(cur_file_id), "task size", cur_lsn - start_lsn);
       } else {
         ls_archive_task_count = ls_mgr_->get_ls_task_count();
         send_task_status_count = archive_sender_->get_send_task_status_count();
@@ -572,7 +582,7 @@ int ObArchiveFetcher::init_helper_(ObArchiveLogFetchTask &task, const LSN &commi
 
 int ObArchiveFetcher::init_iterator_(const ObLSID &id,
     const TmpMemoryHelper &helper,
-    PalfGroupBufferIterator &iter)
+    ipalf::IPalfIterator<ipalf::IGroupEntry> &iter)
 {
   int ret = OB_SUCCESS;
   bool exists = false;
@@ -592,13 +602,12 @@ int ObArchiveFetcher::init_iterator_(const ObLSID &id,
 }
 
 // generate send buffer 前一定已经有足够数据
-int ObArchiveFetcher::generate_send_buffer_(PalfGroupBufferIterator &iter, TmpMemoryHelper &helper)
+int ObArchiveFetcher::generate_send_buffer_(ipalf::IPalfIterator<ipalf::IGroupEntry> &iter, TmpMemoryHelper &helper)
 {
   int ret = OB_SUCCESS;
   char *buf = NULL;
   int64_t buf_len = 0;
-  LogGroupEntry entry;
-  LSN offset;
+  ipalf::IGroupEntry entry;
   bool piece_change = false;  // 遇到更大piece, 不同piece内数据分开, 当前piece已到终点
   bool iter_end = false;    // 任务已处理到end_lsn
   SCN max_scn;
@@ -608,6 +617,8 @@ int ObArchiveFetcher::generate_send_buffer_(PalfGroupBufferIterator &iter, TmpMe
   const int64_t start_ts = common::ObTimeUtility::fast_current_time();
   while (OB_SUCC(ret) && ! iter_end && ! piece_change && ! has_set_stop()) {
     buffer = NULL;
+    LSN offset;
+    int64_t serialize_size = 0;
     if (OB_FAIL(iter.next(max_scn))) {
       if (iterator_need_retry_(ret)) {
         ARCHIVE_LOG(TRACE, "iterate log entry to end", K(ret), K(iter));
@@ -616,13 +627,14 @@ int ObArchiveFetcher::generate_send_buffer_(PalfGroupBufferIterator &iter, TmpMe
       }
     } else if (OB_FAIL(iter.get_entry(buffer, entry, offset))) {
       ARCHIVE_LOG(WARN, "get entry failed", K(ret));
-    } else if (OB_UNLIKELY(! entry.check_integrity())) {
+    } else if (OB_UNLIKELY(! entry.check_integrity(offset))) {
       ret = OB_INVALID_DATA;
       ARCHIVE_LOG(ERROR, "iterate buf not valid", K(ret), K(entry));
-    } else if (OB_UNLIKELY(entry.get_serialize_size() > helper.get_capaicity())) {
+    } else if (FALSE_IT(serialize_size = entry.get_serialize_size(offset))) {
+    } else if (OB_UNLIKELY(serialize_size > helper.get_capaicity())) {
       ret = OB_ERR_UNEXPECTED;
        ARCHIVE_LOG(ERROR, "iterate buf not valid", K(ret), K(helper), K(entry));
-    } else if (OB_UNLIKELY(helper.is_log_out_of_range(entry.get_serialize_size()))) {
+    } else if (OB_UNLIKELY(helper.is_log_out_of_range(serialize_size))) {
       // Committed logs can only be truncated in failover, and the commit_lsn before failover may be not match a log group entry,
       // and the log may not match the buffer for the task
       ret = OB_EAGAIN;
@@ -642,7 +654,7 @@ int ObArchiveFetcher::generate_send_buffer_(PalfGroupBufferIterator &iter, TmpMe
         } else {
           ARCHIVE_LOG(INFO, "set next piece succ", K(piece), K(entry), K(helper));
         }
-      } else if (OB_FAIL(append_log_entry_(buffer, entry, helper))) {
+      } else if (OB_FAIL(append_log_entry_(buffer, entry, helper, offset))) {
         ARCHIVE_LOG(WARN, "helper append buf failed", K(ret));
       } else {
         iter_end = helper.reach_end();
@@ -689,9 +701,9 @@ int ObArchiveFetcher::fill_helper_piece_if_empty_(const ObArchivePiece &piece, T
   return ret;
 }
 
-int ObArchiveFetcher::append_log_entry_(const char *buffer, LogGroupEntry &entry, TmpMemoryHelper &helper)
+int ObArchiveFetcher::append_log_entry_(const char *buffer, ipalf::IGroupEntry &entry, TmpMemoryHelper &helper, const LSN &lsn)
 {
-  return helper.append_log_entry(buffer, entry);
+  return helper.append_log_entry(buffer, entry, lsn);
 }
 
 bool ObArchiveFetcher::cached_buffer_full_(TmpMemoryHelper &helper)
@@ -814,7 +826,8 @@ int ObArchiveFetcher::submit_fetch_log_(ObArchiveLogFetchTask &task, bool &submi
     // just skip
   } else {
     GET_LS_TASK_CTX(ls_mgr_, id) {
-      if (OB_FAIL(ls_archive_task->push_fetch_log(task))) {
+      if (OB_FALSE_IT(task.submit_dest_queue_ts_ = common::ObTimeUtility::fast_current_time())) {
+      } else if (OB_FAIL(ls_archive_task->push_fetch_log(task))) {
         ARCHIVE_LOG(WARN, "push fetch log failed", K(ret), K(id), K(task));
       } else {
         submitted = true;
@@ -878,17 +891,26 @@ int ObArchiveFetcher::try_consume_fetch_log_(const ObLSID &id)
         ARCHIVE_LOG(ERROR, "clear send task failed", K(ret), KPC(task));
       } else if (OB_FAIL(update_fetcher_progress_(*ls_archive_task, *task))) {
         ARCHIVE_LOG(WARN, "update fetcher progresss failed", K(ret), KPC(task), KPC(ls_archive_task));
-      } else if (check_log_fetch_task_consume_complete_(*task)) {
-        // free log fetch task
-        inner_free_task_(task);
-        task = NULL;
-      } else if (OB_FAIL(submit_residual_log_fetch_task_(*task))) {
-        ARCHIVE_LOG(WARN, "submit residual log fetch task failed", K(ret), KPC(task));
       } else {
-        // task not complete if need re-submit to task queue
-        // although get_sorted_fetch_log interface check this condition
-        need_break = true;
-        ARCHIVE_LOG(TRACE, "consume log fetch task succ", K(id));
+        task->consume_ts_ = ObTimeUtility::current_time();
+
+        ARCHIVE_LOG(INFO, "print fetch task stat", KP(task),
+                    "generate_to_push_cost", task->push_fetch_queue_ts_ - task->generate_ts_,
+                    "push_to_submit_cost", task->submit_dest_queue_ts_ - task->push_fetch_queue_ts_,
+                    "submit_to_consume_cost", task->consume_ts_ - task->submit_dest_queue_ts_);
+
+        if (check_log_fetch_task_consume_complete_(*task)) {
+          // free log fetch task
+          inner_free_task_(task);
+          task = NULL;
+        } else if (OB_FAIL(submit_residual_log_fetch_task_(*task))) {
+          ARCHIVE_LOG(WARN, "submit residual log fetch task failed", K(ret), KPC(task));
+        } else {
+          // task not complete if need re-submit to task queue
+          // although get_sorted_fetch_log interface check this condition
+          need_break = true;
+          ARCHIVE_LOG(TRACE, "consume log fetch task succ", K(id));
+        }
       }
 
       if (OB_FAIL(ret) && NULL != task) {
@@ -957,10 +979,15 @@ int ObArchiveFetcher::submit_residual_log_fetch_task_(ObArchiveLogFetchTask &tas
   if (OB_UNLIKELY(cur_piece.is_valid() && cur_offset == start_offset)) {
     ret = OB_INVALID_ARGUMENT;
     ARCHIVE_LOG(WARN, "invalid argument", K(ret), K(task));
-  } else if (OB_FAIL(task_queue_.push(&task))) {
-    ARCHIVE_LOG(WARN, "push task failed", K(ret), K(task));
   } else {
-    ARCHIVE_LOG(TRACE, "submit residual log fetch task succ", KP(&task));
+    task.push_fetch_queue_ts_ = common::ObTimeUtility::fast_current_time();
+    task.consume_ts_ = OB_INVALID_TIMESTAMP;
+    task.submit_dest_queue_ts_ = OB_INVALID_TIMESTAMP;
+    if (OB_FAIL(task_queue_.push(&task))) {
+      ARCHIVE_LOG(WARN, "push task failed", K(ret), K(task));
+    } else {
+      ARCHIVE_LOG(TRACE, "submit residual log fetch task succ", KP(&task));
+    }
   }
   return ret;
 }
@@ -973,6 +1000,7 @@ int ObArchiveFetcher::submit_send_task_(ObArchiveSendTask *send_task)
     ret = OB_INVALID_ARGUMENT;
     ARCHIVE_LOG(WARN, "invalid argument", K(ret), KP(send_task));
   } else if (FALSE_IT(buf_size = send_task->get_buf_size())) {
+  } else if (OB_FALSE_IT(send_task->submit_ts_ = common::ObTimeUtility::fast_current_time())) {
   } else if (OB_FAIL(archive_sender_->submit_send_task(send_task))) {
     ARCHIVE_LOG(WARN, "submit send task failed", K(ret), KPC(send_task));
   } else {
@@ -1176,10 +1204,10 @@ int ObArchiveFetcher::TmpMemoryHelper::set_piece(const ObArchivePiece &piece)
   return ret;
 }
 
-int ObArchiveFetcher::TmpMemoryHelper::append_log_entry(const char *buffer, LogGroupEntry &entry)
+int ObArchiveFetcher::TmpMemoryHelper::append_log_entry(const char *buffer, ipalf::IGroupEntry &entry, const LSN &lsn)
 {
   int ret = OB_SUCCESS;
-  int64_t entry_size = entry.get_serialize_size();
+  int64_t entry_size = entry.get_serialize_size(lsn);
   const SCN &scn = entry.get_scn();
 
   origin_buf_ = buffer;

@@ -16,6 +16,8 @@
 #include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "share/ob_dml_sql_splicer.h"
 #include "share/schema/ob_schema_utils.h"
+#include "share/schema/ob_table_schema.h"
+#include "share/compaction_ttl/ob_compaction_ttl_util.h"
 
 namespace oceanbase
 {
@@ -50,6 +52,7 @@ ObMLogInfo &ObMLogInfo::operator=(const ObMLogInfo &src_schema)
     last_purge_date_ = src_schema.last_purge_date_;
     last_purge_time_ = src_schema.last_purge_time_;
     last_purge_rows_ = src_schema.last_purge_rows_;
+    last_purge_method_ = src_schema.last_purge_method_;
     schema_version_ = src_schema.schema_version_;
     if (OB_FAIL(deep_copy_str(src_schema.purge_next_, purge_next_))) {
       LOG_WARN("deep copy purge next failed", KR(ret), K(src_schema.purge_next_));
@@ -93,6 +96,7 @@ void ObMLogInfo::reset()
   last_purge_time_ = OB_INVALID_COUNT;
   last_purge_rows_ = OB_INVALID_COUNT;
   reset_string(last_purge_trace_id_);
+  last_purge_method_ = ObMLogPurgeMethod::MAX;
   schema_version_ = OB_INVALID_VERSION;
   ObSchema::reset();
 }
@@ -119,12 +123,16 @@ OB_SERIALIZE_MEMBER(ObMLogInfo,
                     last_purge_time_,
                     last_purge_rows_,
                     last_purge_trace_id_,
-                    schema_version_);
+                    schema_version_,
+                    last_purge_method_);
 
 int ObMLogInfo::gen_insert_mlog_dml(const uint64_t exec_tenant_id, ObDMLSqlSplicer &dml) const
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(dml.add_pk_column("tenant_id", 0)) ||
+  uint64_t data_version = 0;
+  if (OB_FAIL(GET_MIN_DATA_VERSION(get_tenant_id(), data_version))) {
+    LOG_WARN("fail to get data version", KR(ret), K(get_tenant_id()));
+  } else if (OB_FAIL(dml.add_pk_column("tenant_id", 0)) ||
       OB_FAIL(dml.add_pk_column("mlog_id", mlog_id_)) ||
       OB_FAIL(dml.add_column("purge_mode", purge_mode_)) ||
       (OB_INVALID_TIMESTAMP != purge_start_ &&
@@ -144,6 +152,9 @@ int ObMLogInfo::gen_insert_mlog_dml(const uint64_t exec_tenant_id, ObDMLSqlSplic
       (!last_purge_trace_id_.empty() &&
        OB_FAIL(dml.add_column("last_purge_trace_id", ObHexEscapeSqlStr(last_purge_trace_id_)))) ||
       OB_FAIL(dml.add_column("schema_version", schema_version_))) {
+    LOG_WARN("add column failed", KR(ret));
+  } else if (data_version >= ObCompactionTTLUtil::COMPACTION_TTL_CMP_DATA_VERSION
+             && OB_FAIL(dml.add_column("last_purge_method", static_cast<int64_t>(last_purge_method_)))) {
     LOG_WARN("add column failed", KR(ret));
   }
   return ret;
@@ -234,12 +245,15 @@ int ObMLogInfo::gen_update_mlog_last_purge_info_dml(const uint64_t exec_tenant_i
                                                     ObDMLSqlSplicer &dml) const
 {
   int ret = OB_SUCCESS;
+  uint64_t data_version = 0;
   if (OB_UNLIKELY(OB_INVALID_SCN_VAL == last_purge_scn_ ||
                   OB_INVALID_TIMESTAMP == last_purge_date_ ||
                   OB_INVALID_COUNT == last_purge_time_ || OB_INVALID_COUNT == last_purge_rows_ ||
                   last_purge_trace_id_.empty())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid mlog last purge info", KR(ret), KPC(this));
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(get_tenant_id(), data_version))) {
+    LOG_WARN("fail to get data version", KR(ret));
   } else if (OB_FAIL(dml.add_pk_column("tenant_id", 0)) ||
              OB_FAIL(dml.add_pk_column("mlog_id", mlog_id_)) ||
              OB_FAIL(dml.add_uint64_column("last_purge_scn", last_purge_scn_)) ||
@@ -248,6 +262,9 @@ int ObMLogInfo::gen_update_mlog_last_purge_info_dml(const uint64_t exec_tenant_i
              OB_FAIL(dml.add_column("last_purge_rows", last_purge_rows_)) ||
              OB_FAIL(
                dml.add_column("last_purge_trace_id", ObHexEscapeSqlStr(last_purge_trace_id_)))) {
+    LOG_WARN("add column failed", KR(ret));
+  } else if (data_version >= ObCompactionTTLUtil::COMPACTION_TTL_CMP_DATA_VERSION
+             && OB_FAIL(dml.add_column("last_purge_method", static_cast<int64_t>(last_purge_method_)))) {
     LOG_WARN("add column failed", KR(ret));
   }
   return ret;
@@ -391,6 +408,10 @@ int ObMLogInfo::fetch_mlog_info(ObISQLClient &sql_client, uint64_t tenant_id, ui
                                                           int64_t, true, false, OB_INVALID_COUNT);
       EXTRACT_VARCHAR_FIELD_TO_CLASS_MYSQL_SKIP_RET(*result, last_purge_trace_id, mlog_info);
       EXTRACT_INT_FIELD_TO_CLASS_MYSQL(*result, schema_version, mlog_info, int64_t);
+      if (compat_version >= ObCompactionTTLUtil::COMPACTION_TTL_CMP_DATA_VERSION) {
+        EXTRACT_INT_FIELD_TO_CLASS_MYSQL_WITH_DEFAULT_VALUE(*result, last_purge_method, mlog_info,
+          ObMLogPurgeMethod, true, false, ObMLogPurgeMethod::MAX);
+      }
     }
   }
   return ret;
@@ -436,6 +457,38 @@ int ObMLogInfo::batch_fetch_mlog_ids(ObISQLClient &sql_client, uint64_t tenant_i
       OZ(mlog_ids.push_back(mlog_id));
     }
   }
+  return ret;
+}
+
+
+int ObMLogInfo::insert_mlog_info_for_rebuild_mlog(
+                ObISQLClient &sql_client,
+                const uint64_t tenant_id,
+                const uint64_t orig_mlog_id,
+                const ObTableSchema &new_mlog_schema)
+{
+  int ret = OB_SUCCESS;
+  ObMLogInfo mlog_info;
+  uint64_t new_mlog_tid = new_mlog_schema.get_table_id();
+  if (tenant_id == OB_INVALID_ID || orig_mlog_id == OB_INVALID_ID) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(tenant_id), K(orig_mlog_id));
+  } else if (OB_FAIL(ObMLogInfo::fetch_mlog_info(sql_client,
+              tenant_id, orig_mlog_id, mlog_info, false/*for_update*/))) {
+    LOG_WARN("failed to fetch mlog info", KR(ret), K(tenant_id), K(orig_mlog_id));
+  } else if (!mlog_info.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("fetch invalid mlog info", K(ret), K(mlog_info));
+  } else if (OB_FALSE_IT(mlog_info.set_mlog_id(new_mlog_tid))) {
+  } else if (new_mlog_schema.get_schema_version() <= mlog_info.get_schema_version()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("new mlog's schema version small than old mlog", K(ret),
+             K(mlog_info), K(new_mlog_schema.get_schema_version()));
+  } else if (OB_FALSE_IT(mlog_info.set_schema_version(new_mlog_schema.get_schema_version()))) {
+  } else if (OB_FAIL(ObMLogInfo::insert_mlog_info(sql_client, mlog_info))) {
+    LOG_WARN("fail to insert mlog info", KR(ret), K(mlog_info));
+  }
+  LOG_INFO("insert mlog info when rebuild mlog", K(ret), K(mlog_info));
   return ret;
 }
 

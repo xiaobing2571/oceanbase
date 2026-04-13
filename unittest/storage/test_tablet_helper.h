@@ -27,9 +27,20 @@
 #include "storage/tablet/ob_tablet_create_delete_helper.h"
 #include "storage/tablet/ob_tablet_obj_load_helper.h"
 #include "storage/init_basic_struct.h"
+#include "share/ob_upgrade_utils.h"
+#include "common/ob_version_def.h"
 
 namespace oceanbase
 {
+namespace common
+{
+// for unittest, return the current data version
+int ObClusterVersion::get_tenant_data_version(const uint64_t tenant_id, uint64_t &data_version)
+{
+  data_version = DATA_CURRENT_VERSION;
+  return OB_SUCCESS;
+}
+}
 namespace storage
 {
 class TestTabletHelper
@@ -148,8 +159,8 @@ inline int TestTabletHelper::create_tablet(
         *tablet_handle.get_allocator(),
         ls_id, tablet_id, tablet_id, share::SCN::base_scn(),
         snapshot_version, create_tablet_schema, need_create_empty_major_sstable, share::SCN::invalid_scn()/*clog_checkpoint_scn*/,
-        share::SCN::invalid_scn()/*mds_checkpoint_scn*/, false/*is_split_dest_tablet*/, ObTabletID()/*split_src_tablet_id*/,
-        false/*micro_index_clustered*/, need_generate_cs_replica_cg_array, false/*has_cs_replica*/, freezer))){
+        share::SCN::invalid_scn()/*mds_checkpoint_scn*/, share::ObSplitTabletInfo()/*split_info*/,
+        false/*micro_index_clustered*/, need_generate_cs_replica_cg_array, false/*has_cs_replica*/, DATA_VERSION_4_3_0_0, freezer))){
       STORAGE_LOG(WARN, "failed to init tablet", K(ret), K(ls_id), K(tablet_id));
     } else if (ObTabletStatus::Status::MAX != tablet_status) {
       ObTabletCreateDeleteMdsUserData data;

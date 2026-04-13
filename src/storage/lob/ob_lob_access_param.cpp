@@ -48,6 +48,7 @@ int ObLobAccessParam::assign(const ObLobAccessParam& other)
   this->tablet_id_ = other.tablet_id_;
   this->lob_meta_tablet_id_ = other.lob_meta_tablet_id_;
   this->lob_piece_tablet_id_ = other.lob_piece_tablet_id_;
+  this->specified_tablet_id_ = other.specified_tablet_id_;
 
   this->coll_type_ = other.coll_type_;
   this->lob_locator_ = other.lob_locator_;
@@ -478,7 +479,8 @@ int ObLobAccessParam::get_tx_read_snapshot(ObLobLocatorV2 &locator, transaction:
     int64_t read_snapshot_data_pos = 0;
     if (OB_FAIL(locator.get_read_snapshot_data(read_snapshot_data))) {
       LOG_WARN("failed to get read_snapshot_data", K(ret), K(locator));
-    } else if (OB_FAIL(read_snapshot.deserialize_for_lob(read_snapshot_data.ptr(), read_snapshot_data.length(), read_snapshot_data_pos))) {
+    } else if (OB_FAIL(read_snapshot.deserialize_for_lob(fb_snapshot_,
+        read_snapshot_data.ptr(), read_snapshot_data.length(), read_snapshot_data_pos))) {
       LOG_WARN("failed to deserialize read_snapshot_data", K(ret), K(locator));
     }
   // for compatibility

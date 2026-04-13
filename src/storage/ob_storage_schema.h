@@ -76,7 +76,7 @@ public:
   int legacy_deserialize(const char *buf, const int64_t data_len, int64_t &pos);
   int legacy_serialize(char *buf, const int64_t buf_len, int64_t &pos) const;
   int64_t legacy_serialize_len() const;
-
+  bool is_schema_changed(const ObStorageColumnSchema &other) const;
   TO_STRING_KV(K_(meta_type), K_(is_column_stored_in_sstable), K_(is_rowkey_column),
       K_(is_generated_column), K_(orig_default_value));
 
@@ -148,6 +148,7 @@ public:
   int deserialize(common::ObIAllocator &allocator, const char *buf, const int64_t data_len, int64_t &pos);
   int64_t get_serialize_size() const;
   int deep_copy(const ObStorageColumnGroupSchema &other, common::ObIAllocator &allocator);
+  int truncate_all_column_group(const int64_t schema_store_column_cnt);
   OB_INLINE bool is_all_column_group() const { return type_ == share::schema::ALL_COLUMN_GROUP; }
   OB_INLINE bool is_default_column_group () const { return type_ == share::schema::DEFAULT_COLUMN_GROUP; }
   OB_INLINE bool is_rowkey_column_group() const { return type_ == share::schema::ROWKEY_COLUMN_GROUP; }
@@ -158,6 +159,7 @@ public:
   { // column_idxs_ is null for all cg
     return (nullptr == column_idxs_) ? col_idx : column_idxs_[col_idx];
   }
+  bool is_schema_changed(const ObStorageColumnGroupSchema &other) const;
   TO_STRING_KV(K_(version), K_(type), K_(compressor_type), K_(row_store_type), K_(block_size), K_(schema_column_cnt), K_(rowkey_column_cnt),
       K_(schema_rowkey_column_cnt), K_(column_cnt), "column_idxs", ObArrayWrap<uint16_t>(column_idxs_, column_cnt_));
 public:
@@ -234,6 +236,7 @@ public:
   void reset_column_group_array();
   void reset();
   virtual bool is_valid() const override;
+  bool is_schema_changed(const ObStorageSchema &other_schema) const;
   // serialize & deserialize
   int serialize(char *buf, const int64_t buf_len, int64_t &pos) const;
   int deserialize(
@@ -242,7 +245,10 @@ public:
       const int64_t data_len,
       int64_t &pos);
   int64_t get_serialize_size() const;
-  void update_column_cnt(const int64_t input_col_cnt);
+  void update_column_cnt_and_schema_version(
+      const int64_t input_col_cnt,
+      const int64_t input_store_col_cnt,
+      const int64_t input_schema_version);
 
   // for new mds
   int assign(common::ObIAllocator &allocator, const ObStorageSchema &other);
@@ -258,12 +264,15 @@ public:
   inline int64_t get_column_group_count() const { return column_group_array_.count(); }
   inline int64_t has_all_column_group() const { return has_all_column_group_; }
   inline bool is_row_store() const { return column_group_array_.count() <= 1; }
+  virtual int get_is_column_store(bool &is_column_store) const override { is_column_store = !is_row_store(); return OB_SUCCESS; }
   inline bool need_generate_cg_array() const { return column_group_array_.count() <= column_array_.count(); }
   virtual inline int64_t get_pctfree() const override { return pctfree_; }
   virtual inline int64_t get_progressive_merge_round() const override { return progressive_merge_round_; }
   virtual inline int64_t get_progressive_merge_num() const override { return progressive_merge_num_; }
   virtual inline uint64_t get_master_key_id() const override { return master_key_id_; }
   virtual inline bool is_use_bloomfilter() const override { return is_use_bloomfilter_; }
+  virtual inline bool has_ttl_definition() const override { return has_ttl_definition_; }
+  virtual inline bool was_compaction_ttl() const override { return was_compaction_ttl_; }
   virtual inline bool is_index_table() const override { return share::schema::is_index_table(table_type_); }
   virtual inline bool is_storage_index_table() const override
   {
@@ -296,8 +305,11 @@ public:
   virtual int get_store_column_count(int64_t &column_count, const bool full_col) const override;
   int get_stored_column_count_in_sstable(int64_t &column_count) const;
   virtual int get_multi_version_column_descs(common::ObIArray<share::schema::ObColDesc> &column_descs) const override;
+  int get_multi_version_column_descs(common::ObIArray<share::schema::ObColDesc> &column_descs, bool no_virtual) const;
   virtual int get_rowkey_column_ids(common::ObIArray<share::schema::ObColDesc> &column_ids) const override;
-  virtual int get_skip_index_col_attr(common::ObIArray<share::schema::ObSkipIndexColumnAttr> &skip_idx_metas) const override;
+  virtual int get_skip_index_col_attr_by_schema(common::ObIArray<share::schema::ObSkipIndexColumnAttr> &skip_idx_metas,
+                                                ObSEArray<ObObjMeta, 16> *column_types=nullptr,
+                                                const bool only_set_fts=false) const override;
   virtual int get_encryption_id(int64_t &encrypt_id) const override;
   virtual const common::ObString &get_encryption_str() const override { return encryption_; }
   virtual bool need_encrypt() const override;
@@ -318,6 +330,10 @@ public:
     type = semistruct_encoding_type_;
     return OB_SUCCESS;
   }
+  virtual const common::ObString& get_semistruct_properties() const override
+  {
+    return semistruct_properties_;
+  }
   virtual inline share::schema::ObTableType get_table_type() const override { return table_type_; }
   virtual inline share::schema::ObIndexType get_index_type() const override { return index_type_; }
   const common::ObIArray<ObStorageColumnSchema> &get_store_column_schemas() const { return column_array_; }
@@ -327,6 +343,8 @@ public:
   virtual inline common::ObCompressorType get_compressor_type() const override { return compressor_type_; }
   virtual inline ObMergeEngineType get_merge_engine_type() const override { return merge_engine_type_; }
   virtual inline bool is_delete_insert_merge_engine() const override { return ObMergeEngineType::OB_MERGE_ENGINE_DELETE_INSERT == merge_engine_type_; }
+  virtual inline bool is_append_only_merge_engine() const override { return ObMergeEngineType::OB_MERGE_ENGINE_APPEND_ONLY == merge_engine_type_; }
+  virtual inline ObSkipIndexLevel get_skip_index_level() const override { return skip_index_level_; }
   virtual inline bool is_column_info_simplified() const override { return column_info_simplified_; }
 
   virtual int init_column_meta_array(
@@ -358,16 +376,21 @@ public:
   OB_INLINE bool is_user_hidden_table() const { return share::schema::TABLE_STATE_IS_HIDDEN_MASK & table_mode_.state_flag_; }
   OB_INLINE bool is_cs_replica_compat() const { return is_cs_replica_compat_; }
   OB_INLINE bool get_enable_macro_block_bloom_filter() const override { return enable_macro_block_bloom_filter_; }
+  OB_INLINE int64_t get_micro_block_format_version() const override { return micro_block_format_version_; }
+  OB_INLINE ObRowStoreType get_minor_row_store_type() const { return minor_row_store_type_; }
   int set_storage_schema_version(const uint64_t tenant_data_version);
+  int update_column_info(const share::schema::ObTableSchema &input_schema, const uint64_t tenant_data_version = DATA_CURRENT_VERSION);
+  void set_minor_row_store_type(const ObRowStoreType minor_row_store_type) { minor_row_store_type_ = minor_row_store_type; }
 
   VIRTUAL_TO_STRING_KV(KP(this), K_(storage_schema_version), K_(version),
-      K_(is_use_bloomfilter), K_(column_info_simplified), K_(compat_mode), K_(table_type), K_(index_type),
+      K_(column_info_simplified), K_(merge_engine_type), K_(has_ttl_definition), K_(was_compaction_ttl), K_(compat_mode), K_(table_type), K_(index_type),
       K_(row_store_type), K_(schema_version), K_(is_cs_replica_compat), K_(is_column_table_schema), K_(enable_macro_block_bloom_filter),
       K_(column_cnt), K_(store_column_cnt), K_(tablet_size), K_(pctfree), K_(block_size), K_(progressive_merge_round),
-      K_(master_key_id), K_(compressor_type), K_(encryption), K_(encrypt_key),
+      K_(master_key_id), K_(compressor_type), K_(encryption), K_(encrypt_key), K_(is_use_bloomfilter),
       "rowkey_cnt", rowkey_array_.count(), K_(rowkey_array), "column_cnt", column_array_.count(), K_(column_array),
       "skip_index_cnt", skip_idx_attr_array_.count(), K_(skip_idx_attr_array),
-      "column_group_cnt", column_group_array_.count(), K_(column_group_array), K_(has_all_column_group), K_(merge_engine_type));
+      "column_group_cnt", column_group_array_.count(), K_(column_group_array), K_(has_all_column_group),
+      K_(micro_block_format_version), K_(minor_row_store_type), K_(skip_index_level));
 public:
   static int trim(const ObCollationType type, blocksstable::ObStorageDatum &storage_datum);
 private:
@@ -377,7 +400,8 @@ private:
   inline bool is_view_table() const { return share::schema::ObTableType::USER_VIEW == table_type_ || share::schema::ObTableType::SYSTEM_VIEW == table_type_ || share::schema::ObTableType::MATERIALIZED_VIEW == table_type_; }
 
   int generate_str(const share::schema::ObTableSchema &input_schema);
-  int generate_column_array(const share::schema::ObTableSchema &input_schema);
+  int generate_column_array(const share::schema::ObTableSchema &input_schema, const uint64_t tenant_data_version = DATA_CURRENT_VERSION);
+  int add_column(const share::schema::ObColumnSchemaV2 &col_schema, const uint64_t tenant_data_version = DATA_CURRENT_VERSION);
   int generate_column_group_array(const share::schema::ObTableSchema &input_schema, common::ObIAllocator &allocator);
   int generate_cs_replica_cg_array(common::ObIAllocator &allocator, ObIArray<ObStorageColumnGroupSchema> &cg_schemas) const; // also used by ddl
   int generate_cs_replica_cg_array();
@@ -411,7 +435,7 @@ public:
   static const int32_t SS_ONE_BIT = 1;
   static const int32_t SS_HALF_BYTE = 4;
   static const int32_t SS_ONE_BYTE = 8;
-  static const int32_t SS_RESERVED_BITS = 15;
+  static const int32_t SS_RESERVED_BITS = 13;
 
   // STORAGE_SCHEMA_VERSION is for serde compatibility.
   // Currently we do not use "standard" serde function macro,
@@ -424,11 +448,13 @@ public:
   static const int64_t STORAGE_SCHEMA_VERSION_V3 = 3; // add for cg_group
   static const int64_t STORAGE_SCHEMA_VERSION_V4 = 4;
   static const int64_t STORAGE_SCHEMA_VERSION_V5 = 5; // add for merge_engine_type_ and semistruct encoding type in 4.3.5 bp2
-  static const int64_t STORAGE_SCHEMA_VERSION_LATEST = STORAGE_SCHEMA_VERSION_V5;
+  static const int64_t STORAGE_SCHEMA_VERSION_V6 = 6; // add for micro_block_format_version and semistruct properties in 4.4.1 bp1
+  static const int64_t STORAGE_SCHEMA_VERSION_V7 = 7; // add for minor_row_store_type and skip_index_level in 4.5.1
+  static const int64_t STORAGE_SCHEMA_VERSION_LATEST = STORAGE_SCHEMA_VERSION_V7;
   common::ObIAllocator *allocator_;
   int64_t storage_schema_version_;
 
-  union {
+  union { //FARM COMPAT WHITELIST
     uint32_t info_;
     struct
     {
@@ -439,6 +465,8 @@ public:
       uint32_t is_cs_replica_compat_             : SS_ONE_BIT; // for storage schema on tablet
       uint32_t is_column_table_schema_           : SS_ONE_BIT;
       uint32_t enable_macro_block_bloom_filter_  : SS_ONE_BIT;
+      uint32_t has_ttl_definition_               : SS_ONE_BIT;
+      uint32_t was_compaction_ttl_               : SS_ONE_BIT;
       uint32_t reserved_                         : SS_RESERVED_BITS;
     };
   };
@@ -454,6 +482,7 @@ public:
   int64_t progressive_merge_round_;
   int64_t progressive_merge_num_;
   uint64_t master_key_id_; // for encryption
+  int64_t micro_block_format_version_;
   ObCompressorType compressor_type_;
   ObString encryption_; // for encryption
   ObString encrypt_key_; // for encryption
@@ -466,6 +495,10 @@ public:
   share::schema::ObMvMode mv_mode_;
   ObMergeEngineType merge_engine_type_;
   share::schema::ObSemiStructEncodingType semistruct_encoding_type_;
+  common::ObString semistruct_properties_;
+  // the value of minor_row_store_type_ is not based on the schema_version_
+  ObRowStoreType minor_row_store_type_;
+  ObSkipIndexLevel skip_index_level_;
   bool is_inited_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObStorageSchema);

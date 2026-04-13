@@ -24,6 +24,13 @@
 #include "share/schema/ob_outline_mgr.h"
 #include "share/schema/ob_udt_mgr.h"
 #include "share/schema/ob_catalog_schema_struct.h"
+#include "share/schema/ob_external_resource_mgr.h"
+#include "share/schema/ob_location_schema_struct.h"
+#include "share/schema/ob_objpriv_mysql_schema_struct.h"
+#include "share/schema/ob_ai_model_mgr.h"
+#include "share/schema/ob_ccl_schema_struct.h"
+#include "share/schema/ob_ccl_rule_mgr.h"
+#include "share/schema/ob_sensitive_rule_schema_struct.h"
 
 namespace oceanbase
 {
@@ -270,6 +277,7 @@ public:
   int get_simple_tenant_schemas(common::ObIArray<const ObSimpleTenantSchema *> &tenant_schemas) const;
 
   int get_tenant_ids(common::ObIArray<uint64_t> &tenant_ids) const;
+  int get_user_tenant_count(int64_t &count) const;
   int get_available_tenant_ids(common::ObIArray<uint64_t> &tenant_ids) const;
   int get_tablegroup_ids_in_tenant(const uint64_t tenant_id,
                                    common::ObIArray<uint64_t> &tablegroup_id_array);
@@ -495,6 +503,24 @@ public:
                          const common::ObIArray<uint64_t> &enable_role_id_array,
                          const common::ObString &catalog_name,
                          bool &allow_show);
+  int check_sensitive_rule_access(const ObSessionPrivInfo &session_priv,
+                                  const common::ObIArray<uint64_t> &enable_role_id_array,
+                                  const common::ObString &sensitive_rule_name);
+  int check_sensitive_rule_access(const ObSessionPrivInfo &session_priv,
+                                  const common::ObIArray<uint64_t> &enable_role_id_array,
+                                  const uint64_t sensitive_rule_id);
+  int check_sensitive_rule_db_access(const ObSessionPrivInfo &session_priv,
+                                     const common::ObIArray<uint64_t> &enable_role_id_array,
+                                     const common::ObString &sensitive_rule_name,
+                                     const common::ObString &database_name);
+  int check_sensitive_rule_db_access(const ObSessionPrivInfo &session_priv,
+                                     const common::ObIArray<uint64_t> &enable_role_id_array,
+                                     const uint64_t sensitive_rule_id,
+                                     const common::ObString &database_name);
+  int check_sensitive_rule_show(const ObSessionPrivInfo &session_priv,
+                                const common::ObIArray<uint64_t> &enable_role_id_array,
+                                const common::ObString &sensitive_rule_name,
+                                bool &allow_show);
   int check_db_access(ObSessionPrivInfo &s_priv,
                       const common::ObIArray<uint64_t> &enable_role_id_array,
                       const uint64_t catalog_id,
@@ -593,6 +619,11 @@ public:
   int get_catalog_priv_with_user_id(const uint64_t tenant_id,
                                     const uint64_t user_id,
                                     common::ObIArray<const ObCatalogPriv *> &catalog_privs);
+  int get_sensitive_rule_priv_set(const ObSensitiveRulePrivSortKey &sensitive_rule_priv_key,
+                                  ObPrivSet &priv_set);
+  int get_sensitive_rule_priv_with_user_id(const uint64_t tenant_id,
+                                           const uint64_t user_id,
+                                           common::ObIArray<const ObSensitiveRulePriv *> &sensitive_rule_privs);
   int get_db_priv_with_user_id(const uint64_t tenant_id,
                                const uint64_t user_id,
                                common::ObIArray<const ObDBPriv*> &db_privs);
@@ -634,9 +665,11 @@ public:
   int get_db_priv_set(const ObOriginalDBKey &db_priv_key, ObPrivSet &priv_set, bool is_pattern = false);
   int get_table_priv_set(const ObTablePrivSortKey &table_priv_key, ObPrivSet &priv_set);
   int get_routine_priv_set(const ObRoutinePrivSortKey &routine_priv_key, ObPrivSet &priv_set);
-  int get_obj_privs(
-      const ObObjPrivSortKey &obj_priv_key,
-      ObPackedObjPriv &obj_privs);
+  int get_obj_mysql_priv_set(const ObObjMysqlPrivSortKey &obj_mysql_priv_key, ObPrivSet &priv_set);
+  int get_obj_privs( const ObObjPrivSortKey &obj_priv_key, ObPackedObjPriv &obj_privs);
+  int get_obj_mysql_priv_with_user_id(const uint64_t tenant_id,
+                                      const uint64_t user_id,
+                                      ObIArray<const ObObjMysqlPriv *> &obj_mysql_privs);
   //TODO@xiyu: ObDDLOperator::drop_tablegroup
   int check_database_exists_in_tablegroup(
       const uint64_t tenant_id,
@@ -756,6 +789,9 @@ public:
                                   const common::ObString &pacakge_name,
                                   ObPackageType package_type,
                                   uint64_t &package_id);
+  int get_simple_trigger_schema(const uint64_t tenant_id,
+                                const uint64_t trigger_id,
+                                const ObSimpleTriggerSchema *&simple_trigger);
   //procedure
   inline int check_standalone_procedure_exist(uint64_t tenant_id, uint64_t database_id,
                                               const common::ObString &procedure_name, bool &exist) const
@@ -1010,7 +1046,8 @@ public:
                             sql::ObSQLSessionInfo *session_info,
                             const ObString &dblink_name,
                             bool is_reverse_link,
-                            uint64_t *current_scn);
+                            uint64_t *current_scn,
+                            bool &is_under_oracle12c);
   // dblink function end
 
   // directory function begin
@@ -1023,6 +1060,32 @@ public:
   int get_directory_schemas_in_tenant(const uint64_t tenant_id,
                                       common::ObIArray<const ObDirectorySchema *> &directory_schemas);
   // directory function end
+
+  // location function begin
+  int get_location_schema_by_name(const uint64_t tenant_id,
+                                  const common::ObString &name,
+                                  const ObLocationSchema *&schema);
+  int get_location_schema_by_id(const uint64_t tenant_id,
+                                const uint64_t location_id,
+                                const ObLocationSchema *&schema);
+  int get_location_schema_by_prefix_match_with_priv(const ObSessionPrivInfo &session_priv,
+                                                    const common::ObIArray<uint64_t> &enable_role_id_array,
+                                                    const uint64_t tenant_id,
+                                                    const common::ObString &access_path,
+                                                    const ObLocationSchema *&schema,
+                                                    const bool is_need_write_priv = false);
+  int get_location_schemas_in_tenant(const uint64_t tenant_id,
+                                     common::ObIArray<const ObLocationSchema *> &location_schemas);
+
+  int check_location_access(const ObSessionPrivInfo &session_priv,
+                            const common::ObIArray<uint64_t> &enable_role_id_array,
+                            const ObString &location_name,
+                            const bool is_need_write_priv = false);
+  int check_location_show(const ObSessionPrivInfo &session_priv,
+                          const common::ObIArray<uint64_t> &enable_role_id_array,
+                          const common::ObString &location_name,
+                          bool &allow_show);
+  // location function end
 
   // rls function begin
   int get_rls_policy_schema_by_name(const uint64_t tenant_id,
@@ -1071,6 +1134,39 @@ public:
                                const uint64_t catalog_id,
                                const ObCatalogSchema *&schema);
   // catalog function end
+
+  // external resource function begin
+  int get_external_resource_schema(const uint64_t &tenant_id,
+                                   const uint64_t &database_id,
+                                   const ObString &name,
+                                   const ObSimpleExternalResourceSchema *&schema);
+  int get_external_resource_schema(const uint64_t &tenant_id,
+                                   const uint64_t &external_resource_id,
+                                   const ObSimpleExternalResourceSchema *&schema);
+  int check_external_resource_exist(uint64_t tenant_id,
+                                    uint64_t database_id,
+                                    ObString name,
+                                    bool &is_exist);
+  // external resource function end
+
+  // sensitive rule function begin
+  int get_sensitive_rule_schema_count(const uint64_t tenant_id, int64_t &count);
+  int get_sensitive_rule_schema_by_name(const uint64_t tenant_id,
+                                        const common::ObString &name,
+                                        const ObSensitiveRuleSchema *&schema);
+  int get_sensitive_rule_schema_by_id(const uint64_t tenant_id,
+                                      const uint64_t sensitive_rule_id,
+                                      const ObSensitiveRuleSchema *&schema);
+  int get_sensitive_column_schemas_by_id(const uint64_t tenant_id,
+                                         const uint64_t sensitive_rule_id,
+                                         common::ObIArray<const ObSensitiveColumnSchema *> &schemas);
+  int get_sensitive_rule_schema_by_column(const uint64_t tenant_id,
+                                          const uint64_t table_id,
+                                          const uint64_t column_id,
+                                          const ObSensitiveRuleSchema *&schema);
+  int get_sensitive_rule_schemas_by_table(const ObTableSchema &table_schema,
+                                          ObIArray<const ObSensitiveRuleSchema *> &schemas);
+  // sensitive rule function end
 
   int check_user_exist(const uint64_t tenant_id,
                        const common::ObString &user_name,
@@ -1160,6 +1256,11 @@ public:
   GET_SIMPLE_SCHEMAS_IN_DATABASE_FUNC_DECLARE(package, ObSimplePackageSchema);
   GET_SIMPLE_SCHEMAS_IN_DATABASE_FUNC_DECLARE(routine, ObSimpleRoutineSchema);
   GET_SIMPLE_SCHEMAS_IN_DATABASE_FUNC_DECLARE(mock_fk_parent_table, ObSimpleMockFKParentTableSchema);
+  GET_SIMPLE_SCHEMAS_IN_DATABASE_FUNC_DECLARE(external_resource, ObSimpleExternalResourceSchema);
+
+  int get_vector_info_index_ids_in_tenant(const uint64_t tenant_id,
+                                          bool &has_ivf_index,
+                                          ObIArray<uint64_t> &table_ids);
 
   int check_routine_priv(const ObSessionPrivInfo &session_priv,
                          const common::ObIArray<uint64_t> &enable_role_id_array,
@@ -1167,10 +1268,38 @@ public:
 
   int check_routine_definer_existed(uint64_t tenant_id, const ObString &user_name, bool &existed);
 
+  int check_obj_mysql_priv(const ObSessionPrivInfo &session_priv,
+                           const common::ObIArray<uint64_t> &enable_role_id_array,
+                           const ObNeedPriv &obj_mysql_need_priv);
+  int get_obj_mysql_priv_with_obj_name(const uint64_t tenant_id,
+                                       const ObString &obj_name,
+                                       const uint64_t obj_type,
+                                       ObIArray<const ObObjMysqlPriv *> &obj_privs,
+                                       bool reset_flag);
+  // ai function
+  int get_ai_model_schema(const uint64_t tenant_id,
+                          const uint64_t ai_model_id,
+                          const ObAiModelSchema *&ai_model_schema);
+
+  int get_ai_model_schema(const uint64_t tenant_id,
+                          const ObString &ai_model_name,
+                          const ObAiModelSchema *&ai_model_schema);
+
+  int get_ccl_rule_with_name(const uint64_t tenant_id,
+                             const common::ObString &name,
+                             const ObCCLRuleSchema *&ccl_rule_schema);
+
+  int get_ccl_rule_with_ccl_rule_id(const uint64_t tenant_id,
+                                    const uint64_t ccl_rule_id,
+                                    const ObCCLRuleSchema *&ccl_rule_schema);
+
+  int get_ccl_rule_infos(const uint64_t tenant_id, CclRuleContainsInfo,
+                         ObCCLRuleMgr::CCLRuleInfos *&ccl_rule_infos);
+  int get_ccl_rule_count(const uint64_t tenant_id, uint64_t & count);
+
 private:
   int check_ssl_access(const ObUserInfo &user_info,
                        SSL *ssl_st);
-  int check_ssl_invited_cn(const uint64_t tenant_id, SSL *ssl_st);
   int check_catalog_priv(const ObSessionPrivInfo &session_priv,
                          const common::ObIArray<uint64_t> &enable_role_id_array,
                          const ObNeedPriv &need_priv);
@@ -1178,6 +1307,13 @@ private:
                          const common::ObIArray<uint64_t> &enable_role_id_array,
                          const ObNeedPriv &need_priv,
                          ObPrivSet &user_catalog_priv_set);
+  int check_sensitive_rule_priv(const ObSessionPrivInfo &session_priv,
+                                const common::ObIArray<uint64_t> &enable_role_id_array,
+                                const ObNeedPriv &need_priv);
+  int check_sensitive_rule_priv(const ObSessionPrivInfo &session_priv,
+                                const common::ObIArray<uint64_t> &enable_role_id_array,
+                                const ObNeedPriv &need_priv,
+                                ObPrivSet &user_sensitive_rule_priv_set);
   int check_db_priv(const ObSessionPrivInfo &session_priv,
                     const common::ObIArray<uint64_t> &enable_role_id_array,
                     const common::ObString &db,
@@ -1205,9 +1341,7 @@ private:
                               const uint64_t role_id,
                               ObSessionPrivInfo &s_priv,
                               common::ObIArray<uint64_t> &enable_role_id_array);
-  int get_simple_trigger_schema(const uint64_t tenant_id,
-                                const uint64_t trigger_id,
-                                const ObSimpleTriggerSchema *&simple_trigger);
+
   int get_simple_trigger_schema(const uint64_t tenant_id,
                                 const uint64_t database_id,
                                 const common::ObString &trigger_name,

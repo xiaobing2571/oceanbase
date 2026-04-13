@@ -151,7 +151,9 @@ ObServerSuperBlock::ObServerSuperBlock() : header_(), body_(), min_file_id_(0), 
 
 bool ObServerSuperBlock::is_valid() const
 {
-  return header_.is_valid() && body_.is_valid();
+  return header_.is_valid()
+         && body_.is_valid()
+         && max_file_id_ >= min_file_id_;
 }
 
 int64_t ObServerSuperBlock::get_serialize_size() const
@@ -354,14 +356,6 @@ void ObTenantSuperBlock::reset()
   max_file_id_ = 0;
 }
 
-void ObTenantSuperBlock::copy_snapshots_from(const ObTenantSuperBlock &other)
-{
-  snapshot_cnt_ = other.snapshot_cnt_;
-  for (int64_t i = 0; i < snapshot_cnt_; i++) {
-    tenant_snapshots_[i] = other.tenant_snapshots_[i];
-  }
-}
-
 bool ObTenantSuperBlock::is_valid() const
 {
   bool is_valid = OB_INVALID_TENANT_ID != tenant_id_
@@ -373,7 +367,8 @@ bool ObTenantSuperBlock::is_valid() const
                   && (is_old_version() || IS_EMPTY_BLOCK_LIST(tablet_meta_entry_))
                   && snapshot_cnt_ >= 0
                   && auto_inc_ls_epoch_ >= 0
-                  && ls_cnt_ >= 0;
+                  && ls_cnt_ >= 0
+                  && max_file_id_ >= min_file_id_;
   return is_valid;
 }
 
@@ -577,7 +572,7 @@ ObActiveTabletItem::ObActiveTabletItem(const common::ObTabletID tablet_id, const
 
 bool ObActiveTabletItem::is_valid() const {
   return tablet_id_.is_valid()
-      && get_transfer_seq() != share::OB_INVALID_TRANSFER_SEQ
+      && get_transfer_epoch() != share::OB_INVALID_TRANSFER_SEQ
       && get_tablet_meta_version() != blocksstable::ObStorageObjectOpt::INVALID_TABLET_VERSION;
 }
 
@@ -593,7 +588,14 @@ int ObLSActiveTabletArray::assign(const ObLSActiveTabletArray &other)
   return ret;
 }
 
-OB_SERIALIZE_MEMBER(ObPendingFreeTabletItem, tablet_id_, tablet_meta_version_, status_, free_time_, gc_type_, tablet_transfer_seq_);
+OB_SERIALIZE_MEMBER(ObPendingFreeTabletItem,
+                    tablet_id_,
+                    tablet_meta_version_,
+                    status_,
+                    free_time_,
+                    gc_type_,
+                    tablet_private_transfer_epoch_ // FARM COMPAT WHITELIST
+                    );
 OB_SERIALIZE_MEMBER(ObLSPendingFreeTabletArray,
                     ls_id_, // FARM COMPAT WHITELIST
                     ls_epoch_, // FARM COMPAT WHITELIST

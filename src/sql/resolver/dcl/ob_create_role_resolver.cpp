@@ -15,6 +15,7 @@
 #include "sql/resolver/dcl/ob_create_role_stmt.h"
 #include "sql/resolver/dcl/ob_set_password_resolver.h"
 #include "src/sql/resolver/ob_resolver_utils.h"
+#include "lib/encrypt/ob_encrypted_helper.h"
 
 namespace oceanbase
 {
@@ -113,16 +114,24 @@ int ObCreateRoleResolver::resolve(const ParseNode &parse_tree)
       LOG_WARN("pw_node is NULL", K(ret));
     } else {
       ObString password(pw_node->str_len_, pw_node->str_value_);
+      ObString plugin;
+      bool is_plugin_supported = true;
       if (1 == need_enc_node->value_) { // identified by 
         create_role_stmt->set_need_enc(true);
       } else {                          // identified by values
         create_role_stmt->set_need_enc(false);
-        if (!ObSetPasswordResolver::is_valid_mysql41_passwd(password)) {
-          ret = OB_ERR_PASSWORD_FORMAT;
-          LOG_WARN("Wrong password format", K(password), K(ret));
-        }
       }
-      OX (create_role_stmt->set_password(password);)
+      if (OB_FAIL(ret)) {
+      } else if (ObEncryptedHelper::is_caching_sha2_password_plugin(plugin)) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("caching_sha2_password is not supported for role", K(ret));
+      } else if (!create_role_stmt->get_need_enc() &&
+                 OB_FAIL(ObSetPasswordResolver::is_valid_encrypted_passwd(password, plugin))) {
+        ret = OB_ERR_PASSWORD_FORMAT;
+        LOG_WARN("Wrong password format", K(password), K(plugin), K(ret));
+      }
+      OX (create_role_stmt->set_password(password));
+      OX (create_role_stmt->set_plugin(ObEncryptedHelper::format_plugin_name(plugin)));
     }
   }
   // replace password to *** in query_string for audit

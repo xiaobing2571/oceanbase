@@ -73,19 +73,8 @@ private:
 class ObVectorQueryVidIterator
 {
 public:
-  ObVectorQueryVidIterator(int64_t total, int64_t *vid, int64_t extra_column_count, int64_t extra_info_actual_size, ObIAllocator *allocator)
-    : is_init_(false),
-      total_(total),
-      cur_pos_(0),
-      batch_size_(0),
-      vids_(vid),
-      extra_column_count_(extra_column_count),
-      extra_info_ptr_(),
-      row_(nullptr),
-      obj_(nullptr),
-      allocator_(allocator) {};
-
-  explicit ObVectorQueryVidIterator(int64_t extra_column_count, int64_t extra_info_actual_size)
+  explicit ObVectorQueryVidIterator(int64_t extra_column_count, int64_t extra_info_actual_size,
+                                   int64_t rel_cnt, common::hash::ObHashMap<int64_t, double*> *rel_map_ptr)
       : is_init_(false),
         total_(0),
         cur_pos_(0),
@@ -96,14 +85,16 @@ public:
         extra_info_ptr_(),
         row_(nullptr),
         obj_(nullptr),
-        allocator_(nullptr){};
+        allocator_(nullptr),
+        rel_count_(rel_cnt),
+        rel_map_ptr_(rel_map_ptr) {};
   virtual ~ObVectorQueryVidIterator() {};
-  int init();
-  int init(int64_t total, int64_t *vids, float *distance, ObIAllocator *allocator);
+  bool is_init() const { return is_init_; }
   int init(int64_t need_count, ObIAllocator *allocator);
   int add_results(int64_t add_cnt, int64_t *add_vids, float *add_distance, const ObVecExtraInfoPtr &extra_infos);
   int add_result(int64_t add_vids, float add_distance, const char *extra_info);
   int64_t get_total() const { return total_; }
+  void set_total(int64_t total) { if (total_ > total) { total_ = total; } }
   int64_t* get_vids() const { return vids_; }
   float* get_distance() const { return distance_; }
   int64_t get_extra_column_count() const { return extra_column_count_; }
@@ -112,8 +103,9 @@ public:
   int init(int64_t total, int64_t *vids, float *distance, const ObVecExtraInfoPtr &extra_info_ptr, ObIAllocator *allocator);
   void set_batch_size(int64_t batch_size) { batch_size_ = batch_size; }
   bool get_enough() { return total_ >= alloc_size_; }
+  int reset_obj();
 
-  virtual int get_next_row(ObNewRow *&row, const sql::ExprFixedArray& res_exprs);
+  virtual int get_next_row(ObNewRow *&row, const sql::ExprFixedArray& res_exprs, const bool no_rel = false);
   virtual int get_next_rows(ObNewRow *&row, int64_t &size, const sql::ExprFixedArray& res_exprs);
   virtual void reset();
   TO_STRING_EMPTY();
@@ -132,37 +124,105 @@ private:
   ObNewRow *row_;
   ObObj *obj_;
   ObIAllocator *allocator_;
+  int64_t rel_count_;
+  common::hash::ObHashMap<int64_t, double*> *rel_map_ptr_;
 };
 
 struct ObVsagQueryResult
 {
+  ObVsagQueryResult():
+    total_(0), vids_(nullptr), distances_(nullptr), extra_info_buf_ptr_(nullptr),
+    extra_info_ptr_(), mem_ctx_(nullptr), idx_(0) {}
+
+  TO_STRING_KV(K_(total), KP_(vids), KP_(distances), KP_(extra_info_buf_ptr),
+      K_(extra_info_ptr), KP_(mem_ctx), K_(idx))
+
   int64_t total_;
   const int64_t *vids_;
   const float *distances_;
+  const char *extra_info_buf_ptr_;
   ObVecExtraInfoPtr extra_info_ptr_;
+  // for free vsag result memory when use sparse vector
+  ObVsagMemContext *mem_ctx_;
+  // for result merge
+  int64_t idx_;
 };
+
+typedef ObSEArray<ObVsagQueryResult*, 4> ObVsagQueryResultArray;
 
 class ObPluginVectorIndexHelper final
 {
 public:
-  static int merge_delta_and_snap_vids(const ObVsagQueryResult &first,
-                                       const ObVsagQueryResult &second,
-                                       const int64_t total,
-                                       int64_t &actual_cnt,
-                                       int64_t *&vids_result,
-                                       float *&float_result,
-                                       ObVecExtraInfoPtr &extra_info_result);
-
-  static int get_vector_memory_value_and_limit(const uint64_t tenant_id,
-                                               int64_t& value,
-                                               int64_t& upper_limit);
-
-  static int is_ob_vector_memory_valid(const uint64_t tenant_id,
-                                       bool& is_valid);
-
+  static int driect_merge_delta_and_snap_vids(
+                                              const ObVsagQueryResultArray &results,
+                                              int64_t &actual_cnt,
+                                              int64_t *&vids_result,
+                                              float *&float_result,
+                                              ObVecExtraInfoPtr &extra_info_result);
+  static int sort_merge_delta_and_snap_vids(
+                                            ObVsagQueryResultArray &results,
+                                            const int64_t total,
+                                            int64_t &actual_cnt,
+                                            int64_t *&vids_result,
+                                            float *&float_result,
+                                            ObVecExtraInfoPtr &extra_info_result);
   static int get_vector_memory_limit_size(const uint64_t tenant_id,
                                           int64_t& memory_limit);
-  static int vsag_errcode_2ob(int vsag_errcode);
+  static int get_active_segment_max_size(const uint64_t tenant_id, int64_t &size);
+  static int get_merge_base_percentage(const uint64_t tenant_id, int64_t &percentage);
+  static bool enable_persist_vector_index_incremental(const uint64_t tenant_id);
+};
+
+// RAII class for measuring function call latency
+// Uses OB_TSC_TIMESTAMP.fast_current_time() for optimal performance (rdtsc CPU instruction)
+class ObPluginVectorIndexAdaptor;
+class ObCostGuard
+{
+public:
+  // Default slow query threshold: 100ms = 100000us
+  static const int64_t KNN_SEARCH_SLOW_THRESHOLD_US = 100 * 1000;
+  explicit OB_INLINE ObCostGuard(int64_t threshold_us = KNN_SEARCH_SLOW_THRESHOLD_US)
+      : is_knn_search_(false),
+        start_ts_(OB_TSC_TIMESTAMP.fast_current_time()),
+        func_name_(nullptr),
+        context_(nullptr),
+        threshold_us_(threshold_us),
+        ef_search_(0),
+        limit_(0)
+  {}
+  OB_INLINE ObCostGuard(const void* context, const char *func_name, int64_t ef_search, int64_t limit)
+      : is_knn_search_(true),
+        start_ts_(OB_TSC_TIMESTAMP.fast_current_time()),
+        func_name_(func_name),
+        context_(context),
+        threshold_us_(KNN_SEARCH_SLOW_THRESHOLD_US),
+        ef_search_(ef_search),
+        limit_(limit)
+  {}
+
+  OB_INLINE ~ObCostGuard()
+  {
+    if (OB_LIKELY(is_knn_search_)) {
+      const int64_t cost_us = OB_TSC_TIMESTAMP.fast_current_time() - start_ts_;
+      if (OB_UNLIKELY(cost_us > threshold_us_)) {
+        OB_LOG_RET(WARN, OB_SUCCESS, "[VEC_INDEX][KNN_SEARCH] function cost too long", KP_(context), K_(func_name), "cost_ms", cost_us / 1000, K_(limit), K_(ef_search));
+      }
+    }
+  }
+  OB_INLINE int64_t cost_time_ms()
+  {
+    const int64_t cost_us = OB_TSC_TIMESTAMP.fast_current_time() - start_ts_;
+    return cost_us / 1000;
+  }
+
+private:
+  bool is_knn_search_;
+  int64_t start_ts_;
+  const char *func_name_;
+  const void *context_;  // adaptor or segment handler, for logging only
+  int64_t threshold_us_;
+  int64_t ef_search_;
+  int64_t limit_;
 };
 
 };

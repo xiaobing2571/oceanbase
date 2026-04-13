@@ -43,6 +43,8 @@ class ObPLRoutineInfo;
 }
 namespace sql
 {
+struct ObTriggerRowRefType;
+class ObTriggerArg;
 class ObRawExprUtils;
 class ObSynonymChecker;
 class ObRoutineMatchInfo
@@ -51,15 +53,28 @@ public:
   struct MatchInfo
   {
     MatchInfo()
-      : need_cast_(false), src_type_(ObMaxType), dest_type_(ObMaxType) {}
-    MatchInfo(bool need_cast, ObObjType src_type, ObObjType dst_type)
-      : need_cast_(need_cast), src_type_(src_type), dest_type_(dst_type) {}
+      : need_cast_(false),
+        src_type_(ObMaxType),
+        dest_type_(ObMaxType),
+        is_anonymous_associative_array_(false) {}
+
+    MatchInfo(bool need_cast,
+            ObObjType src_type,
+            ObObjType dst_type)
+    : need_cast_(need_cast),
+      src_type_(src_type),
+      dest_type_(dst_type),
+      is_anonymous_associative_array_(false) {}
 
     bool need_cast_;
     ObObjType src_type_;
     ObObjType dest_type_;
+    bool is_anonymous_associative_array_;
 
-    TO_STRING_KV(K_(need_cast), K_(src_type), K_(dest_type));
+    TO_STRING_KV(K_(need_cast),
+                 K_(src_type),
+                 K_(dest_type),
+                 K_(is_anonymous_associative_array));
   };
 
   bool need_cast()
@@ -92,6 +107,20 @@ public:
   ObObjType get_type(int i)
   {
     return match_info_.at(i).dest_type_;
+  }
+
+  bool is_anonymous_associative_array(int i) const
+  {
+    return match_info_.at(i).is_anonymous_associative_array_;
+  }
+
+  bool has_null_actual_params()
+  {
+    bool has_null_actual_params = false;
+    for (int64_t i = 0; i < match_info_.count(); ++i) {
+      has_null_actual_params = has_null_actual_params || ObNullType == match_info_.at(i).src_type_;
+    }
+    return has_null_actual_params;
   }
 
 public:
@@ -138,13 +167,6 @@ public:
                                            const ObString &column_name,
                                            bool& exists);
 
-  static int collect_schema_version(share::schema::ObSchemaGetterGuard &schema_guard,
-                                    const ObSQLSessionInfo *session_info,
-                                    ObRawExpr *expr,
-                                    ObIArray<ObSchemaObjVersion> &dependency_objects,
-                                    bool is_called_in_sql = false,
-                                    ObIArray<uint64_t> *dep_db_array = NULL);
-
   static int resolve_extended_type_info(const ParseNode &str_list_node,
                                         ObIArray<ObString>& type_info_array);
   static int resolve_collection_type_info(const uint64_t tenant_data_version,
@@ -167,7 +189,7 @@ public:
   static int resolve_sparse_vector_type_info(const ParseNode &type_node,
                                       ObStringBuffer &buf,
                                       uint8_t &depth);
-  inline static bool is_collection_support_type(const ObObjType type);
+  static bool is_collection_support_type(const ObObjType type);
   // type_infos is %ori_cs_type, need convert to %cs_type first
   static int check_extended_type_info(common::ObIAllocator &alloc,
                                       ObIArray<ObString> &type_infos,
@@ -260,6 +282,7 @@ public:
                    const common::ObIArray<sql::ObRawExpr *> &expr_params,
                    const common::ObIArray<const share::schema::ObIRoutineInfo *> &routine_infos,
                    const share::schema::ObRoutineInfo *&routine_info);
+  static int check_anonymous_associative_array(ObIArray<ObRoutineMatchInfo> &match_infos);
   static int get_routine(pl::ObPLPackageGuard &package_guard,
                          ObResolverParams &params,
                          uint64_t tenant_id,
@@ -296,7 +319,8 @@ public:
                              const ParseNode &sp_name_node,
                              ObString &db_name,
                              ObString &sp_name,
-                             bool need_db_name = true);
+                             bool need_db_name = true,
+                             const ObString *default_db_name = nullptr);
   static int resolve_synonym_object_recursively(ObSchemaChecker &schema_checker,
                                                 ObSynonymChecker &synonym_checker,
                                                 uint64_t tenant_id,
@@ -327,14 +351,15 @@ public:
                                      pl::ObPLBlockNS *ns,
                                      ObQualifiedName &q_name,
                                      ObIArray<ObQualifiedName> &columns,
-                                     ObIArray<ObRawExpr*> &real_exprs,
+                                     ObIArray<ObRawExpr *> &real_exprs,
                                      ObRawExpr *&expr,
                                      pl::ObPLPackageGuard *package_guard,
                                      const ParamStore *params,
                                      bool is_prepare_protocol = false,
                                      bool is_check_mode = false,
                                      bool is_sql_scope = false,
-                                     ObIArray<ObSchemaObjVersion> *dep_tbl = nullptr);
+                                     ObIArray<ObSchemaObjVersion> *dep_tbl = nullptr,
+                                     ObQueryCtx *query_ctx = nullptr);
   static int resolve_external_param_info(ExternalParams &param_info,
                                          const ObSQLSessionInfo &session_info,
                                          ObRawExprFactory &expr_factory,
@@ -383,6 +408,7 @@ public:
                            const ObCompatType compat_type,
                            const bool enable_mysql_compatible_dates,
                            int8_t min_const_integer_precision,
+                           uint64_t exec_min_cluster_version,
                            bool is_from_pl = false,
                            bool fmt_int_or_ch_decint = false);
 
@@ -402,7 +428,8 @@ public:
                                uint64_t tenant_id,
                                const bool enable_decimal_int_type,
                                const bool enable_mysql_compatible_dates,
-                               const bool convert_real_type_to_decimal = false);
+                               const bool convert_real_type_to_decimal = false,
+                               const bool is_external_table = false);
 
   static int resolve_str_charset_info(const ParseNode &type_node,
                                       common::ObDataType &data_type,
@@ -465,7 +492,10 @@ public:
                                                int64_t &expr_num,
                                                common::ObIArray<ObRawExpr *> &part_value_expr_array,
                                                const bool &in_tablegroup = false);
-  static int resolve_columns_for_partition_range_value_expr(ObRawExpr *&expr, ObArray<ObQualifiedName> &columns);
+  static int resolve_columns_for_partition_range_value_expr(ObIAllocator &allocator,
+                                                            const ObPartitionFuncType part_type,
+                                                            ObRawExpr *&expr,
+                                                            ObArray<ObQualifiedName> &columns);
   static int resolve_partition_range_value_expr(ObResolverParams &params,
                                                 const ParseNode &node,
                                                 const common::ObString &part_name,
@@ -741,6 +771,8 @@ public:
                                       bool &has_distinct);
   // check whether view is allowed to be WITH CHECK OPTION
   static int view_with_check_option_allowed(const ObSelectStmt *stmt, bool &with_check_option);
+  static int recursive_search_table_in_ref_query(const ObRawExpr &expr, int64_t table_id, bool &found);
+  static int recursive_search_table_in_ref_query(const ObSelectStmt *stmt, int64_t table_id, bool &found);
   static void set_stmt_type(const ObItemType item_type) { ObResolverUtils::item_type_ = item_type; }
 
   static common::ObString get_stmt_type_string(stmt::StmtType stmt_type);
@@ -797,7 +829,11 @@ public:
                                           int64_t table_id,
                                           int64_t column_idx,
                                           const ObString &expr_name);
+  static ObRawExpr *find_file_column_expr(ObIArray<ObRawExpr *> &pseudo_exprs,
+                                          int64_t table_id,
+                                          int64_t mapped_column_id);
   static int calc_file_column_idx(const ObString &column_name, uint64_t &file_column_idx);
+  static int calc_file_column_external_name(const ObString &column_name, ObString &external_column_name);
   static int build_file_column_expr_for_odps(
     ObRawExprFactory &expr_factory,
     const ObSQLSessionInfo &session_info,
@@ -807,6 +843,25 @@ public:
     int64_t column_idx,
     const ObColumnSchemaV2 *column_schema,
     ObRawExpr *&expr);
+  static int build_file_column_expr_for_iceberg(
+    ObRawExprFactory &expr_factory,
+    const ObSQLSessionInfo &session_info,
+    const uint64_t table_id,
+    const ObString &table_name,
+    const ObString &column_name,
+    int64_t column_idx,
+    const ObColumnSchemaV2 *generated_column,
+    ObRawExpr *&expr);
+  static int build_file_column_expr_for_kafka(
+    ObRawExprFactory &expr_factory,
+    const ObSQLSessionInfo &session_info,
+    const uint64_t table_id,
+    const common::ObString &table_name,
+    const common::ObString &column_name,
+    int64_t column_idx,
+    const ObColumnSchemaV2 *column_schema,
+    ObRawExpr *&expr,
+    const ObExternalFileFormat &format);
   static int build_file_column_expr_for_csv(
     ObRawExprFactory &expr_factory,
     const ObSQLSessionInfo &session_info,
@@ -833,7 +888,7 @@ public:
     const common::ObString &column_name,
     ObRawExpr *&expr);
 
-  static int build_file_row_expr_for_parquet(
+  static int build_file_row_expr_for_parquet_orc(
     ObRawExprFactory &expr_factory,
     const ObSQLSessionInfo &session_info,
     const uint64_t table_id,
@@ -849,26 +904,44 @@ public:
     ObRawExpr *get_path_expr,
     ObRawExpr *cast_expr,
     const ObColumnSchemaV2 *generated_column,
+    sql::ColumnIndexType column_index_type,
+    uint64_t column_idx,
     ObRawExpr *&expr);
   //only used for DDL resolver, resolve a PSEUDO column expr for validation and printer not for execution
   static int resolve_external_table_column_def(ObRawExprFactory &expr_factory,
+                                               const ObTableSchema &external_table_schema,
                                                const ObSQLSessionInfo &session_info,
                                                const ObQualifiedName &q_name,
                                                common::ObIArray<ObRawExpr*> &real_exprs,
                                                ObRawExpr *&expr,
                                                const ObColumnSchemaV2 *gen_col_schema = NULL);
-  static bool is_external_file_column_name(const common::ObString &name);
   static bool is_external_pseudo_column_name(const common::ObString &name);
-  static ObExternalFileFormat::FormatType resolve_external_file_column_type(const common::ObString &name);
+  static bool check_external_pseudo_column_is_valid(
+      const ObExternalFileFormat::FormatType format_type,
+      const common::ObString &column_name);
+  static ObExternalFileFormat::FormatType deduce_external_file_format_from_pseudo_column_name(
+      const common::ObString &column_name);
   static int resolve_file_size_node(const ParseNode *file_size_node, int64_t &parse_int_value);
   static int resolve_varchar_file_size(const ParseNode *child, int64_t &parse_int_value);
+  struct FileFormatContext {
+    bool is_tunnel_set;
+    FileFormatContext(): is_tunnel_set(false) {}
+    void reset() {
+      is_tunnel_set = false;
+    }
+  };
   static int resolve_file_format(const ParseNode *node,
                                  ObExternalFileFormat &format,
-                                 ObResolverParams &params);
+                                 ObResolverParams &params,
+                                 FileFormatContext &ff_ctx);
+  static int resolve_kafka_format(const ParseNode *node,
+                                  ObExternalFileFormat &format,
+                                  ObResolverParams &params);
   static int resolve_file_compression_format(const ParseNode *node,
                                              ObExternalFileFormat &format,
                                              ObResolverParams &params);
   static int resolve_binary_format(const ParseNode *node, ObExternalFileFormat &format);
+  static int resolve_column_index_type(const ParseNode *node, ObExternalFileFormat &format);
   static int wrap_csv_binary_format_expr(ObResolverParams &params, const ObCSVGeneralFormat& csv_format, ObRawExpr *&real_ref_expr);
   static int resolve_file_format_string_value(const ParseNode *node,
                                               const ObCharsetType &format_charset,
@@ -898,6 +971,35 @@ public:
                             ObObjParam &obj_param,
                             bool &is_param,
                             const bool enable_decimal_int);
+  static int check_must_be_positive(ObPlanCacheCtx &pc_ctx,
+                              ObIAllocator &allocator,
+                              const stmt::StmtType stmt_type,
+                              const ParseNode *node,
+                              const int64_t param_idx,
+                              const ParamStore &phy_ctx_params,
+                              const ObBitSet<> &must_be_positive_idx,
+                              ObObjParam &obj_param);
+  static int16_t calc_decint_precision_for_int_type(int64_t strlen,
+                                              bool enable_decimal_int_type,
+                                              const stmt::StmtType stmt_type,
+                                              bool fmt_int_or_ch_decint,
+                                              int8_t min_const_integer_precision);
+  static int use_decimalint(const ParseNode *node, ObObjParam &val,
+                               ObIAllocator &allocator, ObDecimalInt *&decint,
+                              int16_t &len, int16_t &precision, int16_t &scale,
+                              const stmt::StmtType stmt_type,
+                              bool fmt_int_or_ch_decint,
+                              bool &use_decimalint_as_result);
+  static int recheck_parameter_for_pl(ObPlanCacheCtx &pc_ctx,
+                            ObIAllocator &allocator,
+                            const stmt::StmtType stmt_type,
+                            const ParseNode *pc_param,
+                            const int64_t param_idx,
+                            const ParamStore &phy_ctx_params,
+                            const bool fmt_int_or_ch_decint,
+                            ObObjParam &obj_param,
+                            int8_t min_const_integer_precision,
+                            bool enable_decimal_int_type);
   static int check_keystore_status(const uint64_t tenant_id, ObSchemaChecker &schema_checker);
   static int check_encryption_name(common::ObString &encryption_name, bool &need_encrypt);
   static int check_not_supported_tenant_name(const common::ObString &tenant_name);
@@ -929,6 +1031,22 @@ public:
   static bool is_external_pseudo_column(const ObRawExpr &expr);
   static int cnt_external_pseudo_column(const ObRawExpr &expr, bool &contain);
   static bool is_pseudo_partition_column_name(const ObString name);
+  static int check_whether_assigned_for_before_update_trigger(ObResolverParams &params,
+                                                              ObSchemaChecker *schema_checker,
+                                                              const ObColumnSchemaV2 &column,
+                                                              uint64_t table_id,
+                                                              bool &need);
+  static int rm_space_for_neg_num(ParseNode *param_node, ObIAllocator &allocator);
+
+  static int collect_trigger_ref_column(ObSQLSessionInfo &session_info,
+                                        share::schema::ObSchemaGetterGuard &schema_guard,
+                                        const ObTriggerInfo &trigger_info,
+                                        const ObTableSchema &table_schema,
+                                        int64_t col_cnt,
+                                        ObIArray<ObTriggerRowRefType> &ref_types);
+  static int set_flashback_info_for_view(ObDMLStmt *stmt,
+                                         ObRawExpr* const flashback_query_expr,
+                                         const TableItem::FlashBackQueryType flashback_query_type);
 private:
   static int try_convert_to_unsiged(const ObRawExprResType &restype,
                                     ObRawExpr& src_expr,
@@ -957,17 +1075,44 @@ private:
   static int check_partition_range_value_result_type(const share::schema::ObPartitionFuncType part_type,
                                                      const ObColumnRefRawExpr &part_column_expr,
                                                      ObRawExpr &part_value_expr);
-  static int rm_space_for_neg_num(ParseNode *param_node, ObIAllocator &allocator);
   static int handle_varchar_charset(ObCharsetType charset_type,
                                     ObIAllocator &allocator,
                                     ParseNode *&node);
 
   static int is_negative_ora_nmb(const common::ObObjParam &obj_param, bool &is_neg, bool &is_zero);
   static const common::ObString stmt_type_string[];
+  static int check_before_update_row_trigger_ref_cols(pl::ObPLPackageGuard &package_guard,
+                                                        common::ObIAllocator &allocator,
+                                                        share::schema::ObSchemaGetterGuard &schema_guard,
+                                                        ObSQLSessionInfo &session_info,
+                                                        common::ObMySQLProxy &sql_proxy,
+                                                        const ObIArray<uint64_t> &trigger_list,
+                                                        const ObString &column_name,
+                                                        bool &need);
+  static int collect_trigger_func_ref_column(pl::ObPLFunction *func,
+                                int64_t col_cnt,
+                                const ObTableSchema &table_schema,
+                                ObIArray<ObTriggerRowRefType> &ref_types);
 
   // disallow construct
   ObResolverUtils();
   ~ObResolverUtils();
+
+public:
+  /**
+   * @brief: walk through parse tree and calculate the returning param count,
+   *         designed for prexecute protocol
+   * @param parse_tree [in] parse tree of the sql
+   * @param returning_param_count [out] the count of returning params
+   * @return oceanbase error code defined in lib/ob_errno.def
+   */
+  static int calc_returning_param_count(const ParseNode &parse_tree,
+                                        int64_t &returning_param_count);
+
+private:
+  static int calc_returning_param_count_recursive(const ParseNode &parse_tree,
+                                                  int64_t &returning_param_count,
+                                                  bool &returning_stmt_found);
 };
 } // end namespace sql
 } // end namespace oceanbase

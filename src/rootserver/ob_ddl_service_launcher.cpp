@@ -19,6 +19,7 @@
 #include "share/ob_server_struct.h"     // for GCTX
 #include "share/rc/ob_tenant_base.h"    // for MTL_ID
 #include "rootserver/ob_root_service.h" // for ObRootService
+#include "share/scheduler/ob_partition_auto_split_helper.h" // for ObRsAutoSplitScheduler reset
 
 namespace oceanbase
 {
@@ -26,7 +27,8 @@ namespace rootserver
 {
 bool ObDDLServiceLauncher::is_ddl_service_started_ = false;
 ObDDLServiceLauncher::ObDDLServiceLauncher()
-  : inited_(false)
+  : inited_(false),
+    rw_lock_(common::ObLatchIds::OB_DDL_SERVICE_LAUNCHER_SPIN_RW_LOCK)
 {
 }
 
@@ -200,6 +202,8 @@ int ObDDLServiceLauncher::switch_to_follower_gracefully()
       FLOG_INFO("reset index name checker success");
       GCTX.root_service_->get_ddl_service().get_non_partitioned_tablet_allocator().reset_all_cache();
       FLOG_INFO("reset non partitioned tablet allocator success");
+      ObRsAutoSplitScheduler::get_instance().reset_direct_cache();
+      FLOG_INFO("reset RS auto split scheduler direct cache success");
     }
     ATOMIC_SET(&is_ddl_service_started_, false);
   }

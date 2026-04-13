@@ -16,6 +16,7 @@
 
 #include "ob_cdc_part_trans_resolver.h"
 #include "ob_log_cluster_id_filter.h"     // ClusterIdFilter
+#include "ob_log_lsn_filter.h"            // LsnFilter
 #include "logservice/logfetcher/ob_log_part_serve_info.h"       // PartServeInfo
 #include "ob_log_config.h"                // TCONF
 
@@ -142,12 +143,14 @@ ObCDCPartTransResolver::ObCDCPartTransResolver(
     TaskPool &task_pool,
     PartTransTaskMap &task_map,
     IObLogFetcherDispatcher &dispatcher,
-    IObLogClusterIDFilter &cluster_id_filter) :
+    IObLogClusterIDFilter &cluster_id_filter,
+    IObLogLsnFilter &lsn_filter) :
     offlined_(false),
     tls_id_(),
     part_trans_dispatcher_(tls_id_str, task_pool, task_map, dispatcher),
     cluster_id_filter_(cluster_id_filter),
-    enable_direct_load_inc_(false)
+    enable_direct_load_inc_(false),
+    lsn_filter_(lsn_filter)
 {}
 
 ObCDCPartTransResolver::~ObCDCPartTransResolver()
@@ -506,6 +509,13 @@ int ObCDCPartTransResolver::read_trans_log_(
       }
       break;
     }
+    case transaction::ObTxLogType::TX_DIRECT_LOAD_INC_MAJOR_LOG:
+    {
+      if (OB_FAIL(handle_direct_log_inc_major_log_(tx_id, lsn, handling_miss_log))) {
+        LOG_ERROR("handle_direct_log_inc_major_log_ failed", KR(ret), K_(tls_id), K(tx_id), K(lsn), K(tx_log_header));
+      }
+      break;
+    }
     case transaction::ObTxLogType::TX_ABORT_LOG:
     {
       if (OB_FAIL(handle_abort_(tx_id, handling_miss_log, tx_log_block))) {
@@ -663,6 +673,24 @@ int ObCDCPartTransResolver::handle_direct_load_inc_log_(
     }
   }
 
+  return ret;
+}
+
+int ObCDCPartTransResolver::handle_direct_log_inc_major_log_(
+    const transaction::ObTransID &tx_id,
+    const palf::LSN &lsn,
+    const bool handling_miss_log)
+{
+  int ret = OB_SUCCESS;
+  PartTransTask *task = NULL;
+  if (OB_FAIL(obtain_task_(tx_id, task, handling_miss_log))) {
+    LOG_ERROR("obtain_task_ fail", KR(ret), K_(tls_id), K(tx_id), K(lsn), K(handling_miss_log));
+  } else if (OB_FAIL(push_fetched_log_entry_(lsn, *task))) {
+    LOG_ERROR("push_fetched_log_entry into part_trans_task failed", KR(ret), K_(tls_id), K(tx_id), K(lsn),
+        K(handling_miss_log), KPC(task));
+  } else {
+    LOG_DEBUG("handle_direct_log_inc_major_log", K_(tls_id), K(tx_id), K(lsn), K(handling_miss_log), KPC(task));
+  }
   return ret;
 }
 
@@ -920,7 +948,9 @@ int ObCDCPartTransResolver::handle_commit_(
   bool is_redo_complete = false;
   is_served = false;
 
-  if (OB_UNLIKELY(! missing_info.is_empty())) {
+  if (OB_UNLIKELY(lsn_filter_.filter(tls_id_.get_tenant_id(), tls_id_.get_ls_id().id(), lsn.val_))) {
+    LOG_INFO("commit log is filtered", K_(tls_id), K(lsn), K(tx_id));
+  } else if (OB_UNLIKELY(! missing_info.is_empty())) {
     ret = OB_NEED_RETRY;
     missing_info.set_need_reconsume_commit_log_entry();
     LOG_WARN("found missing_info not empty, may have commit_info_log before the commit_log in current log_entry, retry later",

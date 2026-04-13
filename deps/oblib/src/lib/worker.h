@@ -23,6 +23,9 @@ namespace oceanbase
 {
 namespace rpc { class ObRequest; }
 namespace sql { class ObSQLSessionInfo; }
+#ifdef OB_BUILD_SHARED_STORAGE
+namespace storage { class ObTieredMetadataObjectManager; }
+#endif
 namespace lib
 {
 using common::ObIAllocator;
@@ -51,6 +54,7 @@ public:
   // query immediately.
   virtual bool need_retry() const { return false; }
   virtual void resume() {}
+  virtual int try_add_stream_rpc_session_wait_cnt(int cnt) { return OB_SUCCESS; }
 
   // This function is called before worker waiting for some resources
   // and starting to give cpu out so that Multi-Tenancy would be aware
@@ -238,7 +242,32 @@ private:
   bool group_changed_;
   int ret_;
 };
+
+bool is_global_background_resource_isolation_enabled();
+
 #define CONSUMER_GROUP_ID_GUARD(group_id) oceanbase::lib::ConsumerGroupIdGuard consumer_group_id_guard_(group_id)
+
+#ifdef OB_BUILD_SHARED_STORAGE
+class WorkerGroupIdGuard
+{
+  friend class storage::ObTieredMetadataObjectManager;
+private:
+  WorkerGroupIdGuard(uint64_t group_id)
+    : old_group_id_(GET_GROUP_ID())
+  {
+    THIS_WORKER.set_group_id_(group_id);
+  }
+  ~WorkerGroupIdGuard()
+  {
+    THIS_WORKER.set_group_id_(old_group_id_);
+  }
+
+private:
+  uint64_t old_group_id_;
+};
+
+#define WORKER_GROUP_ID_GUARD(group_id) oceanbase::lib::WorkerGroupIdGuard worker_group_id_guard_(group_id)
+#endif
 
 class ConsumerGroupFuncGuard
 {
@@ -252,12 +281,12 @@ public:
     } else {
       uint64_t group_id = 0;
       ret_ = CONVERT_FUNCTION_TYPE_TO_GROUP_ID(func_type, group_id);
-      // if (OB_SUCCESS == ret_ && group_id != thread_group_id_) {
-      /* need to move to background even if group_id not changed */
+      if (OB_SUCCESS == ret_ &&
+          (is_global_background_resource_isolation_enabled() || group_id != thread_group_id_)) {
         group_changed_ = true;
         ret_ = SET_GROUP_ID(group_id, true /* is_background */);
-      // }
-    }
+      }
+   }
   }
   ~ConsumerGroupFuncGuard()
   {
@@ -311,6 +340,22 @@ public:
 
 private:
   Worker::CompatMode last_compat_mode_;
+};
+
+class WorkerTimeoutGuard
+{
+public:
+  WorkerTimeoutGuard(int64_t abs_timeout_ts)
+  {
+    prev_abs_timeout_ = THIS_WORKER.get_timeout_ts();
+    THIS_WORKER.set_timeout_ts(abs_timeout_ts);
+  }
+  ~WorkerTimeoutGuard()
+  {
+    THIS_WORKER.set_timeout_ts(prev_abs_timeout_);
+  }
+private:
+  int64_t prev_abs_timeout_;
 };
 
 

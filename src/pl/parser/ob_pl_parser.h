@@ -52,14 +52,17 @@ public:
   int parse_routine_body(const common::ObString &routine_body,
                          ObStmtNodeTree *&routine_stmt,
                          bool is_for_trigger,
+                         bool &is_wrap,
                          bool need_unwrap = true /* for wrapped procedure/function */);
   int parse_package(const common::ObString &source,
                     ObStmtNodeTree *&package_stmt,
                     const ObDataTypeCastParams &dtc_params,
                     share::schema::ObSchemaGetterGuard *schema_guard,
                     bool is_for_trigger,
+                    bool &is_wrap,
                     const share::schema::ObTriggerInfo *trg_info = NULL,
-                    bool need_unwrap = true /* for wrapped package */);
+                    bool need_unwrap = true /* for wrapped package */,
+                    sql::ObSQLSessionInfo *session = nullptr);
 #ifdef OB_BUILD_ORACLE_PL
   static bool is_wrapped_parse_tree(const ParseNode &parse_tree);
   static int check_wrapped_parse_tree_legal(const ParseNode &parse_tree);
@@ -72,13 +75,15 @@ private:
                       bool is_for_trigger,
                       bool is_dynamic,
                       bool is_inner_parse,
-                      bool &is_include_old_new_in_trigger);
+                      bool &is_include_old_new_in_trigger,
+                      bool &contain_sensitive_data);
   int parse_stmt_block(ObParseCtx &parse_ctx,
                        ObStmtNodeTree *&multi_stmt);
   int reconstruct_trigger_package(ObStmtNodeTree *&package_stmt,
                                   const share::schema::ObTriggerInfo *trg_info,
                                   const ObDataTypeCastParams &dtc_params,
-                                  share::schema::ObSchemaGetterGuard *schema_guard);
+                                  share::schema::ObSchemaGetterGuard *schema_guard,
+                                  sql::ObSQLSessionInfo *session);
 #ifdef OB_BUILD_ORACLE_PL
   int decode_cipher_text(common::ObIAllocator &allocator,
                          const ObStmtNodeTree *cipher_stmt,

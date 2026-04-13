@@ -453,6 +453,10 @@ int ObPLADTService::get_pl_exec_context(ObLLVMType &type)
         LOG_WARN("push_back error", K(ret));
       } else if (OB_FAIL(pl_exec_context.push_back(int64_type))) { // plcontext
         LOG_WARN("push_back error", K(ret));
+      } else if (OB_FAIL(pl_exec_context.push_back(int64_type))) { // tmp_allocator
+        LOG_WARN("push_back error", K(ret));
+      } else if (OB_FAIL(pl_exec_context.push_back(int64_type))) { // result_allocator
+        LOG_WARN("push_back error", K(ret));
       } else if (OB_FAIL(helper_.create_struct_type(ObString("pl_exec_context"), pl_exec_context, struct_type))) {
         LOG_WARN("failed to create struct type", K(ret));
       } else {
@@ -510,6 +514,7 @@ int ObPLADTService::get_pl_condition_value(ObLLVMType &type)
         int64_t str_len_;
         int64_t stmt_id_;
         bool signal_;
+        int64_t ob_error_code_;
        */
       if (OB_FAIL(pl_condition_value.push_back(int64_type))) {
         LOG_WARN("push_back error", K(ret));
@@ -522,6 +527,8 @@ int ObPLADTService::get_pl_condition_value(ObLLVMType &type)
       } else if (OB_FAIL(pl_condition_value.push_back(int64_type))) {
         LOG_WARN("push_back error", K(ret));
       } else if (OB_FAIL(pl_condition_value.push_back(int8_type))) {
+        LOG_WARN("push_back error", K(ret));
+      } else if (OB_FAIL(pl_condition_value.push_back(int64_type))) {
         LOG_WARN("push_back error", K(ret));
       } else if (OB_FAIL(helper_.create_struct_type(ObString("pl_condition_value"), pl_condition_value, struct_type))) {
         LOG_WARN("failed to create struct type", K(ret));

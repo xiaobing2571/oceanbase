@@ -54,6 +54,9 @@ LOG_OP_DEF(LOG_STAT_COLLECTOR, "STAT COLLECTOR")
 LOG_OP_DEF(LOG_OPTIMIZER_STATS_GATHERING, "OPTIMIZER STATISTICS GATHERING")
 LOG_OP_DEF(LOG_VALUES_TABLE_ACCESS, "VALUES TABLE ACCESS")
 LOG_OP_DEF(LOG_EXPAND, "EXPANSION")
+// Hybrid fusion operator (used to handle global fusion / rerank for hybrid search in PX/distributed scenarios)
+LOG_OP_DEF(LOG_HYBRID_FUSION, "HYBRID FUSION")
+LOG_OP_DEF(LOG_RESCAN, "RESCAN")
 /* end of logical operator type */
 LOG_OP_DEF(LOG_OP_END, "OP_DEF_END")
 #endif /*LOG_OP_DEF*/
@@ -98,6 +101,20 @@ enum AggregateAlgo
   SCALAR_AGGREGATE
 };
 
+enum LimitType
+{
+  SINGLE_LIMIT = 0,
+  FINAL_LIMIT,
+  PARTIAL_LIMIT
+};
+
+enum AggregatePathType
+{
+  SINGLE = 0,
+  FINAL,
+  PARTIAL
+};
+
 enum SetAlgo
 {
   INVALID_SET_ALGO = 0,
@@ -133,10 +150,11 @@ enum DistAlgo
   DIST_HASH_LOCAL_PARTITION = (1UL << 18),
   DIST_BROADCAST_HASH_LOCAL = (1UL << 19),
   DIST_HASH_LOCAL_BROADCAST = (1UL << 20),
-  DIST_MAX_JOIN_METHOD = (1UL << 21), // represents max join method
+  DIST_RANDOM_BROADCAST = (1UL << 21),
+  DIST_MAX_JOIN_METHOD = (1UL << 22), // represents max join method
   // only for set operator
-  DIST_SET_RANDOM = (1UL << 22),
-  DIST_SET_PARTITION_WISE = (1UL << 23) // non-strict set pw with phy_table_location_info_
+  DIST_SET_RANDOM = (1UL << 23),
+  DIST_SET_PARTITION_WISE = (1UL << 24) // non-strict set pw with phy_table_location_info_
 };
 
 inline const ObString &ob_dist_algo_str(DistAlgo algo)
@@ -165,6 +183,7 @@ inline const ObString &ob_dist_algo_str(DistAlgo algo)
     "HASH LOCAL PARTITION",
     "BROADCAST HASH LOCAL",
     "HASH LOCAL BROADCAST",
+    "RANDOM BROADCAST",
     "UNKNOWN ALGO",
     "SET RANDOM",
     "SET PARTITION WISE"
@@ -216,6 +235,8 @@ inline DistAlgo get_dist_algo(int64_t method)
     return DIST_ALL_NONE;
   } else if (method & DIST_RANDOM_ALL) {
     return DIST_RANDOM_ALL;
+  } else if (method & DIST_RANDOM_BROADCAST) {
+    return DIST_RANDOM_BROADCAST;
   } else if (method & DIST_HASH_ALL) {
     return DIST_HASH_ALL;
   } else if (method & DIST_SET_RANDOM) {
@@ -312,8 +333,8 @@ enum WinDistAlgo
   WIN_DIST_NONE    = (1UL),
   WIN_DIST_HASH    = (1UL << 1), // hash distribute
   WIN_DIST_RANGE   = (1UL << 2), // range distribute
-  WIN_DIST_LIST    = (1UL << 3),  // range + random distribute
-  WIN_DIST_HASH_LOCAL   = (1UL << 4)  // range + random distribute
+  WIN_DIST_HASH_LOCAL   = (1UL << 3),  // local hash
+  WIN_DIST_LIST    = (1UL << 4)  // range + random distribute
 };
 
 inline WinDistAlgo get_win_dist_algo(uint64_t method)

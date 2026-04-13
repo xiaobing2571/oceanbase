@@ -538,6 +538,7 @@ int64_t ob_parse_binary_len(int64_t len)
   return (len + 1) / 2;
 }
 
+extern void ob_parse_binary_simd(const char **src, const char *end, char **dest);
 void ob_parse_binary(const char *src, int64_t len, char *dest)
 {
   if (OB_UNLIKELY(NULL == src || len <= 0 || NULL == dest)) {
@@ -556,6 +557,9 @@ void ob_parse_binary(const char *src, int64_t len, char *dest)
     } else {
       //for odd number, we have copy the first char,  so we should minus 2;
       const char *end = src + len - (is_odd ? 2 : 1);
+#if defined(__GNUC__) && defined(__x86_64__)
+      ob_parse_binary_simd(&src, end, &dest);
+#endif
       for (; src <= end; src += 2)
       {
         *dest = (char)(16*char_int(src[0]) + char_int(src[1]));
@@ -902,7 +906,8 @@ ParseNode *push_back_child(void *malloc_pool, int *error_code, ParseNode *left_n
                            T_SET_UNION == left_node->type_ ||
                            T_SET_UNION_ALL == left_node->type_ ||
                            T_VALUE_VECTOR == left_node->type_ ||
-                           T_VALUE_LIST == left_node->type_))) {
+                           T_VALUE_LIST == left_node->type_ ||
+                           T_OP_CNN == left_node->type_))) {
     *error_code = OB_PARSER_ERR_UNEXPECTED;
   } else {
     int64_t capacity = get_need_reserve_capacity(left_node->num_child_ + 1);
@@ -944,7 +949,8 @@ ParseNode *push_front_child(void *malloc_pool, int *error_code, ParseNode *right
                            T_OP_AND == right_node->type_ ||
                            T_EXPR_LIST == right_node->type_ ||
                            T_SET_UNION == right_node->type_ ||
-                           T_SET_UNION_ALL == right_node->type_))) {
+                           T_SET_UNION_ALL == right_node->type_ ||
+                           T_OP_CNN == right_node->type_))) {
     *error_code = OB_PARSER_ERR_UNEXPECTED;
   } else {
     int64_t capacity = get_need_reserve_capacity(right_node->num_child_ + 1);
@@ -977,7 +983,8 @@ ParseNode *append_child(void *malloc_pool, int *error_code, ParseNode *left_node
                            T_OP_AND == left_node->type_ ||
                            T_EXPR_LIST == left_node->type_ ||
                            T_SET_UNION == left_node->type_ ||
-                           T_SET_UNION_ALL == left_node->type_))) {
+                           T_SET_UNION_ALL == left_node->type_ ||
+                           T_OP_CNN == left_node->type_))) {
     *error_code = OB_PARSER_ERR_UNEXPECTED;
 
   } else {

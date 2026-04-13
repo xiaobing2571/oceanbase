@@ -38,6 +38,7 @@ public:
   int init(const common::ObString &backup_root_path);
   int join_incarnation(const uint64_t incarnation);
   int join(const common::ObString &path, const ObBackupFileSuffix &type);
+  int join(const common::ObString &path);
   int join(const uint64_t int_path, const ObBackupFileSuffix &type);
   int join(const int64_t v, const ObBackupFileSuffix &type);
   bool is_empty() const { return 0 == cur_pos_; }
@@ -64,6 +65,15 @@ public:
   int join_table_list_part_file(const share::SCN &scn, const int64_t part_no);
   int join_table_list_meta_info_file(const share::SCN &scn);
   int join_major_compaction_mview_dep_tablet_list_file();
+  int join_ss_tablet_group_checkpoint(const int64_t retry_id);
+  int join_tablet();
+  int join_tablet_id(const common::ObTabletID &tablet_id);
+  int join_ss_tablet_info(const int64_t file_id);
+  int join_ss_tablet_meta_file_info();
+  int join_ss_tablet_macro_block_file_info();
+  int join_macro_block_list(const int64_t file_id);
+  int join_backup_file_list(const int64_t file_id);
+  int join_file_list(const int64_t file_id, const ObBackupFileSuffix &type);
   static int parse_checkpoint(const char *entry_d_name, const common::ObString &file_name, const ObBackupFileSuffix &type, uint64_t &checkpoint);
   static int parse_partial_table_list_file_name(const char *entry_d_name, const share::SCN &scn, int64_t &part_no);
   static int parse_table_list_meta_file_name(const char *entry_d_name, share::SCN &scn);
@@ -73,6 +83,8 @@ public:
   int64_t length() const { return cur_pos_; }
   int64_t capacity() const { return sizeof(path_); }
   common::ObString get_obstr() const;
+  // TODO(xingzhi): add test for get_basename + remove_first_level_dir + has_dir
+  int get_basename(ObBackupPathString &basename) const;
   bool operator ==(const ObBackupPath &path) const;
   ObBackupPath &operator=(const ObBackupPath &path);
   uint64_t hash() const;
@@ -197,6 +209,13 @@ struct ObBackupPathUtil
   static int get_backup_ls_attr_info_path(const share::ObBackupDest &backup_tenant_dest,
       const share::ObBackupSetDesc &desc, const int64_t turn_id, share::ObBackupPath &backup_path); 
 
+  // file:///obbackup/backup_set_1_full/infos/meta_info/ls_id_list_info.obbak
+  static int get_backup_ls_id_list_path(const share::ObBackupDest &backup_set_dest,
+      share::ObBackupPath &backup_path);
+
+  static int get_backup_ls_id_list_path(const share::ObBackupDest &backup_tenant_dest,
+      const share::ObBackupSetDesc &desc, share::ObBackupPath &backup_path);
+
   // file:///obbackup/backup_set_1_full/infos/meta_info/ls_meta_infos.obbak
   static int get_ls_meta_infos_path(const share::ObBackupDest &backup_set_dest, share::ObBackupPath &backup_path);
 
@@ -243,6 +262,11 @@ struct ObBackupPathUtil
   // file:///obbackup/backup_set_1_full/log_stream_1/meta_info_turn_1_retry_0/ls_meta_info.obbak
   static int get_ls_meta_info_backup_path(const share::ObBackupDest &backup_tenant_dest,
       const share::ObBackupSetDesc &desc, const share::ObLSID &ls_id, const int64_t turn_id,
+      const int64_t retry_id, share::ObBackupPath &backup_path);
+
+  // file:///obbackup/backup_set_1_full/log_stream_1/meta_info_turn_1_retry_0/ls_meta_info.obbak
+  static int get_ls_meta_info_backup_path(const share::ObBackupDest &backup_set_dest,
+      const share::ObLSID &ls_id, const int64_t turn_id,
       const int64_t retry_id, share::ObBackupPath &backup_path);
 
   // file:///obbackup/backup_set_1_full/logstream_1/xxx_xxx_turn_1_retry_0/macro_range_index.obbak
@@ -300,12 +324,32 @@ struct ObBackupPathUtil
   // file:///obbackup/backup_set_1_full/infos/major_compaction_mview_dep_tablet_list
   static int get_major_compaction_mview_dep_tablet_list_path(const share::ObBackupDest &backup_set_dest, share::ObBackupPath &path);
 
+  // file:///obbackup/backup_set_1_full/logstream_1/tablet_group_checkpoint.[retry_id]
+  static int get_ss_tablet_group_checkpoint_file_path(const share::ObBackupDest &backup_set_dest,
+      const share::ObLSID &ls_id, const int64_t retry_id, share::ObBackupPath &path);
+
+  // file:///obbackup/backup_set_1_full/log_stream_1/ss_tablet_info.[file_id].obbak
+  static int get_ss_ls_data_tablet_info_path(const share::ObBackupDest &backup_set_dest,
+      const share::ObLSID &ls_id, const int64_t turn_id, const int64_t retry_id,
+      const int64_t file_id, share::ObBackupPath &backup_path);
+
+  // file:///obbackup/backup_set_1_full/tablet/[tablet_id]/ss_tablet_meta_file_info.obbak
+  static int get_ss_tablet_meta_file_info_path(const share::ObBackupDest &backup_set_dest,
+      const share::ObLSID &ls_id, const common::ObTabletID &tablet_id, share::ObBackupPath &backup_path);
+
+  // file:///obbackup/backup_set_1_full/tablet/[tablet_id]/ss_tablet_macro_block_file_info.obbak
+  static int get_ss_tablet_macro_block_file_info_path(const share::ObBackupDest &backup_set_dest,
+      const share::ObLSID &ls_id, const common::ObTabletID &tablet_id, share::ObBackupPath &backup_path);
+
   static int construct_backup_set_dest(const share::ObBackupDest &backup_tenant_dest, 
       const share::ObBackupSetDesc &backup_desc, share::ObBackupDest &backup_set_dest);
   static int construct_backup_complement_log_dest(const share::ObBackupDest &backup_tenant_dest,
       const share::ObBackupSetDesc &backup_desc, share::ObBackupDest &backup_set_dest);
-  static int construct_backup_complement_log_dest(const share::ObBackupDest &backup_tenant_dest,
-      share::ObBackupDest &backup_set_dest);
+  static int construct_backup_complement_log_dest(const share::ObBackupDest &backup_set_dest,
+    share::ObBackupDest &complement_log_dest);
+  static int get_meta_info_path(const share::ObBackupDest &backup_set_dest,
+      const share::ObLSID &ls_id, const int64_t turn_id, const int64_t retry_id,
+      const bool is_final_fuse, ObBackupPath &path);
 
 private:
   static int get_tenant_data_backup_set_placeholder_path_(

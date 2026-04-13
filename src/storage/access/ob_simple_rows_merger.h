@@ -27,7 +27,7 @@ public:
   virtual ObRowMergerType type() override { return ObRowMergerType::SIMPLE_MERGER; }
   ObSimpleRowsMerger(Comparator& cmp);
   virtual ~ObSimpleRowsMerger();
-  virtual int init(const int64_t table_cnt, common::ObIAllocator &allocator) override;
+  virtual int init(const int64_t max_table_cnt, const int64_t table_cnt, common::ObIAllocator &allocator) override;
   virtual bool is_inited() const override { return is_inited_; }
   virtual int open(const int64_t table_cnt) override;
   virtual void reset() override;
@@ -40,7 +40,7 @@ public:
   virtual int count() const override;
   virtual bool empty() const override;
   virtual bool is_unique_champion() const override;
-  TO_STRING_KV(K_(is_inited), K_(table_cnt), K_(item_cnt))
+  VIRTUAL_TO_STRING_KV(K_(is_inited), K_(table_cnt), K_(item_cnt));
 
 private:
   bool is_inited_;
@@ -89,8 +89,9 @@ void ObSimpleRowsMerger<T, Comparator>::reuse()
 }
 
 template <typename T, typename Comparator>
-int ObSimpleRowsMerger<T, Comparator>::init(const int64_t table_cnt, common::ObIAllocator &allocator)
+int ObSimpleRowsMerger<T, Comparator>::init(const int64_t max_table_cnt, const int64_t table_cnt, common::ObIAllocator &allocator)
 {
+  UNUSED(max_table_cnt);
   int ret = OB_SUCCESS;
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
@@ -171,7 +172,9 @@ int ObSimpleRowsMerger<T, Comparator>::push(const T &item)
       int64_t i = item_cnt_ - 1;
       for ( ; OB_SUCC(ret) && i >= 0; --i) {
         if (OB_FAIL(cmp_.cmp(item, items_[i], cmp_ret))) {
-          STORAGE_LOG(WARN, "Fail to compare item", K(ret), K(i), K(items_[i]), K(item));
+          if (OB_BLOCK_SWITCHED != ret) {
+            STORAGE_LOG(WARN, "Fail to compare item", K(ret), K(i), K(items_[i]), K(item));
+          }
           break;
         } else if (cmp_ret < 0) {
           items_[i+1] = items_[i];

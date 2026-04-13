@@ -189,6 +189,7 @@ public:
   const ObTableSchema *get_all_core_table() const;
 #ifdef OB_BUILD_SHARED_STORAGE
   const ObTableSchema *get_sslog_table() const;
+  const ObTableSchema *get_tiered_metadata_store_table() const;
 #endif
 
   // @param[in]:
@@ -215,6 +216,7 @@ private:
   int init_all_core_table();
 #ifdef OB_BUILD_SHARED_STORAGE
   int init_sslog_table();
+  int init_tiered_metadata_store_table();
 #endif
   int put_sys_schema(
       const ObSchemaCacheKey &cache_key,
@@ -236,6 +238,7 @@ private:
   ObTableSchema all_core_table_;
 #ifdef OB_BUILD_SHARED_STORAGE
   ObTableSchema sslog_table_;
+  ObTableSchema tiered_metadata_store_table_;
 #endif
   ObSimpleTenantSchema simple_gts_tenant_;
   ObTenantSchema full_gts_tenant_;
@@ -317,6 +320,7 @@ private:
   DEF_SCHEMA_INFO_FETCHER(tablespace, ObTablespaceSchema); 
   DEF_SCHEMA_INFO_FETCHER(profile, ObProfileSchema);
   DEF_SCHEMA_INFO_FETCHER(mock_fk_parent_table, ObMockFKParentTableSchema);
+  DEF_SCHEMA_INFO_FETCHER(ccl_rule, ObCCLRuleSchema);
 #undef DEF_SCHEMA_INFO_FETCHER
 #endif
 

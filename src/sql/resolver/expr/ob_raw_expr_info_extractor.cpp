@@ -148,19 +148,28 @@ int ObRawExprInfoExtractor::visit(ObColumnRefRawExpr &expr)
 int ObRawExprInfoExtractor::clear_info(ObRawExpr &expr)
 {
   int ret = OB_SUCCESS;
-  ObExprInfo &expr_info = expr.get_expr_info();
+  const ObExprInfo &expr_info = expr.get_expr_info();
   bool is_implicit_cast = expr_info.has_member(IS_OP_OPERAND_IMPLICIT_CAST);
   bool is_self_param = expr_info.has_member(IS_UDT_UDF_SELF_PARAM);
   bool is_auto_part_expr = expr_info.has_member(IS_AUTO_PART_EXPR);
-  expr_info.reset();
+  bool is_pl_sql_transpiled = expr_info.has_member(IS_PL_SQL_TRANSPILED);
+  bool is_fake_deterministic_udf = expr_info.has_member(IS_FAKE_CONST_UDF);
+  expr.reset_flag();
   if (is_implicit_cast) {
-    OZ(expr_info.add_member(IS_OP_OPERAND_IMPLICIT_CAST));
+    OZ(expr.add_flag(IS_OP_OPERAND_IMPLICIT_CAST));
   }
   if (is_self_param) {
-    OZ(expr_info.add_member(IS_UDT_UDF_SELF_PARAM));
+    OZ(expr.add_flag(IS_UDT_UDF_SELF_PARAM));
   }
   if (is_auto_part_expr) {
-    OZ(expr_info.add_member(IS_AUTO_PART_EXPR));
+    OZ(expr.add_flag(IS_AUTO_PART_EXPR));
+  }
+  if (is_pl_sql_transpiled) {
+    OZ(expr.add_flag(IS_PL_SQL_TRANSPILED));
+    OZ(expr.add_flag(CNT_PL_UDF));
+  }
+  if (is_fake_deterministic_udf) { // this flag is only used in range converter for non-deterministic udf filter
+    OZ(expr.add_flag(IS_FAKE_CONST_UDF));
   }
   return ret;
 }
@@ -315,8 +324,8 @@ int ObRawExprInfoExtractor::visit(ObOpRawExpr &expr)
         LOG_WARN("failed to add flag IS_ASSIGN_EXPR", K(ret));
       }
     } else if (T_OP_IS == expr.get_expr_type()) {
-      if (OB_FAIL(expr.add_flag(IS_IS_EXPR))) {
-        LOG_WARN("failed to add flag IS_IS_EXPR", K(ret));
+      if (OB_FAIL(expr.add_flag(CNT_IS_EXPR))) {
+        LOG_WARN("failed to add flag CNT_IS_EXPR", K(ret));
       }
     }
   } else if (3 == expr.get_param_count()) {
@@ -509,6 +518,7 @@ int ObRawExprInfoExtractor::visit(ObSysFunRawExpr &expr)
     if (T_FUN_SYS_AUTOINC_NEXTVAL == expr.get_expr_type()
         || T_FUN_SYS_VEC_VID == expr.get_expr_type()
         || T_FUN_SYS_DOC_ID == expr.get_expr_type()
+        || T_PSEUDO_HIDDEN_CLUSTERING_KEY == expr.get_expr_type()
         || T_FUN_SYS_TABLET_AUTOINC_NEXTVAL == expr.get_expr_type()
         || T_FUN_SYS_SLEEP == expr.get_expr_type()
         || (T_FUN_SYS_LAST_INSERT_ID == expr.get_expr_type() && expr.get_param_count() > 0)
@@ -546,6 +556,10 @@ int ObRawExprInfoExtractor::visit(ObSysFunRawExpr &expr)
               || T_FUN_SYS_UUID_SHORT == expr.get_expr_type()) {
       if (OB_FAIL(expr.add_flag(IS_RAND_FUNC))) {
         LOG_WARN("failed to add flag IS_RAND_FUNC", K(ret));
+      }
+    } else if (T_FUN_TMP_FILE_OPEN == expr.get_expr_type()) {
+      if (OB_FAIL(expr.add_flag(IS_RAND_FUNC))) {
+        LOG_WARN("failed to add flag IS_RAND_FUNC for T_FUN_TMP_FILE_OPEN", K(ret));
       }
     } else if (T_FUN_SYS_ROWNUM == expr.get_expr_type()) {
       if (OB_FAIL(expr.add_flag(IS_ROWNUM))) {
@@ -600,7 +614,8 @@ int ObRawExprInfoExtractor::visit(ObSysFunRawExpr &expr)
           || T_FUN_SYS_LOCALTIMESTAMP == expr.get_expr_type()
           || (T_FUN_SYS_SYSDATE == expr.get_expr_type() && lib::is_oracle_mode())
           || T_FUN_SYS_SYSTIMESTAMP == expr.get_expr_type()
-          || (T_FUN_SYS_UNIX_TIMESTAMP == expr.get_expr_type()
+          || ((T_FUN_SYS_UNIX_TIMESTAMP == expr.get_expr_type()
+               || T_FUN_SYS_TO_UNIX_TIMESTAMP == expr.get_expr_type())
               && 0 == expr.get_param_exprs().count())) { // check if has argument
         if (OB_FAIL(expr.add_flag(IS_CUR_TIME))) { //需要在plan执行前取系统当前时间
           LOG_WARN("failed to add flag IS_CUR_TIME", K(ret));
@@ -615,6 +630,13 @@ int ObRawExprInfoExtractor::visit(ObSysFunRawExpr &expr)
         }
       } else {}
     }
+    if (OB_SUCC(ret) &&
+      (expr.get_expr_type() == T_FUN_PL_COLLECTION_CONSTRUCT ||
+       expr.get_expr_type() == T_FUN_PL_OBJECT_CONSTRUCT)) {
+    if (OB_FAIL(expr.add_flag(CNT_PL_UDT_CONSTRUCT))) {
+      LOG_WARN("failed to add flag IS_OR", K(ret));
+    }
+  }
   }
   if (OB_SUCC(ret) && OB_FAIL(pull_info(expr))) {
     LOG_WARN("fail to add pull info", K(ret));
@@ -640,17 +662,17 @@ int ObRawExprInfoExtractor::visit(ObAliasRefRawExpr &expr)
     LOG_WARN("fail to clear info", K(ret));
   } else if (OB_FAIL(expr.add_flag(IS_ALIAS))) {
     LOG_WARN("failed to add flag", K(ret));
-  } else if (OB_ISNULL(expr.get_ref_expr())) {
+  } else if (OB_ISNULL(expr.get_query_ref_expr())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ref expr is null");
   } else if (expr.is_ref_query_output()) {
     if (OB_FAIL(expr.add_flag(CNT_SUB_QUERY))) {
       LOG_WARN("failed to add expr flag", K(ret));
     }
-  } else if (OB_FAIL(expr.add_child_flags(expr.get_ref_expr()->get_expr_info()))) {
+  } else if (OB_FAIL(expr.add_child_flags(expr.get_query_ref_expr()->get_expr_info()))) {
     LOG_WARN("add child flags to expr failed", K(ret));
   } else {
-    expr.set_is_deterministic(expr.get_ref_expr()->is_deterministic());
+    expr.set_is_deterministic(expr.get_query_ref_expr()->is_deterministic());
   }
   return ret;
 }

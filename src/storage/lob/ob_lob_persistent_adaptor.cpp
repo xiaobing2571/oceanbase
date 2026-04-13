@@ -450,7 +450,10 @@ int ObPersistentLobApator::inner_get_tablet(
     ObTabletHandle &handle)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ls_handle.get_ls()->get_tablet_with_timeout(tablet_id,
+  if (ls_handle.get_ls()->is_logonly_replica()) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("logonly replica has no tablet", KR(ret));
+  } else if (OB_FAIL(ls_handle.get_ls()->get_tablet_with_timeout(tablet_id,
                                                                  handle,
                                                                  param.timeout_,
                                                                  ObMDSGetTabletMode::READ_READABLE_COMMITED,
@@ -715,7 +718,19 @@ int ObPersistentLobApator::write_lob_meta(ObLobAccessParam& param, ObDatumRowIte
       }
     }
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(oas->insert_rows(
+    } else {
+      ret = OB_E(EventTable::EN_LOB_META_DML_FAILED, param.get_inrow_threshold()) OB_SUCCESS;
+      if (OB_FAIL(ret) && param.tablet_id_.is_user_tablet()) {
+        LOG_ERROR("due to error injection, lob meta not being inserted into the auxiliary table", K(ret), K(param));
+        ObDatumRow *row = nullptr;
+        while (OB_SUCC(row_iter.get_next_row(row))) {
+        }
+        if (ret != OB_ITER_END) {
+          LOG_WARN("get next row fail", K(ret));
+        } else {
+          ret = OB_SUCCESS;
+        }
+      } else if (OB_FAIL(oas->insert_rows(
         param.ls_id_,
         param.lob_meta_tablet_id_,
         *param.tx_desc_,
@@ -723,7 +738,8 @@ int ObPersistentLobApator::write_lob_meta(ObLobAccessParam& param, ObDatumRowIte
         column_ids,
         &row_iter,
         affected_rows))) {
-      LOG_WARN("insert_rows fail", K(ret));
+        LOG_WARN("insert_rows fail", K(ret));
+      }
     }
   }
   return ret;

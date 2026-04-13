@@ -19,6 +19,23 @@
 
 namespace oceanbase
 {
+
+namespace common
+{
+// time
+constexpr int64_t MS_US = 1000LL;
+constexpr int64_t S_US = 1000LL * MS_US;
+constexpr int64_t MIN_US = 60LL * S_US;
+constexpr int64_t HOUR_US = 60LL * MIN_US;
+constexpr int64_t DAY_US = 24LL * HOUR_US;
+
+// size
+constexpr int64_t KB = 1024LL;
+constexpr int64_t MB = 1024LL * KB;
+constexpr int64_t GB = 1024LL * MB;
+
+} // common
+
 namespace common
 {
 
@@ -36,7 +53,8 @@ public:
 
   ObStorageIORetryStrategyBase(const int64_t timeout_us)
       : start_time_us_(0),  // cannot use virtual func `current_time_us` in constructor
-        timeout_us_(timeout_us < 0 ? OB_STORAGE_MAX_IO_TIMEOUT_US : timeout_us) // 0 means never retry
+        timeout_us_(timeout_us < 0 ? OB_STORAGE_MAX_IO_TIMEOUT_US : timeout_us), // 0 means never retry
+        delay_us_(BASE_DELAY_US)
   {}
 
   // A virtual destructor can lead to link failures, temporarily commented out
@@ -48,7 +66,7 @@ public:
   }
   virtual int64_t current_time_us() const = 0;
 
-  bool should_retry(const RetType &outcome, const int64_t attempted_retries) const
+  bool should_retry(const RetType &outcome, const int64_t attempted_retries)
   {
     bool bret = should_retry_impl_(outcome, attempted_retries);
     if (bret && is_timeout_(attempted_retries)) {
@@ -58,11 +76,12 @@ public:
   }
 
   virtual uint32_t calc_delay_time_us(
-      const RetType &outcome, const int64_t attempted_retries) const
+      const RetType &outcome, const int64_t attempted_retries)
   {
-    static const uint32_t base_delay_us = 25 * 1000;        // 25ms
-    static const uint32_t MAX_DELAY_US = 5 * 1000 * 1000LL; // 5s
-    return MIN(base_delay_us * (1 << attempted_retries), MAX_DELAY_US);
+    if (attempted_retries != 0 && delay_us_ < MAX_DELAY_US) {
+      delay_us_ = delay_us_ * DELAY_EXPONENT;
+    }
+    return MIN(delay_us_, MAX_DELAY_US);
   }
 
   virtual void log_error(
@@ -72,11 +91,17 @@ protected:
   virtual bool is_timeout_(const int64_t attempted_retries) const = 0;
 
   virtual bool should_retry_impl_(
-      const RetType &outcome, const int64_t attempted_retries) const = 0;
+      const RetType &outcome, const int64_t attempted_retries) = 0;
 
 protected:
+  static const uint32_t BASE_DELAY_US = 25 * 1000;        // 25ms
+  static const uint32_t MAX_DELAY_US = 5 * 1000 * 1000LL; // 5s
+  static const uint32_t DELAY_EXPONENT = 3;
+  static const uint32_t MAX_ERRSIM_RETRY_COUNT = 5;
+  int64_t errsim_retry_count_;
   int64_t start_time_us_;
   int64_t timeout_us_;
+  int64_t delay_us_;
 };
 
 // interface class, used for OSS & S3,
@@ -136,7 +161,7 @@ FuncRetType<FuncType, Args...> execute_until_timeout(
       // if should_retry, log the current error
       uint32_t sleep_time_us = retry_strategy.calc_delay_time_us(func_ret, retries);
       retry_strategy.log_error(func_ret, retries);
-      ::usleep(sleep_time_us);
+      ob_usleep(sleep_time_us);
     }
     retries++;
   } while (should_retry_flag);
@@ -148,10 +173,14 @@ class ObObjectStorageTenantGuard
 {
 public:
   ObObjectStorageTenantGuard(const uint64_t tenant_id, const int64_t timeout_us);
+  ObObjectStorageTenantGuard(
+      const uint64_t tenant_id, const int64_t timeout_us, const uint64_t group_id);
   virtual ~ObObjectStorageTenantGuard();
 
   static uint64_t get_tenant_id();
   static int64_t get_timeout_us();
+  static uint64_t get_io_group_id();
+  static int64_t get_timeout_ms();
 
 private:
   static thread_local uint64_t tl_tenant_id_;
@@ -159,6 +188,9 @@ private:
 
   static thread_local int64_t tl_timeout_us_;
   int64_t old_timeout_us_;
+
+  static thread_local uint64_t tl_io_group_id_;
+  uint64_t old_io_group_id_;
 };
 
 } // common

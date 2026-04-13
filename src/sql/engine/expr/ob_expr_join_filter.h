@@ -50,6 +50,7 @@ public:
           is_first_ = true;
           is_partition_wise_jf_ = false;
           is_active_ = true;
+          skip_during_rescan_ = false;
         }
       virtual ~ObExprJoinFilterContext();
     public:
@@ -102,7 +103,9 @@ public:
       inline void collect_sample_info(const int64_t filter_count,
                                       const int64_t total_count) override final
       {
-        (void)slide_window_.update_slide_window_info(filter_count, total_count);
+        if (enable_slide_window_) {
+          (void)slide_window_.update_slide_window_info(filter_count, total_count);
+        }
       }
 
     public:
@@ -133,7 +136,9 @@ public:
           // pushdown filter parameters
           bool is_partition_wise_jf_ : 1;
           bool is_active_ : 1;
-          uint64_t reserved_:58;
+          bool enable_slide_window_ : 1;
+          bool skip_during_rescan_ : 1;
+          uint64_t reserved_:56;
         };
       };
       int64_t max_wait_time_ms_;

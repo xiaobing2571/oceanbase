@@ -56,8 +56,10 @@ int get_safe_str_len(const char* str);
 int c_str_to_int(const char *str, const int64_t length, int64_t &num);
 int c_str_to_int(const char *str, int64_t &num);
 int get_storage_prefix_from_path(const common::ObString &uri, const char *&prefix);
+// extra_info = nullptr means no extra info
 int handle_listed_object(ObBaseDirEntryOperator &op,
-    const char *obj_name, const int64_t obj_name_len, const int64_t obj_size);
+    const char *obj_name, const int64_t obj_name_len, const int64_t obj_size,
+    const ObFileExtraInfo *extra_info = nullptr);
 int handle_listed_directory(ObBaseDirEntryOperator &op,
     const char *dir_name, const int64_t dir_name_len);
 int build_bucket_and_object_name(ObIAllocator &allocator,
@@ -76,20 +78,134 @@ int record_failed_files_idx(const hash::ObHashMap<ObString, int64_t> &files_to_d
 int ob_set_field(const char *value, char *field, const uint32_t field_length);
 int ob_apr_abort_fn(int retcode);
 
+template<size_t N>
+class ObSmallString
+{
+public:
+  ObSmallString(const uint64_t tenant_id)
+      : allocator_(lib::ObMemAttr(tenant_id, "ObSmallString")), large_buffer_(nullptr), len_(0)
+  {
+    MEMSET(small_buffer_, 0, N);
+  }
+  virtual ~ObSmallString() { reset(); }
+  void reset()
+  {
+    len_ = 0;
+    large_buffer_ = nullptr;
+    MEMSET(small_buffer_, 0, N);
+    allocator_.reset();
+  }
+
+  bool empty() const { return len_ <= 0; }
+  int64_t length() const { return len_; }
+  bool is_small() const { return len_ <= N; }
+  const char *ptr() const { return is_small() ? small_buffer_ : large_buffer_; }
+  uint64_t hash() const
+  {
+    uint64_t hash_value = 0;
+    if (!empty()) {
+      hash_value = common::murmurhash(ptr(), len_, hash_value);
+    }
+    return hash_value;
+  }
+
+  int set(const ObString &str)
+  {
+    int ret = OB_SUCCESS;
+    reset();
+    const int64_t str_len = str.length();
+    if (str_len <= 0) {
+      // do nothing
+    } else if (str_len <= N) { // small string
+      MEMCPY(small_buffer_, str.ptr(), str_len);
+      len_ = str_len;
+    } else { // large string
+      if (OB_ISNULL(large_buffer_ = static_cast<char *>(allocator_.alloc(str_len)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        OB_LOG(WARN, "fail to allocate memory", K(ret), K(str_len), K(str));
+      } else {
+        MEMCPY(large_buffer_, str.ptr(), str_len);
+        len_ = str_len;
+      }
+    }
+    return ret;
+  }
+
+  int set(const char *str, const int64_t str_len)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_ISNULL(str) || OB_UNLIKELY(str_len < 0)) {
+      ret = OB_INVALID_ARGUMENT;
+      OB_LOG(WARN, "invalid argument", K(ret), KP(str), K(str_len));
+    } else if (OB_FAIL(set(ObString(str_len, str)))) {
+      // skip log
+    }
+    return ret;
+  }
+
+  int assign(const ObSmallString<N> &other)
+  {
+    int ret = OB_SUCCESS;
+    if (this != &other) {
+      if (other.empty()) {
+        reset();
+      } else if (OB_FAIL(set(ObString(other.length(), other.ptr())))) {
+        OB_LOG(WARN, "fail to assign ObSmallString", K(ret), K(other));
+      }
+    }
+    return ret;
+  }
+
+  int64_t to_string(char *buf, const int64_t buf_len) const
+  {
+    int64_t pos = 0;
+    if (OB_NOT_NULL(buf) && OB_LIKELY(buf_len > 0)) {
+      if (OB_NOT_NULL(ptr())) {
+        pos = snprintf(buf, buf_len, "%.*s", MIN(static_cast<int32_t>(buf_len), length()), ptr());
+        if (pos < 0) {
+          pos = 0;
+        } else if (pos >= buf_len) {
+          pos = buf_len - 1;
+        }
+      }
+    }
+    return pos;
+  }
+
+private:
+  ObArenaAllocator allocator_; // for large_buffer_
+  char small_buffer_[N];
+  char *large_buffer_;
+  int64_t len_;
+};
+
 struct ObStorageObjectMetaBase
 {
   OB_UNIS_VERSION_V(1);
 public:
-  ObStorageObjectMetaBase() : type_(ObStorageObjectMetaType::OB_OBJ_INVALID) { reset(); }
+  ObStorageObjectMetaBase()
+      : type_(ObStorageObjectMetaType::OB_OBJ_INVALID),
+        digest_(ObObjectStorageTenantGuard::get_tenant_id())
+  {
+    reset();
+  }
   ~ObStorageObjectMetaBase() { reset(); }
 
-  void reset() { is_exist_ = false; length_ = -1; }
+  void reset()
+  {
+    is_exist_ = false;
+    length_ = -1;
+    mtime_s_ = -1;
+    digest_.reset();
+  }
 
-  TO_STRING_KV(K_(is_exist), K_(length));
+  TO_STRING_KV(K_(is_exist), K_(length), K(type_), K(mtime_s_), K(digest_));
 
   bool is_exist_;
   int64_t length_;
   ObStorageObjectMetaType type_;
+  int64_t mtime_s_; // time of last modification, aligned with ObIODFileStat
+  ObSmallString<64> digest_;
 };
 
 // Each fragment meta corresponds to a normal object in a 'dir'.
@@ -165,7 +281,7 @@ public:
 
   static bool fragment_meta_cmp_func(const ObAppendableFragmentMeta &left, const ObAppendableFragmentMeta &right);
 
-  TO_STRING_KV(K_(is_exist), K_(length), K_(type), K_(fragment_metas));
+  INHERIT_TO_STRING_KV("ObStorageObjectMetaBase", ObStorageObjectMetaBase, K(fragment_metas_));
 
   ObSEArray<ObAppendableFragmentMeta, 10> fragment_metas_;
 };
@@ -178,7 +294,7 @@ public:
   int64_t max_name_len_; // no matter full path, or just object/file name, can not be longer than this value.
   int64_t rsp_num_; // real listed-item number which is obtained from the listed result
   bool has_next_; // list result can only return up-to 1000 objects once, thus may need to multi operation.
-  bool need_size_; // If true, that means when we list items, we also need to get each item's size
+  bool need_meta_; // If true, that means when we list items, we also need to get each item's size
   int64_t *size_arr_; // save all the length of each object/file (the order is the same with name_arr)
   int64_t cur_listed_count_;
   int64_t total_list_limit_;  // The maximum number of objects required to be listed. <= 0 means there is no limit
@@ -186,14 +302,14 @@ public:
 
   ObStorageListCtxBase()
     : max_list_num_(0), name_arr_(NULL), max_name_len_(0), rsp_num_(0),
-      has_next_(false), need_size_(false), size_arr_(NULL),
+      has_next_(false), need_meta_(false), size_arr_(NULL),
       cur_listed_count_(0), total_list_limit_(-1),
       opendal_lister_(nullptr)
   {}
 
   virtual ~ObStorageListCtxBase() { reset(); }
 
-  int init(ObArenaAllocator &allocator, const int64_t max_list_num, const bool need_size);
+  int init(ObArenaAllocator &allocator, const int64_t max_list_num, const bool need_meta);
 
   void reset();
 
@@ -202,7 +318,7 @@ public:
   void inc_cur_listed_count();
   bool has_reached_list_limit() const;
 
-  TO_STRING_KV(K_(max_list_num), K_(max_name_len), K_(rsp_num), K_(has_next), K_(need_size),
+  TO_STRING_KV(K_(max_list_num), K_(max_name_len), K_(rsp_num), K_(has_next), K_(need_meta),
     KP_(name_arr), KP_(size_arr));
 };
 
@@ -261,6 +377,7 @@ public:
 class ObIStorageUtil
 {
 public:
+  virtual ~ObIStorageUtil() {}
   virtual int open(common::ObObjectStorageInfo *storage_info) = 0;
   virtual void close() = 0;
   virtual int is_exist(const common::ObString &uri, bool &exist) = 0;
@@ -287,6 +404,7 @@ public:
 class ObIStorageReader
 {
 public:
+  virtual ~ObIStorageReader() {}
   virtual int open(const common::ObString &uri,
                    common::ObObjectStorageInfo *storage_info, const bool head_meta = true) = 0;
   virtual int pread(char *buf,const int64_t buf_size, const int64_t offset, int64_t &read_size) = 0;
@@ -298,6 +416,7 @@ public:
 class ObIStorageWriter
 {
 public:
+  virtual ~ObIStorageWriter() {}
   virtual int open(const common::ObString &uri, common::ObObjectStorageInfo *storage_info) = 0;
   virtual int write(const char *buf,const int64_t size) = 0;
   virtual int pwrite(const char *buf, const int64_t size, const int64_t offset) = 0;
@@ -310,6 +429,7 @@ public:
 class ObIStorageMultiPartWriter
 {
 public:
+  virtual ~ObIStorageMultiPartWriter() {}
   virtual int open(const common::ObString &uri, common::ObObjectStorageInfo *storage_info) = 0;
   virtual int write(const char *buf, const int64_t size) = 0;
   virtual int pwrite(const char *buf, const int64_t size, const int64_t offset) = 0;
@@ -323,6 +443,7 @@ public:
 class ObIStorageParallelMultipartWriter
 {
 public:
+  virtual ~ObIStorageParallelMultipartWriter() {}
   virtual int open(const common::ObString &uri, common::ObObjectStorageInfo *storage_info) = 0;
   virtual int upload_part(const char *buf, const int64_t size, const int64_t part_id) = 0;
   virtual int complete() = 0;
@@ -370,10 +491,14 @@ public:
       const ObString &uri,
       const int64_t &handled_size);
   ~ObObjectStorageGuard();
+  static bool is_connectivity_check_file(const ObString &uri);
 
 private:
   void print_access_storage_log_() const;
   bool is_slow_io_(const int64_t cost_time_us) const;
+
+public:
+  static constexpr char OB_STR_CONNECTIVITY_CHECK[] = "connectivity_check";
 
 private:
   static constexpr int64_t SMALL_IO_SIZE = 128LL * 1024LL;             // 128KB

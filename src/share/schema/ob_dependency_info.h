@@ -132,7 +132,8 @@ public:
                                              uint64_t dep_obj_id,
                                              int64_t schema_version,
                                              share::schema::ObObjectType dep_obj_type);
-
+  static int remove_duplicated_dep_infos(ObIArray<ObDependencyInfo> &deps,
+                                        ObIArray<ObDependencyInfo> &source_deps);
   static int collect_dep_info(ObIArray<ObDependencyInfo> &deps,
                               ObObjectType dep_obj_type,
                               int64_t ref_obj_id,
@@ -147,11 +148,9 @@ public:
              common::ObString &dep_attrs,
              common::ObString &dep_reason,
              bool is_pl = true);
-  static int collect_dep_infos(ObReferenceObjTable &ref_objs,
-                               common::ObIArray<ObDependencyInfo> &deps,
-                               ObObjectType dep_obj_type,
-                               uint64_t dep_obj_id,
-                               int64_t &max_version);
+  static int collect_dep_infos_for_view(const ObReferenceObjTable &ref_objs,
+                                        const bool need_nested_dep,
+                                        common::ObIArray<ObDependencyInfo> &deps);
   static int collect_dep_infos(
     const common::ObIArray<ObBasedSchemaObjectInfo> &based_schema_object_infos,
     common::ObIArray<ObDependencyInfo> &deps,
@@ -163,12 +162,13 @@ public:
     const common::ObString &dep_attrs,
     const common::ObString &dep_reason,
     const int64_t schema_version);
-
   int get_object_create_time(common::ObISQLClient &sql_client,
                              share::schema::ObObjectType obj_type,
                              int64_t &create_time,
                              common::ObString &ref_obj_name);
   int gen_dependency_dml(const uint64_t exec_tenant_id, oceanbase::share::ObDMLSqlSplicer &dml);
+  int get_timestamp_str(int64_t timestamp, ObSqlString &value_str);
+  int get_insert_value_str(ObSqlString &value_str);
 
   static int collect_ref_infos(uint64_t tenant_id,
                                uint64_t dep_obj_id,
@@ -182,7 +182,12 @@ public:
                                   uint64_t ref_obj_id,
                                   common::ObISQLClient &sql_proxy,
                                   common::ObIArray<std::pair<uint64_t, share::schema::ObObjectType>> &objs);
-  static int collect_all_dep_objs_inner(uint64_t tenant_id,
+  static int collect_all_dep_objs_inner_rcte(uint64_t tenant_id,
+                                        uint64_t root_obj_id,
+                                        uint64_t ref_obj_id,
+                                        common::ObISQLClient &sql_proxy,
+                                        common::ObIArray<std::pair<uint64_t, share::schema::ObObjectType>> &objs);
+  static int collect_all_dep_objs_inner_recursive(uint64_t tenant_id,
                                         uint64_t root_obj_id,
                                         uint64_t ref_obj_id,
                                         common::ObISQLClient &sql_proxy,
@@ -217,7 +222,6 @@ public:
                               uint64_t tenant_id,
                               uint64_t dep_obj_id,
                               uint64_t schema_version, uint64_t owner_id);
-
   TO_STRING_KV(K_(tenant_id),
                K_(dep_obj_id),
                K_(dep_obj_type),
@@ -238,7 +242,37 @@ private:
                                   const common::ObIArray<std::pair<uint64_t, int64_t>>& ref_obj_infos,
                                   common::ObISQLClient &sql_proxy,
                                   common::ObIArray<CriticalDepInfo> &objs);
-
+  static bool is_duplicate_dependency(const ObIArray<ObDependencyInfo> &deps,
+                                      ObObjectType dep_obj_type,
+                                      int64_t ref_obj_id,
+                                      int64_t ref_timestamp,
+                                      ObObjectType ref_obj_type);
+  static int create_dependency_info(ObDependencyInfo &dep,
+                                   ObObjectType dep_obj_type,
+                                   int64_t ref_obj_id,
+                                   int64_t ref_timestamp,
+                                   ObObjectType ref_obj_type,
+                                   uint64_t property = 0,
+                                   const ObString &dep_attrs = ObString(),
+                                   const ObString &dep_reason = ObString(),
+                                   uint64_t order = UINT64_MAX,
+                                   uint64_t tenant_id = OB_INVALID_TENANT_ID,
+                                   uint64_t dep_obj_id = OB_INVALID_ID,
+                                   uint64_t dep_obj_owner_id = OB_INVALID_ID,
+                                   int64_t schema_version = OB_INVALID_VERSION);
+  static int add_dependency_if_not_duplicate(ObIArray<ObDependencyInfo> &deps,
+                                            ObObjectType dep_obj_type,
+                                            int64_t ref_obj_id,
+                                            int64_t ref_timestamp,
+                                            ObObjectType ref_obj_type,
+                                            uint64_t property = 0,
+                                            const ObString &dep_attrs = ObString(),
+                                            const ObString &dep_reason = ObString(),
+                                            uint64_t tenant_id = OB_INVALID_TENANT_ID,
+                                            uint64_t dep_obj_id = OB_INVALID_ID,
+                                            uint64_t dep_obj_owner_id = OB_INVALID_ID,
+                                            int64_t schema_version = OB_INVALID_VERSION,
+                                            uint64_t custom_order = UINT64_MAX);
 private:
   uint64_t tenant_id_;
   uint64_t dep_obj_id_;

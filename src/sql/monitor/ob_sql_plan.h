@@ -244,6 +244,7 @@ private:
                               PlanText &plan_text);
 
   int format_plan_table(ObIArray<ObSqlPlanItem*> &sql_plan_infos,
+                        const bool is_explain_format_object_name_display,
                         const ObExplainDisplayOpt& option,
                         PlanText &plan_text);
 
@@ -289,6 +290,9 @@ private:
                       int64_t nested_count);
 
   const char* get_tree_line(int type);
+
+public:
+  void filter_rescan_op(ObIArray<ObSqlPlanItem*> &sql_plan_infos);
 
 public:
   static int format_one_output_expr(char *buf,

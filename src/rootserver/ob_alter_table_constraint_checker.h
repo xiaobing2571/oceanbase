@@ -13,6 +13,7 @@
 #define OCEANBASE_ROOTSERVER_OB_ALTER_TABLE_CONSTRAINT_CHECKER_H_
 #include "lib/ob_define.h"
 #include "share/ob_ddl_common.h"
+#include "share/ob_rpc_struct.h"
 namespace oceanbase
 {
 namespace share
@@ -40,10 +41,10 @@ public:
       const uint64_t tenant_data_version,
       bool &can_modify_column_name_and_constraint);
 
-  static int check_can_add_cst_on_two_column(
+  static int check_can_add_cst_on_multi_column(
       const obrpc::ObAlterTableArg &alter_table_arg,
       const uint64_t tenant_data_version,
-      bool &can_add_cst_on_two_column);
+      bool &can_add_cst_on_multi_column);
   static int check_is_change_cst_column_name(
         const share::schema::ObTableSchema &table_schema,
         const share::schema::AlterTableSchema &alter_table_schema,
@@ -62,6 +63,11 @@ public:
       bool &need_modify);
   static int modify_not_null_constraint_validate(
       const obrpc::ObAlterTableArg &alter_table_arg,
+      AlterTableSchema &alter_table_schema);
+  static int fill_new_constraint_info(
+      const obrpc::ObAlterTableArg::AlterConstraintType op_type,
+      const AlterTableSchema &tmp_alter_table_schema,
+      const ObTableSchema &new_table_schema,
       AlterTableSchema &alter_table_schema);
 };
 

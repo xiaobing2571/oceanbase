@@ -51,6 +51,7 @@ int ObPxReceiveOpInput::get_dfo_key(ObDtlDfoKey &key)
 int ObPxReceiveOpInput::get_data_ch(ObPxTaskChSet &task_ch_set, int64_t timeout_ts, ObDtlChTotalInfo &ch_info)
 {
   int ret = OB_SUCCESS;
+  common::ScopedTimer timer(ObMetricId::WAIT_CHANNEL_INFO_COST);
   ObPxSQCProxy *ch_provider = reinterpret_cast<ObPxSQCProxy *>(ch_provider_ptr_);
   int64_t task_id = OB_INVALID_ID;
   if (OB_ISNULL(ch_provider)) {
@@ -96,7 +97,12 @@ ObPxReceiveOp::ObPxReceiveOp(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOp
     iter_end_(false),
     channel_linked_(false),
     task_channels_(),
-    row_reader_(get_spec().id_),
+    row_reader_(get_spec().id_, &(static_cast<const ObPxReceiveSpec &>(spec_).child_exprs_),
+      ctx_.get_physical_plan_ctx()->get_phy_plan()->get_min_cluster_version() >= CLUSTER_VERSION_4_3_3_0,
+      ((ctx_.get_physical_plan_ctx()->get_phy_plan()->get_min_cluster_version() >= MOCK_CLUSTER_VERSION_4_3_5_3 &&
+        ctx_.get_physical_plan_ctx()->get_phy_plan()->get_min_cluster_version() < CLUSTER_VERSION_4_4_0_0) ||
+      ctx_.get_physical_plan_ctx()->get_phy_plan()->get_min_cluster_version() >= CLUSTER_VERSION_4_4_1_0
+      )? &ctx_.get_allocator() : NULL, this),
     px_row_msg_proc_(&row_reader_),
     msg_loop_(op_monitor_info_),
     ts_cnt_(0),
@@ -372,7 +378,9 @@ int ObPxReceiveOp::inner_drain_exch()
     if (OB_FAIL(try_link_channel())) {
       LOG_WARN("failed to link channel", K(ret));
     } else if (OB_FAIL(active_all_receive_channel())) {
-      LOG_WARN("failed to active all receive channel", K(ret));
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to active all receive channel", K(ret));
+      }
     }
     LOG_TRACE("drain px receive", K(get_spec().id_), K(ret), K(lbt()));
     dfc_.drain_all_channels();
@@ -486,7 +494,7 @@ int ObPxReceiveOp::wrap_get_next_batch(const int64_t max_row_cnt)
     // set project flag to prevent duplcated expression calculation
     if (NULL != all_exprs) {
       FOREACH_CNT(e, *(all_exprs)) {
-        (*e)->get_eval_info(eval_ctx_).projected_ = 1;
+        (*e)->get_eval_info(eval_ctx_).set_projected(true);
       }
     }
   }
@@ -615,6 +623,14 @@ int ObPxReceiveOp::send_channel_ready_msg(int64_t child_dfo_id)
     }
   }
   return ret;
+}
+
+int ObPxReceiveOp::inner_close() {
+  int ret = OB_SUCCESS;
+  if (dfc_.get_total_block_time() > 0) {
+    INC_METRIC_VAL(ObMetricId::DTL_BLOCKING_TIME, dfc_.get_total_block_time() * 1000);
+  }
+  return ObOperator::inner_close();
 }
 //------------- end ObPxReceiveOp-----------------
 
@@ -757,7 +773,7 @@ void ObPxReceiveOp::do_clear_datum_eval_flag()
   FOREACH_CNT(e, spec_.calc_exprs_) {
     if ((*e)->is_batch_result()) {
       (*e)->get_evaluated_flags(eval_ctx_).unset(eval_ctx_.get_batch_idx());
-      (*e)->get_eval_info(eval_ctx_).projected_ = 0;
+      (*e)->get_eval_info(eval_ctx_).set_projected(false);
     } else {
       (*e)->get_eval_info(eval_ctx_).clear_evaluated_flag();
     }
@@ -800,7 +816,9 @@ int ObPxFifoReceiveOp::fetch_rows(const int64_t row_cnt)
           ret = OB_TIMEOUT;
           LOG_WARN("get row from channel timeout", K(ret));
         } else {
-          ob_usleep<ObWaitEventIds::DTL_PROCESS_CHANNEL_SLEEP>(1 * 1000);
+          int64_t begin_sleep_time = rdtsc();
+          ob_usleep<ObWaitEventIds::WAIT_DTL_RECEIVE_RESPONSE>(1 * 1000, 0, 0, 0);
+          op_monitor_info_.block_time_ += rdtsc() - begin_sleep_time;
           int tmp_ret = ctx_.fast_check_status();
           if (OB_SUCCESS != tmp_ret) {
             LOG_WARN("wait to receive row interrupted", K(tmp_ret), K(ret));

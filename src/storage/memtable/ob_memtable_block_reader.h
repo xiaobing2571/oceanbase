@@ -61,7 +61,28 @@ public:
       const sql::ObPushdownFilterExecutor *parent,
       sql::ObPushdownFilterExecutor &filter,
       const sql::PushdownFilterInfo &pd_filter_info,
-      common::ObBitmap &result_bitmap);
+      common::ObBitmap &result_bitmap) override;
+
+  virtual int filter_pushdown_truncate_filter(const sql::ObPushdownFilterExecutor *parent,
+                                              sql::ObPushdownFilterExecutor &filter,
+                                              const sql::PushdownFilterInfo &pd_filter_info,
+                                              common::ObBitmap &result_bitmap) override;
+
+  virtual int filter_pushdown_ttl_filter(const sql::ObPushdownFilterExecutor *parent,
+                                         sql::ObPushdownFilterExecutor &filter,
+                                         const sql::PushdownFilterInfo &pd_filter_info,
+                                         common::ObBitmap &result_bitmap) override;
+
+  virtual int filter_pushdown_base_version_filter(const sql::ObPushdownFilterExecutor *parent,
+                                                  sql::ObPushdownFilterExecutor &filter,
+                                                  const sql::PushdownFilterInfo &pd_filter_info,
+                                                  common::ObBitmap &result_bitmap) override;
+
+private:
+  int filter_pushdown_single_column_mds_filter(const sql::ObPushdownFilterExecutor *parent,
+                                               sql::ObPushdownFilterExecutor &filter,
+                                               const sql::PushdownFilterInfo &pd_filter_info,
+                                               common::ObBitmap &result_bitmap);
 
 public:
   /********** derived from ObIMicroBlockReader **********/
@@ -69,6 +90,7 @@ public:
 
   virtual bool has_lob_out_row() const override { return has_lob_out_row_; }
   bool is_single_version_rows() const { return is_single_version_rows_; }
+  virtual const ObMicroBlockHeader* get_micro_header() const override final { return nullptr; }
 
   /********** derived from ObIMicroBlockReader **********/
   TO_STRING_KV(K_(is_inited), K_(has_lob_out_row), K_(is_single_version_rows), K_(is_delete_insert), K_(reader_type),

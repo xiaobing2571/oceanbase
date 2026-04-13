@@ -179,6 +179,10 @@ ObIndexBlockMacroIterator::ObIndexBlockMacroIterator()
       is_reverse_scan_(false),
       is_inited_(false)
 {
+  ObMemAttr attr(MTL_ID(), "IdxBlkMacroIter");
+  micro_index_infos_.set_attr(attr);
+  micro_endkeys_.set_attr(attr);
+  micro_endkey_allocator_.set_attr(attr);
 }
 
 ObIndexBlockMacroIterator::~ObIndexBlockMacroIterator()
@@ -218,6 +222,7 @@ void ObIndexBlockMacroIterator::reset() {
   is_iter_end_ = false;
   is_reverse_scan_ = false;
   is_inited_ = false;
+  index_tree_type_ = IndexTreeType::Unknown;
 }
 
 int ObIndexBlockMacroIterator::open(
@@ -230,6 +235,7 @@ int ObIndexBlockMacroIterator::open(
   int ret = OB_SUCCESS;
   bool start_beyond_range = false;
   bool end_beyond_range = false;
+  ObArenaAllocator tmp_arena("MacroIterTmp", OB_MALLOC_MIDDLE_BLOCK_SIZE, MTL_ID());
   ObDatumRowkey sstable_endkey;
   int cmp_ret = 0;
 
@@ -241,7 +247,7 @@ int ObIndexBlockMacroIterator::open(
     LOG_WARN("SSTable is not valid", K(ret), K(sstable), K(range));
   } else if (sstable.no_data_to_read()) {
     is_iter_end_ = true;
-  } else if (OB_FAIL(sstable.get_last_rowkey(allocator, sstable_endkey))) {
+  } else if (OB_FAIL(sstable.get_last_rowkey(tmp_arena, sstable_endkey))) {
     LOG_WARN("Fail to get last rowkey of sstable", K(ret));
   } else if (OB_FAIL(sstable_endkey.compare(
       range.get_start_key(), rowkey_read_info.get_datum_utils(), cmp_ret))) {
@@ -398,17 +404,9 @@ int ObIndexBlockMacroIterator::get_next_idx_row(ObIAllocator &item_allocator, Ob
     // traverse all node of this macro block and collect index info
     ObDatumRowkey rowkey;
     row_offset = idx_row_parser->get_row_offset();
-    if (idx_row_header->is_data_index() && !idx_row_header->is_major_node()) {
-      if (OB_FAIL(idx_row_parser->get_minor_meta(minor_meta_info))) {
-        LOG_WARN("Fail to get minor meta info", K(ret));
-      }
-    } else if (!idx_row_header->is_major_node() || !idx_row_header->is_pre_aggregated()) {
-      // Do not have aggregate data
-    } else if (OB_FAIL(idx_row_parser->get_agg_row(agg_row_buf, agg_buf_size))) {
-      LOG_WARN("Fail to get aggregate", K(ret));
-    }
-
-    if (OB_SUCC(ret)) {
+    if (OB_FAIL(idx_row_parser->parse_minor_meta_and_agg_row(minor_meta_info, agg_row_buf, agg_buf_size))) {
+      LOG_WARN("Fail to parse minor meta and agg row", K(ret));
+    } else {
       if (need_record_micro_info_) {
         micro_endkey_allocator_.reuse();
         reuse_micro_info_array();
@@ -802,7 +800,7 @@ int ObIndexBlockMacroIterator::get_cs_range(
     LOG_WARN("Fail to get get data block", K(ret), K(macro_handle));
   } else if (OB_FAIL(reader_helper.init(*allocator_))) {
     LOG_WARN("Fail to init reader helper", K(ret));
-  } else if (OB_FAIL(reader_helper.get_reader(micro_block_iter.get_row_type(), reader))) {
+  } else if (OB_FAIL(reader_helper.get_reader(*data_block.get_micro_header(), reader))) {
     LOG_WARN("Fail to get reader", K(ret));
   } else if (OB_FAIL(reader->init(data_block, rowkey_read_info))) {
     LOG_WARN("Fail to init data block reader", K(ret), K(rowkey_read_info));

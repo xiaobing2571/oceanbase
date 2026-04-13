@@ -31,19 +31,23 @@ SendMsgResponse::~SendMsgResponse()
 {
   int ret = OB_SUCCESS;
   if (in_process_) {
-    if (OB_FAIL(wait())) {
+    if (OB_FAIL(wait(ObDtlChannel::DtlChannelType::BASIC_CHANNEL))) {
       LOG_DEBUG("send dtl message failed", K(ret));
     }
   }
 }
 
-int SendMsgResponse::init()
+int SendMsgResponse::init(bool is_transmit)
 {
   int ret = OB_SUCCESS;
+  int32_t event_no = common::ObWaitEventIds::DTL_RECEIVE_MSG_WAIT;
+  if (is_transmit) {
+    event_no = common::ObWaitEventIds::DTL_TRANSMIT_MSG_WAIT;
+  }
   if (inited_) {
     ret = OB_INIT_TWICE;
     LOG_WARN("init twice");
-  } else if (OB_FAIL(cond_.init(common::ObWaitEventIds::DEFAULT_COND_WAIT))) {
+  } else if (OB_FAIL(cond_.init(event_no))) {
     LOG_WARN("thread condition init failed", K(ret));
   } else {
     inited_ = true;
@@ -98,7 +102,7 @@ int SendMsgResponse::on_finish(const bool is_block, const int return_code)
   return ret;
 }
 
-int SendMsgResponse::wait()
+int SendMsgResponse::wait(ObDtlLocalChannel::DtlChannelType channel_type)
 {
   int ret = OB_SUCCESS;
   if (!inited_) {
@@ -110,10 +114,11 @@ int SendMsgResponse::wait()
     int64_t start_t = 0;
     int64_t end_t = 0;
     int64_t interval = 60000; // ms
+    oceanbase::lib::Thread::WaitGuard wait_guard(oceanbase::lib::Thread::WAIT_FOR_PX_MSG);
     while (!finish_ && OB_SUCC(ret)) {
       // 这里为什么是while true等待，因为callback引用了当前线程一些变量，
       // 如果采用中断，提前退出，会导致callback如果晚于线程退出，则引用非法东西而core掉
-      cond_.wait(1);
+      cond_.wait(1, static_cast<int64_t>(channel_type));
       ++count_v;
       // 60s
       if (count_v > interval) {
@@ -147,6 +152,8 @@ ObDtlBasicChannel::ObDtlBasicChannel(
       peer_id_(id ^ 1),
       write_buffer_(nullptr),
       process_buffer_(nullptr),
+      send_sem_(common::ObWaitEventIds::DTL_PROCESS_BUFFER_SEND_WAIT),
+      recv_sem_(common::ObWaitEventIds::DTL_PROCESS_BUFFER_RECEIVE_WAIT),
       alloc_new_buf_(false),
       seq_no_(0),
       send_buffer_cnt_(0),
@@ -185,6 +192,8 @@ ObDtlBasicChannel::ObDtlBasicChannel(
           peer_id_(id ^ 1),
           write_buffer_(nullptr),
           process_buffer_(nullptr),
+          send_sem_(common::ObWaitEventIds::DTL_PROCESS_BUFFER_SEND_WAIT),
+          recv_sem_(common::ObWaitEventIds::DTL_PROCESS_BUFFER_RECEIVE_WAIT),
           alloc_new_buf_(false),
           seq_no_(0),
           send_buffer_cnt_(0),
@@ -214,10 +223,14 @@ ObDtlBasicChannel::~ObDtlBasicChannel()
   LOG_TRACE("dtl use time", KP(id_), K(times_), K(write_buf_use_time_), K(send_use_time_), K(msg_count_));
 }
 
-int ObDtlBasicChannel::init()
+int ObDtlBasicChannel::init(ObDtlFlowControl *dfc)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(msg_response_.init())) {
+  bool is_transmit = false;
+  if (dfc) {
+    is_transmit = dfc->is_transmit();
+  }
+  if (OB_FAIL(msg_response_.init(is_transmit))) {
     LOG_WARN("int message response failed", K(ret));
   } else {
     is_inited_ = true;
@@ -229,8 +242,14 @@ int ObDtlBasicChannel::wait_response()
 {
   int ret = OB_SUCCESS;
   if (msg_response_.is_in_process()) {
-    if (OB_FAIL(msg_response_.wait())) {
+    if (belong_to_transmit_data()) {
+      channel_loop_->begin_wait_time_counting();
+    }
+    if (OB_FAIL(msg_response_.wait(get_channel_type()))) {
       LOG_WARN("send previous message fail", K(ret));
+    }
+    if (belong_to_transmit_data()) {
+      channel_loop_->end_wait_time_counting();
     }
     if (OB_HASH_NOT_EXIST == ret) {
       if (is_drain()) {
@@ -337,7 +356,7 @@ int ObDtlBasicChannel::feedup(ObDtlLinkedBuffer *&buffer)
   return common::OB_NOT_IMPLEMENT;
 }
 
-int ObDtlBasicChannel::mock_eof_buffer(int64_t timeout_ts)
+int ObDtlBasicChannel::mock_eof_buffer(int64_t timeout_ts, uint64_t dfo_id)
 {
   int ret = OB_SUCCESS;
   int64_t min_buf_size = ObChunkDatumStore::Block::min_buf_size(0);
@@ -360,8 +379,14 @@ int ObDtlBasicChannel::mock_eof_buffer(int64_t timeout_ts)
       buffer->seq_no() = 1;
       buffer->pos() = 0;
       if (use_interm_result_) {
-        if (OB_FAIL(MTL(ObDTLIntermResultManager*)->process_interm_result(buffer, id_))) {
-          LOG_WARN("fail to process internal result", K(ret));
+        if (OB_UNLIKELY(dfo_id == OB_INVALID_ID)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_ERROR("dfo_id is invalid", K(ret), K(dfo_id));
+        } else {
+          buffer->set_dfo_id(dfo_id);
+          if (OB_FAIL(MTL(ObDTLIntermResultManager*)->process_interm_result(buffer, id_))) {
+            LOG_WARN("fail to process internal result", K(ret));
+          }
         }
       } else {
         bool inc_recv_buf_cnt = false;
@@ -651,9 +676,9 @@ int ObDtlBasicChannel::process1(
         mock_buffer.set_data_msg(true);
         ObDtlMsgType type = ObDtlMsgType::PX_DATUM_ROW;
         if (OB_ISNULL(result_info) || !result_info->is_rich_format()) {
-          mock_buffer.set_buf(reinterpret_cast<char *>(&datum_iter_));
+          mock_buffer.set_buf(reinterpret_cast<char *>(&datum_iter_), sizeof(datum_iter_));
         } else {
-          mock_buffer.set_buf(reinterpret_cast<char *>(&row_iter_));
+          mock_buffer.set_buf(reinterpret_cast<char *>(&row_iter_), sizeof(row_iter_));
           mock_buffer.set_row_meta(result_info->get_row_store()->get_row_meta());
           type = ObDtlMsgType::PX_VECTOR_ROW;
         }
@@ -987,6 +1012,7 @@ int ObDtlBasicChannel::switch_writer(const ObDtlMsg &msg)
       } else if (DtlWriterType::VECTOR_ROW_WRITER == msg_writer_map[px_row.get_data_type()]) {
         vector_row_msg_writer_.set_row_meta(meta_);
         msg_writer_ = &vector_row_msg_writer_;
+        vector_row_msg_writer_.set_plan_min_cluster_version(plan_min_cluster_version_);
       } else if (DtlWriterType::VECTOR_WRITER == msg_writer_map[px_row.get_data_type()]) {
         msg_writer_ = &vector_msg_writer_;
       } else {

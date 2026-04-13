@@ -39,6 +39,12 @@ namespace observer
         enable_response_time_stats, sql::stmt::stmt_name, process_type, elapsed_us); \
     break;
 
+#define RECORD_FAILED_OP_STAT(process_type, stat_prefix)                     \
+  case ObTableProccessType::process_type:                                            \
+    EVENT_INC(stat_prefix##_COUNT);                                                  \
+    EVENT_ADD(stat_prefix##_TIME, elapsed_us);                                       \
+    break;
+
 #define RECORD_STAT_END()                                                                         \
   default:                                                                                        \
     SERVER_LOG_RET(                                                                               \
@@ -76,16 +82,49 @@ public:
   {
     // rerouting: whether client should refresh location cache and retry
     // Now, following the same logic as in ../mysql/ob_query_retry_ctrl.cpp
-    return is_master_changed_error(err)
-      || is_server_down_error(err)
-      || is_partition_change_error(err)
-      || is_server_status_error(err)
-      || is_unit_migrate(err)
-      || is_transaction_rpc_timeout_err(err)
-      || is_has_no_readable_replica_err(err)
-      || is_select_dup_follow_replic_err(err)
-      || is_trans_stmt_need_retry_error(err)
-      || is_snapshot_discarded_err(err);
+    return is_need_refresh_route_meta_error(err)
+        || is_need_refresh_route_location_error(err);
+  }
+
+  OB_INLINE static bool is_need_refresh_route_meta_error(int err)
+  {
+      return err == OB_SCHEMA_ERROR
+          || err == OB_TABLE_NOT_EXIST
+          || err == OB_TABLET_NOT_EXIST
+          || err == OB_LS_NOT_EXIST
+          || err == OB_MAPPING_BETWEEN_TABLET_AND_LS_NOT_EXIST // cannot retry in server because tablet_id will be used to get ls_id, get ls_id is easy to timeout, let client retry
+          || err == OB_SNAPSHOT_DISCARDED
+          || err == OB_SCHEMA_EAGAIN
+          || err == OB_ERR_WAIT_REMOTE_SCHEMA_REFRESH
+          || err == OB_GTS_NOT_READY
+          || err == OB_ERR_OPERATION_ON_RECYCLE_OBJECT;
+  }
+
+  OB_INLINE static bool is_need_refresh_route_location_error(int err) {
+    return err == OB_LOCATION_LEADER_NOT_EXIST
+        || err == OB_NOT_MASTER
+        || err == OB_RS_NOT_MASTER
+        || err == OB_RS_SHUTDOWN
+        || err == OB_RPC_SEND_ERROR
+        || err == OB_RPC_POST_ERROR
+        || err == OB_PARTITION_NOT_EXIST
+        || err == OB_LOCATION_NOT_EXIST
+        || err == OB_PARTITION_IS_STOPPED
+        || err == OB_PARTITION_IS_BLOCKED
+        || err == OB_SERVER_IS_INIT
+        || err == OB_SERVER_IS_STOPPING
+        || err == OB_TRANS_RPC_TIMEOUT
+        || err == OB_NO_READABLE_REPLICA;
+  }
+
+  OB_INLINE static bool can_did_local_retry(int err) {
+    return is_need_refresh_route_location_error(err)
+        || err == OB_TABLET_NOT_EXIST
+        || err == OB_LS_NOT_EXIST
+        || err == OB_SNAPSHOT_DISCARDED
+        || err == OB_SCHEMA_EAGAIN
+        || err == OB_ERR_WAIT_REMOTE_SCHEMA_REFRESH
+        || err == OB_GTS_NOT_READY;
   }
 
   OB_INLINE static bool need_do_move_response(const int err, const obrpc::ObRpcPacket &rpc_pkt)
@@ -138,7 +177,16 @@ public:
       RECORD_STAT_WITH_ROW(TABLE_API_HBASE_CHECK_AND_PUT, HBASEAPI_CHECK_PUT, T_HBASE_CHECK_AND_PUT)
       RECORD_STAT_WITH_ROW(TABLE_API_HBASE_INCREMENT, HBASEAPI_INCREMENT, T_HBASE_INCREMENT)
       RECORD_STAT_WITH_ROW(TABLE_API_HBASE_APPEND, HBASEAPI_APPEND, T_HBASE_APPEND)
-      RECORD_STAT_WITH_ROW(TABLE_API_HBASE_HYBRID, HBASEAPI_HYBRID, T_HBASE_OTHER)
+      RECORD_STAT_WITH_ROW(TABLE_API_HBASE_HYBRID, HBASEAPI_HYBRID, T_HBASE_HYBRID_BATCH)
+
+      // new hbase metrics
+      RECORD_STAT_WITH_ROW(TABLE_API_HBASE_CHECK_AND_MUTATE, HBASEAPI_CHECK_MUTATE, T_HBASE_CHECK_AND_MUTATE);
+      RECORD_STAT_WITH_ROW(TABLE_API_HBASE_SCAN, HBASEAPI_SCAN, T_HBASE_SCAN);
+      RECORD_STAT_WITH_ROW(TABLE_API_HBASE_GET, HBASEAPI_GET, T_HBASE_GET);
+      RECORD_STAT_WITH_ROW(TABLE_API_HBASE_BATCH_PUT, HBASEAPI_BATCH_PUT, T_HBASE_BATCH_PUT);
+      RECORD_STAT_WITH_ROW(TABLE_API_HBASE_BATCH_DELETE, HBASEAPI_BATCH_DELETE, T_HBASE_BATCH_DELETE);
+      RECORD_STAT_WITH_ROW(TABLE_API_HBASE_BATCH_GET, HBASEAPI_BATCH_GET, T_HBASE_BATCH_GET);
+      RECORD_FAILED_OP_STAT(TABLE_API_FAILED_OP, TABLEAPI_FAILED_OP);
 
       // table query
       RECORD_STAT_WITH_ROW(TABLE_API_TABLE_QUERY, TABLEAPI_QUERY, T_KV_QUERY)

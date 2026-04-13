@@ -19,6 +19,7 @@ using namespace common;
 namespace compaction
 {
 ERRSIM_POINT_DEF(EN_CO_MERGE_REUSE_MICRO);
+ERRSIM_POINT_DEF(EN_FORCE_CHECK_MACRO_BLOCK_OP);
 
 ObProgressiveMergeMgr::ObProgressiveMergeMgr()
   : progressive_merge_round_(0),
@@ -112,6 +113,26 @@ void ObProgressiveMergeMgr::mark_progressive_round_unfinish()
 {
   ATOMIC_SET(&finish_cur_round_, false);
 }
+
+bool ObProgressiveMergeMgr::check_need_progressive_merge(
+    const int64_t schema_progressive_merge_num,
+    const int64_t schema_progressive_merge_round,
+    const blocksstable::ObSSTableBasicMeta &base_meta)
+{
+  bool bret = false;
+  const int64_t progressive_merge_num = 0 == schema_progressive_merge_num
+                                      ? OB_AUTO_PROGRESSIVE_MERGE_NUM
+                                      : schema_progressive_merge_num;
+  if (schema_progressive_merge_round <= INIT_PROGRESSIVE_MERGE_ROUND) {
+    // initial state
+  } else if (base_meta.progressive_merge_round_ < schema_progressive_merge_round) {
+    bret = true;
+  } else if (base_meta.progressive_merge_round_ == schema_progressive_merge_round) {
+    bret = base_meta.progressive_merge_step_ < progressive_merge_num;
+  }
+  return bret;
+}
+
 /*
  *ObProgressiveMergeHelper
  */
@@ -128,15 +149,18 @@ void ObProgressiveMergeHelper::reset()
 }
 
 int ObProgressiveMergeHelper::init(
-  const ObSSTable &sstable,
-  const ObMergeParameter &merge_param,
-  ObProgressiveMergeMgr *mgr)
+    ObIArray<ObITable*> &tables,
+    const ObMergeParameter &merge_param,
+    ObProgressiveMergeMgr *mgr)
 {
   int ret = OB_SUCCESS;
   const ObStaticMergeParam &static_param = merge_param.static_param_;
   if (OB_UNLIKELY(is_inited_)) {
     ret = OB_INIT_TWICE;
     LOG_WARN("ObProgressiveMergeHelper init twice", K(ret));
+  } else if (OB_UNLIKELY(tables.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("input tables is empty", K(ret));
   } else if (OB_UNLIKELY(NULL != mgr && !mgr->is_inited())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("input progressive mgr is invalid", KR(ret), KPC(mgr));
@@ -149,9 +173,18 @@ int ObProgressiveMergeHelper::init(
   } else {
     mgr_ = mgr; // init mgr first
     int64_t rewrite_macro_cnt = 0, reduce_macro_cnt = 0, rewrite_block_cnt_for_progressive = 0;
-
-    if (OB_FAIL(collect_macro_info(sstable, merge_param, rewrite_macro_cnt, reduce_macro_cnt, rewrite_block_cnt_for_progressive))) {
-      LOG_WARN("Fail to scan secondary meta", K(ret), K(merge_param));
+    for (int64_t i = 0; OB_SUCC(ret) && i < tables.count(); ++i) {
+      ObSSTable *sstable = nullptr;
+      if (OB_ISNULL(tables.at(i))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Unexpected null table", K(ret));
+      } else if (!tables.at(i)->is_sstable()) {
+      } else if (FALSE_IT(sstable = static_cast<ObSSTable *>(tables.at(i)))) {
+      } else if (OB_FAIL(collect_macro_info(*sstable, merge_param, rewrite_macro_cnt, reduce_macro_cnt, rewrite_block_cnt_for_progressive))) {
+        LOG_WARN("Fail to scan secondary meta", K(ret), K(merge_param));
+      }
+    }
+    if (OB_FAIL(ret)) {
     } else if (need_calc_progressive_merge()) {
       if (rewrite_block_cnt_for_progressive > 0) {
         need_rewrite_block_cnt_ = MAX(rewrite_block_cnt_for_progressive /
@@ -169,9 +202,15 @@ int ObProgressiveMergeHelper::init(
         check_macro_need_merge_ = rewrite_macro_cnt <= (reduce_macro_cnt * 2);
       }
       if (static_param.data_version_ < DATA_VERSION_4_3_2_0
-          && sstable.is_normal_cg_sstable() && rewrite_macro_cnt < CG_TABLE_CHECK_REWRITE_CNT_) {
+          && tables.at(0)->is_normal_cg_sstable() && rewrite_macro_cnt < CG_TABLE_CHECK_REWRITE_CNT_) {
         check_macro_need_merge_ = true;
       }
+#ifdef ERRSIM
+      if (EN_FORCE_CHECK_MACRO_BLOCK_OP) {
+        check_macro_need_merge_ = table_idx_ == 0;
+        SERVER_EVENT_SYNC_ADD("merge_errsim", "force_check_macro_block_op", "tablet_id", static_param.get_tablet_id());
+      }
+#endif
       FLOG_INFO("finish macro block need merge check", "tablet_id", static_param.get_tablet_id(), K(check_macro_need_merge_), K(rewrite_macro_cnt), K(reduce_macro_cnt), K(table_idx_));
     }
   }
@@ -237,35 +276,38 @@ int ObProgressiveMergeHelper::open_macro_iter(
   int ret = OB_SUCCESS;
   const ObStaticMergeParam &static_param = merge_param.static_param_;
   const storage::ObITableReadInfo *index_read_info = nullptr;
+  const blocksstable::ObDatumRange *merge_range = nullptr;
   if (sstable.is_normal_cg_sstable()) {
     if (OB_FAIL(MTL(ObTenantCGReadInfoMgr *)->get_index_read_info(index_read_info))) {
       LOG_WARN("failed to get index read info from ObTenantCGReadInfoMgr", KR(ret));
+    } else if (OB_FAIL(merge_param.get_rowid_range_by_scn_range(sstable.get_key().scn_range_, merge_range))) {
+      LOG_WARN("failed to get rowid range by scn range", KR(ret), K(sstable.get_key().scn_range_));
     }
   } else {
     index_read_info = static_param.rowkey_read_info_;
+    merge_range = &merge_param.merge_range_;
   }
-  const ObDatumRange &merge_range = sstable.is_normal_cg_sstable() ? merge_param.merge_rowid_range_ : merge_param.merge_range_;
   if (OB_FAIL(ret)) {
   } else if (OB_ISNULL(index_read_info)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("index read info is unexpected null", KR(ret), KP(index_read_info), K(sstable), K(merge_param));
   } else if (OB_FAIL(sstable.scan_secondary_meta(
           allocator,
-          merge_range,
+          *merge_range,
           *index_read_info,
           DATA_BLOCK_META,
           sec_meta_iter))) {
-    LOG_WARN("Fail to scan secondary meta", K(ret), K(merge_range));
+    LOG_WARN("Fail to scan secondary meta", K(ret), KPC(merge_range));
   }
   return ret;
 }
 
 int ObProgressiveMergeHelper::check_macro_block_op(const ObMacroBlockDesc &macro_desc,
-                                                   ObMacroBlockOp &block_op)
+                                                   ObBlockOp &block_op)
 {
   int ret = OB_SUCCESS;
 
-  block_op.reset();
+  block_op.set_none();
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObProgressiveMergeHelper not init", K(ret));
@@ -286,7 +328,7 @@ int ObProgressiveMergeHelper::check_macro_block_op(const ObMacroBlockDesc &macro
     if (block_op.is_none() && check_macro_need_merge_) {
       bool need_set_block_op = macro_desc.macro_meta_->val_.data_zsize_ < REWRITE_MACRO_SIZE_THRESHOLD;
 #ifdef ERRSIM
-      if (OB_UNLIKELY(EN_CO_MERGE_REUSE_MICRO)) {
+      if (OB_UNLIKELY(EN_CO_MERGE_REUSE_MICRO || EN_FORCE_CHECK_MACRO_BLOCK_OP)) {
         ret = OB_SUCCESS;
         need_set_block_op = true;
         FLOG_INFO("ERRSIM EN_CO_MERGE_REUSE_MICRO", KR(ret), K(need_set_block_op));
@@ -296,7 +338,8 @@ int ObProgressiveMergeHelper::check_macro_block_op(const ObMacroBlockDesc &macro
       } else if (data_version_ < DATA_VERSION_4_3_2_0) {
         block_op.set_rewrite();
       } else {
-        block_op.set_reorg();
+        block_op.set_open();
+        LOG_INFO("check macro block op", K(ret), "data_zsize", macro_desc.macro_meta_->val_.data_zsize_, K(table_idx_));
       }
     }
   }

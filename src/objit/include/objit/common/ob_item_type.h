@@ -91,6 +91,8 @@ typedef enum ObItemType
   T_VAR_INT = 65,
 
   T_EXEC_VAR = 66,
+  T_JSON_NUMBER = 67,
+  T_JSON_STRING = 68,
 
   T_REF_ALIAS_COLUMN = 88,
   T_REF_COLUMN = 89,
@@ -216,6 +218,7 @@ typedef enum ObItemType
   T_OP_OUTPUT_PACK = 186,
   T_FUN_GET_TEMP_TABLE_SESSID = 187,
   T_OP_PUSHDOWN_TOPN_FILTER = 188,
+  T_OP_LOCAL_DYNAMIC_FILTER = 189,
   ///< @note add new operator before this line
 
   // system functions
@@ -514,6 +517,11 @@ typedef enum ObItemType
   T_FUN_SYS_GET_MYSQL_ROUTINE_PARAMETER_TYPE_STR = 782,
   T_FUN_SYS_MYSQL_TO_CHAR = 783,
   T_FUN_INNER_TYPE_TO_ENUMSET = 784,
+  T_FUN_SYS_MONTHS_ADD = 785,
+  T_FUN_SYS_CBRT = 786,
+  T_FUN_SYS_BTRIM = 787,
+  T_FUN_SYS_E = 788,
+  T_FUN_SYS_COUNT_SUBSTRINGS = 789,
 
   ///< @note add new mysql only function type before this line
   T_MYSQL_ONLY_SYS_MAX_OP = 800,
@@ -912,6 +920,13 @@ typedef enum ObItemType
   T_FUN_SYS_MAP = 1783,
   T_FUN_SYS_MAP_KEYS = 1784,
   T_FUN_SYS_MAP_VALUES = 1785,
+  T_FUN_SYS_L2_SQUARED = 1786,
+  T_FUN_SYS_SEMANTIC_DISTANCE = 1787,
+  T_FUN_SYS_SEMANTIC_VECTOR_DISTANCE = 1788,
+  T_FUN_SYS_VECTOR_SIMILARITY = 1789,
+  T_FUN_SYS_VECTOR_L2_SIMILARITY = 1790,
+  T_FUN_SYS_VECTOR_IP_SIMILARITY = 1791,
+  T_FUN_SYS_VECTOR_COS_SIMILARITY = 1792,
   ///< @note add new oracle only function type before this line
 
   T_FUN_SYS_TABLET_AUTOINC_NEXTVAL = 1801, // add only for heap table
@@ -956,6 +971,36 @@ typedef enum ObItemType
   T_FUN_SYS_SPIV_DIM = 1917,  // sparse vector index
   T_FUN_SYS_SPIV_VALUE = 1918,
   T_FUN_SYS_CHECK_LOCATION_ACCESS = 1919,
+  T_FUN_STARTUP_MODE = 1920,
+  T_FUN_SYS_TMP_FILE_OPEN = 1922,
+  T_FUN_SYS_TMP_FILE_CLOSE = 1923,
+  T_FUN_SYS_TMP_FILE_WRITE = 1924,
+  T_FUN_SYS_TMP_FILE_READ = 1925,
+  T_FUN_SYS_HYBRID_VEC_CHUNK = 1926, // hybrid vector index
+  T_FUN_SYS_FORMAT_PROFILE = 1927, // format query profile
+  T_FUN_SYS_EMBEDDED_VEC = 1928,
+  T_FUN_SYS_AI_PROMPT = 1929,
+  T_FUN_SYS_VEC_VISIBLE = 1930, // vector index table 5
+  T_FUN_SYS_MAX_PT = 1931,
+  T_FUN_CK_GROUPCONCAT = 1932,
+  T_FUN_CK_VARSAMP = 1933,
+  T_FUN_CK_STDDEVSAMP = 1934,
+  T_FUN_CK_UNIQ = 1935,
+  T_FUN_SYS_EDIT_DISTANCE = 1936,
+  T_FUN_SYS_EDIT_DISTANCE_UTF8 = 1937,
+  T_FUN_SYS_POS_LIST = 1938, // fulltext index phrase match
+  T_FUN_CK_SYS_IS_NAN = 1939,
+  T_FUN_CK_RAND_CANONICAL = 1940,
+  T_FUN_SYS_LOAD_FILE = 1941,
+  T_FUN_SYS_AI_PARSE_DOCUMENT = 1942,
+  T_FUN_SYS_SEARCH_INDEX_INNER_PATH = 1943,
+  T_FUN_SYS_SEARCH_INDEX_INNER_VALUE = 1944,
+  T_FUN_CK_TO_TYPE_NAME = 1945,
+  T_FUN_SYS_TO_FLOAT64_OR_NULL = 1946,
+  T_FUN_SYS_NEW_TIME = 1947,
+  T_FUN_SYS_NLS_CHARSET_ID = 1948,
+  T_FUN_SYS_AUDIT_LOG_PASSWORD_SET = 1949,
+  T_FUN_SYS_AUDIT_LOG_PASSWORD_GET = 1950,
 
   ///< @note add new sys function type before this line
   T_FUN_SYS_END = 2000,
@@ -1025,6 +1070,38 @@ typedef enum ObItemType
   T_FUN_INNER_PREFIX_MIN = 2073,
   T_FUN_INNER_PREFIX_MAX = 2074,
   T_FUN_SYS_INNER_INFO_COLS_COLUMN_KEY_PRINTER = 2075,
+  T_FUN_ARG_MIN = 2076,
+  T_FUN_ARG_MAX = 2077,
+  T_FUN_TMP_FILE_OPEN = 2078,
+  T_FUN_TMP_FILE_CLOSE = 2079,
+  T_FUN_TMP_FILE_WRITE = 2080,
+  T_FUN_TMP_FILE_READ = 2081,
+  T_FUN_SYS_AI_COMPLETE = 2082,
+  T_FUN_SYS_AI_EMBED = 2083,
+  T_FUN_SYS_AI_RERANK = 2084,
+  T_FUN_MD5_CNN_WS = 2085,
+  T_FUN_SYS_BUCKET = 2086,
+  T_FUN_SYS_SDO_ANYINTERACT = 2087,
+  T_FUN_SYS_SDO_CONTAINS = 2088,
+  T_FUN_SYS_DATE_TRUNC = 2089,
+  T_FUN_ANY = 2090,
+  T_FUN_ARBITRARY = 2091,
+  // ClickHouse-compatible date functions
+  T_FUN_SYS_DATE_ADD_CLICKHOUSE = 2092,
+  T_FUN_SYS_DATE_SUB_CLICKHOUSE = 2093,
+  T_FUN_SYS_FORMAT_DATE_TIME = 2094,
+  T_FUN_SYS_TO_UNIX_TIMESTAMP = 2095,
+  T_FUN_SYS_VOID = 2096,
+  T_FUN_COLLECT_FILE_LIST = 2097,
+  T_FUN_SYS_PARSE_DATE_TIME = 2098,
+  T_FUN_SYS_COUNT_INROW = 2099,
+  T_FUN_WINDOW_FUNNEL = 2100,
+  T_FUN_SYS_EXT_MIN = 2101,
+  T_FUN_SYS_EXT_MAX = 2102,
+  T_FUN_SYS_INNER_COLLATION_TYPE_TO_CHARSET = 2103,
+  T_FUN_SYS_INNER_COLLATION_TYPE_TO_COLLATION = 2104,
+  T_FUN_SYS_IMAGE_TYPE = 2105,
+
   T_MAX_OP = 3000,
 
   //pseudo column, to mark the group iterator id
@@ -1041,11 +1118,15 @@ typedef enum ObItemType
   T_PSEUDO_ROW_TRANS_INFO_COLUMN = 3012, // trans_info, only for defensive check
   T_PSEUDO_IDENTIFY_SEQ = 3013,
   T_PSEUDO_ROLLUP_GROUPING_ID = 3014,
+  T_PSEUDO_ENCODE_DUP_EXPR = 3015,
   T_PSEUDO_GROUP_PARAM = 3040,
   T_PSEUDO_EXTERNAL_FILE_COL = 3041,
   T_PSEUDO_RELEVANCE_SCORE = 3042, // relecance score for sparse retireval
   T_PSEUDO_EXTERNAL_FILE_URL = 3043,
   T_PSEUDO_DDL_SLICE_ID = 3044,
+  T_PSEUDO_HIDDEN_CLUSTERING_KEY = 3045,
+  T_PSEUDO_WINDOW_FUNNEL_TIME = 3046,
+  T_PSEUDO_WINDOW_FUNNEL_EVENT_IDX = 3047,
   T_WINDOW_FUNCTION = 3151,
   T_WIN_GENERALIZED_WINDOW = 3152,
   T_WIN_NEW_GENERALIZED_WINDOW = 3153,
@@ -1069,6 +1150,8 @@ typedef enum ObItemType
   T_WIN_FUN_LAG = 3171,
   T_WIN_FUN_AVG = 3172,
   T_WIN_FUN_RATIO_TO_REPORT = 3173,
+  T_WIN_FUN_LEAD_IN_FRAME = 3174,
+  T_WIN_FUN_LAG_IN_FRAME = 3175,
   T_TABLET_AUTOINC_NEXTVAL = 3266, // hidden_pk for heap table
 
   ///< @note values of the following symbols are insiginificant
@@ -2553,7 +2636,7 @@ typedef enum ObItemType
   T_FLUSH_PRIVILEGES = 4629,
   T_SCHEMA_ID = 4630,
   T_CANCEL_TRANSFER_PARTITION = 4631,
-  T_CANCEL_BALANCE_JOB = 4632, //FARM COMPAT WHITELIST
+  T_BALANCE_JOB_OP = 4632, //FARM COMPAT WHITELIST
   T_AUTO_SPLIT_TABLET_SIZE = 4633,
 
   T_DATA_DISK_SIZE = 4634,
@@ -2858,6 +2941,135 @@ typedef enum ObItemType
   T_UDF_PROPERTY_LIST = 4866,
 
   T_MICRO_BLOCK_FORMAT_VERSION = 4867,
+  T_MV_NESTED_REFRESH_CLAUSE = 4868, // placeholder for mview
+  T_ALTER_SUBPARTITION_EXCHANGE = 4869,
+  T_CREATE_SENSITIVE_RULE       = 4870,
+  T_DROP_SENSITIVE_RULE         = 4871,
+  T_ALTER_SENSITIVE_RULE        = 4872,
+  T_ALTER_SENSITIVE_RULE_ACTION = 4873,
+  T_SENSITIVE_FIELD             = 4874,
+  T_SENSITIVE_FIELD_LIST        = 4875,
+  T_SENSITIVE_PROTECTION_SPEC   = 4876,
+  T_SENSITIVE_ENCRYPTION_SPEC   = 4877,
+  T_SENSITIVE_MASKING_SPEC      = 4878,
+  T_SHOW_SENSITIVE_RULES        = 4879,
+  T_SHOW_SENSITIVE_RULES_OPTION = 4880,
+
+  // catalog
+  T_URI = 4881, // FARM COMPAT WHITELIST
+  T_ACCESS_INFO = 4882,
+  T_WAREHOUSE = 4883,
+  T_SEQUENCE_NAME = 4884,
+  T_STORAGE_CACHE_POLICY_IN_PART_LIST = 4885,
+  T_COLUMN_INDEX_TYPE = 4886,
+  T_FREQ_THRESHOLD = 4887,
+  T_SEMISTRUCT_PROPERTIES = 4888,
+  T_CLUSTERING_KEY = 4889,
+  T_CLUSTERING_KEY_DROP = 4890,
+
+  // optimizer hint
+  T_INDEX_MERGE_HINT = 4891,
+  T_NO_INDEX_MERGE_HINT = 4892,
+
+  T_TABLE_FLASHBACK_PROCTIME = 4893,
+  // hint for disable rich format of operators
+  T_DISABLE_OP_RICH_FORMAT = 4894,
+
+  T_PRINCIPAL = 4895,
+  T_KEYTAB = 4896,
+  T_KRB5CONF = 4897,
+  T_MAX_CLIENT_POOL_SIZE = 4898,
+  T_SOCKET_TIMEOUT = 4899,
+  // erase ss local_cache
+  T_FLUSH_SS_LOCAL_CACHE = 4900,
+    // alter type
+  T_TYPE_ALTER = 4901,
+  T_TYPE_ALTER_CLAUSE = 4902,
+  T_TYPE_ALTER_COMPILE = 4903,
+  T_TYPE_ALTER_ATTR = 4904,
+  T_TYPE_ALTER_ATTR_LIST = 4905,
+  T_COMMON_IDENTIFIER_LIST = 4906,
+  T_ALTER_ATTRIBUTE_DEFINITION_LIST = 4907,
+  T_REPLACE_TENANT = 4908,
+  T_FORMAT_OBJECT_NAME_DISPLAY = 4909,
+  T_CACHE_REFRESH_INTERVAL_SEC = 4910,
+  T_BACKUP_VALIDATE = 4911,
+  T_TRANSITION = 4912,
+  T_FUN_ES_SCORE = 4913, // fulltext index for ES SQL
+  T_FUN_ES_MATCH = 4914, // fulltext index for ES SQL
+  T_HYBRID_SEARCH = 4915, // FARM COMPAT WHITELIST
+  T_RESCAN = 4916, // rescan_op
+  T_HMS_CATALOG_NAME = 4917, // FARM COMPAT WHITELIST for hive metastore side default catalog
+  T_TABLE_VERSION_QUERY = 4918,
+  T_TABLE_VERSION_QUERY_TIMESTAMP = 4919,
+  T_TABLE_LOCK_MODE_HINT = 4920,  // to lock table before execute dml
+  T_PREFIX = 4921,
+  T_AUTH_TYPE = 4922,
+  T_USERNAME = 4923,
+  T_USERPASSWORD = 4924,
+  T_SCOPE = 4925,
+  T_OAUTH2_SVR_URI = 4926,
+  T_SIGN_NAME = 4927,
+  T_SIGN_REGION = 4928,
+  T_TOKEN = 4929,
+  T_VENDED_CREDENTAIL_ENABLED = 4930,
+  T_HTTP_TIMEOUT = 4931,
+  T_HTTP_KEEPLIVE_TIME = 4932,
+  T_RANDOM_PARTITION = 4933, // random distribution
+  T_COLUMN_NAME_CASE_SENSITIVE = 4934,
+  T_REPLACE_LS = 4935, // replace LS
+  T_DISABLE_TRIGGER_HINT = 4936, // disable_trigger hint
+  T_FTS_INDEX_TYPE = 4937, // fulltext index type
+  T_FTS_INDEX_FILTER = 4938, // fulltext index filter
+  T_FTS_INDEX_MATCH = 4939, // fulltext index phrase match
+  T_FTS_INDEX_PHRASE_MATCH = 4940, // fulltext index phrase match type
+  T_TENANT_TABLE_MAJOR_FREEZE = 4941, // tenant table major freeze
+  T_SET_PROTECTION_MODE = 4942, // set_protection_mode
+  T_DELTA_FORMAT = 4943, // delta_format table option
+  T_SKIP_INDEX_LEVEL = 4944,
+  T_DSL_QUERY = 4945, // hybrid search dsl query
+  T_PARALLEL_PARSE_ON_SINGLE_FILE = 4946, // disable parallel parse single csv
+  T_TTL_DEFINITION_WITH_TYPE = 4947,
+  T_WITH_INDEX = 4948, // prewarm data table with index table
+  T_PREWARM_SS_LOCAL_CACHE = 4949, // prewarm data into ss_local_cache
+  T_MIXED_RETENTION = 4950,  // mixed retention
+
+  //direct load kafka
+  T_CREATE_ROUTINE_LOAD = 4951,
+  T_LOAD_PROPERTIES = 4952,
+  T_KAFKA_CUSTOM_PROPERTY = 4953,
+  T_PAUSE_ROUTINE_LOAD = 4954,
+  T_RESUME_ROUTINE_LOAD = 4955,
+  T_STOP_ROUTINE_LOAD = 4956,
+
+  T_PARALLEL_PARSE_FILE_SIZE_THRESHOLD = 4957,
+  T_MAX_ROW_LENGTH = 4958,
+  T_HYBRID_SEARCH_SCORE = 4959, // hybrid search score
+  T_AI_SPLIT_DOCUMENT_EXPRESSION = 4960, // ai_split_document
+
+  // vector index query
+  T_VECTOR_INDEX_HINT = 4961,
+  T_FILTER_ADAPTIVE = 4962,
+  T_PRE_FILTER = 4963,
+  T_POST_FILTER = 4964,
+  T_INDEX_DATA_GEN_EXPRESSION = 4965,
+  T_TABLEGROUP_SCOPE = 4966,
+  T_GROUP_COMMIT = 4967,
+
+  T_ALTER_VIEW_COMPILE = 4968,
+
+  T_MAX_EXECUTION_TIME = 4969,    // for max_execution_time hint
+
+  // for cache hint
+  T_CACHE_HINT = 4970,
+  T_NOCACHE_HINT = 4971,
+
+  T_DOMAIN_LIST = 4972, // for dblink yacc grammar
+  // search index ddl params
+  T_SEARCH_INDEX_COLUMN_PARAMS = 4973,
+  T_SEARCH_INDEX_INCLUDE_PATHS = 4974,
+  T_SEARCH_INDEX_EXCLUDE_PATHS = 4975,
+  T_SEARCH_INDEX_INCLUDE_TYPES = 4976,
 
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
@@ -2881,6 +3093,8 @@ typedef enum ObCacheType
   CACHE_TYPE_PL_OBJ,
   CACHE_TYPE_PS_OBJ,
   CACHE_TYPE_LIB_CACHE,
+  CACHE_TYPE_RESULT,
+  CACHE_TYPE_SEQUENCE,
   CACHE_TYPE_MAX //Attention: add a new type before CACHE_TYPE_MAX
 } ObCacheType;
 
@@ -2999,7 +3213,10 @@ typedef enum ObOutlineType
                            || (op) == T_SHOW_PROCEDURE_CODE || (op) == T_SHOW_FUNCTION_CODE \
                            || (op) == T_SHOW_ENGINE || (op) == T_SHOW_OPEN_TABLES \
                            || (op) == T_SHOW_PLUGINS || (op) == T_SHOW_CHECK_TABLE \
-                           || (op) == T_SHOW_OLAP_ASYNC_JOB_STATUS)
+                           || (op) == T_SHOW_OLAP_ASYNC_JOB_STATUS                \
+                           || (op) == T_SHOW_CREATE_LOCATION \
+                           || (op) == T_SHOW_LOCATIONS       \
+                           || (op) == T_LOCATION_UTILS_LIST)
 
 #define EXPR_OP_NUM (T_MAX_OP-T_MIN_OP-1)
 extern const char *get_type_name(int type);
@@ -3025,7 +3242,17 @@ extern const char *get_type_name(int type);
                          (op) == T_FUNC_SYS_ARRAY_AGG ||\
                          ((op) >= T_FUN_SYS_BIT_AND && (op) <= T_FUN_SYS_BIT_XOR) || \
                          (op) == T_FUN_INNER_PREFIX_MAX || \
-                         (op) == T_FUN_INNER_PREFIX_MIN)
+                         (op) == T_FUN_INNER_PREFIX_MIN || \
+                         (op) == T_FUN_STDDEV_SAMP || \
+                         ((op) >= T_FUN_ARG_MIN && (op) <= T_FUN_ARG_MAX) || \
+                         (op) == T_FUN_ANY || \
+                         (op) == T_FUN_ARBITRARY || \
+                         (op) == T_FUN_SYS_COUNT_INROW || \
+                         ((op) >= T_FUN_CK_GROUPCONCAT && (op) <= T_FUN_CK_UNIQ) || \
+                         (op) == T_FUN_WINDOW_FUNNEL || \
+                         (op) == T_FUN_SYS_EXT_MIN || \
+                         (op) == T_FUN_SYS_EXT_MAX)
+
 #define MAYBE_ROW_OP(op) ((op) >= T_OP_EQ && (op) <= T_OP_NE)
 #define IS_PSEUDO_COLUMN_TYPE(op) \
   ((op) == T_LEVEL || (op) == T_CONNECT_BY_ISLEAF || (op) == T_CONNECT_BY_ISCYCLE || (op) == T_ORA_ROWSCN)

@@ -16,6 +16,7 @@
 #include "lib/stat/ob_diagnostic_info_util.h"
 #include "lib/ob_lib_config.h"
 #include "lib/stat/ob_diagnostic_info_guard.h" // ObLocalDiagnosticInfo
+#include "rpc/obrpc/ob_rpc_packet.h"
 
 namespace oceanbase
 {
@@ -71,7 +72,8 @@ ObDiagnosticInfoContainer::ObDiagnosticInfoContainer(int64_t tenant_id, int64_t 
       summarys_(DiagnosticInfoValueAlloc<ObDiagnosticInfoCollector, ObDiagnosticKey>(
           &di_collector_allocator_)),
       runnings_(tenant_id, DiagnosticInfoValueAlloc<ObDiagnosticInfo, SessionID>(&di_allocator_, di_upper_limit)),
-      cache_()
+      cache_(),
+      pcode_in_request_queue_{}
 {
   wait_event_pool_.init();
 }
@@ -91,6 +93,9 @@ int ObDiagnosticInfos::allocate_diagnostic_info(int64_t tenant_id, int64_t group
 {
   int ret = OB_SUCCESS;
   SessionID sess_id(session_id);
+  if (is_rpc_request(session_id)) {
+    ATOMIC_INC(&rpc_size_);
+  }
   if (OB_FAIL(di_infos_.create(sess_id, di_info))) {
     LOG_WARN("failed to create di info", K(ret), K(session_id), K(tenant_id), K(group_id));
   } else {
@@ -102,6 +107,9 @@ int ObDiagnosticInfos::allocate_diagnostic_info(int64_t tenant_id, int64_t group
 int ObDiagnosticInfos::delete_diagnostic_info(const ObDiagnosticInfo *di_info)
 {
   int ret = OB_SUCCESS;
+  if (is_rpc_request(di_info->get_session_id())) {
+    ATOMIC_DEC(&rpc_size_);
+  }
   if (OB_NOT_NULL(di_info)) {
     if (di_info->get_uref() - INT32_MAX / 2 < 0) {
       LOG_ERROR_RET(OB_ERR_UNEXPECTED, "di session leak", KPC(di_info), K(di_info));
@@ -122,7 +130,8 @@ int ObDiagnosticInfos::inc_ref(const ObDiagnosticInfo *di_info)
       LOG_WARN("failed to inc di ref", K(ret));
     } else {
 #ifdef ENABLE_DEBUG_LOG
-      if (!(*di_info == *tmp_di)) {
+      // using cache would change group id.
+      if (!di_info->is_using_cache() && !(*di_info == *tmp_di)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_ERROR("inc ref wrongly", K(di_info->get_session_id()), K(tmp_di->get_session_id()),
             KPC(di_info), KPC(tmp_di));
@@ -350,6 +359,19 @@ int64_t ObRunningDiagnosticInfoContainer::size() const
   } else {
     for (int i = 0; i < slot_count_; i++) {
       size += buffer_[i].size();
+    }
+  }
+  return size;
+}
+
+int64_t ObRunningDiagnosticInfoContainer::get_rpc_size() const
+{
+  int64_t size = 0;
+  if (!is_inited_) {
+    LOG_WARN_RET(OB_SUCCESS, "get session diagnostic info size before init!", K(ret));
+  } else {
+    for (int i = 0; i < slot_count_; i++) {
+      size += buffer_[i].get_rpc_size();
     }
   }
   return size;
@@ -690,16 +712,17 @@ bool ObDiagnosticInfoContainer::check_element_all_freed() const
 }
 
 int ObDiagnosticInfoContainer::for_each_and_delay_release_ref(
-    std::function<bool(const SessionID &, ObDiagnosticInfo *)> &fn)
+    std::function<bool(const SessionID &, ObDiagnosticInfo *)> &fn, ObArray<ObDiagnosticInfo *> &di_array)
 {
   int ret = OB_SUCCESS;
-  ObArray<ObDiagnosticInfo *> di_array;
   ObRunningDiagnosticInfoContainer &runnings = runnings_;
   std::function<bool(const SessionID &, ObDiagnosticInfo *)> fn_wrapper =
       [&di_array, &runnings, &fn](const SessionID &id, ObDiagnosticInfo *di) {
         int ret = OB_SUCCESS;
         if (OB_FAIL(runnings.inc_ref(di))) {
           LOG_WARN("failed to inc ref di", K(ret));
+          //ignore error to continue iteration
+          ret = OB_SUCCESS;
         } else if (OB_FAIL(di_array.push_back(di))) {
           LOG_WARN("faield to push back id to di_array", K(ret));
           int tmp_ret = OB_SUCCESS;
@@ -711,26 +734,79 @@ int ObDiagnosticInfoContainer::for_each_and_delay_release_ref(
             ret = tmp_ret;
           }
         } else if (OB_FAIL(fn(id, di))) {
-          LOG_DEBUG("faield to exec fn", K(ret));
+          LOG_WARN("faield to exec fn", K(ret));
         }
-        return ret;
+        return ret == OB_SUCCESS;
       };
 
   if (OB_FAIL(for_each_running_di(fn_wrapper))) {
-    LOG_ERROR("failed to for each running di", K(ret));
-  }
-
-  for (int i = 0; i < di_array.count(); i++) {
-    int tmp_ret = OB_SUCCESS;
-    if (OB_TMP_FAIL(runnings.dec_ref(di_array[i]))) {
-      LOG_ERROR("failed to dec ref", K(tmp_ret));
-    }
-
-    if (tmp_ret != OB_SUCCESS) {
-      ret = tmp_ret;
-    }
+    LOG_WARN("failed to for each running di", K(ret));
   }
   return ret;
+}
+
+int ObDiagnosticInfoContainer::release_diagnostic_info(ObArray<ObDiagnosticInfo *>&di_array)
+{
+  int ret = OB_SUCCESS;
+  int save_ret = OB_SUCCESS;
+  for (int i = 0; i < di_array.count(); i++) {
+    if (OB_FAIL(runnings_.dec_ref(di_array[i]))) {
+      LOG_ERROR("failed to dec ref", K(ret), KPC(di_array[i]));
+      save_ret = ret;
+      //continue to release other diagnostic info
+      ret = OB_SUCCESS;
+    }
+  }
+  return ret == OB_SUCCESS ? save_ret : ret;
+}
+
+void ObDiagnosticInfoContainer::calculate_wait_in_request_queue(ObDiagnosticInfo *di)
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(di)) {
+    if (di->get_ash_stat().pcode_ == 0) {// mysql request
+      pcode_in_request_queue_[obrpc::ObRpcPacketSet::THE_PCODE_COUNT]++;
+    } else {// rpc request
+      const obrpc::ObRpcPacketCode pcode =
+          static_cast<obrpc::ObRpcPacketCode>(di->get_ash_stat().pcode_);
+      int64_t idx = obrpc::ObRpcPacketSet::instance().idx_of_pcode(pcode);
+      if (idx < obrpc::ObRpcPacketSet::THE_PCODE_COUNT && idx >= 0) {
+        pcode_in_request_queue_[idx]++;
+      } else {
+        LOG_WARN("invalid pcode", K(pcode), KPC(di));
+      }
+    }
+  }
+}
+
+void ObDiagnosticInfoContainer::copy_wait_request_to_ash_buffer_and_reset(int64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  for (int i = 0; i < obrpc::ObRpcPacketSet::THE_PCODE_COUNT + 1; i++) {
+    if (pcode_in_request_queue_[i] > 0) {
+      share::ObActiveSessHistList &ash_list = share::ObActiveSessHistList::get_instance();
+      ObActiveSessionStatItem tmp_item;
+      if (i < obrpc::ObRpcPacketSet::THE_PCODE_COUNT) {
+        tmp_item.session_type_ = ObActiveSessionStatItem::SessionType::BACKGROUND;
+        snprintf(tmp_item.program_, ASH_PROGRAM_STR_LEN, "T%ld_RPC_REQUEST", tenant_id);
+        MEMCCPY(tmp_item.action_,
+          obrpc::ObRpcPacketSet::instance().name_of_idx(i),
+          '\0',
+          sizeof(tmp_item.action_) - 1);
+      } else {
+        tmp_item.session_type_ = ObActiveSessionStatItem::SessionType::FOREGROUND;
+        snprintf(tmp_item.program_, ASH_PROGRAM_STR_LEN, "T%ld_SQL_CMD", tenant_id);
+      }
+      tmp_item.tenant_id_ = tenant_id;
+      tmp_item.event_no_ = ObWaitEventIds::NETWORK_QUEUE_WAIT;
+      tmp_item.p1_ = static_cast<uint64_t>(obrpc::ObRpcPacketSet::instance().pcode_of_idx(i));
+      tmp_item.weight_ = pcode_in_request_queue_[i];
+      tmp_item.is_wr_weight_sample_ = true;
+      ash_list.add_item(tmp_item);
+      pcode_in_request_queue_[i] = 0;
+      ash_list.inc_compress_num();
+    }
+  }
 }
 
 } /* namespace common */

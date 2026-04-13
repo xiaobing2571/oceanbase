@@ -45,7 +45,11 @@ public:
     sort_cmp_funs_(alloc),
     sort_collations_(alloc),
     popular_values_hash_(alloc),
-    calc_tablet_id_expr_(NULL)
+    calc_tablet_id_expr_(NULL),
+    dup_expr_list_(alloc),
+    encoded_dup_expr_(NULL),
+    aggr_code_expr_(NULL),
+    max_aggr_code_(0)
   {}
   ~ObPxDistTransmitSpec() {}
   virtual int register_to_datahub(ObExecContext &ctx) const override;
@@ -55,6 +59,10 @@ public:
   ObSortCollations sort_collations_;
   common::ObFixedArray<uint64_t, ObIAllocator> popular_values_hash_; // for hybrid hash distribution
   ObExpr *calc_tablet_id_expr_;   // for slave mapping
+  ExprFixedArray dup_expr_list_;
+  ObExpr *encoded_dup_expr_;
+  ObExpr *aggr_code_expr_;
+  int64_t max_aggr_code_;
 };
 
 class ObPxDistTransmitOp : public ObPxTransmitOp
@@ -103,6 +111,10 @@ protected:
   int add_batch_row_for_piece_msg(ObChunkDatumStore &sample_store);
   int add_batch_row_for_piece_msg_vec(ObChunkDatumStore &sample_store);
   int add_row_for_piece_msg(ObChunkDatumStore &sample_store);
+
+  virtual int do_project_trans_exprs(const ObIArray<ObExpr *> &trans_exprs, const ObBatchRows &brs,
+                                     ObEvalCtx &eval_ctx) override;
+
 private:
   int build_row_sample_piece_msg(int64_t expected_range_count,
     ObDynamicSamplePieceMsg &piece_msg);

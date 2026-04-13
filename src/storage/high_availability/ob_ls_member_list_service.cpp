@@ -24,7 +24,7 @@ namespace storage
 ObLSMemberListService::ObLSMemberListService()
   : is_inited_(false),
     ls_(NULL),
-    transfer_scn_iter_lock_(),
+    transfer_scn_iter_lock_(common::ObLatchIds::LS_MEMBER_LIST_SERVICE_LOCK),
     log_handler_(NULL)
 {
 }
@@ -167,6 +167,30 @@ int ObLSMemberListService::switch_learner_to_acceptor(
   return ret;
 }
 
+int ObLSMemberListService::replace_learners(
+    const common::ObMemberList &added_learners,
+    const common::ObMemberList &removed_learners,
+    const bool need_check_transfer_scn,
+    const int64_t timeout)
+{
+  int ret = OB_SUCCESS;
+  palf::LogConfigVersion config_version;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    STORAGE_LOG(WARN, "ls is not inited", K(ret));
+  } else if (need_check_transfer_scn && OB_FAIL(check_ls_transfer_scn_validity_(config_version))) {
+    STORAGE_LOG(WARN, "failed to check ls transfer scn validity", K(ret));
+  } else if (OB_FAIL(log_handler_->replace_learners(added_learners,
+                                                    removed_learners,
+                                                    timeout))) {
+    STORAGE_LOG(WARN, "failed to replace learners", K(ret), K(added_learners), K(removed_learners));
+  } else {
+    STORAGE_LOG(INFO, "replace learners success", K(ret), K(added_learners), K(removed_learners),
+        K(need_check_transfer_scn), K(config_version));
+  }
+  return ret;
+}
+
 int ObLSMemberListService::get_max_tablet_transfer_scn(share::SCN &transfer_scn)
 {
   int ret = OB_SUCCESS;
@@ -203,7 +227,7 @@ int ObLSMemberListService::get_max_tablet_transfer_scn(share::SCN &transfer_scn)
       } else if (OB_FALSE_IT(key.tablet_id_ = tablet_id)) {
       } else if (OB_FAIL(t3m->get_tablet(priority, key, tablet_handle))) {
         STORAGE_LOG(WARN, "failed to get tablet", K(ret), K(key));
-      } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_committed(mds_data))) {
+      } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_committed_tablet_status(mds_data))) {
         if (OB_EMPTY_RESULT == ret) {
           STORAGE_LOG(INFO, "committed tablet_status does not exist", K(ret), K(key));
           ret = OB_SUCCESS;
@@ -266,6 +290,9 @@ int ObLSMemberListService::get_leader_config_version_and_transfer_scn_(
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "cnt not match", KR(ret),
                       "return_cnt", return_code_array.count());
+  } else if (OB_SUCCESS != return_code_array.at(0)) {
+    ret = return_code_array.at(0);
+    STORAGE_LOG(WARN, "rpc to leader failed", KR(ret), K(addr));
   } else if (OB_FAIL(process_result_from_async_rpc_(proxy,
                                                     addr,
                                                     return_code_array,
@@ -312,6 +339,9 @@ int ObLSMemberListService::check_ls_transfer_scn_(const share::SCN &transfer_scn
   if (OB_ISNULL(ls_)) {
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "ls should not be null", K(ret), KP_(ls));
+  } else if (!ObReplicaTypeCheck::is_replica_with_ssstore(ls_->get_ls_meta().get_replica_type())) {
+    check_pass = true;
+    STORAGE_LOG(INFO, "replica without ssstore, no need check", KPC_(ls));
   } else if (OB_FAIL(ls_->get_transfer_scn(local_transfer_scn))) {
     STORAGE_LOG(WARN, "failed to get transfer scn", K(ret), KP_(ls));
   } else if (transfer_scn > local_transfer_scn) {
@@ -330,6 +360,8 @@ int ObLSMemberListService::get_ls_member_list_(common::ObIArray<common::ObAddr> 
   ObStorageHAGetMemberHelper get_member_helper;
   ObLSService *ls_svr = NULL;
   ObStorageRpc *storage_rpc = NULL;
+  common::ObMemberList member_list;
+  addr_list.reset();
   if (OB_ISNULL(ls_)) {
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "ls should not be null", K(ret), KP_(ls));
@@ -341,8 +373,19 @@ int ObLSMemberListService::get_ls_member_list_(common::ObIArray<common::ObAddr> 
     STORAGE_LOG(WARN, "storage rpc should not be NULL", K(ret), KP(storage_rpc));
   } else if (OB_FAIL(get_member_helper.init(storage_rpc))) {
     STORAGE_LOG(WARN, "failed to init palf helper", K(ret), KP_(ls));
-  } else if (OB_FAIL(get_member_helper.get_ls_member_list(ls_->get_tenant_id(), ls_->get_ls_id(), addr_list))) {
+  } else if (OB_FAIL(get_member_helper.get_ls_member_list(ls_->get_tenant_id(), ls_->get_ls_id(), member_list))) {
     STORAGE_LOG(WARN, "failed to get ls member list", K(ret), KP_(ls));
+  } else { //filter L replica
+    for (int64_t i = 0; OB_SUCC(ret) && i < member_list.get_member_number(); ++i) {
+      common::ObMember member;
+      if (OB_FAIL(member_list.get_member_by_index(i, member))) {
+        STORAGE_LOG(WARN, "failed to get member by index", K(ret), K(i), K(member_list));
+      } else if (member.is_logonly()) {
+        //do nothing
+      } else if (OB_FAIL(addr_list.push_back(member.get_server()))) {
+        STORAGE_LOG(WARN, "failed to push addr into array", K(ret), K(member));
+      }
+    }
   }
   return ret;
 }

@@ -106,6 +106,51 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObSchemaVersionUpdater);
 };
 
+static const char *SERVER_FULL_SCHEMA_REFRESH_PARALLELISM_REQUEST = "REQUEST";
+static const char *SERVER_FULL_SCHEMA_REFRESH_PARALLELISM_OBJECT = "OBJECT";
+
+class ObSchemaGetterController
+{
+public:
+  ObSchemaGetterController()
+    : inited_(false),
+      lock_(common::ObLatchIds::OB_SCHEMA_GETTER_LOCK) {}
+  ~ObSchemaGetterController() {}
+  int init(share::schema::ObMultiVersionSchemaService *schema_service);
+  int get_schema(const ObSchemaMgr *mgr,
+                const ObRefreshSchemaStatus &schema_status,
+                const ObSchemaType schema_type,
+                const uint64_t schema_id,
+                const int64_t schema_version,
+                common::ObKVCacheHandle &handle,
+                const ObSchema *&schema);
+private:
+  int check_inner_stat_() const;
+  int construct_schema_(const ObSchemaMgr *mgr,
+                        const ObRefreshSchemaStatus &schema_status,
+                        const ObSchemaType schema_type,
+                        const uint64_t schema_id,
+                        const int64_t schema_version,
+                        common::ObKVCacheHandle &handle,
+                        const ObSchema *&schema);
+  int check_and_set_key_(const ObSchemaCacheKey &key, bool &is_set);
+  int erase_key_(const ObSchemaCacheKey &key);
+  bool is_object_level_parallelism_(const uint64_t tenant_id, const ObSchemaMgr *mgr, const int64_t start_time) const;
+private:
+  static const int64_t COND_SLOT_NUM = 256;
+  static const int64_t CONSTRUCTING_KEY_SET_SIZE = 256;
+  static const int64_t MAX_SCHEMA_CONSTRUCT_WAIT_TIME_US = 10000000; // 10s
+  static const int64_t WAIT_TIME_MS = 500; // 0.5s
+private:
+  bool inited_;
+  share::schema::ObMultiVersionSchemaService *schema_service_;
+  ObThreadCond cond_slot_[COND_SLOT_NUM];
+  common::hash::ObHashSet<ObSchemaCacheKey> constructing_keys_;
+  ObSpinLock lock_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObSchemaGetterController);
+};
+
 // singleton class
 class ObMultiVersionSchemaService;
 
@@ -209,7 +254,8 @@ public:
                               sql::ObSQLSessionInfo *session_info,
                               const ObString &dblink_name,
                               bool is_reverse_link,
-                              uint64_t *current_scn);
+                              uint64_t *current_scn,
+                              bool &is_under_oracle12c); // for dblink connect to Oracle, if Oracle is under 12.1.0.1, is_under_oracle12c will be true
 
   // get the latest schema version
   // if core_schema_version = false, return user schema version
@@ -255,6 +301,7 @@ public:
 
   bool is_tenant_not_refreshed(const uint64_t tenant_id);
   bool is_tenant_refreshed(const uint64_t tenant_id) const;
+  int check_all_tenant_schema_refreshed(bool &all_refreshed);
 
   // sql should retry when tenant is normal but never refresh schema successfully.
   bool is_schema_error_need_retry(
@@ -354,7 +401,9 @@ public:
                              bool check_bootstrap = false);
   // Trigger an asynchronous refresh task and wait for the refresh result
   int async_refresh_schema(const uint64_t tenant_id,
-                           const int64_t schema_version);
+                           const int64_t schema_version,
+                           const share::schema::ObRefreshSchemaInfo *schema_info = nullptr);
+  int try_update_last_refreshed_schema_info(common::ObArray<share::schema::ObRefreshSchemaInfo> &refresh_schema_infos);
   int add_schema(const uint64_t tenant_id, const bool force_add = false);
 
   int try_eliminate_schema_mgr();
@@ -379,6 +428,7 @@ public:
 friend class tools::ObAgentTaskGenerator;
 friend class tools::ObAgentTaskWorker;
 friend class ObDDLEpochMgr;
+friend class ObSchemaGetterController;
   virtual void stop();
   virtual void wait();
   virtual int destroy();
@@ -488,6 +538,8 @@ private:
                                   const uint64_t &database_id,
                                   int64_t &cal_database_timeout,
                                   int64_t &total_purge_count);
+  virtual int check_schema_slot_available(const uint64_t tenant_id) override;
+
 
 private:
   static const int64_t MAX_VERSION_COUNT = 64;
@@ -510,6 +562,7 @@ private:
   ObSchemaStoreMap schema_store_map_;
   ObDDLTransController ddl_trans_controller_;
   ObDDLEpochMgr ddl_epoch_mgr_;
+  ObSchemaGetterController schema_getter_controller_;
 
   DISALLOW_COPY_AND_ASSIGN(ObMultiVersionSchemaService);
 };

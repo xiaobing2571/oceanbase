@@ -727,7 +727,7 @@ void column_cast(common::ObObj &obj, const share::schema::ObColumnSchemaV2 &colu
   }
 }
 
-void column_cast(common::ObObj &obj, const ColumnSchemaInfo &column_schema_info)
+void column_cast(common::ObObj &obj, const ColumnSchemaInfo &column_schema_info, const bool is_out_row)
 {
   // Neither the NULL type nor the Ext type update Meta information
   if (! obj.is_null() && ! obj.is_ext()) {
@@ -740,6 +740,11 @@ void column_cast(common::ObObj &obj, const ColumnSchemaInfo &column_schema_info)
       obj.set_scale(column_schema_info.get_accuracy().get_precision());
     } else {
       obj.set_scale(column_schema_info.get_accuracy().get_scale());
+    }
+
+    // outrow doesn't have lob_header so can't set lob_header
+    if (obj.is_lob_storage() && !is_out_row) {
+      obj.set_has_lob_header();
     }
   }
 }
@@ -1073,6 +1078,115 @@ int split(char *str, const char *delimiter,
   return ret;
 }
 
+int parse_addr_with_port(
+    const char *addr_str,
+    const char *&ip_str,
+    const char *&port1_str,
+    const char *&port2_str)
+{
+  int ret = OB_SUCCESS;
+  ip_str = nullptr;
+  port1_str = nullptr;
+  port2_str = nullptr;
+
+  if (OB_ISNULL(addr_str) || OB_UNLIKELY(0 == strlen(addr_str))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_ERROR("invalid argument", KP(addr_str));
+  } else {
+    // Make a copy for parsing (strtok_r will modify the string)
+    const int64_t addr_str_len = strlen(addr_str);
+    char addr_buf[256];  // Should be enough for any valid address
+    if (OB_UNLIKELY(addr_str_len >= sizeof(addr_buf))) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_ERROR("address string too long", K(addr_str_len), K(sizeof(addr_buf)));
+    } else {
+      MEMCPY(addr_buf, addr_str, addr_str_len);
+      addr_buf[addr_str_len] = '\0';
+
+      char *save_ptr = nullptr;
+
+      // Check if it's IPv6 format (starts with '[')
+      if ('[' == addr_buf[0]) {
+        // IPv6 format: [ipv6]:port1 or [ipv6]:port1:port2
+        ip_str = addr_buf + 1;  // Skip '['
+        char *close_bracket = strrchr(addr_buf, ']');
+        if (OB_ISNULL(close_bracket)) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_ERROR("invalid IPv6 format, missing ']'", K(addr_str));
+        } else {
+          *close_bracket = '\0';  // Replace ']' with '\0'
+          close_bracket++;
+          if (':' != *close_bracket) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_ERROR("invalid IPv6 format, missing ':' after ']'", K(addr_str));
+          } else {
+            close_bracket++;  // Skip ':'
+            // Now close_bracket points to port1 start position
+            if (OB_ISNULL(port1_str = strtok_r(close_bracket, ":", &save_ptr))) {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_ERROR("parse port1 failed", K(addr_str));
+            } else {
+              // Try to get port2 (may not exist for single port format)
+              port2_str = strtok_r(nullptr, ":", &save_ptr);
+              // port2_str can be NULL for single port format
+            }
+          }
+        }
+      } else {
+        // IPv4 format or hostname: port1 or port1:port2
+        // Count colons to determine format
+        int colon_count = 0;
+        for (int64_t i = 0; i < addr_str_len; i++) {
+          if (':' == addr_buf[i]) {
+            colon_count++;
+          }
+        }
+
+        if (colon_count >= 2) {
+          // Two or more colons - format: ip:port1:port2 (rootserver_list format)
+          // Parse from right to left: find last colon for port2, second last for port1
+          char *last_colon = strrchr(addr_buf, ':');
+          if (OB_NOT_NULL(last_colon)) {
+            *last_colon = '\0';
+            port2_str = last_colon + 1;
+
+            // Find second last colon for port1
+            char *second_last_colon = strrchr(addr_buf, ':');
+            if (OB_NOT_NULL(second_last_colon)) {
+              *second_last_colon = '\0';
+              port1_str = second_last_colon + 1;
+              ip_str = addr_buf;
+            } else {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_ERROR("invalid format, expected ip:port1:port2", K(addr_str));
+            }
+          } else {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_ERROR("invalid format, missing ':'", K(addr_str));
+          }
+        } else if (colon_count == 1) {
+          // Single colon - format: ip:port or hostname:port
+          if (OB_ISNULL(ip_str = strtok_r(addr_buf, ":", &save_ptr))) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_ERROR("parse ip/hostname failed", K(addr_str));
+          } else {
+            port1_str = strtok_r(nullptr, ":", &save_ptr);
+            if (OB_ISNULL(port1_str)) {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_ERROR("parse port failed", K(addr_str));
+            }
+          }
+        } else {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_ERROR("invalid format, missing ':'", K(addr_str));
+        }
+      }
+    }
+  }
+
+  return ret;
+}
+
 int split_int64(const ObString &str, const char delimiter, ObIArray<int64_t> &ret_array)
 {
   int ret = OB_SUCCESS;
@@ -1254,7 +1368,7 @@ int get_tenant_compat_mode(const uint64_t tenant_id,
     if (! done) {
       // Retry to get it again
       ret = OB_SUCCESS;
-      // After a failure to acquire the tenant schema, and in order to ensure that the modules can handle the performance, usleep for a short time
+      // After a failure to acquire the tenant schema, and in order to ensure that the modules can handle the performance, ob_usleep for a short time
       ob_usleep(100);
     }
 
@@ -1520,6 +1634,25 @@ int c_str_to_int(const char *str, int64_t &num)
     ret = OB_INVALID_ARGUMENT;
   } else {
     num = strtoll(str, &end_str, 10);
+    if (errno != 0 || (NULL != end_str && *end_str != '\0')) {
+      LOG_ERROR("strtoll convert string to int value fail", K(str), K(num),
+        "error", strerror(errno), K(end_str));
+      ret = OB_INVALID_DATA;
+    }
+  }
+  return ret;
+}
+
+int c_str_to_uint64(const char *str, uint64_t &num)
+{
+  int ret = OB_SUCCESS;
+  errno = 0;
+  char *end_str = NULL;
+  if (OB_ISNULL(str) || OB_UNLIKELY(0 == strlen(str))) {
+    LOG_ERROR("c_str_to_int str should not null");
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    num = strtoull(str, &end_str, 10);
     if (errno != 0 || (NULL != end_str && *end_str != '\0')) {
       LOG_ERROR("strtoll convert string to int value fail", K(str), K(num),
         "error", strerror(errno), K(end_str));

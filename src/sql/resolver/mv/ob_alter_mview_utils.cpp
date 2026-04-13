@@ -85,9 +85,49 @@ int ObAlterMviewUtils::resolve_mv_options(const ParseNode &node,
           OB_UNLIKELY(T_PARALLEL != parallel_node->type_)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("invalid parallel node", K(node.children_[0]), K(ret));
+      } else if (OB_UNLIKELY(parallel_node->children_[0]->value_ < 0)) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("invalid refresh dop", K(parallel_node->children_[0]->value_), K(ret));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "value for PARALLEL or DEGREE must be equal to or greater than 0!");
       } else {
         const int64_t refresh_dop = parallel_node->children_[0]->value_;
         alter_mview_arg.set_refresh_dop(refresh_dop);
+      }
+    } else if (4 == node.int32_values_[0]) {
+      ParseNode *nest_refresh_node = node.children_[0];
+      if (OB_UNLIKELY(data_version < MOCK_DATA_VERSION_4_3_5_3
+                      || (data_version >= DATA_VERSION_4_4_0_0 && data_version < MOCK_DATA_VERSION_4_4_2_0)
+                      || (data_version >= DATA_VERSION_4_5_0_0 && data_version < DATA_VERSION_4_5_1_0))) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("tenant data version is less than 4.3.5.3 or between 4.4.0.0 and 4.4.2.0 or between 4.5.0.0 and 4.5.1.0, alter mv nested refresh mode is not supported",
+                K(ret), K(data_version));
+      } else if (OB_ISNULL(nest_refresh_node) ||
+                 OB_UNLIKELY(T_MV_NESTED_REFRESH_CLAUSE != nest_refresh_node->type_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid nested refresh node", KP(node.children_[0]), K(ret));
+      } else {
+        int32_t nested_refresh_mode_val = nest_refresh_node->int32_values_[0];
+        switch (nested_refresh_mode_val) {
+          case 0:
+            alter_mview_arg.set_alter_nested_refresh_mode(share::schema::ObMVNestedRefreshMode::INDIVIDUAL);
+            break;
+          case 1:
+            alter_mview_arg.set_alter_nested_refresh_mode(share::schema::ObMVNestedRefreshMode::INCONSISTENT);
+            break;
+          case 2:
+            // ret = OB_NOT_SUPPORTED;
+            // LOG_WARN("sync refresh not supported now", K(ret));
+            // LOG_USER_ERROR(OB_NOT_SUPPORTED, "nested sync refresh");
+            alter_mview_arg.set_alter_nested_refresh_mode(share::schema::ObMVNestedRefreshMode::CONSISTENT);
+            break;
+          default:
+            break;
+        }
+        // if (alter_mview_arg.get_nested_refresh_mode() == share::schema::ObMVNestedRefreshMode::CONSISTENT) {
+        //   ret = OB_NOT_SUPPORTED;
+        //   LOG_WARN("nested sync refresh not supported now", K(ret));
+        //   LOG_USER_ERROR(OB_NOT_SUPPORTED, "nested sync refresh");
+        // }
       }
     } else {
       ParseNode *refresh_info_node = node.children_[0];
@@ -204,6 +244,10 @@ int ObAlterMviewUtils::resolve_mlog_options(const ParseNode &node,
           OB_UNLIKELY(T_PARALLEL != parallel_node->type_)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("invalid parallel node", K(node.children_[0]), K(ret));
+      } else if (OB_UNLIKELY(parallel_node->children_[0]->value_ < 1)) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("invalid table dop", K(parallel_node->children_[0]->value_), K(ret));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "value for PARALLEL or DEGREE must be greater than 0!");
       } else {
         const int64_t table_dop = parallel_node->children_[0]->value_;
         alter_mlog_arg.set_table_dop(table_dop);
@@ -246,7 +290,7 @@ int ObAlterMviewUtils::check_column_option_for_mlog_master(const ObTableSchema &
 {
   int ret = OB_SUCCESS;
   if (table_schema.required_by_mview_refresh()) {
-    if (T_COLUMN_ADD == type) {
+    if (T_COLUMN_ADD == type || T_COLUMN_MODIFY == type || T_COLUMN_ALTER == type) {
     } else {
       if (table_schema.has_mlog_table()) {
         ret = OB_NOT_SUPPORTED;
@@ -254,7 +298,7 @@ int ObAlterMviewUtils::check_column_option_for_mlog_master(const ObTableSchema &
                        "modify column to table with materialized view log is");
         LOG_WARN("modify column to table with materialized view log is not supported",
                  KR(ret), K(table_schema.get_table_name()));
-      } else if (table_schema.table_referenced_by_fast_lsm_mv()) {
+      } else if (table_schema.table_referenced_by_mv()) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED,
                        "modify column to table required by materialized view is");
@@ -282,7 +326,8 @@ int ObAlterMviewUtils::check_action_node_for_mlog_master(const ObTableSchema &ta
         || T_DROP_CONSTRAINT == type
         || T_ALTER_FOREIGN_KEY_OPTION == type
         || T_ALTER_INDEX_OPTION == type
-        || T_ALTER_MLOG_OPTIONS == type) {
+        || T_ALTER_MLOG_OPTIONS == type
+        || T_ALTER_PARTITION_OPTION == type) {
     } else {
       if (table_schema.has_mlog_table()) {
         ret = OB_NOT_SUPPORTED;
@@ -290,7 +335,38 @@ int ObAlterMviewUtils::check_action_node_for_mlog_master(const ObTableSchema &ta
                        "this alter table to table with materialized view log is");
         LOG_WARN("this alter table to table with materialized view log is not supported", KR(ret),
                  K(table_schema.get_table_name()));
-      } else if (table_schema.table_referenced_by_fast_lsm_mv()) {
+      } else if (table_schema.table_referenced_by_mv()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       "this alter table to table required by materialized view is");
+        LOG_WARN("this alter table to table required by materialized view is not supported",
+                 KR(ret), K(table_schema.get_table_name()));
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected table type", KR(ret), K(table_schema), K(type));
+      }
+    }
+    SQL_RESV_LOG(INFO, "resolve the master of mlog for alter table", K(ret), K(type), K(table_schema));
+  }
+  return ret;
+}
+
+int ObAlterMviewUtils::check_partition_option_for_mlog_master(const ObTableSchema &table_schema,
+                                                              const ObItemType type)
+{
+  int ret = OB_SUCCESS;
+  if (table_schema.required_by_mview_refresh()) {
+    if (false) {
+      // todo: T_ALTER_PARTITION_ADD, it makes refresh failed because
+      // the mlog query begin version is less than tablet create commit version
+    } else {
+      if (table_schema.has_mlog_table()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       "this alter table to table with materialized view log is");
+        LOG_WARN("this alter table to table with materialized view log is not supported", KR(ret),
+                 K(table_schema.get_table_name()));
+      } else if (table_schema.table_referenced_by_mv()) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED,
                        "this alter table to table required by materialized view is");

@@ -205,6 +205,8 @@ int ObExprValuesOp::inner_open()
   node_idx_ = 0;
   const bool is_explicit_cast = false;
   const int32_t result_flag = 0;
+  uint64_t compat_version = 0;
+  bool implicit_first_century_year = false;
   ObPhysicalPlanCtx *plan_ctx = GET_PHY_PLAN_CTX(ctx_);
   if (OB_ISNULL(plan_ctx) || OB_ISNULL(ctx_.get_sql_ctx())) {
     ret = OB_ERR_UNEXPECTED;
@@ -214,8 +216,17 @@ int ObExprValuesOp::inner_open()
   } else if (OB_FAIL(ObSQLUtils::get_default_cast_mode(is_explicit_cast, result_flag,
                                                        ctx_.get_my_session(), cm_))) {
     LOG_WARN("fail to get_default_cast_mode", K(ret));
+  } else if (OB_FAIL((ctx_.get_my_session()->get_compatibility_version(compat_version)))) {
+    LOG_WARN("failed to get compatibility version", K(ret));
+  } else if (OB_FAIL(ObCompatControl::check_feature_enable(
+               compat_version, ObCompatFeatureType::IMPLICIT_FIRST_CENTURY_YEAR,
+               implicit_first_century_year))) {
+    LOG_WARN("failed to check feature enable", K(ret));
   } else {
     // see ObSQLUtils::wrap_column_convert_ctx(), add CM_WARN_ON_FAIL for INSERT IGNORE.
+    if (implicit_first_century_year) {
+      cm_ = cm_ | CM_IMPLICIT_FIRST_CENTURY_YEAR;
+    }
     cm_ = cm_ | CM_COLUMN_CONVERT;
     if (plan_ctx->is_ignore_stmt() || !is_strict_mode(ctx_.get_my_session()->get_sql_mode())) {
       // CM_CHARSET_CONVERT_IGNORE_ERR is will give '?' when do string_string convert.
@@ -345,7 +356,7 @@ int ObExprValuesOp::get_real_batch_obj_type(ObDatumMeta &src_meta,
 {
   int ret = OB_SUCCESS;
   const ObExprValuesSpec &my_spec = MY_SPEC;
-  if ((my_spec.ins_values_batch_opt_ || (ctx_.has_dynamic_values_table() && my_spec.array_group_idx_ >= 0)) &&
+  if ((my_spec.contain_ab_param_ || (ctx_.has_dynamic_values_table() && my_spec.array_group_idx_ >= 0)) &&
       T_QUESTIONMARK == src_expr->type_ &&
       src_expr->frame_idx_ < spec_.plan_->get_expr_frame_info().const_frame_.count() +
                              spec_.plan_->get_expr_frame_info().param_frame_.count()) {
@@ -589,18 +600,25 @@ OB_INLINE int ObExprValuesOp::calc_next_row()
             if (OB_FAIL(datum_caster_.to_type(dst_expr->datum_meta_, str_values,
                                               real_src_expr, cm_, datum))) {
               LOG_WARN("fail to do to_type", K(ret), K(*dst_expr), K(real_src_expr));
-              ObString column_name = my_spec.column_names_.at(col_idx);
+              ObString column_name = "";
+              if (col_idx >= 0 && col_idx < my_spec.column_names_.count()) {
+                column_name = my_spec.column_names_.at(col_idx);
+              }
               ret = ObDMLService::log_user_error_inner(ret, row_num, column_name, ctx_,
                                                        dst_expr->datum_meta_.type_);
             }
           }
         } else if (!dst_expr->obj_meta_.is_lob_storage()) {
-          ObString column_name = my_spec.column_names_.at(col_idx);
+          ObString column_name = "";
+          if (col_idx >= 0 && col_idx < MY_SPEC.column_names_.count()) {
+            column_name = MY_SPEC.column_names_.at(col_idx);
+          }
           ObUserLoggingCtx::Guard logging_ctx_guard(*eval_ctx_.exec_ctx_.get_user_logging_ctx());
           eval_ctx_.exec_ctx_.set_cur_rownum(row_num);
           eval_ctx_.exec_ctx_.set_cur_column_name(&column_name);
           if (OB_FAIL(datum_caster_.to_type(dst_expr->datum_meta_, real_src_expr,
-                                            cm_, datum, 0, dst_expr->obj_meta_.get_subschema_id()))) {
+                                            cm_, datum, 0, dst_expr->obj_meta_.get_subschema_id(),
+                                            dst_expr->max_length_))) {
             LOG_WARN("fail to dynamic cast", K(dst_expr->datum_meta_),
                                              K(real_src_expr), K(cm_), K(ret));
             if (dst_expr->obj_meta_.is_geometry()) {
@@ -614,7 +632,10 @@ OB_INLINE int ObExprValuesOp::calc_next_row()
           if (OB_FAIL(eval_values_op_dynamic_cast_to_lob(real_src_expr, src_obj_meta, dst_expr))) {
             LOG_WARN("fail to dynamic cast to lob types", K(dst_expr->datum_meta_),
                                                           K(real_src_expr), K(cm_), K(ret));
-            ObString column_name = my_spec.column_names_.at(col_idx);
+            ObString column_name = "";
+            if (col_idx >= 0 && col_idx < MY_SPEC.column_names_.count()) {
+              column_name = MY_SPEC.column_names_.at(col_idx);
+            }
             ret = ObDMLService::log_user_error_inner(ret, row_num, column_name, ctx_,
                                                      dst_expr->datum_meta_.type_);
           } else {

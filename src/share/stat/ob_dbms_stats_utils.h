@@ -26,9 +26,19 @@ namespace common {
 class ObDbmsStatsUtils
 {
 public:
+
+  static int init_table_stats(ObIAllocator &allocator,
+                            int64_t cnt,
+                            ObIArray<ObOptTableStat *> &table_stats);
+
   static int init_col_stats(ObIAllocator &allocator,
                             int64_t col_cnt,
                             ObIArray<ObOptColumnStat *> &col_stats);
+
+  static int assign_col_param(const ObIArray<ObColumnStatParam> *src_col_params,
+                              int64_t start,
+                              int64_t end,
+                              ObIArray<ObColumnStatParam> &target_col_params);
 
   static int check_range_skew(ObHistType hist_type,
                               const ObHistogram::Buckets &bkts,
@@ -47,6 +57,13 @@ public:
                                ObIArray<ObOptColumnStat*> &column_stats,
                                const bool is_index_stat = false,
                                const bool is_online_stat = false);
+
+  static int split_batch_write_with_trx_lock_timeout(sql::ObExecContext &ctx,
+                                                      sqlclient::ObISQLConnection *conn,
+                                                      ObIArray<ObOptTableStat*> &table_stats,
+                                                      ObIArray<ObOptColumnStat*> &column_stats,
+                                                      const bool is_index_stat = false,
+                                                      const bool is_online_stat = false);
 
   static int split_batch_write(share::schema::ObSchemaGetterGuard *schema_guard,
                                sql::ObSQLSessionInfo *session_info,
@@ -88,7 +105,14 @@ public:
   static bool is_subpart_id(const ObIArray<PartInfo> &partition_infos,
                             const int64_t partition_id,
                             int64_t &part_id);
-  
+
+  static int get_subpart_ids(const ObIArray<PartInfo> &partition_infos,
+                             const int64_t partition_id,
+                             ObIArray<int64_t> &sub_part_ids);
+  static int get_no_need_collect_part_ids(const ObTableStatParam &param,
+                                          const int64_t partition_id,
+                                          ObIArray<int64_t> &no_collect_subpart_ids);
+
   static int get_valid_duration_time(const int64_t start_time,
                                      const int64_t max_duration_time,
                                      int64_t &valid_duration_time);
@@ -143,6 +167,7 @@ public:
 
   static int64_t check_text_can_reuse(const ObObj &obj, bool &can_reuse);
 
+  static int error_code_wrapper(int ret);
   static int get_current_opt_stats(const ObTableStatParam &param,
                                    ObIArray<ObOptTableStatHandle> &cur_tab_handles,
                                    ObIArray<ObOptColumnStatHandle> &cur_col_handles);
@@ -230,6 +255,11 @@ public:
                                                    const ObIArray<ObOptColumnStat*> &column_stats,
                                                    const ObIArray<PrefixColumnPair> &pairs,
                                                    ObIArray<ObOptColumnStat*> &copy_stats);
+
+  static int set_trx_lock_timeout(sqlclient::ObISQLConnection *conn,
+                                  int64_t trx_lock_timeout,
+                                  int64_t &old_trx_lock_timeout,
+                                  bool &need_restore);
   static int copy_global_index_prefix_stats_to_text(share::schema::ObSchemaGetterGuard *schema_guard,
                                                     ObIAllocator &allocator,
                                                     const ObIArray<ObOptColumnStat*> &column_stats,
@@ -241,7 +271,28 @@ public:
                                              const ObOptColumnStat &col_stat,
                                              const ObObjMeta &text_col_meta,
                                              ObOptColumnStat *&text_column_stat);
+  static int deep_copy_string(char *buf, const int64_t buf_len, int64_t &pos,
+                              const ObString &str, ObString &dst);
 
+  static int get_max_work_area_size(uint64_t tenant_id, int64_t &max_wa_memory_size);
+
+
+  static int get_table_index_infos(share::schema::ObSchemaGetterGuard *schema_guard,
+                                   const uint64_t tenant_id,
+                                   const uint64_t table_id,
+                                   uint64_t *index_tid_arr,
+                                   int64_t &index_count);
+
+  static int dbms_stat_set_names(ObSQLSessionInfo *session_info,
+                                 ObCharsetType client_charset_type,
+                                 ObCharsetType connection_charset_type,
+                                 ObCharsetType result_charset_type,
+                                 ObCollationType collation_type);
+
+  static int find_column_param_by_column_id(const ObIArray<ObColumnStatParam> &column_params,
+                                            const uint64_t column_id,
+                                            bool &find_it,
+                                            const ObColumnStatParam *&column_param);
 private:
   static int batch_write(share::schema::ObSchemaGetterGuard *schema_guard,
                          const uint64_t tenant_id,

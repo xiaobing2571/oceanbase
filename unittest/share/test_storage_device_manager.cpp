@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include "share/io/ob_io_manager.h"
 #include "common/storage/ob_fd_simulator.h"
+#include "storage/ob_io_device.h"
 #define private public
 #include "share/ob_device_manager.h"
 #undef private
@@ -47,20 +48,20 @@ TEST_F(TestFdSimulator, test_fd)
   ObFdSimulator fd_sim;
   ASSERT_EQ(OB_SUCCESS, fd_sim.init());
   int device_type = 0;
-  int device_flag = 0;
+  ObStorageAccessType device_op_type = ObStorageAccessType::OB_STORAGE_ACCESS_READER;
   oceanbase::common::ObArenaAllocator allocator;
   void* ctx = NULL;
-  int test_total_num = 200;
-  int test_1_num = 90; //<100
-  int test_2_num = 30; //90-110
-  int test_3_num = 80; //200
+  int test_total_num = 600; // 2 * DEFAULT_ARRAY_SIZE
+  int test_1_num = 270; //(0, DEFAULT_ARRAY_SIZE)
+  int test_2_num = 60; //(DEFAULT_ARRAY_SIZE, 2 * DEFAULT_ARRAY_SIZE)
+  int test_3_num = 270; //let total num is (2 * DEFAULT_ARRAY_SIZE)
   int used_fd_cnt = 0;
   int free_fd_cnt = 0;
   int expect_used_fd_cnt = 0;
   int expect_free_fd_cnt = 0;
 
   int tmp_device_type = 0;
-  int tmp_device_flag = 0;
+  ObStorageAccessType tmp_device_op_type = ObStorageAccessType::OB_STORAGE_ACCESS_READER;
   void* tmp_ctx = NULL;
   //init fds
   ObIOFd* fds = static_cast<ObIOFd*>(allocator.alloc(sizeof(ObIOFd)*test_total_num));
@@ -73,12 +74,12 @@ TEST_F(TestFdSimulator, test_fd)
   ctx = fds;
   for (int i = 0; i < test_1_num + test_2_num; i++) {
     device_type = i % 5; 
-    device_flag = i % 2;
-    ASSERT_EQ(OB_SUCCESS, fd_sim.get_fd(ctx, device_type, device_flag, fds[i]));
+    device_op_type = static_cast<ObStorageAccessType>(i % 2);
+    ASSERT_EQ(OB_SUCCESS, fd_sim.get_fd(ctx, device_type, device_op_type, fds[i]));
     ObFdSimulator::get_fd_device_type(fds[i], tmp_device_type);
-    ObFdSimulator::get_fd_flag(fds[i], tmp_device_flag);
+    ObFdSimulator::get_fd_op_type(fds[i], tmp_device_op_type);
     ASSERT_EQ(tmp_device_type, device_type);
-    ASSERT_EQ(tmp_device_flag, device_flag);
+    ASSERT_EQ(tmp_device_op_type, device_op_type);
     fd_sim.get_fd_stat(used_fd_cnt, free_fd_cnt);
     ASSERT_EQ(i + 1, used_fd_cnt);
     if (i < ObFdSimulator::DEFAULT_ARRAY_SIZE) {
@@ -104,12 +105,12 @@ TEST_F(TestFdSimulator, test_fd)
   //get fd, util fd num is 200, check the fd
   for (int i = 0; i < test_1_num + test_2_num; i++) {
     if (i % 3 == 0) {
-      ASSERT_EQ(OB_SUCCESS, fd_sim.get_fd(ctx, device_type, device_flag, fds[i]));
+      ASSERT_EQ(OB_SUCCESS, fd_sim.get_fd(ctx, device_type, device_op_type, fds[i]));
     }
   }
 
   for (int i = test_1_num + test_2_num; i < test_1_num + test_2_num + test_3_num; i++) {
-    ASSERT_EQ(OB_SUCCESS, fd_sim.get_fd(ctx, device_type, device_flag, fds[i]));
+    ASSERT_EQ(OB_SUCCESS, fd_sim.get_fd(ctx, device_type, device_op_type, fds[i]));
   }
   fd_sim.get_fd_stat(used_fd_cnt, free_fd_cnt);
   ASSERT_EQ(used_fd_cnt, test_1_num + test_2_num + test_3_num);
@@ -151,18 +152,6 @@ private:
   DISALLOW_COPY_AND_ASSIGN(TestDeviceManager);
 };
 
-class ObClusterEnableObdalConfigFalse: public ObClusterEnableObdalConfigBase
-{
-public:
-  ObClusterEnableObdalConfigFalse() {};
-  virtual ~ObClusterEnableObdalConfigFalse() {};
-  virtual bool is_enable_obdal() const { return false; }
-  static ObClusterEnableObdalConfigFalse &get_instance() {
-    static ObClusterEnableObdalConfigFalse instance;
-    return instance;
-  }
-};
-
 TEST_F(TestDeviceManager, test_device_manager)
 {
   ASSERT_EQ(OB_SUCCESS, ObIOManager::get_instance().init());
@@ -187,6 +176,7 @@ TEST_F(TestDeviceManager, test_device_manager)
       ASSERT_EQ(tmp_dev_handle, device_handle[i]);
     } else {
       tmp_dev_handle = device_handle[i];
+      ASSERT_EQ(OB_SUCCESS, device_handle[i]->init(ObIODOpts()));
       ASSERT_EQ(OB_SUCCESS, ObIOManager::get_instance().add_device_channel(device_handle[i],
                                                                            16/*async_channel_count*/,
                                                                            2/*sync_channel_count*/,
@@ -308,16 +298,50 @@ TEST_F(TestDeviceManager, test_device_manager)
     ASSERT_EQ(OB_SUCCESS, databuff_printf(tmp_storage_info.access_id_,
                                           sizeof(tmp_storage_info.access_id_),
                                           "%d", 0));
-    cluster_enable_obdal_config = &ObClusterEnableObdalConfigFalse::get_instance();
+    ASSERT_EQ(OB_SUCCESS, ObObjectStorageInfo::register_cluster_state_mgr(&ObClusterStateBaseMgr::get_instance()));
+    ObClusterStateBaseMgr::get_instance().set_enable_obdal(false);
     ObIODevice *device_handle = nullptr;
     ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_prefix_oss, tmp_storage_info,
                                              default_storage_id_mod, device_handle));
-    cluster_enable_obdal_config = &ObClusterEnableObdalConfigBase::get_instance();
+    ObClusterStateBaseMgr::get_instance().set_enable_obdal(true);
     ObIODevice *device_handle2 = nullptr;
     ASSERT_EQ(OB_SUCCESS, manager.get_device(storage_prefix_oss, tmp_storage_info,
                                              default_storage_id_mod, device_handle2));
     ASSERT_NE(device_handle, device_handle2);
-    cluster_enable_obdal_config = &ObClusterEnableObdalConfig::get_instance();
+    ObClusterStateBaseMgr::get_instance().set_enable_obdal(false);
+  }
+}
+
+TEST_F(TestDeviceManager, test_nfs_and_local_disk)
+{
+  if (false) {
+    // ASSERT_EQ(OB_SUCCESS, ObIOManager::get_instance().init());
+    ObDeviceManager &manager = ObDeviceManager::get_instance();
+    ObString nfs_path = "file:///mnt/nfs_share";
+    ObString nfs_path2 = "file:///mnt/nfs_share/a/b/c/d/e";
+    ObString local_disk_path = "file:///home";
+
+    ObIODevice *nfs_device_handle = nullptr;
+    ObIODevice *nfs_device_handle2 = nullptr;
+    ObIODevice *local_disk_handle = nullptr;
+    ObObjectStorageInfo nfs_storage_info;
+    ObObjectStorageInfo nfs_storage_info2;
+    ObObjectStorageInfo local_disk_info;
+    ObStorageIdMod nfs_storage_id_mod(0, ObStorageUsedMod::STORAGE_USED_DATA);
+    ObStorageIdMod nfs_storage_id_mod2(0, ObStorageUsedMod::STORAGE_USED_DATA);
+    ObStorageIdMod local_disk_id_mod(1, ObStorageUsedMod::STORAGE_USED_DATA);
+    ASSERT_EQ(OB_SUCCESS, manager.get_device(nfs_path, nfs_storage_info, nfs_storage_id_mod, nfs_device_handle));
+    ASSERT_EQ(OB_SUCCESS, manager.get_device(nfs_path2, nfs_storage_info2, nfs_storage_id_mod2, nfs_device_handle2));
+    ASSERT_EQ(OB_SUCCESS, manager.get_device(local_disk_path, local_disk_info, local_disk_id_mod, local_disk_handle));
+
+    ASSERT_TRUE(nfs_device_handle != nullptr);
+    ASSERT_TRUE(nfs_device_handle2 != nullptr);
+    ASSERT_TRUE(local_disk_handle != nullptr);
+    ASSERT_TRUE(nfs_device_handle != local_disk_handle);
+    ASSERT_TRUE(nfs_device_handle == nfs_device_handle);
+    ASSERT_EQ(true, nfs_device_handle->should_limit_net_bandwidth());
+    ASSERT_EQ(true, nfs_device_handle->should_limit_net_bandwidth());
+    ASSERT_EQ(false, local_disk_handle->should_limit_net_bandwidth());
   }
 }
 

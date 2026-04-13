@@ -27,6 +27,11 @@
 
 namespace oceanbase
 {
+namespace share
+{
+struct ObSearchIndexConfigFilter;
+}
+
 namespace sql
 {
 class ObExecContext;
@@ -126,7 +131,8 @@ public:
       uint32_t is_not_in_node_: 1;
       uint32_t is_like_node_:   1; // for generate range expr
       uint32_t is_rowid_node_:  1; // for generate range expr
-      uint32_t reserved_:      22;
+      uint32_t is_search_node_: 1; // for search index range expr
+      uint32_t reserved_:      21;
     };
   };
   int64_t column_cnt_;
@@ -174,7 +180,8 @@ public:
         */
         uint32_t rowid_idx_:      8;
         uint32_t is_not_first_col_in_row_: 1;
-        uint32_t reserved_:      19;
+        uint32_t cnt_exec_param_: 1;
+        uint32_t reserved_:      18;
       };
     };
     union {
@@ -202,15 +209,75 @@ class ObRangeColumnMeta
   OB_UNIS_VERSION(1);
 public:
   ObRangeColumnMeta()
-  : column_type_()
+  : column_type_(), column_id_(OB_INVALID_ID)
   {}
 
-  ObRangeColumnMeta(const ObExprResType &type)
-  : column_type_(type)
+  ObRangeColumnMeta(const ObExprResType &type, uint64_t column_id)
+  : column_type_(type), column_id_(column_id)
   {}
 
   TO_STRING_KV(N_COLUMN_TYPE, column_type_);
   ObExprResType column_type_;
+  uint64_t column_id_;
+};
+
+class ObFastFinalPos
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObFastFinalPos() :
+    index_(-1),
+    offset_(-1),
+    flags_(0) {}
+
+  ObFastFinalPos(const ObFastFinalPos &other) :
+    index_(other.index_),
+    offset_(other.offset_),
+    flags_(other.flags_) {}
+
+  TO_STRING_KV(K_(index), K_(offset), K_(flags));
+public:
+  int64_t index_;
+  int32_t offset_;
+  union {
+    uint32_t flags_;
+    struct {
+      uint32_t is_upper_bound_ :  1;
+      uint32_t reserved_       : 31;
+    };
+  };
+};
+
+/*
+ * Context for search index used to generate query range.
+ */
+struct ObSearchIndexRangeCtx
+{
+public:
+  ObSearchIndexRangeCtx() : column_meta_(), column_idx_(OB_INVALID_INDEX), need_constraint_(false),
+    path_prefix_(), pick_type_(T_NULL), json_filter_(nullptr) {}
+
+  ~ObSearchIndexRangeCtx();
+
+  int init(const ObTableSchema *base_table_schema, const ColumnItem &column_item,
+           ObExecContext *exec_ctx, const ObTableSchema *index_schema,
+           common::ObIAllocator &allocator);
+  bool is_range_key(const uint64_t column_id) const { return column_id == column_meta_.column_id_; }
+  uint64_t column_id() const { return column_meta_.column_id_; }
+  ObRangeColumnMeta *column_meta() { return &column_meta_; }
+  inline bool has_pick() const { return pick_type_ != T_NULL; }
+  inline bool need_constraint() const { return need_constraint_; }
+  const share::ObSearchIndexConfigFilter *get_json_filter() const { return json_filter_; }
+
+  TO_STRING_KV(K_(column_meta), K_(column_idx), K_(path_prefix), K_(pick_type), KP_(json_filter));
+
+  // selected column info
+  ObRangeColumnMeta column_meta_;  // column meta used to extract search index range.
+  int64_t column_idx_;             // column index in search index table.
+  bool need_constraint_;           // constraint to check string length
+  ObString path_prefix_;           // current literal path string.
+  ObItemType pick_type_;           // current pick type
+  share::ObSearchIndexConfigFilter *json_filter_; // json path and type filter
 };
 
 struct ObQueryRangeCtx
@@ -236,7 +303,11 @@ struct ObQueryRangeCtx
       can_range_get_(true),
       contail_geo_filters_(false),
       force_no_link_(false),
-      unique_index_column_num_(-1) {}
+      is_global_index_(false),
+      unique_index_column_num_(-1),
+      constraints_expr_factory_(nullptr),
+      ignore_fake_const_udf_(false),
+      search_index_range_ctx_(nullptr) {}
   ~ObQueryRangeCtx() {}
   int init(ObPreRangeGraph *pre_range_graph,
            const ObIArray<ColumnItem> &range_columns,
@@ -248,7 +319,11 @@ struct ObQueryRangeCtx
            const int64_t index_prefix,
            const ColumnIdInfoMap *geo_column_id_map,
            const bool force_no_link,
-           const ObTableSchema *index_schema);
+           const ObTableSchema *index_schema,
+           ObRawExprFactory *constraints_expr_factory,
+           const bool ignore_fake_const_udf,
+           ObSearchIndexRangeCtx *search_index_range_ctx);
+  OB_INLINE bool is_search_index() const { return OB_NOT_NULL(search_index_range_ctx_); }
   int64_t column_cnt_;
   // 131 is the next prime number larger than OB_MAX_ROWKEY_COLUMN_NUMBER
   common::hash::ObPlacementHashMap<int64_t, int64_t, 131> range_column_map_;
@@ -280,7 +355,11 @@ struct ObQueryRangeCtx
   bool can_range_get_;
   bool contail_geo_filters_;
   bool force_no_link_;
+  bool is_global_index_;
   int64_t unique_index_column_num_;
+  ObRawExprFactory *constraints_expr_factory_;
+  bool ignore_fake_const_udf_;
+  ObSearchIndexRangeCtx *search_index_range_ctx_;
 };
 
 class ObPreRangeGraph : public ObQueryRangeProvider
@@ -307,6 +386,7 @@ public:
     unprecise_range_exprs_(alloc),
     total_range_sizes_(alloc),
     range_expr_max_offsets_(alloc),
+    fast_final_pos_arr_(alloc),
     flags_(0) {}
 
   virtual ~ObPreRangeGraph() { reset(); }
@@ -331,7 +411,10 @@ public:
                                       const bool ignore_calc_failure = true,
                                       const int64_t index_prefix = -1,
                                       const ObTableSchema *index_schema = NULL,
-                                      const ColumnIdInfoMap *geo_column_id_map = NULL);
+                                      const ColumnIdInfoMap *geo_column_id_map = NULL,
+                                      ObRawExprFactory *constraint_expr_factory = NULL,
+                                      const bool ignore_fake_const_udf = false,
+                                      ObSearchIndexRangeCtx *search_index_range_ctx = NULL);
   virtual int get_tablet_ranges(common::ObIAllocator &allocator,
                                 ObExecContext &exec_ctx,
                                 ObQueryRangeArray &ranges,
@@ -350,6 +433,7 @@ public:
                                          common::ObIAllocator &allocator,
                                          ObExecContext &exec_ctx,
                                          const ParamStore &param_store,
+                                         int64_t range_buffer_idx,
                                          void *range_buffer,
                                          ObQueryRangeArray &ranges,
                                          const common::ObDataTypeCastParams &dtc_params) const;
@@ -366,9 +450,10 @@ public:
   }
   virtual bool is_precise_get() const { return is_precise_get_; }
   bool is_standard_range() const { return is_standard_range_; }
-  bool is_equal_range() const { return is_equal_range_; }
+  bool is_equal_range() const override { return is_equal_range_; }
   virtual int64_t get_column_count() const { return column_count_; }
   virtual bool has_exec_param() const { return contain_exec_param_; }
+  virtual bool has_fake_const_udf() const { return cnt_fake_const_udf_; }
   virtual bool is_ss_range() const { return skip_scan_offset_ > -1; }
   virtual int64_t get_skip_scan_offset() const { return skip_scan_offset_; }
   virtual int reset_skip_scan_range()
@@ -384,16 +469,24 @@ public:
   virtual const common::ObIArray<ObRawExpr*> &get_unprecise_range_exprs() const { return unprecise_range_exprs_; }
   virtual int get_prefix_info(int64_t &equal_prefix_count,
                               int64_t &range_prefix_count,
+                              int64_t &ss_range_prefix_count,
                               bool &contain_always_false) const;
   virtual int get_total_range_sizes(common::ObIArray<uint64_t> &total_range_sizes) const;
 
   const ObIArray<uint64_t>& get_range_sizes() const { return total_range_sizes_; }
-  virtual bool is_fast_nlj_range() const { return fast_nlj_range_; }
+  virtual bool is_fast_nlj_range() const { return fast_nlj_range_ | general_nlj_range_; }
+  virtual bool enable_new_false_range() const { return enable_new_false_range_; }
   int get_prefix_info(const ObRangeNode *range_node,
                       bool* equals,
-                      int64_t &equal_prefix_count) const;
+                      bool* extract_ranges,
+                      const int64_t start_offset,
+                      int64_t &equal_prefix_count,
+                      int64_t &range_prefix_count) const;
   int get_new_equal_idx(const ObRangeNode *range_node,
                         bool* equals,
+                        ObIArray<int64_t> &new_idx) const;
+  int get_new_range_idx(const ObRangeNode *range_node,
+                        bool* extract_ranges,
                         ObIArray<int64_t> &new_idx) const;
 
   ObRangeNode* get_range_head() { return node_head_; }
@@ -416,6 +509,7 @@ public:
   void set_is_equal_range(const bool v) { is_equal_range_ = v; }
   void set_is_get(const bool v) { is_get_ = v; }
   void set_contain_exec_param(const bool v) { contain_exec_param_ = v; }
+  void set_cnt_fake_const_udf(const bool v) { cnt_fake_const_udf_ = v; }
   void set_skip_scan_offset(int64_t v) { skip_scan_offset_ = v; }
   int set_range_exprs(ObIArray<ObRawExpr*> &range_exprs) { return range_exprs_.assign(range_exprs); }
   int set_ss_range_exprs(ObIArray<ObRawExpr*> &range_exprs) { return ss_range_exprs_.assign(range_exprs); }
@@ -464,6 +558,9 @@ public:
                      ObRawExpr *column_expr,
                      ObRawExpr *value_expr,
                      ObRawExpr *extra_value_expr = nullptr);
+  int set_general_nlj_range_extraction(const ObIArray<ObFastFinalPos> &pos_arr);
+  const ObIArray<ObFastFinalPos>& get_general_nlj_range_extraction() const { return fast_final_pos_arr_; }
+  void set_enable_new_false_range(bool v) { enable_new_false_range_ = v; }
 private:
   DISALLOW_COPY_AND_ASSIGN(ObPreRangeGraph);
 private:
@@ -491,12 +588,16 @@ private:
   common::ObFixedArray<ObRawExpr*, common::ObIAllocator> unprecise_range_exprs_;
   common::ObFixedArray<uint64_t, common::ObIAllocator> total_range_sizes_;
   common::ObFixedArray<int64_t, common::ObIAllocator> range_expr_max_offsets_;
+  common::ObFixedArray<ObFastFinalPos, common::ObIAllocator> fast_final_pos_arr_;
   union {
     uint32_t flags_;
     struct {
-      uint32_t contain_geo_filters_  :  1;
-      uint32_t fast_nlj_range_       :  1;
-      uint32_t reserved_             : 30;
+      uint32_t contain_geo_filters_    :  1;
+      uint32_t fast_nlj_range_         :  1;
+      uint32_t general_nlj_range_      :  1;
+      uint32_t enable_new_false_range_ :  1;
+      uint32_t cnt_fake_const_udf_     :  1;
+      uint32_t reserved_               : 27;
     };
   };
 };

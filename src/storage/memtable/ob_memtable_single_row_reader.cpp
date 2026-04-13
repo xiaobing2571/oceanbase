@@ -103,12 +103,12 @@ int ObMemtableSingleRowReader::init_a_new_range(const ObDatumRange &new_range_to
   } else if (OB_FAIL(ObMemtableKey::build(start_key,
                                           *out_cols,
                                           &real_range.get_start_key().get_store_rowkey(),
-                                          *context_->get_range_allocator()))) {
+                                          *context_->allocator_))) {
     TRANS_LOG(WARN, "start key build fail", K(param_->table_id_), K(real_range));
   } else if (OB_FAIL(ObMemtableKey::build(end_key,
                                           *out_cols,
                                           &real_range.get_end_key().get_store_rowkey(),
-                                          *context_->get_range_allocator()))) {
+                                          *context_->allocator_))) {
     TRANS_LOG(WARN, "end key build fail", K(param_->table_id_), K(real_range));
   } else {
     ObMvccEngine& mvcc_engine = memtable_->get_mvcc_engine();
@@ -123,7 +123,7 @@ int ObMemtableSingleRowReader::init_a_new_range(const ObDatumRange &new_range_to
                                  memtable_->get_ls_id(),
                                  row_iter_))) {
       TRANS_LOG(WARN, "mvcc engine scan fail", K(ret), K(mvcc_scan_range));
-    } else if (OB_FAIL(bitmap_.init(read_info_->get_request_count(), read_info_->get_schema_rowkey_count()))) {
+    } else if (OB_FAIL(bitmap_.init(read_info_->get_request_count(), read_info_->get_schema_rowkey_count() + read_info_->get_extra_rowkey_count()))) {
       TRANS_LOG(WARN, "Failed to init bitmap ", K(ret));
     } else {
       TRANS_LOG(DEBUG, "mvcc engine scan success",
@@ -358,6 +358,16 @@ int ObMemtableSingleRowReader::fill_in_next_row_by_value_iter_(const ObMemtableK
     if (OB_FAIL(ObReadRow::iterate_row(*read_info_, *rowkey, *value_iter, next_row, bitmap_, next_row_scn))) {
       STORAGE_LOG(WARN, "iterate_row fail", K(ret), K(*rowkey), KP(value_iter));
     } else {
+      /* scan should not return rows with row_scn <= base_version,
+      *  rows in memtable which have row_scn <= base_version may overwrite rows in inc major sstables with greater row_scn
+      *  MAJOR      EMPTY    (version 100)
+      *  INC_MAJOR  INSERT 1 (version 110)
+      *  MEMTABLE   DELETE 1 (version 90)
+      */
+      if (next_row_scn <= context_->trans_version_range_.base_version_) {
+        next_row.row_flag_.reset();
+        next_row.row_flag_.set_flag(DF_NOT_EXIST);
+      }
       acquired_row_cnt = 1;
     }
   }

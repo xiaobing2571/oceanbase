@@ -245,6 +245,12 @@ int ObDropIndexTask::drop_index_impl()
   } else if (OB_UNLIKELY(nullptr == database_schema || nullptr == data_table_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null schema", K(ret), KP(database_schema), KP(data_table_schema));
+  } else if (data_table_schema->is_search_def_index()
+    && OB_FAIL(schema_guard.get_table_schema(tenant_id_, data_table_schema->get_data_table_id(), data_table_schema))) {
+    LOG_WARN("get data table schema failed", K(ret), K(data_table_schema->get_data_table_id()));
+  } else if (nullptr == data_table_schema) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get null schema", K(ret), KP(database_schema), KP(data_table_schema));
   } else if (OB_FAIL(drop_index_sql.assign(drop_index_arg_.ddl_stmt_str_))) {
     LOG_WARN("assign user drop index sql failed", K(ret));
   } else {
@@ -263,6 +269,7 @@ int ObDropIndexTask::drop_index_impl()
     drop_index_arg.ddl_stmt_str_      = drop_index_sql.string();
     drop_index_arg.is_add_to_scheduler_ = false;
     drop_index_arg.task_id_           = task_id_;
+    drop_index_arg.is_hidden_         = drop_index_arg_.is_hidden_;
     if (OB_FAIL(ObDDLUtil::get_ddl_rpc_timeout(index_schema->get_all_part_num() + data_table_schema->get_all_part_num(), ddl_rpc_timeout))) {
       LOG_WARN("failed to get ddl rpc timeout", K(ret));
     } else if (OB_FAIL(DDL_SIM(tenant_id_, task_id_, DROP_INDEX_RPC_FAILED))) {

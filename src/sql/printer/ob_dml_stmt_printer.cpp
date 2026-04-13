@@ -20,6 +20,7 @@
 #include "sql/optimizer/ob_log_plan.h"
 #include "sql/monitor/ob_sql_plan.h"
 #include "sql/resolver/dml/ob_transpose_resolver.h"
+#include "sql/hybrid_search/ob_hybrid_search_dsl_resolver.h"
 namespace oceanbase
 {
 using namespace common;
@@ -71,7 +72,6 @@ int ObDMLStmtPrinter::prepare_dblink_hint(ObQueryHint &query_hint_dblink)
     ObGlobalHint &global_hint_dblink = query_hint_dblink.get_global_hint();
     global_hint_dblink.reset();
     global_hint_dblink.merge_query_timeout_hint(global_hint.query_timeout_);
-    global_hint_dblink.merge_read_consistency_hint(global_hint.read_consistency_, global_hint.frozen_version_);
     global_hint_dblink.merge_log_level_hint(global_hint.log_level_);
     global_hint_dblink.force_trace_log_ = global_hint.force_trace_log_;
     global_hint_dblink.monitor_ = global_hint.monitor_;
@@ -79,6 +79,17 @@ int ObDMLStmtPrinter::prepare_dblink_hint(ObQueryHint &query_hint_dblink)
     if (OB_ISNULL(session_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null ptr", K(ret), K(lbt()));
+    } else {
+      int64_t read_consistency = INVALID_CONSISTENCY;
+      if (INVALID_CONSISTENCY != global_hint.read_consistency_) {
+        global_hint_dblink.merge_read_consistency_hint(global_hint.read_consistency_, global_hint.frozen_version_);
+      } else if (OB_FAIL(session_->get_sys_variable(SYS_VAR_OB_READ_CONSISTENCY, read_consistency))) {
+        LOG_WARN("get read consistency failed", K(ret));
+      } else {
+        global_hint_dblink.merge_read_consistency_hint(static_cast<ObConsistencyLevel>(read_consistency), -1);
+      }
+    }
+    if (OB_FAIL(ret)) {
     } else if (stmt_->is_select_stmt()) {
       uint64_t dblink_id = OB_INVALID_ID;
       dblink_id = stmt_->get_dblink_id();
@@ -161,7 +172,8 @@ int ObDMLStmtPrinter::print_hint()
     DATA_PRINTF("%s", hint_begin);
     if (OB_SUCC(ret)) {
       const ObQueryHint &query_hint = stmt_->get_query_ctx()->get_query_hint();
-      ObQueryHint query_hint_dblink;
+      ObArenaAllocator allocator(ObModIds::OB_SQL_COMPILE);
+      ObQueryHint query_hint_dblink(allocator);
       if (print_params_.for_dblink_ &&
           is_first_stmt_for_hint_ &&
           OB_FAIL(prepare_dblink_hint(query_hint_dblink))) {
@@ -268,6 +280,9 @@ int ObDMLStmtPrinter::print_table_with_subquery(const TableItem *table_item)
                                subquery_print_params))) {
       LOG_WARN("failed to print subquery", K(ret));
     } else if (!table_item->alias_name_.empty()) {
+      if (OB_FAIL(print_flashback_info(table_item))) {
+        LOG_WARN("failed to print flashback info", K(ret));
+      }
       DATA_PRINTF(" ");
       PRINT_IDENT_WITH_QUOT(table_item->alias_name_);
     } else {
@@ -492,20 +507,16 @@ int ObDMLStmtPrinter::print_table(const TableItem *table_item,
     LOG_WARN("stmt_ is NULL or buf_ is NULL or pos_ is NULL", K(ret));
   } else {
     switch (table_item->type_) {
-    case TableItem::LINK_TABLE: {
-        if (OB_FAIL(print_base_table(table_item))) {
-          LOG_WARN("failed to print base table", K(ret), K(*table_item));
-        } else if (!no_print_alias && !table_item->alias_name_.empty()) {
-          //DATA_PRINTF(lib::is_oracle_mode() ? " \"%.*s\"" : " `%.*s`",
-          //            LEN_AND_PTR(table_item->alias_name_));
-          DATA_PRINTF(" ");
-          PRINT_IDENT_WITH_QUOT(table_item->alias_name_);
-        }
-        break;
-      }
+    case TableItem::LINK_TABLE:
     case TableItem::BASE_TABLE: {
-        if (OB_FAIL(print_base_table(table_item))) {
+        if (table_item->is_hybrid_search_table()) {
+          if (OB_FAIL(print_hybrid_search_table(table_item))) {
+            LOG_WARN("failed to print hybrid search table", K(ret), K(*table_item));
+          }
+        } else if (OB_FAIL(print_base_table(table_item))) {
           LOG_WARN("failed to print base table", K(ret), K(*table_item));
+        }
+        if (OB_FAIL(ret)) {
         } else if (!no_print_alias && !table_item->alias_name_.empty()) {
           //DATA_PRINTF(lib::is_oracle_mode() ? " \"%.*s\"" : " `%.*s`",
           //            LEN_AND_PTR(table_item->alias_name_));
@@ -515,10 +526,16 @@ int ObDMLStmtPrinter::print_table(const TableItem *table_item,
         break;
       }
     case TableItem::ALIAS_TABLE: {
-        if (OB_FAIL(print_base_table(table_item))) {
+        if (table_item->is_hybrid_search_table()) {
+          if (OB_FAIL(print_hybrid_search_table(table_item))) {
+            LOG_WARN("failed to print hybrid search table", K(ret), K(*table_item));
+          }
+        } else if (OB_FAIL(print_base_table(table_item))) {
           LOG_WARN("failed to print base table", K(ret), K(*table_item));
         //table in insert all can't print alias(bug:
-        } else if (!no_print_alias) {
+        }
+        if (OB_FAIL(ret)) {
+        } else  if (!no_print_alias) {
           DATA_PRINTF(" ");
           PRINT_IDENT_WITH_QUOT(table_item->alias_name_);
         }
@@ -620,6 +637,9 @@ int ObDMLStmtPrinter::print_table(const TableItem *table_item,
         } else if (table_item->is_view_table_ && !print_params_.for_dblink_) {
           PRINT_TABLE_NAME(print_params_, table_item);
           if (OB_SUCC(ret)) {
+            if (OB_FAIL(print_flashback_info(table_item))) {
+              LOG_WARN("failed to print flashback info", K(ret));
+            }
             if (table_item->alias_name_.length() > 0) {
               DATA_PRINTF(" %.*s", LEN_AND_PTR(table_item->alias_name_));
             }
@@ -713,6 +733,37 @@ int ObDMLStmtPrinter::print_table(const TableItem *table_item,
           }
           break;
         }
+        case MulModeTableType::OB_INDEX_DATA_GEN_TABLE_TYPE : {
+          DATA_PRINTF("INDEX_DATA_GENERATOR_TABLE(");
+          for (int64_t i = 0; OB_SUCC(ret) && i < table_item->json_table_def_->doc_exprs_.count(); ++i) {
+            if (OB_FAIL(expr_printer_.do_print(table_item->json_table_def_->doc_exprs_.at(i), T_FROM_SCOPE))) {
+              LOG_WARN("failed to print expr", K(ret));
+            } else {
+              DATA_PRINTF(",");
+            }
+          }
+          DATA_PRINTF(" %d", table_item->json_table_def_->index_table_id_);
+          DATA_PRINTF(")");
+          DATA_PRINTF(" %.*s", LEN_AND_PTR(table_item->alias_name_));
+          break;
+        }
+        case MulModeTableType::OB_AI_SPLIT_DOCUMENT_TABLE_TYPE : {
+          DATA_PRINTF("AI_SPLIT_DOCUMENT(");
+          for (int64_t i = 0; OB_SUCC(ret) && i < table_item->json_table_def_->doc_exprs_.count(); ++i) {
+            if (OB_FAIL(expr_printer_.do_print(table_item->json_table_def_->doc_exprs_.at(i), T_FROM_SCOPE))) {
+              LOG_WARN("failed to print expr", K(ret));
+            } else if (i != table_item->json_table_def_->doc_exprs_.count() - 1) {
+              DATA_PRINTF(",");
+            } else {
+              DATA_PRINTF(")");
+            }
+          }
+          if (OB_SUCC(ret) && !table_item->alias_name_.empty()) {
+            DATA_PRINTF(" ");
+            PRINT_IDENT_WITH_QUOT(table_item->alias_name_);
+          }
+          break;
+        }
         default : {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpected table function type");
@@ -746,6 +797,51 @@ int ObDMLStmtPrinter::print_table(const TableItem *table_item,
     }
   }
 
+  return ret;
+}
+
+int ObDMLStmtPrinter::print_hybrid_search_table(const TableItem *table_item)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(table_item)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table item is null", K(ret));
+  } else {
+    DATA_PRINTF("hybrid_search(table ");
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(print_base_table(table_item))) {
+      LOG_WARN("failed to print base table for hybrid search", K(ret), KPC(table_item));
+    } else if (OB_ISNULL(table_item->dsl_query_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("hybrid search query info is null", K(ret), KPC(table_item));
+    } else if (table_item->dsl_query_->raw_dsl_param_str_.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("hybrid search raw dsl param string is empty", K(ret), KPC(table_item));
+    } else {
+      ObString dsl_param_str = table_item->dsl_query_->raw_dsl_param_str_.trim_space_only();
+      DATA_PRINTF(", '");
+      if (OB_FAIL(ret)) {
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < dsl_param_str.length(); ++i) {
+          const char ch = dsl_param_str.ptr()[i];
+          if ('\'' == ch) {
+            DATA_PRINTF("''");
+          } else if ('\\' == ch) {
+            // Keep backslashes after SQL literal parsing.
+            DATA_PRINTF("\\\\");
+          } else {
+            DATA_PRINTF("%c", ch);
+          }
+        }
+        if (OB_SUCC(ret)) {
+          DATA_PRINTF("'");
+        }
+      }
+      if (OB_SUCC(ret)) {
+        DATA_PRINTF(")");
+      }
+    }
+  }
   return ret;
 }
 
@@ -1560,7 +1656,7 @@ int ObDMLStmtPrinter::build_json_table_nested_tree(const TableItem* table_item, 
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("fail to allocate col node", K(ret));
     } else {
-      col_def = new (col_def) ObDmlJtColDef();
+      col_def = new (col_def) ObDmlJtColDef(*allocator);
       col_def->col_base_info_.assign(info);
 
       if (info.col_type_ != NESTED_COL_TYPE) {
@@ -1974,6 +2070,10 @@ int ObDMLStmtPrinter::print_base_table(const TableItem *table_item)
           DATA_PRINTF(" sample(");
           DATA_PRINTF("%lf", table_item->sample_info_->percent_);
           DATA_PRINTF(")");
+        } else if (SampleInfo::SampleMethod::DDL_BLOCK_SAMPLE == table_item->sample_info_->method_) {
+          DATA_PRINTF("ddl block sample(");
+          DATA_PRINTF("%lf", table_item->sample_info_->percent_);
+          DATA_PRINTF(")");
         }
         if (table_item->sample_info_->seed_ != -1) {
           DATA_PRINTF(" seed(");
@@ -1983,36 +2083,10 @@ int ObDMLStmtPrinter::print_base_table(const TableItem *table_item)
       }
 
       // flashback query
-      if (OB_SUCC(ret)) {
-        bool explain_non_extend = false;
-        if (OB_NOT_NULL(stmt_->get_query_ctx()) &&
-            OB_NOT_NULL(stmt_->get_query_ctx()->root_stmt_) &&
-            stmt_->get_query_ctx()->root_stmt_->is_explain_stmt()) {
-          explain_non_extend = !static_cast<const ObExplainStmt *>
-                                (stmt_->get_query_ctx()->root_stmt_)->is_explain_extended();
-        }
-        if (OB_NOT_NULL(table_item->flashback_query_expr_) &&
-            // do not print flashback of link table when explain [basic]
-            !(table_item->is_link_table() && explain_non_extend)) {
-          if (table_item->flashback_query_type_ == TableItem::USING_TIMESTAMP) {
-            DATA_PRINTF(" as of timestamp "); 
-            if (OB_FAIL(expr_printer_.do_print(table_item->flashback_query_expr_, T_NONE_SCOPE))) {
-              LOG_WARN("fail to print where expr", K(ret));
-            }
-          } else if (table_item->flashback_query_type_ == TableItem::USING_SCN) {
-            if (lib::is_oracle_mode()) {
-              DATA_PRINTF(" as of scn "); 
-            } else {
-              DATA_PRINTF(" as of snapshot "); 
-            }
-            if (OB_FAIL(expr_printer_.do_print(table_item->flashback_query_expr_, T_NONE_SCOPE))) {
-              LOG_WARN("fail to print where expr", K(ret));
-            }
-          } else {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("get unexpected type", K(ret), K(table_item->flashback_query_type_));
-          }
-        }
+      if (OB_FAIL(ret)) {
+        // do nothing.
+      } else if (OB_FAIL(print_flashback_info(table_item))) {
+        LOG_WARN("failed to print flashback info", K(ret));
       }
     }
   }
@@ -2276,6 +2350,40 @@ int ObDMLStmtPrinter::print_approx()
     LOG_WARN("stmt_ is NULL or buf_ is NULL or pos_ is NULL", K(ret));
   } else if (stmt_->has_vec_approx()) {
     DATA_PRINTF(" approx ");
+  }
+  return ret;
+}
+
+int ObDMLStmtPrinter::print_vector_index_query_param()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(stmt_) || OB_ISNULL(buf_) || OB_ISNULL(pos_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("stmt_ is NULL or buf_ is NULL or pos_ is NULL", K(ret));
+  } else {
+    const ObVectorIndexQueryParam& param = stmt_->get_vector_index_query_param();
+    if (param.is_valid()) {
+      DATA_PRINTF(" parameters(");
+      if (OB_SUCC(ret) && param.is_set_ef_search_) {
+        DATA_PRINTF("ef_search=%d", param.ef_search_);
+      }
+      if (OB_SUCC(ret) && param.is_set_refine_k_) {
+        DATA_PRINTF(", refine_k=%f", param.refine_k_);
+      }
+      if (OB_SUCC(ret) && param.is_set_ivf_nprobes_) {
+        DATA_PRINTF(", ivf_nprobes=%d", param.ivf_nprobes_);
+      }
+      if (OB_SUCC(ret) && param.is_set_drop_ratio_search_) {
+        DATA_PRINTF(", drop_ratio_search=%f", param.ob_sparse_drop_ratio_search_);
+      }
+      if (OB_SUCC(ret) && param.is_set_similarity_threshold_) {
+        DATA_PRINTF(", similarity_threshold=%f", param.similarity_threshold_);
+      }
+      if (OB_SUCC(ret) && param.is_set_ivf_nprobes_) {
+        DATA_PRINTF(", ivf_nprobes=%d", param.ivf_nprobes_);
+      }
+      DATA_PRINTF(") ");
+    }
   }
   return ret;
 }
@@ -2730,11 +2838,53 @@ bool ObDMLStmtPrinter::need_print_catalog_name(const ObString& catalog_name)
   if (is_oracle_mode()) {
   } else if (!ObCatalogUtils::is_internal_catalog_name(catalog_name)) {
     need_print = true;
-  } else if (is_print_view_definition() || GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_3_5_2) {
+  } else if (print_params_.not_print_internal_catalog_ || GET_MIN_CLUSTER_VERSION() <= CLUSTER_VERSION_4_3_5_2) {
   } else {
     need_print = true;
   }
   return need_print;
+}
+
+int ObDMLStmtPrinter::print_flashback_info(const TableItem *table_item)
+{
+  int ret = OB_SUCCESS;
+  bool explain_non_extend = false;
+  if (OB_ISNULL(table_item) || OB_ISNULL(stmt_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpect null expr", K(ret), KPC(table_item), KPC(stmt_));
+  } else {
+    if (OB_NOT_NULL(stmt_->get_query_ctx()) &&
+        OB_NOT_NULL(stmt_->get_query_ctx()->root_stmt_) &&
+        stmt_->get_query_ctx()->root_stmt_->is_explain_stmt()) {
+      explain_non_extend = !static_cast<const ObExplainStmt *>
+                            (stmt_->get_query_ctx()->root_stmt_)->is_explain_extended();
+    }
+    if (OB_NOT_NULL(table_item->flashback_query_expr_) &&
+        // do not print flashback of link table when explain [basic]
+        !(table_item->is_link_table() && explain_non_extend)) {
+      if (table_item->flashback_query_type_ == TableItem::USING_TIMESTAMP) {
+        DATA_PRINTF(" as of timestamp ");
+        if (OB_FAIL(expr_printer_.do_print(table_item->flashback_query_expr_, T_NONE_SCOPE))) {
+          LOG_WARN("fail to print where expr", K(ret));
+        }
+      } else if (table_item->flashback_query_type_ == TableItem::USING_SCN) {
+        if (lib::is_oracle_mode()) {
+          DATA_PRINTF(" as of scn ");
+        } else {
+          DATA_PRINTF(" as of snapshot ");
+        }
+        if (OB_FAIL(expr_printer_.do_print(table_item->flashback_query_expr_, T_NONE_SCOPE))) {
+          LOG_WARN("fail to print where expr", K(ret));
+        }
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected type", K(ret), K(table_item->flashback_query_type_));
+      }
+    } else if (table_item->is_mv_proctime_table_) {
+      DATA_PRINTF(" as of proctime()");
+    }
+  }
+  return ret;
 }
 
 } //end of namespace sql

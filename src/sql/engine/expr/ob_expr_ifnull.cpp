@@ -17,6 +17,7 @@
 
 #include "sql/engine/expr/ob_expr_promotion_util.h"
 #include "sql/session/ob_sql_session_info.h"
+#include "sql/engine/expr/ob_expr_result_type_util.h"
 
 
 namespace oceanbase
@@ -59,7 +60,24 @@ int ObExprIfNull::calc_result_type2(ObExprResType &type,
     type.set_collation_type(CS_TYPE_BINARY);
   }
 
-  if (OB_SUCC(ret)) {
+  if (OB_FAIL(ret)) {
+  } else if (ob_is_collection_sql_type(type.get_type())) {
+    ObSQLSessionInfo *sess = const_cast<ObSQLSessionInfo *>(type_ctx.get_session());
+    ObExecContext *exec_ctx = sess->get_cur_exec_ctx();
+    ObExprResType coll_calc_type = type;
+    if (OB_ISNULL(exec_ctx)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("exec ctx is null", K(ret));
+    } else if (type1.get_subschema_id() == type2.get_subschema_id()) {
+      type.set_collection(type1.get_subschema_id());
+    } else if (OB_FAIL(ObExprResultTypeUtil::get_array_calc_type(exec_ctx, type1, type2, coll_calc_type))) {
+      LOG_WARN("deduce calc type failed", K(ret));
+    } else {
+      type1.set_calc_meta(coll_calc_type);
+      type2.set_calc_meta(coll_calc_type);
+      type.set_collection(coll_calc_type.get_subschema_id());
+    }
+  } else {
     if (type.get_type() == type1.get_type()) {
       type.set_accuracy(type1.get_accuracy());
     } else {
@@ -103,10 +121,15 @@ int ObExprIfNull::calc_result_type2(ObExprResType &type,
       }
     }
     type.set_length(MAX(type1.get_length(), type2.get_length()));
-    type1.set_calc_meta(type.get_obj_meta());
-    type1.set_calc_accuracy(type.get_accuracy());
-    type2.set_calc_meta(type.get_obj_meta());
-    type2.set_calc_accuracy(type.get_accuracy());
+    if (OB_SUCC(ret)) {
+      type1.set_calc_meta(type.get_obj_meta());
+      type1.set_calc_accuracy(type.get_accuracy());
+      type2.set_calc_meta(type.get_obj_meta());
+      type2.set_calc_accuracy(type.get_accuracy());
+    if (type1.has_result_flag(NOT_NULL_FLAG) || type2.has_result_flag(NOT_NULL_FLAG)) {
+        type.set_result_flag(NOT_NULL_FLAG);
+      }
+    }
   }
 
   return ret;

@@ -55,6 +55,7 @@ enum SelectParserOffset
   PARSE_SELECT_ORDER,
   PARSE_SELECT_APPROX,
   PARSE_SELECT_LIMIT,
+  PARSE_SELECT_VECTOR_INDEX_PARAMS,
   PARSE_SELECT_FOR_UPD,
   PARSE_SELECT_HINTS,
   PARSE_SELECT_WHEN, // I find that it is no longer used.
@@ -62,7 +63,7 @@ enum SelectParserOffset
   PARSE_SELECT_FETCH_TEMP, //use to temporary store fetch clause in parser
   PARSE_SELECT_WITH_CHECK_OPTION,
   PARSE_SELECT_INTO_EXTRA,// ATTENTION!! SELECT_INTO_EXTRA must be the last one
-  PARSE_SELECT_MAX_IDX  // = 24, ATTENTION!! adjust malloc_select_node(node, malloc_pool) after adding a new enum value
+  PARSE_SELECT_MAX_IDX  // = 25, ATTENTION!! adjust malloc_select_node(node, malloc_pool) after adding a new enum value
 };
 
 enum GrantParseOffset
@@ -240,6 +241,7 @@ typedef struct _ObQuestionMarkCtx
   bool by_ordinal_;
   bool by_name_;
   bool by_defined_name_;
+  bool by_order_; // only oracle mode may set this flag to true, so default is false
 } ObQuestionMarkCtx;
 
 
@@ -329,6 +331,7 @@ typedef struct
     uint32_t is_returning_                     : 1;
     uint32_t is_into_cluster_                  : 1;
     uint32_t is_oracle_compat_groupby_         : 1; // true if has rollup/cube/grouping sets in mysql mode
+    uint32_t clickhouse_func_exposed_          : 1;
   };
 
   ParseNode *result_tree_;
@@ -365,6 +368,7 @@ typedef struct
   int realloc_cnt_;
   bool stop_add_comment_;
 #endif
+  int json_object_depth_;
 } ParseResult;
 
 typedef struct _ObFastParseCtx
@@ -449,6 +453,7 @@ extern bool nodename_is_sdo_geometry_type(const ParseNode *node);
 #define OB_NODE_CAST_C_LEN_IDX 1
 #define OB_NODE_CAST_GEO_TYPE_IDX 1
 #define OB_NODE_CAST_CS_LEVEL_IDX 2
+#define OB_NODE_CAST_COLLECTION_TYPE_IDX 3
 
 typedef enum ObNumberParseType
 {

@@ -48,6 +48,7 @@ int ObTabletCreateMdsHelper::register_process(
   int ret = OB_SUCCESS;
   bool valid = false;
   common::ObSArray<ObTabletID> tablet_id_array;
+  common::ObSArray<ObTabletID> unused_tablet_id_array;
   if (CLICK_FAIL(tablet_id_array.reserve(arg.get_tablet_count()))) {
     LOG_WARN("failed to reserve memory", K(ret), "capacity", arg.get_tablet_count());
   } else if (CLICK_FAIL(check_create_arg(arg, valid))) {
@@ -55,7 +56,7 @@ int ObTabletCreateMdsHelper::register_process(
   } else if (OB_UNLIKELY(!valid)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected error, arg is not valid", K(ret), K(arg));
-  } else if (CLICK_FAIL(create_tablets(arg, false/*for_replay*/, share::SCN::invalid_scn(), ctx, tablet_id_array))) {
+  } else if (CLICK_FAIL(create_tablets(arg, false/*for_replay*/, share::SCN::invalid_scn(), ctx, tablet_id_array, unused_tablet_id_array))) {
     LOG_WARN("failed to create tablets", K(ret), K(arg));
   } else if (!arg.set_binding_info_outside_create() && CLICK_FAIL(ObTabletBindingHelper::modify_tablet_binding_for_new_mds_create(arg, SCN::invalid_scn(), ctx))) {
     LOG_WARN("failed to modify tablet binding", K(ret));
@@ -117,12 +118,13 @@ int ObTabletCreateMdsHelper::replay_process(
 {
   MDS_TG(1_s);
   int ret = OB_SUCCESS;
-  common::ObSArray<ObTabletID> tablet_id_array;
+  common::ObSArray<ObTabletID> creating_tablet_id_array;
+  common::ObSArray<ObTabletID> empty_mds_tablet_id_array;
   const ObLSID &ls_id = arg.id_;
   ObLSHandle ls_handle;
   ObLS *ls = nullptr;
   share::SCN tablet_change_checkpoint_scn;
-  if (CLICK_FAIL(tablet_id_array.reserve(arg.get_tablet_count()))) {
+  if (CLICK_FAIL(creating_tablet_id_array.reserve(arg.get_tablet_count()))) {
     LOG_WARN("failed to reserve memory", K(ret), "capacity", arg.get_tablet_count());
   } else if (CLICK_FAIL(get_ls(ls_id, ls_handle))) {
     LOG_WARN("failed to get ls", K(ret), K(ls_id));
@@ -133,7 +135,7 @@ int ObTabletCreateMdsHelper::replay_process(
   } else if (scn <= tablet_change_checkpoint_scn) {
     LOG_INFO("current scn is smaller than ls tablet change check point scn, log replaying can be skipped",
         K(ret), K(scn), K(tablet_change_checkpoint_scn));
-  } else if (CLICK_FAIL(create_tablets(arg, true/*for_replay*/, scn, ctx, tablet_id_array))) {
+  } else if (CLICK_FAIL(create_tablets(arg, true/*for_replay*/, scn, ctx, creating_tablet_id_array, empty_mds_tablet_id_array))) {
     LOG_WARN("failed to create tablets", K(ret), K(arg), K(scn));
   } else if (!arg.set_binding_info_outside_create() && CLICK_FAIL(ObTabletBindingHelper::modify_tablet_binding_for_new_mds_create(arg, scn, ctx))) {
     LOG_WARN("failed to modify tablet binding", K(ret));
@@ -147,7 +149,11 @@ int ObTabletCreateMdsHelper::replay_process(
   if (CLICK_FAIL(ret)) {
     // roll back
     int tmp_ret = OB_SUCCESS;
-    if (CLICK() && OB_TMP_FAIL(rollback_remove_tablets(ls_id, tablet_id_array))) {
+    if (CLICK() && OB_TMP_FAIL(ObTabletCreateDeleteHelper::rollback_is_written(ls_id, empty_mds_tablet_id_array))) {
+      LOG_ERROR("failed to rollback_is_written", K(tmp_ret));
+      ob_usleep(1 * 1000 * 1000);
+      ob_abort();
+    } else if (CLICK() && OB_TMP_FAIL(rollback_remove_tablets(ls_id, creating_tablet_id_array))) {
       LOG_ERROR("failed to roll back remove tablets", K(tmp_ret));
       ob_usleep(1 * 1000 * 1000);
       ob_abort();
@@ -340,7 +346,8 @@ int ObTabletCreateMdsHelper::create_tablets(
     const bool for_replay,
     const share::SCN &scn,
     mds::BufferCtx &ctx,
-    common::ObIArray<common::ObTabletID> &tablet_id_array)
+    common::ObIArray<common::ObTabletID> &creating_tablet_id_array,
+    common::ObIArray<common::ObTabletID> &empty_mds_tablet_id_array)
 {
   MDS_TG(10_ms);
   int ret = OB_SUCCESS;
@@ -348,19 +355,19 @@ int ObTabletCreateMdsHelper::create_tablets(
   for (int64_t i = 0; OB_SUCC(ret) && i < arg.tablets_.count(); ++i) {
     const ObCreateTabletInfo &info = arg.tablets_.at(i);
     if (is_pure_data_tablets(info)) {
-      if (CLICK_FAIL(build_pure_data_tablet(arg, info, for_replay, scn, ctx, tablet_id_array))) {
+      if (CLICK_FAIL(build_pure_data_tablet(arg, info, for_replay, scn, ctx, creating_tablet_id_array, empty_mds_tablet_id_array))) {
         LOG_WARN("failed to build pure data tablet", K(ret), K(info));
       }
     } else if (is_mixed_tablets(info)) {
-      if (CLICK_FAIL(build_mixed_tablets(arg, info, for_replay, scn, ctx, tablet_id_array))) {
+      if (CLICK_FAIL(build_mixed_tablets(arg, info, for_replay, scn, ctx, creating_tablet_id_array, empty_mds_tablet_id_array))) {
         LOG_WARN("failed to build mixed tablets", K(ret), K(info));
       }
     } else if (is_pure_aux_tablets(info)) {
-      if (CLICK_FAIL(build_pure_aux_tablets(arg, info, for_replay, scn, ctx, tablet_id_array))) {
+      if (CLICK_FAIL(build_pure_aux_tablets(arg, info, for_replay, scn, ctx, creating_tablet_id_array, empty_mds_tablet_id_array))) {
         LOG_WARN("failed to build pure aux tablets", K(ret), K(info));
       }
     } else if (is_bind_hidden_tablets(info)) {
-      if (CLICK_FAIL(build_bind_hidden_tablets(arg, info, for_replay, scn, ctx, tablet_id_array))) {
+      if (CLICK_FAIL(build_bind_hidden_tablets(arg, info, for_replay, scn, ctx, creating_tablet_id_array, empty_mds_tablet_id_array))) {
         LOG_WARN("failed to build hidden tablets", K(ret), K(info));
       }
     }
@@ -618,14 +625,17 @@ int ObTabletCreateMdsHelper::check_and_get_create_tablet_schema_info(
     const ObSArray<obrpc::ObCreateTabletExtraInfo> &create_tablet_extra_infos,
     const obrpc::ObCreateTabletInfo &info,
     const int64_t index,
+    const ObTabletMdsUserDataType create_type,
     const ObCreateTabletSchema *&create_tablet_schema,
+    const share::SCN &clog_checkpoint_scn,
     bool &need_create_empty_major_sstable,
     bool &micro_index_clustered,
-    ObTabletID &split_src_tablet_id)
+    ObSplitTabletInfo &split_info)
 {
   int ret = OB_SUCCESS;
   create_tablet_schema = nullptr;
   need_create_empty_major_sstable = true;
+  split_info.reset();
   if (OB_UNLIKELY(create_tablet_extra_infos.count() != create_tablet_schemas.count()
         || index < 0
         || index >= info.table_schema_index_.count()
@@ -640,7 +650,13 @@ int ObTabletCreateMdsHelper::check_and_get_create_tablet_schema_info(
   } else {
     const obrpc::ObCreateTabletExtraInfo &extra_info = create_tablet_extra_infos[info.table_schema_index_[index]];
     micro_index_clustered = extra_info.micro_index_clustered_;
-    split_src_tablet_id = extra_info.split_src_tablet_id_;
+    if (ObTabletMdsUserDataType::START_SPLIT_DST == create_type) {
+      split_info.set_data_incomplete(ObTabletMdsUserDataType::START_SPLIT_DST == create_type);
+      split_info.set_split_src_tablet_id(extra_info.split_src_tablet_id_);
+      split_info.set_split_start_scn(clog_checkpoint_scn);
+      split_info.set_reuse_macro_block(extra_info.split_can_reuse_macro_block_);
+    }
+
     if (DATA_VERSION_4_3_0_0 <= extra_info.tenant_data_version_) {
       need_create_empty_major_sstable = extra_info.need_create_empty_major_;
     } else {
@@ -657,7 +673,8 @@ int ObTabletCreateMdsHelper::build_pure_data_tablet(
     const bool for_replay,
     const share::SCN &scn,
     mds::BufferCtx &ctx,
-    common::ObIArray<common::ObTabletID> &tablet_id_array)
+    common::ObIArray<common::ObTabletID> &creating_tablet_id_array,
+    common::ObIArray<common::ObTabletID> &empty_mds_tablet_id_array)
 {
   MDS_TG(5_ms);
   int ret = OB_SUCCESS;
@@ -673,6 +690,7 @@ int ObTabletCreateMdsHelper::build_pure_data_tablet(
   const share::SCN &clog_checkpoint_scn = arg.clog_checkpoint_scn_;
   const share::SCN &mds_checkpoint_scn = arg.mds_checkpoint_scn_;
   const bool has_cs_replica = info.has_cs_replica_;
+  const ObTabletMdsUserDataType create_type = arg.create_type_;
   ObTabletHandle tablet_handle;
   bool exist = false;
   int64_t index = -1;
@@ -680,7 +698,7 @@ int ObTabletCreateMdsHelper::build_pure_data_tablet(
   ObLS *ls = nullptr;
   bool need_create_empty_major_sstable = true;
   bool micro_index_clustered = false;
-  ObTabletID split_src_tablet_id;
+  ObSplitTabletInfo split_info;
   if (CLICK_FAIL(get_ls(ls_id, ls_handle))) {
     LOG_WARN("failed to get ls", K(ret), K(ls_id));
   } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
@@ -697,9 +715,13 @@ int ObTabletCreateMdsHelper::build_pure_data_tablet(
       }
     } else {
       exist = true;
+      if (CLICK_FAIL(ObTabletCreateDeleteHelper::update_empty_mds_tablet_id_array_if_need(*tablet_handle.get_obj(),
+              empty_mds_tablet_id_array))) {
+        LOG_WARN("failed to update_empty_mds_tablet_id_array_if_need", K(ret), K(ls_id), K(data_tablet_id));
+      }
     }
   }
-
+  uint64_t data_format_version = 0;
   if (CLICK_FAIL(ret)) {
   } else if (for_replay && exist) {
     LOG_INFO("create pure data tablet is already exist, skip it", K(ret), K(for_replay), K(exist),
@@ -709,21 +731,23 @@ int ObTabletCreateMdsHelper::build_pure_data_tablet(
   } else if (OB_UNLIKELY(index < 0)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected error, table schema index is invalid", K(ret), K(ls_id), K(data_tablet_id), K(index));
-  } else if (CLICK_FAIL(tablet_id_array.push_back(data_tablet_id))) {
+  } else if (CLICK_FAIL(creating_tablet_id_array.push_back(data_tablet_id))) {
     LOG_WARN("failed to push back tablet id", K(ret), K(ls_id), K(data_tablet_id));
   } else if (OB_FAIL(check_and_get_create_tablet_schema_info(create_tablet_schemas, create_tablet_extra_infos, info, index,
-      create_tablet_schema, need_create_empty_major_sstable, micro_index_clustered, split_src_tablet_id))) {
+      create_type, create_tablet_schema, clog_checkpoint_scn, need_create_empty_major_sstable, micro_index_clustered, split_info))) {
     LOG_WARN("check and get create tablet schema_info failed", K(ret));
+  } else if (FALSE_IT(data_format_version = create_tablet_extra_infos[info.table_schema_index_[index]].need_create_empty_major_ ? 0 : create_tablet_extra_infos[index].tenant_data_version_)) {
+    // using need_create_empty_major_sstable to determine tablet build by the offline ddl
   } else if (CLICK_FAIL(ls->get_tablet_svr()->create_tablet(ls_id, data_tablet_id, data_tablet_id,
       scn, snapshot_version, *create_tablet_schema, compat_mode,
-      need_create_empty_major_sstable, clog_checkpoint_scn, mds_checkpoint_scn, arg.create_type_,
-      micro_index_clustered, has_cs_replica, split_src_tablet_id, tablet_handle))) {
+      need_create_empty_major_sstable, clog_checkpoint_scn, mds_checkpoint_scn,
+      micro_index_clustered, has_cs_replica, split_info, data_format_version, tablet_handle))) {
     LOG_WARN("failed to do create tablet", K(ret), K(ls_id), K(data_tablet_id), "arg", PRETTY_ARG(arg));
   }
 
   if (OB_FAIL(ret)) {
   } else if (CLICK_FAIL(set_tablet_status(ls->get_tablet_svr(), tablet_handle, for_replay, scn, ctx,
-      arg.is_old_mds_, arg.create_type_, create_commit_version))) {
+      arg.is_old_mds_, create_type, create_commit_version))) {
     LOG_WARN("failed to set tablet normal status", K(ret), K(ls_id), K(data_tablet_id));
   }
 
@@ -736,7 +760,8 @@ int ObTabletCreateMdsHelper::build_mixed_tablets(
     const bool for_replay,
     const share::SCN &scn,
     mds::BufferCtx &ctx,
-    common::ObIArray<common::ObTabletID> &tablet_id_array)
+    common::ObIArray<common::ObTabletID> &creating_tablet_id_array,
+    common::ObIArray<common::ObTabletID> &empty_mds_tablet_id_array)
 {
   MDS_TG(10_ms);
   int ret = OB_SUCCESS;
@@ -751,6 +776,7 @@ int ObTabletCreateMdsHelper::build_mixed_tablets(
   const share::SCN &clog_checkpoint_scn = arg.clog_checkpoint_scn_;
   const share::SCN &mds_checkpoint_scn = arg.mds_checkpoint_scn_;
   const bool has_cs_replica = info.has_cs_replica_;
+  const ObTabletMdsUserDataType create_type = arg.create_type_;
   ObTabletHandle data_tablet_handle;
   ObTabletHandle tablet_handle;
   ObTabletID lob_meta_tablet_id;
@@ -775,9 +801,9 @@ int ObTabletCreateMdsHelper::build_mixed_tablets(
     const ObCreateTabletSchema *create_tablet_schema = nullptr;
     bool need_create_empty_major_sstable = true;
     bool micro_index_clustered = false;
-    ObTabletID split_src_tablet_id;
+    ObSplitTabletInfo split_info;
     if (OB_FAIL(check_and_get_create_tablet_schema_info(create_tablet_schemas, create_tablet_extra_infos, info, i,
-        create_tablet_schema, need_create_empty_major_sstable, micro_index_clustered, split_src_tablet_id))) {
+        create_type, create_tablet_schema, clog_checkpoint_scn, need_create_empty_major_sstable, micro_index_clustered, split_info))) {
       LOG_WARN("check and get create tablet schema_info failed", K(ret));
     } else if (create_tablet_schema->is_aux_lob_meta_table()) {
       lob_meta_tablet_id = tablet_id;
@@ -797,25 +823,31 @@ int ObTabletCreateMdsHelper::build_mixed_tablets(
         }
       } else {
         exist = true;
+        if (CLICK_FAIL(ObTabletCreateDeleteHelper::update_empty_mds_tablet_id_array_if_need(*tablet_handle.get_obj(),
+                empty_mds_tablet_id_array))) {
+          LOG_WARN("failed to update_empty_mds_tablet_id_array_if_need", K(ret), K(ls_id), K(tablet_id));
+        }
       }
     }
 
-
+    uint64_t data_format_version = 0;
     if (OB_FAIL(ret)) {
     } else if (for_replay && exist) {
       LOG_INFO("tablet already exists in replay procedure, skip it", K(ret), K(ls_id), K(tablet_id));
-    } else if (CLICK_FAIL(tablet_id_array.push_back(tablet_id))) {
+    } else if (CLICK_FAIL(creating_tablet_id_array.push_back(tablet_id))) {
       LOG_WARN("failed to push back tablet id", K(ret), K(ls_id), K(tablet_id));
+    } else if (FALSE_IT(data_format_version = create_tablet_extra_infos[info.table_schema_index_[i]].need_create_empty_major_ ? 0 : create_tablet_extra_infos[i].tenant_data_version_)) {
+      // using need_create_empty_major_sstable to determine tablet build by the offline ddl
     } else if (CLICK_FAIL(ls->get_tablet_svr()->create_tablet(ls_id, tablet_id, data_tablet_id,
         scn, snapshot_version, *create_tablet_schema, compat_mode,
-        need_create_empty_major_sstable, clog_checkpoint_scn, mds_checkpoint_scn, arg.create_type_,
-        micro_index_clustered, has_cs_replica, split_src_tablet_id, tablet_handle))) {
+        need_create_empty_major_sstable, clog_checkpoint_scn, mds_checkpoint_scn,
+        micro_index_clustered, has_cs_replica, split_info, data_format_version, tablet_handle))) {
       LOG_WARN("failed to do create tablet", K(ret), K(ls_id), K(tablet_id), K(data_tablet_id), "arg", PRETTY_ARG(arg));
     }
 
     if (OB_FAIL(ret)) {
     } else if (CLICK_FAIL(set_tablet_status(ls->get_tablet_svr(), tablet_handle, for_replay, scn, ctx,
-        arg.is_old_mds_, arg.create_type_, create_commit_version))) {
+        arg.is_old_mds_, create_type, create_commit_version))) {
       LOG_WARN("failed to set tablet normal status", K(ret), K(ls_id), K(tablet_id));
     }
 
@@ -846,7 +878,8 @@ int ObTabletCreateMdsHelper::build_pure_aux_tablets(
     const bool for_replay,
     const share::SCN &scn,
     mds::BufferCtx &ctx,
-    common::ObIArray<common::ObTabletID> &tablet_id_array)
+    common::ObIArray<common::ObTabletID> &creating_tablet_id_array,
+    common::ObIArray<common::ObTabletID> &empty_mds_tablet_id_array)
 {
   MDS_TG(10_ms);
   int ret = OB_SUCCESS;
@@ -861,6 +894,7 @@ int ObTabletCreateMdsHelper::build_pure_aux_tablets(
   const share::SCN &clog_checkpoint_scn = arg.clog_checkpoint_scn_;
   const share::SCN &mds_checkpoint_scn = arg.mds_checkpoint_scn_;
   const bool has_cs_replica = info.has_cs_replica_;
+  const ObTabletMdsUserDataType create_type = arg.create_type_;
   ObTabletHandle tablet_handle;
   bool exist = false;
   ObLSHandle ls_handle;
@@ -882,7 +916,7 @@ int ObTabletCreateMdsHelper::build_pure_aux_tablets(
     const ObCreateTabletSchema *create_tablet_schema = nullptr;
     bool need_create_empty_major_sstable = true;
     bool micro_index_clustered = false;
-    ObTabletID split_src_tablet_id;
+    ObSplitTabletInfo split_info;
     if (for_replay) {
       const ObTabletMapKey key(ls_id, tablet_id);
       if (CLICK_FAIL(ObTabletCreateDeleteHelper::replay_mds_get_tablet(key, ls, tablet_handle))) {
@@ -894,28 +928,34 @@ int ObTabletCreateMdsHelper::build_pure_aux_tablets(
         }
       } else {
         exist = true;
+        if (CLICK_FAIL(ObTabletCreateDeleteHelper::update_empty_mds_tablet_id_array_if_need(*tablet_handle.get_obj(),
+                empty_mds_tablet_id_array))) {
+          LOG_WARN("failed to update_empty_mds_tablet_id_array_if_need", K(ret), K(ls_id), K(tablet_id));
+        }
       }
     }
-
+    uint64_t data_format_version = 0;
     if (OB_FAIL(ret)) {
     } else if (for_replay && exist) {
       LOG_INFO("create pure aux tablet is already exist, skip it", K(ret), K(for_replay), K(exist),
           K(ls_id), K(data_tablet_id), K(tablet_id));
-    } else if (CLICK_FAIL(tablet_id_array.push_back(tablet_id))) {
+    } else if (CLICK_FAIL(creating_tablet_id_array.push_back(tablet_id))) {
       LOG_WARN("failed to push back tablet id", K(ret), K(ls_id), K(tablet_id));
     } else if (OB_FAIL(check_and_get_create_tablet_schema_info(create_tablet_schemas, create_tablet_extra_infos, info, i,
-        create_tablet_schema, need_create_empty_major_sstable, micro_index_clustered, split_src_tablet_id))) {
+        create_type, create_tablet_schema, clog_checkpoint_scn, need_create_empty_major_sstable, micro_index_clustered, split_info))) {
       LOG_WARN("check and get create tablet schema_info failed", K(ret));
+    } else if (FALSE_IT(data_format_version = create_tablet_extra_infos[info.table_schema_index_[i]].need_create_empty_major_ ? 0 : create_tablet_extra_infos[i].tenant_data_version_)) {
+      // using need_create_empty_major_sstable to determine tablet build by the offline ddl
     } else if (CLICK_FAIL(ls->get_tablet_svr()->create_tablet(ls_id, tablet_id, data_tablet_id,
         scn, snapshot_version, *create_tablet_schema, compat_mode,
-        need_create_empty_major_sstable, clog_checkpoint_scn, mds_checkpoint_scn, arg.create_type_,
-        micro_index_clustered, has_cs_replica, split_src_tablet_id, tablet_handle))) {
+        need_create_empty_major_sstable, clog_checkpoint_scn, mds_checkpoint_scn,
+        micro_index_clustered, has_cs_replica, split_info, data_format_version, tablet_handle))) {
       LOG_WARN("failed to do create tablet", K(ret), K(ls_id), K(tablet_id), K(data_tablet_id), "arg", PRETTY_ARG(arg));
     }
 
     if (OB_FAIL(ret)) {
     } else if (CLICK_FAIL(set_tablet_status(ls->get_tablet_svr(), tablet_handle, for_replay, scn, ctx,
-        arg.is_old_mds_, arg.create_type_, create_commit_version))) {
+        arg.is_old_mds_, create_type, create_commit_version))) {
       LOG_WARN("failed to set tablet normal status", K(ret), K(ls_id), K(tablet_id));
     }
   }
@@ -931,7 +971,8 @@ int ObTabletCreateMdsHelper::build_bind_hidden_tablets(
     const bool for_replay,
     const share::SCN &scn,
     mds::BufferCtx &ctx,
-    common::ObIArray<common::ObTabletID> &tablet_id_array)
+    common::ObIArray<common::ObTabletID> &creating_tablet_id_array,
+    common::ObIArray<common::ObTabletID> &empty_mds_tablet_id_array)
 {
   MDS_TG(10_ms);
   int ret = OB_SUCCESS;
@@ -946,6 +987,7 @@ int ObTabletCreateMdsHelper::build_bind_hidden_tablets(
   const share::SCN &clog_checkpoint_scn = arg.clog_checkpoint_scn_;
   const share::SCN &mds_checkpoint_scn = arg.mds_checkpoint_scn_;
   const bool has_cs_replica = info.has_cs_replica_;
+  const ObTabletMdsUserDataType create_type = arg.create_type_;
   ObTabletHandle tablet_handle;
   int64_t aux_info_idx = -1;
   ObTabletID lob_meta_tablet_id;
@@ -973,9 +1015,9 @@ int ObTabletCreateMdsHelper::build_bind_hidden_tablets(
     bool has_related_aux_info = find_aux_info_for_hidden_tablets(arg, tablet_id, aux_info_idx);
     bool need_create_empty_major_sstable = true;
     bool micro_index_clustered = false;
-    ObTabletID split_src_tablet_id;
+    ObSplitTabletInfo split_info;
     if (OB_FAIL(check_and_get_create_tablet_schema_info(create_tablet_schemas, create_tablet_extra_infos, info, i,
-        create_tablet_schema, need_create_empty_major_sstable, micro_index_clustered, split_src_tablet_id))) {
+        create_type, create_tablet_schema, clog_checkpoint_scn, need_create_empty_major_sstable, micro_index_clustered, split_info))) {
       LOG_WARN("check and get create tablet schema_info failed", K(ret));
     } else if (has_related_aux_info) {
       const ObCreateTabletInfo &aux_info = arg.tablets_.at(aux_info_idx);
@@ -1004,26 +1046,32 @@ int ObTabletCreateMdsHelper::build_bind_hidden_tablets(
           LOG_WARN("failed to get tablet", K(ret), K(ls_id), K(orig_tablet_id), K(tablet_id));
         }
       } else {
+        if (CLICK_FAIL(ObTabletCreateDeleteHelper::update_empty_mds_tablet_id_array_if_need(*tablet_handle.get_obj(),
+                empty_mds_tablet_id_array))) {
+          LOG_WARN("failed to update_empty_mds_tablet_id_array_if_need", K(ret), K(ls_id), K(tablet_id));
+        }
         exist = true;
       }
     }
-
+    uint64_t data_format_version = 0;
     if (OB_FAIL(ret)) {
     } else if (for_replay && exist) {
       LOG_INFO("create hidden tablet is already exist, skip it", K(ret), K(for_replay), K(exist),
           K(ls_id), K(orig_tablet_id), K(tablet_id));
-    } else if (CLICK_FAIL(tablet_id_array.push_back(tablet_id))) {
+    } else if (CLICK_FAIL(creating_tablet_id_array.push_back(tablet_id))) {
       LOG_WARN("failed to push back tablet id", K(ret), K(ls_id), K(tablet_id));
+    } else if (FALSE_IT(data_format_version = create_tablet_extra_infos[info.table_schema_index_[i]].need_create_empty_major_ ? 0 : create_tablet_extra_infos[i].tenant_data_version_)) {
+      // using need_create_empty_major_sstable to determine tablet build by the offline ddl
     } else if (CLICK_FAIL(ls->get_tablet_svr()->create_tablet(ls_id, tablet_id, tablet_id,
         scn, snapshot_version, *create_tablet_schema, compat_mode,
-        need_create_empty_major_sstable, clog_checkpoint_scn, mds_checkpoint_scn, arg.create_type_,
-        micro_index_clustered, has_cs_replica, split_src_tablet_id, tablet_handle))) {
+        need_create_empty_major_sstable, clog_checkpoint_scn, mds_checkpoint_scn,
+        micro_index_clustered, has_cs_replica, split_info, data_format_version, tablet_handle))) {
       LOG_WARN("failed to do create tablet", K(ret), K(ls_id), K(tablet_id), K(orig_tablet_id), "arg", PRETTY_ARG(arg));
     }
 
     if (OB_FAIL(ret)) {
     } else if (CLICK_FAIL(set_tablet_status(ls->get_tablet_svr(), tablet_handle, for_replay, scn, ctx,
-        arg.is_old_mds_, arg.create_type_, create_commit_version))) {
+        arg.is_old_mds_, create_type, create_commit_version))) {
       LOG_WARN("failed to set tablet normal status", K(ret), K(ls_id), K(tablet_id));
     }
 
@@ -1126,5 +1174,6 @@ void ObTabletCreateMdsHelper::handle_ret_for_replay(int &ret)
     LOG_INFO("rewrite failure to OB_EAGAIN to retry clog replay", K(ret), K(origin_ret));
   }
 }
+
 } // namespace storage
 } // namespace oceanbase

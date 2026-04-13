@@ -46,41 +46,54 @@ public:
 
 // batch operation interface
 public:
-  static int multi_insert(ObTableCtx &ctx, const ObIArray<ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
-  static int multi_update(ObTableCtx &ctx, const ObIArray<ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
-  static int multi_insert_or_update(ObTableCtx &ctx, const ObIArray<ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
-  static int multi_put(ObTableCtx &ctx, const ObIArray<ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
-  static int multi_get(ObTableCtx &ctx, const ObIArray<ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
-  static int multi_delete(ObTableCtx &ctx, const ObIArray<ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
-  static int multi_replace(ObTableCtx &ctx, const ObIArray<ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
+  static int multi_insert(ObTableCtx &ctx, const ObIArray<const ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
+  static int multi_update(ObTableCtx &ctx, const ObIArray<const ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
+  static int multi_insert_or_update(ObTableCtx &ctx, const ObIArray<const ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
+  static int multi_put(ObTableCtx &ctx, const ObIArray<const ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
+  static int multi_get(ObTableCtx &ctx, const ObIArray<const ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
+  static int multi_delete(ObTableCtx &ctx, const ObIArray<const ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
+  static int multi_replace(ObTableCtx &ctx, const ObIArray<const ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results = nullptr);
   static int construct_entities_from_row(ObIAllocator &allocator,
                                          ObKvSchemaCacheGuard &schema_cache_guard,
                                          ObNewRow &row,
-                                         const ObIArray<ObITableEntity*> &entities,
+                                         const ObIArray<const ObITableEntity*> &entities,
                                          ObIArray<ObTableOperationResult> &results);
   static int get_result_index(const ObNewRow &row,
-                              const ObIArray<ObITableEntity*> &entities,
+                              const ObIArray<const ObITableEntity*> &entities,
                               const ObIArray<uint64_t> &rowkey_ids,
                               ObObj *rowkey_cells,
                               ObIArray<int64_t> &indexs);
   static int generate_scan_ranges_by_entities(const uint64_t table_id,
-                                              const ObIArray<ObITableEntity*> &entities,
+                                              const ObIArray<const ObITableEntity*> &entities,
                                               ObIArray<common::ObNewRange> &ranges);
   static int compare_rowkey(ObRowkey &storage_rowkey, ObRowkey &request_rowkey, bool &is_equal);
+  static int extract_hbase_cells(ObTableCtx &ctx, const ObHCfRows &cf_rows);
+  // Helper methods for hbase_batch_put
+  static int get_appropriate_spec(ObTableCtx &ctx,
+                                 ObTableApiCacheGuard &cache_guard,
+                                 ObTableApiSpec *&spec);
+  static int execute_batch_put(ObTableCtx &ctx, ObTableApiSpec *spec);
+  static int execute_single_put(ObTableCtx &ctx, ObTableApiSpec *spec);
+  static int execute_multi_put_within_executor(ObTableCtx &ctx, ObTableApiSpec *spec);
+  static int execute_multi_put_with_same_spec(ObTableCtx &ctx,
+                                              ObTableApiSpec *spec);
+  static int execute_and_cleanup_executor(ObTableCtx &ctx,
+                                         ObTableApiSpec *spec,
+                                         ObTableApiExecutor *executor);
 // query interface
 public:
   static int query(ObTableCtx &ctx, ObTableApiRowIterator &iter);
 
 // for service inner use
 private:
-  static int check_batch_args(ObTableCtx &ctx, const ObIArray<ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results);
-  static int adjust_entities(ObTableCtx &ctx, const common::ObIArray<ObITableEntity *> &entities);
-  static bool need_calc_tablet_id(const common::ObIArray<ObTabletID> *tablet_ids, const common::ObIArray<ObITableEntity *> &entities);
+  static int check_batch_args(ObTableCtx &ctx, const ObIArray<const ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results);
+  static int adjust_entities(ObTableCtx &ctx, const common::ObIArray<const ObITableEntity *> &entities);
+  static bool need_calc_tablet_id(const common::ObIArray<ObTabletID> *tablet_ids, const common::ObIArray<const ObITableEntity *> &entities);
   static bool need_calc_tablet_id(const common::ObIArray<ObTabletID> *tablet_ids);
   static int calc_tablet_ids(ObTableCtx &ctx, const ObIArray<ObNewRange> &ranges, ObIArray<ObTabletID> *&tablet_ids);
   static int process_executor(ObTableCtx &ctx, ObTableApiExecutor *executor, ObTableOperationResult &result);
   static int process_dml_result(ObTableCtx &ctx, ObTableApiExecutor &executor, ObTableOperationResult &result);
-  static bool is_same_plan(ObTableOperationType::Type op_type, ObITableEntity &src_entity, ObITableEntity &dest_entity);
+  static bool is_same_plan(ObTableOperationType::Type op_type, const ObITableEntity &src_entity, const ObITableEntity &dest_entity);
   static int init_tablet_ids_array(ObTableCtx &ctx, const int64_t array_size, ObIArray<ObTabletID> *&tablet_ids);
 private:
   template<int SPEC_TYPE>
@@ -97,7 +110,8 @@ private:
       SERVER_LOG(WARN, "fail to get expr frame info", K(ret));
     } else if (OB_FAIL(ObTableExprCgService::alloc_exprs_memory(ctx, *expr_frame_info))) {
       SERVER_LOG(WARN, "fail to alloc exprs memory", K(ret));
-    } else if (FALSE_IT(ctx.set_expr_info(expr_frame_info))) {
+    } else if (OB_FAIL((ctx.init_expr_frame_info(expr_frame_info)))) {
+      SERVER_LOG(WARN, "fail to init expr frame info", K(ret));
     } else if (OB_FAIL(cache_guard.get_spec<SPEC_TYPE>(&ctx, spec))) {
       SERVER_LOG(WARN, "fail to get spec from cache", K(ret), K(SPEC_TYPE));
     } else if (OB_ISNULL(spec)) {
@@ -130,7 +144,9 @@ private:
       ctx.set_need_dist_das(true);
       // set all op to ET_DYNAMIC temperally, because if entity_type == ET_HKV, if will modify timestamp
       ctx.set_entity_type(ObTableEntityType::ET_DYNAMIC);
-      if (OB_FAIL(get_spec<SPEC_TYPE>(ctx, cache_guard, spec))) {
+      if (OB_FAIL(ctx.adjust_entity())) {
+        SERVER_LOG(WARN, "fail to adjust entity", K(ret), K(entity));
+      } else if (OB_FAIL(get_spec<SPEC_TYPE>(ctx, cache_guard, spec))) {
         SERVER_LOG(WARN, "fail to get spec", K(ret), K(SPEC_TYPE), K(OP_TYPE));
       } else if (OB_FAIL(spec->create_executor(ctx, executor))) {
         SERVER_LOG(WARN, "fail to create executor", K(ret), K(SPEC_TYPE), K(OP_TYPE));
@@ -142,7 +158,7 @@ private:
         executor = nullptr;
       }
       // cache is release, avoid others to visit it
-      ctx.set_expr_info(nullptr);
+      ctx.reset_expr_frame_info();
     }
     OB_TABLE_END_AUDIT(ret_code, ret,
                        snapshot, ctx.get_exec_ctx().get_das_ctx().get_snapshot(),
@@ -151,7 +167,7 @@ private:
   }
 
   template<int SPEC_TYPE, ObTableOperationType::Type OP_TYPE, sql::stmt::StmtType STMT_TYPE>
-  static int process_batch_in_executor(ObTableCtx &ctx, const ObIArray<ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results)
+  static int process_batch_in_executor(ObTableCtx &ctx, const ObIArray<const ObITableEntity*> &entities, ObIArray<ObTableOperationResult> *results)
   {
     int ret = OB_SUCCESS;
     ObTableAuditMultiOp multi_op(OP_TYPE, &entities);
@@ -206,7 +222,7 @@ private:
       executor = nullptr;
     }
     // cache is release, avoid others to visit it
-    ctx.set_expr_info(nullptr);
+    ctx.reset_expr_frame_info();
     OB_TABLE_END_AUDIT(ret_code, ret,
                        snapshot, ctx.get_exec_ctx().get_das_ctx().get_snapshot(),
                        stmt_type, STMT_TYPE);
@@ -215,7 +231,7 @@ private:
 
   template<int SPEC_TYPE, ObTableOperationType::Type OP_TYPE, sql::stmt::StmtType STMT_TYPE>
   static int process_batch_with_same_spec(ObTableCtx &ctx,
-                                          const common::ObIArray<ObITableEntity*> &entities,
+                                          const common::ObIArray<const ObITableEntity*> &entities,
                                           common::ObIArray<ObTableOperationResult> *results)
   {
     int ret = OB_SUCCESS;
@@ -274,7 +290,7 @@ private:
       } // end for
     }
     // cache is release, avoid others to visit it
-    ctx.set_expr_info(nullptr);
+    ctx.reset_expr_frame_info();
     OB_TABLE_END_AUDIT(ret_code, ret,
                        snapshot, ctx.get_exec_ctx().get_das_ctx().get_snapshot(),
                        stmt_type, STMT_TYPE);

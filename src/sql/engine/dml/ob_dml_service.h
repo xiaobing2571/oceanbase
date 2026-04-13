@@ -91,6 +91,9 @@ public:
   static int check_filter_row(const ObInsCtDef &ins_ctdef,
                               ObEvalCtx &eval_ctx,
                               bool &is_skipped);
+  static int check_filter_row(const ObUpdCtDef &upd_ctdef,
+                              ObEvalCtx &eval_ctx,
+                              bool &is_skipped);
   static int check_error_ret_by_row(const ObInsCtDef &ins_ctdef,
                                     ObTableModifyOp &dml_op,
                                     const int errcode);
@@ -188,7 +191,8 @@ public:
 
   static void init_dml_write_flag(const ObDASDMLBaseCtDef &base_ctdef,
                                   ObDASDMLBaseRtDef &base_rtdef,
-                                  concurrent_control::ObWriteFlag &write_flag);
+                                  concurrent_control::ObWriteFlag &write_flag,
+                                  bool is_insert_up_gts_opt);
 
   static int init_dml_param(const ObDASDMLBaseCtDef &base_ctdef,
                             ObDASDMLBaseRtDef &base_rtdef,
@@ -196,7 +200,8 @@ public:
                             const int16_t write_branch_id,
                             common::ObIAllocator &das_alloc,
                             storage::ObStoreCtxGuard &store_ctx_gurad,
-                            storage::ObDMLBaseParam &dml_param);
+                            storage::ObDMLBaseParam &dml_param,
+                            bool is_insert_up_gts_opt);
   static int init_das_dml_rtdef(ObDMLRtCtx &dml_rtctx,
                                 const ObDASDMLBaseCtDef &das_ctdef,
                                 ObDASDMLBaseRtDef &das_rtdef,
@@ -266,7 +271,7 @@ public:
   static int set_heap_table_hidden_pk(const ObInsCtDef &ins_ctdef,
                                       const common::ObTabletID &tablet_id,
                                       ObEvalCtx &eval_ctx);
-  static int create_anonymous_savepoint(transaction::ObTxDesc &tx_desc, transaction::ObTxSEQ &savepoint);
+  static int create_anonymous_savepoint(transaction::ObTxDesc &tx_desc, transaction::ObTxSEQ &savepoint, int16_t branch_id = 0);
   static int rollback_local_savepoint(transaction::ObTxDesc &tx_desc,
                                       const transaction::ObTxSEQ savepoint,
                                       int64_t expire_ts);
@@ -351,6 +356,7 @@ public:
       related_tablet_ids_(nullptr),
       das_allocator_(nullptr),
       ft_doc_word_infos_(nullptr),
+      is_do_gts_opt_(false),
       dml_param_()
   { }
   int write_tablet(DMLIterator &iter, int64_t &affected_rows);
@@ -374,6 +380,7 @@ public:
   ObTabletIDFixedArray *related_tablet_ids_;
   common::ObIAllocator *das_allocator_;
   common::ObIArray<ObFTDocWordInfo> *ft_doc_word_infos_;
+  bool is_do_gts_opt_;
 private:
   storage::ObDMLBaseParam dml_param_;
 };
@@ -395,7 +402,7 @@ int ObDASIndexDMLAdaptor<N, DMLIterator>::write_tablet(DMLIterator &iter, int64_
     concurrent_control::ObWriteFlag write_flag;
 
     // write_flag should be inited before get store ctx, as it will be used in the call function
-    (void)ObDMLService::init_dml_write_flag(*ctdef_, *rtdef_, write_flag);
+    (void)ObDMLService::init_dml_write_flag(*ctdef_, *rtdef_, write_flag, is_do_gts_opt_);
     if (OB_FAIL(as->get_write_store_ctx_guard(ls_id_,
                                               rtdef_->timeout_ts_,
                                               *tx_desc_,
@@ -405,7 +412,7 @@ int ObDASIndexDMLAdaptor<N, DMLIterator>::write_tablet(DMLIterator &iter, int64_
                                               store_ctx_guard))) {
       LOG_WARN("fail to get_write_store_ctx_guard", K(ret), K(ls_id_));
     } else if (OB_FAIL(ObDMLService::init_dml_param(
-        *ctdef_, *rtdef_, *snapshot_, write_branch_id_, *das_allocator_, store_ctx_guard, dml_param_))) {
+        *ctdef_, *rtdef_, *snapshot_, write_branch_id_, *das_allocator_, store_ctx_guard, dml_param_, is_do_gts_opt_))) {
       SQL_DAS_LOG(WARN, "init dml param failed", K(ret), K(ctdef_->table_id_), K(ctdef_->index_tid_));
 
     } else if (OB_FAIL(write_rows(ls_id_, tablet_id_, *ctdef_, *rtdef_, iter, affected_rows))) {
@@ -425,7 +432,7 @@ int ObDASIndexDMLAdaptor<N, DMLIterator>::write_tablet(DMLIterator &iter, int64_
         if (OB_FAIL(iter.rewind(related_ctdef, doc_word_info))) {
           SQL_DAS_LOG(WARN, "rewind iterator failed", K(ret));
         } else if (OB_FAIL(ObDMLService::init_dml_param(*related_ctdef, *related_rtdef,
-            *snapshot_, write_branch_id_, *das_allocator_, store_ctx_guard, dml_param_))) {
+            *snapshot_, write_branch_id_, *das_allocator_, store_ctx_guard, dml_param_, is_do_gts_opt_))) {
           SQL_DAS_LOG(WARN, "init index dml param failed", K(ret),
                       K(related_ctdef->table_id_), K(related_ctdef->index_tid_));
         } else if (OB_FAIL(write_rows(ls_id_,
@@ -472,7 +479,7 @@ int ObDASIndexDMLAdaptor<N, DMLIterator>::write_tablet_with_ignore(DMLIterator &
     //这里后续要删掉，临时处理
     ObChunkDatumStore::StoredRow *store_row = nullptr;
     dsr.store_row_ = const_cast<ObDASWriteBuffer::DmlRow*>(dml_row);
-    if (OB_FAIL(ObDMLService::create_anonymous_savepoint(*tx_desc_, savepoint_no))) {
+    if (OB_FAIL(ObDMLService::create_anonymous_savepoint(*tx_desc_, savepoint_no, write_branch_id_))) {
       SQL_DAS_LOG(WARN, "create anonymous savepoint failed", K(ret));
     } else if (OB_FAIL(single_row_buffer.init(*das_allocator_, ObDASWriteBuffer::DAS_ROW_DEFAULT_EXTEND_SIZE, MTL_ID()))) {
       SQL_DAS_LOG(WARN, "init single row buffer failed", K(ret));
@@ -488,7 +495,7 @@ int ObDASIndexDMLAdaptor<N, DMLIterator>::write_tablet_with_ignore(DMLIterator &
       storage::ObStoreCtxGuard store_ctx_guard;
       concurrent_control::ObWriteFlag write_flag;
 
-      (void)ObDMLService::init_dml_write_flag(*ctdef_, *rtdef_, write_flag);
+      (void)ObDMLService::init_dml_write_flag(*ctdef_, *rtdef_, write_flag, is_do_gts_opt_);
       if (OB_FAIL(as->get_write_store_ctx_guard(ls_id_,
                                                 rtdef_->timeout_ts_,
                                                 *tx_desc_,
@@ -498,7 +505,7 @@ int ObDASIndexDMLAdaptor<N, DMLIterator>::write_tablet_with_ignore(DMLIterator &
                                                 store_ctx_guard))) {
         LOG_WARN("fail to get_write_store_ctx_guard", K(ret), K(ls_id_));
       } else if (OB_FAIL(ObDMLService::init_dml_param(*ctdef_, *rtdef_, *snapshot_, write_branch_id_,
-          *das_allocator_, store_ctx_guard, dml_param_))) {
+          *das_allocator_, store_ctx_guard, dml_param_, is_do_gts_opt_))) {
         SQL_DAS_LOG(WARN, "init dml param failed", K(ret), KPC_(ctdef), KPC_(rtdef));
       } else if (with_local_index && FALSE_IT(dml_param_.write_flag_.set_skip_flush_redo())) {
       } else if (OB_FAIL(write_rows(ls_id_,
@@ -527,7 +534,8 @@ int ObDASIndexDMLAdaptor<N, DMLIterator>::write_tablet_with_ignore(DMLIterator &
                                                           write_branch_id_,
                                                           *das_allocator_,
                                                           store_ctx_guard,
-                                                          dml_param_))) {
+                                                          dml_param_,
+                                                          is_do_gts_opt_))) {
             SQL_DAS_LOG(WARN, "init index dml param failed", K(ret),
                         KPC(related_ctdef), KPC(related_rtdef));
           } else if (i == related_ctdefs_->count() - 1 && FALSE_IT(dml_param_.write_flag_.unset_skip_flush_redo())) {

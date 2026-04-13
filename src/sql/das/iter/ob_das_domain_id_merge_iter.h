@@ -19,6 +19,7 @@
 #include "share/ob_ls_id.h"
 #include "storage/access/ob_dml_param.h"
 #include "share/domain_id/ob_domain_id.h"
+#include "share/vector_index/ob_vector_index_util.h"
 
 namespace oceanbase
 {
@@ -84,7 +85,11 @@ public:
   virtual int do_table_scan() override;
   virtual int rescan() override;
   virtual void clear_evaluated_flag() override;
-
+  virtual int set_scan_rowkey(ObEvalCtx *eval_ctx,
+                              const ObIArray<ObExpr *> &rowkey_exprs,
+                              const ObDASScanCtDef *lookup_ctdef,
+                              ObIAllocator *alloc,
+                              int64_t group_id) override;
   ObDASScanIter *get_data_table_iter() { return data_table_iter_; }
   int set_domain_id_merge_related_ids(const ObDASRelatedTabletID &tablet_ids, const share::ObLSID &ls_id);
 
@@ -108,6 +113,7 @@ protected:
       transaction::ObTxReadSnapshot *snapshot,
       storage::ObTableScanParam &scan_param);
   int build_rowkey_domain_range();
+  int check_is_need_multi_get();
   int concat_row();
   int concat_rows(int64_t &count, int64_t capacity);
   int sorted_merge_join_row();
@@ -149,6 +155,13 @@ protected:
       common::ObIArray<common::ObRowkey> &rowkeys,
       common::ObIArray<share::ObDomainIdUtils::DomainIds> &domain_ids);
   int get_domain_id_count(const ObDASScanCtDef *ctdef, int64_t &domain_id_count);
+  int multi_get_row();
+  int multi_get_rows(int64_t &count, int64_t capacity);
+  int check_is_emb_vec_domain(int64_t iter_idx, bool &is_emb_vec);
+  int reset_rowkey_domain_iter_scan_range(int64_t iter_idx, const common::ObRowkey &data_table_rowkey);
+  int fill_null_domain_id_in_data_table(const ObDASScanCtDef *ctdef,
+                                       ObDASScanRtDef *rtdef,
+                                       common::ObIAllocator &allocator);
 private:
   bool need_filter_rowkey_domain_;
   bool is_no_sample_;
@@ -162,6 +175,7 @@ private:
   ObArray<ObTabletID> rowkey_domain_tablet_ids_;
   share::ObLSID rowkey_domain_ls_id_;
   lib::MemoryContext merge_memctx_;
+  bool is_need_multi_get_;
 };
 
 } // end namespace sql

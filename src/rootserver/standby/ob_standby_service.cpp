@@ -20,6 +20,7 @@
 #include "share/ob_global_stat_proxy.h"//ObGlobalStatProxy
 #include "share/backup/ob_backup_config.h" // ObBackupConfigParserMgr
 #include "storage/high_availability/ob_transfer_lock_utils.h" // ObMemberListLockUtils
+#include "share/ob_license_utils.h"
 
 namespace oceanbase
 {
@@ -90,8 +91,8 @@ void ObStandbyService::tenant_event_start_(
     const uint64_t switch_tenant_id, const obrpc::ObSwitchTenantArg &arg, int ret,
     int64_t begin_ts, const share::ObAllTenantInfo &tenant_info)
 {
-  char tenant_info_buf[1024] = "";
-  PRINT_TENANT_INFO(tenant_info, tenant_info_buf);
+  char tenant_info_buf[MAX_TENANT_EVENT_VALUE_LENGTH] = "";
+  PRINT_OBJ_INFO(tenant_info, tenant_info_buf);
   switch (arg.get_op_type()) {
       case ObSwitchTenantArg::SWITCH_TO_PRIMARY :
         TENANT_EVENT(switch_tenant_id, TENANT_ROLE_CHANGE, SWITCHOVER_TO_PRIMARY_START, begin_ts,
@@ -125,8 +126,8 @@ void ObStandbyService::tenant_event_end_(
       LOG_WARN("failed to load tenant info", KR(ret), K(switch_tenant_id));
     }
   }
-  char tenant_info_buf[1024] = "";
-  PRINT_TENANT_INFO(tenant_info, tenant_info_buf);
+  char tenant_info_buf[MAX_TENANT_EVENT_VALUE_LENGTH] = "";
+  PRINT_OBJ_INFO(tenant_info, tenant_info_buf);
   switch (arg.get_op_type()) {
     case ObSwitchTenantArg::SWITCH_TO_PRIMARY :
       TENANT_EVENT(switch_tenant_id, TENANT_ROLE_CHANGE, SWITCHOVER_TO_PRIMARY_END, end_ts,
@@ -327,7 +328,10 @@ int ObStandbyService::recover_tenant(const obrpc::ObRecoverTenantArg &arg)
   const char *alter_cluster_event = "recover_tenant";
   uint64_t compat_version = 0;
   CLUSTER_EVENT_ADD_CONTROL_START(ret, alter_cluster_event, "stmt_str", arg.get_stmt_str());
-  if (OB_FAIL(check_inner_stat_())) {
+
+  if (OB_FAIL(ObLicenseUtils::check_standby_allowed())) {
+    LOG_WARN("check standby allowed failed", KR(ret));
+  } else if (OB_FAIL(check_inner_stat_())) {
     LOG_WARN("inner stat error", KR(ret), K_(inited));
   } else if (!arg.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
@@ -457,6 +461,13 @@ int ObStandbyService::do_recover_tenant(
     ret = OB_OP_NOT_ALLOW;
     LOG_WARN("tenant role is not STANDBY", K(tenant_info));
     LOG_USER_ERROR(OB_OP_NOT_ALLOW, "tenant role is not STANDBY, recover is");
+  } else if (OB_UNLIKELY(tenant_info.get_switchover_status().is_flashback_and_stay_standby_status()
+      && obrpc::ObRecoverTenantArg::RecoverType::CANCEL != recover_type)) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_WARN("recover when the tenant's switchover_status is not allowed",
+        KR(ret), K(recover_type), K(tenant_info));
+    LOG_USER_ERROR(OB_OP_NOT_ALLOW,"Recover when the tenant's switchover_status is "
+        "'FLASHBACK AND STAY STANDBY' is");
   } else if (tenant_info.get_switchover_status() != working_sw_status) {
     ret = OB_OP_NOT_ALLOW;
     LOG_WARN("unexpected tenant switchover status", KR(ret), K(working_sw_status), K(tenant_info));
@@ -763,8 +774,10 @@ int ObStandbyService::switch_to_standby_prepare_ls_status_(
        and normal switchover status */
     if (OB_FAIL(ObLSServiceHelper::process_status_to_steady(true/* lock_sys_ls */,
                                    share::PREP_SWITCHING_TO_STANDBY_SWITCHOVER_STATUS,
+                                   switchover_epoch,
                                    tenant_stat))) {
       LOG_WARN("failed to process_ls_status_missmatch", KR(ret));
+    } else if (FALSE_IT(DEBUG_SYNC(BEFORE_SWITCHING_TO_STANDBY))) {
     } else if (OB_FAIL(ObAllTenantInfoProxy::update_tenant_role(
                     tenant_id, sql_proxy_, switchover_epoch,
                     share::STANDBY_TENANT_ROLE, status,

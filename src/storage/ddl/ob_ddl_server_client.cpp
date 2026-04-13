@@ -44,29 +44,23 @@ int ObDDLServerClient::execute_recover_restore_table(const obrpc::ObRecoverResto
   return ret;
 }
 
+template<typename CreateHiddenTableArgType>
 int ObDDLServerClient::create_hidden_table(
-    const obrpc::ObCreateHiddenTableArg &arg,
+    const CreateHiddenTableArgType &arg,
     obrpc::ObCreateHiddenTableRes &res,
     int64_t &snapshot_version,
     uint64_t &data_format_version,
     sql::ObSQLSessionInfo &session)
 {
   int ret = OB_SUCCESS;
-  ObAddr rs_leader_addr;
   const int64_t retry_interval = 100 * 1000L;
-  obrpc::ObCommonRpcProxy *common_rpc_proxy = GCTX.rs_rpc_proxy_;
   if (OB_UNLIKELY(!arg.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arg", K(ret), K(arg));
-  } else if (OB_ISNULL(common_rpc_proxy)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("common rpc proxy is null", K(ret));
-  } else if (OB_FAIL(GCTX.rs_mgr_->get_master_root_server(rs_leader_addr))) {
-    LOG_WARN("fail to rootservice address", K(ret));
   }
 
   while (OB_SUCC(ret)) {
-    if (OB_FAIL(common_rpc_proxy->to(rs_leader_addr).timeout(GCONF._ob_ddl_timeout).create_hidden_table(arg, res))) {
+    if (OB_FAIL(inner_create_hidden_table_(arg, res))) {
       LOG_WARN("failed to create hidden table", KR(ret), K(arg));
     } else {
       break;
@@ -117,6 +111,19 @@ int ObDDLServerClient::create_hidden_table(
   LOG_INFO("finish create hidden table.", K(ret), "ddl_event_info", ObDDLEventInfo(), K(arg), K(res));
   return ret;
 }
+
+template int ObDDLServerClient::create_hidden_table(
+             const oceanbase::obrpc::ObCreateHiddenTableArg &arg,
+             obrpc::ObCreateHiddenTableRes &res,
+             int64_t &snapshot_version,
+             uint64_t &data_format_version,
+             sql::ObSQLSessionInfo &session);
+template int ObDDLServerClient::create_hidden_table(
+             const ObCreateHiddenTableArgV2 &arg,
+             obrpc::ObCreateHiddenTableRes &res,
+             int64_t &snapshot_version,
+             uint64_t &data_format_version,
+             sql::ObSQLSessionInfo &session);
 
 int ObDDLServerClient::start_redef_table(const obrpc::ObStartRedefTableArg &arg, obrpc::ObStartRedefTableRes &res, sql::ObSQLSessionInfo &session)
 {
@@ -415,9 +422,10 @@ int ObDDLServerClient::wait_task_reach_pending(
         uint64_t unused_target_object_id = 0;
         int64_t unused_schema_version = 0;
         share::ObDDLTaskStatus task_status = share::ObDDLTaskStatus::PREPARE;
+        bool unused_is_offline_index_rebuild = false;
         if (OB_FAIL(ObDDLUtil::get_data_information(tenant_id, task_id, data_format_version,
-            snapshot_version, task_status, unused_target_object_id, unused_schema_version, is_no_logging))) {
-          if (OB_LIKELY(OB_ITER_END == ret)) {
+            snapshot_version, task_status, unused_target_object_id, unused_schema_version, is_no_logging, unused_is_offline_index_rebuild))) {
+          if (OB_LIKELY(OB_ENTRY_NOT_EXIST == ret)) {
             ret = OB_ENTRY_NOT_EXIST;
             ObAddr unused_addr;
             int64_t forward_user_msg_len = 0;
@@ -476,6 +484,38 @@ int ObDDLServerClient::check_need_stop(const uint64_t tenant_id)
   } else if (observer::ObServer::get_instance().is_stopped()) {
     ret = OB_TIMEOUT;
     LOG_WARN("server is stopping", K(ret), K(tenant_id));
+  }
+  return ret;
+}
+
+int ObDDLServerClient::inner_create_hidden_table_(const ObCreateHiddenTableArg &arg, obrpc::ObCreateHiddenTableRes &res)
+{
+  int ret = OB_SUCCESS;
+  ObAddr rs_leader_addr;
+  obrpc::ObCommonRpcProxy common_rpc_proxy;
+  if (OB_ISNULL(GCTX.rs_rpc_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("common rpc proxy is null", KR(ret));
+  } else if (FALSE_IT(common_rpc_proxy = *GCTX.rs_rpc_proxy_)) {
+    // ignore
+  } else if (OB_FAIL(common_rpc_proxy.timeout(GCONF._ob_ddl_timeout).create_hidden_table(arg, res))) {
+    LOG_WARN("failed to create hidden table", KR(ret), K(arg));
+  }
+  return ret;
+}
+
+int ObDDLServerClient::inner_create_hidden_table_(const ObCreateHiddenTableArgV2 &arg, obrpc::ObCreateHiddenTableRes &res)
+{
+  int ret = OB_SUCCESS;
+  ObAddr rs_leader_addr;
+  obrpc::ObCommonRpcProxy common_rpc_proxy;
+  if (OB_ISNULL(GCTX.rs_rpc_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("common rpc proxy is null", KR(ret));
+  } else if (FALSE_IT(common_rpc_proxy = *GCTX.rs_rpc_proxy_)) {
+    // ignore
+  } else if (OB_FAIL(common_rpc_proxy.timeout(GCONF._ob_ddl_timeout).create_hidden_table_v2(arg, res))) {
+    LOG_WARN("failed to create hidden table", KR(ret), K(arg));
   }
   return ret;
 }

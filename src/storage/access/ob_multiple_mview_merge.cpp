@@ -12,6 +12,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "ob_multiple_mview_merge.h"
+#include "ob_table_scan_iterator.h"
 
 namespace oceanbase
 {
@@ -50,15 +51,16 @@ ObMviewBaseMerge::~ObMviewBaseMerge()
 {
 }
 
-bool ObMviewBaseMerge::check_table_need_read(const ObITable &table, int64_t &major_version) const
+int ObMviewBaseMerge::check_table_need_read(const ObITable *table, bool &need_table) const
 {
-  bool need_read = true;
-  if (table.is_major_sstable()) {
-    major_version = table.get_snapshot_version();
-  } else if (major_version > 0) {
-    need_read = major_version != access_ctx_->trans_version_range_.snapshot_version_;
+  int ret = OB_SUCCESS;
+  need_table = true;
+  if (OB_FAIL(ObMultipleMerge::check_table_need_read(table, need_table))) {
+    LOG_WARN("fail to check table need read", K(ret), KPC(table));
+  } else if (need_table && !table->is_major_sstable() && major_table_version_ > 0) {
+    need_table = major_table_version_ != access_ctx_->trans_version_range_.snapshot_version_;
   }
-  return need_read;
+  return ret;
 }
 
 int ObMviewBaseMerge::alloc_row_store(ObTableAccessContext &context, const ObTableAccessParam &param)
@@ -338,6 +340,16 @@ int ObMviewMultiScanMerge::open(ObTableScanRange &table_scan_range)
   return ObMultipleMultiScanMerge::open(table_scan_range.get_ranges());
 }
 
+int ObMviewLevelOrderScanMerge::open(ObTableScanRange &table_scan_range)
+{
+  return ObLevelOrderScanMerge::open(table_scan_range.get_ranges().at(0));
+}
+
+int ObMviewLevelOrderMultiScanMerge::open(ObTableScanRange &table_scan_range)
+{
+  return ObLevelOrderMultiScanMerge::open(table_scan_range.get_ranges());
+}
+
 ObMviewMergeWrapper::ObMviewMergeWrapper()
 {
   MEMSET(merges_, 0, sizeof(merges_));
@@ -382,6 +394,7 @@ int ObMviewMergeWrapper::alloc_mview_merge(
     ObTableAccessContext &context,
     ObGetTableParam &get_table_param,
     ObTableScanRange &table_scan_range,
+    ObTableScanParam &scan_param,
     ObMviewMergeWrapper *&merge_wrapper,
     ObMviewMerge *&mview_merge)
 {
@@ -391,7 +404,7 @@ int ObMviewMergeWrapper::alloc_mview_merge(
       OB_ISNULL(merge_wrapper = OB_NEWx(ObMviewMergeWrapper, alloctor))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("Failed to alloc mview merge wrapper", K(ret));
-  } else if (OB_FAIL(merge_wrapper->get_mview_merge(param, context, get_table_param, table_scan_range, mview_merge))) {
+  } else if (OB_FAIL(merge_wrapper->get_mview_merge(param, context, get_table_param, table_scan_range, scan_param, mview_merge))) {
     LOG_WARN("Failed to get mview merge", K(ret));
   }
   return ret;
@@ -402,13 +415,18 @@ int ObMviewMergeWrapper::get_mview_merge(
     ObTableAccessContext &context,
     ObGetTableParam &get_table_param,
     ObTableScanRange &table_scan_range,
+    ObTableScanParam &scan_param,
     ObMviewMerge *&version_merge)
 {
   int ret = OB_SUCCESS;
   ObQRIterType merge_type;
   ObMviewMerge *tmp_merge = nullptr;
   version_merge = nullptr;
-  if (OB_FAIL(table_scan_range.get_query_iter_type(merge_type))) {
+  if (OB_FAIL(ObTableScanIterator::calc_query_iter_type(table_scan_range,
+                                                        context.store_ctx_->mvcc_acc_ctx_.get_snapshot_version().get_val_for_tx(),
+                                                        scan_param,
+                                                        get_table_param,
+                                                        merge_type))) {
     LOG_WARN("Failed to get query iter type", K(ret));
   } else if (nullptr == (tmp_merge = merges_[merge_type])) {
     switch (merge_type) {
@@ -427,6 +445,14 @@ int ObMviewMergeWrapper::get_mview_merge(
       }
       case T_MULTI_SCAN: {
         tmp_merge = OB_NEWx(ObMviewMultiScanMerge, context.stmt_allocator_);
+        break;
+      }
+      case T_LEVEL_ORDER_SCAN: {
+        tmp_merge = OB_NEWx(ObMviewLevelOrderScanMerge, context.stmt_allocator_);
+        break;
+      }
+      case T_LEVEL_ORDER_MULTI_SCAN: {
+        tmp_merge = OB_NEWx(ObMviewLevelOrderMultiScanMerge, context.stmt_allocator_);
         break;
       }
       default: {

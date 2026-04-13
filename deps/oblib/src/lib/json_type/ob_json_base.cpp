@@ -51,7 +51,7 @@ struct ObJsonBaseUnique {
   }
 };
 
-bool ObIJsonBase::is_json_number(ObJsonNodeType json_type) const
+bool ObIJsonBase::is_json_number_type(ObJsonNodeType json_type)
 {
   bool ret_bool = false;
   switch (json_type) {
@@ -72,6 +72,11 @@ bool ObIJsonBase::is_json_number(ObJsonNodeType json_type) const
     }
   }
   return ret_bool;
+}
+
+bool ObIJsonBase::is_json_number(ObJsonNodeType json_type) const
+{
+  return is_json_number_type(json_type);
 }
 
 bool ObIJsonBase::is_json_scalar(ObJsonNodeType json_type) const
@@ -3932,6 +3937,7 @@ int ObIJsonBase::print(ObJsonBuffer &j_buf, bool is_quoted, uint64_t reserve_len
         break;
       }
 
+      case ObJsonNodeType::J_SEMI_HETE_COL:
       case ObJsonNodeType::J_ARRAY: {
         ++depth;
         if (OB_FAIL(SMART_CALL(print_array(j_buf, depth, is_pretty)))) {
@@ -4774,7 +4780,8 @@ int ObIJsonBase::compare(const ObIJsonBase &other, int &res, bool is_path) const
               LOG_WARN("fail to compare json string", K(ret));
             }
           } else {
-            res = str_a.compare(str_b);
+            int raw_cmp = str_a.compare(str_b);
+            res = (raw_cmp < 0) ? -1 : ((raw_cmp > 0) ? 1 : 0);
           }
           break;
         }
@@ -6521,6 +6528,13 @@ int ObJsonBaseFactory::alloc_node(ObIAllocator &allocator, const ObJsonNodeType 
       if (OB_ISNULL(j_node = OB_NEWx(ObJsonOFloat, &allocator, 0))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_WARN("fail to alloc memory for float json node", K(ret), "size", sizeof(ObJsonOFloat));
+      }
+      break;
+    }
+    case ObJsonNodeType::J_SEMI_BIN: {
+      if (OB_ISNULL(j_node = OB_NEWx(ObJsonSemiBin, &allocator))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("fail to alloc memory for semi json node", K(ret));
       }
       break;
     }

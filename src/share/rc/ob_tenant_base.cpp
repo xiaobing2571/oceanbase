@@ -110,8 +110,10 @@ ObTenantBase::ObTenantBase(const uint64_t id, const int64_t epoch, bool enable_t
     enable_tenant_ctx_check_(enable_tenant_ctx_check),
     thread_count_(0),
     mini_mode_(false),
+    thread_list_lock_(common::ObLatchIds::OB_TENANT_THREAD_LIST_LOCK),
     marked_prepare_gc_ts_(0)
 {
+  MEMSET(group_cpu_time_us_, 0, sizeof(group_cpu_time_us_));
 }
 #undef CONSTRUCT_MEMBER
 
@@ -351,20 +353,37 @@ ObCgroupCtrl *ObTenantBase::get_cgroup()
 
 int ObTenantBase::pre_run()
 {
+  ObTimeGuard timeguard("tenant_pre_run", 10 * 1000);
   int ret = OB_SUCCESS;
   ObTenantEnv::set_tenant(this);
+  ob_get_origin_tenant_id() = this->id();
   {
     ThreadListNode *node = lib::Thread::current().get_thread_list_node();
+    ThreadListNode *group_node  = lib::Thread::current().get_group_thread_list_node();
+    uint64_t thread_group_id = lib::Thread::current().get_thread_group_id();
+    ThreadList *group_thread_list = NULL;
+    if (OB_INVALID_GROUP_ID != thread_group_id && thread_group_id < OB_TENANT_THREAD_GROUP_MAXNUM) {
+      group_thread_list = &group_thread_list_array_[thread_group_id];
+    }
     lib::ObMutexGuard guard(thread_list_lock_);
     if (!thread_list_.add_last(node)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_ERROR("add to thread list fail", K(ret));
+    } else {
+      if (NULL != group_thread_list) {
+        if (!group_thread_list->add_last(group_node)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_ERROR("add to group thread list fail", K(thread_group_id), K(ret));
+        }
+      }
     }
   }
+  timeguard.click("add_to_thread_list");
   ATOMIC_INC(&thread_count_);
   if (GCONF._enable_numa_aware && OB_NUMA_SHARED_INDEX == AFFINITY_CTRL.get_tls_node()) {
     AFFINITY_CTRL.thread_bind_to_node(thread_count_);
   }
+  timeguard.click("bind_numa_node");
   // register in tenant cgroup without modifying group_id
   ObCgroupCtrl *cgroup_ctrl = get_cgroup();
   if (OB_NOT_NULL(cgroup_ctrl) && cgroup_ctrl->is_valid()) {
@@ -380,9 +399,25 @@ int ObTenantBase::end_run()
 {
   int ret = OB_SUCCESS;
   ObTenantEnv::set_tenant(nullptr);
+  ob_get_origin_tenant_id() = 0;
   {
     ThreadListNode *node = lib::Thread::current().get_thread_list_node();
+    ThreadListNode *group_node  = lib::Thread::current().get_group_thread_list_node();
+    uint64_t thread_group_id = lib::Thread::current().get_thread_group_id();
+    ThreadList *group_thread_list = NULL;
+    if (OB_INVALID_GROUP_ID != thread_group_id && thread_group_id < OB_TENANT_THREAD_GROUP_MAXNUM) {
+      group_thread_list = &group_thread_list_array_[thread_group_id];
+    }
     lib::ObMutexGuard guard(thread_list_lock_);
+
+    if (NULL != group_thread_list) {
+      int64_t inc = 0;
+      lib::Thread *thread = node->get_data();
+      if (OB_SUCC(thread->get_group_cpu_time_inc(inc))) {
+        IGNORE_RETURN ATOMIC_FAA(&group_cpu_time_us_[thread_group_id], inc);
+      }
+      group_thread_list->remove(group_node);
+    }
     thread_list_.remove(node);
   }
   ATOMIC_DEC(&thread_count_);
@@ -623,6 +658,37 @@ void ObTenantSwitchGuard::release()
 
     reset();
   }
+}
+
+int ObTenantSimpleGuard::get_tenant_base(uint64_t tenant_id, ObTenantBase *&tenant_base)
+{
+  int ret = OB_SUCCESS;
+
+  if (!common::is_valid_tenant_id(tenant_id)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("invalid tenant id to get", K(ret), K(tenant_id));
+  } else if (tenant_id == MTL_ID()) {
+    tenant_base = ObTenantEnv::get_tenant();
+  } else if (is_virtual_tenant_id(tenant_id)) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_ERROR("can't get virtual tenant", K(ret), K(tenant_id));
+  } else if (OB_FAIL(get_tenant_base_with_lock(tenant_id, lock_handle_, tenant_base, release_cb_))) {
+    if (ret == OB_IN_STOP_STATE) {
+      ret = OB_TENANT_NOT_IN_SERVER;
+    }
+    LOG_WARN("get tenant base fail", K(tenant_id), K(ret), K(lbt()));
+  }
+
+  return ret;
+}
+
+void ObTenantSimpleGuard::release()
+{
+  if (release_cb_ != nullptr) {
+    release_cb_(lock_handle_);
+    release_cb_ = nullptr;
+  }
+  reset();
 }
 
 } // end of namespace share

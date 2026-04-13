@@ -15,16 +15,20 @@
 
 #include "ob_log_plan.h"
 #include "ob_log_del_upd.h"
+#include "sql/optimizer/ob_log_optimizer_stats_gathering.h"
 
 namespace oceanbase
 {
 namespace sql
 {
+class ObLogStatCollector;
 class ObDelUpdLogPlan: public ObLogPlan
 {
 public:
   ObDelUpdLogPlan(ObOptimizerContext &ctx, const ObDelUpdStmt *del_upd_stmt)
       : ObLogPlan(ctx, del_upd_stmt),
+        index_dml_infos_(allocator_),
+        extra_dependency_tables_(allocator_),
         max_dml_parallel_(ObGlobalHint::UNSET_PARALLEL),
         use_pdml_(false),
         use_parallel_das_dml_(false)
@@ -177,11 +181,6 @@ public:
                                   ObTablePartitionInfo *table_location,
                                   IndexDMLInfo *index_dml_info);
 
-  int check_need_exchange_for_pdml_del_upd(ObLogicalOperator *top,
-                                           const ObExchangeInfo &exch_info,
-                                           uint64_t table_id,
-                                           bool &need_exchange);
-
   int create_index_dml_info(const IndexDMLInfo &orgi_dml_info,
                             IndexDMLInfo *&opt_dml_info);
   //split update index dml info with delete and insert
@@ -223,7 +222,7 @@ public:
                                   ObIArray<ObColumnRefRawExpr*> &column_exprs,
                                   bool need_spk);
 
-  int check_index_update(ObAssignments assigns,
+  int check_index_update(const ObAssignments &assigns,
                          const ObTableSchema& index_schema,
                          const bool is_update_view,
                          bool& need_update);
@@ -237,7 +236,12 @@ public:
                                 IndexDMLInfo*& index_dml_info) const;
   int check_update_part_key(const ObTableSchema* index_schema,
                             IndexDMLInfo*& index_dml_info) const;
-  int check_update_primary_key(const ObTableSchema* index_schema,
+  int check_vec_hnsw_index_vid_opt(ObSchemaGetterGuard &schema_guard,
+                                   const ObDelUpdStmt *stmt,
+                                   const ObTableSchema* index_schema,
+                                   IndexDMLInfo*& index_dml_info) const;
+  int check_update_primary_key(ObSchemaGetterGuard &schema_guard,
+                               const ObTableSchema* index_schema,
                                IndexDMLInfo*& index_dml_info) const;
   int allocate_link_dml_as_top(ObLogicalOperator *&old_top);
   bool use_pdml() const { return use_pdml_; }
@@ -262,15 +266,25 @@ protected:
   int candi_allocate_subplan_filter_for_assignments(ObIArray<ObRawExpr*> &assign_exprs);
   int extract_assignment_subqueries(ObRawExpr *expr,
                                     ObIArray<ObRawExpr*> &normal_query_refs,
-                                    ObIArray<ObRawExpr*> &alias_query_refs);
+                                    ObIArray<ObRawExpr*> &alias_query_refs,
+                                    ObIArray<ObAliasRefRawExpr*> &project_ref_exprs);
+  int check_pdml_interval_partition_supported(const uint64_t ref_table_id) const;
   int check_use_direct_load();
+  int check_basic_sharding_for_dml_stmt(ObShardingInfo &target_sharding,
+                                        ObLogicalOperator &child,
+                                        bool &is_basic);
 private:
   int get_parallel_info_from_direct_load(int64_t &dml_parallel) const;
+  int check_dml_table_write_dependency(const uint64_t table_id, const ObTableSchema &index_schema) const;
+  int prepare_inverted_sort_keys(ObLogStatCollector &stat_collector);
+  int build_rowkey_sort_keys_from_schema(const ObTableSchema &index_schema,
+                                         const ObInsertStmt &insert_stmt,
+                                         ObIArray<OrderItem> &sort_keys);
   DISALLOW_COPY_AND_ASSIGN(ObDelUpdLogPlan);
 
 protected:
-  ObSEArray<IndexDMLInfo *, 1, common::ModulePageAllocator, true> index_dml_infos_;
-  ObSEArray<share::schema::ObSchemaObjVersion, 4, common::ModulePageAllocator, true> extra_dependency_tables_;
+  ObSqlArray<IndexDMLInfo *> index_dml_infos_;
+  ObSqlArray<share::schema::ObSchemaObjVersion> extra_dependency_tables_;
   int64_t max_dml_parallel_;
   int64_t use_pdml_;
   bool use_parallel_das_dml_;

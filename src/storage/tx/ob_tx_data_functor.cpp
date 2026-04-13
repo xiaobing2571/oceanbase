@@ -10,10 +10,13 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "ob_tx_data_functor.h"
+#include "storage/tx/ob_tx_data_functor.h"
+#include "storage/memtable/mvcc/ob_mvcc_row.h"
 #include "storage/tx/ob_trans_service.h"
 #include "observer/virtual_table/ob_all_virtual_tx_data.h"
 #include "storage/high_availability/ob_tablet_group_restore.h"
+#include "storage/memtable/mvcc/ob_mvcc_row.h"
+#include "storage/tx_storage/ob_ls_service.h"
 
 namespace oceanbase
 {
@@ -368,9 +371,23 @@ bool LockForReadFunctor::recheck()
   return recheck_op_();
 }
 
+OB_INLINE
+void LockForReadFunctor::lock_for_read_end_(const uint64_t lock_start_time,
+                                            const int ret) const
+{
+  const uint64_t lock_use_time = rdtsc() - lock_start_time;
+  EVENT_ADD(MEMSTORE_WAIT_READ_LOCK_TIME, lock_use_time);
+  if (memtable::is_mvcc_lock_related_error_(ret)) {
+    EVENT_INC(MEMSTORE_READ_LOCK_FAIL_COUNT);
+  } else if (OB_SUCCESS == ret) {
+    EVENT_INC(MEMSTORE_READ_LOCK_SUCC_COUNT);
+  }
+}
+
 int LockForReadFunctor::operator()(const ObTxData &tx_data, ObTxCCCtx *tx_cc_ctx)
 {
   int ret = OB_ERR_SHARED_LOCK_CONFLICT;
+  const int64_t lock_start_time = rdtsc();
   const int64_t MAX_RETRY_CNT = 1000;
   const int64_t MAX_SLEEP_US = 1000;
   memtable::ObMvccAccessCtx &acc_ctx = lock_for_read_arg_.mvcc_acc_ctx_;
@@ -427,6 +444,7 @@ int LockForReadFunctor::operator()(const ObTxData &tx_data, ObTxCCCtx *tx_cc_ctx
     }
   }
 
+  (void)lock_for_read_end_(lock_start_time, ret);
   TRANS_LOG(DEBUG, "lock for read", K(ret), K(tx_data), KPC(tx_cc_ctx), KPC(this));
 
   return ret;

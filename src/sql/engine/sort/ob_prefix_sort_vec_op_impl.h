@@ -29,8 +29,10 @@ class ObPrefixSortVecImpl final : public ObSortVecOpImpl<Compare, Store_Row, has
   using CopyableComparer = typename ObSortVecOpImpl<Compare, Store_Row, has_addon>::CopyableComparer;
 
 public:
-  explicit ObPrefixSortVecImpl(ObMonitorNode &op_monitor_info, lib::MemoryContext &mem_context) :
-    ObSortVecOpImpl<Compare, Store_Row, has_addon>(op_monitor_info, mem_context),
+  explicit ObPrefixSortVecImpl(ObMonitorNode &op_monitor_info,
+                               lib::MemoryContext &mem_context,
+                               ObSqlWorkAreaType profile_type) :
+    ObSortVecOpImpl<Compare, Store_Row, has_addon>(op_monitor_info, mem_context, profile_type),
     full_sk_collations_(nullptr), base_sk_collations_(), prev_row_(nullptr),
     next_prefix_row_(nullptr), child_(nullptr), self_op_(nullptr), sort_row_count_(nullptr),
     selector_(nullptr), selector_size_(0), sort_prefix_rows_(0), prefix_pos_(0),
@@ -58,7 +60,7 @@ protected:
               allocator_, mem_context_, eval_ctx_, cmp_sk_exprs_, sk_exprs_, all_exprs_,
               addon_exprs_, addon_vec_ptrs_, sk_vec_ptrs_, comp_, part_cnt_, topn_cnt_,
               outputted_rows_cnt_, cmp_sort_collations_, exec_ctx_, enable_encode_sortkey_,
-              sk_rows_, addon_rows_, sk_store_, addon_store_, sk_row_meta_, addon_row_meta_);
+              sk_rows_, addon_rows_, store_mgr_);
 
   // fetch rows in same prefix && do sort, set %next_prefix_row_ to nullptr
   // when all child rows are fetched.

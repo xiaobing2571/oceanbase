@@ -34,6 +34,7 @@ static const char *migration_op_type_strs[] = {
     "RESTORE_STANDBY_LS_OP",
     "REBUILD_TABLET_OP",
     "REPLACE_LS_OP",
+    "RESTORE_LS_OP"
 };
 
 const char *ObMigrationOpType::get_str(const TYPE &type)
@@ -63,23 +64,6 @@ ObMigrationOpType::TYPE ObMigrationOpType::get_type(const char *type_str)
   return type;
 }
 
-bool ObMigrationOpType::need_keep_old_tablet(const TYPE &type)
-{
-  int ret = OB_SUCCESS;
-  bool bool_ret = false;
-
-  if (!is_valid(type)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("check need keep old tablet get invaid argument", K(ret), K(type));
-  } else if (ObMigrationOpType::REBUILD_LS_OP == type || ObMigrationOpType::CHANGE_LS_OP == type) {
-    // TODO(yangyi.yyy): fix in 5.0: open this restriction if support tablet link
-    bool_ret = false;
-  } else {
-    bool_ret = false;
-  }
-  return bool_ret;
-}
-
 int ObMigrationOpType::get_ls_wait_status(const TYPE &type, ObMigrationStatus &wait_status)
 {
   int ret = OB_SUCCESS;
@@ -93,9 +77,26 @@ int ObMigrationOpType::get_ls_wait_status(const TYPE &type, ObMigrationStatus &w
     wait_status = ObMigrationStatus::OB_MIGRATION_STATUS_ADD_WAIT;
   } else if (ObMigrationOpType::REBUILD_LS_OP == type) {
     wait_status = ObMigrationStatus::OB_MIGRATION_STATUS_REBUILD_WAIT;
+  } else if (ObMigrationOpType::REPLACE_LS_OP == type) {
+    wait_status = ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE_WAIT;
   } else {
     ret = OB_ERR_UNDEFINED;
     LOG_WARN("type is not valid", K(type));
+  }
+  return ret;
+}
+
+int ObMigrationOpType::get_ls_hold_status(const TYPE &type, ObMigrationStatus &hold_status)
+{
+  int ret = OB_SUCCESS;
+  hold_status = ObMigrationStatus::OB_MIGRATION_STATUS_MAX;
+  if (!is_valid(type)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invaid argument", K(ret), K(type));
+  } else if (ObMigrationOpType::REPLACE_LS_OP == type) {
+    hold_status = ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE_HOLD;
+  } else {
+    hold_status = ObMigrationStatus::OB_MIGRATION_STATUS_HOLD;
   }
   return ret;
 }
@@ -163,6 +164,10 @@ int ObMigrationStatusHelper::trans_migration_op(
       migration_status = OB_MIGRATION_STATUS_RESTORE_STANDBY;
       break;
     }
+    case ObMigrationOpType::REPLACE_LS_OP: {
+      migration_status = OB_MIGRATION_STATUS_REPLACE;
+      break;
+    }
     default: {
       ret = OB_INVALID_ARGUMENT;
       LOG_ERROR("unknown op type", K(ret), K(op_type));
@@ -204,6 +209,14 @@ int ObMigrationStatusHelper::trans_fail_status(const ObMigrationStatus &cur_stat
       fail_status = OB_MIGRATION_STATUS_MIGRATE_FAIL;
       break;
     }
+    case OB_MIGRATION_STATUS_REPLACE: {
+      fail_status = OB_MIGRATION_STATUS_REPLACE_FAIL;
+      break;
+    }
+    case OB_MIGRATION_STATUS_REPLACE_FAIL: {
+      fail_status = OB_MIGRATION_STATUS_REPLACE_FAIL;
+      break;
+    }
     case OB_MIGRATION_STATUS_CHANGE: {
       fail_status = OB_MIGRATION_STATUS_NONE;
       break;
@@ -217,12 +230,20 @@ int ObMigrationStatusHelper::trans_fail_status(const ObMigrationStatus &cur_stat
       fail_status = OB_MIGRATION_STATUS_NONE;
       break;
     }
+    case OB_MIGRATION_STATUS_REPLACE_HOLD: {
+      fail_status = OB_MIGRATION_STATUS_REPLACE_FAIL;
+      break;
+    }
     case OB_MIGRATION_STATUS_MIGRATE_WAIT : {
       fail_status = OB_MIGRATION_STATUS_MIGRATE_FAIL;
       break;
     }
     case OB_MIGRATION_STATUS_ADD_WAIT : {
       fail_status = OB_MIGRATION_STATUS_ADD_FAIL;
+      break;
+    }
+    case OB_MIGRATION_STATUS_REPLACE_WAIT : {
+      fail_status = OB_MIGRATION_STATUS_REPLACE_FAIL;
       break;
     }
     //rebuild and rebuild_wait need use trans_rebuild_fail_status interface
@@ -259,6 +280,11 @@ int ObMigrationStatusHelper::trans_reboot_status(const ObMigrationStatus &cur_st
       reboot_status = OB_MIGRATION_STATUS_MIGRATE_FAIL;
       break;
     }
+    case OB_MIGRATION_STATUS_REPLACE:
+    case OB_MIGRATION_STATUS_REPLACE_FAIL: {
+      reboot_status = OB_MIGRATION_STATUS_REPLACE_FAIL;
+      break;
+    }
     case OB_MIGRATION_STATUS_REBUILD: {
       reboot_status = OB_MIGRATION_STATUS_REBUILD;
       break;
@@ -275,12 +301,20 @@ int ObMigrationStatusHelper::trans_reboot_status(const ObMigrationStatus &cur_st
       reboot_status = OB_MIGRATION_STATUS_NONE;
       break;
     }
+    case OB_MIGRATION_STATUS_REPLACE_HOLD: {
+      reboot_status = OB_MIGRATION_STATUS_REPLACE_HOLD;
+      break;
+    }
     case OB_MIGRATION_STATUS_MIGRATE_WAIT : {
       reboot_status = OB_MIGRATION_STATUS_MIGRATE_FAIL;
       break;
     }
     case OB_MIGRATION_STATUS_ADD_WAIT : {
       reboot_status = OB_MIGRATION_STATUS_ADD_FAIL;
+      break;
+    }
+    case OB_MIGRATION_STATUS_REPLACE_WAIT : {
+      reboot_status = OB_MIGRATION_STATUS_REPLACE_FAIL;
       break;
     }
     case OB_MIGRATION_STATUS_REBUILD_WAIT: {
@@ -373,7 +407,7 @@ int ObMigrationStatusHelper::set_ls_migrate_gc_status_(
     LOG_WARN("failed to set migration status", K(ret));
   } else if (!allow_gc) {
     LOG_INFO("ls is not allow gc", K(ret), K(ls));
-  } else if (OB_FAIL(ls.get_log_handler()->disable_sync())) {
+  } else if (!ls.get_log_handler()->is_in_stop_state() && OB_FAIL(ls.get_log_handler()->disable_sync())) {
     LOG_WARN("failed to disable replay", K(ret));
   }
   return ret;
@@ -381,7 +415,6 @@ int ObMigrationStatusHelper::set_ls_migrate_gc_status_(
 
 int ObMigrationStatusHelper::check_ls_transfer_tablet_(
     const share::ObLSID &ls_id,
-    const ObMigrationStatus &migration_status,
     bool &allow_gc)
 {
   int ret = OB_SUCCESS;
@@ -411,6 +444,8 @@ int ObMigrationStatusHelper::check_ls_transfer_tablet_(
   } else if (OB_FAIL(set_ls_migrate_gc_status_(*ls, allow_gc))) {
     LOG_WARN("failed to set ls gc status", KR(ret));
   } else if (!allow_gc) {
+    //do nothing
+  }  else if (!ObReplicaTypeCheck::is_replica_with_ssstore(ls->get_ls_meta().get_replica_type())) {
     //do nothing
   } else if (OB_FAIL(ls->get_restore_status(restore_status))) {
     LOG_WARN("failed to get restore status", K(ret), KPC(ls));
@@ -503,8 +538,10 @@ int ObMigrationStatusHelper::allow_transfer_src_ls_gc_(
   } else if (ObMigrationStatus::OB_MIGRATION_STATUS_NONE != status
       && ObMigrationStatus::OB_MIGRATION_STATUS_MIGRATE_WAIT != status
       && ObMigrationStatus::OB_MIGRATION_STATUS_ADD_WAIT != status
+      && ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE_WAIT != status
       && ObMigrationStatus::OB_MIGRATION_STATUS_REBUILD_WAIT != status
-      && ObMigrationStatus::OB_MIGRATION_STATUS_HOLD != status) {
+      && ObMigrationStatus::OB_MIGRATION_STATUS_HOLD != status
+      && ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE_HOLD != status) {
     allow_gc = true;
   } else {
     allow_gc = false;
@@ -540,24 +577,27 @@ int ObMigrationStatusHelper::check_ls_allow_gc(
   int ret = OB_SUCCESS;
   allow_gc = false;
   const uint64_t tenant_id = MTL_ID();
-  bool for_compatible = false;
 
   if (!ls_id.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("ls_id is invalid", K(ret), K(ls_id));
-  } else if (check_migration_status_is_fail_(cur_status)) {
+  } else if (check_migration_status_is_fail(cur_status)) {
     allow_gc = true;
-  } else if (OB_FAIL(check_transfer_meta_info_compatible_(for_compatible))) {
-    LOG_WARN("failed to check transfer meta info compatible", K(ret), K(ls_id));
+  // TODO(muwei.ym) check transfer meta info for compatible in 4.4.1
+  //} else if (OB_FAIL(check_transfer_meta_info_compatible_(for_compatible))) {
+  //  LOG_WARN("failed to check transfer meta info compatible", K(ret), K(ls_id));
   } else {
-    if (for_compatible) {
-      if (OB_FAIL(check_ls_transfer_tablet_v1_(ls_id, cur_status, allow_gc))) {
-        LOG_WARN("failed to check ls transfer tablet old", K(ret), K(ls_id));
-      }
+    bool allow_gc_v2 = false;
+    bool allow_gc_v1 = false;
+    if (OB_FAIL(check_ls_transfer_tablet_(ls_id, allow_gc_v2))) {
+      LOG_WARN("failed to check ls transfer tablet", K(ret), K(ls_id));
+    } else if (OB_FAIL(check_ls_transfer_tablet_v1_(ls_id, cur_status, allow_gc_v2, allow_gc_v1))) {
+      LOG_WARN("failed to check ls transfer tablet old", K(ret), K(ls_id));
+    } else if (allow_gc_v2 != allow_gc_v1) {
+      allow_gc = false;
+      FLOG_INFO("transfer check src ls allow gc result not same", K(allow_gc_v2), K(allow_gc_v1), K(ls_id));
     } else {
-      if (OB_FAIL(check_ls_transfer_tablet_(ls_id, cur_status, allow_gc))) {
-        LOG_WARN("failed to check ls transfer tablet", K(ret), K(ls_id));
-      }
+      allow_gc = allow_gc_v2;
     }
   }
   return ret;
@@ -609,12 +649,13 @@ int ObMigrationStatusHelper::check_transfer_meta_info_compatible_(
   return ret;
 }
 
-bool ObMigrationStatusHelper::check_migration_status_is_fail_(const ObMigrationStatus &cur_status)
+bool ObMigrationStatusHelper::check_migration_status_is_fail(const ObMigrationStatus &cur_status)
 {
   bool is_fail = false;
   if (OB_MIGRATION_STATUS_ADD_FAIL == cur_status
       || OB_MIGRATION_STATUS_MIGRATE_FAIL == cur_status
-      || OB_MIGRATION_STATUS_REBUILD_FAIL == cur_status) {
+      || OB_MIGRATION_STATUS_REBUILD_FAIL == cur_status
+      || OB_MIGRATION_STATUS_REPLACE_FAIL == cur_status) {
     is_fail = true;
   }
   return is_fail;
@@ -629,7 +670,7 @@ bool ObMigrationStatusHelper::need_online(const ObMigrationStatus &cur_status)
 bool ObMigrationStatusHelper::check_allow_gc_abandoned_ls(const ObMigrationStatus &cur_status)
 {
   bool allow_gc = false;
-  if (check_migration_status_is_fail_(cur_status)) {
+  if (check_migration_status_is_fail(cur_status)) {
     allow_gc = true;
   } else if (OB_MIGRATION_STATUS_GC == cur_status) {
     allow_gc = true;
@@ -675,6 +716,7 @@ int ObMigrationStatusHelper::check_can_change_status(
     case OB_MIGRATION_STATUS_NONE: {
       if (OB_MIGRATION_STATUS_ADD == change_status
           || OB_MIGRATION_STATUS_MIGRATE == change_status
+          || OB_MIGRATION_STATUS_REPLACE == change_status
           || OB_MIGRATION_STATUS_CHANGE == change_status
           || OB_MIGRATION_STATUS_REBUILD == change_status
           || OB_MIGRATION_STATUS_RESTORE_STANDBY == change_status
@@ -711,6 +753,20 @@ int ObMigrationStatusHelper::check_can_change_status(
       }
       break;
     }
+    case OB_MIGRATION_STATUS_REPLACE: {
+      if (OB_MIGRATION_STATUS_REPLACE == change_status
+          || OB_MIGRATION_STATUS_REPLACE_FAIL == change_status
+          || OB_MIGRATION_STATUS_REPLACE_WAIT == change_status) {
+        can_change = true;
+      }
+      break;
+    }
+    case OB_MIGRATION_STATUS_REPLACE_FAIL: {
+      if (OB_MIGRATION_STATUS_REPLACE_FAIL == change_status) {
+        can_change = true;
+      }
+      break;
+    }
     case OB_MIGRATION_STATUS_REBUILD: {
       if (OB_MIGRATION_STATUS_NONE == change_status
           || OB_MIGRATION_STATUS_REBUILD == change_status
@@ -743,6 +799,14 @@ int ObMigrationStatusHelper::check_can_change_status(
       }
       break;
     }
+    case OB_MIGRATION_STATUS_REPLACE_HOLD: {
+      if (OB_MIGRATION_STATUS_REPLACE_HOLD == change_status
+          || OB_MIGRATION_STATUS_REPLACE_FAIL == change_status
+          || OB_MIGRATION_STATUS_NONE == change_status) {
+        can_change = true;
+      }
+      break;
+    }
     case OB_MIGRATION_STATUS_MIGRATE_WAIT: {
       if (OB_MIGRATION_STATUS_HOLD == change_status
           || OB_MIGRATION_STATUS_MIGRATE_FAIL == change_status) {
@@ -753,6 +817,13 @@ int ObMigrationStatusHelper::check_can_change_status(
     case OB_MIGRATION_STATUS_ADD_WAIT: {
       if (OB_MIGRATION_STATUS_HOLD == change_status
           || OB_MIGRATION_STATUS_ADD_FAIL == change_status) {
+        can_change = true;
+      }
+      break;
+    }
+    case OB_MIGRATION_STATUS_REPLACE_WAIT: {
+      if (OB_MIGRATION_STATUS_REPLACE_HOLD == change_status
+          || OB_MIGRATION_STATUS_REPLACE_FAIL == change_status) {
         can_change = true;
       }
       break;
@@ -780,7 +851,7 @@ int ObMigrationStatusHelper::check_can_change_status(
     }
     default: {
       ret = OB_INVALID_ARGUMENT;
-      LOG_ERROR("invalid cur status for fail", K(ret), K(cur_status));
+      LOG_ERROR("invalid cur status for fail", K(ret), K(cur_status), K(change_status));
     }
     }
   }
@@ -849,6 +920,7 @@ int ObMigrationStatusHelper::check_migration_in_final_state(
       || ObMigrationStatus::OB_MIGRATION_STATUS_ADD_FAIL == status
       || ObMigrationStatus::OB_MIGRATION_STATUS_MIGRATE_FAIL == status
       || ObMigrationStatus::OB_MIGRATION_STATUS_REBUILD_FAIL == status
+      || ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE_FAIL == status
       || ObMigrationStatus::OB_MIGRATION_STATUS_GC == status) {
     in_final_state = true;
   } else {
@@ -860,6 +932,7 @@ int ObMigrationStatusHelper::check_migration_in_final_state(
 int ObMigrationStatusHelper::check_ls_transfer_tablet_v1_(
     const share::ObLSID &ls_id,
     const ObMigrationStatus &migration_status,
+    const bool allow_gc_v2,
     bool &allow_gc)
 {
   int ret = OB_SUCCESS;
@@ -890,12 +963,14 @@ int ObMigrationStatusHelper::check_ls_transfer_tablet_v1_(
     LOG_WARN("failed to set ls gc status", KR(ret));
   } else if (!allow_gc) {
     //do nothing
+  } else if (!ObReplicaTypeCheck::is_replica_with_ssstore(ls->get_ls_meta().get_replica_type())) {
+    //do nothing
   } else if (OB_FAIL(ls->get_restore_status(restore_status))) {
     LOG_WARN("failed to get restore status", K(ret), KPC(ls));
   } else if (restore_status.is_in_restoring()) {
     allow_gc = true;
     LOG_INFO("ls ls in restore status, allow gc", K(ret), K(restore_status), K(ls_id));
-  } else if (OB_FAIL(check_ls_with_transfer_task_v1_(*ls, need_check_allow_gc, need_wait_dest_ls_replay))) {
+  } else if (OB_FAIL(check_ls_with_transfer_task_v1_(*ls, allow_gc_v2, need_check_allow_gc, need_wait_dest_ls_replay))) {
     LOG_WARN("failed to check ls with transfer task", K(ret), KPC(ls));
   } else if (!need_check_allow_gc) {
     allow_gc = false;
@@ -926,7 +1001,7 @@ int ObMigrationStatusHelper::check_ls_transfer_tablet_v1_(
         LOG_WARN("tablet is NULL", KR(ret), K(ls_id));
       } else if (tablet->is_ls_inner_tablet() || tablet->is_empty_shell()) {
         // do nothing
-      } else if (OB_FAIL(tablet->get_latest(user_data,
+      } else if (OB_FAIL(tablet->get_latest_tablet_status(user_data,
           unused_writer, unused_trans_stat, unused_trans_version))) {
         if (OB_EMPTY_RESULT == ret) {
           LOG_INFO("tablet_status is null, ls is allowed to be GC", KR(ret), "tablet_id", tablet->get_tablet_meta().tablet_id_, K(ls_id));
@@ -956,6 +1031,7 @@ int ObMigrationStatusHelper::check_ls_transfer_tablet_v1_(
 
 int ObMigrationStatusHelper::check_ls_with_transfer_task_v1_(
     ObLS &ls,
+    const bool allow_gc_v2,
     bool &need_check_allow_gc,
     bool &need_wait_dest_ls_replay)
 {
@@ -977,7 +1053,7 @@ int ObMigrationStatusHelper::check_ls_with_transfer_task_v1_(
     LOG_WARN("mysql proxy should not be NULL", K(ret), KP(sql_proxy));
   } else if (OB_FAIL(ObStorageHAUtils::check_tenant_will_be_deleted(is_tenant_deleted))) {
     LOG_WARN("failed to check tenant deleted", K(ret), K(ls));
-  } else if (is_tenant_deleted) {
+  } else if (is_tenant_deleted && allow_gc_v2) {
     need_check_allow_gc = true;
     need_wait_dest_ls_replay = false;
     FLOG_INFO("unit wait gc in observer, allow gc", K(tenant_id), K(src_ls_id));
@@ -1058,7 +1134,9 @@ int ObMigrationStatusHelper::check_transfer_dest_ls_status_for_ls_gc_v1_(
       && ObMigrationStatus::OB_MIGRATION_STATUS_MIGRATE_WAIT != dest_ls_status
       && ObMigrationStatus::OB_MIGRATION_STATUS_ADD_WAIT != dest_ls_status
       && ObMigrationStatus::OB_MIGRATION_STATUS_REBUILD_WAIT != dest_ls_status
-      && ObMigrationStatus::OB_MIGRATION_STATUS_HOLD != dest_ls_status) {
+      && ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE_WAIT != dest_ls_status
+      && ObMigrationStatus::OB_MIGRATION_STATUS_HOLD != dest_ls_status
+      && ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE_HOLD != dest_ls_status) {
     allow_gc = true;
     LOG_INFO("transfer dest ls check transfer status passed", K(ret), K(transfer_ls_id), K(dest_ls_status));
   } else if (OB_FAIL(check_transfer_dest_tablet_for_ls_gc_v1_(dest_ls, tablet_id, transfer_scn, need_wait_dest_ls_replay, allow_gc))) {
@@ -1126,10 +1204,16 @@ bool ObMigrationStatusHelper::can_gc_ls_without_check_dependency(
     const ObMigrationStatus &cur_status)
 {
   bool allow_gc = false;
-  if (check_migration_status_is_fail_(cur_status)) {
+  if (check_migration_status_is_fail(cur_status)) {
     allow_gc = true;
   }
   return allow_gc;
+}
+
+bool ObMigrationStatusHelper::can_gc_ls_without_member_verification(
+    const ObMigrationStatus &cur_status)
+{
+  return OB_MIGRATION_STATUS_REPLACE_FAIL == cur_status;
 }
 
 bool ObMigrationStatusHelper::check_can_report_readable_scn(
@@ -1137,12 +1221,36 @@ bool ObMigrationStatusHelper::check_can_report_readable_scn(
 {
   bool can_report = false;
   if (ObMigrationStatus::OB_MIGRATION_STATUS_HOLD == cur_status
+      || ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE_HOLD == cur_status
       || ObMigrationStatus::OB_MIGRATION_STATUS_NONE == cur_status) {
     can_report = true;
   } else {
     can_report = false;
   }
   return can_report;
+}
+
+bool ObMigrationStatusHelper::is_in_rebuild(
+    const ObMigrationStatus &cur_status)
+{
+  bool in_rebuild = false;
+  if (ObMigrationStatus::OB_MIGRATION_STATUS_REBUILD == cur_status
+      || ObMigrationStatus::OB_MIGRATION_STATUS_REBUILD_WAIT == cur_status) {
+    in_rebuild = true;
+  }
+  return in_rebuild;
+}
+
+bool ObMigrationStatusHelper::is_in_replace(
+    const ObMigrationStatus &cur_status)
+{
+  bool in_replace = false;
+  if (ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE == cur_status
+      || ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE_HOLD == cur_status
+      || ObMigrationStatus::OB_MIGRATION_STATUS_REPLACE_WAIT == cur_status) {
+    in_replace = true;
+  }
+  return in_replace;
 }
 
 /******************ObMigrationOpArg*********************/
@@ -1156,7 +1264,8 @@ ObMigrationOpArg::ObMigrationOpArg()
     data_src_(),
     paxos_replica_number_(0),
     prioritize_same_zone_src_(false),
-    tablet_id_array_()
+    tablet_id_array_(),
+    member_list_config_version_()
 {
 }
 
@@ -1167,16 +1276,34 @@ bool ObMigrationOpArg::is_valid() const
       && type_>= 0 && type_ < ObMigrationOpType::MAX_LS_OP
       && cluster_id_ > 0
       && src_.is_valid()
-      && dst_.is_valid()
-      && (paxos_replica_number_ > 0 || ObMigrationOpType::REBUILD_LS_OP == type_)
-      && (ObMigrationOpType::MIGRATE_LS_OP == type_ ?
-         (src_.get_server() != dst_.get_server()) : true);
+      && dst_.is_valid();
+
+  if (b_ret) {
+    if (ObMigrationOpType::REBUILD_LS_OP != type_
+        && ObMigrationOpType::REPLACE_LS_OP != type_
+        && ObMigrationOpType::RESTORE_LS_OP != type_) {
+      b_ret = paxos_replica_number_ > 0;
+    }
+  }
+
+  if (b_ret) {
+    if (ObMigrationOpType::MIGRATE_LS_OP == type_ && src_.get_server() == dst_.get_server()) {
+      b_ret = false;
+    }
+  }
 
   if (b_ret) {
     if (ObMigrationOpType::REBUILD_TABLET_OP == type_ && tablet_id_array_.empty()) {
       b_ret = false;
     }
   }
+
+  if (b_ret) {
+    if (ObMigrationOpType::REPLACE_LS_OP == type_) {
+      b_ret = member_list_config_version_.is_valid();
+    }
+  }
+
   return b_ret;
 }
 
@@ -1192,6 +1319,72 @@ void ObMigrationOpArg::reset()
   paxos_replica_number_ = 0;
   prioritize_same_zone_src_ = false;
   tablet_id_array_.reset();
+  member_list_config_version_.reset();
+}
+
+int ObMigrationOpArg::init(const obrpc::ObLSMigrateReplicaArg &arg)
+{
+  int ret = OB_SUCCESS;
+  if (!arg.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arg", K(ret), K(arg));
+  } else {
+    cluster_id_ = GCONF.cluster_id;
+    src_ = arg.src_;
+    data_src_ = arg.force_data_source_;
+    dst_ = arg.dst_;
+    ls_id_ = arg.ls_id_;
+    priority_ = ObMigrationOpPriority::PRIO_MID;
+    paxos_replica_number_ = arg.paxos_replica_number_;
+    type_ = ObMigrationOpType::MIGRATE_LS_OP;
+    prioritize_same_zone_src_ = arg.prioritize_same_zone_src_;
+#ifdef ERRSIM
+    prioritize_same_zone_src_ = GCONF.enable_parallel_migration;
+#endif
+  }
+
+  return ret;
+}
+
+int ObMigrationOpArg::init(const obrpc::ObLSAddReplicaArg &arg)
+{
+  int ret = OB_SUCCESS;
+  if (!arg.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arg", K(ret), K(arg));
+  } else {
+    cluster_id_ = GCONF.cluster_id;
+    // for add tasks, the src_ field is useless, but must be valid
+    src_ = arg.dst_;
+    data_src_ = arg.force_data_source_;
+    dst_ = arg.dst_;
+    ls_id_ = arg.ls_id_;
+    priority_ = ObMigrationOpPriority::PRIO_HIGH;
+    paxos_replica_number_ = arg.new_paxos_replica_number_;
+    type_ = ObMigrationOpType::ADD_LS_OP;
+  }
+
+  return ret;
+}
+
+int ObMigrationOpArg::init(const obrpc::ObLSReplaceReplicaArg &arg)
+{
+  int ret = OB_SUCCESS;
+  if (!arg.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arg", K(ret), K(arg));
+  } else {
+    cluster_id_ = GCONF.cluster_id;
+    // for replace tasks, the src_ field is useless, but must be valid
+    src_ = arg.get_dst_member();
+    dst_ = arg.get_dst_member();
+    member_list_config_version_ = arg.get_config_version();
+    ls_id_ = arg.get_ls_id();
+    priority_ = ObMigrationOpPriority::PRIO_HIGH;
+    type_ = ObMigrationOpType::REPLACE_LS_OP;
+  }
+
+  return ret;
 }
 
 /******************ObTabletsTransferArg*********************/
@@ -1363,6 +1556,10 @@ bool ObMigrationUtils::is_need_retry_error(const int err)
     case OB_UNEXPECTED_TABLET_STATUS :
     case OB_TABLET_TRANSFER_SEQ_NOT_MATCH :
     case OB_MIGRATE_TX_DATA_NOT_CONTINUES :
+    case OB_TRANS_CTX_NOT_EXIST:
+    case OB_LS_NOT_IN_LEARNER_LIST:
+    case OB_ALLOCATE_MEMORY_FAILED:
+    case OB_SS_LS_IN_GC_STATUS:
       bret = false;
       break;
     default:
@@ -1438,6 +1635,10 @@ int ObMigrationUtils::get_dag_priority(
         break;
       }
       case ObMigrationOpType::TYPE::REBUILD_LS_OP: {
+        prio = ObDagPrio::DAG_PRIO_HA_HIGH;
+        break;
+      }
+      case ObMigrationOpType::TYPE::REPLACE_LS_OP: {
         prio = ObDagPrio::DAG_PRIO_HA_HIGH;
         break;
       }
@@ -1569,7 +1770,50 @@ int ObCopyMacroRangeInfo::assign(const ObCopyMacroRangeInfo &macro_range_info)
 OB_SERIALIZE_MEMBER(ObCopyMacroRangeInfo,
     start_macro_block_id_, end_macro_block_id_, macro_block_count_, is_leader_restore_, start_macro_block_end_key_);
 
-/******************ObCopyMacroRangeInfo*********************/
+/********************* ObCopyMacroRangeIdInfo *********************/
+ObCopyMacroRangeIdInfo::ObCopyMacroRangeIdInfo()
+  : range_info_(),
+    macro_block_ids_()
+{
+}
+
+ObCopyMacroRangeIdInfo::~ObCopyMacroRangeIdInfo()
+{
+}
+
+bool ObCopyMacroRangeIdInfo::is_valid() const
+{
+  return range_info_.is_valid()
+         && (macro_block_ids_.empty() || macro_block_ids_.count() == range_info_.macro_block_count_);
+}
+
+void ObCopyMacroRangeIdInfo::reset()
+{
+  range_info_.reset();
+  macro_block_ids_.reset();
+}
+
+void ObCopyMacroRangeIdInfo::reuse()
+{
+  range_info_.reuse();
+  macro_block_ids_.reuse();
+}
+
+int ObCopyMacroRangeIdInfo::assign(const ObCopyMacroRangeIdInfo &macro_range_id_info)
+{
+  int ret = OB_SUCCESS;
+  if (!macro_range_id_info.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("copy macro range id info is invalid", K(ret), K(macro_range_id_info));
+  } else if (OB_FAIL(range_info_.assign(macro_range_id_info.range_info_))) {
+    LOG_WARN("failed to assign macro range info", K(ret), K(macro_range_id_info));
+  } else if (OB_FAIL(macro_block_ids_.assign(macro_range_id_info.macro_block_ids_))) {
+    LOG_WARN("failed to assign macro block ids", K(ret), K(macro_range_id_info));
+  }
+  return ret;
+}
+
+/******************ObCopySSTableMacroRangeInfo*********************/
 ObCopySSTableMacroRangeInfo::ObCopySSTableMacroRangeInfo()
   : copy_table_key_(),
     copy_macro_range_array_()
@@ -1870,33 +2114,70 @@ int ObLSRebuildInfo::assign(const ObLSRebuildInfo &info)
 
 OB_SERIALIZE_MEMBER(ObLSRebuildInfo, status_, type_, tablet_id_array_, src_);
 
+/******************ObTabletBackfillType*********************/
+const char *ObTabletBackfillType::get_str(const ObTabletBackfillType &type)
+{
+  const char *str = "UNKNOWN";
+  switch (type.type_) {
+    case BACKFILL_TRANSFER_OUT:
+      str = "BACKFILL_TRANSFER_OUT";
+      break;
+    case BACKFILL_TRANSFER_IN:
+      str = "BACKFILL_TRANSFER_IN";
+      break;
+    default:
+      str = "UNKNOWN";
+      break;
+  }
+  return str;
+}
+
+/******************ObTabletBackfillInfo*********************/
 ObTabletBackfillInfo::ObTabletBackfillInfo()
   : tablet_id_(),
-    is_committed_(false)
-{}
-
-int ObTabletBackfillInfo::init(const common::ObTabletID &tablet_id, bool is_committed)
+    is_committed_(false),
+    is_shared_storage_(false),
+    relative_ls_id_(false),
+    reorganization_scn_(),
+    backfill_scn_(),
+    backfill_type_(),
+    tablet_status_(ObTabletStatus::MAX),
+    src_reorganization_scn_(),
+    transfer_seq_(-1)
 {
-  int ret = OB_SUCCESS;
-  if (!tablet_id.is_valid()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid tablet it", K(ret), K(tablet_id));
-  } else {
-    tablet_id_ = tablet_id;
-    is_committed_ = is_committed;
-  }
-  return ret;
 }
 
 void ObTabletBackfillInfo::reset()
 {
   tablet_id_.reset();
   is_committed_ = false;
+  is_shared_storage_ = false,
+  relative_ls_id_.reset();
+  reorganization_scn_.reset();
+  backfill_scn_.reset();
+  backfill_type_.reset();
+  tablet_status_ = ObTabletStatus::MAX;
+  src_reorganization_scn_.reset();
+  transfer_seq_ = -1;
 }
 
 bool ObTabletBackfillInfo::is_valid() const
 {
-  return tablet_id_.is_valid();
+  bool b_ret = false;
+  if (!relative_ls_id_.is_valid() || !tablet_id_.is_valid() || !reorganization_scn_.is_valid()
+      || !backfill_scn_.is_valid() || !backfill_type_.is_valid() || !tablet_status_.is_valid()
+      || transfer_seq_ < 0) {
+    b_ret = false;
+  } else if (ObTabletBackfillType::BACKFILL_TRANSFER_IN == backfill_type_) {
+    if (!src_reorganization_scn_.is_valid()) {
+      b_ret = false;
+    } else {
+      b_ret = true;
+    }
+  } else {
+    b_ret = true;
+  }
+  return b_ret;
 }
 
 bool ObTabletBackfillInfo::operator == (const ObTabletBackfillInfo &other) const
@@ -1904,13 +2185,43 @@ bool ObTabletBackfillInfo::operator == (const ObTabletBackfillInfo &other) const
   bool is_same = true;
   if (this == &other) {
     // same
-  } else if (tablet_id_ != other.tablet_id_
-      || is_committed_ != other.is_committed_) {
-    is_same = false;
+  } else if (!is_shared_storage_) {
+    if (tablet_id_ != other.tablet_id_
+        || is_committed_ != other.is_committed_) {
+      is_same = false;
+    } else {
+      is_same = true;
+    }
   } else {
-    is_same = true;
+    is_same = relative_ls_id_ == other.relative_ls_id_
+          && tablet_id_ == other.tablet_id_
+          && reorganization_scn_ == other.reorganization_scn_
+          && backfill_scn_ == other.backfill_scn_
+          && backfill_type_ == other.backfill_type_
+          && tablet_status_ == other.tablet_status_
+          && src_reorganization_scn_ == other.src_reorganization_scn_
+          && is_committed_ == other.is_committed_;
   }
   return is_same;
+}
+
+uint64_t ObTabletBackfillInfo::hash() const
+{
+  uint64_t hash_val = 0;
+
+  if (is_shared_storage_) {
+    hash_val = relative_ls_id_.hash();
+    hash_val = common::murmurhash(&tablet_id_, sizeof(tablet_id_), hash_val);
+    hash_val = common::murmurhash(&reorganization_scn_, sizeof(reorganization_scn_), hash_val);
+    hash_val = common::murmurhash(&backfill_scn_, sizeof(backfill_scn_), hash_val);
+    hash_val = common::murmurhash(&backfill_type_, sizeof(backfill_type_), hash_val);
+    hash_val = common::murmurhash(&tablet_status_, sizeof(tablet_status_), hash_val);
+    hash_val = common::murmurhash(&src_reorganization_scn_, sizeof(src_reorganization_scn_), hash_val);
+    hash_val = common::murmurhash(&transfer_seq_, sizeof(transfer_seq_), hash_val);
+  } else {
+    hash_val = common::murmurhash(&tablet_id_, sizeof(tablet_id_), hash_val);
+  }
+  return hash_val;
 }
 
 /******************ObBackfillTabletsTableMgr*********************/
@@ -1983,7 +2294,7 @@ int ObBackfillTabletsTableMgr::ObTabletTableMgr::add_sstable(
     ObStorageMetaHandle sstable_handle;
     if (sstable->is_loaded()) {
       orig_sstable = sstable;
-    } else if (OB_FAIL(ObTabletTableStore::load_sstable(
+    } else if (OB_FAIL(ObCacheSSTableHelper::load_sstable(
         sstable->get_addr(), sstable->is_co_sstable(), sstable_handle))) {
       LOG_WARN("failed to load sstable", K(ret), KPC(sstable));
     } else if (OB_FAIL(sstable_handle.get_sstable(orig_sstable))) {
@@ -2067,7 +2378,7 @@ int ObBackfillTabletsTableMgr::ObTabletTableMgr::get_restore_status(
 
 ObBackfillTabletsTableMgr::ObBackfillTabletsTableMgr()
   : is_inited_(false),
-    lock_(),
+    lock_(common::ObLatchIds::OB_STORAGE_HA_STRUCT_LOCK),
     map_(),
     local_rebuild_seq_(0),
     transfer_start_scn_()
@@ -2362,130 +2673,111 @@ int ObBackfillTabletsTableMgr::get_transfer_scn(share::SCN &transfer_scn)
   return ret;
 }
 
-/******************ObMacroBlcokReuseMgr*********************/
+/******************ObMacroBlcokReuseMgrV2*********************/
 ObMacroBlockReuseMgr::ObMacroBlockReuseMgr()
   : is_inited_(false),
-    reuse_maps_()
+    reuse_map_()
 {
 }
 
 ObMacroBlockReuseMgr::~ObMacroBlockReuseMgr()
 {
-  int ret = OB_SUCCESS;
-  if (OB_FAIL(destroy())) {
-    LOG_ERROR("failed to destroy macro block reuse mgr", K(ret), K_(is_inited));
-  }
 }
 
 int ObMacroBlockReuseMgr::init()
 {
   int ret = OB_SUCCESS;
-  const uint64_t tenant_id = MTL_ID();
-
   if (is_inited_) {
     ret = OB_INIT_TWICE;
     LOG_WARN("macro block reuse mgr init twice", K(ret));
-  } else if (OB_FAIL(reuse_maps_.init("ReuseMaps", tenant_id))) {
-    LOG_WARN("failed to init reuse maps", K(ret), K(tenant_id));
+  } else if (OB_FAIL(reuse_map_.init("ReuseMaps", MTL_ID()))) {
+    LOG_WARN("failed to init reuse map", K(ret));
   } else {
     is_inited_ = true;
-    LOG_INFO("success to init macro block reuse mgr", K(ret), K(reuse_maps_.is_inited()));
+  }
+  return ret;
+}
+
+int ObMacroBlockReuseMgr::add_macro_block_reuse_info(
+  const blocksstable::ObLogicMacroBlockId &logic_id,
+  const blocksstable::MacroBlockId &macro_id,
+  const int64_t &data_checksum)
+{
+  int ret = OB_SUCCESS;
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("macro block reuse mgr do not init", K(ret));
+  } else if (!logic_id.is_valid() || !macro_id.is_valid() || data_checksum < 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("add macro block reuse info get invalid argument", K(ret), K(logic_id), K(macro_id), K(data_checksum));
+  } else {
+    MacroBlockReuseInfo reuse_info(macro_id, data_checksum);
+
+    if (OB_FAIL(reuse_map_.insert(logic_id, reuse_info))) {
+      if (OB_ENTRY_EXIST == ret) {
+        ret = OB_SUCCESS;
+        LOG_INFO("macro block reuse info is already exist, skip add", K(ret), K(logic_id), K(macro_id), K(data_checksum));
+      } else {
+        LOG_WARN("failed to insert reuse info into map", K(ret), K(logic_id), K(macro_id), K(data_checksum));
+      }
+    }
   }
 
-  return OB_SUCCESS;
+  return ret;
+}
+
+int ObMacroBlockReuseMgr::get_macro_block_reuse_info(
+  const blocksstable::ObLogicMacroBlockId &logic_id,
+  blocksstable::MacroBlockId &macro_id,
+  int64_t &data_checksum) const
+{
+  int ret = OB_SUCCESS;
+  MacroBlockReuseInfo reuse_info;
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("macro block reuse mgr do not init", K(ret));
+  } else if (!logic_id.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("get macro block reuse info get invalid argument", K(ret), K(logic_id));
+  } else if (OB_FAIL(reuse_map_.get(logic_id, reuse_info))) {
+    LOG_WARN("failed to get reuse info from map", K(ret), K(logic_id));
+  } else {
+    macro_id = reuse_info.id_;
+    data_checksum = reuse_info.data_checksum_;
+  }
+
+  return ret;
 }
 
 void ObMacroBlockReuseMgr::reset()
 {
   int ret = OB_SUCCESS;
-
-  if (!is_inited_) {
-    LOG_INFO("macro block reuse mgr has not been inited, no need to reset", K_(is_inited));
-  } else {
-    ReuseMaps::BlurredIterator iter(reuse_maps_);
-    ReuseMajorTableKey reuse_key;
-    ReuseMajorTableValue *reuse_value = nullptr;
-
-    // destroy all reuse value
-    while (OB_SUCC(ret)) {
-      if (OB_FAIL(iter.next(reuse_key, reuse_value))) {
-        if (OB_ITER_END == ret) {
-          ret = OB_SUCCESS;
-        } else {
-          LOG_ERROR("failed to get next reuse value, may cause memory leak!", K(ret));
-        }
-        break;
-      } else if (OB_ISNULL(reuse_value)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("reuse value is NULL", K(ret), KP(reuse_value));
-      } else {
-        free_reuse_value_(reuse_value);
-      }
-    }
-  }
-
-  if (OB_SUCC(ret)) {
-    if (OB_FAIL(reuse_maps_.reset())) {
-      LOG_WARN("failed to reset reuse maps", K(ret));
-    }
-  }
-
-  if (OB_FAIL(ret)) {
-    LOG_ERROR("failed to reset macro block reuse mgr, may cause memory leak!!!", K(ret));
+  if (IS_NOT_INIT) {
+    LOG_INFO("macro block reuse mgr do not init, no need to reset");
+  } else if (OB_FAIL(reuse_map_.reset())) {
+    LOG_WARN("failed to reset reuse map", K(ret));
   }
 }
 
-int ObMacroBlockReuseMgr::destroy()
+int64_t ObMacroBlockReuseMgr::get_size() const
 {
-  int ret = OB_SUCCESS;
-
-  if (!is_inited_) {
-    LOG_INFO("macro block reuse mgr has not been inited, no need to destroy", K_(is_inited));
+  int64_t size = 0;
+  int64_t item_size = sizeof(ObLogicMacroBlockId) + sizeof(MacroBlockReuseInfo);
+  if (IS_NOT_INIT) {
+    // skip
+    LOG_INFO("macro block reuse mgr do not init, no need to get capacity");
   } else {
-    reset();
-    if (OB_FAIL(reuse_maps_.destroy())) {
-      LOG_WARN("failed to destroy reuse maps", K(ret));
-    } else {
-      is_inited_ = false;
-    }
+    size = reuse_map_.count() * item_size;
   }
-
-  return ret;
+  return size;
 }
 
-int ObMacroBlockReuseMgr::count(int64_t &count)
+void ObMacroBlockReuseMgr::MacroBlockReuseInfo::reset()
 {
-  int ret = OB_SUCCESS;
-  count = 0;
-
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-  } else {
-    ReuseMaps::BlurredIterator iter(reuse_maps_);
-    ReuseMajorTableKey reuse_key;
-    ReuseMajorTableValue *reuse_value = nullptr;
-    int64_t tmp_count = 0;
-
-    while (OB_SUCC(ret)) {
-      if (OB_FAIL(iter.next(reuse_key, reuse_value))) {
-        if (OB_ITER_END == ret) {
-          ret = OB_SUCCESS;
-        } else {
-          LOG_WARN("failed to get next reuse value", K(ret));
-        }
-        break;
-      } else if (OB_ISNULL(reuse_value)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("reuse value is NULL", K(ret), KP(reuse_value));
-      } else if (OB_FAIL(reuse_value->count(tmp_count))) {
-        LOG_WARN("fail to count item in single reuse map", K(ret), KPC(reuse_value));
-      } else {
-        count += tmp_count;
-      }
-    }
-  }
-
-  return ret;
+  id_.reset();
+  data_checksum_ = -1;
 }
 
 ObLogicTabletID::ObLogicTabletID()
@@ -2573,438 +2865,77 @@ int ObLSMemberListInfo::assign(const ObLSMemberListInfo &info)
   return ret;
 }
 
-int ObMacroBlockReuseMgr::get_macro_block_reuse_info(
-    const ObITable::TableKey &table_key,
-    const blocksstable::ObLogicMacroBlockId &logic_id,
-    blocksstable::MacroBlockId &macro_id,
-    int64_t &data_checksum)
+int ObSSHAMacroCopyUtils::get_dag_priority(const ObSSHAMacroTaskType &task_type, ObDagPrio::ObDagPrioEnum &prio)
 {
   int ret = OB_SUCCESS;
-  ReuseMajorTableKey reuse_key;
-  ReuseMap *reuse_map = nullptr;
-  int64_t snapshot_version = 0;
-  int64_t co_base_snapshot_version = 0;
-  int64_t input_version = 0;
-  MacroBlockReuseInfo reuse_info;
-  macro_id.reset();
-  data_checksum = 0;
-
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("macro block reuse mgr do not init", K(ret));
-  } else if (!table_key.is_valid() || !logic_id.is_valid()) {
+  if (!task_type.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(table_key), K(logic_id));
-  } else if (OB_FAIL(get_reuse_key_(table_key, reuse_key))) {
-    LOG_WARN("failed to get reuse key", K(ret), K(table_key));
-  } else if (OB_FAIL(get_reuse_value_(table_key, reuse_map, snapshot_version, co_base_snapshot_version))) {
-    LOG_WARN("fail to get reuse value", K(ret), K(table_key));
-  } else if (FALSE_IT(input_version = table_key.get_snapshot_version())) {
-  } else if (snapshot_version >= input_version) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("reuse major snapshot version is equal to or greater than input major snapshot version", K(snapshot_version), K(input_version));
-  } else if (OB_FAIL(reuse_map->get(logic_id, reuse_info))) {
-    LOG_WARN("fail to get reuse info in reuse map", K(ret), K(logic_id), K(table_key));
+    LOG_WARN("get invalid argument", K(ret), K(task_type));
   } else {
-    macro_id = reuse_info.id_;
-    data_checksum = reuse_info.data_checksum_;
-  }
-
-  return ret;
-}
-
-int ObMacroBlockReuseMgr::add_macro_block_reuse_info(
-    const ObITable::TableKey &table_key,
-    const blocksstable::ObLogicMacroBlockId &logic_id,
-    const blocksstable::MacroBlockId &macro_id,
-    const int64_t &data_checksum)
-{
-  int ret = OB_SUCCESS;
-  ReuseMajorTableKey reuse_key;
-  ReuseMap *reuse_map = nullptr;
-  MacroBlockReuseInfo reuse_info;
-  int64_t snapshot_version = 0;
-  int64_t input_snapshot_version = 0;
-  int64_t co_base_snapshot_version = 0;
-
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("macro block reuse mgr do not init", K(ret));
-  } else if (!table_key.is_valid() || !logic_id.is_valid() || !macro_id.is_valid()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(table_key), K(logic_id));
-  } else if (OB_FAIL(get_reuse_key_(table_key, reuse_key))) {
-    LOG_WARN("failed to get reuse key", K(ret), K(table_key));
-  } else if (OB_FAIL(get_reuse_value_(table_key, reuse_map, snapshot_version, co_base_snapshot_version))) {
-    LOG_WARN("fail to get reuse value", K(ret), K(table_key));
-  } else if (FALSE_IT(input_snapshot_version = table_key.get_snapshot_version())) {
-  } else if (snapshot_version != input_snapshot_version) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("reuse major snapshot version is not equal to input major snapshot version", K(snapshot_version), K(input_snapshot_version));
-  } else if (FALSE_IT(reuse_info.id_ = macro_id)) {
-  } else if (FALSE_IT(reuse_info.data_checksum_ = data_checksum)) {
-  } else if (OB_FAIL(reuse_map->insert(logic_id, reuse_info))) {
-    LOG_WARN("fail to add reuse info into reuse map", K(ret), K(logic_id), K(table_key));
-  }
-
-  return ret;
-}
-
-int ObMacroBlockReuseMgr::update_single_reuse_map(const ObITable::TableKey &table_key, const storage::ObTabletHandle &tablet_handle, const blocksstable::ObSSTable &sstable)
-{
-  int ret = OB_SUCCESS;
-  ReuseMajorTableKey reuse_key;
-  int64_t max_snapshot_version = 0;
-  int64_t input_snapshot_version = 0;
-  int64_t co_base_snapshot_version = 0;
-  bool need_build = false;
-
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("macro block reuse mgr do not init", K(ret));
-  } else if (!table_key.is_valid() || !tablet_handle.is_valid() || !sstable.is_valid()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(table_key), K(tablet_handle), K(sstable));
-  } else if (OB_FAIL(get_reuse_key_(table_key, reuse_key))) {
-    LOG_WARN("failed to get reuse key", K(ret), K(table_key));
-  } else if (OB_FAIL(get_major_snapshot_version(table_key, max_snapshot_version, co_base_snapshot_version))) {
-    if (OB_ENTRY_NOT_EXIST == ret) {
-      ret = OB_SUCCESS;
-      need_build = true;
-      LOG_INFO("major not in reuse mgr, no need to remove", K(ret), K(need_build), K(table_key));
-    } else {
-      LOG_WARN("failed to get major snapshot version in mgr", K(ret), K(table_key));
-    }
-  } else if (FALSE_IT(input_snapshot_version = table_key.get_snapshot_version())) {
-  } else if (max_snapshot_version >= table_key.get_snapshot_version()) {
-    LOG_INFO("major snapshot version of mgr is equal to or greater than input snapshot version, no need to build", K(need_build), K(max_snapshot_version), K(input_snapshot_version), K(table_key));
-  } else if (OB_FAIL(remove_single_reuse_map_(reuse_key))) {
-    LOG_INFO("failed to remove reuse map", K(ret), K(reuse_key));
-  } else {
-    need_build = true;
-    LOG_INFO("major snapshot version of mgr is less than input snapshot version, remove old reuse map then build", K(need_build), K(max_snapshot_version), K(input_snapshot_version), K(table_key));
-  }
-
-  if (OB_SUCC(ret) && need_build) {
-    LOG_INFO("build reuse map for major sstable", K(ret), K(need_build), K(table_key));
-    if (OB_FAIL(build_single_reuse_map_(table_key, tablet_handle, sstable))) {
-      LOG_WARN("failed to build reuse map", K(ret), K(table_key));
-    } else {
-      LOG_INFO("success to update reuse map", K(ret), K(max_snapshot_version), K(input_snapshot_version), K(table_key));
-    }
-  }
-
-  return ret;
-}
-
-int ObMacroBlockReuseMgr::get_major_snapshot_version(const ObITable::TableKey &table_key, int64_t &snapshot_version, int64_t &co_base_snapshot_version)
-{
-  int ret = OB_SUCCESS;
-  ReuseMap *reuse_map = nullptr;
-  co_base_snapshot_version = 0;
-  snapshot_version = 0;
-
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("macro block reuse mgr do not init", K(ret));
-  } else if (!table_key.is_valid()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid table key", K(ret), K(table_key));
-  } else if (OB_FAIL(get_reuse_value_(table_key, reuse_map, snapshot_version, co_base_snapshot_version))) {
-    LOG_WARN("fail to get reuse value", K(ret), K(table_key));
-  }
-
-  return ret;
-}
-
-ObMacroBlockReuseMgr::MacroBlockReuseInfo::MacroBlockReuseInfo()
-  : id_(),
-    data_checksum_(0)
-{
-}
-
-void ObMacroBlockReuseMgr::MacroBlockReuseInfo::reset()
-{
-  id_.reset();
-  data_checksum_ = 0;
-}
-
-ObMacroBlockReuseMgr::ReuseMajorTableKey::ReuseMajorTableKey()
-  : tablet_id_(0),
-    column_group_idx_(0),
-    table_type_(ObITable::MAX_TABLE_TYPE)
-{
-}
-
-ObMacroBlockReuseMgr::ReuseMajorTableKey::ReuseMajorTableKey(
-    const common::ObTabletID &tablet_id,
-    const uint16_t column_group_idx,
-    const ObITable::TableType table_type)
-  : tablet_id_(tablet_id),
-    column_group_idx_(column_group_idx),
-    table_type_(table_type)
-{
-}
-
-void ObMacroBlockReuseMgr::ReuseMajorTableKey::reset()
-{
-  tablet_id_.reset();
-  column_group_idx_ = 0;
-  table_type_ = ObITable::MAX_TABLE_TYPE;
-}
-
-uint64_t ObMacroBlockReuseMgr::ReuseMajorTableKey::hash() const
-{
-  uint64_t hash_val = 0;
-  hash_val = tablet_id_.hash();
-  hash_val = common::murmurhash(&column_group_idx_, sizeof(column_group_idx_), hash_val);
-  hash_val = common::murmurhash(&table_type_, sizeof(table_type_), hash_val);
-  return hash_val;
-}
-
-bool ObMacroBlockReuseMgr::ReuseMajorTableKey::operator == (const ReuseMajorTableKey &other) const
-{
-  return tablet_id_ == other.tablet_id_ && column_group_idx_ == other.column_group_idx_ && table_type_ == other.table_type_;
-}
-
-ObMacroBlockReuseMgr::ReuseMajorTableValue::ReuseMajorTableValue()
-  : is_inited_(false),
-    snapshot_version_(0),
-    co_base_snapshot_version_(0),
-    reuse_map_()
-{
-}
-
-ObMacroBlockReuseMgr::ReuseMajorTableValue::~ReuseMajorTableValue()
-{
-  if (is_inited_) {
-    reuse_map_.destroy();
-    is_inited_ = false;
-  }
-}
-
-int ObMacroBlockReuseMgr::ReuseMajorTableValue::init(const int64_t &snapshot_version, const int64_t &co_base_snapshot_version)
-{
-  int ret = OB_SUCCESS;
-  const uint64_t tenant_id = MTL_ID();
-
-  if (is_inited_) {
-    ret = OB_INIT_TWICE;
-    LOG_WARN("reuse major table value init twice", K(ret));
-  } else if (snapshot_version < 0 || co_base_snapshot_version < 0) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid snapshot version", K(ret), K(snapshot_version), K(co_base_snapshot_version));
-  } else if (OB_FAIL(reuse_map_.init("ReuseMap", tenant_id))) {
-    LOG_WARN("failed to init reuse map", K(ret), K(tenant_id));
-  } else {
-    snapshot_version_ = snapshot_version;
-    co_base_snapshot_version_ = co_base_snapshot_version;
-    is_inited_ = true;
-  }
-
-  return ret;
-}
-
-int ObMacroBlockReuseMgr::ReuseMajorTableValue::count(int64_t &count)
-{
-  int ret = OB_SUCCESS;
-
-  count = 0;
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-  } else {
-    count = reuse_map_.count();
-  }
-
-  return ret;
-}
-
-int ObMacroBlockReuseMgr::get_reuse_key_(const ObITable::TableKey &table_key, ReuseMajorTableKey &reuse_key)
-{
-  int ret = OB_SUCCESS;
-  reuse_key.reset();
-
-  if (!table_key.is_valid()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid table key",K(ret), K(table_key));
-  } else {
-    reuse_key.tablet_id_ = table_key.tablet_id_;
-    reuse_key.column_group_idx_ = table_key.column_group_idx_;
-    reuse_key.table_type_ = table_key.table_type_;
-  }
-
-  return ret;
-}
-
-int ObMacroBlockReuseMgr::get_reuse_value_(
-    const ObITable::TableKey &table_key,
-    ReuseMap *&reuse_map,
-    int64_t &snapshot_version,
-    int64_t &co_base_snapshot_version)
-{
-  int ret = OB_SUCCESS;
-  ReuseMajorTableKey reuse_key;
-  ReuseMajorTableValue *reuse_value = nullptr;
-  snapshot_version = 0;
-
-  if (OB_FAIL(get_reuse_key_(table_key, reuse_key))) {
-    LOG_WARN("failed to get reuse key", K(ret), K(table_key));
-  } else if (OB_FAIL(reuse_maps_.get(reuse_key, reuse_value))) {
-    LOG_WARN("failed to get reuse value", K(ret), K(reuse_key));
-  } else if (OB_ISNULL(reuse_value)) {
-    ret = OB_ERR_NULL_VALUE;
-    LOG_WARN("reuse value is null", K(ret), KP(reuse_value));
-  } else if (!reuse_value->is_inited_){
-    ret = OB_NOT_INIT;
-    LOG_WARN("reuse value is not inited", K(ret), KPC(reuse_value));
-  } else {
-    reuse_map = &reuse_value->reuse_map_;
-    snapshot_version = reuse_value->snapshot_version_;
-    co_base_snapshot_version = reuse_value->co_base_snapshot_version_;
-  }
-
-  return ret;
-}
-
-int ObMacroBlockReuseMgr::remove_single_reuse_map_(const ReuseMajorTableKey &reuse_key)
-{
-  int ret = OB_SUCCESS;
-  ReuseMajorTableValue *reuse_value = nullptr;
-
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("macro block reuse mgr do not init", K(ret));
-  } else if (OB_FAIL(reuse_maps_.erase(reuse_key, reuse_value))) {
-    LOG_WARN("failed to remove reuse map", K(ret), K(reuse_key));
-  } else if (OB_ISNULL(reuse_value)) {
-    ret = OB_ERR_NULL_VALUE;
-    LOG_WARN("reuse value is null", K(ret), K(reuse_key), KP(reuse_value));
-  } else {
-    free_reuse_value_(reuse_value);
-  }
-
-  return ret;
-}
-
-int ObMacroBlockReuseMgr::build_single_reuse_map_(
-    const ObITable::TableKey &table_key,
-    const storage::ObTabletHandle &tablet_handle,
-    const blocksstable::ObSSTable &sstable)
-{
-  int ret = OB_SUCCESS;
-  ObArenaAllocator allocator;
-  ObDatumRange datum_range;
-  const storage::ObITableReadInfo *index_read_info = nullptr;
-
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("macro block reuse mgr do not init", K(ret));
-  } else if (!table_key.is_valid() || !tablet_handle.is_valid() || !sstable.is_valid()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid arguments", K(ret), K(table_key), K(tablet_handle), K(sstable));
-  } else {
-    SMART_VAR(ObSSTableSecMetaIterator, meta_iter) {
-      if (FALSE_IT(datum_range.set_whole_range())) {
-      } else if (OB_FAIL(tablet_handle.get_obj()->get_sstable_read_info(&sstable, index_read_info))) {
-        LOG_WARN("failed to get index read info ", KR(ret), K(sstable));
-      } else if (OB_FAIL(meta_iter.open(datum_range,
-                    ObMacroBlockMetaType::DATA_BLOCK_META,
-                    sstable,
-                    *index_read_info,
-                    allocator))) {
-        LOG_WARN("failed to open sec meta iterator", K(ret));
-      } else {
-        ObDataMacroBlockMeta data_macro_block_meta;
-        ObLogicMacroBlockId logic_id;
-        MacroBlockId macro_id;
-        ReuseMajorTableKey reuse_key;
-        ReuseMajorTableValue *reuse_value = nullptr;
-        ObSSTableMetaHandle sst_meta_hdl;
-        const ObSSTableMeta *sst_meta = nullptr;
-        int64_t co_base_snapshot_version = 0;
-
-        if (OB_FAIL(get_reuse_key_(table_key, reuse_key))) {
-          LOG_WARN("failed to get reuse key", K(ret), K(table_key));
-        } else if (OB_FAIL(sstable.get_meta(sst_meta_hdl))) {
-          LOG_WARN("failed to get sstable meta handler", K(ret), K(sstable));
-        } else if (OB_FAIL(sst_meta_hdl.get_sstable_meta(sst_meta))) {
-          LOG_WARN("failed to get sstable meta", K(ret), K(sst_meta_hdl));
-        } else if (FALSE_IT(co_base_snapshot_version = sst_meta->get_basic_meta().get_co_base_snapshot_version())) {
-        } else if (OB_FAIL(prepare_reuse_value_(table_key.get_snapshot_version(), co_base_snapshot_version, reuse_value))) {
-          LOG_WARN("failed to init reuse value", K(ret), K(table_key), K(co_base_snapshot_version));
-        } else {
-          while (OB_SUCC(ret)) {
-            data_macro_block_meta.reset();
-            logic_id.reset();
-            if (OB_FAIL(meta_iter.get_next(data_macro_block_meta))) {
-              if (OB_ITER_END == ret) {
-                ret = OB_SUCCESS;
-                break;
-              } else {
-                LOG_WARN("failed to get next", K(ret));
-              }
-            } else {
-              MacroBlockReuseInfo reuse_info;
-              logic_id = data_macro_block_meta.get_logic_id();
-              reuse_info.id_ = data_macro_block_meta.get_macro_id();
-              reuse_info.data_checksum_ = data_macro_block_meta.get_meta_val().data_checksum_;
-
-              if (OB_FAIL(reuse_value->reuse_map_.insert(logic_id, reuse_info))) {
-                LOG_WARN("failed to insert reuse info into reuse map", K(ret), K(logic_id), K(reuse_info), K(table_key));
-              }
-            }
-          }
-
-          if (OB_FAIL(ret)) {
-            LOG_WARN("failed to build reuse value, destory it", K(ret), K(table_key));
-            free_reuse_value_(reuse_value);
-          } else if (OB_FAIL(reuse_maps_.insert(reuse_key, reuse_value))) {
-            LOG_WARN("failed to set reuse map, destroy reuse value", K(ret), K(reuse_key));
-            free_reuse_value_(reuse_value);
-          }
-        }
+    switch (task_type.type_) {
+      case ObSSHAMacroTaskType::Type::BACKUP: {
+        prio = ObDagPrio::DAG_PRIO_HA_LOW;
+        break;
+      }
+      case ObSSHAMacroTaskType::Type::RESTORE: {
+        prio = ObDagPrio::DAG_PRIO_HA_HIGH;
+        break;
+      }
+      default: {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("type not expected", K(ret), K(task_type));
+        break;
       }
     }
   }
-
   return ret;
 }
 
-int ObMacroBlockReuseMgr::prepare_reuse_value_(
-    const int64_t &snapshot_version,
-    const int64_t &co_base_snapshot_version,
-    ReuseMajorTableValue *&reuse_value)
+ObLSMigrationCostStatic::ObLSMigrationCostStatic()
+  : clog_checkpoint_scn_(),
+    tablet_count_(0),
+    create_tablet_cost_(0),
+    migration_dag_net_cost_(0),
+    prewarm_cost_(0),
+    wait_log_sync_cost_(0),
+    wait_log_replay_cost_(0),
+    complete_dag_net_cost_(0),
+    start_ts_(0),
+    finish_ts_(0)
 {
-  int ret = OB_SUCCESS;
-  void *buf = nullptr;
-  ReuseMajorTableValue *tmp_value = nullptr;
-  reuse_value = nullptr;
-
-  if (OB_ISNULL(buf = mtl_malloc(sizeof(ReuseMajorTableValue), "ReuseValue"))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to alloc memory", K(ret), KP(buf));
-  } else if (FALSE_IT(tmp_value = new (buf) ReuseMajorTableValue())) {
-  } else if (OB_FAIL(tmp_value->init(snapshot_version, co_base_snapshot_version))) {
-    LOG_WARN("failed to init reuse value", K(ret), K(snapshot_version), K(co_base_snapshot_version));
-  } else {
-    reuse_value = tmp_value;
-    tmp_value = nullptr;
-  }
-
-  if (OB_NOT_NULL(tmp_value)) {
-    free_reuse_value_(tmp_value);
-  }
-
-  return ret;
 }
 
-void ObMacroBlockReuseMgr::free_reuse_value_(ReuseMajorTableValue *&reuse_value)
+void ObLSMigrationCostStatic::reset()
 {
-  if (OB_NOT_NULL(reuse_value)) {
-    reuse_value->~ReuseMajorTableValue();
-    mtl_free(reuse_value);
-    reuse_value = nullptr;
-  }
+  clog_checkpoint_scn_.reset();
+  tablet_count_ = 0;
+  create_tablet_cost_ = 0;
+  migration_dag_net_cost_ = 0;
+  prewarm_cost_ = 0;
+  wait_log_sync_cost_ = 0;
+  wait_log_replay_cost_ = 0;
+  complete_dag_net_cost_ = 0;
+  start_ts_ = 0;
+  finish_ts_ = 0;
+}
+
+int64_t ObLSMigrationCostStatic::to_string(char *buf, const int64_t buf_len) const
+{
+  int64_t pos = 0;
+  (void)databuff_printf(buf, buf_len, pos,
+                   "{total_cost=%ld,clog_checkpoint_scn=%ld,tablet_count=%ld,create_tablet_cost=%ld,"
+                   "migration_dag_net_cost=%ld,prewarm_cost=%ld,wait_log_sync_cost=%ld,"
+                   "wait_log_replay_cost=%ld,complete_dag_net_cost=%ld}",
+                   finish_ts_ - start_ts_,
+                   clog_checkpoint_scn_.is_valid() ? clog_checkpoint_scn_.get_val_for_tx() : 0,
+                   tablet_count_,
+                   create_tablet_cost_,
+                   migration_dag_net_cost_,
+                   prewarm_cost_,
+                   wait_log_sync_cost_,
+                   wait_log_replay_cost_,
+                   complete_dag_net_cost_);
+  return pos;
 }
 
 }

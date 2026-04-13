@@ -14,10 +14,31 @@
 #define OCEANBASE_SHARED_STORAGE_STORAGE_INCREMENTAL_SSLOG_MOCK_PALF_KV
 
 // #include "close_modules/shared_storage/storage/incremental/sslog/ob_sslog_kv_define.h"
+#include "lib/ob_errno.h"
+#include "lib/oblog/ob_log_module.h"
+#include "storage/incremental/sslog/ob_sslog_kv_define.h"
+#include "src/rootserver/ob_server_zone_op_service.h"
+#include "src/rootserver/ob_disaster_recovery_replace_tenant.h"
+#include "share/ob_master_key_getter.h"
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 namespace oceanbase
 {
+
+#define OB_MOCK_PALF_KV_FOR_REPLACE_SYS_TENANT                                                                                                                                              \
+namespace rootserver {                                                                                                                                                                      \
+  int ObServerZoneOpService::store_data_version_in_palf_kv(const uint64_t tenant_id, const uint64_t data_version) { int ret = OB_SUCCESS; return ret; }                                     \
+  int ObServerZoneOpService::store_server_ids_in_palf_kv(common::ObSEArray<uint64_t, 128> &server_ids, const uint64_t input_max_server_id) { int ret = OB_SUCCESS; return ret; }            \
+  int ObServerZoneOpService::store_max_unit_id_in_palf_kv(const uint64_t max_unit_id) { int ret = OB_SUCCESS; return ret; }                                                                 \
+  int ObServerZoneOpService::generate_new_server_id_from_palf_kv(uint64_t &new_server_id) { int ret = OB_SUCCESS; new_server_id = 1; return ret; }                                          \
+  int ObServerZoneOpService::insert_zone_in_palf_kv(const ObZone &zone) { int ret = OB_SUCCESS; return ret; }                                                                               \
+  int ObServerZoneOpService::store_all_zone_in_palf_kv(const ZoneNameArray &zone_list) { int ret = OB_SUCCESS; return ret; }                                                                \
+  int ObDRReplaceTenant::get_logservice_cluster_id(uint64_t &logservice_cluster_id) { int ret = OB_SUCCESS; logservice_cluster_id = 1; return ret; }                                        \
+}                                                                                                                                                                                           \
+namespace share {                                                                                                                                                                           \
+  int ObMasterKeyUtil::store_sys_root_key_in_palf_kv() { int ret = OB_SUCCESS; return ret; }                                                                                                \
+}                                                                                                                                                                                           \
 
 namespace unittest
 {
@@ -40,7 +61,7 @@ struct VectorHash
 
 class ObMockPalfKV : public sslog::ObPalfKVAdpaterInterface
 {
-private:
+public:
   std::unordered_map<vector<char>, vector<char>, VectorHash> map_;
   int64_t base_gts_;
   ObSpinLock lock_;
@@ -49,10 +70,15 @@ private:
 
  ModulePageAllocator allocator_;
 
+  bool watch_key_errsim_;
+
 public:
   void clear() { map_.clear(); }
 
-  ObMockPalfKV() : map_(), base_gts_(0), lock_(), max_gc_version_(),allocator_() {}
+  ObMockPalfKV() : map_(), base_gts_(0), lock_(common::ObLatchIds::OB_MOCK_PALF_KV_LOCK), max_gc_version_(),allocator_(),watch_key_errsim_(false) {}
+
+  void reset()
+  {}
 
   virtual int init(const uint64_t cluster_id, const uint64_t tenant_id)
   {
@@ -95,7 +121,19 @@ public:
   virtual int set(const common::ObString &key, const common::ObString &value)
   {
     int ret = OB_SUCCESS;
-    ret = OB_NOT_SUPPORTED;
+    vector<char> palf_key;
+    vector<char> palf_new_val;
+    palf_key.resize(key.length());
+    palf_new_val.resize(value.length());
+    memcpy(palf_key.data(), key.ptr(), key.length());
+    memcpy(palf_new_val.data(), value.ptr(), value.length());
+    auto iter = map_.find(palf_key);
+    if (iter == map_.end()) {
+      ret = OB_ENTRY_NOT_EXIST;
+    } else {
+      iter->second.resize(palf_new_val.size());
+      memcpy(iter->second.data(), palf_new_val.data(), palf_new_val.size());
+    }
     return ret;
   }
   virtual int cas(const common::ObString &key,
@@ -136,10 +174,63 @@ public:
 
     return ret;
   }
+
+  virtual int watch_cas(const common::ObString &key,
+                        const common::ObString &watch_key,
+                        const common::ObString &old_value,
+                        const common::ObString &new_value,
+                        bool &expected)
+  {
+    int ret = OB_SUCCESS;
+
+    expected = false;
+
+    vector<char> palf_key;
+    vector<char> palf_old_val;
+    vector<char> palf_new_val;
+    vector<char> watch_key_val;
+    palf_key.resize(key.length());
+    palf_old_val.resize(old_value.length());
+    palf_new_val.resize(new_value.length());
+    watch_key_val.resize(watch_key.length());
+    memcpy(palf_key.data(), key.ptr(), key.length());
+    memcpy(palf_old_val.data(), old_value.ptr(), old_value.length());
+    memcpy(palf_new_val.data(), new_value.ptr(), new_value.length());
+    memcpy(watch_key_val.data(), watch_key.ptr(), watch_key.length());
+
+    auto iter = map_.find(palf_key);
+    auto watch_iter = map_.find(watch_key_val);
+
+    if (watch_iter == map_.end() || watch_key_errsim_) {
+      ret = OB_ENTRY_NOT_EXIST;
+      TRANS_LOG(WARN, "the watch key is not existed", K(ret), K(watch_key));
+    } else if (iter == map_.end()) {
+      ret = OB_ENTRY_NOT_EXIST;
+      TRANS_LOG(WARN, "the palf key is not existed", K(ret), K(key));
+    } else if (iter->second == palf_old_val) {
+      iter->second.resize(palf_new_val.size());
+      memcpy(iter->second.data(), palf_new_val.data(), palf_new_val.size());
+      expected = true;
+    } else {
+      expected = false;
+    }
+
+    return ret;
+  }
+
   virtual int delete_kv(const common::ObString &key)
   {
     int ret = OB_SUCCESS;
-    ret = OB_NOT_SUPPORTED;
+    vector<char> palf_key;
+    palf_key.resize(key.length());
+    memcpy(palf_key.data(), key.ptr(), key.length());
+    auto iter = map_.find(palf_key);
+
+    if (iter == map_.end()) {
+      TRANS_LOG(INFO, "delete key -- no need to delete", K(ret),K(key));
+    } else {
+      map_.erase(iter);
+    }
     return ret;
   }
   virtual int list(const common::ObString &prefix,
@@ -149,6 +240,7 @@ public:
     int ret = OB_SUCCESS;
     auto iter = map_.begin();
     bool prefix_match = false;
+    int64_t id_count = 0;
     while (OB_SUCC(ret) && iter != map_.end()) {
       const vector<char> &key = iter->first;
 
@@ -172,11 +264,13 @@ public:
         ObStringBuffer &val_str = kv_pairs.get_cur_val_buf();
         val_str.append(val.data(), val.size());
         // kv_pairs.push_back({key_str, val_str});
+        TRANS_LOG(INFO, "list match", K(kv_pairs),K(id_count),K(iter->first.size()), K(iter->second.size()));
         if (OB_FAIL(kv_pairs.store_into_cache())) {
           STORAGE_LOG(WARN, "store into sslog kv cache failed", K(ret), K(key_str), K(val_str));
         }
-        TRANS_LOG(INFO, "qc debug2", K(key_str), K(val_str));
       }
+
+      kv_pairs.reuse_cur_buf();
       // ObSSLogKVRowUserKey my_key;
       // ObSSLogKVRowPhysicalKey cur_key;
       // int64_t tmp_pos = 0;
@@ -186,6 +280,7 @@ public:
       // TRANS_LOG(INFO, "qc debug", K(cur_key), K(my_key));
       //
 
+      id_count++;
       iter++;
     }
 
@@ -253,6 +348,96 @@ public:
               K(cur_key), K(cur_val));
   }
 };
+
+class ObMockFirstVersionIterator : public sslog::ObPrefixFirstVersionBaseIterator
+{
+public:
+  ObMockFirstVersionIterator(const uint64_t tenant_id, ObMockPalfKV *palf_kv)
+      : ObPrefixFirstVersionBaseIterator(tenant_id), cache_index_(0), kv_tmp_cache_(tenant_id),
+        mock_palf_kv_(palf_kv)
+  {}
+
+  virtual void reset()
+  {
+    cache_index_ = 0;
+    kv_tmp_cache_.reset();
+    ObPrefixFirstVersionBaseIterator::reset();
+  }
+  virtual int inner_get_next_kv_(ObString &key_buf, ObString &val_buf)
+  {
+    int ret = OB_SUCCESS;
+
+    if (OB_FAIL(ret) || kv_tmp_cache_.count() > 0) {
+      // do nothing
+    } else if (OB_FAIL(mock_palf_kv_->list(common_prefix_, INT32_MAX, kv_tmp_cache_))) {
+      TRANS_LOG(INFO, "list kv failed", K(ret), K(kv_tmp_cache_));
+    }
+
+    if (OB_FAIL(ret)) {
+    } else if (kv_tmp_cache_.count() <= cache_index_) {
+      ret = OB_ITER_END;
+      TRANS_LOG(INFO, "iter the all kv_tmp_cache", K(ret), K(cache_index_), K(kv_tmp_cache_));
+    } else if (OB_FAIL(kv_tmp_cache_.key_at(cache_index_, key_buf))) {
+      TRANS_LOG(WARN, "get key failed", K(ret), K(cache_index_), K(key_buf));
+    } else if (OB_FAIL(kv_tmp_cache_.val_at(cache_index_, val_buf))) {
+      TRANS_LOG(WARN, "get val failed", K(ret), K(cache_index_), K(val_buf));
+    } else {
+      cache_index_++;
+    }
+    return ret;
+  }
+
+private:
+  int64_t cache_index_;
+  ObSSLogKVTempCache kv_tmp_cache_;
+  ObMockPalfKV *mock_palf_kv_;
+};
+
+class ObMockUserKeyAllVersionBaseIterator : public sslog::ObUserKeyAllVersionBaseIterator
+{
+public:
+  ObMockUserKeyAllVersionBaseIterator(const uint64_t tenant_id)
+      : ObUserKeyAllVersionBaseIterator(tenant_id), cache_index_(0), kv_tmp_cache_(tenant_id)
+  {}
+
+  virtual void reset()
+  {
+    cache_index_ = 0;
+    kv_tmp_cache_.reset();
+    sslog::ObUserKeyAllVersionBaseIterator::reset();
+  }
+
+  virtual int inner_get_next_kv_(ObString &key_buf, ObString &val_buf)
+  {
+    int ret = OB_SUCCESS;
+
+    if (OB_FAIL(ret) || kv_tmp_cache_.count() > 0) {
+      // do nothing
+    } else if (OB_FAIL(interface_->list(user_key_buf_, INT32_MAX, kv_tmp_cache_))) {
+      TRANS_LOG(INFO, "list kv failed", K(ret), K(kv_tmp_cache_));
+    }
+
+    if (OB_FAIL(ret)) {
+      // do nothing
+    } else if (kv_tmp_cache_.count() <= cache_index_) {
+      ret = OB_ITER_END;
+      TRANS_LOG(INFO, "iter the all kv_tmp_cache", K(ret), K(cache_index_), K(kv_tmp_cache_));
+    } else if (OB_FAIL(kv_tmp_cache_.key_at(cache_index_, key_buf))) {
+      TRANS_LOG(WARN, "get key failed", K(ret), K(cache_index_), K(key_buf));
+    } else if (OB_FAIL(kv_tmp_cache_.val_at(cache_index_, val_buf))) {
+      TRANS_LOG(WARN, "get val failed", K(ret), K(cache_index_), K(val_buf));
+    } else {
+      cache_index_++;
+    }
+
+    return ret;
+  }
+
+private:
+  int64_t cache_index_;
+  ObSSLogKVTempCache kv_tmp_cache_;
+};
+
 } // namespace unittest
 } // namespace oceanbase
 #endif

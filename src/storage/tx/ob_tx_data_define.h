@@ -140,7 +140,7 @@ private:
   static const int64_t UNIS_VERSION = 1;
 
 public:
-  ObUndoStatusList() : head_(nullptr), undo_node_cnt_(0) {}
+  ObUndoStatusList() : head_(nullptr), undo_node_cnt_(0), lock_(common::ObLatchIds::OB_UNDO_STATUS_NODE_LOCK) {}
   ObUndoStatusList &operator= (const ObUndoStatusList &rhs)
   {
     head_ = rhs.head_;
@@ -292,19 +292,7 @@ public:
     return ref_cnt;
   }
 
-  void dec_ref()
-  {
-#ifdef UNITTEST
-  return;
-#endif
-    if (nullptr == tx_data_allocator_) {
-      STORAGE_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "invalid slice allocator", KPC(this));
-      ob_abort();
-    } else if (0 == ATOMIC_SAF(&ref_cnt_, 1)) {
-      op_guard_.reset();
-      tx_data_allocator_->free(this);
-    }
-  }
+  void dec_ref();
 
   int check_tx_op_exist(share::SCN op_scn, bool &exist);
 
@@ -424,7 +412,7 @@ private:
     bool is_valid_;
     common::SpinRWLock lock_;
 
-    CacheItem() : tx_data_(), is_valid_(false) {}
+    CacheItem() : tx_data_(), is_valid_(false), lock_(common::ObLatchIds::OB_TX_DATA_CACHE_ITEM_LOCK) {}
 
     void reset()
     {

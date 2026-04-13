@@ -20,13 +20,16 @@ namespace oceanbase
 {
 namespace sql
 {
-ObGrantStmt::ObGrantStmt(ObIAllocator *name_pool)
-    : ObDDLStmt(name_pool, stmt::T_GRANT),
+ObGrantStmt::ObGrantStmt(ObIAllocator &allocator)
+    : ObDDLStmt(&allocator, stmt::T_GRANT),
       priv_set_(0),
       grant_level_(OB_PRIV_INVALID_LEVEL),
       database_(),
       table_(),
       tenant_id_(OB_INVALID_ID),
+      grantees_(),
+      users_(),
+      plugins_(),
       masked_sql_(),
       need_create_user_(false),
       need_create_user_priv_(false),
@@ -38,40 +41,13 @@ ObGrantStmt::ObGrantStmt(ObIAllocator *name_pool)
       option_(0),
       sys_priv_array_(),
       obj_priv_array_(),
-      sel_col_ids_(),
-      ins_col_ids_(),
-      upd_col_ids_(),
-      ref_col_ids_(),
+      sel_col_ids_(allocator),
+      ins_col_ids_(allocator),
+      upd_col_ids_(allocator),
+      ref_col_ids_(allocator),
       ref_query_(NULL),
       is_grant_all_tab_priv_(false),
-      table_schema_version_(0)
-{
-}
-
-ObGrantStmt::ObGrantStmt()
-    : ObDDLStmt(NULL, stmt::T_GRANT),
-      priv_set_(0),
-      grant_level_(OB_PRIV_INVALID_LEVEL),
-      database_(),
-      table_(),
-      tenant_id_(OB_INVALID_ID),
-      masked_sql_(),
-      need_create_user_(false),
-      need_create_user_priv_(false),
-      user_name_set_(),
-      role_name_set_(),
-      object_type_(share::schema::ObObjectType::INVALID),
-      object_id_(OB_INVALID_ID),
-      grantor_id_(OB_INVALID_ID),
-      option_(0),
-      sys_priv_array_(),
-      obj_priv_array_(),
-      sel_col_ids_(),
-      ins_col_ids_(),
-      upd_col_ids_(),
-      ref_col_ids_(),
-      ref_query_(NULL),
-      is_grant_all_tab_priv_(false),
+      column_names_priv_(allocator),
       table_schema_version_(0)
 {
 }
@@ -83,7 +59,8 @@ ObGrantStmt::~ObGrantStmt()
 int ObGrantStmt::add_user(const common::ObString &user_name,
                           const common::ObString &host_name,
                           const common::ObString &pwd,
-                          const common::ObString &need_enc)
+                          const common::ObString &need_enc,
+                          const common::ObString &plugin)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(users_.add_string(user_name))) {
@@ -94,6 +71,8 @@ int ObGrantStmt::add_user(const common::ObString &user_name,
     LOG_WARN("failed to add password", K(ret));
   } else if (OB_FAIL(users_.add_string(need_enc))) {
     LOG_WARN("failed to add need enc", K(ret));
+  } else if (OB_FAIL(plugins_.add_string(plugin))) {
+    LOG_WARN("failed to add plugin to plugins array", K(ret));
   } else {
     //do nothing
   }

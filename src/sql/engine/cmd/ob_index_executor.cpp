@@ -21,6 +21,8 @@
 #include "sql/resolver/ddl/ob_flashback_stmt.h"
 #include "observer/ob_server_event_history_table_operator.h"
 #include "storage/ob_partition_pre_split.h"
+#include "share/search_index/ob_search_index_builder_util.h"
+#include "storage/tablet/ob_session_tablet_helper.h"
 
 using namespace oceanbase::common;
 namespace oceanbase
@@ -81,6 +83,8 @@ int ObCreateIndexExecutor::execute(ObExecContext &ctx, ObCreateIndexStmt &stmt)
   } else if (OB_INVALID_ID == create_index_arg.session_id_
              && FALSE_IT(create_index_arg.session_id_ = my_session->get_sessid_for_table())) {
     //impossible
+  } else if (OB_FAIL(storage::ObSessionTabletGCHelper::is_table_has_active_session(tenant_id, create_index_arg.database_name_, create_index_arg.table_name_))) {
+    LOG_WARN("table has active session or error checking", KR(ret), K(tenant_id), K(stmt));
   } else {
     create_index_arg.is_inner_ = my_session->is_inner();
     create_index_arg.parallelism_ = stmt.get_parallelism();
@@ -97,6 +101,7 @@ int ObCreateIndexExecutor::execute(ObExecContext &ctx, ObCreateIndexStmt &stmt)
   }
   if (FAILEDx(GET_MIN_DATA_VERSION(tenant_id, data_version))) {
     LOG_WARN("fail to get data version", KR(ret), K(tenant_id));
+  } else if (FALSE_IT(create_index_arg.data_version_ = data_version)) {
   } else {
     bool is_parallel_ddl = true;
     if (OB_FAIL(ObParallelDDLControlMode::is_parallel_ddl_enable(
@@ -107,7 +112,8 @@ int ObCreateIndexExecutor::execute(ObExecContext &ctx, ObCreateIndexStmt &stmt)
               || data_version < DATA_VERSION_4_2_2_0
               || (data_version >= DATA_VERSION_4_3_0_0 && data_version < DATA_VERSION_4_3_5_0)
               || share::schema::is_fts_or_multivalue_index(create_index_arg.index_type_)
-              || share::schema::is_vec_index(create_index_arg.index_type_)) {
+              || share::schema::is_vec_index(create_index_arg.index_type_)
+              || share::schema::is_search_index(create_index_arg.index_type_)) {
       start_time = ObTimeUtility::current_time();
       if (OB_FAIL(common_rpc_proxy->create_index(create_index_arg, res))) {    //send the signal of creating index to rs
         LOG_WARN("rpc proxy create index failed", K(create_index_arg),
@@ -118,6 +124,7 @@ int ObCreateIndexExecutor::execute(ObExecContext &ctx, ObCreateIndexStmt &stmt)
     } else {
       ObTimeoutCtx ctx;
       start_time = ObTimeUtility::current_time();
+      create_index_arg.is_parallel_ = true;
       const int64_t rpc_timeout = (static_cast<obrpc::ObRpcProxy*>(common_rpc_proxy))->timeout();
       if (OB_FAIL(ctx.set_timeout(rpc_timeout))) {
         LOG_WARN("fail to set timeout ctx", KR(ret));
@@ -135,6 +142,8 @@ int ObCreateIndexExecutor::execute(ObExecContext &ctx, ObCreateIndexStmt &stmt)
   }
   if (FAILEDx(ObResolverUtils::check_sync_ddl_user(my_session, is_sync_ddl_user))) {
     LOG_WARN("Failed to check sync_dll_user", K(ret));
+  } else if (DATA_VERSION_SUPPORT_EMPTY_TABLE_CREATE_INDEX_OPT(data_version)
+          && 0 == res.task_id_) {
   } else if (!is_sys_index && !is_sync_ddl_user) {
     // 只考虑非系统表和非备份恢复时的索引同步检查
     bool build_index_need_retry_at_executor = false;
@@ -148,9 +157,9 @@ int ObCreateIndexExecutor::execute(ObExecContext &ctx, ObCreateIndexStmt &stmt)
         LOG_WARN("index table id is invalid", KR(ret));
       }
     } else if (OB_FAIL(ObDDLExecutorUtil::wait_ddl_finish(create_index_arg.tenant_id_, res.task_id_, res.ddl_need_retry_at_executor_, my_session, common_rpc_proxy))) {
-      LOG_WARN("failed to wait ddl finish", K(ret));
+       LOG_WARN("failed to wait ddl finish", K(ret));
+       }
     }
-  }
   SERVER_EVENT_ADD("ddl", "create index execute finish",
     "tenant_id", MTL_ID(),
     "ret", ret,
@@ -210,7 +219,7 @@ int ObCreateIndexExecutor::set_drop_index_stmt_str(
 int ObCreateIndexExecutor::sync_check_index_status(sql::ObSQLSessionInfo &my_session,
     obrpc::ObCommonRpcProxy &common_rpc_proxy,
     const obrpc::ObCreateIndexArg &create_index_arg,
-    const obrpc::ObAlterTableRes &res,
+    const int64_t ddl_task_id,
     common::ObIAllocator &allocator,
     bool is_update_global_indexes)
 {
@@ -306,8 +315,8 @@ int ObCreateIndexExecutor::sync_check_index_status(sql::ObSQLSessionInfo &my_ses
     }
 
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(ObDDLExecutorUtil::wait_build_index_finish(tenant_id, res.task_id_, is_finish))) {
-      LOG_WARN("wait build index finish failed", K(ret), K(tenant_id), K(res.task_id_));
+    } else if (OB_FAIL(ObDDLExecutorUtil::wait_build_index_finish(tenant_id, ddl_task_id, is_finish))) {
+      LOG_WARN("wait build index finish failed", K(ret), K(tenant_id), K(ddl_task_id));
     } else if (!is_finish) {
       ob_usleep(CHECK_INTERVAL);
       LOG_INFO("index status is not final", K(index_table_id));
@@ -402,7 +411,6 @@ int ObDropIndexExecutor::execute(ObExecContext &ctx, ObDropIndexStmt &stmt)
     LOG_WARN("fail to get first stmt" , K(ret));
   } else {
     tmp_arg.ddl_stmt_str_ = first_stmt;
-
   }
   if (OB_FAIL(ret)) {
   } else if (NULL == my_session) {
@@ -420,9 +428,11 @@ int ObDropIndexExecutor::execute(ObExecContext &ctx, ObDropIndexStmt &stmt)
              && FALSE_IT(tmp_arg.session_id_ = my_session->get_sessid_for_table())) {
     //impossible
   } else if (FALSE_IT(tmp_arg.consumer_group_id_ = THIS_WORKER.get_group_id())) {
+  } else if (OB_FAIL(storage::ObSessionTabletGCHelper::is_table_has_active_session(drop_index_arg.tenant_id_, drop_index_arg.database_name_, drop_index_arg.table_name_))) {
+    LOG_WARN("table has active session or error checking", KR(ret), K(drop_index_arg), K(stmt));
   } else if (OB_FAIL(common_rpc_proxy->drop_index(drop_index_arg, res))) {
     LOG_WARN("rpc proxy drop index failed", "dst", common_rpc_proxy->get_server(), K(ret));
-  } else if (OB_FAIL(wait_drop_index_finish(res.tenant_id_, res.task_id_, *my_session))) {
+  } else if (!drop_index_arg.is_oracle_tmp_table_v2_index_table_ && OB_FAIL(wait_drop_index_finish(res.tenant_id_, res.task_id_, *my_session))) {
     LOG_WARN("wait drop index finish failed", K(ret));
   }
   SERVER_EVENT_ADD("ddl", "drop index execute finish",

@@ -31,7 +31,8 @@ OSDQTaskHandler::OSDQTaskHandler()
     metric_(nullptr),
     file_set_(nullptr),
     storage_info_(nullptr),
-    adapter_()
+    adapter_(),
+    mutex_(common::ObLatchIds::OB_ADMIN_COMMON_LOCK)
 {}
 
 OSDQTaskHandler::~OSDQTaskHandler()
@@ -231,15 +232,15 @@ int OSDQTaskHandler::handle_multipart_write_task_helper_(const OSDQTask *task)
   const int64_t PART_COUNTS = (task->buf_len_ + PART_SIZE - 1) / PART_SIZE;
 
   if (OB_FAIL(adapter_.open_with_access_type(device_handle, fd, storage_info_, task->uri_,
-          access_type, ObStorageIdMod::get_default_id_mod()))) {
+          access_type, ObStorageIdMod::get_default_id_mod(), false/*is_batch_write*/))) {
     OB_LOG(WARN, "failed to open device with access type", KR(ret), KPC(task));
   }
   std::vector<ObIOHandle> io_handles(PART_COUNTS);
   for (int i = 0; i < PART_COUNTS && OB_SUCC(ret); i++) {
     const int64_t START_POS = i * PART_SIZE;
     const int64_t PART_LENGTH = min((i + 1) * PART_SIZE, task->buf_len_) - START_POS;
-    if (FAILEDx(adapter_.async_upload_data(*device_handle, fd, task->buf_, 0/*offset*/,
-          task->buf_len_, io_handles[i]))) {
+    if (FAILEDx(adapter_.async_upload_data(*device_handle, fd, task->buf_ + START_POS, 0/*offset*/,
+          PART_LENGTH, io_handles[i]))) {
       OB_LOG(WARN, "failed to start async upload task!", KR(ret), KPC(task));
     }
   }
@@ -311,9 +312,8 @@ bool OSDQTaskHandler::check_parallel_write_result_(
         OB_LOG(WARN, "parallel append write should succeed when storage type is s3", KR(ret),
           K(op_type1), K(ret1), K(op_type2), K(ret2));
       }
-    } else if (storage_info_->get_type() == ObStorageType::OB_STORAGE_COS
-        || storage_info_->get_type() == ObStorageType::OB_STORAGE_OSS) {
-      // if the storage type is cos or oss, the append write may fail if the append operation is performed
+    } else if (storage_info_->get_type() == ObStorageType::OB_STORAGE_OSS) {
+      // if the storage type is oss, the append write may fail if the append operation is performed
       // after the single or multi-part write operation.
       // but if two parallel operation are both append write operation, they should succeed.
       if (op_type1 == APPEND_WRITE && op_type2 == APPEND_WRITE) {
@@ -641,9 +641,9 @@ int OSDQTaskHandler::handle_write_task(const OSDQTask *task)
       if (OB_UNLIKELY(!check_parallel_write_result_(task->op_type_, ret1, task->parallel_op_type_, ret2))) {
        OSDQLogEntry log;
        log.init("PARALLEL WRITE FAILED", RED_COLOR_PREFIX);
-       log.log_entry(std::string(osdq_op_type_names[task->op_type_])
+       log.log_entry(std::string(OSDQ_OP_TYPE_NAMES[task->op_type_])
            + ": " + std::to_string(ret1) + " " + std::string(ob_error_name(ret1)));
-       log.log_entry(std::string(osdq_op_type_names[task->parallel_op_type_])
+       log.log_entry(std::string(OSDQ_OP_TYPE_NAMES[task->parallel_op_type_])
            + ": " + std::to_string(ret2) + " " + std::string(ob_error_name(ret2)));
        log.print();
       } else {

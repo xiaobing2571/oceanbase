@@ -37,7 +37,7 @@ class ObAllTenantInfoCache
 {
 public:
   ObAllTenantInfoCache()
-     : lock_(),
+     : lock_(common::ObLatchIds::OB_ALL_TENANT_INFO_CACHE_LOCK),
        tenant_info_(),
        last_sql_update_time_(OB_INVALID_TIMESTAMP),
        dump_tenant_info_interval_(DUMP_TENANT_INFO_INTERVAL),
@@ -92,7 +92,7 @@ class ObAllServiceNamesCache
 {
 public:
   ObAllServiceNamesCache()
-    : lock_(),
+    : lock_(common::ObLatchIds::OB_ALL_SERVICE_NAMES_CACHE_LOCK),
       tenant_id_(OB_INVALID_TENANT_ID),
       epoch_(0),
       all_service_names_(),
@@ -172,7 +172,14 @@ public:
 
  /**
   * @description:
-  *    get tenant's global replayable_scn.
+  *    just for logonly replica, return the readable_scn of ObAllTenantInfoCache
+  * @param[out] readable_scn
+  */
+ int get_pure_readable_scn(share::SCN &readable_scn);
+
+ /**
+  * @description:
+  *    get tenant replayable_scn.
   *       for SYS/META tenant: there isn't replayable_scn
   *       for user tenant: get replayable_scn for tenant, which is directly retrieved from
   *                        __all_tenant_info cache
@@ -245,6 +252,7 @@ public:
                               const share::SCN &new_data_version_barrier_scn);
  bool need_refresh(const int64_t refresh_time_interval_us);
  int get_max_ls_id(uint64_t &tenant_id, ObLSID &max_ls_id);
+ int get_switchover_epoch(int64_t &switchover_epoch);
  /**
   * @description:
   *    check if service_status of the given service_name is STOPPED or STOPPING
@@ -264,8 +272,6 @@ public:
   return service_names_cache_.get_service_name(service_name_id, service_name);
  }
 
-
-protected:
  /**
   * @description:
   *    get tenant info
@@ -285,6 +291,7 @@ private:
       const int64_t end_time_us,
       int64_t &last_dump_time_us);
  bool act_as_standby_();
+ int check_server_has_logonly_replica_(const uint64_t tenant_id, bool &has_logonly_replica);
 
 public:
  TO_STRING_KV(K_(is_inited), K_(tenant_id), K_(tenant_info_cache), K_(broadcast_times), K_(rpc_update_times), K_(sql_update_times), K_(last_rpc_update_time_us));

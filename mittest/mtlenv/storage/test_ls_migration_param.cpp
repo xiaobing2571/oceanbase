@@ -249,9 +249,10 @@ TEST_F(TestLSMigrationParam, test_migrate_tablet_param)
   scn.convert_from_ts(ObTimeUtility::current_time());
   ret = src_handle.get_obj()->init_for_first_time_creation(allocator_, src_key.ls_id_, src_key.tablet_id_, src_key.tablet_id_,
       scn, 2022, create_tablet_schema, true/*need_create_empty_major_sstable*/, SCN::invalid_scn()/*clog_checkpoint_scn*/,
-      SCN::invalid_scn()/*mds_checkpoint_scn*/, false/*is_split_dest_tablet*/, ObTabletID()/*split_src_tablet_id*/,
-      true/*micro_index_clustered*/, false/*need_generate_cs_replica_cg_array*/, false/*has_cs_replica*/, ls_handle.get_ls()->get_freezer());
+      SCN::invalid_scn()/*mds_checkpoint_scn*/, share::ObSplitTabletInfo()/*split_info*/,
+      true/*micro_index_clustered*/, false/*need_generate_cs_replica_cg_array*/, false/*has_cs_replica*/, DATA_VERSION_4_3_2_0, ls_handle.get_ls()->get_freezer());
   ASSERT_EQ(common::OB_SUCCESS, ret);
+  src_handle.get_obj()->tablet_meta_.inc_major_snapshot_ = 100;
 
   share::SCN create_commit_scn;
   create_commit_scn = share::SCN::plus(share::SCN::min_scn(), 50);
@@ -273,6 +274,7 @@ TEST_F(TestLSMigrationParam, test_migrate_tablet_param)
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_TRUE(tablet_param.is_valid());
   ASSERT_TRUE(tablet_param.micro_index_clustered_);
+  ASSERT_EQ(100, tablet_param.inc_major_snapshot_);
 
   ObTabletMapKey dst_key;
   dst_key.ls_id_ = TEST_LS_ID;
@@ -294,6 +296,7 @@ TEST_F(TestLSMigrationParam, test_migrate_tablet_param)
   ASSERT_TRUE(dst_meta.is_valid());
   ASSERT_EQ(true, src_meta.micro_index_clustered_);
   ASSERT_EQ(true, dst_meta.micro_index_clustered_);
+  ASSERT_EQ(100, dst_meta.inc_major_snapshot_);
 
   // check create_schema_version_ in tablet meta/migrate param
   ASSERT_TRUE(table_schema.get_schema_version() == src_meta.create_schema_version_);
@@ -335,8 +338,8 @@ TEST_F(TestLSMigrationParam, test_migration_param_compat)
   scn.convert_from_ts(ObTimeUtility::current_time());
   ret = src_handle.get_obj()->init_for_first_time_creation(allocator_, src_key.ls_id_, src_key.tablet_id_, src_key.tablet_id_,
       scn, 2022, create_tablet_schema, true/*need_create_empty_major_sstable*/, SCN::invalid_scn()/*clog_checkpoint_scn*/,
-      SCN::invalid_scn()/*mds_checkpoint_scn*/, false/*is_split_dest_tablet*/, ObTabletID()/*split_src_tablet_id*/,
-      true/*micro_index_clustered*/, false/*need_generate_cs_replica_cg_array*/, false/*has_cs_replica*/, ls_handle.get_ls()->get_freezer());
+      SCN::invalid_scn()/*mds_checkpoint_scn*/, share::ObSplitTabletInfo()/*split_info*/,
+      true/*micro_index_clustered*/, false/*need_generate_cs_replica_cg_array*/, false/*has_cs_replica*/, DATA_VERSION_4_3_2_0, ls_handle.get_ls()->get_freezer());
   ASSERT_EQ(common::OB_SUCCESS, ret);
 
   share::SCN create_commit_scn;

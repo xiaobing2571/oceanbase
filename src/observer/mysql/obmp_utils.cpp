@@ -23,9 +23,38 @@ using namespace share;
 using namespace obmysql;
 using namespace sql;
 
+int ObMPUtils::try_add_changed_package_info(sql::ObSQLSessionInfo &session,
+                                            ObExecContext &exec_ctx)
+{
+  int ret = OB_SUCCESS;
+  if (exec_ctx.need_try_serialize_package_var() &&
+      session.is_track_session_info() &&
+      session.is_package_state_changed()) {
+    LOG_TRACE("++++++++ add changed package info to session! +++++++++++");
+    bool need_reset_exec_ctx = false;
+    if (OB_ISNULL(session.get_cur_exec_ctx())) {
+      session.set_cur_exec_ctx(&exec_ctx);
+      need_reset_exec_ctx = true;
+    }
+    int tmp_ret = session.add_changed_package_info();
+    if (tmp_ret != OB_SUCCESS) {
+      ret = OB_SUCCESS == ret ? tmp_ret : ret;
+      LOG_WARN("failed to add changed package info", K(ret));
+    } else {
+      session.reset_all_package_changed_info();
+      exec_ctx.set_need_try_serialize_package_var(false);
+    }
+    if (need_reset_exec_ctx) {
+      session.set_cur_exec_ctx(nullptr);
+    }
+  }
+  return ret;
+}
+
 int ObMPUtils::add_changed_session_info(OMPKOK &ok_pkt, sql::ObSQLSessionInfo &session)
 {
   int ret = OB_SUCCESS;
+
   if (session.is_session_info_changed()) {
     ok_pkt.set_state_changed(true);
   }
@@ -541,6 +570,7 @@ int ObMPUtils::add_nls_format(OMPKOK &okp, sql::ObSQLSessionInfo &session, const
 int ObMPUtils::add_session_info_on_connect(OMPKOK &okp, sql::ObSQLSessionInfo &session)
 {
   int ret = OB_SUCCESS;
+
   // treat it as state changed
   okp.set_state_changed(true);
 

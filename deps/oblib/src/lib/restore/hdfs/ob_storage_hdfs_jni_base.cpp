@@ -13,7 +13,7 @@
 #include "lib/restore/ob_storage.h"
 #include "ob_storage_hdfs_jni_base.h"
 #include "ob_storage_hdfs_cache.h"
-#include "sql/engine/connector/ob_java_helper.h"
+#include "lib/jni_env/ob_java_helper.h"
 
 #include "lib/utility/ob_print_utils.h"
 #include "lib/utility/ob_tracepoint.h"
@@ -28,7 +28,7 @@ namespace common
 /*--------------------------------ObStorageHdfsBase--------------------------------*/
 ObStorageHdfsBase::ObStorageHdfsBase()
     : is_inited_(false), is_opened_readable_file_(false),
-      is_opened_writable_file_(false), hdfs_read_file_(nullptr),
+      is_opened_writable_file_(false), hdfs_read_file_(nullptr), hdfs_write_file_(nullptr),
       hdfs_client_(nullptr), allocator_(OB_STORAGE_HDFS_ALLOCATOR), namenode_buf_(nullptr),
       path_buf_(nullptr)
 {
@@ -49,13 +49,20 @@ void ObStorageHdfsBase::reset()
     hdfsFS hdfs_fs = hdfs_client_->get_hdfs_fs();
     obHdfsCloseFile(hdfs_fs, hdfs_read_file_);
   }
+  if (is_opened_writable_file_ && OB_NOT_NULL(hdfs_write_file_) &&
+      OB_NOT_NULL(hdfs_client_) && OB_LIKELY(hdfs_client_->is_valid_client()) &&
+      1 == obHdfsFileIsOpenForWrite(hdfs_write_file_)) {
+    int ret = OB_SUCCESS;
+    OB_LOG(TRACE, "reset to close writable file", K(ret));
+    hdfsFS hdfs_fs = hdfs_client_->get_hdfs_fs();
+    obHdfsCloseFile(hdfs_fs, hdfs_write_file_);
+  }
   if (OB_NOT_NULL(hdfs_client_)) {
     hdfs_client_->release();
     hdfs_client_ = nullptr;
   }
-  // TODO(bitao): add writable file to deconstruct
-  if (is_opened_writable_file_) {}
   hdfs_read_file_ = nullptr;
+  hdfs_write_file_ = nullptr;
   is_opened_readable_file_ = false;
   is_opened_writable_file_ = false;
 }
@@ -138,6 +145,7 @@ int ObStorageHdfsBase::get_or_create_read_file(const ObString &uri)
         ret = OB_HDFS_OPEN_FILE_ERROR;
         OB_LOG(WARN, "failed to open hdfs readable file", K(ret), K_(path_buf));
       } else if (0 == obHdfsFileIsOpenForRead(hdfs_read_file_)) {
+        // 1 if the file is opened for read; 0 otherwise
         ret = OB_HDFS_OPEN_FILE_ERROR;
         OB_LOG(WARN, "failed to get the opened hdfs readable file", K(ret), K_(path_buf));
       }
@@ -146,6 +154,39 @@ int ObStorageHdfsBase::get_or_create_read_file(const ObString &uri)
 
   if (OB_SUCC(ret) && !is_opened_readable_file_) {
     is_opened_readable_file_ = true;
+  }
+  return ret;
+}
+
+int ObStorageHdfsBase::get_or_create_write_file(const ObString &uri, const bool is_append)
+{
+  int ret = OB_SUCCESS;
+  if (!is_opened_writable_file_) {
+    OB_LOG(TRACE, "start get or create writable file", K(ret), K(uri), K(path_buf_),
+           KP(hdfs_write_file_));
+    if (OB_ISNULL(hdfs_client_) || OB_LIKELY(!hdfs_client_->is_valid_client())) {
+      ret = OB_HDFS_INVALID_ARGUMENT;
+      OB_LOG(WARN, "hdfs client is not inited", K(ret));
+    } else {
+      OB_LOG(TRACE, "start to open write file", K(ret), K(uri), K(path_buf_));
+      // buffer size is `0` means using default value `4096`.
+      hdfsFS hdfs_fs = hdfs_client_->get_hdfs_fs();
+      // O_WRONLY (meaning create or overwrite i.e., implies O_TRUNCAT)
+      hdfs_write_file_ = obHdfsOpenFile(hdfs_fs, path_buf_, O_WRONLY, 0, 0, 0);
+      if (OB_ISNULL(hdfs_write_file_)) {
+        ret = OB_HDFS_OPEN_FILE_ERROR;
+        char *ex = obHdfsGetLastExceptionRootCause();
+        OB_LOG(WARN, "failed to open hdfs writable file", K(ret), K_(path_buf), K(ex));
+      } else if (0 == obHdfsFileIsOpenForWrite(hdfs_write_file_)) {
+        ret = OB_HDFS_OPEN_FILE_ERROR;
+        char *ex = obHdfsGetLastExceptionRootCause();
+        OB_LOG(WARN, "failed to get the opened hdfs writable file", K(ret), K_(path_buf), K(ex));
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && !is_opened_writable_file_) {
+    is_opened_writable_file_ = true;
   }
   return ret;
 }
@@ -172,9 +213,11 @@ int ObStorageHdfsBase::get_hdfs_file_meta(const ObString &uri, ObStorageObjectMe
       if (file_info->mKind == kObjectKindDirectory) {
         meta.type_ = ObStorageObjectMetaType::OB_FS_DIR;
         meta.length_ = 0;
+        meta.mtime_s_ = file_info->mLastMod;
       } else if (file_info->mKind == kObjectKindFile) {
         meta.type_ = ObStorageObjectMetaType::OB_FS_FILE;
         meta.length_ = file_info->mSize;
+        meta.mtime_s_ = file_info->mLastMod;
       }
       OB_LOG(TRACE, "get file info", K(ret), K(uri), K_(path_buf),
              K(meta.length_), K(meta.is_exist_), K(meta.type_));
@@ -290,6 +333,7 @@ int ObStorageHdfsJniUtil::head_object_meta(const common::ObString &uri,
     obj_meta.type_ = meta.type_;
     if (obj_meta.is_exist_) {
       obj_meta.length_ = meta.length_;
+      obj_meta.mtime_s_ = meta.mtime_s_;
     }
   }
   return ret;
@@ -343,10 +387,16 @@ int ObStorageHdfsJniUtil::batch_del_files(const ObString &uri,
 
 int ObStorageHdfsJniUtil::write_single_file(const common::ObString &uri, const char *buf, const int64_t size)
 {
-  UNUSED(uri);
-  UNUSED(buf);
-  UNUSED(size);
-  int ret = OB_NOT_IMPLEMENT;
+  int ret = OB_SUCCESS;
+  ObExternalIOCounterGuard io_guard;
+  ObStorageHdfsWriter writer;
+  if (OB_FAIL(writer.open(uri, storage_info_))) {
+    OB_LOG(WARN, "fail to open hdfs writer", K(ret), K(uri), KP_(storage_info));
+  } else if (OB_FAIL(writer.write(buf, size))) {
+    OB_LOG(WARN, "fail to write into hdfs", K(ret), K(size), KP(buf));
+  } else if (OB_FAIL(writer.close())) {
+    OB_LOG(WARN, "fail to close hdfs writer", K(ret));
+  }
   return ret;
 }
 
@@ -431,7 +481,7 @@ int ObStorageHdfsJniUtil::list_files(const common::ObString &uri, common::ObBase
           hdfsFileInfo file_info = file_infos[idx];
           if (file_info.mKind == kObjectKindDirectory) {
             // do nothing
-          } else if (op.need_get_file_size()) {
+          } else if (op.need_get_file_meta()) {
             if (OB_UNLIKELY(file_info.mSize < 0)) {
               ret = OB_INVALID_ARGUMENT;
               OB_LOG(WARN, "invalid hdfs file size", K(file_info.mSize),
@@ -586,6 +636,9 @@ int ObStorageHdfsJniUtil::list_directories(
                 static_cast<int64_t>(obj_name_len - uri.length()));
 
             MEMCPY(entry.d_name, file_name.ptr(), file_name.length());
+            ObFileExtraInfo extra_info;
+            extra_info.last_modified_time_ms_ = file_info.mLastMod * 1000;
+            op.set_extra_info(extra_info);
             entry.d_name[file_name.length()] = '\0'; // set str end
             if (OB_FAIL(op.func(&entry))) {
               OB_LOG(WARN, "fail to list hdfs files", K(ret));
@@ -656,7 +709,7 @@ int ObStorageHdfsReader::open(const ObString &uri,
       if (OB_FAIL(get_hdfs_file_meta(uri, meta))) {
         OB_LOG(WARN, "failed to get hdfs object meta", K(ret), K(uri));
       } else if (!meta.is_exist_) {
-        ret = OB_BACKUP_FILE_NOT_EXIST;
+        ret = OB_OBJECT_NOT_EXIST;
         OB_LOG(WARN, "backup file is not exist", K(ret), K(uri));
       } else {
         file_length_ = meta.length_;
@@ -691,13 +744,23 @@ int ObStorageHdfsReader::pread(char *buf,
   } else if (OB_ISNULL(buf) || OB_UNLIKELY(buf_size <= 0 || offset < 0)) {
     ret = OB_INVALID_ARGUMENT;
     OB_LOG(WARN, "invalid arguments", K(ret), KP(buf), K(buf_size), K(offset));
-  } else if (OB_UNLIKELY(offset > file_length_)) {
-    ret = OB_HDFS_INVALID_ARGUMENT;
-    OB_LOG(WARN, "offset exceeds file size", K(ret), K_(file_length), K(offset));
+  } else {
+    get_data_size = buf_size;
+    if (has_meta_) {
+      if (OB_UNLIKELY(offset > file_length_)) {
+        ret = OB_HDFS_INVALID_ARGUMENT;
+        OB_LOG(WARN, "offset exceeds file size", K(ret), K_(file_length), K(offset));
+      } else {
+        get_data_size = MIN(buf_size, file_length_ - offset);
+      }
+    }
   }
+
 
   if (OB_FAIL(ret)) {
     /* do nothing */
+  } else if (get_data_size == 0) {
+    read_size = 0;
   } else {
     hdfsFile readable_file = get_hdfs_read_file();
     hdfsFS fs = get_fs();
@@ -719,19 +782,31 @@ int ObStorageHdfsReader::pread(char *buf,
       int32_t last_bytes_read = 0;
 
       do {
-        last_bytes_read = obHdfsPread(fs, readable_file, temp_offset,
-                                    buf + read_size, buf_size - read_size);
-        OB_LOG(TRACE, "pread stat info in detail", K(ret), K(last_bytes_read),
-               K(read_size), K(temp_offset), K(buf_size));
+        last_bytes_read = obHdfsPread(fs,
+                                      readable_file,
+                                      temp_offset,
+                                      buf + read_size,
+                                      get_data_size - read_size);
+        OB_LOG(TRACE,
+               "pread stat info in detail",
+               K(ret),
+               K(last_bytes_read),
+               K(read_size),
+               K(temp_offset),
+               K(get_data_size));
         if (last_bytes_read == -1) {
           ret = OB_HDFS_READ_FILE_ERROR;
-          OB_LOG(WARN, "failed to position read file", K(ret), K(temp_offset),
-                 K(buf_size), K(read_size));
+          OB_LOG(WARN,
+                 "failed to position read file",
+                 K(ret),
+                 K(temp_offset),
+                 K(get_data_size),
+                 K(read_size));
         } else {
           temp_offset += last_bytes_read;
           read_size += last_bytes_read;
         }
-      } while (last_bytes_read > 0 && OB_SUCC(ret));
+      } while (last_bytes_read > 0 && (get_data_size - read_size) > 0 && OB_SUCC(ret));
     }
   }
   return ret;
@@ -742,6 +817,225 @@ int ObStorageHdfsReader::close()
   int ret = OB_SUCCESS;
   ObExternalIOCounterGuard io_guard;
   reset();
+  return ret;
+}
+
+/*--------------------------------ObStorageHdfsWriter--------------------------------*/
+ObStorageHdfsWriter::ObStorageHdfsWriter()
+  : ObStorageHdfsBase(), is_opened_(false), file_length_(-1)
+{
+}
+
+void ObStorageHdfsWriter::reset()
+{
+  ObStorageHdfsBase::reset();
+  is_opened_ = false;
+  file_length_ = -1;
+}
+
+int ObStorageHdfsWriter::close()
+{
+  int ret = OB_SUCCESS;
+  ObExternalIOCounterGuard io_guard;
+  reset();
+  return ret;
+}
+
+ObStorageHdfsWriter::~ObStorageHdfsWriter()
+{
+  if (is_opened_) {
+    close();
+  }
+}
+
+int ObStorageHdfsWriter::open(
+    const ObString &uri,
+    ObObjectStorageInfo *storage_info)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(is_opened_)) {
+    ret = OB_OBJECT_STORAGE_IO_ERROR;
+    OB_LOG(WARN, "hdfs writer already open, cannot open again", K(ret), K(uri));
+  } else if (OB_FAIL(ObStorageHdfsBase::open(uri, storage_info))) {
+    OB_LOG(WARN, "fail to open in cos_base", K(ret), K(uri));
+  } else {
+    file_length_ = 0;
+  }
+
+  if (OB_FAIL(ret)) {
+    /* do nothing */
+  } else if (OB_FAIL(get_or_create_write_file(uri))) {
+    OB_LOG(WARN, "failed to get writable file", K(ret));
+  } else if (OB_ISNULL(get_hdfs_write_file())) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "get a null writable file", K(ret), K(uri));
+  } else {
+    is_opened_ = true;
+  }
+  return ret;
+}
+
+int ObStorageHdfsWriter::pwrite(const char *buf, const int64_t size, const int64_t offset)
+{
+  int ret = OB_HDFS_NOT_IMPLEMENT;
+  UNUSED(buf);
+  UNUSED(size);
+  UNUSED(offset);
+  return ret;
+}
+
+int ObStorageHdfsWriter::write(const char *buf, const int64_t size)
+{
+  int ret = OB_SUCCESS;
+  ObExternalIOCounterGuard io_guard;
+  if (!is_opened_) {
+    ret = OB_NOT_INIT;
+    OB_LOG(WARN, "hdfs writer not opened", K(ret));
+  } else if (NULL == buf || size < 0) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "buf is NULL or size is invalid", K(ret), KP(buf), K(size));
+  } else {
+    hdfsFile writable_file = get_hdfs_write_file();
+    hdfsFS fs = get_fs();
+    if (OB_ISNULL(writable_file)) {
+      ret = OB_HDFS_INVALID_ARGUMENT;
+      OB_LOG(WARN, "failed to get writable file", K(ret));
+    } else if (0 == obHdfsFileIsOpenForWrite(writable_file)) {
+      // 1 if the file is opened for write; 0 otherwise
+      ret = OB_HDFS_OPEN_FILE_ERROR;
+      OB_LOG(WARN, "failed to get a writable file", K(ret));
+    } else if (OB_ISNULL(fs)) {
+      ret = OB_HDFS_INVALID_ARGUMENT;
+      OB_LOG(WARN, "failed to get file system", K(ret));
+    } else {
+      int64_t written_bytes = obHdfsWrite(fs, writable_file, (void *)buf, size);
+      if (OB_UNLIKELY(-1 == written_bytes)) {
+        ret = OB_HDFS_ERROR;
+        OB_LOG(WARN, "failed to write hdfs file", K(ret));
+      } else if (OB_UNLIKELY(written_bytes != size)) {
+        ret = OB_HDFS_INVALID_ARGUMENT;
+        OB_LOG(WARN, "writen bytes are not equal to expected size", K(ret),
+               K(written_bytes), K(size));
+      } else if (OB_UNLIKELY(-1 == obHdfsFlush(fs, writable_file))) {
+        ret = OB_HDFS_ERROR;
+        OB_LOG(WARN, "failed to flush hdfs file", K(ret));
+      } else {
+        file_length_ += size;
+      }
+    }
+  }
+  return ret;
+}
+
+/*--------------------------------ObStorageHdfsAppendWriter--------------------------------*/
+ObStorageHdfsAppendWriter::ObStorageHdfsAppendWriter()
+  : ObStorageHdfsBase(), is_opened_(false), file_length_(-1), append_times_(0)
+{
+}
+
+void ObStorageHdfsAppendWriter::reset()
+{
+  ObStorageHdfsBase::reset();
+  is_opened_ = false;
+  file_length_ = -1;
+  offset_ = 0;
+  append_times_ = 0;
+}
+
+int ObStorageHdfsAppendWriter::close()
+{
+  int ret = OB_SUCCESS;
+  ObExternalIOCounterGuard io_guard;
+  reset();
+  return ret;
+}
+
+ObStorageHdfsAppendWriter::~ObStorageHdfsAppendWriter()
+{
+  if (is_opened_) {
+    close();
+  }
+}
+
+int ObStorageHdfsAppendWriter::open(
+    const ObString &uri,
+    ObObjectStorageInfo *storage_info)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(is_opened_)) {
+    ret = OB_OBJECT_STORAGE_IO_ERROR;
+    OB_LOG(WARN, "hdfs writer already open, cannot open again", K(ret), K(uri));
+  } else if (OB_FAIL(ObStorageHdfsBase::open(uri, storage_info))) {
+    OB_LOG(WARN, "fail to open in cos_base", K(ret), K(uri));
+  } else {
+    file_length_ = 0;
+  }
+  if (OB_FAIL(ret)) {
+    /* do nothing */
+  } else if (OB_FAIL(get_or_create_write_file(uri, true))) {
+    OB_LOG(WARN, "failed to get writable file", K(ret));
+  } else if (OB_ISNULL(get_hdfs_write_file())) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "get a null writable file", K(ret), K(uri));
+  } else {
+    is_opened_ = true;
+  }
+  return ret;
+}
+
+int ObStorageHdfsAppendWriter::pwrite(const char *buf, const int64_t size, const int64_t offset)
+{
+  int ret = OB_SUCCESS;
+  ObExternalIOCounterGuard io_guard;
+  append_times_ += 1;
+  OB_LOG(TRACE, "hdfs append writer trace", K(ret), K(append_times_));
+
+  if (!is_opened_) {
+    ret = OB_NOT_INIT;
+    OB_LOG(WARN, "hdfs writer not opened", K(ret));
+  } else if (OB_ISNULL(buf) || OB_LIKELY(size <= 0 || offset < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "invalid argument", K(ret), KP(buf), K(size), K(offset));
+  } else {
+    hdfsFile writable_file = get_hdfs_write_file();
+    hdfsFS fs = get_fs();
+    if (OB_ISNULL(writable_file)) {
+      ret = OB_HDFS_INVALID_ARGUMENT;
+      OB_LOG(WARN, "failed to get writable file", K(ret));
+    } else if (0 == obHdfsFileIsOpenForWrite(writable_file)) {
+      // 1 if the file is opened for write; 0 otherwise
+      ret = OB_HDFS_OPEN_FILE_ERROR;
+      OB_LOG(WARN, "failed to get a writable file", K(ret));
+    } else if (OB_ISNULL(fs)) {
+      ret = OB_HDFS_INVALID_ARGUMENT;
+      OB_LOG(WARN, "failed to get file system", K(ret));
+    } else {
+      int64_t written_bytes = obHdfsWrite(fs, writable_file, (void *)buf, size);
+      if (OB_UNLIKELY(-1 == written_bytes)) {
+        ret = OB_HDFS_ERROR;
+        OB_LOG(WARN, "failed to write hdfs file", K(ret));
+      } else if (OB_UNLIKELY(written_bytes != size)) {
+        ret = OB_HDFS_INVALID_ARGUMENT;
+        OB_LOG(WARN, "writen bytes are not equal to expected size", K(ret),
+               K(written_bytes), K(size));
+      } else if (OB_UNLIKELY(-1 == obHdfsFlush(fs, writable_file))) {
+        ret = OB_HDFS_ERROR;
+        OB_LOG(WARN, "failed to flush hdfs file", K(ret));
+      } else {
+        file_length_ += size;
+        offset_ += size;
+        OB_LOG(TRACE, "flush hdfs file", K(ret), K(file_length_), K(offset_), K(size));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObStorageHdfsAppendWriter::write(const char *buf, const int64_t size)
+{
+  int ret = OB_HDFS_NOT_IMPLEMENT;
+  UNUSED(buf);
+  UNUSED(size);
   return ret;
 }
 

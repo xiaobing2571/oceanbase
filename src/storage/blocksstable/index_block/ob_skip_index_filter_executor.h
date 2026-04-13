@@ -16,6 +16,7 @@
 #include "share/schema/ob_table_param.h"
 #include "sql/engine/ob_bit_vector.h"
 #include "sql/engine/basic/ob_pushdown_filter.h"
+//#include "sql/engine/table/ob_external_table_pushdown_filter.h"
 #include "storage/blocksstable/index_block/ob_agg_row_struct.h"
 #include "storage/blocksstable/index_block/ob_index_block_row_struct.h"
 
@@ -40,12 +41,45 @@ struct ObMinMaxFilterParam {
                    : null_count_(null_count), min_datum_(min_datum),
                      max_datum_(max_datum), is_min_prefix_(false),
                      is_max_prefix_(false) {}
+
+  OB_INLINE void set_uncertain()
+  {
+    // reset datum ptr to local buffer and set datum as null (uncertain)
+    null_count_.reuse();
+    min_datum_.reuse();
+    max_datum_.reuse();
+    null_count_.set_null();
+    min_datum_.set_null();
+    max_datum_.set_null();
+  }
+  OB_INLINE bool is_uncertain() const
+  {
+    return null_count_.is_null() && min_datum_.is_null() && max_datum_.is_null();
+  }
+  TO_STRING_KV(K_(null_count), K_(min_datum), K_(max_datum), K_(is_min_prefix), K_(is_max_prefix));
   blocksstable::ObStorageDatum null_count_;
   blocksstable::ObStorageDatum min_datum_;
   blocksstable::ObStorageDatum max_datum_;
   bool is_min_prefix_;
   bool is_max_prefix_;
 };
+
+struct ObSkipIndexCmpRes {
+public:
+  ObSkipIndexCmpRes() : cmp_res_(0), is_certain_(false) {}
+  void reset() { is_certain_ = false; cmp_res_ = 0; }
+  OB_INLINE void set_certain() { is_certain_ = true; }
+  OB_INLINE void set_uncertain() { is_certain_ = false; }
+  OB_INLINE bool is_gt() const { return is_certain_ && cmp_res_ > 0; }
+  OB_INLINE bool is_lt() const { return is_certain_ && cmp_res_ < 0; }
+  OB_INLINE bool is_le() const { return is_certain_ && cmp_res_ <= 0; }
+  OB_INLINE bool is_ge() const { return is_certain_ && cmp_res_ >= 0; }
+  OB_INLINE bool is_eq() const { return is_certain_ && cmp_res_ == 0; }
+  TO_STRING_KV(K_(is_certain), K_(cmp_res));
+  int cmp_res_;
+  bool is_certain_;
+};
+
 class ObAggRowReader;
 class ObSkipIndexFilterExecutor final
 {
@@ -70,32 +104,63 @@ public:
                                   const ObObjMeta &obj_meta,
                                   const ObSkipIndexType index_type,
                                   const ObMicroIndexInfo &index_info,
-                                  sql::ObPhysicalFilterExecutor &filter,
+                                  sql::ObPushdownFilterExecutor &filter,
                                   common::ObIAllocator &allocator,
-                                  const bool use_vectorize);
+                                  const bool use_vectorize,
+                                  const ObITableReadInfo *read_info = nullptr);
   int falsifiable_pushdown_filter(const uint32_t col_idx,
-                                  const ObObjMeta &obj_meta,
+                                  const ObCollationType &cs_type,
                                   const ObSkipIndexType index_type,
                                   const int64_t row_count,
                                   ObMinMaxFilterParam &param,
-                                  sql::ObPhysicalFilterExecutor &filter,
-                                  common::ObIAllocator &allocator,
+                                  sql::ObPushdownFilterExecutor &filter,
                                   const bool use_vectorize);
 
 private:
+  OB_INLINE int fix_and_mock_trans_version_datum(const int64_t col_idx,
+                                                 const ObITableReadInfo *read_info,
+                                                 const ObMicroIndexInfo &index_info,
+                                                 ObMinMaxFilterParam &param);
+
   int filter_on_min_max(const uint32_t col_idx,
                         const uint64_t row_count,
-                        const ObObjMeta &obj_meta,
                         const ObMinMaxFilterParam &param,
                         sql::ObWhiteFilterExecutor &filter,
-                        common::ObIAllocator &allocator);
+                        const ObMicroIndexInfo *index_info = nullptr);
 
   int read_aggregate_data(const uint32_t col_idx,
                    common::ObIAllocator &allocator,
                    const share::schema::ObColumnParam *col_param,
                    const ObObjMeta &obj_meta,
                    const bool is_padding_mode,
-                   ObMinMaxFilterParam &param);
+                   ObMinMaxFilterParam &param,
+                   const ObMicroIndexInfo &index_info,
+                   const ObITableReadInfo *read_info = nullptr);
+
+  int compare_with_prefix(const sql::ObWhiteFilterExecutor &filter,
+                          const common::ObDatum &datum,
+                          const common::ObDatum &filter_datum,
+                          ObSkipIndexCmpRes &res);
+
+  int compare_for_pad_charset(const sql::ObWhiteFilterExecutor &filter,
+                              const common::ObDatum &skip_datum,
+                              const bool is_prefix,
+                              const common::ObDatum &filter_datum,
+                              ObSkipIndexCmpRes &res);
+
+  int compare_for_non_pad_charset(const sql::ObWhiteFilterExecutor &filter,
+                                  const common::ObDatum &skip_datum,
+                                  const bool is_prefix,
+                                  const common::ObDatum &filter_datum,
+                                  ObSkipIndexCmpRes &res);
+
+  int compare(const sql::ObWhiteFilterExecutor &filter,
+              const common::ObDatum &skip_datum,
+              const bool is_prefix,
+              const bool compare_min_value,
+              const common::ObDatum &filter_datum,
+              ObSkipIndexCmpRes &res);
+
   int pad_column(const ObObjMeta &obj_meta,
                  const share::schema::ObColumnParam *col_param,
                  const bool is_padding_mode,
@@ -160,11 +225,10 @@ private:
 
   int black_filter_on_min_max(const uint32_t col_idx,
                               const uint64_t row_count,
-                              const ObObjMeta &obj_meta,
                               ObMinMaxFilterParam &param,
                               sql::ObBlackFilterExecutor &filter,
-                              common::ObIAllocator &allocator,
-                              const bool use_vectorize);
+                              const bool use_vectorize,
+                              const ObCollationType &cs_type);
 private:
   ObAggRowReader agg_row_reader_;
   ObSkipIndexColMeta meta_;

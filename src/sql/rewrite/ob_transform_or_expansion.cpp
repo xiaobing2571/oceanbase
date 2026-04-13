@@ -14,6 +14,7 @@
 #include "sql/rewrite/ob_transform_or_expansion.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_log_table_scan.h"
+#include "sql/optimizer/ob_optimizer_context.h"
 
 namespace oceanbase
 {
@@ -871,6 +872,8 @@ int ObTransformOrExpansion::add_select_item_to_ref_query(ObSelectStmt *stmt,
       } else if (OB_HIDDEN_PK_INCREMENT_COLUMN_ID ==
                  static_cast<ObColumnRefRawExpr*>(expr)->get_column_id()) {
         target_expr = expr;
+      } else if (static_cast<ObColumnRefRawExpr*>(expr)->is_hidden_clustering_key_column()) {
+        target_expr = expr;
       }
     }
     if (OB_SUCC(ret)) {
@@ -1155,7 +1158,7 @@ int ObTransformOrExpansion::adjust_transform_types(uint64_t &transform_types)
 {
   int ret = OB_SUCCESS;
   if (cost_based_trans_tried_) {
-    transform_types &= (~(1 << transformer_type_));
+    transform_types &= (~(1ULL << transformer_type_));
   }
   return ret;
 }
@@ -1257,6 +1260,7 @@ int ObTransformOrExpansion::has_valid_condition(ObDMLStmt &stmt,
 {
   int ret = OB_SUCCESS;
   has_valid = false;
+  bool has_lob = false;
   if (!conds.empty()) {
     ctx.hint_ = static_cast<const ObOrExpandHint*>(get_hint(stmt.get_stmt_hint()));
     bool is_topk = false;
@@ -1264,6 +1268,11 @@ int ObTransformOrExpansion::has_valid_condition(ObDMLStmt &stmt,
     OPT_TRACE("check conditions:", conds);
     if (NULL == expect_ordering) {
       /* do nothing */
+    } else if (OB_FAIL(ObTransformOrExpansion::check_select_expr_has_lob(stmt, has_lob))) {
+      LOG_WARN("failed to check select expr has lob", K(ret));
+    } else if (has_lob) {
+      /* do nothing */
+      OPT_TRACE("stmt has lob, will not try to expand as union distinct");
     } else if (OB_FAIL(StmtUniqueKeyProvider::check_can_set_stmt_unique(&stmt, can_set_distinct))) {
       LOG_WARN("failed to check can set stmt unique", K(ret));
     } else if (!can_set_distinct) {
@@ -1385,11 +1394,20 @@ int ObTransformOrExpansion::check_upd_del_stmt_validity(const ObDelUpdStmt &stmt
   is_valid = true;
   ObQueryCtx *query_ctx = stmt.get_query_ctx();
   ObSEArray<ObDmlTableInfo*, 2> table_infos;
+  bool changed_table_on_null_side = false;
   if (OB_FAIL(const_cast<ObDelUpdStmt&>(stmt).get_dml_table_infos(table_infos))) {
     LOG_WARN("failed to get dml table infos", K(ret));
   } else if (1 != table_infos.count()) {
     is_valid = false;
     OPT_TRACE("multi dml table not support or expansion");
+  } else if (OB_ISNULL(table_infos.at(0))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null table info", K(ret));
+  } else if (OB_FAIL(ObOptimizerUtil::is_table_on_null_side(&stmt, table_infos.at(0)->table_id_, changed_table_on_null_side))) {
+    LOG_WARN("failed to check changed table on null side", K(ret));
+  } else if (changed_table_on_null_side) {
+    is_valid = false;
+    OPT_TRACE("change table on null side, or expansion not supported");
   }
   return ret;
 }
@@ -2877,6 +2895,31 @@ int ObTransformOrExpansion::is_expected_topk_plan(ObLogicalOperator* op,
   return ret;
 }
 
+int ObTransformOrExpansion::build_deduced_index_expr_equal_sets(ObIArray<DeducedExprInfo> &deduced_exprs_info,
+                                                                EqualSets &equal_sets)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObRawExpr*, 4> deduced_exprs;
+  ObSEArray<ObRawExpr*, 4> deduced_from_exprs;
+  for (int64_t i = 0; OB_SUCC(ret) && i < deduced_exprs_info.count(); ++i) {
+    DeducedExprInfo &deduced_expr_info = deduced_exprs_info.at(i);
+    ObSEArray<ObRawExpr*, 2> expr_pair;
+    if (OB_ISNULL(deduced_expr_info.deduced_expr_)
+        || OB_ISNULL(deduced_expr_info.deduced_from_expr_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpect null", K(ret), K(deduced_expr_info.deduced_expr_),
+                                K(deduced_expr_info.deduced_from_expr_));
+    } else if (OB_FAIL(expr_pair.push_back(deduced_expr_info.deduced_expr_))) {
+      LOG_WARN("failed to push back", K(ret));
+    } else if (OB_FAIL(expr_pair.push_back(deduced_expr_info.deduced_from_expr_))) {
+      LOG_WARN("failed to push back", K(ret));
+    } else if (OB_FAIL(ObRawExprSetUtils::add_expr_set(ctx_->allocator_, expr_pair, equal_sets))) {
+      LOG_WARN("failed to add expr set", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObTransformOrExpansion::is_expected_multi_index_plan(ObLogicalOperator* op,
                                                          ObCostBasedRewriteCtx &ctx,
                                                          bool &is_valid)
@@ -2887,10 +2930,18 @@ int ObTransformOrExpansion::is_expected_multi_index_plan(ObLogicalOperator* op,
   ObSEArray<ObRawExpr*, 4> range_exprs;
   ObSEArray<ObRawExpr*, 4> candi_exprs;
   ObSEArray<ObRawExpr*, 4> result_exprs;
-  if (OB_FAIL(get_range_exprs(op, range_exprs))) {
+  TemporaryEqualSets deduced_index_expr_equal_sets;
+  if (OB_ISNULL(op) || OB_ISNULL(op->get_plan())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpect null", K(ret), K(op));
+  } else if (OB_FAIL(get_range_exprs(op, range_exprs))) {
     LOG_WARN("failed to get range exprs", K(ret));
   } else if (range_exprs.empty()) {
     is_valid = false;
+  } else if (OB_FAIL(build_deduced_index_expr_equal_sets(
+                       op->get_plan()->get_optimizer_context().get_deduce_info(),
+                       deduced_index_expr_equal_sets))) {
+    LOG_WARN("failed to build deduce index expr equal sets", K(ret));
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && is_valid && i < N; ++i) {
       candi_exprs.reuse();
@@ -2900,7 +2951,10 @@ int ObTransformOrExpansion::is_expected_multi_index_plan(ObLogicalOperator* op,
       } else if (candi_exprs.empty()) {
         is_valid = false;
         LOG_TRACE("expr is not candi match index expr", K(*ctx.expand_exprs_.at(i)));
-      } else if (OB_FAIL(ObOptimizerUtil::intersect_exprs(candi_exprs, range_exprs, result_exprs))) {
+      } else if (OB_FAIL(ObOptimizerUtil::intersect_exprs(candi_exprs,
+                                                          range_exprs,
+                                                          deduced_index_expr_equal_sets,
+                                                          result_exprs))) {
         LOG_WARN("failed to intersect exprs", K(ret));
       } else if (result_exprs.empty()) {
         is_valid = false;
@@ -3005,9 +3059,7 @@ int ObTransformOrExpansion::check_select_expr_has_lob(ObDMLStmt &stmt, bool &has
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected null expr", K(ret), K(select_items.at(i)));
       } else {
-        has_lob = ObLongTextType == select_expr->get_data_type() ||
-                  ObLobType == select_expr->get_data_type() ||
-                  (is_oracle_mode() && ObJsonType == select_expr->get_data_type());
+        has_lob = ObRawExprUtils::is_invalid_type_for_compare(select_expr->get_result_type());
       }
     }
   } else if (!stmt.is_update_stmt() && !stmt.is_delete_stmt()) {
@@ -3021,9 +3073,7 @@ int ObTransformOrExpansion::check_select_expr_has_lob(ObDMLStmt &stmt, bool &has
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected null expr", K(ret), K(column_items.at(i)));
       } else {
-        has_lob = ObLongTextType == column_expr->get_data_type() ||
-                  ObLobType == column_expr->get_data_type() ||
-                  (is_oracle_mode() && ObJsonType == column_expr->get_data_type());
+        has_lob = ObRawExprUtils::is_invalid_type_for_compare(column_expr->get_result_type());
       }
     }
   }

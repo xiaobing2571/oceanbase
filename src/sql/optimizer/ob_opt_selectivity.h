@@ -37,6 +37,7 @@ namespace common
 class ObOptStatManager;
 class ObHistogram;
 class ObOptColumnStatHandle;
+class ObLakeColumnStat;
 }
 namespace sql
 {
@@ -49,7 +50,6 @@ class ObLogicalOperator;
 class ObJoinOrder;
 class AccessPath;
 struct ColumnItem;
-struct RangeExprs;
 struct ObExprSelPair;
 
 class ObEstCorrelationModel
@@ -131,7 +131,10 @@ private:
 class OptSelectivityCtx
 {
  public:
-  OptSelectivityCtx(ObOptimizerContext &ctx, const ObLogPlan *plan, const ObDMLStmt *stmt)
+  OptSelectivityCtx(ObOptimizerContext &ctx,
+                    const ObLogPlan *plan,
+                    const ObDMLStmt *stmt,
+                    common::ObIAllocator &allocator)
   : opt_ctx_(ctx),
     plan_(plan),
     stmt_(stmt),
@@ -143,7 +146,8 @@ class OptSelectivityCtx
     row_count_2_(-1.0),
     current_rows_(-1.0),
     ambient_card_(NULL),
-    assumption_type_(UNKNOWN_JOIN)
+    assumption_type_(UNKNOWN_JOIN),
+    deduce_infos_(allocator)
   { }
 
   struct ExprDeduceInfo {
@@ -154,8 +158,8 @@ class OptSelectivityCtx
      *      =>
      *      consequence `c1 in (1,2)`, `c2 in (1,2)`
      */
-    ObSEArray<ObRawExpr *, 1> antecedent_;
-    ObSEArray<ObRawExpr *, 1> consequence_;
+    ObSEArray<ObRawExpr *, 1, common::ModulePageAllocator, true> antecedent_;
+    ObSEArray<ObRawExpr *, 1, common::ModulePageAllocator, true> consequence_;
 
     DISABLE_COPY_ASSIGN(ExprDeduceInfo);
     void reuse() {
@@ -317,7 +321,7 @@ class OptSelectivityCtx
    * Used to calculate the selectivity of ambient card.
   */
   ObJoinType assumption_type_;
-  ObSEArray<ExprDeduceInfo, 1, common::ModulePageAllocator, true> deduce_infos_;
+  ObSqlArray<ExprDeduceInfo> deduce_infos_;
 };
 
 class OptColumnMeta
@@ -436,18 +440,20 @@ private:
 class OptTableMeta
 {
 public:
-  OptTableMeta() :
+  OptTableMeta(common::ObIAllocator &allocator) :
     table_id_(OB_INVALID_ID),
     ref_table_id_(OB_INVALID_ID),
     rows_(0),
     stat_type_(OptTableStatType::DEFAULT_TABLE_STAT),
     last_analyzed_(0),
     stat_locked_(false),
-    all_used_parts_(),
-    all_used_tablets_(),
-    pk_ids_(),
-    column_metas_(),
+    all_used_parts_(allocator),
+    all_used_tablets_(allocator),
+    pk_ids_(allocator),
+    column_metas_(allocator),
     ds_level_(ObDynamicSamplingLevel::NO_DYNAMIC_SAMPLING),
+    stat_parts_(allocator),
+    hist_parts_(allocator),
     scale_ratio_(1.0),
     distinct_rows_(0.0),
     table_partition_info_(NULL),
@@ -472,6 +478,15 @@ public:
            const OptSelectivityCtx &ctx,
            const ObTablePartitionInfo *table_partition_info,
            const ObTableMetaInfo *base_meta_info);
+  int init_lake_table(const uint64_t table_id,
+                      const uint64_t ref_table_id,
+                      const int64_t rows,
+                      const int64_t last_analyzed,
+                      const OptTableStatType stat_type,
+                      ObIArray<uint64_t> &column_ids,
+                      const ObIArray<common::ObLakeColumnStat*> &column_stats,
+                      const OptSelectivityCtx &ctx,
+                      const ObTableMetaInfo *base_meta_info);
 
   // int update_stat(const double rows, const bool can_reduce, const bool can_enlarge);
   int add_column_meta_no_dup(const ObIArray<uint64_t> &column_id, const OptSelectivityCtx &ctx);
@@ -514,6 +529,7 @@ public:
   void set_distinct_rows(double rows) { distinct_rows_ = rows; }
   bool is_opt_stat_expired() const { return stale_stats_; }
   void set_stale_stats(bool stale_stats) { stale_stats_ = stale_stats; }
+  const ObTableMetaInfo *get_base_meta_info() const { return base_meta_info_; }
 
 
   // The ratio of the increase in the number of rows in the system table compared to the number of rows in the statistics.
@@ -538,6 +554,11 @@ private:
                        const ObIArray<uint64_t> &column_ids,
                        ObIArray<OptColumnMeta> &column_metas);
 
+  int init_lake_column_meta(const OptSelectivityCtx &ctx,
+                            const ObIArray<uint64_t> &column_ids,
+                            const ObIArray<common::ObLakeColumnStat*> &column_stats,
+                            ObIArray<OptColumnMeta> &column_metas);
+
   int refine_column_meta(const OptSelectivityCtx &ctx,
                          const uint64_t column_id,
                          const ObGlobalColumnStat &stat,
@@ -553,13 +574,13 @@ private :
 
   int64_t micro_block_count_;
 
-  ObSEArray<int64_t, 64, common::ModulePageAllocator, true> all_used_parts_;
-  ObSEArray<ObTabletID, 64, common::ModulePageAllocator, true> all_used_tablets_;
-  ObSEArray<uint64_t, 4, common::ModulePageAllocator, true> pk_ids_;
-  ObSEArray<OptColumnMeta, 32, common::ModulePageAllocator, true> column_metas_;
+  ObSqlArray<int64_t> all_used_parts_;
+  ObSqlArray<ObTabletID> all_used_tablets_;
+  ObSqlArray<uint64_t> pk_ids_;
+  ObSqlArray<OptColumnMeta> column_metas_;
   int64_t ds_level_;//dynamic sampling level
-  ObSEArray<int64_t, 1, common::ModulePageAllocator, true> stat_parts_;
-  ObSEArray<int64_t, 1, common::ModulePageAllocator, true> hist_parts_;
+  ObSqlArray<int64_t> stat_parts_;
+  ObSqlArray<int64_t> hist_parts_;
   double scale_ratio_;
 
   // only valid for child stmt meta of set distinct stmt
@@ -601,6 +622,11 @@ enum class DistinctEstType
 class OptTableMetas
 {
 public:
+  OptTableMetas(common::ObIAllocator &allocator)
+  : allocator_(allocator),
+    table_metas_(allocator),
+    dynamic_expr_metas_(allocator)
+  {}
   int copy_table_meta_info(const OptTableMeta &src_meta, OptTableMeta *&dst_meta);
   int copy_table_meta_info(const OptTableMetas &table_metas, const uint64_t table_id);
 
@@ -621,6 +647,16 @@ public:
                                const ObTablePartitionInfo *table_partition_info,
                                const ObTableMetaInfo *base_meta_info,
                                bool stale_stats);
+
+  int add_lake_table_meta_info(OptSelectivityCtx &ctx,
+                               const uint64_t table_id,
+                               const uint64_t ref_table_id,
+                               const int64_t rows,
+                               const int64_t last_analyzed,
+                               ObIArray<uint64_t> &column_ids,
+                               const ObIArray<ObLakeColumnStat*> &column_stats,
+                               const OptTableStatType stat_type,
+                               const ObTableMetaInfo *base_meta_info);
 
   int add_set_child_stmt_meta_info(const ObSelectStmt *parent_stmt,
                                    const ObSelectStmt *child_stmt,
@@ -649,8 +685,8 @@ public:
                               const OptTableMetas &child_table_metas,
                               double &ndv);
 
-  common::ObIArray<OptTableMeta>& get_table_metas() { return table_metas_; }
-  const common::ObIArray<OptTableMeta>& get_table_metas() const { return table_metas_; }
+  common::ObIArray<OptTableMeta*>& get_table_metas() { return table_metas_; }
+  const common::ObIArray<OptTableMeta*>& get_table_metas() const { return table_metas_; }
   const OptTableMeta* get_table_meta_by_table_id(const uint64_t table_id) const;
   OptTableMeta* get_table_meta_by_table_id(const uint64_t table_id);
   const OptColumnMeta* get_column_meta_by_table_id(const uint64_t table_id,
@@ -665,8 +701,9 @@ public:
   double get_base_rows(const uint64_t table_id) const;
   TO_STRING_KV(K_(table_metas), K_(dynamic_expr_metas));
 private:
-  common::ObSEArray<OptTableMeta, 16, common::ModulePageAllocator, true> table_metas_;
-  common::ObSEArray<OptDynamicExprMeta, 4, common::ModulePageAllocator, true> dynamic_expr_metas_;
+  common::ObIAllocator &allocator_;
+  ObSqlArray<OptTableMeta*> table_metas_;
+  ObSqlArray<OptDynamicExprMeta> dynamic_expr_metas_;
 };
 
 struct OptSelInfo
@@ -835,6 +872,8 @@ public:
     return std::isfinite(num) ? (num < 0 ? 0 : (num > 1 ? 1 : num)) :
            (ignore_inf_error ? 1.0 : num);
   }
+
+  static inline double revise_ndv(double ndv) { return ndv < 1.0 ? 1.0 : ndv; }
 
   static int get_column_range_sel(const OptTableMetas &table_metas,
                                   const OptSelectivityCtx &ctx,

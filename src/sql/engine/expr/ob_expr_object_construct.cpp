@@ -53,7 +53,9 @@ int ObExprObjectConstruct::calc_result_typeN(ObExprResType &type,
       OZ (schema_guard.get_udt_info(tenant_id, udt_id_, udt_info));
       if (OB_SUCC(ret)) {
         ret = OB_ERR_CALL_WRONG_ARG;
-        LOG_USER_ERROR(OB_ERR_CALL_WRONG_ARG, udt_info->get_type_name().length(), udt_info->get_type_name().ptr());
+        if (OB_NOT_NULL(udt_info)) {
+          LOG_USER_ERROR(OB_ERR_CALL_WRONG_ARG, udt_info->get_type_name().length(), udt_info->get_type_name().ptr());
+        }
       }
       LOG_WARN("PLS-00306: wrong number or types of arguments in call", K(ret), K(types[i]), K(elem_types_.at(i)), K(i));
     } else {
@@ -70,7 +72,8 @@ int ObExprObjectConstruct::calc_result_typeN(ObExprResType &type,
 
 int ObExprObjectConstruct::check_types(ObEvalCtx &ctx, const ObObj *objs_stack,
                                        const common::ObIArray<ObExprResType> &elem_types,
-                                       int64_t param_num)
+                                       int64_t param_num,
+                                       uint64_t udt_id)
 {
   int ret = OB_SUCCESS;
   CK (OB_NOT_NULL(objs_stack));
@@ -89,10 +92,13 @@ int ObExprObjectConstruct::check_types(ObEvalCtx &ctx, const ObObj *objs_stack,
           int64_t tenant_id = ctx.exec_ctx_.get_my_session()->get_effective_tenant_id();
           const ObUDTTypeInfo *udt_info = NULL;
           OZ (GCTX.schema_service_->get_tenant_schema_guard(tenant_id, schema_guard));
-          OZ (schema_guard.get_udt_info(tenant_id, elem_types.at(i).get_udt_id(), udt_info));
+          // Use the actual called type name instead of the expected parameter type name
+          OZ (schema_guard.get_udt_info(pl::get_tenant_id_by_object_id(udt_id) , udt_id, udt_info));
           if (OB_SUCC(ret)) {
             ret = OB_ERR_CALL_WRONG_ARG;
-            LOG_USER_ERROR(OB_ERR_CALL_WRONG_ARG, udt_info->get_type_name().length(), udt_info->get_type_name().ptr());
+            if (OB_NOT_NULL(udt_info)) {
+              LOG_USER_ERROR(OB_ERR_CALL_WRONG_ARG, udt_info->get_type_name().length(), udt_info->get_type_name().ptr());
+            }
           }
           LOG_WARN("invalid argument. unexpected obj type", K(ret), KPC(composite), K(elem_types), K(i));
         }
@@ -189,29 +195,42 @@ int ObExprObjectConstruct::eval_object_construct(const ObExpr &expr, ObEvalCtx &
   CK(expr.arg_cnt_ >= info->elem_types_.count());
   CK(OB_NOT_NULL(session = ctx.exec_ctx_.get_my_session()));
   ObObj *objs = nullptr;
+  ObIAllocator *alloc = nullptr;
+  pl::ObPLExecCtx *pl_exec_ctx = nullptr;
+  ObPLComplexTypeMgr *pl_complex_type_mgr = nullptr;
+  OZ (ctx.get_pl_complex_type_mgr(pl_complex_type_mgr));
+  OX (alloc = &pl_complex_type_mgr->alloc_);
+  // for ojbect construct in pl, use top_expr_allocator
+  // we will destroy this obj in pl final interface
+  if (OB_SUCC(ret) && OB_NOT_NULL(session) &&
+      OB_NOT_NULL(session->get_pl_context()) &&
+      OB_NOT_NULL(pl_exec_ctx = session->get_pl_context()->get_current_ctx()) &&
+      pl_exec_ctx->get_exec_ctx() == &ctx.exec_ctx_) {
+    alloc = pl_exec_ctx->get_top_expr_allocator();
+  }
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(expr.eval_param_value(ctx))) {
     LOG_WARN("failed to eval param ", K(ret));
   } else if (expr.arg_cnt_ > 0
      && OB_ISNULL(objs = static_cast<ObObj *>
-        (ctx.exec_ctx_.get_allocator().alloc(expr.arg_cnt_ * sizeof(ObObj))))) {
+        (alloc->alloc(expr.arg_cnt_ * sizeof(ObObj))))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to alloc mem for objs", K(ret));
   } else if (OB_FAIL(fill_obj_stack(expr, ctx, objs))) {
     LOG_WARN("failed to convert obj", K(ret));
-  } else if (expr.arg_cnt_ > 0 && OB_FAIL(check_types(ctx, objs, info->elem_types_, expr.arg_cnt_))) {
+  } else if (expr.arg_cnt_ > 0 && OB_FAIL(check_types(ctx, objs, info->elem_types_, expr.arg_cnt_, info->udt_id_))) {
     LOG_WARN("failed to check types", K(ret));
   } else if (info->rowsize_ != pl::ObRecordType::get_init_size(expr.arg_cnt_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("rowsize_ is not equel to input", K(ret), K(info->rowsize_), K(expr.arg_cnt_));
   } else if (OB_ISNULL(record
            = static_cast<pl::ObPLRecord*>
-             (ctx.exec_ctx_.get_allocator().alloc(pl::ObRecordType::get_init_size(expr.arg_cnt_))))) {
+             (alloc->alloc(pl::ObRecordType::get_init_size(expr.arg_cnt_))))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to alloc memory", K(ret));
   } else {
     new(record)pl::ObPLRecord(info->udt_id_, expr.arg_cnt_);
-    OZ (record->init_data(ctx.exec_ctx_.get_allocator(), false));
+    OZ (record->init_data(*alloc, false));
     CK (OB_NOT_NULL(record->get_allocator()));
     for (int64_t i = 0; OB_SUCC(ret) && i < expr.arg_cnt_; ++i) {
       if (objs[i].is_null() && info->elem_types_.at(i).is_ext()) {
@@ -230,13 +249,13 @@ int ObExprObjectConstruct::eval_object_construct(const ObExpr &expr, ObEvalCtx &
           OZ (ObSPIService::spi_pad_char_or_varchar(session,
                                                     info->elem_types_.at(i).get_type(),
                                                     info->elem_types_.at(i).get_accuracy(),
-                                                    &ctx.exec_ctx_.get_allocator(),
+                                                    alloc,
                                                     &(objs[i])));
         }
         // param ObObj may have different accuracy with the argument, need conversion
         ObObj tmp;
         OZ (ObSPIService::spi_convert(*session,
-                                      ctx.exec_ctx_.get_allocator(),
+                                      *alloc,
                                       objs[i],
                                       info->elem_types_.at(i),
                                       tmp,
@@ -255,18 +274,12 @@ int ObExprObjectConstruct::eval_object_construct(const ObExpr &expr, ObEvalCtx &
                       pl::PL_RECORD_TYPE, pl::ObRecordType::get_init_size(expr.arg_cnt_));
     OZ(res.from_obj(result, expr.obj_datum_map_));
     if (OB_NOT_NULL(record->get_allocator())) {
-      int tmp_ret = OB_SUCCESS;
-      if (OB_ISNULL(ctx.exec_ctx_.get_pl_ctx())) {
-        tmp_ret = ctx.exec_ctx_.init_pl_ctx();
-      }
-      if (OB_SUCCESS == tmp_ret && OB_NOT_NULL(ctx.exec_ctx_.get_pl_ctx())) {
-        tmp_ret = ctx.exec_ctx_.get_pl_ctx()->add(result);
-      }
-      if (OB_SUCCESS != tmp_ret) {
+      int tmp_ret = pl_complex_type_mgr->complex_type_objects_.push_back(result);
+      if (tmp_ret != OB_SUCCESS) {
         int tmp = pl::ObUserDefinedType::destruct_obj(result, nullptr);
         LOG_WARN("fail to collect pl collection allocator, try to free memory", K(tmp_ret), K(tmp));
+        ret = OB_SUCCESS == ret ? tmp_ret : ret;
       }
-      ret = OB_SUCCESS == ret ? tmp_ret : ret;
     }
   }
   return ret;

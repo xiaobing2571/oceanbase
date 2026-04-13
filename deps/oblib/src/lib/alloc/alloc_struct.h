@@ -29,7 +29,7 @@
 #ifndef NDEBUG
 #define MEMCHK_LEVEL 1
 #endif
-
+class ObjectSetV2;
 namespace oceanbase
 {
 namespace lib
@@ -61,7 +61,6 @@ static ssize_t get_page_size()
 
 class BlockSet;
 class ObjectSet;
-class ObjectSetV2;
 
 enum ObAllocPrio
 {
@@ -138,7 +137,6 @@ struct ObMemAttr
   uint64_t tenant_id_;
   ObLabel label_;
   uint64_t ctx_id_;
-  int32_t sub_ctx_id_;
   int32_t numa_id_;
   ObAllocPrio prio_;
   explicit ObMemAttr(
@@ -149,13 +147,12 @@ struct ObMemAttr
       : tenant_id_(tenant_id),
         label_(label),
         ctx_id_(ctx_id),
-        sub_ctx_id_(ObSubCtxIds::MAX_SUB_CTX_ID),
         numa_id_(0),
         prio_(prio),
         use_500_(false),
         expect_500_(true),
         ignore_version_(ObMemVersionNode::tl_ignore_node),
-        use_malloc_v2_(false),
+        enable_malloc_hang_(false),
         extra_size_(0)
   {}
   int64_t to_string(char* buf, const int64_t buf_len) const;
@@ -170,7 +167,7 @@ public:
         uint8_t use_500_ : 1;
         uint8_t expect_500_ : 1;
         uint8_t ignore_version_ : 1;
-        uint8_t use_malloc_v2_ : 1;
+        uint8_t enable_malloc_hang_ : 1;
       };
       uint16_t extra_size_;
     };
@@ -270,6 +267,11 @@ struct AChunk {
   AChunk *prev_, *next_; // ObTenantCtxAllocator's free_list or BlockSet's using_list
   AChunk *prev2_, *next2_; // ObTenantCtxAllocator's using_list
   ASimpleBitSet<MAX_BLOCKS_CNT> blk_bs_;
+#ifdef ENABLE_SANITY
+  char padding_[8];
+#else
+  char padding_[16];
+#endif
   char data_[0];
 } __attribute__ ((aligned (16)));
 
@@ -301,6 +303,68 @@ struct AObjectList
   }
   int64_t v_;
 };
+
+struct AObjectListSafe
+{
+  struct List {
+    int64_t cnt_ : 10;
+    int64_t head_ : 27;
+    int64_t tail_ : 27;
+  };
+  AObjectListSafe()
+    : v_(0)
+  {}
+  void reset() { v_ = 0; }
+  OB_NOINLINE int64_t push(AObject *obj);
+  int64_t popall(AObject *&head, AObject *&tail)
+  {
+    int64_t v = ATOMIC_TAS(&v_, 0);
+    List *l = (List*)&v;
+    tail = (AObject*)((char*)this + l->tail_);
+    head = (AObject*)((char*)this + l->head_);
+    return l->cnt_;
+  }
+  int64_t v_;
+};
+
+struct AObjectListUnsafe
+{
+  static const int64_t HEAD_BITS = 54;
+  static const int64_t HEAD_MASK = (1LL<<HEAD_BITS) - 1;
+  AObjectListUnsafe()
+    : v_(mask(0))
+  {}
+  int64_t mask(int64_t v)
+  {
+    return (int64_t)this ^ v;
+  }
+  int64_t remask(int64_t v)
+  {
+    return v ^ (int64_t)this;
+  }
+  bool is_empty()
+  {
+    return mask(0) == v_;
+  }
+  void reset(AObject *obj, int64_t cnt)
+  {
+    v_ = mask((int64_t)obj) | (cnt<<HEAD_BITS);
+  }
+  void reset() { v_ = mask(0); }
+  int64_t push(AObject *obj)
+  {
+    return push(obj, obj, 1);
+  }
+  int64_t push(AObject *head, AObject *tail, int64_t cnt);
+  AObject *popall()
+  {
+    AObject *head = (AObject*)remask(v_ & HEAD_MASK);
+    reset();
+    return head;
+  }
+  int64_t v_;
+};
+
 struct ABlock {
   enum {
     FULL,
@@ -322,25 +386,30 @@ struct ABlock {
         uint8_t is_large_ : 1;
         uint8_t is_washed_ : 1;
         uint8_t status_ : 2;
-        uint8_t is_malloc_v2_ : 1;
       };
     };
   };
 
-  uint64_t alloc_bytes_;
+  uint32_t alloc_bytes_;
   uint32_t ablock_size_;
-  union {
+  uint16_t sc_idx_;
+  uint16_t max_cnt_;
+
+  union { //FARM COMPAT WHITELIST
+    // for malloc
+    AObjectList freelist_;
+    // for malloc_v2
+    struct {
+      AObjectListUnsafe local_free_;
+      AObjectListSafe remote_free_;
+    };
+  };
+  union { //FARM COMPAT WHITELIST
     ObjectSet *obj_set_;
     ObjectSetV2 *obj_set_v2_;
   };
-  union {
-    struct {
-      int32_t sc_idx_;
-      int32_t max_cnt_;
-      AObjectList freelist_;
-    };
-  };
   ABlock *prev_, *next_;
+  ABlock *next2_;
 };
 
 struct AObject {
@@ -568,6 +637,15 @@ char *AChunk::blk_data(const ABlock *block) const
   return (char*)this + ACHUNK_HEADER_SIZE + b_offset * ABLOCK_SIZE;
 }
 
+
+inline int64_t AObjectListUnsafe::push(AObject *head, AObject *tail, int64_t cnt)
+{
+  int64_t n_cnt = (v_ >> HEAD_BITS) + cnt;
+  tail->next_ = (AObject*)remask(v_ & HEAD_MASK);
+  reset(head, n_cnt);
+  return n_cnt;
+}
+
 inline int64_t AObjectList::push(AObject *obj)
 {
   int64_t ov = ATOMIC_LOAD(&v_);
@@ -579,6 +657,25 @@ inline int64_t AObjectList::push(AObject *obj)
     nh.cnt_ = oh.cnt_ + 1;
   } while (!ATOMIC_CMP_AND_EXCHANGE(&v_, &ov, *(int64_t*)&nh));
   return nh.cnt_;
+}
+
+inline int64_t AObjectListSafe::push(AObject *obj)
+{
+  int64_t ov = ATOMIC_LOAD(&v_);
+  List nl;
+  nl.head_ = (int64_t)obj - (int64_t)this;
+  do {
+    List ol = *(List*)&ov;
+    if (0 == ol.head_) {
+      obj->next_ = NULL;
+      nl.tail_ = nl.head_;
+    } else {
+      obj->next_ = (AObject*)((char*)this + ol.head_);
+      nl.tail_ = ol.tail_;
+    }
+    nl.cnt_ = ol.cnt_ + 1;
+  } while (!ATOMIC_CMP_AND_EXCHANGE(&v_, &ov, *(int64_t*)&nl));
+  return nl.cnt_;
 }
 
 ABlock::ABlock() :
@@ -746,7 +843,7 @@ public:
 private:
   static bool &tl_enable()
   {
-    static __thread bool enable = false;
+    static __thread bool enable = true;
     return enable;
   }
 private:
@@ -794,6 +891,28 @@ private:
   int64_t hold_[OB_MAX_CPU_NUM];
 };
 
+
+class ObAllocContextGuard
+{
+public:
+  ObAllocContextGuard()
+    : last_(in_alloc_context())
+  {
+    in_alloc_context() = true;
+  }
+  ~ObAllocContextGuard()
+  {
+    in_alloc_context() = last_;
+  }
+  static bool &in_alloc_context()
+  {
+    static __thread bool in_alloc_ctx = false;
+    return in_alloc_ctx;
+  }
+private:
+  const bool last_;
+};
+
 #define UNMAMAGED_MEMORY_STAT ObUnmanagedMemoryStat::get_instance()
 
 extern int64_t get_unmanaged_memory_size();
@@ -806,6 +925,14 @@ extern bool is_memleak_light_backtrace_enabled();
 
 #define FORCE_MALLOC_FOR_ABSENT_TENANT() \
   OB_UNLIKELY(oceanbase::lib::ObMallocAllocator::get_instance()->force_malloc_for_absent_tenant_)
+
+#define PARRAY_MALLOC_BACKTRACE(object, backtrace, length)                \
+  SANITY_DISABLE_CHECK_RANGE();                                           \
+  if (object->on_malloc_sample_) {                                        \
+    void *addrs[AOBJECT_BACKTRACE_COUNT];                                 \
+    MEMCPY((char*)addrs, object->bt(), AOBJECT_BACKTRACE_SIZE);           \
+    parray(backtrace, length, (int64_t*)addrs, AOBJECT_BACKTRACE_COUNT);  \
+  }
 } // end of namespace lib
 } // end of namespace oceanbase
 

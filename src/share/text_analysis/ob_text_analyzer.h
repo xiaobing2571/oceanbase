@@ -24,7 +24,7 @@ struct ObTextAnalysisCtx final
 public:
   ObTextAnalysisCtx()
     : cs_(nullptr),
-      filter_stopword_(true),
+      filter_stop_token_(false),
       need_grouping_(false)
   {}
   ~ObTextAnalysisCtx() = default;
@@ -32,17 +32,14 @@ public:
   void reset()
   {
     cs_ = nullptr;
-    filter_stopword_ = true;
+    filter_stop_token_ = false;
     need_grouping_ = false;
   }
-  TO_STRING_KV(KP_(cs), K_(filter_stopword), K_(need_grouping));
+  TO_STRING_KV(KP_(cs), K_(filter_stop_token), K_(need_grouping));
 public:
   const ObCharsetInfo *cs_;
-  bool filter_stopword_;
+  bool filter_stop_token_;
   bool need_grouping_;
-  // language type
-  // word segment plugin type
-  // specified normalization tricks
 };
 
 class ObITextAnalyzer
@@ -53,7 +50,7 @@ public:
 
   virtual void reset();
   virtual int init(const ObTextAnalysisCtx &ctx, ObIAllocator &allocator);
-  virtual int analyze(const ObDatum &document, ObITokenStream *&token_stream) = 0;
+  virtual int analyze(const ObDatum &document, ObIFTTokenStream *&token_stream) = 0;
   VIRTUAL_TO_STRING_KV(KPC_(ctx), K_(analyze_pipeline), K_(is_inited));
 protected:
   virtual int inner_init(const ObTextAnalysisCtx &ctx, ObIAllocator &allocator) = 0;
@@ -61,14 +58,14 @@ protected:
   int add_normalizer(
       const ObTokenNormalizer::TokenNormalizerType &type,
       const ObTextAnalysisCtx &ctx);
-  ObITokenStream *get_tail_token_stream();
+  ObIFTTokenStream *get_tail_token_stream();
 private:
   template<typename T>
-  int add_token_stream(ObITokenStream *&token_stream);
+  int add_token_stream(ObIFTTokenStream *&token_stream);
 protected:
   ObIAllocator *allocator_;
   const ObTextAnalysisCtx *ctx_;
-  ObSEArray<ObITokenStream *, 4> analyze_pipeline_;
+  ObSEArray<ObIFTTokenStream *, 4> analyze_pipeline_;
   bool is_inited_;
 };
 
@@ -78,7 +75,7 @@ public:
   ObEnglishTextAnalyzer() : ObITextAnalyzer() {}
   virtual ~ObEnglishTextAnalyzer() {}
 
-  virtual int analyze(const ObDatum &document, ObITokenStream *&token_stream) override;
+  virtual int analyze(const ObDatum &document, ObIFTTokenStream *&token_stream) override;
 protected:
   virtual int inner_init(const ObTextAnalysisCtx &ctx, ObIAllocator &allocator) override;
 };

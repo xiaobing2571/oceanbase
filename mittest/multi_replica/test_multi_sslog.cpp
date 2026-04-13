@@ -150,7 +150,8 @@ int ObAccessService::check_read_allowed_(
         }
       }
     } else if (OB_FAIL(construct_store_ctx_other_variables_(*ls, tablet_id, scan_param.timeout_,
-         ctx.mvcc_acc_ctx_.get_snapshot_version(), tablet_handle, ctx_guard))) {
+         ctx.mvcc_acc_ctx_.get_snapshot_version(), tablet_handle, ctx_guard,
+         nullptr != scan_param.table_param_ ? scan_param.table_param_->get_table_type() : ObTableType::MAX_TABLE_TYPE))) {
       if (OB_SNAPSHOT_DISCARDED == ret && scan_param.fb_snapshot_.is_valid()) {
         ret = OB_TABLE_DEFINITION_CHANGED;
       } else {
@@ -166,7 +167,7 @@ namespace unittest
 {
 
 #define SSLOG_TABLE_READ_INIT                                           \
-  sslog::ObSSLogIteratorGuard iter(true/*read_unfinish*/, true/*read_mark_delete*/); \
+  sslog::ObSSLogIteratorGuard iter(true/*read_unfinish*/, true/*read_init_value*/, true/*read_mark_delete*/); \
   sslog::ObSSLogMetaValueIterator *raw_iter = dynamic_cast<sslog::ObSSLogMetaValueIterator *>(iter.get_sslog_iterator());
 
 #define EXE_SQL(sql_str)                                            \

@@ -21,6 +21,7 @@
 #include "rpc/obrpc/ob_rpc_result_code.h"
 #include "rpc/obrpc/ob_rpc_proxy.h"
 #include "share/ob_heartbeat_struct.h"
+#include "share/ob_flashback_standby_log_struct.h"
 
 namespace oceanbase
 {
@@ -53,14 +54,19 @@ RPC_F(obrpc::OB_GET_MIN_SSTABLE_SCHEMA_VERSION, obrpc::ObGetMinSSTableSchemaVers
     obrpc::ObGetMinSSTableSchemaVersionRes, ObGetMinSSTableSchemaVersionProxy);
 RPC_F(obrpc::OB_DETECT_MASTER_RS_LS, obrpc::ObDetectMasterRsArg,
       obrpc::ObDetectMasterRsLSResult, ObDetectMasterRsLSProxy);
+RPC_F(obrpc::OB_DETECT_SSLOG_LS, obrpc::ObDetectSSlogLSArg,
+      obrpc::ObDetectSSlogLSResult, ObDetectSSlogLSProxy);
 RPC_F(obrpc::OB_GET_ROOT_SERVER_ROLE, obrpc::ObDetectMasterRsArg,
       obrpc::ObGetRootserverRoleResult, ObGetRootserverRoleProxy);
 RPC_F(obrpc::OB_CREATE_LS, obrpc::ObCreateLSArg, obrpc::ObCreateLSResult, ObLSCreatorProxy);
 RPC_F(obrpc::OB_CREATE_TABLET, obrpc::ObBatchCreateTabletArg, obrpc::ObCreateTabletBatchRes, ObTabletCreatorProxy);
 RPC_F(obrpc::OB_SET_MEMBER_LIST, obrpc::ObSetMemberListArgV2, obrpc::ObSetMemberListResult, ObSetMemberListProxy);
+RPC_F(obrpc::OB_GET_UNIT_INFO, obrpc::ObGetUnitInfoArg, obrpc::ObGetUnitInfoResult, ObGetUnitInfoProxy);
 RPC_F(obrpc::OB_BATCH_BROADCAST_SCHEMA, obrpc::ObBatchBroadcastSchemaArg, obrpc::ObBatchBroadcastSchemaResult, ObBatchBroadcastSchemaProxy);
 RPC_F(obrpc::OB_DROP_TABLET, obrpc::ObBatchRemoveTabletArg, obrpc::ObRemoveTabletRes, ObTabletDropProxy);
 RPC_F(obrpc::OB_SWITCH_SCHEMA, obrpc::ObSwitchSchemaArg, obrpc::ObSwitchSchemaResult, ObSwitchSchemaProxy);
+RPC_F(obrpc::OB_BATCH_DETECT_SESSION_ALIVE, obrpc::ObBatchDetectSessionAliveArg, obrpc::ObBatchDetectSessionAliveResult, ObBatchDetectSessionAliveProxy);
+RPC_F(obrpc::OB_DETECT_CLIENT_SESSION_ALIVE, obrpc::UInt64, obrpc::Bool, ObDetectClientSessionAliveProxy);
 RPC_F(obrpc::OB_GET_LS_ACCESS_MODE, obrpc::ObGetLSAccessModeInfoArg, obrpc::ObLSAccessModeInfo, ObGetLSAccessModeProxy);
 RPC_F(obrpc::OB_CHANGE_LS_ACCESS_MODE, obrpc::ObLSAccessModeInfo, obrpc::ObChangeLSAccessModeRes, ObChangeLSAccessModeProxy);
 RPC_F(obrpc::OB_BATCH_GET_TABLET_AUTOINC_SEQ, obrpc::ObBatchGetTabletAutoincSeqArg,
@@ -100,7 +106,16 @@ RPC_F(obrpc::OB_REFRESH_SERVICE_NAME, obrpc::ObRefreshServiceNameArg, obrpc::ObR
 RPC_F(obrpc::OB_CAL_STANDBY_TENANT_PHY_RESOURCE, obrpc::ObGetTenantResArg, obrpc::ObTenantLogicalRes, ObGetTenantResProxy);
 RPC_F(obrpc::OB_KILL_QUERY_CLIENT_SESSION, obrpc::ObKillQueryClientSessionArg, obrpc::Int64, ObKillQueryClientSessionProxy);
 RPC_RS(obrpc::OB_PARALLEL_CREATE_NORMAL_TENANT, obrpc::ObParallelCreateNormalTenantArg, obrpc::ObRpcProxy::NoneT, ObParallelCreateNormalTenantProxy);
+RPC_F(obrpc::OB_LOAD_TENANT_TABLE_SCHEMA, obrpc::ObLoadTenantTableSchemaArg, obrpc::ObRpcProxy::NoneT, ObLoadTenantTableSchemaProxy);
 RPC_F(obrpc::OB_ALL_SERVER_TRACER_BROADCAST, obrpc::ObRefreshTenantInfoArg, obrpc::Int64, ObAllServerTracerProxy);
+RPC_F(obrpc::OB_CLEAR_FETCHED_LOG_CACHE, share::ObClearFetchedLogCacheArg, share::ObClearFetchedLogCacheRes, ObClearFetchedLogCacheProxy);
+RPC_F(obrpc::OB_CHECK_BACKUP_DEST_RW_CONSISTENCY, obrpc::ObCheckBackupDestRWConsistencyArg, obrpc::Int64, ObCheckBackupDestRWConsistencyProxy);
+RPC_F(obrpc::OB_CHECK_SYS_TABLE_SCHEMA, obrpc::ObCheckSysTableSchemaArg, obrpc::ObCheckSysTableSchemaResult, ObCheckSysTableSchemaProxy);
+#ifdef OB_BUILD_SHARED_STORAGE
+RPC_F(obrpc::OB_PREWARM_SS_LOCAL_CACHE, obrpc::ObPrewarmSSLocalCacheArg, obrpc::ObPrewarmSSLocalCacheResult, ObPrewarmSSLocalCacheProxy);
+#endif
+RPC_RS(obrpc::OB_NON_ATOMIC_DROP_TABLE_IN_DATABASE, obrpc::ObDropTableArg, obrpc::ObDropTableRes, ObNonAtomicDropTableInDBProxy);
+
 
 }//end namespace rootserver
 }//end namespace oceanbase

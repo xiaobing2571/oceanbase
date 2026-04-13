@@ -75,8 +75,9 @@ ObTenantMediumChecker::ObTenantMediumChecker()
     error_tablet_cnt_(0),
     tablet_ls_set_(),
     ls_info_map_(),
-    lock_(),
-    ls_locality_cache_empty_(true)
+    lock_(common::ObLatchIds::OB_TENANT_MEDIUM_CHECKER_LOCK),
+    ls_locality_cache_empty_(true),
+    ls_locality_cache_refresh_success_(true)
 {}
 
 ObTenantMediumChecker::~ObTenantMediumChecker()
@@ -87,9 +88,7 @@ ObTenantMediumChecker::~ObTenantMediumChecker()
 int ObTenantMediumChecker::init()
 {
   int ret = OB_SUCCESS;
-  if (GCTX.is_shared_storage_mode()) {
-    FLOG_INFO("cluster is shared storage mode, not init ObTenantMediumChecker", KR(ret));
-  } else if (IS_INIT) {
+  if (IS_INIT) {
     ret = OB_INIT_TWICE;
     LOG_WARN("ObTenantMediumChecker is inited before", KR(ret), KPC(this));
   } else if (OB_FAIL(tablet_ls_set_.create(DEFAULT_MAP_BUCKET, "MedCheckSet", "CheckSetNode", MTL_ID()))) {
@@ -126,6 +125,7 @@ int ObTenantMediumChecker::refresh_ls_status()
   if (OB_FAIL(ls_locality_cache.init(MTL_ID()))) {
     LOG_WARN("failed to init ls locality cache", K(ret));
   } else if (OB_FAIL(ls_locality_cache.refresh_ls_locality(true/*force_refresh*/))) {
+    ls_locality_cache_refresh_success_ = false;
     LOG_WARN("failed to refresh ls locality", K(ret));
   } else if (OB_FAIL(MTL(ObLSService *)->get_ls_ids(ls_ids))) {
     LOG_WARN("failed to get all ls id", K(ret));
@@ -136,6 +136,7 @@ int ObTenantMediumChecker::refresh_ls_status()
     } else {
       ls_locality_cache_empty_ = false;
     }
+    ls_locality_cache_refresh_success_ = true;
     ls_info_map_.reuse();
     for (int64_t i = 0; i < ls_ids.count(); ++i) {
       const ObLSID &ls_id = ls_ids[i];
@@ -214,6 +215,15 @@ bool ObTenantMediumChecker::locality_cache_empty()
   bool bret = true;
   if (IS_INIT) {
     bret = ls_locality_cache_empty_;
+  }
+  return bret;
+}
+
+bool ObTenantMediumChecker::locality_cache_refresh_success()
+{
+  bool bret = true;
+  if (IS_INIT) {
+    bret = ls_locality_cache_refresh_success_;
   }
   return bret;
 }

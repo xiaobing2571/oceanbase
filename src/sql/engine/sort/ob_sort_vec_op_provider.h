@@ -53,6 +53,11 @@ public:
   {
     return is_inited_;
   }
+  void destroy()
+  {
+    reset();
+    mem_entify_guard_.~MemEntifyFreeGuard();
+  }
   void reset();
   int sort();
   int init(ObSortVecOpContext &context);
@@ -79,7 +84,7 @@ private:
   int decide_sort_key_type(ObSortVecOpContext &context);
   bool is_basic_cmp_type(VecValueTypeClass vec_tc);
   template <typename SORT_CLASS>
-  int alloc_sort_impl_instance(ObISortVecOpImpl *&sort_impl);
+  int alloc_sort_impl_instance(ObSortVecOpContext &ctx, ObISortVecOpImpl *&sort_impl);
   template <SortType sort_type, SortKeyType sk_type, bool has_addon>
   int init_sort_impl_instance(ObSortVecOpContext &context, ObISortVecOpImpl *&sort_op_impl);
   class MemEntifyFreeGuard
@@ -182,32 +187,33 @@ template <SortType sort_type, bool is_basic_cmp, SortKeyType sk_type, bool has_a
 using RTSortImplType =
   typename RTSortImplTraits<sort_type, is_basic_cmp, sk_type, has_addon>::SortImplType;
 
-template <SortKeyType sk_type, bool is_basic_cmp>
+template <SortKeyType sk_type, bool has_addon, bool is_basic_cmp>
 struct RTSingleColSortImplTraits
 {
-  using SingleColSortImplType = ObSortVecOpImpl<SingleColCompare<ObSortKeyStore<false>, is_basic_cmp>,
-                                           ObSortKeyStore<false>,
-                                           false>;
+  using SingleColSortImplType = ObSortVecOpImpl<SingleColCompare<ObSortKeyStore<has_addon>, has_addon, is_basic_cmp>,
+                                           ObSortKeyStore<has_addon>,
+                                           has_addon>;
 };
-template <bool is_basic_cmp>
-struct RTSingleColSortImplTraits<ObSortVecOpProvider::SK_TYPE_GENERAL, is_basic_cmp>
+template <bool has_addon, bool is_basic_cmp>
+struct RTSingleColSortImplTraits<ObSortVecOpProvider::SK_TYPE_GENERAL, has_addon, is_basic_cmp>
 {
-  using SingleColSortImplType = ObSortVecOpImpl<SingleColCompare<ObSortKeyStore<false>, is_basic_cmp>,
-                                           ObSortKeyStore<false>,
-                                           false>;
+  using SingleColSortImplType = ObSortVecOpImpl<SingleColCompare<ObSortKeyStore<has_addon>, has_addon, is_basic_cmp>,
+                                           ObSortKeyStore<has_addon>,
+                                           has_addon>;
 };
 
-template <bool is_basic_cmp>
-struct RTSingleColSortImplTraits<ObSortVecOpProvider::SK_TYPE_TOPN, is_basic_cmp>
+template <bool has_addon, bool is_basic_cmp>
+struct RTSingleColSortImplTraits<ObSortVecOpProvider::SK_TYPE_TOPN, has_addon, is_basic_cmp>
 {
-  using SingleColSortImplType = ObSortVecOpImpl<SingleColCompare<ObTopNSortKey<false>, is_basic_cmp, true>,
-                                           ObTopNSortKey<false>,
-                                           false>;
+  using SingleColSortImplType = ObSortVecOpImpl<SingleColCompare<
+                                            ObTopNSortKey<has_addon>, has_addon, is_basic_cmp, true>,
+                                           ObTopNSortKey<has_addon>,
+                                           has_addon>;
 };
 
-template <SortKeyType sk_type, bool is_basic_cmp>
+template <SortKeyType sk_type, bool has_addon, bool is_basic_cmp>
 using RTSingleColSortImplType =
-  typename RTSingleColSortImplTraits<sk_type, is_basic_cmp>::SingleColSortImplType;
+  typename RTSingleColSortImplTraits<sk_type, has_addon, is_basic_cmp>::SingleColSortImplType;
 
 } // end namespace sql
 } // end namespace oceanbase

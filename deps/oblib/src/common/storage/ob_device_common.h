@@ -37,54 +37,88 @@ namespace common
 
 const static int DEFAULT_OPT_ARG_NUM = 4;
 
+// ObFileExtraInfo do not hold etag memory
+struct ObFileExtraInfo
+{
+  ObFileExtraInfo() { reset(); }
+  ~ObFileExtraInfo() { reset(); }
+  void reset()
+  {
+    last_modified_time_ms_ = 0;
+    etag_ = nullptr;
+    etag_len_ = 0;
+  }
+
+  OB_INLINE ObFileExtraInfo &operator=(const ObFileExtraInfo &other)
+  {
+    if (this != &other) {
+      last_modified_time_ms_ = other.last_modified_time_ms_;
+      etag_ = other.etag_;
+      etag_len_ = other.etag_len_;
+    }
+    return *this;
+  }
+  bool is_last_modify_time_valid() const
+  {
+    return last_modified_time_ms_ > 0;
+  }
+  bool is_etag_valid() const
+  {
+    return OB_NOT_NULL(etag_) && etag_len_ > 0;
+  }
+
+  // ObFileExtraInfo do not hold etag memory,
+  // so do not print etag content to avoid invalid memory access
+  TO_STRING_KV(K(last_modified_time_ms_), KP(etag_), K(etag_len_));
+  int64_t last_modified_time_ms_;
+  const char *etag_;
+  int64_t etag_len_;
+};
+
 class ObBaseDirEntryOperator
 {
 public:
   enum ObDirOpFlag {
     DOF_REG = 0,
     DOF_DIR = 1,
-    // Set marker for object storage request when ObDirOpFlag is DOF_MARKER.
-    // For example, list_files("oss://bucketname/uri"), if DOF_MARKER is specified with marker 'marker',
-    // objects whose names are alphabetically greater than the 'marker' are returned
-    DOF_REG_WITH_MARKER = 2,
     DOF_MAX_FLAG
   };
-  ObBaseDirEntryOperator() : op_flag_(DOF_REG), size_(0), scan_count_(INT64_MAX), marker_(nullptr) {}
+  ObBaseDirEntryOperator()
+      : op_flag_(DOF_REG), size_(0), scan_count_(INT64_MAX),
+        dir_(nullptr), extra_info_()
+  {}
   virtual ~ObBaseDirEntryOperator() = default;
   virtual int func(const dirent *entry) = 0;
-  virtual bool need_get_file_size() const { return false; }
+  virtual bool need_get_file_meta() const { return false; }
   void set_dir_flag() {op_flag_ = DOF_DIR;}
   bool is_dir_scan() {return (op_flag_ == DOF_DIR) ? true : false;}
   void set_size(const int64_t size) { size_ = size; }
   int64_t get_size() const { return size_; }
-  int set_marker_flag(const char *marker, const int64_t scan_count)
+
+  int64_t get_scan_count() { return scan_count_; }
+  int set_dir(const char *dir)
   {
-    // List objects under the specified directory that are lexicographically greater than 'marker',
-    // and the number of objects returned does not exceed op.get_scan_count()
-    // If 'marker' is "", it means
-    // the listing starts from the lexicographically smallest object in the specified directory
-    // If op.get_scan_count() is <= 0,
-    // it indicates there is no upper limit on the number of objects listed
     int ret = OB_SUCCESS;
-    if (OB_ISNULL(marker)) {
+    if (OB_ISNULL(dir) || OB_UNLIKELY(strlen(dir) >= common::MAX_PATH_SIZE)) {
       ret = OB_INVALID_ARGUMENT;
-      OB_LOG(WARN, "fail to set marker", K(ret), KP(marker));
+      OB_LOG(WARN, "invalid argument", KR(ret), K(dir));
     } else {
-      marker_ = marker;
-      op_flag_ = DOF_REG_WITH_MARKER;
-      scan_count_ = scan_count;
+      dir_ = dir;
     }
     return ret;
   }
-  bool is_marker_scan() { return (op_flag_ == DOF_REG_WITH_MARKER) ? true : false; }
-  int64_t get_scan_count() { return scan_count_; }
-  const char *get_marker() const { return marker_; }
-  TO_STRING_KV(K_(op_flag), K_(size), K_(scan_count));
+  const char *get_dir() const { return dir_; }
+  void set_extra_info(const ObFileExtraInfo &extra_info) { extra_info_ = extra_info; }
+  const ObFileExtraInfo &get_extra_info() const { return extra_info_; }
+  void reset_extra_info() { extra_info_.reset(); }
+
+  TO_STRING_KV(K_(op_flag), K_(size), K_(scan_count), K(extra_info_));
 private:
   int op_flag_;
   int64_t size_; // Always set 0 for directory.
   int64_t scan_count_; // Default value is INT64_MAX.
-  const char *marker_;        // Default value is nullptr
+  const char *dir_;
+  ObFileExtraInfo extra_info_;
 };
 
 /*ObStorageType and OB_STORAGE_TYPES_STR should be mapped one by one*/
@@ -92,11 +126,12 @@ enum ObStorageType : uint8_t
 {
   OB_STORAGE_OSS = 0,
   OB_STORAGE_FILE = 1,
-  OB_STORAGE_COS = 2,
-  OB_STORAGE_LOCAL = 3,
-  OB_STORAGE_S3 = 4,
-  OB_STORAGE_LOCAL_CACHE = 5,
-  OB_STORAGE_HDFS = 6,
+  OB_STORAGE_LOCAL = 2,
+  OB_STORAGE_S3 = 3,
+  OB_STORAGE_LOCAL_CACHE = 4,
+  OB_STORAGE_HDFS = 5,
+  OB_STORAGE_AZBLOB = 6,
+  OB_STORAGE_TABLE = 7,
   OB_STORAGE_MAX_TYPE
 };
 
@@ -121,6 +156,7 @@ enum ObStorageAccessType
   OB_STORAGE_ACCESS_MULTIPART_WRITER = 5,
   OB_STORAGE_ACCESS_DIRECT_MULTIPART_WRITER = 6,
   OB_STORAGE_ACCESS_BUFFERED_MULTIPART_WRITER = 7,
+  OB_STORAGE_ACCESS_UTIL = 8,
   OB_STORAGE_ACCESS_MAX_TYPE
 };
 
@@ -169,7 +205,14 @@ struct ObStorageIdMod
     storage_used_mod_ = ObStorageUsedMod::STORAGE_USED_MAX;
   }
 
-  ObStorageInfoType get_category() const { return __storage_table_mapper[static_cast<uint8_t>(storage_used_mod_)]; }
+  ObStorageInfoType get_category() const {
+    ObStorageInfoType res = __storage_table_mapper[static_cast<uint8_t>(ObStorageUsedMod::STORAGE_USED_OTHER)];
+    if (storage_used_mod_ == ObStorageUsedMod::STORAGE_USED_MAX) {
+    } else if (storage_used_mod_ < ObStorageUsedMod::STORAGE_USED_MAX) {
+      res = __storage_table_mapper[static_cast<uint8_t>(storage_used_mod_)];
+    }
+    return res;
+  }
 
   static const ObStorageIdMod get_default_id_mod()
   {
@@ -195,10 +238,36 @@ struct ObStorageIdMod
     return storage_id_mod;
   }
 
+  static const ObStorageIdMod get_default_ddl_id_mod()
+  {
+    static const ObStorageIdMod storage_id_mod(
+        OB_STORAGE_ID_DDL, ObStorageUsedMod::STORAGE_USED_DDL);
+    return storage_id_mod;
+  }
+
+  static const ObStorageIdMod get_default_external_id_mod()
+  {
+    static const ObStorageIdMod storage_id_mod(
+        OB_STORAGE_ID_EXTERNAL, ObStorageUsedMod::STORAGE_USED_EXTERNAL);
+    return storage_id_mod;
+  }
+
+  static const ObStorageIdMod get_default_export_id_mod()
+  {
+    static const ObStorageIdMod storage_id_mod(
+        OB_STORAGE_ID_EXPORT, ObStorageUsedMod::STORAGE_USED_EXPORT);
+    return storage_id_mod;
+  }
+
   TO_STRING_KV(K_(storage_id), K_(storage_used_mod));
 
   uint64_t storage_id_;
   ObStorageUsedMod storage_used_mod_;
+
+public:
+  static const uint64_t OB_STORAGE_ID_DDL = 2000;
+  static const uint64_t OB_STORAGE_ID_EXTERNAL = 2001;
+  static const uint64_t OB_STORAGE_ID_EXPORT = 2002;
 };
 
 }

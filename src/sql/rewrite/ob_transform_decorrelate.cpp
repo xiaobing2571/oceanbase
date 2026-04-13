@@ -761,6 +761,7 @@ int ObTransformDecorrelate::check_transform_aggr_validity(ObDMLStmt *stmt,
     is_valid = false;
     OPT_TRACE("ref query is valid group by");
   } else if (ref_query->has_rollup() ||
+             ref_query->has_grouping_sets() ||
              ref_query->has_having() ||
              NULL != ref_query->get_limit_percent_expr() ||
              NULL != ref_query->get_offset_expr() ||
@@ -855,6 +856,7 @@ int ObTransformDecorrelate::do_transform_aggr_lateral_inline_view(
   ObSEArray<ObRawExpr *, 4> real_values;
   ObSEArray<bool, 4> is_null_prop;
   int64_t idx = 0;
+  bool ref_query_is_scala_group_by = false;
   if (OB_ISNULL(stmt) ||
       OB_ISNULL(ref_query) ||
       OB_ISNULL(table_item) ||
@@ -869,6 +871,8 @@ int ObTransformDecorrelate::do_transform_aggr_lateral_inline_view(
   } else if (table_item->alias_name_.empty() &&
              OB_FALSE_IT(table_item->alias_name_ = table_item->table_name_)) {
     // do nothing
+  } else {
+    ref_query_is_scala_group_by = ref_query->is_scala_group_by();
   }
 
   for (int64_t i = 0; OB_SUCC(ret) && i < pullup_conds.count(); ++i) {
@@ -918,7 +922,7 @@ int ObTransformDecorrelate::do_transform_aggr_lateral_inline_view(
   }
 
   if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(gather_select_item_null_propagate(ref_query, is_null_prop))) {
+  } else if (OB_FAIL(gather_select_item_null_propagate(ref_query, ref_query_is_scala_group_by, is_null_prop))) {
     LOG_WARN("failed to gather select item null propagate", K(ret));
   } else if (OB_FAIL(ObTransformUtils::deduce_query_values(*ctx_,
                                                            *stmt,
@@ -937,7 +941,7 @@ int ObTransformDecorrelate::do_transform_aggr_lateral_inline_view(
     LOG_WARN("failed to decorrelation", K(ret));
   } else if (OB_FAIL(transform_from_list(*stmt,
                                          table_item,
-                                         ref_query->is_scala_group_by(),
+                                         ref_query_is_scala_group_by,
                                          pullup_conds,
                                          from_item_list,
                                          joined_table_list))) {
@@ -947,18 +951,17 @@ int ObTransformDecorrelate::do_transform_aggr_lateral_inline_view(
 }
 
 int ObTransformDecorrelate::gather_select_item_null_propagate(ObSelectStmt *ref_query,
+                                                              bool ref_query_is_scala_group_by,
                                                               ObIArray<bool> &is_null_prop)
 {
   int ret = OB_SUCCESS;
   ObSEArray<const ObRawExpr*, 4> vars;
-  bool is_scala_group_by = false;
+  bool is_scala_group_by = ref_query_is_scala_group_by;
   if (OB_ISNULL(ref_query)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(ret));
   } else if (OB_FAIL(is_null_prop.prepare_allocate(ref_query->get_select_item_size()))) {
     LOG_WARN("failed to prepare allocate case when array", K(ret));
-  } else {
-    is_scala_group_by = ref_query->is_scala_group_by();
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < ref_query->get_select_item_size(); ++i) {
     ObRawExpr *expr = NULL;
@@ -1032,7 +1035,8 @@ bool ObTransformDecorrelate::is_valid_group_by(const ObSelectStmt &ref_query)
   if (ref_query.is_scala_group_by()) {
     is_valid = true;
   } else if (ref_query.get_group_expr_size() > 0 &&
-             ref_query.get_rollup_expr_size() == 0) {
+             ref_query.get_rollup_expr_size() == 0 &&
+             ref_query.get_grouping_sets_items_size() == 0) {
     is_valid = true;
   }
   return is_valid;

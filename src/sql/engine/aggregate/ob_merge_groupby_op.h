@@ -43,7 +43,8 @@ public:
       sort_cmp_funcs_(alloc),
       enable_encode_sort_(false),
       est_rows_per_group_(0),
-      enable_hash_base_distinct_(false)
+      enable_hash_base_distinct_(false),
+      backup_exprs_(alloc)
     {
     }
 
@@ -84,6 +85,7 @@ public:
   bool enable_encode_sort_;
   int64_t est_rows_per_group_;
   bool enable_hash_base_distinct_;
+  ExprFixedArray backup_exprs_;
 };
 
 // 输入数据已经按照groupby列排序

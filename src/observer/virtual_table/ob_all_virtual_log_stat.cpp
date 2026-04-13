@@ -32,10 +32,15 @@ void ObAllVirtualPalfStat::destroy()
 {
 }
 
+ERRSIM_POINT_DEF(ERRSIM_VIRTUAL_LOG_STAT_ERROR);
 int ObAllVirtualPalfStat::inner_get_next_row(common::ObNewRow *&row)
 {
   int ret = OB_SUCCESS;
-  if (false == start_to_read_) {
+  // use for debug
+  if (OB_FAIL(ERRSIM_VIRTUAL_LOG_STAT_ERROR)) {
+    SERVER_LOG(WARN, "ERRSIM_VIRTUAL_LOG_STAT_ERROR is opened, returning OB_SIZE_OVERFLOW");
+  }
+  if (OB_SUCC(ret) && false == start_to_read_) {
     auto func_iterate_tenant = [&]() -> int
     {
       int ret = OB_SUCCESS;
@@ -59,6 +64,8 @@ int ObAllVirtualPalfStat::inner_get_next_row(common::ObNewRow *&row)
                 logservice::ObLogStat log_stat;
                 if (OB_FAIL(log_handler->stat(log_stat.palf_stat_))) {
                   SERVER_LOG(WARN, "ObLogHandler stat failed", K(ret), K(ls->get_ls_id()));
+                  // try another ls
+                  ret = OB_SUCCESS;
                 } else if (OB_FAIL(insert_log_stat_(log_stat, &cur_row_))){
                   SERVER_LOG(WARN, "ObAllVirtualPalfStat insert_log_stat_ failed", K(ret), K(log_stat));
                 } else {

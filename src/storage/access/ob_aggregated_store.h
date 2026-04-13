@@ -18,6 +18,7 @@
 #include "storage/blocksstable/ob_datum_row.h"
 #include "storage/access/ob_pushdown_aggregate.h"
 #include "storage/blocksstable/index_block/ob_index_block_row_struct.h"
+#include "storage/ob_trans_version_skip_index_util.h"
 
 namespace oceanbase
 {
@@ -50,8 +51,7 @@ public:
       const ObTableAccessContext *context,
       const int32_t col_idx,
       blocksstable::ObIMicroBlockReader *reader,
-      const ObPushdownRowIdCtx &pd_row_id_ctx,
-      const bool reserve_memory) override;
+      const ObPushdownRowIdCtx &pd_row_id_ctx) override;
   int eval(blocksstable::ObStorageDatum &datum, const int64_t row_count) override;
   int fill_index_info(const blocksstable::ObMicroIndexInfo &index_info, const bool is_cg) override;
   OB_INLINE bool is_vec() const override { return false; }
@@ -98,6 +98,7 @@ public:
   virtual ~ObAggregatedStore();
   virtual void reset() override;
   virtual void reuse() override;
+  int reuse_for_refresh_table() override;
   int reuse_capacity(const int64_t capacity) override;
   virtual int init(const ObTableAccessParam &param, common::hash::ObHashSet<int32_t> *agg_col_mask = nullptr) override;
   int fill_index_info(const blocksstable::ObMicroIndexInfo &index_info, const bool is_cg) override;
@@ -122,17 +123,29 @@ public:
     //        index_info.can_blockscan(agg_row_.has_lob_column_out()) &&
     //        !index_info.is_left_border() &&
     //        !index_info.is_right_border();
-    can_agg = filter_is_null() &&
-              !agg_row_.check_need_access_data() &&
-              index_info.can_blockscan() &&
-              (!agg_row_.has_lob_column_out() || !index_info.has_lob_out_row()) &&
-              !index_info.is_left_border() &&
-              !index_info.is_right_border();
-    return OB_SUCCESS;
+    int ret = OB_SUCCESS;
+    can_agg = false;
+    ObTransVersionSkipIndexInfo skip_index_info;
+    if (!index_info.is_macro_node() && OB_FAIL(ObTransVersionSkipIndexReader::read_min_max_snapshot(
+            index_info, iter_param_->get_schema_rowkey_count(), skip_index_info))) {
+      LOG_WARN("Failed to read min max snapshot", K(ret), K(index_info), KPC(iter_param_));
+    } else {
+      can_agg = filter_is_null() &&
+                (index_info.is_macro_node() || skip_index_info.min_snapshot_ > context_.trans_version_range_.base_version_) &&
+                !agg_row_.check_need_access_data() &&
+                index_info.can_blockscan() &&
+                (index_info.row_header_->is_major_node() || (iter_param_->enable_inc_skip_index() && index_info.row_header_->is_single_version_rows())) &&
+                (!agg_row_.has_lob_column_out() || !index_info.has_lob_out_row()) &&
+                !index_info.is_left_border() &&
+                !index_info.is_right_border();
+    }
+
+    return ret;
   }
   // OB_INLINE void set_end() override { iter_end_flag_ = IterEndState::ITER_END; }
   int check_agg_in_row_mode(const ObTableIterParam &iter_param);
   bool has_data();
+  int set_ignore_eval_index_info(const bool ignore_eval_index_info) override;
   INHERIT_TO_STRING_KV("ObBlockBatchedRowStore", ObBlockBatchedRowStore, K_(agg_row), K_(agg_flat_row_mode));
 
 private:

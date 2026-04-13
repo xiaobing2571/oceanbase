@@ -25,6 +25,8 @@ int ObLogSubPlanFilter::get_op_exprs(ObIArray<ObRawExpr*> &all_exprs)
     LOG_WARN("failed to get vector expr", K(ret));
   } else if (OB_FAIL(append(all_exprs, subquery_exprs_))) {
     LOG_WARN("failed to append subquery exprs", K(ret));
+  } else if (OB_FAIL(append(all_exprs, project_ref_exprs_))) {
+    LOG_WARN("failed to append project ref exprs", K(ret));
   } else if (OB_FAIL(append(all_exprs, onetime_exprs_))) {
     LOG_WARN("failed to append onetime exprs", K(ret));
   } else if (OB_FAIL(append(all_exprs, exec_params_))) {
@@ -260,6 +262,7 @@ int ObLogSubPlanFilter::do_re_est_cost(EstimateCostInfo &param, double &card, do
     ObBasicCostInfo &cost_info = cost_infos.at(0);
     card = cost_info.rows_ * sel;
     cost_info.rows_ = ObJoinOrder::calc_single_parallel_rows(cost_info.rows_, param.need_parallel_);
+    cost_info.rows_ = max(cost_info.rows_, 1.0);
     ObOptimizerContext &opt_ctx = get_plan()->get_optimizer_context();
     ObSubplanFilterCostInfo info(cost_infos, get_onetime_idxs(), get_initplan_idxs());
     if (OB_FAIL(ObOptEstCost::cost_subplan_filter(info, op_cost, opt_ctx))) {
@@ -521,17 +524,16 @@ int ObLogSubPlanFilter::compute_spf_batch_rescan(bool &can_batch)
       right_allocated_exchange |= child->is_exchange_allocated();
     }
   }
-  if (OB_FAIL(ret) || !can_batch || !has_rescan_subquery) {
+  if (OB_FAIL(ret) || !can_batch || !has_rescan_subquery || right_allocated_exchange) {
     can_batch = false;
   } else if (DistAlgo::DIST_BASIC_METHOD == dist_algo_
              || DistAlgo::DIST_NONE_ALL == dist_algo_
              || DistAlgo::DIST_HASH_ALL == dist_algo_
              || DistAlgo::DIST_RANDOM_ALL == dist_algo_
              || (DistAlgo::DIST_PARTITION_WISE == dist_algo_
-                 && !left_allocated_exchange
-                 && !right_allocated_exchange)) {
+                 && !left_allocated_exchange)) {
     can_batch = true;
-  } else if (DistAlgo::DIST_PULL_TO_LOCAL == dist_algo_ && !right_allocated_exchange) {
+  } else if (DistAlgo::DIST_PULL_TO_LOCAL == dist_algo_) {
     can_batch = true;
   } else {
     can_batch = false;
@@ -712,7 +714,7 @@ int ObLogSubPlanFilter::get_repart_sharding_info(ObLogicalOperator* child_op,
   ObSEArray<ObRawExpr*, 4> src_keys;
   ObSEArray<ObRawExpr*, 4> target_keys;
   ObSEArray<bool, 4> null_safe_info;
-  EqualSets input_esets;
+  TemporaryEqualSets input_esets;
 
   for (int64_t i = 1; OB_SUCC(ret) && i < get_num_of_child(); i++) {
     if (OB_ISNULL(child = get_child(i))) {
@@ -803,7 +805,7 @@ int ObLogSubPlanFilter::rebuild_repart_sharding_info(const ObShardingInfo *input
                        get_plan()->get_allocator().alloc(sizeof(ObShardingInfo))))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate memory", K(ret));
-  } else if (OB_FALSE_IT(out_sharding = new(out_sharding) ObShardingInfo())) {
+  } else if (OB_FALSE_IT(out_sharding = new(out_sharding) ObShardingInfo(get_plan()->get_allocator()))) {
   } else if (OB_FAIL(out_sharding->copy_without_part_keys(*input_sharding))) {
     LOG_WARN("failed to assign sharding info", K(ret));
   } else {
@@ -888,7 +890,8 @@ int ObLogSubPlanFilter::compute_op_parallel_and_server_info()
 int ObLogSubPlanFilter::print_outline_data(PlanText &plan_text)
 {
   int ret = OB_SUCCESS;
-  ObPQSubqueryHint hint;
+  ObArenaAllocator allocator(ObModIds::OB_SQL_COMPILE);
+  ObPQSubqueryHint hint(allocator);
   const ObDMLStmt *stmt = NULL;
   ObString qb_name;
   if (OB_ISNULL(get_plan()) || OB_ISNULL(stmt = get_plan()->get_stmt())) {
@@ -1079,7 +1082,7 @@ int ObLogSubPlanFilter::need_compare_batch_rescan(const ObLogSubPlanFilter &firs
                                                                    range_row_count))) {
         LOG_WARN("failed get rescan path index id", K(ret));
       } else if (!simple_rescan_path) {
-        need_compare = true;
+        need_compare = false;
       } else if (ObJoinOrder::PRUNING_ROW_COUNT_THRESHOLD <= range_row_count) {
         need_compare = false;
       } else if (OB_FAIL(ObOptimizerUtil::get_rescan_path_index_id(op2,
@@ -1089,7 +1092,7 @@ int ObLogSubPlanFilter::need_compare_batch_rescan(const ObLogSubPlanFilter &firs
                                                                    range_row_count))) {
         LOG_WARN("failed get rescan path index id", K(ret));
       } else if (!simple_rescan_path) {
-        need_compare = true;
+        need_compare = false;
       } else if (ObJoinOrder::PRUNING_ROW_COUNT_THRESHOLD <= range_row_count) {
         need_compare = false;
       } else if (first_table_id == second_table_id && first_index_id == second_index_id) {

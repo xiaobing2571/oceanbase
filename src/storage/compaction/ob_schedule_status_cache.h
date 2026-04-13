@@ -12,6 +12,7 @@
 #include "share/scn.h"
 #include "storage/compaction/ob_compaction_schedule_util.h"
 #include "storage/compaction/ob_batch_freeze_tablets_dag.h"
+#include "storage/compaction/ob_tenant_status_cache.h"
 #include "storage/tx_storage/ob_ls_handle.h"
 namespace oceanbase
 {
@@ -31,6 +32,9 @@ struct ObLSStatusCache final
     CAN_MERGE = 0,
     WEAK_READ_TS_NOT_READY,
     OFFLINE_OR_DELETED,
+    RESTORE_NOT_READY,     //FARM COMPAT WHITELIST
+    ALLOW_EMERGENCY_MERGE, //FARM COMPAT WHITELIST
+    LOOP_NOT_READY_LS,
     STATE_MAX,
   };
   static const char *ls_state_to_str(const LSState &state);
@@ -46,11 +50,11 @@ struct ObLSStatusCache final
       state_(STATE_MAX)
   {}
   ~ObLSStatusCache() {}
-  int init_for_major(const int64_t merge_version, storage::ObLSHandle &ls_handle);
-  bool can_merge() const { return CAN_MERGE == state_; }
+  int init_for_major(const int64_t merge_version, const int64_t loop_cnt, storage::ObLSHandle &ls_handle);
+  bool can_merge() const { return CAN_MERGE == state_ || LOOP_NOT_READY_LS == state_; }
   void reset();
-  int check_restore_status(storage::ObLS &ls);
   static void check_ls_state(storage::ObLS &ls, LSState &state);
+  static bool is_restore_ready_for_merge(storage::ObLS &ls);
   static bool check_weak_read_ts_ready(
       const int64_t &merge_version,
       storage::ObLS &ls);
@@ -79,6 +83,8 @@ public:
     NO_MAJOR_SSTABLE,
     INVALID_LS_STATE, // for ss
     TENANT_SKIP_MERGE,
+    RESTORE_STATUS_NOT_READY, //FARM COMPAT WHITELIST
+    EMERGENCY_MERGE_REQUIRED, //FARM COMPAT WHITELIST
     EXECUTE_STATE_MAX,
   };
   static const char *tablet_execute_state_to_str(const TabletExecuteState &state);
@@ -103,14 +109,15 @@ public:
   {
     return state >= CAN_SCHEDULE_NEW_ROUND && state < NEW_ROUND_STATE_MAX;
   }
-  ObTabletStatusCache()
+  ObTabletStatusCache(ObTenantStatusCache &tenant_status_snapshot)
     : tablet_id_(),
       allocator_(ObMemAttr(MTL_ID(), "MediumList")),
       medium_list_(nullptr),
       tablet_merge_finish_(false),
       execute_state_(EXECUTE_STATE_MAX),
       new_round_state_(NEW_ROUND_STATE_MAX),
-      is_inited_(false)
+      is_inited_(false),
+      tenant_status_snapshot_(tenant_status_snapshot)
   {}
   virtual ~ObTabletStatusCache() { destroy(); }
   void destroy()
@@ -123,16 +130,27 @@ public:
     storage::ObLS &ls,
     const int64_t merge_version,
     const storage::ObTablet &tablet,
-    const bool is_remote_tenant,
     const bool ls_could_schedule_new_round);
   int init_for_diagnose(
     storage::ObLS &ls,
     const int64_t merge_version,
     const storage::ObTablet &tablet);
-  bool can_merge() const { return CAN_MERGE == execute_state_; }
+  bool is_inited() const { return is_inited_; }
+  static int check_unfinished_inc_major(
+    storage::ObLS &ls,
+    const int64_t schedule_scn,
+    const storage::ObTablet &tablet,
+    bool &exists_unfinished_inc_major);
+  bool can_merge() const {
+    return CAN_MERGE == execute_state_ || EMERGENCY_MERGE_REQUIRED == execute_state_;
+  }
   bool need_diagnose() const;
   bool could_schedule_new_round() const { return can_merge() && inner_check_new_round_state(); }
   bool tablet_merge_finish() const { return tablet_merge_finish_; }
+
+  bool is_emergency_merge_required() const { return EMERGENCY_MERGE_REQUIRED == execute_state_; }
+  bool is_restore_status_blocking() const { return RESTORE_STATUS_NOT_READY == execute_state_; }
+  static int get_tablet_inc_major_sstable_count(const storage::ObTablet &tablet, int64_t &sstable_count);
 
   // CAREFUL! medium list may be NULL for some situation
   const compaction::ObMediumCompactionInfoList *medium_list() const { return medium_list_; }
@@ -148,8 +166,8 @@ protected:
   bool inner_check_new_round_state() const { return CAN_SCHEDULE_NEW_ROUND == new_round_state_; }
   int inner_init_state(
     const int64_t merge_version,
-    const storage::ObTablet &tablet,
-    const bool is_remote_tenant);
+    ObLS &ls,
+    const storage::ObTablet &tablet);
   int check_medium_list(
     const share::ObLSID &ls_id,
     const storage::ObTablet &tablet,
@@ -163,6 +181,9 @@ protected:
   int update_tablet_report_status(
     storage::ObLS &ls,
     const storage::ObTablet &tablet);
+  int check_execute_state_for_remote_tablet_(
+    storage::ObLS &ls,
+    const ObTablet &tablet);
   static const int64_t PRINT_LOG_INVERVAL = 2 * 60 * 1000 * 1000L; // 2m
 protected:
   common::ObTabletID tablet_id_;
@@ -172,6 +193,7 @@ protected:
   TabletExecuteState execute_state_;
   TabletScheduleNewRoundState new_round_state_;
   bool is_inited_;
+  ObTenantStatusCache &tenant_status_snapshot_;
 };
 
 } // namespace compaction

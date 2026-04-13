@@ -13,6 +13,7 @@
 #define USING_LOG_PREFIX STORAGE
 #include "ob_imicro_block_reader.h"
 #include "index_block/ob_index_block_row_struct.h"
+#include "storage/access/ob_table_access_context.h"
 
 namespace oceanbase
 {
@@ -197,7 +198,19 @@ int ObIMicroBlockReader::filter_white_filter(
       case sql::WHITE_OP_BT: {
         int cmp_ret_0 = 0;
         int cmp_ret_1 = 0;
-        if (OB_UNLIKELY(ref_datums.count() != 2)) {
+        bool need_compare = true;
+        if (filter.is_filter_dynamic_node()) {
+          const sql::ObDynamicFilterExecutor &dynamic_filter =
+              static_cast<const sql::ObDynamicFilterExecutor &>(filter);
+          if (!dynamic_filter.is_data_prepared() || dynamic_filter.is_pass_all_data()) {
+            filtered = false;
+            need_compare = false;
+          } else if (dynamic_filter.is_filter_all_data()) {
+            need_compare = false;
+          }
+        }
+        if (!need_compare) {
+        } else if (OB_UNLIKELY(ref_datums.count() != 2)) {
           ret = OB_INVALID_ARGUMENT;
           LOG_WARN("Invalid argument for between operators", K(ret), K(ref_datums));
         } else if (datum.is_null()) {
@@ -230,5 +243,87 @@ int ObIMicroBlockReader::filter_white_filter(
   }
   return ret;
 }
+
+int ObIMicroBlockReader::get_column_datum(
+      const ObTableIterParam &iter_param,
+      const ObTableAccessContext &context,
+      const share::schema::ObColumnParam &col_param,
+      const int32_t col_offset,
+      const int64_t row_index,
+      ObStorageDatum &datum)
+{
+  INIT_SUCC(ret);
+  if (OB_FAIL(get_raw_column_datum(col_offset, row_index, datum))) {
+    LOG_WARN("Failed to get raw column datum", K(col_offset), K(row_index));
+  } else if (col_param.get_meta_type().is_lob_storage() && !datum.is_null() &&
+             !datum.get_lob_data().in_row_) {
+    if (OB_FAIL(context.lob_locator_helper_->fill_lob_locator_v2(
+            datum, col_param, iter_param, context))) {
+      LOG_WARN("Failed to fill lob loactor",
+               K(ret),
+               K(datum),
+               K(context),
+               K(iter_param));
+    }
+  }
+  return ret;
+}
+
+int ObIMicroBlockReader::get_logical_row_cnt(const int64_t last, int64_t &row_idx,
+                                  int64_t &row_cnt)
+{
+  int ret = OB_SUCCESS;
+  const ObRowHeader *row_header = nullptr;
+  int64_t row_count;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("reader not init", K(ret));
+  } else if (OB_FAIL(get_row_count(row_count))) {
+    LOG_WARN("Failed to get row count");
+  } else if (last >= row_count) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(row_idx), K(last));
+  } else {
+    while (OB_SUCC(ret) && row_idx <= last) {
+      MultiVersionInfo multi_version_info;
+      if (OB_FAIL(get_multi_version_info(row_idx, multi_version_info))) {
+        LOG_WARN("Failed to get multi version info", K(row_idx), K(row_count));
+      } else if (multi_version_info.mvcc_row_flag_.is_first_multi_version_row()) {
+        row_cnt += multi_version_info.dml_row_flag_.get_delta();
+      }
+      row_idx++;
+    }
+  }
+  return ret;
+}
+
+
+int ObMicroBlockData::init_with_prepare_micro_header(
+    const char *buf,
+    const int64_t size)
+{
+  int ret = OB_SUCCESS;
+  buf_ = buf;
+  size_ = size;
+  if (nullptr != buf && size > 0) {
+    if (OB_FAIL(prepare_micro_header())) {
+      LOG_WARN("failed to deserialize micro header", KR(ret));
+      reset();
+    }
+  }
+  return ret;
+}
+
+int ObMicroBlockData::prepare_micro_header()
+{
+  int ret = OB_SUCCESS;
+  ObMicroBlockHeader::simple_cast(buf_, micro_header_);
+  if (OB_UNLIKELY(nullptr == micro_header_ || !micro_header_->is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid micro header", KR(ret), KP_(buf), KPC(micro_header_));
+  }
+  return ret;
+}
+
 }
 }

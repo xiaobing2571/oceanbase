@@ -16,6 +16,7 @@
 #include "share/aggregate/agg_ctx.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
 #include "sql/engine/basic/ob_compact_row.h"
+#include "agg_reuse_cell.h"
 
 namespace oceanbase
 {
@@ -30,14 +31,15 @@ public:
   Processor(sql::ObEvalCtx &eval_ctx, ObIArray<ObAggrInfo> &aggr_infos, const lib::ObLabel &label,
             sql::ObMonitorNode &monitor_info, const int64_t tenant_id) :
     inited_(false),
-    support_fast_single_row_agg_(false), has_distinct_(false), has_order_by_(false), dir_id_(-1),
+    has_distinct_(false), has_order_by_(false), dir_id_(-1),
     op_eval_infos_(nullptr),
     allocator_(label, OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id, ObCtxIds::WORK_AREA),
     agg_ctx_(eval_ctx, tenant_id, aggr_infos, label),
     aggregates_(allocator_, aggr_infos.count()),
     fast_single_row_aggregates_(allocator_, aggr_infos.count()), extra_rt_info_buf_(nullptr),
     cur_extra_rt_info_idx_(0), add_one_row_fns_(allocator_, aggr_infos.count()),
-    cur_batch_group_idx_(0), cur_batch_group_buf_(nullptr)
+    cur_batch_group_idx_(0), cur_batch_group_buf_(nullptr),
+    reuse_aggrow_mgr_(allocator_, aggr_infos.count())
   {
     agg_ctx_.op_monitor_info_ = &monitor_info;
   }
@@ -133,14 +135,10 @@ public:
   {
     __builtin_prefetch(row, 0/* read */, 2 /*high temp locality*/);
   }
-  inline void set_support_fast_single_row_agg(const bool support_fast_single_row_agg)
-  {
-    support_fast_single_row_agg_ = support_fast_single_row_agg;
-  }
 
   inline bool support_fast_single_row_agg() const
   {
-    return support_fast_single_row_agg_;
+    return true;
   }
 
   inline void set_dir_id(const int64_t dir_id)
@@ -180,8 +178,12 @@ public:
     for (int i = 0; supported && i < aggr_exprs.count(); i++) {
       ObAggFunRawExpr *agg_expr = static_cast<ObAggFunRawExpr *>(aggr_exprs.at(i));
       OB_ASSERT(agg_expr != NULL);
-      supported = aggregate::supported_aggregate_function(agg_expr->get_expr_type(),
-                                                          use_hash_rollup, has_rollup);
+      if (agg_expr->is_param_distinct() && (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_3_3_0)) {
+        supported = false;
+      } else {
+        supported = aggregate::supported_aggregate_function(agg_expr->get_expr_type(),
+							    use_hash_rollup, has_rollup);
+      }
     }
     return supported;
   }
@@ -216,6 +218,8 @@ public:
   int init_one_aggr_row(const RowMeta &row_meta, ObCompactRow *&row, ObIAllocator &extra_allocator,
                         const int64_t group_id = 0);
   int reuse_group(const int64_t group_id);
+
+  static int reuse_agg_row(AggrRowPtr agg_row, RuntimeContext &agg_ctx, ReuseAggCellMgr &reuse_mgr);
 
   int init_fast_single_row_aggs();
   bool has_extra() const { return agg_ctx_.has_extra_; }
@@ -286,7 +290,6 @@ private:
   using add_one_row_fn = int (*)(IAggregate *, RuntimeContext &, const int32_t, AggrRowPtr,
                                  ObIVector *, const int64_t, const int64_t);
   bool inited_;
-  bool support_fast_single_row_agg_;
   bool has_distinct_;
   bool has_order_by_;
   int64_t dir_id_;
@@ -301,6 +304,7 @@ private:
   ObFixedArray<add_one_row_fn, ObIAllocator> add_one_row_fns_;
   int64_t cur_batch_group_idx_;
   char *cur_batch_group_buf_;
+  ReuseAggCellMgr reuse_aggrow_mgr_;
   // ObFixedArray<typename T>
 };
 } // end aggregate

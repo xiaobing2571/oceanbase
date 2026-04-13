@@ -45,7 +45,8 @@ enum class ObFreezeSourceFlag : int64_t
   TEST_MODE           = 13, // used for test only
   TABLET_SPLIT        = 14,
   GC_TABLET           = 15,
-  MAX_SOURCE          = 16,
+  MIGRATION           = 16,
+  MAX_SOURCE          = 17,
 };
 
 static const int64_t MAX_FREEZE_SOURCE_TYPE_COUNT = static_cast<int64_t>(ObFreezeSourceFlag::MAX_SOURCE);
@@ -56,7 +57,7 @@ inline bool is_valid_freeze_source(const ObFreezeSourceFlag source)
     && source < ObFreezeSourceFlag::MAX_SOURCE;
 }
 
-inline const char *obj_to_cstring(const ObFreezeSourceFlag type)
+static inline const char *obj_to_cstring(const ObFreezeSourceFlag type)
 {
   const char *ret = "INVALID";
   switch (type) {

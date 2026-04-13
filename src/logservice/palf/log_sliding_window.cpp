@@ -65,16 +65,18 @@ LogSlidingWindow::LogSlidingWindow()
     log_engine_(NULL),
     plugins_(NULL),
     lsn_allocator_(),
+    group_buffer_lock_(common::ObLatchIds::PALF_SW_GROUP_BUFFER_LOCK),
     group_buffer_(),
     last_submit_info_lock_(common::ObLatchIds::PALF_SW_SUBMIT_INFO_LOCK),
     last_submit_lsn_(),
     last_submit_end_lsn_(),
     last_submit_log_id_(OB_INVALID_LOG_ID),
     last_submit_log_pid_(INVALID_PROPOSAL_ID),
-    max_flushed_info_lock_(),
+    max_flushed_info_lock_(common::ObLatchIds::OB_PALF_SW_MAX_FLUSHED_INFO_LOCK),
     max_flushed_lsn_(),
     max_flushed_end_lsn_(),
     max_flushed_log_pid_(INVALID_PROPOSAL_ID),
+    committed_info_lock_(common::ObLatchIds::OB_PALF_SW_COMMITTED_INFO_LOCK),
     committed_end_lsn_(),
     last_slide_info_lock_(common::ObLatchIds::PALF_SW_SLIDE_INFO_LOCK),
     last_slide_log_id_(OB_INVALID_LOG_ID),
@@ -593,7 +595,7 @@ int LogSlidingWindow::wait_group_buffer_ready_(const LSN &lsn, const int64_t dat
       sleep_us = MAX_SLEEP_US;
     }
     ob_usleep(sleep_us);
-    PALF_LOG(WARN, "usleep wait", K_(palf_id), K_(self), K(lsn), K(data_len), K(curr_committed_end_lsn));
+    PALF_LOG(WARN, "ob_usleep wait", K_(palf_id), K_(self), K(lsn), K(data_len), K(curr_committed_end_lsn));
     get_committed_end_lsn_(curr_committed_end_lsn);
   }
   return ret;

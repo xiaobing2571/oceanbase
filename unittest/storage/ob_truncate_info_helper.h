@@ -26,10 +26,20 @@ class ObArenaAllocator;
 class ObRowkey;
 class ObTabletID;
 struct ObVersionRange;
+class ObMySQLProxy;
+namespace sqlclient
+{
+class ObISQLConnection;
+}
 }
 namespace share
 {
 class ObLSID;
+namespace schema
+{
+class ObSchemaGetterGuard;
+class ObTableSchema;
+}
 }
 namespace storage
 {
@@ -94,13 +104,20 @@ public:
     }
   static int read_distinct_truncate_info_array(
     common::ObArenaAllocator &allocator,
-    ObTablet &tablet,
+    const share::ObLSID &ls_id,
+    const common::ObTabletID &tablet_id,
     const common::ObVersionRange &read_version_range,
     storage::ObTruncateInfoArray &truncate_info_array);
   static int batch_mock_truncate_info(
     common::ObArenaAllocator &allocator,
     const char *key_data,
     storage::ObTruncateInfoArray &truncate_info_array);
+
+  static int get_table_schema(
+    const uint64_t tenant_id,
+    share::schema::ObSchemaGetterGuard &schema_guard,
+    const int64_t table_id,
+    const share::schema::ObTableSchema *&table_schema);
 };
 
 } // storage

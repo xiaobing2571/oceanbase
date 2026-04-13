@@ -195,7 +195,7 @@ int ObAllVirtualTenantParameterStat::update_seed()
       SERVER_LOG(WARN, "seed config init failed", K(ret));
     } else if (OB_FAIL(sql_client_retry_weak.read(result, OB_SYS_TENANT_ID, from_seed))) {
       SERVER_LOG(WARN, "read config from __all_seed_parameter failed", K(from_seed), K(ret));
-    } else if (OB_FAIL(seed_config_.update_local(ObSystemConfig::INIT_VERSION, result, false))) {
+    } else if (OB_FAIL(seed_config_.update_local(ObSystemConfig::INIT_VERSION, result))) {
       SERVER_LOG(WARN, "update seed config failed", K(ret));
     } else {
       tenant_iter_ = seed_config_.get_container().begin();
@@ -289,6 +289,18 @@ int ObAllVirtualTenantParameterStat::fill_row_(common::ObNewRow *&row,
                            K(tenant_id), K(data_version));
               } else {
                 cells[i].set_varchar(dv_buf);
+              }
+            } else if (0 == ObString("_parallel_ddl_control").case_compare(iter->first.str())) {
+              ObParallelDDLControlMode ddl_mode;
+              if (OB_FAIL(ddl_mode.parse_from_config_string(iter->second->str()))) {
+                SERVER_LOG(WARN, "fail to parse config", KR(ret));
+              } else {
+                ObString deep_str;
+                if (OB_FAIL(ddl_mode.to_config_string(*allocator_, deep_str))) {
+                  SERVER_LOG(WARN, "fail to build string", KR(ret));
+                } else {
+                  cells[i].set_varchar(deep_str);
+                }
               }
             } else {
               if (!is_sys_tenant(effective_tenant_id_) &&

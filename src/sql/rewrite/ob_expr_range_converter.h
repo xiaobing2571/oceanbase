@@ -15,7 +15,6 @@
 #include "sql/rewrite/ob_query_range_define.h"
 
 
-
 namespace oceanbase
 {
 namespace sql
@@ -47,6 +46,7 @@ public:
                            int64_t expr_depth,
                            ObRangeNode *&range_node);
   int convert_is_expr(const ObRawExpr *expr, int64_t expr_depth, ObRangeNode *&range_node);
+  int convert_is_not_expr(const ObRawExpr *expr, int64_t expr_depth, ObRangeNode *&range_node);
 
   int convert_between_expr(const ObRawExpr *expr, int64_t expr_depth, ObRangeNode *&range_node);
   int convert_not_between_expr(const ObRawExpr *expr, int64_t expr_depth, ObRangeNode *&range_node);
@@ -67,6 +67,8 @@ public:
                                const int64_t start_val_idx,
                                const int64_t end_val_idx,
                                ObRangeNode &range_node) const;
+  int fill_range_node_for_is_not_null(const int64_t key_idx,
+                                   ObRangeNode &range_node) const;
 
   int check_expr_precise(const ObRawExpr &const_expr,
                          const ObObjMeta &calc_type,
@@ -78,10 +80,9 @@ public:
 
   int sort_range_exprs(const ObIArray<ObRawExpr*> &range_exprs,
                        ObIArray<ObRawExpr*> &out_range_exprs);
-  static int is_implicit_collation_range_valid(ObItemType cmp_type,
-                                               ObCollationType l_collation,
-                                               ObCollationType r_collation,
-                                               bool &is_valid);
+  static int is_precise_json_contains(ObExecContext &exec_ctx,
+                                      const ObObj &json_value,
+                                      bool &is_precise);
 private:
   ObExprRangeConverter();
   int alloc_range_node(ObRangeNode *&range_node);
@@ -114,6 +115,10 @@ private:
                                const ObRawExprResType &res_type,
                                int64_t expr_depth,
                                ObRangeNode *&range_node);
+  int get_single_json_in_range_node(const ObRawExpr *json_expr,
+                                    const ObRawExpr *r_expr,
+                                    int64_t expr_depth,
+                                    ObRangeNode *&range_node);
   int get_row_in_range_ndoe(const ObRawExpr &l_expr,
                             const ObRawExpr &r_expr,
                             const ObRawExprResType &res_type,
@@ -135,20 +140,23 @@ private:
                        int64_t expr_depth,
                        ObRangeNode *&range_node);
   int gen_is_null_range_node(const ObRawExpr *l_expr, int64_t expr_depth, ObRangeNode *&range_node);
+  int gen_is_not_null_range_node(const ObRawExpr *l_expr, int64_t expr_depth, ObRangeNode *&range_node);
 
   int check_escape_valid(const ObRawExpr *escape, char &escape_ch, bool &is_valid);
   int build_decode_like_expr(ObRawExpr *pattern, ObRawExpr *escape, char escape_ch,
                              ObRangeColumnMeta *column_meta, int64_t &start_val_idx, int64_t &end_val_idx);
   int get_calculable_expr_val(const ObRawExpr *expr, ObObj &val, bool &is_valid, const bool ignore_error = true);
   int check_calculable_expr_valid(const ObRawExpr *expr, bool &is_valid, const bool ignore_error = true);
-  int add_precise_constraint(const ObRawExpr *expr, bool is_precise);
+  int add_precise_constraint(const ObRawExpr *expr, bool is_precise, char escape);
   int add_prefix_pattern_constraint(const ObRawExpr *expr);
+  int add_json_contains_constraint(const ObRawExpr *expr, bool is_precise);
   int get_final_expr_idx(const ObRawExpr *expr,
                          const ObRangeColumnMeta *column_meta,
                          int64_t &idx);
   int get_final_in_array_idx(InParam *&in_param, int64_t &idx);
   bool is_range_key(const uint64_t column_id, int64_t &key_idx);
-  ObRangeColumnMeta* get_column_meta(int64_t idx);
+  // for search index, specify get_def_meta to get def column meta
+  ObRangeColumnMeta* get_column_meta(int64_t idx, bool get_def_meta = false);
   int try_wrap_lob_with_substr(const ObRawExpr *expr,
                                const ObRangeColumnMeta *column_meta,
                                const ObRawExpr *&out_expr);
@@ -236,6 +244,63 @@ private:
                                           const ObExprResType &result_type,
                                           int64_t expr_depth,
                                           ObRangeNode *&range_node);
+  int can_be_extract_orcl_spatial_range(const ObRawExpr *const_expr,
+                                        bool &can_extract);
+  int get_orcl_spatial_range_node(const ObRawExpr &l_expr,
+                                  const ObRawExpr &r_expr,
+                                  int64_t expr_depth,
+                                  ObRangeNode *&range_node);
+  int get_orcl_spatial_relationship(const ObRawExpr *const_expr,
+                                    bool &can_extract,
+                                    ObDomainOpType& real_op_type);
+  int add_string_equal_expr_constraint(const ObRawExpr *const_expr,
+                                       const ObString &val);
+  static bool is_json_access_expr(const ObRawExpr &expr);
+  int get_json_access_expr_range(const ObRawExpr *l_expr,
+                                 const ObRawExpr *r_expr,
+                                 ObItemType cmp_type,
+                                 int64_t expr_depth,
+                                 ObRangeNode *&range_node);
+  int preprocess_json_access_expr(const ObRawExpr *json_expr,
+                                  const ObItemType op_type,
+                                  const ObRawExpr *&new_expr,
+                                  bool &can_extract,
+                                  const ObRawExpr *const_expr = nullptr);
+  int get_final_search_index_value_param_idx(const ObRawExpr &const_expr,
+                                             const ObObjType *cmp_type,
+                                             int64_t &value_param_idx);
+  int gen_search_index_cmp_node(const ObColumnRefRawExpr &column_expr,
+                                const ObRawExpr *const_expr,
+                                ObItemType cmp_type,
+                                bool null_safe,
+                                bool &is_valid,
+                                ObRangeNode *&range_node);
+  int fill_scalar_search_index_range_node(const ObColumnRefRawExpr &column_expr,
+                                          const int64_t value_param_idx,
+                                          ObItemType cmp_type,
+                                          bool null_safe,
+                                          ObRangeNode *&range_node);
+
+  int fill_json_search_index_range_node(const ObColumnRefRawExpr &column_expr,
+                                        const ObRawExpr &const_expr,
+                                        ObItemType cmp_type,
+                                        bool null_safe,
+                                        ObRangeNode *&range_node);
+
+  static bool domain_expr_can_use_search_index(const ObRawExpr *domain_expr);
+  int get_domain_param_expr(const ObRawExpr &domain_expr, const ObColumnRefRawExpr *&column_expr,
+                            const ObRawExpr *&const_expr, bool &can_extract);
+  int convert_domain_expr_on_search_index(const ObRawExpr *domain_expr, int64_t expr_depth,
+                                          ObRangeNode *&range_node);
+  int fill_search_index_member_of_range_node(const ObColumnRefRawExpr &column_expr,
+                                             const ObRawExpr &const_expr,
+                                             ObRangeNode *&range_node);
+  int fill_search_index_domain_range_node(const ObColumnRefRawExpr &column_expr,
+                                          const ObRawExpr &const_expr,
+                                          common::ObDomainOpType op_type,
+                                          bool with_path,
+                                          ObRangeNode *&range_node);
+
 private:
   ObIAllocator &allocator_;
   ObQueryRangeCtx &ctx_;

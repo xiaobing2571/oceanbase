@@ -277,7 +277,9 @@ int ObTenantMdsService::for_each_mds_table_in_ls(ObLS &ls, const ObFunction<int(
   int64_t mds_table_total_num = 0;
   MdsTableMgrHandle mgr_handle;
   ObArray<ObTabletID> ids_in_t3m_array;
-  if (MDS_FAIL(ls.get_mds_table_mgr(mgr_handle))) {
+  if (ObReplicaTypeCheck::is_log_replica(ls.get_replica_type())) {
+    MDS_LOG_NONE(TRACE, "skip logonly replica", K(ls));
+  } else if (MDS_FAIL(ls.get_mds_table_mgr(mgr_handle))) {
     MDS_LOG_NONE(WARN, "fail to get mds table mgr");
   } else if (MDS_FAIL(mgr_handle.get_mds_table_mgr()->for_each_in_t3m_mds_table(
     [&mds_table_total_num, &ids_in_t3m_array, &ls](MdsTableBase &mds_table) -> int {// with map's bucket lock protected
@@ -367,11 +369,11 @@ int ObTenantMdsTimer::try_recycle_mds_table_(ObTablet &tablet,
   #define PRINT_WRAPPER KR(ret), K(tablet.get_tablet_meta().tablet_id_), K(tablet_oldest_scn), KPC(this)
   int ret = OB_SUCCESS;
   const ObTabletPointerHandle &pointer_handle = tablet.get_pointer_handle();
-  ObTabletBasePointer *tablet_pointer = pointer_handle.get_resource_ptr();
+  ObTabletPointer *tablet_pointer = pointer_handle.get_tablet_pointer();
   MDS_TG(5_ms);
   if (OB_ISNULL(tablet_pointer)) {
     ret = OB_BAD_NULL_ERROR;
-    MDS_LOG_GC(ERROR, "down cast to tablet pointer failed");
+    MDS_LOG_GC(ERROR, "down cast to tablet pointer failed", K(pointer_handle));
   } else if (MDS_FAIL(tablet_pointer->try_release_mds_nodes_below(tablet_oldest_scn))) {
     MDS_LOG_GC(WARN, "fail to release mds nodes");
   } else {
@@ -386,11 +388,11 @@ int ObTenantMdsTimer::try_gc_mds_table_(ObTablet &tablet)
   #define PRINT_WRAPPER KR(ret), K(tablet.get_tablet_meta().tablet_id_), KPC(this)
   int ret = OB_SUCCESS;
   const ObTabletPointerHandle &pointer_handle = tablet.get_pointer_handle();
-  ObTabletBasePointer *tablet_pointer = pointer_handle.get_resource_ptr();
+  ObTabletPointer *tablet_pointer = pointer_handle.get_tablet_pointer();
   MDS_TG(5_ms);
   if (OB_ISNULL(tablet_pointer)) {
     ret = OB_BAD_NULL_ERROR;
-    MDS_LOG_GC(ERROR, "down cast to tablet pointer failed");
+    MDS_LOG_GC(ERROR, "down cast to tablet pointer failed", K(pointer_handle));
   } else if (MDS_FAIL(tablet_pointer->try_gc_mds_table())) {
     if (OB_EAGAIN != ret) {
       MDS_LOG_GC(WARN, "try gc mds table failed");

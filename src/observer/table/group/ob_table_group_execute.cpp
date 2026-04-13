@@ -14,7 +14,7 @@
 #include "ob_table_group_execute.h"
 #include "observer/table/ob_table_move_response.h"
 #include "ob_table_tenant_group.h"
-#include "storage/memtable/ob_lock_wait_mgr.h"
+#include "storage/lock_wait_mgr/ob_lock_wait_mgr.h"
 
 using namespace oceanbase::observer;
 using namespace oceanbase::transaction;
@@ -347,7 +347,11 @@ int ObTableOpProcessor::init_batch_params(ObTableBatchCtx &batch_ctx,
     batch_ctx.credential_ = &group_ctx_->credential_;
     for (int64_t i = 0; i < ops_->count() && OB_SUCC(ret); i++) {
       ObTableOp *single_op = static_cast<ObTableOp *>(ops_->at(i));
-      if (OB_FAIL(batch_ops.push_back(single_op->op_))) {
+      ObITableEntity *entity = nullptr;
+      if (OB_FAIL(single_op->op_.get_entity(entity))) {
+        LOG_WARN("fail to get entity", K(ret), K(i));
+      } else if (FALSE_IT(entity->set_allocator(&single_op->get_allocator()))) {
+      } else if (OB_FAIL(batch_ops.push_back(single_op->op_))) {
         LOG_WARN("fail to push back table operation", K(single_op->op_), K(i));
       } else if (OB_FAIL(batch_ctx.tablet_ids_.push_back(single_op->tablet_id()))) {
         LOG_WARN("fail to push back tablet id", K(ret), K(single_op->tablet_id()), K(i));
@@ -396,10 +400,11 @@ int ObTableOpProcessor::init_table_ctx(ObTableBatchCtx &batch_ctx)
     LOG_WARN("fail to init table tb_ctx common part", K(ret),
               KPC(batch_ctx.credential_), K(group_ctx_->timeout_ts_));
   } else {
+    bool is_weak_read = batch_ctx.consistency_level_ == ObTableConsistencyLevel::EVENTUAL;
     switch (op_type) {
       case ObTableOperationType::GET: {
-        if (OB_FAIL(tb_ctx.init_get())) {
-          LOG_WARN("fail to init get tb_ctx", K(ret), K(tb_ctx));
+        if (OB_FAIL(tb_ctx.init_get(is_weak_read))) {
+          LOG_WARN("fail to init get tb_ctx", K(ret), K(tb_ctx), K(is_weak_read));
         }
         break;
       }

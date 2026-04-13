@@ -18,6 +18,7 @@
 #include "lib/string/ob_string.h"
 #include "deps/oblib/src/common/ob_field.h"
 #include "observer/ob_server_struct.h"
+#include "rpc/obmysql/packet/ompk_eof.h"
 
 namespace oceanbase
 {
@@ -70,18 +71,32 @@ public:
                                     bool has_more_result,
                                     bool &can_retry,
                                     int64_t fetch_limit  = common::OB_INVALID_COUNT);
+  virtual int send_eof_packet(bool has_more_result);
+  virtual int seal_eof_packet(bool has_more_result, obmysql::OMPKEOF& eofp);
   ObIMPPacketSender& get_packet_sender() { return sender_; }
   int response_query_header(const ColumnsFieldIArray &fields,
                                     bool has_more_result = false,
                                     bool need_set_ps_out = false,
                                     bool ps_cursor_execute = false,
                                     sql::ObResultSet *result = NULL);
-  int convert_string_value_charset(common::ObObj& value, sql::ObResultSet &result, ObCharsetType charset_type, ObCharsetType nchar);
-  int convert_lob_value_charset(common::ObObj& value, sql::ObResultSet &result, ObCharsetType charset_type, ObCharsetType nchar);
-  int convert_text_value_charset(common::ObObj& value, sql::ObResultSet &result, ObCharsetType charset_type, ObCharsetType nchar);
+  int convert_string_value_charset(common::ObObj& value, sql::ObResultSet &result,
+                                   ObCharsetType charset_type, ObCharsetType nchar,
+                                   common::ObIAllocator *alloc = NULL);
+  int convert_lob_value_charset(common::ObObj& value, sql::ObResultSet &result,
+                                ObCharsetType charset_type, ObCharsetType nchar,
+                                common::ObIAllocator *alloc = NULL);
+  int convert_text_value_charset(common::ObObj& value, sql::ObResultSet &result,
+                                 ObCharsetType charset_type, ObCharsetType nchar,
+                                 common::ObIAllocator *alloc = NULL);
+  int convert_extend_value_charset(common::ObObj& value, sql::ObResultSet &result,
+                                   ObCharsetType charset_type, ObCharsetType nchar);
+  int convert_value_charset(common::ObObj& value, sql::ObResultSet &result,
+                            ObCharsetType charset_type, ObCharsetType nchar,
+                            common::ObIAllocator *alloc = NULL);
 
   int convert_lob_locator_to_longtext(common::ObObj& value, sql::ObResultSet &result);
-  int process_lob_locator_results(common::ObObj& value, sql::ObResultSet &result);
+  int process_lob_locator_results(common::ObObj& value, sql::ObResultSet &result,
+                                  common::ObIAllocator *alloc = NULL);
   static int convert_lob_locator_to_longtext(common::ObObj& value, 
                                              bool is_use_lob_locator, 
                                              common::ObIAllocator *allocator);

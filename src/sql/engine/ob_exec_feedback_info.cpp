@@ -11,6 +11,7 @@
  */
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/ob_exec_feedback_info.h"
+#include "share/ob_define.h"
 
 
 using namespace oceanbase::common;
@@ -23,14 +24,27 @@ OB_SERIALIZE_MEMBER(ObExecFeedbackNode,
                     op_close_time_,
                     op_first_row_time_,
                     op_last_row_time_,
-                    db_time_,
+                    cpu_time_,// FARM COMPAT WHITELIST, rename from db_time
                     block_time_,
                     worker_count_,
-                    pdml_op_write_rows_);
+                    pdml_op_write_rows_,
+                    ssstore_read_row_count_,
+                    memstore_read_row_count_,
+                    das_local_index_scan_time_,
+                    das_local_index_scan_rows_,
+                    das_local_data_scan_time_,
+                    das_local_data_scan_rows_,
+                    das_remote_index_scan_time_,
+                    das_remote_index_scan_rows_,
+                    das_remote_data_scan_time_,
+                    das_remote_data_scan_rows_,
+                    das_index_rpc_count_,
+                    das_data_rpc_count_);
 
 OB_SERIALIZE_MEMBER(ObExecFeedbackInfo,
                     nodes_,
-                    total_db_time_);
+                    total_cpu_time_ // FARM COMPAT WHITELIST, rename from total_db_time
+                  );
 
 int ObExecFeedbackInfo::merge_feedback_info(const ObExecFeedbackInfo &feedback_info)
 {
@@ -55,7 +69,7 @@ int ObExecFeedbackInfo::merge_feedback_info(const ObExecFeedbackInfo &feedback_i
             max(fb_nodes.at(right).op_last_row_time_, nodes_.at(left).op_last_row_time_);
         nodes_.at(left).op_close_time_ =
             max(fb_nodes.at(right).op_close_time_, nodes_.at(left).op_close_time_);
-        nodes_.at(left).db_time_ = max(fb_nodes.at(right).db_time_, nodes_.at(left).db_time_);
+        nodes_.at(left).cpu_time_ = max(fb_nodes.at(right).cpu_time_, nodes_.at(left).cpu_time_);
         nodes_.at(left).output_row_count_ += fb_nodes.at(right).output_row_count_;
         nodes_.at(left).pdml_op_write_rows_ += fb_nodes.at(right).pdml_op_write_rows_;
         nodes_.at(left).worker_count_ += fb_nodes.at(right).worker_count_;
@@ -77,7 +91,7 @@ int ObExecFeedbackInfo::merge_feedback_info(const ObExecFeedbackInfo &feedback_i
     is_valid_ = false;
     LOG_WARN("mark the feedback info is invalid", K(ret));
   } else {
-    total_db_time_ += feedback_info.get_total_db_time();
+    total_cpu_time_ += feedback_info.get_total_cpu_time();
   }
   return ret;
 }
@@ -85,7 +99,7 @@ int ObExecFeedbackInfo::merge_feedback_info(const ObExecFeedbackInfo &feedback_i
 int ObExecFeedbackInfo::assign(const ObExecFeedbackInfo &other)
 {
   int ret = OB_SUCCESS;
-  total_db_time_ = other.get_total_db_time();
+  total_cpu_time_ = other.get_total_cpu_time();
   is_valid_ = other.is_valid();
   OZ(nodes_.assign(other.get_feedback_nodes()));
   return ret;

@@ -15,6 +15,7 @@
 #include "ob_px_row_store.h"
 #include "sql/dtl/ob_dtl.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
+#include "sql/engine/px/exchange/ob_px_receive_op.h"
 
 
 using namespace oceanbase::common;
@@ -177,8 +178,9 @@ int ObReceiveRowReader::add_buffer(dtl::ObDtlLinkedBuffer &buf, bool &transferre
       if (NULL != vec_row_iter_ && vec_row_iter_->is_valid() && vec_row_iter_->has_next()) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("rows must be all iterated before new iterate added", K(ret));
-      } else if (OB_FAIL(row_meta_.assign(buf.get_row_meta()))) {
-        LOG_WARN("row_meta assign failed", K(ret));
+      // no need assign here
+      // } else if (OB_FAIL(row_meta_.assign(buf.get_row_meta()))) {
+      //   LOG_WARN("row_meta assign failed", K(ret));
       } else {
         vec_row_iter_ = reinterpret_cast<ObTempRowStore::Iterator *>(buf.buf());
       }
@@ -372,14 +374,10 @@ int ObReceiveRowReader::get_next_compact_rows(ObTempRowStore::RowBlock *blk,
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get invalid param", K(ret), KP(blk), KP(srows));
   } else {
-    for (int64_t i = 0; OB_SUCC(ret) && cur_iter_rows_ < blk->rows() && i < max_rows; ++i) {
-      const ObCompactRow *srow = NULL;
-      if (OB_FAIL(blk->get_store_row(cur_iter_pos_, srow))) {
-        LOG_WARN("failed to get store row", K(ret));
-      } else {
-        srows[read_rows++] = srow;
-        ++cur_iter_rows_;
-      }
+    if (OB_FAIL(blk->get_store_rows(cur_iter_pos_, srows, MIN(max_rows, blk->rows() - cur_iter_rows_), read_rows))) {
+      LOG_WARN("get store rows failed", K(ret));
+    } else {
+      cur_iter_rows_ += read_rows;
     }
   }
   return ret;
@@ -479,8 +477,8 @@ int ObReceiveRowReader::attach_rows(const common::ObIArray<ObExpr*> &exprs,
         }
         e->set_evaluated_projected(eval_ctx);
         ObEvalInfo &info = e->get_eval_info(eval_ctx);
-        info.notnull_ = false;
-        info.point_to_frame_ = false;
+        info.set_notnull(false);
+        info.set_point_to_frame(false);
       }
     }
     // deep copy dynamic const expr datum
@@ -527,8 +525,8 @@ int ObReceiveRowReader::attach_vectors(const common::ObIArray<ObExpr*> &exprs,
         }
         e->set_evaluated_projected(eval_ctx);
         ObEvalInfo &info = e->get_eval_info(eval_ctx);
-        info.notnull_ = false;
-        info.point_to_frame_ = false;
+        info.set_notnull(false);
+        info.set_point_to_frame(false);
       }
     }
     // deep copy dynamic const expr datum
@@ -610,8 +608,8 @@ int ObReceiveRowReader::attach_vectors(const common::ObIArray<ObExpr*> &exprs,
       }
       e->set_evaluated_projected(eval_ctx);
       ObEvalInfo &info = e->get_eval_info(eval_ctx);
-      info.notnull_ = false;
-      info.point_to_frame_ = false;
+      info.set_notnull(false);
+      info.set_point_to_frame(false);
     }
   }
   if (OB_SUCC(ret) && dynamic_const_exprs.count() > 0 && read_rows > 0) {
@@ -679,6 +677,18 @@ int ObReceiveRowReader::get_next_batch(const ObIArray<ObExpr*> &exprs,
   return ret;
 }
 
+int ObReceiveRowReader::init_row_meta()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(child_exprs_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("child exprs is null", K(ret));
+  } else if (OB_FAIL(row_meta_.init(*child_exprs_, 0, reorder_fixed_expr_, allocator_))) {
+    LOG_WARN("failed to init row meta", K(reorder_fixed_expr_), K(child_exprs_->count()), KP(allocator_), K(ret));
+  }
+  return ret;
+}
+
 //shanting2.0
 int ObReceiveRowReader::get_next_batch_vec(const ObIArray<ObExpr*> &exprs,
                                            const ObIArray<ObExpr*> &dynamic_const_exprs,
@@ -688,7 +698,15 @@ int ObReceiveRowReader::get_next_batch_vec(const ObIArray<ObExpr*> &exprs,
                                            const ObCompactRow **srows)
  {
   int ret = OB_SUCCESS;
-  if (NULL == srows) {
+  if (!row_meta_init_) {
+    if (OB_FAIL(init_row_meta())) {
+      LOG_WARN("failed to init row meta", K(ret));
+    } else {
+      row_meta_init_ = true;
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (NULL == srows) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("NULL store rows", K(ret));
   } else if (NULL != datum_iter_) {
@@ -755,7 +773,7 @@ int ObReceiveRowReader::get_next_batch_vec(const ObIArray<ObExpr*> &exprs,
                 LOG_WARN("failed to init vector", K(ret));
               }
             }
-            OZ(attach_vectors(exprs, dynamic_const_exprs, curr_buffer->get_row_meta(), eval_ctx, srows, read_rows));
+            OZ(attach_vectors(exprs, dynamic_const_exprs, row_meta_, eval_ctx, srows, read_rows));
           }
           break;
         }
@@ -787,6 +805,10 @@ int ObReceiveRowReader::get_next_batch_vec(const ObIArray<ObExpr*> &exprs,
       }
     }
   }
+  if (OB_FAIL(ret) || read_rows <= 0 || OB_ISNULL(recv_op_)) {
+  } else if (OB_FAIL(recv_op_->do_project_recv_exprs(read_rows, srows, exprs, eval_ctx))) {
+    LOG_WARN("do project recv exprs failed", K(ret));
+  }
   return ret;
 }
 
@@ -807,6 +829,7 @@ void ObReceiveRowReader::reset()
   datum_iter_ = NULL;
   vec_row_iter_ = NULL;
   row_meta_.reset();
+  row_meta_init_ = false;
 }
 
 

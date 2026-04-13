@@ -31,6 +31,7 @@ enum class LogFormatFlag
   STAT_FORMAT = 3,
   META_FORMAT = 4,
   DECOMPRESS_FORMAT = 5,
+  BLOCK_FORMAT = 6,
 };
 
 class ObAdminLogDumperInterface
@@ -116,6 +117,18 @@ private:
   common::ObTabletID tablet_id_;
 };
 
+class ObAdminLogDumpBlockHelper
+{
+public:
+  static int generate_dump_dir(const char *dir_path, const int64_t tablet_id,
+                               const int64_t trans_id, const int64_t seq_no,
+                               char *dir_full_path);
+  static int create_dir_if_not_exist(const char *dir_full_path);
+  static int write_macro_block_file(const char *dir_full_path, int32_t start_slice_idx,
+                                    uint16_t column_group_idx, int64_t data_seq, int64_t scn_val,
+                                    const char *data_buf, int64_t data_len);
+};
+
 struct ObLogStat
 {
   ObLogStat() {reset();}
@@ -159,6 +172,9 @@ struct ObLogStat
   K(ext_info_log_count_));
 };
 
+/// Default max bytes of column payload to dump as hex when hex_length_ is 0.
+static const int64_t OB_ADMIN_DEFAULT_DUMP_HEX_LENGTH = 128L;
+
 struct ObAdminMutatorStringArg
 {
 public:
@@ -172,8 +188,8 @@ public:
   void reset();
   void reset_buf();
   ObAdminMutatorStringArg &operator= (const ObAdminMutatorStringArg &rhs);
-  TO_STRING_KV(KP_(buf), K_(buf_len), KP(decompress_buf_), K(decompress_buf_len_), K_(pos), K(flag_), K(filter_),
-               KPC(log_stat_));
+  TO_STRING_KV(KP_(buf), K_(buf_len), KP(decompress_buf_), K(decompress_buf_len_), K_(pos), K(flag_), K(hex_length_),
+               K(filter_), KPC(log_stat_), KP(dir_path_));
 public:
   char *buf_;
   int64_t buf_len_;
@@ -182,10 +198,13 @@ public:
   int64_t decompress_buf_len_;
   int64_t pos_;
   LogFormatFlag flag_;
+  /// Max bytes of column data to dump as hex (0 = use default 128). Set via OB_ADMIN_DUMP_FULL_HEX env or --full-hex.
+  int64_t hex_length_;
 //  int64_t tx_id_;
   ObAdminLogDumperInterface *writer_ptr_;
   ObAdminLogDumpFilter filter_;
   ObLogStat *log_stat_;
+  char *dir_path_;
 };
 
 } // namespace share

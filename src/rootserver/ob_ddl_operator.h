@@ -125,6 +125,7 @@ public:
   virtual int purge_tenant_in_recyclebin(const share::schema::ObTenantSchema &tenant_schema,
                                          common::ObMySQLTransaction &trans,
                                          const common::ObString *ddl_stmt_str);
+  virtual int try_init_tenant_data_version(const uint64_t tenant_id);
   virtual int replace_sys_variable(share::schema::ObSysVariableSchema &sys_variable_schema,
                                    const int64_t schema_version,
                                    common::ObMySQLTransaction &trans,
@@ -208,7 +209,8 @@ public:
                            common::ObMySQLTransaction &trans,
                            const common::ObString *ddl_stmt_str = NULL,
                            const bool need_sync_schema_version = true,
-                           const bool is_truncate_table = false);
+                           const bool is_truncate_table = false,
+                           const int64_t create_vec_index_parallel = 0);
   int truncate_table(const ObString *ddl_stmt_str,
                      const share::schema::ObTableSchema &orig_table_schema,
                      const share::schema::ObTableSchema &new_table_schema,
@@ -541,7 +543,11 @@ public:
                                  const ObIArray<share::schema::ObIndexType> &index_types,
                                  const common::ObString *ddl_stmt_str,
                                  common::ObMySQLTransaction &trans);
-
+  virtual int switch_mlog_status(const share::schema::ObTableSchema &data_table_schema,
+                                 const uint64_t old_mlog_id,
+                                 const uint64_t new_mlog_id,
+                                 ObSchemaGetterGuard &schema_guard,
+                                 common::ObMySQLTransaction &trans);
   // tablespace
   virtual int create_tablespace(share::schema::ObTablespaceSchema &tablespace_schema,
                                 common::ObMySQLTransaction &trans,
@@ -581,7 +587,8 @@ public:
                          const uint64_t user_id,
                          const common::ObString &passwd,
                          const common::ObString *ddl_stmt_str,
-                         common::ObMySQLTransaction &trans);
+                         common::ObMySQLTransaction &trans,
+                         const common::ObString &plugin);
   virtual int set_max_connections(const uint64_t tenant_id,
                                   const uint64_t user_id,
                                   const uint64_t max_connections_per_hour,
@@ -942,7 +949,6 @@ public:
                                     share::schema::ObSchemaGetterGuard &schema_guard);
   //----End of functions for row level security----
 
-
   virtual int insert_temp_table_info(common::ObMySQLTransaction &trans,
                                      const share::schema::ObTableSchema &table_schema);
   virtual int delete_temp_table_info(common::ObMySQLTransaction &trans,
@@ -1027,6 +1033,11 @@ public:
                         ObMySQLTransaction &trans);
   inline share::schema::ObMultiVersionSchemaService &get_multi_schema_service() { return schema_service_; }
   inline common::ObMySQLProxy &get_sql_proxy() { return sql_proxy_; }
+  int cleanup_autoinc_cache(const share::schema::ObTableSchema &table_schema);
+  int sync_version_for_cascade_table(
+      const uint64_t tenant_id,
+      const common::ObIArray<uint64_t> &table_ids,
+      common::ObMySQLTransaction &trans);
   virtual int set_need_flush_ora(
       share::schema::ObSchemaGetterGuard &schema_guard,
       const share::schema::ObObjPrivSortKey &obj_priv_key,          /* in: obj priv key*/
@@ -1069,14 +1080,6 @@ private:
   int check_tenant_exist(share::schema::ObSchemaGetterGuard &schema_guard,
                          const common::ObString &tenant_name,
                          bool &is_exist);
-
-  int sync_version_for_cascade_table(
-      const uint64_t tenant_id,
-      const common::ObIArray<uint64_t> &table_ids,
-      common::ObMySQLTransaction &trans);
-
-  int cleanup_autoinc_cache(const share::schema::ObTableSchema &table_schema);
-
   bool is_aux_object(const share::schema::ObDatabaseSchema &schema);
   bool is_aux_object(const share::schema::ObTableSchema &schema);
   bool is_aux_object(const share::schema::ObTriggerInfo &schema);
@@ -1214,6 +1217,9 @@ private:
       const share::schema::ObSysVariableSchema &sys_variable,
       const uint64_t tenant_id,
       common::ObMySQLTransaction &trans);
+  int try_create_tablegroup_for_database_(
+      common::ObMySQLTransaction &trans,
+      share::schema::ObDatabaseSchema &database_schema);
 private:
   static const int64_t ENCRYPT_KEY_LENGTH = 15;
 protected:

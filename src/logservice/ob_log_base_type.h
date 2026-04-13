@@ -181,6 +181,17 @@ enum ObLogBaseType
   // for sslog uid service
   SSLOG_UID_LOG_BASE_TYPE = 57,
 #endif
+  // for obkv table async query session id service
+  TABLE_SESS_ID_LOG_BASE_TYPE = 58,
+  // for backup validate service
+  BACKUP_VALIDATE_SERVICE_LOG_BASE_TYPE = 59,
+  // for vector index scheduler
+  VEC_INDEX_SERVICE_LOG_BASE_TYPE = 60,
+  // for random partition
+  SYS_RANDOM_PARTITION_SCHEDULER_LOG_BASE_TYPE = 61,
+  TTL_SERVICE_LOG_BASE_TYPE = 62,
+  SYNC_MODE_LOG_BASE_TYPE = 63,
+  PROTECTION_MODE_MGR_LOG_BASE_TYPE = 64,
   // pay attention!!!
   // add log type in log_base_type_to_string
   // max value
@@ -321,6 +332,20 @@ int log_base_type_to_string(const ObLogBaseType log_type,
   } else if (log_type == SSLOG_UID_LOG_BASE_TYPE) {
     strncpy(str ,"SSLOG_UID", str_len);
 #endif
+  } else if (log_type == TABLE_SESS_ID_LOG_BASE_TYPE) {
+    strncpy(str, "TABLE_SESS_ID", str_len);
+  } else if (log_type == BACKUP_VALIDATE_SERVICE_LOG_BASE_TYPE) {
+    strncpy(str, "BACKUP_VALIDATE_SERVICE", str_len);
+  } else if (log_type == VEC_INDEX_SERVICE_LOG_BASE_TYPE) {
+    strncpy(str, "VEC_INDEX_SERVICE", str_len);
+  } else if (log_type == SYS_RANDOM_PARTITION_SCHEDULER_LOG_BASE_TYPE) {
+    strncpy(str, "RANDOM_PARTITION_SCHEDULER", str_len);
+  } else if (log_type == TTL_SERVICE_LOG_BASE_TYPE) {
+    strncpy(str, "TTL_SERVICE", str_len);
+  } else if (log_type == SYNC_MODE_LOG_BASE_TYPE) {
+    strncpy(str, "SYNC_MODE", str_len);
+  } else if (log_type == PROTECTION_MODE_MGR_LOG_BASE_TYPE) {
+    strncpy(str, "PROTECTION_MODE_MGR", str_len);
   } else {
     ret = OB_INVALID_ARGUMENT;
   }

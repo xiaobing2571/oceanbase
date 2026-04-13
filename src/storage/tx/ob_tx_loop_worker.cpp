@@ -14,6 +14,11 @@
 #include "storage/tx/ob_trans_service.h"
 #include "storage/tx/ob_leak_checker.h"
 
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "close_modules/shared_storage/storage/incremental/garbage_collector/ob_ss_garbage_collector_service.h"
+#endif
+
+
 namespace oceanbase
 {
 
@@ -80,6 +85,7 @@ void ObTxLoopWorker::reset()
   last_check_start_working_retry_ts_ = 0;
   last_log_cb_pool_adjust_ts_ = 0;
   last_tenant_config_refresh_ts_ = 0;
+  last_palf_kv_gc_interval_ts_ = 0;
 }
 
 void ObTxLoopWorker::run1()
@@ -92,8 +98,12 @@ void ObTxLoopWorker::run1()
   bool can_gc_retain_ctx = false;
   bool can_check_and_retry_start_working = false;
   bool can_adjust_log_cb_pool =  false;
+  bool can_gc_palf_kv = false;
 
   while (!has_set_stop()) {
+    omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+    const int64_t KEEPALIVE_INTERVAL = tenant_config.is_valid() ?
+        min(tenant_config->_keepalive_interval, LOOP_INTERVAL) : LOOP_INTERVAL;
     start_time_us = ObTimeUtility::current_time();
     if (REACH_TIME_INTERVAL(60000000)) {
       ObLeakChecker::dump();
@@ -134,7 +144,13 @@ void ObTxLoopWorker::run1()
       last_tenant_config_refresh_ts_ = common::ObClockGenerator::getClock();
     }
 
-    (void)scan_all_ls_(can_gc_tx, can_gc_retain_ctx, can_check_and_retry_start_working, can_adjust_log_cb_pool);
+    if (common::ObClockGenerator::getClock() - last_palf_kv_gc_interval_ts_
+        > CLUSTER_PALF_KV_GC_INTERVAL) {
+      last_palf_kv_gc_interval_ts_ = common::ObClockGenerator::getClock();
+      can_gc_palf_kv = true;
+    }
+
+    (void)scan_all_ls_(can_gc_tx, can_gc_retain_ctx, can_check_and_retry_start_working, can_adjust_log_cb_pool, can_gc_palf_kv);
 
     // TODO shanyan.g
     // 1) We use max(max_commit_ts, gts_cache) as read snapshot,
@@ -144,20 +160,22 @@ void ObTxLoopWorker::run1()
 
     time_used = ObTimeUtility::current_time() - start_time_us;
 
-    if (time_used < LOOP_INTERVAL) {
-      ob_usleep(LOOP_INTERVAL- time_used, true/*is_idle_sleep*/);
+    if (time_used < KEEPALIVE_INTERVAL) {
+      ob_usleep(KEEPALIVE_INTERVAL - time_used, true/*is_idle_sleep*/);
     }
     can_gc_tx = false;
     can_gc_retain_ctx = false;
     can_check_and_retry_start_working = false;
     can_adjust_log_cb_pool = false;
+    can_gc_palf_kv = false;
   }
 }
 
 int ObTxLoopWorker::scan_all_ls_(bool can_tx_gc,
                                  bool can_gc_retain_ctx,
                                  bool can_check_and_retry_start_working,
-                                 bool can_adjust_log_cb_pool)
+                                 bool can_adjust_log_cb_pool,
+                                 bool can_gc_palf_kv)
 {
   int ret = OB_SUCCESS;
   int iter_ret = OB_SUCCESS;
@@ -188,77 +206,85 @@ int ObTxLoopWorker::scan_all_ls_(bool can_tx_gc,
       common::ObRole role = common::ObRole::INVALID_ROLE;
       int64_t base_proposal_id, proposal_id;
 
-      if (OB_TMP_FAIL(cur_ls_ptr->get_log_handler()->get_role(role, base_proposal_id))) {
-        TRANS_LOG(WARN, "get role failed", K(tmp_ret), K(cur_ls_ptr->get_ls_id()));
-        status = MinStartScnStatus::UNKOWN;
-      } else if (role == common::ObRole::FOLLOWER) {
-        status = MinStartScnStatus::UNKOWN;
-      }
-
-      // tx gc, interval = 15s
-      if (can_tx_gc) {
-        // TODO shanyan.g close ctx gc temporarily because of logical bug
-        //
-
-        // ATTENTION : get_max_decided_scn must before iterating all trans ctx.
-        // set max_decided_scn as default value
-        if (OB_TMP_FAIL(cur_ls_ptr->get_log_handler()->get_max_decided_scn(max_decided_scn))) {
-          TRANS_LOG(WARN, "get max decided scn failed", KR(tmp_ret), K(min_start_scn));
-          max_decided_scn.set_invalid();
-        } else {
-          (void)cur_ls_ptr->update_min_start_scn_info(max_decided_scn);
+      if (ObReplicaTypeCheck::is_log_replica(cur_ls_ptr->get_replica_type())) {
+        // do nothing
+      } else {
+        if (OB_TMP_FAIL(cur_ls_ptr->get_log_handler()->get_role(role, base_proposal_id))) {
+          TRANS_LOG(WARN, "get role failed", K(tmp_ret), K(cur_ls_ptr->get_ls_id()));
+          status = MinStartScnStatus::UNKOWN;
+        } else if (role == common::ObRole::FOLLOWER) {
+          status = MinStartScnStatus::UNKOWN;
         }
-        min_start_scn = max_decided_scn;
-        do_tx_gc_(cur_ls_ptr, min_start_scn, status);
+
+        // tx gc, interval = 15s
+        if (can_tx_gc) {
+          // TODO shanyan.g close ctx gc temporarily because of logical bug
+          //
+
+          // ATTENTION : get_max_decided_scn must before iterating all trans ctx.
+          // set max_decided_scn as default value
+          if (OB_TMP_FAIL(cur_ls_ptr->get_log_handler()->get_max_decided_scn(max_decided_scn))) {
+            TRANS_LOG(WARN, "get max decided scn failed", KR(tmp_ret), K(min_start_scn));
+            max_decided_scn.set_invalid();
+          } else {
+            (void)cur_ls_ptr->update_min_start_scn_info(max_decided_scn);
+          }
+          min_start_scn = max_decided_scn;
+          do_tx_gc_(cur_ls_ptr, min_start_scn, status);
+        }
+
+        if (MinStartScnStatus::UNKOWN == status) {
+          // do nothing
+        } else if (OB_TMP_FAIL(cur_ls_ptr->get_log_handler()->get_role(role, proposal_id))) {
+          TRANS_LOG(WARN, "get role failed", K(tmp_ret), K(cur_ls_ptr->get_ls_id()));
+          status = MinStartScnStatus::UNKOWN;
+        } else if (role == common::ObRole::FOLLOWER) {
+          status = MinStartScnStatus::UNKOWN;
+        } else if (base_proposal_id != proposal_id) {
+          status = MinStartScnStatus::UNKOWN;
+        }
+
+        // During the transfer, we should not update min_start_scn, otherwise we
+        // will ignore the ctx that has been transferred in. So we check whether
+        // transfer is going on there.
+        //
+        // TODO(handora.qc): while after we have checked the transfer and later
+        // submitted the log, the transfer may also happens during these two
+        // operations. So we need double check it in the log application/replay.
+        if(MinStartScnStatus::UNKOWN == status) {
+          // do nothing
+        } else if (cur_ls_ptr->get_transfer_status().get_transfer_prepare_enable()) {
+          TRANS_LOG(INFO, "ignore min start scn during transfer prepare enabled",
+                    K(cur_ls_ptr->get_transfer_status()), K(status), K(min_start_scn));
+          status = MinStartScnStatus::UNKOWN;
+        }
+
+        if (MinStartScnStatus::UNKOWN == status) {
+          min_start_scn.reset();
+        } else if (MinStartScnStatus::NO_CTX == status) {
+          min_start_scn.set_min();
+        }
+
+        // keep alive, interval = 100ms
+        do_keep_alive_(cur_ls_ptr, min_start_scn, status);
+
+        if (can_gc_retain_ctx) {
+          do_retain_ctx_gc_(cur_ls_ptr);
+        }
+
+        if (can_check_and_retry_start_working) {
+          do_start_working_retry_(cur_ls_ptr);
+        }
+        // ignore ret
+        (void)cur_ls_ptr->get_tx_svr()->check_all_readonly_tx_clean_up();
+
+        if (can_adjust_log_cb_pool) {
+          do_log_cb_pool_adjust_(cur_ls_ptr, role);
+        }
       }
 
-      if (MinStartScnStatus::UNKOWN == status) {
-        // do nothing
-      } else if (OB_TMP_FAIL(cur_ls_ptr->get_log_handler()->get_role(role, proposal_id))) {
-        TRANS_LOG(WARN, "get role failed", K(tmp_ret), K(cur_ls_ptr->get_ls_id()));
-        status = MinStartScnStatus::UNKOWN;
-      } else if (role == common::ObRole::FOLLOWER) {
-        status = MinStartScnStatus::UNKOWN;
-      } else if (base_proposal_id != proposal_id) {
-        status = MinStartScnStatus::UNKOWN;
-      }
-
-      // During the transfer, we should not update min_start_scn, otherwise we
-      // will ignore the ctx that has been transferred in. So we check whether
-      // transfer is going on there.
-      //
-      // TODO(handora.qc): while after we have checked the transfer and later
-      // submitted the log, the transfer may also happens during these two
-      // operations. So we need double check it in the log application/replay.
-      if(MinStartScnStatus::UNKOWN == status) {
-        // do nothing
-      } else if (cur_ls_ptr->get_transfer_status().get_transfer_prepare_enable()) {
-        TRANS_LOG(INFO, "ignore min start scn during transfer prepare enabled",
-                  K(cur_ls_ptr->get_transfer_status()), K(status), K(min_start_scn));
-        status = MinStartScnStatus::UNKOWN;
-      }
-
-      if (MinStartScnStatus::UNKOWN == status) {
-        min_start_scn.reset();
-      } else if (MinStartScnStatus::NO_CTX == status) {
-        min_start_scn.set_min();
-      }
-
-      // keep alive, interval = 100ms
-      do_keep_alive_(cur_ls_ptr, min_start_scn, status);
-
-      if (can_gc_retain_ctx) {
-        do_retain_ctx_gc_(cur_ls_ptr);
-      }
-
-      if (can_check_and_retry_start_working) {
-        do_start_working_retry_(cur_ls_ptr);
-      }
-      // ignore ret
-      (void)cur_ls_ptr->get_tx_svr()->check_all_readonly_tx_clean_up();
-
-      if (can_adjust_log_cb_pool) {
-        do_log_cb_pool_adjust_(cur_ls_ptr, role);
+      if (can_gc_palf_kv) {
+        do_palf_kv_gc_(cur_ls_ptr, role);
       }
     }
   }
@@ -302,7 +328,7 @@ void ObTxLoopWorker::refresh_tenant_config_()
     ret = OB_ERR_UNEXPECTED;
     TRANS_LOG(ERROR, "unexpected transaction service", K(ret), KP(txs));
   } else {
-    txs->get_tx_elr_util().check_and_update_tx_elr_info();
+    txs->refresh_tenant_config();
   }
 }
 
@@ -331,6 +357,45 @@ void ObTxLoopWorker::update_max_commit_ts_()
       TRANS_LOG(ERROR, "unexpected transaction service", K(ret), KP(txs));
     } else {
       txs->get_tx_version_mgr().update_max_commit_ts(snapshot, false);
+    }
+  } while (OB_EAGAIN == ret);
+  // TODO, sys tenant
+  if (is_meta_tenant(MTL_ID()) && GCTX.is_shared_storage_mode()) {
+    update_max_commit_ts_for_sslog_();
+  }
+}
+
+void ObTxLoopWorker::update_max_commit_ts_for_sslog_()
+{
+  int ret = OB_SUCCESS;
+  SCN snapshot;
+  const int64_t expire_ts = ObClockGenerator::getClock() + 1000000; // 1s
+  ObTransService *txs = NULL;
+
+  do {
+    int64_t n = ObClockGenerator::getClock();
+    if (n >= expire_ts) {
+      ret = OB_TIMEOUT;
+    } else if (!GCTX.is_shared_storage_mode()) {
+      // do nothing
+      ret = OB_SUCCESS;
+    } else if (!is_meta_tenant(MTL_ID())) {
+      // do nothing
+      ret = OB_SUCCESS;
+    } else if (OB_FAIL(OB_TS_MGR.get_gts(get_sslog_gts_tenant_id(MTL_ID()), NULL, snapshot))) {
+      if (OB_EAGAIN == ret) {
+        ob_usleep(500, true/*is_idle_sleep*/);
+      } else {
+        TRANS_LOG(WARN, "get gts fail", "tenant_id", MTL_ID());
+      }
+    } else if (OB_UNLIKELY(!snapshot.is_valid())) {
+      ret = OB_ERR_UNEXPECTED;
+      TRANS_LOG(WARN, "invalid snapshot from gts", K(snapshot));
+    } else if (OB_ISNULL(txs = MTL(ObTransService *))) {
+      ret = OB_ERR_UNEXPECTED;
+      TRANS_LOG(ERROR, "unexpected transaction service", K(ret), KP(txs));
+    } else {
+      txs->get_tx_version_mgr_for_sslog().update_max_commit_ts(snapshot, false);
     }
   } while (OB_EAGAIN == ret);
 }
@@ -386,6 +451,30 @@ void ObTxLoopWorker::do_log_cb_pool_adjust_(ObLS *ls_ptr, const common::ObRole r
   }
 }
 
+void ObTxLoopWorker::do_palf_kv_gc_(ObLS *ls_ptr, const common::ObRole role)
+{
+  int ret = OB_SUCCESS;
+  share::SCN max_gc_scn;
+
+  const uint64_t tenant_id = MTL_ID();
+  const share::ObLSID ls_id = ls_ptr->get_ls_id();
+
+#ifdef OB_BUILD_SHARED_STORAGE
+  if (!is_sys_tenant(tenant_id)) {
+    // do nothing
+  } else if (!ls_id.is_sslog_ls() || role != common::ObRole::LEADER) {
+    // do nothing
+  } else {
+    if (OB_FAIL(MTL(ObSSGarbageCollectorService *)->get_min_ss_gc_last_succ_scn(true /*is_for_sslog_table */, max_gc_scn))) {
+      TRANS_LOG(WARN, "get max gc scn failed", K(ret), K(max_gc_scn), K(tenant_id), K(ls_id));
+    } else if (OB_FAIL(MTL(ObTransService *)->push_palf_kv_gc_task(max_gc_scn))) {
+      TRANS_LOG(WARN, "push palf kv gc task failed", K(ret), K(max_gc_scn), K(tenant_id), K(ls_id));
+    }
+
+    TRANS_LOG(INFO, "do palf kv gc", K(ret), K(tenant_id), K(ls_id), K(max_gc_scn));
+  }
+#endif
+}
 }
 }
 

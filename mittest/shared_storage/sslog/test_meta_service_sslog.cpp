@@ -29,6 +29,66 @@
 #include "mittest/shared_storage/clean_residual_data.h"
 #include "storage/init_basic_struct.h"
 #include "storage/tx_storage/ob_ls_service.h"
+#include "storage/incremental/garbage_collector/ob_ss_garbage_collector_service.h"
+#include "unittest/storage/sslog/test_mock_palf_kv.h"
+#include "close_modules/shared_storage/storage/incremental/sslog/ob_i_sslog_proxy.h"
+#include "close_modules/shared_storage/storage/incremental/sslog/ob_sslog_kv_proxy.h"
+
+namespace oceanbase
+{
+OB_MOCK_PALF_KV_FOR_REPLACE_SYS_TENANT
+namespace sslog
+{
+
+oceanbase::unittest::ObMockPalfKV PALF_KV;
+
+int get_sslog_table_guard(const ObSSLogTableType type,
+                          const int64_t tenant_id,
+                          ObSSLogProxyGuard &guard)
+{
+  int ret = OB_SUCCESS;
+
+  switch (type)
+  {
+    case ObSSLogTableType::SSLOG_TABLE: {
+      void *proxy = share::mtl_malloc(sizeof(ObSSLogTableProxy), "ObSSLogTable");
+      if (nullptr == proxy) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        ObSSLogTableProxy *sslog_table_proxy = new (proxy) ObSSLogTableProxy(tenant_id);
+        if (OB_FAIL(sslog_table_proxy->init())) {
+          SSLOG_LOG(WARN, "fail to inint", K(ret));
+        } else {
+          guard.set_sslog_proxy((ObISSLogProxy *)proxy);
+        }
+      }
+      break;
+    }
+    case ObSSLogTableType::SSLOG_PALF_KV: {
+      void *proxy = share::mtl_malloc(sizeof(ObSSLogKVProxy), "ObSSLogTable");
+      if (nullptr == proxy) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        ObSSLogKVProxy *sslog_kv_proxy = new (proxy) ObSSLogKVProxy(&PALF_KV);
+        // if (OB_FAIL(sslog_kv_proxy->init(GCONF.cluster_id, tenant_id))) {
+        //   SSLOG_LOG(WARN, "init palf kv failed", K(ret));
+        // } else {
+          guard.set_sslog_proxy((ObISSLogProxy *)proxy);
+        // }
+      }
+      break;
+    }
+    default: {
+      ret = OB_INVALID_ARGUMENT;
+      SSLOG_LOG(WARN, "invalid sslog type", K(type));
+      break;
+    }
+  }
+
+  return ret;
+}
+} // namespace sslog
+} // namespace oceanbase
 
 uint64_t tenant_id = 0;
 
@@ -143,7 +203,7 @@ int MockSSTableGenerator::mock_sstable(
   ObStorageSchema storage_schema;
   if (OB_FAIL(storage_schema.init(allocator, table_schema, lib::Worker::CompatMode::MYSQL))) {
     LOG_WARN("failed to init storage schema", K(ret));
-  } else if (OB_FAIL(param.init_for_empty_major_sstable(tablet_id, storage_schema, 100, -1, false))) {
+  } else if (OB_FAIL(param.init_for_empty_major_sstable(tablet_id, storage_schema, 100, -1, false, false))) {
     LOG_WARN("failed to build create sstable param", K(ret), K(table_key));
   } else {
     param.table_key_ = table_key;
@@ -202,14 +262,50 @@ public:
     ObLSID ls_id(LS_ID);
     ls_id_ = ls_id;
   }
+  void wait_sys_to_leader()
+  {
+    share::ObTenantSwitchGuard tenant_guard;
+    int ret = OB_ERR_UNEXPECTED;
+    ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(1));
+    ObLS *ls = nullptr;
+    ObLSID ls_id(ObLSID::SYS_LS_ID);
+    ObLSHandle handle;
+    ObLSService *ls_svr = MTL(ObLSService *);
+    ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, handle, ObLSGetMod::STORAGE_MOD));
+    ls = handle.get_ls();
+    ASSERT_NE(nullptr, ls);
+    ASSERT_EQ(ls_id, ls->get_ls_id());
+    for (int i=0; i<100; i++) {
+      ObRole role;
+      int64_t proposal_id = 0;
+      ASSERT_EQ(OB_SUCCESS, ls->get_log_handler()->get_role(role, proposal_id));
+      if (role == ObRole::LEADER) {
+        ret = OB_SUCCESS;
+        break;
+      }
+      ob_usleep(10 * 1000);
+    }
+    ASSERT_EQ(OB_SUCCESS, ret);
+  }
 
   void create_test_tenant(uint64_t &tenant_id)
   {
     TRANS_LOG(INFO, "create_tenant start");
-    ASSERT_EQ(OB_SUCCESS, create_tenant("tt1"));
+    wait_sys_to_leader();
+    int ret = OB_SUCCESS;
+    int retry_cnt = 0;
+    do {
+      if (OB_FAIL(create_tenant("tt1"))) {
+        TRANS_LOG(WARN, "create_tenant fail, need retry", K(ret));
+        ob_usleep(15 * 1000 * 1000); // 15s
+      } else {
+        break;
+      }
+      retry_cnt++;
+    } while (OB_FAIL(ret) && retry_cnt < 10);
+    ASSERT_EQ(OB_SUCCESS, ret);
     ASSERT_EQ(OB_SUCCESS, get_tenant_id(tenant_id));
     ASSERT_EQ(OB_SUCCESS, get_curr_simple_server().init_sql_proxy2());
-    TRANS_LOG(INFO, "create_tenant end", K(tenant_id));
   }
   const ObTabletID get_next_tablet_id();
   int build_update_table_store_param_(ObArenaAllocator &allocator,
@@ -251,7 +347,7 @@ int ObTestSSLogMetaService::build_update_table_store_param_(ObArenaAllocator &al
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("sstable should not be nullptr");
   } else {
-    SCN clog_checkpoint_scn = SCN::min_scn();
+    SCN clog_checkpoint_scn = sstable->get_end_scn();
     param.snapshot_version_ = tablet_handle.get_obj()->get_snapshot_version();
     param.multi_version_start_ = tablet_handle.get_obj()->get_multi_version_start();
 
@@ -263,7 +359,6 @@ int ObTestSSLogMetaService::build_update_table_store_param_(ObArenaAllocator &al
     }
 
     param.rebuild_seq_ = ls_handle.get_ls()->get_rebuild_seq();
-    const bool need_check_sstable = true;
     param.ddl_info_.update_with_major_flag_ = false;
 
     param.sstable_ = sstable;
@@ -271,14 +366,13 @@ int ObTestSSLogMetaService::build_update_table_store_param_(ObArenaAllocator &al
 
     if (FAILEDx(param.init_with_ha_info(ObHATableStoreParam(
             tablet_handle.get_obj()->get_tablet_meta().transfer_info_.transfer_seq_,
-            need_check_sstable,
             true /*need_check_transfer_seq*/)))) {
       LOG_WARN("failed to init with ha info", KR(ret));
     } else if (OB_FAIL(param.init_with_compaction_info(ObCompactionTableStoreParam(
                       merge_type,
                       clog_checkpoint_scn,
                       false /*need_report*/,
-                      tablet_handle.get_obj()->has_truncate_info())))) {
+                      tablet_handle.get_obj()->has_merged_with_mds_info())))) {
       LOG_WARN("failed to init with compaction info", KR(ret));
     } else {
       LOG_INFO("success to init ObUpdateTableStoreParam", KR(ret), K(param), KPC(param.sstable_));
@@ -299,6 +393,9 @@ TEST_F(ObTestSSLogMetaService, test_create_ls)
   ObGarbageCollector *gc_service = MTL(logservice::ObGarbageCollector *);
   ASSERT_EQ(true, gc_service != NULL);
   gc_service->stop();
+  ObSSGarbageCollectorService *ss_gc_service = MTL(ObSSGarbageCollectorService *);
+  ASSERT_EQ(true, ss_gc_service != NULL);
+  ss_gc_service->stop();
 
   int ret = OB_SUCCESS;
   ObLSService *ls_svr = MTL(ObLSService *);
@@ -319,26 +416,28 @@ TEST_F(ObTestSSLogMetaService, test_create_ls)
   ASSERT_EQ(OB_SUCCESS, gen_create_ls_arg(tenant_id, ls_id, arg));
   ASSERT_EQ(OB_SUCCESS, ls_svr->create_ls(arg));
   ASSERT_EQ(OB_SUCCESS, meta_svr->create_ls(arg));
-  EXPECT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, handle, ObLSGetMod::STORAGE_MOD));
+  ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, handle, ObLSGetMod::STORAGE_MOD));
   ls = handle.get_ls();
   ASSERT_NE(nullptr, ls);
   ASSERT_EQ(ls_id, ls->get_ls_id());
 
   // get ls meta
   ObSSLSMeta ls_meta;
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_ls_meta(ls_id, ls_meta));
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_ls_meta(ls_id, ls_meta));
   ASSERT_EQ(ls_id, ls_meta.ls_id_);
 
   // get inner tablet
   common::ObArenaAllocator allocator("TestTabletMeta",
                                      OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID(), ObCtxIds::DEFAULT_CTX_ID);
   const SCN transfer_scn = SCN::min_scn();
+  SCN row_scn;
   TRANS_LOG(INFO, "start to get tablet 1");
   ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet_from_ss_(ls_id,
                                                       tablet_id,
                                                       transfer_scn,
                                                       allocator,
-                                                      tablet_hdl));
+                                                      tablet_hdl,
+                                                      row_scn));
   ASSERT_NE(nullptr, tablet_hdl.get_obj());
   ASSERT_EQ(tablet_id, tablet_hdl.get_obj()->get_tablet_id());
 
@@ -370,8 +469,9 @@ TEST_F(ObTestSSLogMetaService, test_update_ls_meta)
   // 2. get cache ls meta
   ObSSLSMeta *cache_ls_meta = nullptr;
   ASSERT_EQ(OB_SUCCESS, meta_svr->get_ls_meta_cache_(ls_id, cache_ls_meta));
-  ASSERT_NE(nullptr, cache_ls_meta);
-  ASSERT_EQ(ls_id, cache_ls_meta->ls_id_);
+  // cache is disabled
+  ASSERT_EQ(NULL, cache_ls_meta);
+  // ASSERT_EQ(ls_id, cache_ls_meta->ls_id_);
   LOG_INFO("get ls meta", K(orig_ls_meta), KPC(cache_ls_meta));
 
   // 3. update ls gc state
@@ -380,8 +480,8 @@ TEST_F(ObTestSSLogMetaService, test_update_ls_meta)
                                                      LSGCState::LS_OFFLINE,
                                                      offline_scn));
 
-  ASSERT_EQ(cache_ls_meta->offline_scn_, offline_scn);
-  ASSERT_EQ(cache_ls_meta->gc_state_, LSGCState::LS_OFFLINE);
+  // ASSERT_EQ(cache_ls_meta->offline_scn_, offline_scn);
+  // ASSERT_EQ(cache_ls_meta->gc_state_, LSGCState::LS_OFFLINE);
 
   // 4. clean cache and read from share storge
   cache_ls_meta = nullptr;
@@ -413,7 +513,7 @@ TEST_F(ObTestSSLogMetaService, test_acquire_first_created_ss_tablet_)
 
   common::ObArenaAllocator allocator("TestTabletMeta",
                                      OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID(), ObCtxIds::DEFAULT_CTX_ID);
-  EXPECT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
   ls = ls_handle.get_ls();
   ASSERT_NE(nullptr, ls);
   ret = TestTabletHelper::create_tablet(ls_handle, cur_tablet_id, schema, allocator);
@@ -463,11 +563,13 @@ TEST_F(ObTestSSLogMetaService, test_create_tablet)
   // 1. there is no ss tablet.
   const SCN transfer_scn = SCN::min_scn();
   ObTabletHandle tablet_hdl1;
+  SCN row_scn;
   ASSERT_EQ(OB_OBJECT_NOT_EXIST, meta_svr->get_tablet_from_ss_(ls_id,
                                                                tablet_id,
                                                                transfer_scn,
                                                                allocator,
-                                                               tablet_hdl1));
+                                                               tablet_hdl1,
+                                                               row_scn));
 
   ObTabletHandle tablet_hdl;
   ASSERT_EQ(OB_TABLET_NOT_EXIST, meta_svr->get_tablet(ls_id,
@@ -476,7 +578,7 @@ TEST_F(ObTestSSLogMetaService, test_create_tablet)
                                                       allocator,
                                                       tablet_hdl));
   // 2. create tablet while there is no ss tablet.
-  EXPECT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, handle, ObLSGetMod::STORAGE_MOD));
+  ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, handle, ObLSGetMod::STORAGE_MOD));
   ls = handle.get_ls();
   ASSERT_NE(nullptr, ls);
   // create the tablet local
@@ -495,7 +597,8 @@ TEST_F(ObTestSSLogMetaService, test_create_tablet)
                                                       tablet_id,
                                                       transfer_scn,
                                                       allocator,
-                                                      tablet_hdl2));
+                                                      tablet_hdl2,
+                                                      row_scn));
   ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet(ls_id,
                                              tablet_id,
                                              transfer_scn,
@@ -525,7 +628,7 @@ TEST_F(ObTestSSLogMetaService, test_update_tablet_table_store)
   ObLSHandle ls_handle;
   ObLS *ls = NULL;
   ObLSID ls_id = ls_id_;
-  EXPECT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
   ls = ls_handle.get_ls();
   ASSERT_NE(nullptr, ls);
   ret = ls->get_tablet(ObTabletID(INITED_TABLET_ID_), orig_tablet_handle);
@@ -537,6 +640,7 @@ TEST_F(ObTestSSLogMetaService, test_update_tablet_table_store)
   ObTableHandleV2 table_handle;
   ObTabletID tablet_id = ObTabletID(INITED_TABLET_ID_);
   const SCN transfer_scn = SCN::min_scn();
+  int64_t sstable_op_id = 100;
   ret = build_update_table_store_param_(
     allocator,
     schema,
@@ -556,8 +660,70 @@ TEST_F(ObTestSSLogMetaService, test_update_tablet_table_store)
       tablet_id,
       transfer_scn,
       ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MAJOR_SSTABLE,
+      sstable_op_id,
       update_param);
   ASSERT_EQ(OB_SUCCESS, ret);
+
+  SCN read_scn;
+  ret = meta_svr->get_max_committed_meta_scn(share::SYS_LS, read_scn);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ObSSMetaReadParam read_param;
+  read_param.set_tablet_level_param(ObSSMetaReadParamType::TABLET_KEY,
+                                    ObSSMetaReadResultType::READ_WHOLE_ROW,
+                                    true, /*try read local*/
+                                    ObSSLogMetaType::SSLOG_TABLET_META,
+                                    ls_id_,
+                                    tablet_id,
+                                    transfer_scn);
+  ObRawMetaRow row;
+  ret = meta_svr->get_raw_meta_row(
+      read_param,
+      read_scn,
+      allocator,
+      row);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  LOG_INFO("read raw meta row", K(row));
+
+  ObSSLogMetaKey sslog_meta_key;
+  ObSSMetaUpdateMetaInfo meta_info;
+  ObAtomicExtraInfo extra_info;
+  ObSSTabletSSLogValue value;
+
+  ObMetaDiskAddr tablet_addr;
+  uint64_t op_id = 1;
+  int64_t pos = 0;
+  if (OB_FAIL(value.deserialize_meta_info(row.meta_value_.ptr(),
+                                          row.meta_value_.length(),
+                                          pos))) {
+    LOG_WARN("deserialize meta info failed", K(ret));
+  } else if (FALSE_IT(meta_info = value.get_meta_info())) {
+  } else if (FALSE_IT(pos = 0)) {
+  } else if (OB_FAIL(ObAtomicTabletMetaFile::get_tablet_addr(ls_id,
+                                                             tablet_id,
+                                                             op_id,
+                                                             row.meta_value_.length(),
+                                                             tablet_addr))) {
+    LOG_WARN("get tablet addr failed", K(ret));
+  } else if (OB_FAIL(value.deserialize(allocator,
+                                       tablet_addr,
+                                       row.meta_value_.ptr(),
+                                       row.meta_value_.length(),
+                                       pos))) {
+    LOG_WARN("deserialize tablet fail", K(ret), K(tablet_addr), K(pos));
+  } else if (FALSE_IT(pos = 0)) {
+  } else if (OB_FAIL(extra_info.deserialize(row.extra_info_.ptr(),
+                                            row.extra_info_.length(),
+                                            pos))) {
+    LOG_WARN("get extra info failed", K(ret), K(row));
+  } else if (FALSE_IT(pos = 0)) {
+  } else if (OB_FAIL(sslog_meta_key.deserialize(row.meta_key_.ptr(),
+                                                row.meta_key_.length(),
+                                                pos))) {
+    LOG_WARN("deserialize meta key fail", K(ret), K(row));
+  }
+  ASSERT_EQ(ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MAJOR_SSTABLE, meta_info.update_reason_);
+  ASSERT_EQ(sstable_op_id, meta_info.sstable_op_id_);
+  LOG_INFO("get the result first upload", K(row), K(sslog_meta_key), K(meta_info), K(value), K(extra_info));
 }
 
 TEST_F(ObTestSSLogMetaService, test_update_tablet_table_store_update)
@@ -578,7 +744,7 @@ TEST_F(ObTestSSLogMetaService, test_update_tablet_table_store_update)
 
   common::ObArenaAllocator allocator("TestTabletMeta",
                                      OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID(), ObCtxIds::DEFAULT_CTX_ID);
-  EXPECT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
   ls = ls_handle.get_ls();
   ASSERT_NE(nullptr, ls);
   ret = TestTabletHelper::create_tablet(ls_handle, cur_tablet_id, schema, allocator);
@@ -610,6 +776,7 @@ TEST_F(ObTestSSLogMetaService, test_update_tablet_table_store_update)
       cur_tablet_id,
       orig_tablet_handle.get_obj()->get_reorganization_scn(),
       ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MAJOR_SSTABLE,
+      100,
       update_param);
   ASSERT_EQ(OB_SUCCESS, ret);
   LOG_INFO("test_meta_service debug : reg ss tablet success", K(ret), K(ls_id_), K(cur_tablet_id));
@@ -629,6 +796,7 @@ TEST_F(ObTestSSLogMetaService, test_update_tablet_table_store_update)
       cur_tablet_id,
       orig_tablet_handle.get_obj()->get_reorganization_scn(),
       ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MAJOR_SSTABLE,
+      100,
       update_param);
   ASSERT_EQ(OB_SUCCESS, ret);
 
@@ -637,7 +805,8 @@ TEST_F(ObTestSSLogMetaService, test_update_tablet_table_store_update)
     schema,
     ls_handle,
     orig_tablet_handle,
-    compaction::ObMergeType::MDS_MINOR_MERGE,
+    // Keep this test on non-MDS merge path; mock sstable has no tablet-status MDS row.
+    compaction::ObMergeType::MAJOR_MERGE,
     table_handle,
     update_param);
   ASSERT_EQ(OB_SUCCESS, ret);
@@ -646,7 +815,8 @@ TEST_F(ObTestSSLogMetaService, test_update_tablet_table_store_update)
       ls_id_,
       cur_tablet_id,
       orig_tablet_handle.get_obj()->get_reorganization_scn(),
-      ObMetaUpdateReason::TABLET_COMPACT_ADD_MDS_MINOR_SSTABLE,
+      ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MAJOR_SSTABLE,
+      100,
       update_param);
   ASSERT_EQ(OB_SUCCESS, ret);
   LOG_INFO("test_meta_service debug : update ss tablet success", K(ret), K(ls_id_), K(cur_tablet_id));
@@ -675,11 +845,11 @@ TEST_F(ObTestSSLogMetaService, test_tablet_meta_snapshot_read)
   SCN before_write_scn;
   SCN after_create_scn;
   SCN after_update_scn;
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(before_write_scn));
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(share::SYS_LS, before_write_scn));
 
   LOG_INFO("before write", K(before_write_scn));
 
-  EXPECT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
   ls = ls_handle.get_ls();
   ASSERT_NE(nullptr, ls);
   ret = TestTabletHelper::create_tablet(ls_handle, cur_tablet_id, schema, allocator);
@@ -688,7 +858,7 @@ TEST_F(ObTestSSLogMetaService, test_tablet_meta_snapshot_read)
                                                 cur_tablet_id,
                                                 transfer_scn));
 
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(after_create_scn));
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(share::SYS_LS, after_create_scn));
   LOG_INFO("after create", K(after_create_scn));
 
   ObTabletHandle orig_tablet_handle;
@@ -709,38 +879,42 @@ TEST_F(ObTestSSLogMetaService, test_tablet_meta_snapshot_read)
                                             cur_tablet_id,
                                             orig_tablet_handle.get_obj()->get_reorganization_scn(),
                                             ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MAJOR_SSTABLE,
+                                            100,
                                             update_param);
   ASSERT_EQ(OB_SUCCESS, ret);
 
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(after_update_scn));
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(share::SYS_LS, after_update_scn));
   LOG_INFO("after update", K(after_update_scn));
 
   // 2. check the three version
-  EXPECT_EQ(true, after_create_scn > before_write_scn);
-  EXPECT_EQ(true, after_update_scn > after_create_scn);
+  ASSERT_EQ(true, after_create_scn > before_write_scn);
+  ASSERT_EQ(true, after_update_scn > after_create_scn);
 
   // 3. read with snapshot
   ObSSMetaReadParam read_param;
-  read_param.set_tablet_level_param(ObSSLogMetaType::SSLOG_TABLET_META,
-                                   ls_id,
-                                   cur_tablet_id,
-                                   transfer_scn);
-  EXPECT_EQ(true, read_param.is_valid());
+  read_param.set_tablet_level_param(ObSSMetaReadParamType::TABLET_KEY,
+                                    ObSSMetaReadResultType::READ_WHOLE_ROW,
+                                    true, /*try read local*/
+                                    ObSSLogMetaType::SSLOG_TABLET_META,
+                                    ls_id,
+                                    cur_tablet_id,
+                                    transfer_scn);
+  ASSERT_EQ(true, read_param.is_valid());
 
   ObTabletHandle tablet_handle;
-  EXPECT_EQ(OB_TABLET_NOT_EXIST, meta_svr->get_tablet(read_param,
+  ASSERT_EQ(OB_TABLET_NOT_EXIST, meta_svr->get_tablet(read_param,
                                                       before_write_scn,
                                                       allocator,
                                                       tablet_handle));
   LOG_INFO("read content of not exist tablet", K(tablet_handle));
 
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_tablet(read_param,
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet(read_param,
                                              after_create_scn,
                                              allocator,
                                              tablet_handle));
   LOG_INFO("read content after created", K(tablet_handle));
 
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_tablet(read_param,
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet(read_param,
                                              after_update_scn,
                                              allocator,
                                              tablet_handle));
@@ -753,29 +927,29 @@ TEST_F(ObTestSSLogMetaService, test_tablet_meta_snapshot_read)
 
   ObSSTabletIterator *iter = nullptr;
   ObSSMetaIterGuard<ObSSTabletIterator> iter_guard;
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_tablet(read_param,
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet(read_param,
                                              range,
                                              iter_guard));
   iter_guard.get_iter(iter);
   LOG_INFO("read with version range", K(range));
 
   ObAtomicExtraInfo extra_info;
-  EXPECT_EQ(OB_SUCCESS, iter->get_next(allocator,
+  ASSERT_EQ(OB_SUCCESS, iter->get_next(allocator,
                                        tablet_handle,
                                        extra_info));
   LOG_INFO("iter first one", K(extra_info), K(tablet_handle));
 
-  EXPECT_EQ(OB_SUCCESS, iter->get_next(allocator,
+  ASSERT_EQ(OB_SUCCESS, iter->get_next(allocator,
                                        tablet_handle,
                                        extra_info));
   LOG_INFO("iter second one", K(extra_info), K(tablet_handle));
 
-  EXPECT_EQ(OB_ITER_END, iter->get_next(allocator,
+  ASSERT_EQ(OB_SUCCESS, iter->get_next(allocator,
                                        tablet_handle,
                                        extra_info));
   LOG_INFO("iter third one", K(extra_info), K(tablet_handle));
 
-  EXPECT_EQ(OB_ITER_END, iter->get_next(allocator,
+  ASSERT_EQ(OB_ITER_END, iter->get_next(allocator,
                                         tablet_handle,
                                         extra_info));
   LOG_INFO("iter forth one", K(extra_info), K(tablet_handle));
@@ -791,19 +965,20 @@ TEST_F(ObTestSSLogMetaService, test_ls_ids_snapshot_read)
   ObSSMetaService *meta_svr = MTL(ObSSMetaService *);
   SCN curr_scn;
   // 1. get read snapshot
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(curr_scn));
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(share::SYS_LS, curr_scn));
   LOG_INFO("current meta scn", K(curr_scn));
 
   // 2. get the iter
   ObSSMetaReadParam read_param;
-  read_param.set_ls_level_param(ObSSLogMetaType::SSLOG_LS_META,
+  read_param.set_ls_level_param(ObSSMetaReadParamType::TENANT_PREFIX,
+                                ObSSMetaReadResultType::READ_ONLY_KEY,
+                                true,
+                                ObSSLogMetaType::SSLOG_LS_META,
                                 ls_id_);
-  read_param.set_read_param_type(ObSSMetaReadParamType::TENANT_PREFIX);
-  read_param.set_read_result_type(ObSSMetaReadResultType::READ_ONLY_KEY);
-  EXPECT_EQ(true, read_param.is_valid());
+  ASSERT_EQ(true, read_param.is_valid());
   ObSSLSIDIterator *iter = nullptr;
   ObSSMetaIterGuard<ObSSLSIDIterator> iter_guard;
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_ls_ids(read_param,
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_ls_ids(read_param,
                                              curr_scn,
                                              iter_guard));
   LOG_INFO("read ls ids with snapshot", K(curr_scn));
@@ -826,19 +1001,21 @@ TEST_F(ObTestSSLogMetaService, test_tablet_ids_snapshot_read)
   ObSSMetaService *meta_svr = MTL(ObSSMetaService *);
   SCN curr_scn;
   // 1. get read snapshot
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(curr_scn));
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(share::SYS_LS, curr_scn));
   LOG_INFO("current meta scn", K(curr_scn));
 
   // 2. get the iter
   ObSSMetaReadParam read_param;
-  read_param.set_ls_level_param(ObSSLogMetaType::SSLOG_TABLET_META,
+  read_param.set_ls_level_param(ObSSMetaReadParamType::LS_PREFIX,
+                                ObSSMetaReadResultType::READ_ONLY_KEY,
+                                true,
+                                ObSSLogMetaType::SSLOG_TABLET_META,
                                 ls_id_);
-  read_param.set_read_param_type(ObSSMetaReadParamType::LS_PREFIX);
-  read_param.set_read_result_type(ObSSMetaReadResultType::READ_ONLY_KEY);
-  EXPECT_EQ(true, read_param.is_valid());
+  read_param.set_parallel_segment_query_params(5, true, SSLOG_DEFAULT_SEGMENT_SIZE);
+  ASSERT_EQ(true, read_param.is_valid());
   ObSSTabletIDIterator *iter = nullptr;
   ObSSMetaIterGuard<ObSSTabletIDIterator> iter_guard;
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_tablet_ids(read_param,
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet_ids(read_param,
                                                  curr_scn,
                                                  iter_guard));
   LOG_INFO("read tablet ids with snapshot", K(curr_scn));
@@ -863,20 +1040,22 @@ TEST_F(ObTestSSLogMetaService, test_get_tablet_iter)
   ObSSMetaService *meta_svr = MTL(ObSSMetaService *);
   SCN curr_scn;
   // 1. get read snapshot
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(curr_scn));
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(share::SYS_LS, curr_scn));
   LOG_INFO("current meta scn", K(curr_scn));
 
   // 2. get the iter
   ObSSMetaReadParam read_param;
-  read_param.set_ls_level_param(ObSSLogMetaType::SSLOG_TABLET_META,
+  read_param.set_ls_level_param(ObSSMetaReadParamType::LS_PREFIX,
+                                ObSSMetaReadResultType::READ_WHOLE_ROW,
+                                true,
+                                ObSSLogMetaType::SSLOG_TABLET_META,
                                 ls_id_);
-  read_param.set_read_param_type(ObSSMetaReadParamType::LS_PREFIX);
-  read_param.set_read_result_type(ObSSMetaReadResultType::READ_WHOLE_ROW);
-  EXPECT_EQ(true, read_param.is_valid());
+  read_param.set_parallel_segment_query_params(3, true, SSLOG_DEFAULT_SEGMENT_SIZE);
+  ASSERT_EQ(true, read_param.is_valid());
   ObSSTabletIterator *iter = nullptr;
   ObSSMetaIterGuard<ObSSTabletIterator> iter_guard;
   ObTabletHandle tablet_handle;
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_tablet_iter(read_param,
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet_iter(read_param,
                                                   curr_scn,
                                                   iter_guard));
   LOG_INFO("read tablet iter with snapshot", K(curr_scn));
@@ -899,20 +1078,22 @@ TEST_F(ObTestSSLogMetaService, test_raw_meta_row)
   ObSSMetaService *meta_svr = MTL(ObSSMetaService *);
   SCN curr_scn;
   // 1. get read snapshot
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(curr_scn));
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_max_committed_meta_scn(share::SYS_LS, curr_scn));
   LOG_INFO("current meta scn", K(curr_scn));
 
   // 2. get the iter
   ObSSMetaReadParam read_param;
-  read_param.set_ls_level_param(ObSSLogMetaType::SSLOG_TABLET_META,
+  read_param.set_ls_level_param(ObSSMetaReadParamType::LS_PREFIX,
+                                ObSSMetaReadResultType::READ_WHOLE_ROW,
+                                true, /*read_local*/
+                                ObSSLogMetaType::SSLOG_TABLET_META,
                                 ls_id_);
-  read_param.set_read_param_type(ObSSMetaReadParamType::LS_PREFIX);
-  read_param.set_read_result_type(ObSSMetaReadResultType::READ_WHOLE_ROW);
-  EXPECT_EQ(true, read_param.is_valid());
+  read_param.set_parallel_segment_query_params(1, true, SSLOG_DEFAULT_SEGMENT_SIZE);
+  ASSERT_EQ(true, read_param.is_valid());
   ObRawMetaRowIterator *iter = nullptr;
   ObSSMetaIterGuard<ObRawMetaRowIterator> iter_guard;
   ObRawMetaRow row;
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_raw_tablet_meta_row_iter(read_param,
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_raw_tablet_meta_row_iter(read_param,
                                                                curr_scn,
                                                                iter_guard));
   LOG_INFO("read raw tablet meta row iter with snapshot", K(curr_scn));
@@ -921,18 +1102,58 @@ TEST_F(ObTestSSLogMetaService, test_raw_meta_row)
     LOG_INFO("get raw row", K(row));
   }
 
-  // 4. get the ls meta row
-  read_param.set_ls_level_param(ObSSLogMetaType::SSLOG_LS_META,
-                                ls_id_);
-  read_param.set_read_param_type(ObSSMetaReadParamType::LS_KEY);
-  read_param.set_read_result_type(ObSSMetaReadResultType::READ_WHOLE_ROW);
-  EXPECT_EQ(true, read_param.is_valid());
-  EXPECT_EQ(OB_SUCCESS, meta_svr->get_raw_ls_meta_row(read_param,
-                                                      curr_scn,
-                                                      allocator,
-                                                      row));
+  // 3. test range read with meta row.
+  ObSSTabletSSLogValue meta_v;
   ObSSLogMetaKey sslog_meta_key;
+  ObSSMetaUpdateMetaInfo meta_info;
   int64_t pos = 0;
+  if (FALSE_IT(pos = 0)) {
+  } else if (OB_FAIL(sslog_meta_key.deserialize(row.meta_key_.ptr(),
+                                                row.meta_key_.length(),
+                                                pos))) {
+    LOG_WARN("deserialize meta key fail", K(ret), K(row));
+  } else if (FALSE_IT(pos = 0)) {
+  } else if (OB_FAIL(meta_v.deserialize_meta_info(row.meta_value_.ptr(),
+                                                  row.meta_value_.length(),
+                                                  pos))) {
+    LOG_WARN("deserialize meta info failed", K(ret));
+  } else if (FALSE_IT(meta_info = meta_v.get_meta_info())) {
+  }
+
+  // tablet raw row range read.
+  read_param.set_tablet_level_param(ObSSMetaReadParamType::TABLET_KEY,
+                                    ObSSMetaReadResultType::READ_WHOLE_ROW,
+                                    true, /*read_local*/
+                                    ObSSLogMetaType::SSLOG_TABLET_META,
+                                    sslog_meta_key.tablet_meta_key_.ls_id_,
+                                    sslog_meta_key.tablet_meta_key_.tablet_id_,
+                                    sslog_meta_key.tablet_meta_key_.reorganization_scn_);
+  ASSERT_EQ(true, read_param.is_valid());
+  ObMetaVersionRange range;
+  range.version_start_ = share::SCN::min_scn();
+  range.version_end_ = curr_scn;
+  LOG_INFO("read tablet raw row range param", K(read_param), K(range));
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_raw_tablet_meta_row_iter(read_param,
+                                                               range,
+                                                               iter_guard));
+  LOG_INFO("read raw tablet meta row iter with version range", K(range));
+  iter_guard.get_iter(iter);
+  while (OB_SUCC(iter->get_next(row))) {
+    LOG_INFO("get raw row of range", K(row));
+  }
+
+  // 4. get the ls meta row
+  read_param.set_ls_level_param(ObSSMetaReadParamType::LS_KEY,
+                                ObSSMetaReadResultType::READ_WHOLE_ROW,
+                                true, /*read_local*/
+                                ObSSLogMetaType::SSLOG_LS_META,
+                                ls_id_);
+  ASSERT_EQ(true, read_param.is_valid());
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_raw_meta_row(read_param,
+                                                   curr_scn,
+                                                   allocator,
+                                                   row));
+  pos = 0;
   sslog_meta_key.deserialize(row.meta_key_.ptr(),
                              row.meta_key_.length(),
                              pos);
@@ -960,7 +1181,10 @@ TEST_F(ObTestSSLogMetaService, test_ls_meta_rpc)
   // 1. update with rpc
   SCN offline_scn = SCN::base_scn();
   offline_scn = SCN::plus(offline_scn, 1);
-  ObUpdateSharedLSMetaArg arg(ls_id, LSGCState::LS_OFFLINE, offline_scn);
+  const int64_t curr_time = ObTimeUtility::current_time();
+  const int64_t timeout_us = 10_s;
+  ObUpdateSharedLSMetaArg arg(ls_id, LSGCState::LS_OFFLINE, offline_scn,
+                              curr_time + timeout_us);
 
   ObSharedRpcTransmitResult res;
   ASSERT_EQ(OB_SUCCESS, meta_svr->forward_request_(addr,
@@ -969,9 +1193,10 @@ TEST_F(ObTestSSLogMetaService, test_ls_meta_rpc)
                                                    res));
   LOG_INFO("the rpc result", K(arg), K(res));
   ASSERT_EQ(OB_SUCCESS, meta_svr->get_ls_meta_cache_(ls_id, cache_ls_meta));
-  ASSERT_NE(nullptr, cache_ls_meta);
-  ASSERT_EQ(cache_ls_meta->offline_scn_, offline_scn);
-  ASSERT_EQ(cache_ls_meta->gc_state_, LSGCState::LS_OFFLINE);
+  // ls meta cache disabled
+  ASSERT_EQ(NULL, cache_ls_meta);
+  // ASSERT_EQ(cache_ls_meta->offline_scn_, offline_scn);
+  // ASSERT_EQ(cache_ls_meta->gc_state_, LSGCState::LS_OFFLINE);
 
   offline_scn = SCN::plus(offline_scn, 1);
   global_is_sswriter = false;
@@ -986,8 +1211,17 @@ TEST_F(ObTestSSLogMetaService, test_ls_meta_rpc)
                                                       arg,
                                                       res));
   LOG_INFO("the rpc result", K(arg), K(res));
-  ASSERT_NE(cache_ls_meta->offline_scn_, offline_scn);
+  // ASSERT_NE(cache_ls_meta->offline_scn_, offline_scn);
 
+  // 3. check timeout
+  arg.abs_timeout_ts_ = ObTimeUtility::current_time();
+  usleep(1000 * 1000);
+  ASSERT_EQ(OB_TIMEOUT, meta_svr->forward_request_(addr,
+                                                   ObSharedRpcTransmitArg::RPCType::RPC_TYPE_SHARED_META,
+                                                   arg,
+                                                   res));
+  LOG_INFO("the rpc result", K(arg), K(res));
+  // ASSERT_NE(cache_ls_meta->offline_scn_, offline_scn);
   global_is_sswriter = true;
 }
 
@@ -1009,7 +1243,7 @@ TEST_F(ObTestSSLogMetaService, test_tablet_handle_assign)
 
   common::ObArenaAllocator allocator("TestTabletMeta",
                                     OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID(), ObCtxIds::DEFAULT_CTX_ID);
-  EXPECT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
   ls = ls_handle.get_ls();
   ASSERT_NE(nullptr, ls);
   ret = TestTabletHelper::create_tablet(ls_handle, cur_tablet_id, schema, allocator);
@@ -1059,6 +1293,191 @@ TEST_F(ObTestSSLogMetaService, test_tablet_handle_assign)
   ASSERT_EQ(OB_ERR_UNEXPECTED, tmp_tablet_handle.assign(t3m_tablet_handle)); // COPY_FROM_T3M
 }
 
+TEST_F(ObTestSSLogMetaService, test_BasePointerHandle)
+{
+  share::ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id));
+  int ret = OB_SUCCESS;
+
+  share::schema::ObTableSchema schema;
+  TestSchemaUtils::prepare_data_schema(schema);
+  ObTabletID cur_tablet_id = get_next_tablet_id();
+  const SCN transfer_scn = SCN::min_scn();
+  ObLSID ls_id = ls_id_;
+  ObSSMetaService *meta_svr = MTL(ObSSMetaService *);
+  ObLSService *ls_svr = MTL(ObLSService*);
+  ObLSHandle ls_handle;
+  ObLS *ls = NULL;
+
+  common::ObArenaAllocator allocator("TestTabletMeta",
+                                    OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID(), ObCtxIds::DEFAULT_CTX_ID);
+  ASSERT_EQ(OB_SUCCESS, ls_svr->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ls = ls_handle.get_ls();
+  ASSERT_NE(nullptr, ls);
+  ret = TestTabletHelper::create_tablet(ls_handle, cur_tablet_id, schema, allocator);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ASSERT_EQ(OB_SUCCESS, meta_svr->create_tablet(ls_id_,
+                                                cur_tablet_id,
+                                                transfer_scn));
+  LOG_INFO("test_meta_service debug : create tablet success", K(ret), K(ls_id_), K(cur_tablet_id));
+
+  ObTabletHandle ss_tablet_handle;
+  ret = meta_svr->get_tablet(ls_id,
+                             cur_tablet_id,
+                             transfer_scn,
+                             allocator,
+                             ss_tablet_handle);
+  LOG_INFO("get tablet_handle SSLOCAL", K(ss_tablet_handle), K(ss_tablet_handle.get_obj()->get_pointer_handle()));
+  ASSERT_EQ(true, ss_tablet_handle.get_obj()->get_pointer_handle().is_valid());
+  ASSERT_EQ(1, ss_tablet_handle.get_obj()->get_pointer_handle().base_pointer_->get_ref_cnt());
+}
+
+TEST_F(ObTestSSLogMetaService, test_modify_raw_meta_tenant_id)
+{
+  share::ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id));
+  int ret = OB_SUCCESS;
+  ObSSMetaService *meta_svr = MTL(ObSSMetaService*);
+  ASSERT_TRUE(nullptr != meta_svr);
+
+  ObArenaAllocator allocator("TestModifyTId");
+
+  // Test case 1: Same digit count - in-place modification
+  {
+    ObRawMetaRow row;
+    row.type_ = ObSSLogMetaType::SSLOG_TABLET_META;
+    row.row_scn_ = share::SCN::base_scn();
+
+    // Create a meta_key with tenant_id = 1002
+    const char* original_meta_key = "id_1:1002;id_2:1;id_3:200002;id_4:0;";
+    int64_t meta_key_len = strlen(original_meta_key);
+    char* meta_key_buf = static_cast<char*>(allocator.alloc(meta_key_len + 1));
+    ASSERT_TRUE(nullptr != meta_key_buf);
+    memcpy(meta_key_buf, original_meta_key, meta_key_len);
+    meta_key_buf[meta_key_len] = '\0';
+    row.meta_key_.assign_ptr(meta_key_buf, meta_key_len);
+
+    uint64_t new_tenant_id = 1014; // Same digit count as 1002
+    ret = meta_svr->modify_raw_meta_tenant_id(new_tenant_id, allocator, row);
+    ASSERT_EQ(OB_SUCCESS, ret);
+
+    // Verify the modification
+    const char* expected_meta_key = "id_1:1014;id_2:1;id_3:200002;id_4:0;";
+    LOG_INFO("expected meta key", K(expected_meta_key));
+    LOG_INFO("actual meta key", K(row.meta_key_));
+    ASSERT_EQ(0, memcmp(row.meta_key_.ptr(), expected_meta_key, row.meta_key_.length()));
+    LOG_INFO("Test case 1 passed: same digit count modification", K(row.meta_key_));
+  }
+
+  // Test case 2: Different digit count - serialize/deserialize method
+  {
+    ObRawMetaRow row;
+    row.type_ = ObSSLogMetaType::SSLOG_TABLET_META;
+    row.row_scn_ = share::SCN::base_scn();
+
+    // Create a meta_key with tenant_id = 1
+    const char* original_meta_key = "id_1:1;id_2:1;id_3:200002;id_4:0;";
+    int64_t meta_key_len = strlen(original_meta_key);
+    char* meta_key_buf = static_cast<char*>(allocator.alloc(meta_key_len + 1));
+    ASSERT_TRUE(nullptr != meta_key_buf);
+    memcpy(meta_key_buf, original_meta_key, meta_key_len);
+    meta_key_buf[meta_key_len] = '\0';
+    row.meta_key_.assign_ptr(meta_key_buf, meta_key_len);
+
+    uint64_t new_tenant_id = 1003; // Different digit count from 1
+    ret = meta_svr->modify_raw_meta_tenant_id(new_tenant_id, allocator, row);
+    ASSERT_EQ(OB_SUCCESS, ret);
+
+    // Verify the modification
+    const char* expected_meta_key = "id_1:1003;id_2:1;id_3:200002;id_4:0;";
+    ASSERT_EQ(0, memcmp(row.meta_key_.ptr(), expected_meta_key, row.meta_key_.length()));
+    LOG_INFO("Test case 2 passed: different digit count modification", K(row.meta_key_));
+  }
+
+  // Test case 3: Invalid meta_key - empty string
+  {
+    ObRawMetaRow row;
+    row.type_ = ObSSLogMetaType::SSLOG_TABLET_META;
+    row.row_scn_ = share::SCN::base_scn();
+    row.meta_key_.assign_ptr("", 0); // Empty meta_key
+
+    uint64_t new_tenant_id = 1002;
+    ret = meta_svr->modify_raw_meta_tenant_id(new_tenant_id, allocator, row);
+    ASSERT_EQ(OB_INVALID_ARGUMENT, ret);
+    LOG_INFO("Test case 3 passed: invalid empty meta_key", K(ret));
+  }
+
+  // Test case 4: Invalid meta_key - missing id_1: prefix
+  {
+    ObRawMetaRow row;
+    row.type_ = ObSSLogMetaType::SSLOG_TABLET_META;
+    row.row_scn_ = share::SCN::base_scn();
+
+    const char* invalid_meta_key = "invalid_key_format";
+    int64_t meta_key_len = strlen(invalid_meta_key);
+    char* meta_key_buf = static_cast<char*>(allocator.alloc(meta_key_len + 1));
+    ASSERT_TRUE(nullptr != meta_key_buf);
+    memcpy(meta_key_buf, invalid_meta_key, meta_key_len);
+    meta_key_buf[meta_key_len] = '\0';
+    row.meta_key_.assign_ptr(meta_key_buf, meta_key_len);
+
+    uint64_t new_tenant_id = 1002;
+    ret = meta_svr->modify_raw_meta_tenant_id(new_tenant_id, allocator, row);
+    ASSERT_EQ(OB_ERR_UNEXPECTED, ret);
+    LOG_INFO("Test case 4 passed: invalid meta_key format", K(ret));
+  }
+
+  // Test case 5: Edge case - single digit to single digit
+  {
+    ObRawMetaRow row;
+    row.type_ = ObSSLogMetaType::SSLOG_TABLET_META;
+    row.row_scn_ = share::SCN::base_scn();
+
+    const char* original_meta_key = "id_1:5;id_2:1;id_3:200002;id_4:0;";
+    int64_t meta_key_len = strlen(original_meta_key);
+    char* meta_key_buf = static_cast<char*>(allocator.alloc(meta_key_len + 1));
+    ASSERT_TRUE(nullptr != meta_key_buf);
+    memcpy(meta_key_buf, original_meta_key, meta_key_len);
+    meta_key_buf[meta_key_len] = '\0';
+    row.meta_key_.assign_ptr(meta_key_buf, meta_key_len);
+
+    uint64_t new_tenant_id = 9; // Same digit count as 5
+    ret = meta_svr->modify_raw_meta_tenant_id(new_tenant_id, allocator, row);
+    ASSERT_EQ(OB_SUCCESS, ret);
+
+    // Verify the modification
+    const char* expected_meta_key = "id_1:9;id_2:1;id_3:200002;id_4:0;";
+    ASSERT_EQ(0, memcmp(row.meta_key_.ptr(), expected_meta_key, row.meta_key_.length()));
+    LOG_INFO("Test case 5 passed: single digit modification", K(row.meta_key_));
+  }
+
+  // Test case 6: Large tenant_id
+  {
+    ObRawMetaRow row;
+    row.type_ = ObSSLogMetaType::SSLOG_TABLET_META;
+    row.row_scn_ = share::SCN::base_scn();
+
+    const char* original_meta_key = "id_1:12345;id_2:1;id_3:200002;id_4:0;";
+    int64_t meta_key_len = strlen(original_meta_key);
+    char* meta_key_buf = static_cast<char*>(allocator.alloc(meta_key_len + 1));
+    ASSERT_TRUE(nullptr != meta_key_buf);
+    memcpy(meta_key_buf, original_meta_key, meta_key_len);
+    meta_key_buf[meta_key_len] = '\0';
+    row.meta_key_.assign_ptr(meta_key_buf, meta_key_len);
+
+    uint64_t new_tenant_id = 99999; // Same digit count as 12345
+    ret = meta_svr->modify_raw_meta_tenant_id(new_tenant_id, allocator, row);
+    ASSERT_EQ(OB_SUCCESS, ret);
+
+    // Verify the modification
+    const char* expected_meta_key = "id_1:99999;id_2:1;id_3:200002;id_4:0;";
+    ASSERT_EQ(0, memcmp(row.meta_key_.ptr(), expected_meta_key, row.meta_key_.length()));
+    LOG_INFO("Test case 6 passed: large tenant_id modification", K(row.meta_key_));
+  }
+
+  LOG_INFO("All test cases for modify_raw_meta_tenant_id passed");
+}
+
 } // unittest
 } // oceanbase
 
@@ -1070,7 +1489,7 @@ int main(int argc, char **argv)
   char buf[1000];
   const int64_t cur_time_ns = ObTimeUtility::current_time_ns();
   memset(buf, 1000, sizeof(buf));
-  databuff_printf(buf, sizeof(buf), "%s/%lu?host=%s&access_id=%s&access_key=%s&s3_region=%s&max_iops=2000&max_bandwidth=200000000B&scope=region",
+  databuff_printf(buf, sizeof(buf), "%s/%lu_meta_service?host=%s&access_id=%s&access_key=%s&s3_region=%s&max_iops=2000&max_bandwidth=200000000B&scope=region",
       oceanbase::unittest::S3_BUCKET, cur_time_ns, oceanbase::unittest::S3_ENDPOINT, oceanbase::unittest::S3_AK, oceanbase::unittest::S3_SK, oceanbase::unittest::S3_REGION);
   oceanbase::shared_storage_info = buf;
   while(EOF != (c = getopt(argc,argv,"t:l:"))) {
@@ -1093,7 +1512,7 @@ int main(int argc, char **argv)
   GCONF.memory_limit.set_value("20G");
   GCONF.system_memory.set_value("5G");
 
-  LOG_INFO("main>>>");
+  LOG_INFO("main>>>", K(cur_time_ns));
   oceanbase::unittest::RunCtx.time_sec_ = time_sec;
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

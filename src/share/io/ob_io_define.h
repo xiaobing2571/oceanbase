@@ -59,6 +59,28 @@ static constexpr int64_t DEFAULT_OBJECT_STORAGE_IO_TIMEOUT_MS = 20 * 1000L;
 
 enum class ObIOMode : uint8_t { READ = 0, WRITE = 1, MAX_MODE };
 
+/*
+ObIOReadMode is a submodule under the READ module. Its configurations include:
+DEFAULT: Handles standard read requests;
+Other modes: Designed for utility requests.
+*/
+enum class ObIOReadMode {
+  DEFAULT,
+  EXIST,
+  ADAPTIVE_EXIST,
+  STAT,
+  ADAPTIVE_STAT,
+  UNLINK,
+  ADAPTIVE_UNLINK,
+  MKDIR,
+  RMDIR,
+  IS_TAGGING,
+  COMPLETE,
+  ABORT,
+  SEAL_FILE,
+  MAX_MODE,
+};
+
 enum class ObIOGroupMode : uint8_t { LOCALREAD = 0, LOCALWRITE = 1, REMOTEREAD = 2, REMOTEWRITE = 3, MODECNT };
 
 enum class ObIOPriority : uint8_t {
@@ -70,6 +92,7 @@ enum class ObIOPriority : uint8_t {
 
 const char *get_io_mode_string(const ObIOMode mode);
 const char *get_io_mode_string(const ObIOGroupMode mode);
+bool is_without_read_buf(const ObIOReadMode read_mode);
 int transform_usage_index_to_group_config_index(const uint64_t &usage_index, uint64_t &group_config_index);
 ObIOMode get_io_mode_enum(const char *mode_string);
 
@@ -131,12 +154,11 @@ public:
   bool is_sys_module() const;
   uint8_t get_func_type() const;
   int64_t get_wait_event() const;
-  void set_read();
+  void set_read(ObIOReadMode read_mode = ObIOReadMode::DEFAULT);
   bool is_read() const;
+  ObIOReadMode get_read_mode() const;
   void set_write();
   bool is_write() const;
-  void set_sync();
-  void set_async();
   bool is_sync() const;
   void set_unlimited(const bool is_unlimited = true);
   bool is_unlimited() const;
@@ -158,15 +180,31 @@ public:
   void set_need_close_dev_and_fd();
   void set_no_need_close_dev_and_fd();
   bool is_need_close_dev_and_fd() const;
-  TO_STRING_KV("mode", common::get_io_mode_string(static_cast<ObIOMode>(mode_)), K(group_id_), K(func_type_),
+  void set_buffered_read(const bool is_buffered_read = true);
+  bool is_buffered_read() const;
+  void set_preread();
+  void set_no_preread();
+  void set_upload_part();
+  void set_no_upload_part();
+  bool is_upload_part() const;
+  bool is_preread() const;
+  void set_ss_private_dir();
+  void set_ss_public_dir();
+  bool is_ss_private_dir() const;
+  bool is_ss_public_dir() const;
+  TO_STRING_KV("mode", common::get_io_mode_string(static_cast<ObIOMode>(mode_)), K_(read_mode), K(group_id_), K(func_type_),
       K(wait_event_id_), K(is_sync_), K(is_unlimited_), K(is_detect_), K(is_write_through_), K(is_sealed_),
-      K(is_time_detect_), K(need_close_dev_and_fd_), K(reserved_));
+      K(is_time_detect_), K(need_close_dev_and_fd_), K(is_preread_), K(is_buffered_read_), K(is_upload_part_), K(reserved_));
+private:
+  void set_sync_();
+  void set_async_();
 
 private:
   friend struct ObIOResult;
   void set_func_type(const uint8_t func_type);
   void set_resource_group_id(const uint64_t group_id);
   static constexpr int64_t IO_MODE_BIT = 4; // read, write, append
+  static constexpr int64_t IO_READ_MOD_BIT = 4;
   static constexpr int64_t IO_FUNC_TYPE_BIT = 8;
   static constexpr int64_t IO_WAIT_EVENT_BIT = 32; // for performance monitor
   static constexpr int64_t IO_SYNC_FLAG_BIT = 1; // indicate if the caller is waiting io finished
@@ -184,7 +222,12 @@ private:
   // does not need to close device and fd. object storage block io uses ObObjectDevice, which
   // needs to close device and fd.
   static constexpr int64_t IO_CLOSE_DEV_AND_FD_BIT = 1;
+  static constexpr int64_t IO_BUFFERED_READ_BIT = 1; // indicate read mode of the io
+  static constexpr int64_t IO_PREREAD_FLAG_BIT = 1;
+  static constexpr int64_t IO_UPLOAD_PART_BIT = 1;
+  static constexpr int64_t IO_SS_DIR_TYPE_BIT = 4; // indicate the type of ss dir, 0: not ss dir, 1: private, 2: public
   static constexpr int64_t IO_RESERVED_BIT = 64 - IO_MODE_BIT
+                                                - IO_READ_MOD_BIT
                                                 - IO_WAIT_EVENT_BIT
                                                 - IO_SYNC_FLAG_BIT
                                                 - IO_DETECT_FLAG_BIT
@@ -192,12 +235,18 @@ private:
                                                 - IO_WRITE_THROUGH_BIT
                                                 - IO_SEALED_FLAG_BIT
                                                 - IO_TIME_DETECT_FLAG_BIT
-                                                - IO_CLOSE_DEV_AND_FD_BIT;
+                                                - IO_CLOSE_DEV_AND_FD_BIT
+                                                - IO_BUFFERED_READ_BIT
+                                                - IO_PREREAD_FLAG_BIT
+                                                - IO_UPLOAD_PART_BIT
+                                                - IO_SS_DIR_TYPE_BIT;
+  static_assert(IO_RESERVED_BIT >= 0, "IO_RESERVED_BIT must be >= 0");
 
   union { // FARM COMPAT WHITELIST
     int64_t flag_;
     struct {
       int64_t mode_ : IO_MODE_BIT;
+      uint8_t read_mode_ : IO_READ_MOD_BIT;
       uint8_t func_type_ : IO_FUNC_TYPE_BIT;
       int64_t wait_event_id_ : IO_WAIT_EVENT_BIT;
       bool is_sync_ : IO_SYNC_FLAG_BIT;
@@ -207,6 +256,10 @@ private:
       bool is_sealed_ : IO_SEALED_FLAG_BIT;
       bool is_time_detect_ : IO_TIME_DETECT_FLAG_BIT;
       bool need_close_dev_and_fd_ : IO_CLOSE_DEV_AND_FD_BIT;
+      bool is_buffered_read_ : IO_BUFFERED_READ_BIT;
+      bool is_preread_ : IO_PREREAD_FLAG_BIT;
+      bool is_upload_part_ : IO_UPLOAD_PART_BIT;
+      uint8_t ss_dir_type_ : IO_SS_DIR_TYPE_BIT;
       int64_t reserved_ : IO_RESERVED_BIT;
     };
   };
@@ -232,8 +285,11 @@ enum class ObIOCallbackType : uint8_t {
   TMP_CACHED_READ_CALLBACK = 13,
   INC_UPLOAD_ASYNC_MACRO_READ_CALLBACK = 14,
   EXTERNAL_DATA_LOAD_FROM_REMOTE_CALLBACK = 15,
-  EX_CACHED_READ_CALLBACK = 16,
-  MAX_CALLBACK_TYPE = 17
+  EXTERNAL_DATA_CACHED_READ_CALLBACK = 16,
+  EX_CACHED_READ_CALLBACK = 17,
+  SS_TMP_FILE_READ_CALLBACK = 18,
+  SS_MACRO_BLOCK_PREWARM_CALLBACK = 19,
+  MAX_CALLBACK_TYPE = 20
 };
 
 bool is_atomic_write_callback(const ObIOCallbackType type);
@@ -306,6 +362,22 @@ public:
   const char *buf_;
   char *user_data_buf_;  // actual data buf without cb, allocated by the calling layer
   int64_t part_id_;      // multipart upload's part id
+  ObString uri_;
+};
+
+// Please obey the following rules, when adding new write strategy:
+// 1. add new strategy at the end of the enum class
+// 2. update the convert_write_strategy_to_mask function in generate_shared_object_type.py
+enum class ObStorageObjectWriteStrategy : uint8_t
+{
+  // write object storage
+  WRITE_THROUGH = 0,
+  // write local cache (fallback to write object storage, when local disk space is not enough)
+  WRITE_BACK = 1,
+  // write object storage (in foreground) and try write local cache (in background). as long as
+  // successfully write object storage, this write operation is considered successful.
+  WRITE_THROUGH_AND_TRY_WRITE_LCACHE = 2,
+  INVALID_WRITE_STRATEGY = 3
 };
 
 #ifdef OB_BUILD_SHARED_STORAGE
@@ -324,9 +396,12 @@ public:
   int64_t tmp_file_valid_length_;
   uint64_t effective_tablet_id_; // indicate effective tablet id about partition split
   bool is_write_cache_; // indicate write or read macro cache
+  ObStorageObjectWriteStrategy write_strategy_; // indicate write strategy of this io
+  bool is_batch_write_; // indicate batch write, for batch write to tiered metadata table
 
   INHERIT_TO_STRING_KV("SNIOInfo", ObSNIOInfo, K_(phy_block_handle), K_(fd_cache_handle),
-                       K_(tmp_file_valid_length), K_(effective_tablet_id), K_(is_write_cache));
+                       K_(tmp_file_valid_length), K_(effective_tablet_id), K_(is_write_cache),
+                       K_(write_strategy), K_(is_batch_write));
 };
 #endif
 
@@ -382,13 +457,7 @@ public:
   ~ObIOTimeLog();
   void reset();
   // Note: -1 represents invalid value
-  TO_STRING_KV(K_(begin_ts), "enqueue_used", (enqueue_ts_ > 0 ? enqueue_ts_ - begin_ts_ : -1), "dequeue_used",
-      (dequeue_ts_ > 0 ? dequeue_ts_ - enqueue_ts_ : -1), "submit_used",
-      (submit_ts_ > 0 ? submit_ts_ - dequeue_ts_ : -1), "return_used", (return_ts_ > 0 ? return_ts_ - submit_ts_ : -1),
-      "callback_enqueue_used", (callback_enqueue_ts_ > 0 ? callback_enqueue_ts_ - return_ts_ : -1),
-      "callback_dequeue_used", (callback_dequeue_ts_ > 0 ? callback_dequeue_ts_ - callback_enqueue_ts_ : -1),
-      "callback_finish_used", (callback_finish_ts_ > 0 ? callback_finish_ts_ - callback_dequeue_ts_ : -1), "end_used",
-      (end_ts_ > 0 ? end_ts_ - callback_finish_ts_ : -1));
+  DECLARE_TO_STRING;
 
 public:
   int64_t begin_ts_;
@@ -492,7 +561,6 @@ struct ObIOSSGrpKey
   TO_STRING_KV(K(tenant_id_), K(group_key_));
 };
 
-
 class ObIOResult final
 {
 public:
@@ -510,7 +578,9 @@ public:
   ObIOGroupKey get_group_key() const;
   uint64_t get_sys_module_id() const;
   bool is_sys_module() const;
+  bool is_canceled() const { return is_canceled_; }
   int64_t get_data_size() const;
+  int64_t get_user_io_size() const;
   uint64_t get_io_usage_index();
   uint64_t get_tenant_id() const;
   void inc_ref(const char *msg = nullptr);
@@ -523,10 +593,12 @@ public:
   int transform_group_config_index_to_usage_index(const ObIOGroupKey &key, uint64_t &usage_index);
   ObThreadCond &get_cond() { return cond_; }
 
-  TO_STRING_KV(K(is_inited_), K(is_finished_), K(is_canceled_), K(has_estimated_), K(complete_size_), K(offset_), K(size_),
+  TO_STRING_KV(KP(this), K(is_inited_), K(is_finished_), K(is_canceled_), K(has_estimated_), K(complete_size_), K(offset_), K(size_),
                K(timeout_us_), K(result_ref_cnt_), K(out_ref_cnt_), K(flag_), K(ret_code_), K(tenant_id_), K(tenant_io_mgr_),
                KP(user_data_buf_), KP(buf_), KP(io_callback_), K_(time_log));
   DISALLOW_COPY_AND_ASSIGN(ObIOResult);
+private:
+  int set_flag_sync_or_async_(const ObIOInfo &info);
 private:
 #ifdef OB_BUILD_SHARED_STORAGE
   friend class ObSSIORequest;
@@ -543,7 +615,7 @@ private:
   bool is_finished_;
   bool is_canceled_;
   bool has_estimated_;
-  bool is_object_device_req_;
+  bool is_limit_net_bandwidth_req_;
   volatile int32_t result_ref_cnt_; //for io_result and io_handle
   volatile int32_t out_ref_cnt_; //for io_handle
   int64_t complete_size_;
@@ -563,7 +635,7 @@ public:
   ObIORetCode ret_code_;
 };
 
-class ObIORequest : public common::ObDLinkBase<ObIORequest>
+class ObIORequest : public common::ObDLinkBase<ObIORequest>, public TCRequestOwner
 {
 public:
   ObIORequest();
@@ -575,15 +647,15 @@ public:
   virtual void reset();
   void free();
   void set_result(ObIOResult &io_result);
-  bool is_canceled();
   int64_t timeout_ts() const;
   int64_t get_data_size() const;
   ObIOGroupKey get_group_key() const;
   uint64_t get_sys_module_id() const;
   bool is_sys_module() const;
   oceanbase::share::ObFunctionType get_func_type() const;
+  bool is_local_clog_io() const;
   bool is_local_clog_not_isolated();
-  bool is_object_device_req() const;
+  bool is_limit_net_bandwidth_req() const;
   char *calc_io_buf();  // calc the aligned io_buf of raw_buf_, which interact with the operating system
   const ObIOFlag &get_flag() const;
   ObIOMode get_mode() const; // 2 mode
@@ -602,12 +674,17 @@ public:
   void free_io_buffer();
   void inc_ref(const char *msg = nullptr);
   void dec_ref(const char *msg = nullptr);
+  bool is_canceled() const;
+
+  int alloc_uri_cstr(const ObIOInfo &info);
+  void free_uri_cstr();
+  char *get_uri_cstr() const { return uri_cstr_; }
 
   int64_t get_remained_io_timeout_us();
 
-  TO_STRING_KV(K(is_inited_), K(tenant_id_), KP(control_block_), K(ref_cnt_), KP(raw_buf_), K(fd_), K(is_object_device_req()),
-               K(trace_id_), K(retry_count_), K(tenant_io_mgr_), K_(storage_accesser),
-               KPC(io_result_), K_(part_id));
+  TO_STRING_KV(KP(this), KP(io_result_), K(is_inited_), K(tenant_id_), KP(control_block_), K(ref_cnt_), KP(raw_buf_), K(fd_), K(is_limit_net_bandwidth_req()),
+               K(align_size_), K(align_offset_), K(trace_id_), K(retry_count_), K(tenant_io_mgr_), K_(storage_accesser),
+               KPC(io_result_), K_(part_id), KCSTRING_(uri_cstr));
 private:
   friend class ObTenantIOSchedulerV2;
   friend class ObDeviceChannel;
@@ -649,6 +726,7 @@ protected:
   ObIOFd fd_;
   ObCurTraceId::TraceId trace_id_;
   int64_t part_id_;   // multipart upload's part id
+  char *uri_cstr_;
 };
 
 typedef common::ObDList<ObIORequest> IOReqList;
@@ -698,12 +776,17 @@ public:
   bool is_valid() const;
   OB_INLINE bool is_finished() const
   {
-    return nullptr != result_ && result_->is_finished_;
+    return (nullptr != result_ && result_->is_finished_);
+  }
+  bool is_limit_net_bandwidth_req() const
+  {
+    return (nullptr != result_ && result_->is_limit_net_bandwidth_req_);
   }
 
   int wait(const int64_t wait_timeout_ms = UINT64_MAX);
   const char *get_buffer();
   int64_t get_data_size() const;
+  int64_t get_user_io_size() const;
   int64_t get_rt() const;
   int get_fs_errno(int &io_errno) const;
   void reset();
@@ -711,12 +794,14 @@ public:
   int get_io_ret() const;
   int get_io_flag(ObIOFlag &flag) const;
   int get_io_time_us(int64_t &io_time_us) const;
+  int get_io_callback_time_us(int64_t &io_callback_time_us) const;
   int check_is_finished(bool &is_finished);
   void clear_io_callback();
   ObIOCallback *get_io_callback();
   bool need_trace() const;
   storage::ObStorageCheckID get_check_id() const { return storage::ObStorageCheckID::IO_HANDLE; }
-  TO_STRING_KV("io_result", to_cstring(result_));
+  void get_remained_io_timeout_ms(int64_t &real_wait_timeout_ms) const;
+  TO_STRING_KV("io_result", result_);
 
 private:
   void estimate();

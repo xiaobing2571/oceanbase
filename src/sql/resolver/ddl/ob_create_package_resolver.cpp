@@ -15,6 +15,7 @@
 #include "ob_create_package_stmt.h"
 #include "pl/ob_pl_package.h"
 #include "pl/ob_pl_compile.h"
+#include "pl/ob_pl_router.h"
 
 namespace oceanbase
 {
@@ -242,6 +243,7 @@ int ObCreatePackageResolver::resolve(const ParseNode &parse_tree)
                                                 package_body_info));
           if (OB_SUCC(ret) && OB_NOT_NULL(package_body_info) && !package_body_info->is_for_trigger()) {
             ObString source = package_body_info->get_source();
+            bool is_wrap = false;
             OZ (ObSQLUtils::convert_sql_text_from_schema_for_resolve(
                   *allocator_, session_info_->get_dtc_params(), source));
             OZ (package_body_ast.init(db_name,
@@ -257,7 +259,8 @@ int ObCreatePackageResolver::resolve(const ParseNode &parse_tree)
             OZ (compiler.analyze_package(source,
                                          &(package_ast.get_body()->get_namespace()),
                                          package_body_ast,
-                                         false));
+                                         false,
+                                         is_wrap));
             if (OB_SUCC(ret)) {
               obrpc::ObCreatePackageArg &create_package_arg = stmt->get_create_package_arg();
               ObIArray<ObRoutineInfo> &routine_list = create_package_arg.public_routine_infos_;
@@ -440,6 +443,9 @@ int ObCreatePackageResolver::resolve_functions_spec(const ObPackageInfo &package
     } */else {
       if (pl_routine_info->is_deterministic()) {
         routine_info.set_deterministic();
+      }
+      if (pl_routine_info->is_result_cache()) {
+        routine_info.set_result_cache();
       }
       if (pl_routine_info->is_parallel_enable()) {
         routine_info.set_parallel_enable();
@@ -666,7 +672,8 @@ int ObCreatePackageBodyResolver::resolve(const ParseNode &parse_tree)
 
           OX (source = package_spec_info->get_source());
           OZ (ObSQLUtils::convert_sql_text_from_schema_for_resolve(tmp_allocator, session_info_->get_dtc_params(), source));
-          OZ (compiler.analyze_package(source,NULL, package_spec_ast, false));
+          bool is_wrap = false;
+          OZ (compiler.analyze_package(source,NULL, package_spec_ast, false, is_wrap));
 
           OZ (package_body_ast.init(db_name,
                                     package_name,
@@ -679,7 +686,8 @@ int ObCreatePackageBodyResolver::resolve(const ParseNode &parse_tree)
           OZ (compiler.analyze_package(package_body_src,
                                     &(package_spec_ast.get_body()->get_namespace()),
                                     package_body_ast,
-                                    false));
+                                    false,
+                                    is_wrap));
 
           if (OB_SUCC(ret)) {
             if (package_body_ast.get_serially_reusable()
@@ -823,6 +831,7 @@ int ObCreatePackageBodyResolver::update_routine_route_sql(ObIAllocator &allocato
 {
   int ret = OB_SUCCESS;
   const ObPLRoutineInfo *pl_routine_info = NULL;
+  ObPLFunctionAST *routine_ast = NULL;
   ObRoutineInfo routine_info;
   for (int64_t i = ObPLRoutineTable::NORMAL_ROUTINE_START_IDX;
        OB_SUCC(ret) && i < spec_routine_table.get_count(); i++) {
@@ -830,6 +839,7 @@ int ObCreatePackageBodyResolver::update_routine_route_sql(ObIAllocator &allocato
     bool found = false;
     OX (routine_info.reset());
     OZ (body_routine_table.get_routine_info(i, pl_routine_info));
+    OZ (body_routine_table.get_routine_ast(i, routine_ast));
     for (int64_t j = 0; OB_SUCC(ret) && j < routine_infos.count(); ++j) {
       tmp_routine_info = routine_infos.at(j);
       if (tmp_routine_info->get_subprogram_id() == i) {
@@ -844,9 +854,12 @@ int ObCreatePackageBodyResolver::update_routine_route_sql(ObIAllocator &allocato
         OX (routine_info.set_route_sql(route_sql));
         OZ (ObSQLUtils::convert_sql_text_to_schema_for_storing(allocator, session_info.get_dtc_params(), routine_body));
         OX (routine_info.set_routine_body(routine_body));
+        if (OB_SUCC(ret) && OB_NOT_NULL(routine_ast)) {
+          routine_info.reset_analyze_flag();
+          OZ (pl::ObPLRouter::mark_sql_transpiler_eligible(*routine_ast, routine_info));
+        }
         if (OB_SUCC(ret)) {
           // reset flag attr
-          routine_info.reset_analyze_flag();
           if (pl_routine_info->is_modifies_sql_data()) {
             routine_info.set_modifies_sql_data();
           } else if (pl_routine_info->is_reads_sql_data()) {

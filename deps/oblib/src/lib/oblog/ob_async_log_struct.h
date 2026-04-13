@@ -81,17 +81,25 @@ public:
   bool is_supported_file() const { return MAX_FD_FILE != fd_type_; }
   bool is_audit_file() const { return FD_AUDIT_FILE == fd_type_; }
   bool is_alert_file() const { return FD_ALERT_FILE == fd_type_; }
-
+  void set_cached_item()  { is_cached_item_ = true; }
+  bool is_cached_item() const { return is_cached_item_; }
+  inline void set_slot(int64_t slot) { slot_  = slot; }
+  inline int64_t get_slot() const { return slot_; }
+  inline void set_large_item(bool is_large) { is_large_item_ = is_large; }
+  inline bool is_large_item() const { return is_large_item_; }
 private:
   ObPLogFDType fd_type_;
   int32_t log_level_;
   int32_t tl_type_;
   bool is_force_allow_;
   bool is_size_overflow_;
+  bool is_cached_item_;
+  bool is_large_item_;
   int64_t timestamp_;
   int64_t header_pos_;
   int64_t buf_size_;
   int64_t pos_;
+  int64_t slot_;
   char buf_[0];
 private:
   DISALLOW_COPY_AND_ASSIGN(ObPLogItem);
@@ -102,15 +110,22 @@ class ObPLogFileStruct
 public:
   ObPLogFileStruct();
   virtual ~ObPLogFileStruct() { close_all(); }
+  static void set_sync_size_threshold(uint64_t threshold);
   int open(const char *log_file, const bool open_wf_flag, const bool redirect_flag);
   int reopen(const bool redirect_flag);
   int reopen_wf();
   int close_all();
   bool is_opened() { return fd_ > STDERR_FILENO; }
   int64_t get_write_size() const { return write_size_; }
+  void fsync();
+  void wfsync();
+  void try_fsync(const int64_t size);
+  void try_wfsync(const int64_t size);
+  void reset();
 public:
   static const int32_t MAX_LOG_FILE_NAME_SIZE = 256;
   static const mode_t LOG_FILE_MODE = 0644;
+  static uint64_t sync_size_threshold;
 
   char filename_[MAX_LOG_FILE_NAME_SIZE];
   int32_t fd_;//descriptor of log-file
@@ -120,6 +135,10 @@ public:
   int64_t file_size_;
   struct stat stat_;
   struct stat wf_stat_;
+  int64_t offset_;
+  int64_t wf_offset_;
+  int64_t unsynced_size_;
+  int64_t wf_unsynced_size_;
 };
 
 } // common

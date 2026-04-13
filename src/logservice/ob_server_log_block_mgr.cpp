@@ -62,7 +62,10 @@ int ObServerLogBlockMgr::check_clog_directory_is_empty(const char *clog_dir, boo
 }
 
 ObServerLogBlockMgr::ObServerLogBlockMgr()
-    : log_pool_meta_serialize_buf_(NULL),
+    : log_pool_meta_lock_(common::ObLatchIds::OB_SERVER_LOG_BLOCK_MGR_SPIN_LOCK),
+      resize_lock_(common::ObLatchIds::OB_SERVER_LOG_BLOCK_MGR_RESIZE_LOCK),
+      block_id_range_lock_(common::ObLatchIds::OB_SERVER_LOG_BLOCK_MGR_RWLOCK),
+      log_pool_meta_serialize_buf_(NULL),
       dir_fd_(-1),
       meta_fd_(-1),
       log_pool_meta_(),
@@ -232,9 +235,11 @@ int ObServerLogBlockMgr::get_disk_usage(int64_t &in_use_size_byte, int64_t &tota
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     CLOG_LOG(ERROR, "ObServerLogBlockMgr has not inited", K(ret), KPC(this));
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
   } else if (GCONF.enable_logservice) {
     in_use_size_byte = 0;
-    total_size_byte = INT64_MAX - 1;
+    total_size_byte = OB_SERVER_LOG_DISK_CAPACITY_IN_SHARED_LOG_SERVICE;
+#endif
   } else {
     total_size_byte = get_total_size_guarded_by_lock_();
     in_use_size_byte = get_in_use_size_guarded_by_lock_();

@@ -94,7 +94,7 @@ ObFreezerStat::ObFreezerStat()
     freeze_snapshot_version_(),
     diagnose_info_(),
     memtables_info_(),
-    lock_()
+    lock_(common::ObLatchIds::OB_FREEZER_STAT_LOCK)
 {}
 
 ObFreezerStat::~ObFreezerStat()
@@ -373,7 +373,7 @@ ObFreezer::ObFreezer()
     high_priority_freeze_cnt_(0),
     low_priority_freeze_cnt_(0),
     pend_replay_cnt_(0),
-    byte_lock_(),
+    byte_lock_(common::ObLatchIds::OB_FREEZER_LOCK),
     need_resubmit_log_(false),
     enable_(false),
     is_inited_(false),
@@ -393,7 +393,7 @@ ObFreezer::ObFreezer(ObLS *ls)
     high_priority_freeze_cnt_(0),
     low_priority_freeze_cnt_(0),
     pend_replay_cnt_(0),
-    byte_lock_(),
+    byte_lock_(common::ObLatchIds::OB_FREEZER_LOCK),
     need_resubmit_log_(false),
     enable_(false),
     is_inited_(false),
@@ -401,6 +401,7 @@ ObFreezer::ObFreezer(ObLS *ls)
     is_async_ls_freeze_task_existing_(false),
     throttle_is_skipping_(false),
     tenant_replay_is_pending_(false),
+    flush_is_disabled_(false),
     async_freeze_tablets_() {}
 
 ObFreezer::~ObFreezer()
@@ -427,6 +428,7 @@ void ObFreezer::reset()
   is_async_ls_freeze_task_existing_ = false;
   throttle_is_skipping_ = false;
   tenant_replay_is_pending_ = false;
+  flush_is_disabled_ = false;
 }
 
 int ObFreezer::init(ObLS *ls)
@@ -453,6 +455,7 @@ int ObFreezer::init(ObLS *ls)
     is_async_ls_freeze_task_existing_ = false;
     throttle_is_skipping_ = false;
     tenant_replay_is_pending_ = false;
+    flush_is_disabled_ = false;
 
     is_inited_ = true;
   }
@@ -588,14 +591,15 @@ int ObFreezer::wait_ls_freeze_finish()
     // this means that all memtables can be dumped
     int64_t time_counter = 0;
     while (!get_ls_data_checkpoint()->ls_freeze_finished()) {
-      if (TC_REACH_TIME_INTERVAL(1LL * 1000LL * 1000LL /* 1 second */)) {
+      // check pend replay condition each 100ms
+      if (TC_REACH_TIME_INTERVAL(100LL * 1000LL /* 10 ms */)) {
         ++time_counter;
 
         // check pend condition every second
         (void)pend_replay_helper.check_pend_condition_once();
 
         // check resubmit log condition and report some debug info every 5 seconds
-        if (time_counter >= 5 && time_counter % 5 == 0) {
+        if (time_counter >= 50 && time_counter % 50 == 0) {
           (void)resubmit_log_if_needed_(start_time, false /* is_tablet_freeze */, false /* is_try */);
         }
       }
@@ -651,13 +655,11 @@ struct AsyncFreezeFunctor {
   const int64_t trace_id_;
   const bool is_ls_freeze_;
   const ObLSID ls_id_;
-  ObFreezer *freezer_;
   // hold ls handle to avoid logstream being destroyed
-  AsyncFreezeFunctor(const int64_t trace_id, const bool is_ls_freeze, ObFreezer *freezer, ObLSHandle &ls_handle)
+  AsyncFreezeFunctor(const int64_t trace_id, const bool is_ls_freeze, const ObLSID ls_id)
       : trace_id_(trace_id),
         is_ls_freeze_(is_ls_freeze),
-        ls_id_(freezer->get_ls_id()),
-        freezer_(freezer) {}
+        ls_id_(ls_id) {}
   int operator()()
   {
     int ret = OB_SUCCESS;
@@ -666,15 +668,15 @@ struct AsyncFreezeFunctor {
     if (OB_FAIL(MTL(ObLSService *)->get_ls(ls_id_, ls_handle, ObLSGetMod::STORAGE_MOD))) {
       STORAGE_LOG(WARN, "get ls handle failed. stop async freeze task", KR(ret), K(ls_id_));
     } else {
-      // freezer_ cannot be nullptr because AsyncFreezeFunctor is constructed by ObFreezer::this pointer
+      ObLS *ls = ls_handle.get_ls();
       STORAGE_LOG(
-          INFO, "[Freezer] An Async Freeze Task Start", K(trace_id_), K(ls_id_), K(is_ls_freeze_), KP(freezer_));
+          INFO, "[Freezer] An Async Freeze Task Start", K(trace_id_), K(ls_id_), K(is_ls_freeze_), KP(ls));
       if (is_ls_freeze_) {
-        common::ObDIActionGuard(common::ObDIActionGuard::NS_ACTION, "LSFreeze:%ld", ls_id_.id());
-        (void)freezer_->async_ls_freeze_consumer(trace_id_);
+        common::ObDIActionGuard di_action_guard(common::ObDIActionGuard::NS_ACTION, "LSFreeze:%ld", ls_id_.id());
+        (void)ls->get_freezer()->async_ls_freeze_consumer(trace_id_);
       } else {
-        common::ObDIActionGuard(common::ObDIActionGuard::NS_ACTION, "TabletFreeze:%ld", ls_id_.id());
-        (void)freezer_->async_tablet_freeze_consumer(trace_id_);
+        common::ObDIActionGuard di_action_guard(common::ObDIActionGuard::NS_ACTION, "TabletFreeze:%ld", ls_id_.id());
+        (void)ls->get_freezer()->async_tablet_freeze_consumer(trace_id_);
       }
     }
     return ret;
@@ -715,7 +717,7 @@ void ObFreezer::submit_an_async_freeze_task(const int64_t trace_id, const bool i
     if (OB_FAIL(MTL(ObLSService *)->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD))) {
       STORAGE_LOG(WARN, "get ls handle failed. stop async freeze task", KR(ret), K(ls_id));
     } else if (acquired_exec_async_task_permission_(is_ls_freeze)) {
-      AsyncFreezeFunctor async_freeze_functor(trace_id, is_ls_freeze, this, ls_handle);
+      AsyncFreezeFunctor async_freeze_functor(trace_id, is_ls_freeze, ls_id);
       do {
         ret = tenant_freezer->freeze_thread_pool_.commit_task_ignore_ret(async_freeze_functor);
         if (OB_FAIL(ret) && REACH_TIME_INTERVAL(5LL * 1000LL * 1000LL)) {
@@ -809,22 +811,24 @@ void ObFreezer::async_tablet_freeze_consumer(const int64_t trace_id)
 
 void ObFreezer::try_freeze_tx_data_()
 {
-  int ret = OB_SUCCESS;
-  const int64_t MAX_RETRY_DURATION = 1LL * 1000LL * 1000LL;  // 1 seconds
-  int64_t retry_times = 0;
-  int64_t start_freeze_ts = ObClockGenerator::getClock();
-  do {
-    if (OB_FAIL(ls_->get_tx_table()->self_freeze_task())) {
-      if (OB_EAGAIN == ret) {
-        // sleep 100ms and retry
-        retry_times++;
-        ob_throttle_usleep(100LL * 1000LL, ret, ls_->get_ls_id().id());
-      } else {
-        STORAGE_LOG(WARN, "freeze tx data table failed", KR(ret), K(get_ls_id()));
+  if (is_user_tenant(MTL_ID())) {
+    int ret = OB_SUCCESS;
+    const int64_t MAX_RETRY_DURATION = 1LL * 1000LL * 1000LL;  // 1 seconds
+    int64_t retry_times = 0;
+    int64_t start_freeze_ts = ObClockGenerator::getClock();
+    do {
+      if (OB_FAIL(ls_->get_tx_table()->self_freeze_task())) {
+        if (OB_EAGAIN == ret) {
+          // sleep 100ms and retry
+          retry_times++;
+          ob_throttle_usleep(100LL * 1000LL, ret, ls_->get_ls_id().id());
+        } else {
+          STORAGE_LOG(WARN, "freeze tx data table failed", KR(ret), K(get_ls_id()));
+        }
       }
-    }
-  } while (OB_EAGAIN == ret && ObClockGenerator::getClock() - start_freeze_ts < MAX_RETRY_DURATION);
-  STORAGE_LOG(INFO, "freeze tx data after logstream freeze", KR(ret), K(retry_times), KTIME(start_freeze_ts));
+    } while (OB_EAGAIN == ret && ObClockGenerator::getClock() - start_freeze_ts < MAX_RETRY_DURATION);
+    STORAGE_LOG(INFO, "freeze tx data after logstream freeze", KR(ret), K(retry_times), KTIME(start_freeze_ts));
+  }
 }
 
 // must be used under the protection of ls_lock
@@ -1044,7 +1048,7 @@ int ObFreezer::set_tablet_freeze_flag_(const int64_t trace_id,
     while (OB_FAIL(frozen_memtable_handles.push_back(frozen_memtable_handle))) {
       TRANS_LOG(ERROR, "[Freezer] fail to push_back", K(ret), K(tablet_id));
       stat_.add_diagnose_info("fail to push_back");
-      usleep(100 * 1000);  // sleep 100ms
+      ob_usleep(100 * 1000);  // sleep 100ms
     }
   }
 
@@ -1153,9 +1157,10 @@ int ObFreezer::handle_no_active_memtable_(const ObTabletID &tablet_id,
     ObProtectedMemtableMgrHandle *protected_handle = NULL;
     ObTabletMiniMergeDag tmp_mini_dag;
     bool is_exist = false;
+    bool unused_is_emergency = false;
     if (OB_FAIL(tmp_mini_dag.init_by_param(&param))) {
       LOG_WARN("failed to init mini dag", K(ret), K(param));
-    } else if (OB_FAIL(MTL(ObTenantDagScheduler *)->check_dag_exist(&tmp_mini_dag, is_exist))) {
+    } else if (OB_FAIL(MTL(ObTenantDagScheduler *)->check_dag_exist(&tmp_mini_dag, is_exist, unused_is_emergency))) {
       LOG_WARN("failed to check dag exists", K(ret), K(ls_id), K(tablet_id));
     } else if (is_exist) {
       // we need to wait the current mini compaction dag to complete
@@ -1164,28 +1169,6 @@ int ObFreezer::handle_no_active_memtable_(const ObTabletID &tablet_id,
     } else if (OB_FAIL(get_ls_tablet_svr()->update_tablet_snapshot_version(tablet_id,
                                                                            freeze_snapshot_version.get_val_for_tx()))) {
       LOG_WARN("failed to update tablet snapshot version", K(ret), K(ls_id), K(tablet_id), K(freeze_snapshot_version));
-    } else if (OB_FAIL(tablet->get_protected_memtable_mgr_handle(protected_handle))) {
-      LOG_WARN("failed to get_protected_memtable_mgr_handle", K(ret), KPC(tablet));
-    } else if (protected_handle->get_max_saved_version_from_medium_info_recorder() >=
-               freeze_snapshot_version.get_val_for_tx() && !GCTX.is_shared_storage_mode()) {
-      int tmp_ret = OB_SUCCESS;
-      ObCOMajorMergePolicy::ObCOMajorMergeType co_major_merge_type;
-      if (OB_FAIL(ObTenantTabletScheduler::get_co_merge_type_for_compaction(freeze_snapshot_version.get_val_for_tx(), *tablet, co_major_merge_type))) {
-        LOG_WARN("fail to get co merge type from medium info", K(ret), K(freeze_snapshot_version), KPC(tablet));
-      } else if (OB_TMP_FAIL(compaction::ObTenantTabletScheduler::schedule_merge_dag(ls_id,
-                                                                                     *tablet,
-                                                                                     MEDIUM_MERGE,
-                                                                                     freeze_snapshot_version.get_val_for_tx(),
-                                                                                     EXEC_MODE_LOCAL,
-                                                                                     nullptr, /*dag_net_id*/
-                                                                                     co_major_merge_type))) {
-        if (OB_SIZE_OVERFLOW != tmp_ret && OB_EAGAIN != tmp_ret) {
-          ret = tmp_ret;
-          LOG_WARN("failed to schedule medium merge dag", K(ret), K(ls_id), K(tablet_id));
-        }
-      } else {
-        TRANS_LOG(INFO, "[Freezer] memtable_mgr doesn't have memtable", K(ret), K(ls_id), K(tablet_id));
-      }
     }
   } else {
     TRANS_LOG(INFO, "[Freezer] memtable_mgr has memtable", K(ret), K(ls_id), K(tablet_id));
@@ -1358,14 +1341,15 @@ int ObFreezer::wait_memtable_ready_for_flush_(ObITabletMemtable *tablet_memtable
       } else if (FALSE_IT(ready_for_flush = tablet_memtable->ready_for_flush())) {
       } else if (FALSE_IT(is_force_released = tablet_memtable->is_force_released())) {
       } else if (!ready_for_flush && !is_force_released) {
-        if (TC_REACH_TIME_INTERVAL(1LL * 1000LL * 1000LL /* 1 second */)) {
+        // check pend replay condition each 100ms
+        if (TC_REACH_TIME_INTERVAL(100LL * 1000LL /* 100 ms */)) {
           ++time_counter;
 
           // check pend condition every second
           (void)pend_replay_helper.check_pend_condition_once();
 
           // check resubmit log condition and report some debug info every 5 seconds
-          if (time_counter >= 5 && time_counter % 5 == 0) {
+          if (time_counter >= 50 && time_counter % 50 == 0) {
             (void)resubmit_log_if_needed_(start_time, true /* is_tablet_freeze */, false /* is_try */, tablet_memtable);
           }
         }
@@ -1402,7 +1386,7 @@ int ObFreezer::submit_log_for_freeze(const bool is_tablet_freeze, const bool is_
   bool trace_id_need_reset = false;
   if (!ObCurTraceId::get_trace_id()->is_valid()) {
     ObCurTraceId::init(GCONF.self_addr_);
-    bool trace_id_need_reset = true;
+    trace_id_need_reset = true;
   }
   do {
     ret = OB_SUCCESS;
@@ -2025,6 +2009,8 @@ void ObFreezer::PendTenantReplayHelper::restore_tenant_replay_()
     if (OB_ISNULL(ls = ls_handle_array_.at(i).get_ls())) {
       ret = OB_ERR_UNEXPECTED;
       STORAGE_LOG(ERROR, "[ObFreezer] invalid ls handle", KR(ret), KPC(ls));
+    } else if (ls->is_logonly_replica()) {
+      STORAGE_LOG(TRACE, "[ObFreezer] skip logonly replica", KPC(ls));
     } else if (OB_FAIL(ls->get_freezer()->restore_ls_replay())) {
       STORAGE_LOG(WARN, "[ObFreezer] restore replay failed", KR(ret), KPC(ls));
     }

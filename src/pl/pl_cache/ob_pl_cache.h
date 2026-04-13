@@ -35,6 +35,17 @@ struct ObPLCacheCtx;
 class ObPLObjectSet;
 class ObPLCacheMgr;
 
+struct ObPLCacheBasicCtx
+{
+  ObPLCacheBasicCtx()
+    : session_info_(nullptr),
+      schema_guard_(nullptr)
+  {}
+
+  ObSQLSessionInfo *session_info_;
+  share::schema::ObSchemaGetterGuard *schema_guard_;
+};
+
 struct ObPLTableColumnInfo
 {
   common::ObIAllocator *inner_alloc_;
@@ -217,7 +228,7 @@ struct ObPLObjectKey : public ObILibCacheKey
     key_id_(common::OB_INVALID_ID),
     sessid_(0),
     name_(),
-    mode_(ObjectMode::NORMAL),
+    mode_(static_cast<uint64_t>(ObjectMode::NORMAL)),
     sys_vars_str_() {}
   ObPLObjectKey(uint64_t db_id, uint64_t key_id)
   : ObILibCacheKey(ObLibCacheNameSpace::NS_INVALID),
@@ -225,7 +236,7 @@ struct ObPLObjectKey : public ObILibCacheKey
     key_id_(key_id),
     sessid_(0),
     name_(),
-    mode_(ObjectMode::NORMAL),
+    mode_(static_cast<uint64_t>(ObjectMode::NORMAL)),
     sys_vars_str_() {}
 
   void reset();
@@ -241,8 +252,11 @@ struct ObPLObjectKey : public ObILibCacheKey
 
   enum class ObjectMode
   {
-    NORMAL,
-    PROFILE,
+    NORMAL = 0,
+    PROFILE = 1,
+    CODE_COVERAGE = 2,
+    DEBUG = 4,
+    PLSQL_TRANSFORM_TO_ASSIGN = 8,
   };
 
   uint64_t  db_id_;
@@ -252,66 +266,107 @@ struct ObPLObjectKey : public ObILibCacheKey
   // sessid_ != 0 and mode_ == NORMAL marks DEBUG compile, for now
   // TODO: unify DEBUG and PROFILE compile or add DEBUG mode separately
   common::ObString name_;
-  ObjectMode mode_;
+  uint64_t mode_;
   common::ObString sys_vars_str_;
 };
 
-
-class ObPLObjectValue : public common::ObDLinkBase<ObPLObjectValue>
+// used by udf result cache and pl object value !!!
+class ObPLDependencyCheck
 {
 public:
-  ObPLObjectValue(common::ObIAllocator &alloc) :
-    pc_alloc_(&alloc),
-    sys_schema_version_(OB_INVALID_VERSION),
-    tenant_schema_version_(OB_INVALID_VERSION),
-    sessid_(OB_INVALID_ID),
-    sess_create_time_(0),
-    contain_sys_name_table_(false),
-    contain_tmp_table_(false),
-    contain_sys_pl_object_(false),
-    stored_schema_objs_(pc_alloc_),
-    params_info_(ObWrapperAllocator(alloc)),
-    pl_routine_obj_(NULL) {}
+  ObPLDependencyCheck(common::ObIAllocator &alloc)
+    : pc_alloc_(&alloc),
+      sys_schema_version_(OB_INVALID_VERSION),
+      tenant_schema_version_(OB_INVALID_VERSION),
+      stored_schema_objs_(&alloc),
+      stored_sys_schema_objs_(&alloc)
+      {}
 
-  virtual ~ObPLObjectValue() { reset(); }
-  int init(const ObILibCacheObject &cache_obj, ObPLCacheCtx &pc_ctx);
+  int lift_schema_version(int64_t new_tenant_schema_version, int64_t new_sys_schema_version);
   int set_stored_schema_objs(const DependenyTableStore &dep_table_store,
                               share::schema::ObSchemaGetterGuard *schema_guard);
-  int lift_tenant_schema_version(int64_t new_schema_version);
+  int add_match_info(ObILibCacheCtx &ctx,
+                      ObILibCacheKey *key,
+                      const ObILibCacheObject &cache_obj);
+  virtual int external_check() { return OB_SUCCESS; }
+  int need_check_schema_version(ObPLCacheBasicCtx &pc_ctx,
+                                int64_t &new_schema_version,
+                                int64_t &new_sys_schema_version,
+                                bool &need_check,
+                                bool &need_check_sys_obj);
   int obtain_new_column_infos(share::schema::ObSchemaGetterGuard &schema_guard,
                                               const PCVPlSchemaObj &schema_obj,
                                               ObIArray<ObPLTableColumnInfo> &column_infos);
   int check_value_version(share::schema::ObSchemaGetterGuard *schema_guard,
-                                  bool need_check_schema,
+                                  ObIArray<PCVPlSchemaObj*> &stored_schema_array,
                                   const ObIArray<PCVPlSchemaObj> &schema_array,
                                   bool &is_old_version);
-  int need_check_schema_version(ObPLCacheCtx &pc_ctx,
-                                int64_t &new_schema_version,
-                                bool &need_check);
   int resolve_and_check_synonym(ObSchemaChecker &schema_checker,
                                 uint64_t tenant_id,
                                 uint64_t db_id,
                                 ObSQLSessionInfo &session_info,
                                 const ObSimpleSynonymSchema &synonym_info);
-  int get_synonym_schema_version(ObPLCacheCtx &pc_ctx,
+  int get_synonym_schema_version(ObPLCacheBasicCtx &pc_ctx,
                                   uint64_t tenant_id,
                                   const PCVPlSchemaObj &pcv_schema,
                                   int64_t &new_version);
-  int get_all_dep_schema(ObPLCacheCtx &pc_ctx,
-                          const uint64_t database_id,
+  int get_all_dep_schema(ObPLCacheBasicCtx &pc_ctx,
                           int64_t &new_schema_version,
-                          bool &need_check_schema,
-                          ObIArray<PCVPlSchemaObj> &schema_array);
+                          int64_t &new_sys_schema_version,
+                          ObIArray<PCVPlSchemaObj> &schema_array,
+                          ObIArray<PCVPlSchemaObj> &sys_schema_array);
+
+  int check_dup_pl_cache_obj(const ObPLCacheBasicCtx &pc_ctx,
+                            ObIArray<PCVPlSchemaObj*> &stored_schema_array,
+                            const ObIArray<PCVPlSchemaObj> &schema_array,
+                            bool &is_dup);
+
+  int inner_get_all_dep_schema(ObPLCacheBasicCtx &pc_ctx,
+                               ObIArray<PCVPlSchemaObj*> &stored_schema_array,
+                               ObIArray<PCVPlSchemaObj> &schema_array);
+
   // get all dependency schemas, used for add plan
   static int get_all_dep_schema(share::schema::ObSchemaGetterGuard &schema_guard,
                                 const DependenyTableStore &dep_schema_objs,
-                                common::ObIArray<PCVPlSchemaObj> &schema_array);
-  int match_dep_schema(const ObPLCacheCtx &pc_ctx,
+                                common::ObIArray<PCVPlSchemaObj> &schema_array,
+                                common::ObIArray<PCVPlSchemaObj> &sys_schema_array);
+  int match_dep_schema(const ObPLCacheBasicCtx &pc_ctx,
+                        ObIArray<PCVPlSchemaObj*> &stored_schema_array,
                         const ObIArray<PCVPlSchemaObj> &schema_array,
                         bool &is_same);
-  int add_match_info(ObILibCacheCtx &ctx,
-                      ObILibCacheKey *key,
-                      const ObILibCacheObject &cache_obj);
+
+  virtual void set_expired_schema_version(const PCVPlSchemaObj &src) { return; }
+
+  void reset();
+
+  TO_STRING_KV(K_(sys_schema_version),
+               K_(tenant_schema_version),
+               K_(stored_schema_objs),
+               K_(stored_sys_schema_objs));
+
+  common::ObIAllocator *pc_alloc_;
+  int64_t sys_schema_version_;
+  int64_t tenant_schema_version_;
+  /* The update of the system package/class will only push up the schema version of the system tenant.
+     If the object under the common tenant depends on the system package/class,
+     In the update scenario, since the schema_version of ordinary users is not pushed up,
+     it may miss checking whether the system package/type is out of date,
+     Causes routine objects that depend on system packages/classes to be unavailable after updating,
+     so schema checks are always performed on classes containing system packages/classes*/
+  common::ObFixedArray<PCVPlSchemaObj *, common::ObIAllocator> stored_schema_objs_;
+  common::ObFixedArray<PCVPlSchemaObj *, common::ObIAllocator> stored_sys_schema_objs_;
+};
+
+class ObPLObjectValue : public common::ObDLinkBase<ObPLObjectValue>, public ObPLDependencyCheck
+{
+public:
+  ObPLObjectValue(common::ObIAllocator &alloc) :
+    ObPLDependencyCheck(alloc),
+    params_info_(ObWrapperAllocator(alloc)),
+    pl_routine_obj_(NULL) {}
+
+  virtual ~ObPLObjectValue() { reset(); }
+  int init(const ObILibCacheObject &cache_obj, ObPLCacheCtx &pc_ctx);
 
   bool match_params_info(const Ob2DArray<ObPlParamInfo,
                                 OB_MALLOC_BIG_BLOCK_SIZE,
@@ -331,40 +386,14 @@ public:
   int set_max_concurrent_num_for_add(ObPLCacheCtx &pc_ctx);
   int set_max_concurrent_num_for_get(ObPLCacheCtx &pc_ctx);
   int inner_set_max_concurrent_num(const ObOutlineInfo *outline_info);
-  OB_INLINE void copy_obj_schema_version(ObSchemaObjVersion& dest, const PCVPlSchemaObj *src)
-  {
-    dest.object_id_ = src->schema_id_;
-    dest.version_ = src->schema_version_;
-  }
+
+  virtual int external_check();
+  virtual void set_expired_schema_version(const PCVPlSchemaObj &src);
 
   void reset();
   int64_t get_mem_size();
 
-  TO_STRING_KV(K_(sys_schema_version),
-               K_(tenant_schema_version),
-               K_(sessid),
-               K_(sess_create_time),
-               K_(contain_sys_name_table),
-               K_(contain_tmp_table),
-               K_(contain_sys_pl_object),
-               K_(stored_schema_objs));
-
 public:
-  common::ObIAllocator *pc_alloc_;
-  int64_t sys_schema_version_;
-  int64_t tenant_schema_version_;
-  uint64_t sessid_; // session id for temporary table
-  uint64_t sess_create_time_; // sess_create_time_ for temporary table
-  bool contain_sys_name_table_;
-  bool contain_tmp_table_;
-  /* The update of the system package/class will only push up the schema version of the system tenant.
-     If the object under the common tenant depends on the system package/class,
-     In the update scenario, since the schema_version of ordinary users is not pushed up,
-     it may miss checking whether the system package/type is out of date,
-     Causes routine objects that depend on system packages/classes to be unavailable after updating,
-     so schema checks are always performed on classes containing system packages/classes*/
-  bool contain_sys_pl_object_;
-  common::ObFixedArray<PCVPlSchemaObj *, common::ObIAllocator> stored_schema_objs_;
   common::Ob2DArray<ObPlParamInfo, common::OB_MALLOC_BIG_BLOCK_SIZE,
                     common::ObWrapperAllocator, false> params_info_;
   pl::ObPLCacheObject *pl_routine_obj_;
@@ -372,15 +401,12 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObPLObjectValue);
 };
 
-
-struct ObPLCacheCtx : public ObILibCacheCtx
+struct ObPLCacheCtx : public ObILibCacheCtx, public ObPLCacheBasicCtx
 {
   ObPLCacheCtx()
     : ObILibCacheCtx(),
       handle_id_(MAX_HANDLE),
       key_(),
-      session_info_(NULL),
-      schema_guard_(NULL),
       need_add_obj_stat_(true),
       cache_params_(NULL),
       raw_sql_(),
@@ -393,8 +419,6 @@ struct ObPLCacheCtx : public ObILibCacheCtx
   CacheRefHandleID handle_id_;
   ObPLObjectKey key_;
   char sql_id_[common::OB_MAX_SQL_ID_LENGTH + 1];
-  ObSQLSessionInfo *session_info_;
-  share::schema::ObSchemaGetterGuard *schema_guard_;
   bool need_add_obj_stat_;
   ParamStore *cache_params_;
   ObString raw_sql_;

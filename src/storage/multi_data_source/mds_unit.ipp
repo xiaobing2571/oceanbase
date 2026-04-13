@@ -20,6 +20,7 @@
 #include "share/ob_errno.h"
 #include "runtime_utility/mds_retry_control.h"
 #include "storage/multi_data_source/runtime_utility/common_define.h"
+#include "storage/multi_data_source/adapter_define/mds_dump_node.h"
 #include <type_traits>
 #ifndef STORAGE_MULTI_DATA_SOURCE_MDS_UNIT_H_IPP
 #define STORAGE_MULTI_DATA_SOURCE_MDS_UNIT_H_IPP
@@ -134,7 +135,7 @@ typename MdsUnit<K, V>::const_reverse_iterator MdsUnit<K, V>::crend()
 { return const_reverse_iterator(nullptr); }
 
 template <typename K, typename V>
-MdsUnit<K, V>::MdsUnit() {}
+MdsUnit<K, V>::MdsUnit() : lock_(common::ObLatchIds::OB_MDS_UNIT_LOCK) {}
 
 template <typename K, typename V>
 MdsUnit<K, V>::~MdsUnit()
@@ -640,6 +641,7 @@ void MdsUnit<K, V>::report_event_(const char (&event_str)[N],
 
 template <typename V>
 MdsUnit<DummyKey, V>::MdsUnit()
+  : lock_(common::ObLatchIds::OB_MDS_UNIT_LOCK)
 {
   single_row_.v_.key_ = &(single_row_.k_);
   single_row_.v_.p_mds_unit_ = this;

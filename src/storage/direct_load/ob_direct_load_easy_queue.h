@@ -26,8 +26,7 @@ template<class T>
 class ObDirectLoadEasyQueue //性能很差的一个queue，主要为了方便使用
 {
 public:
-  ObDirectLoadEasyQueue() : malloc_(ObMemAttr(MTL_ID(), "TLD_EasyQueue")), queue_(malloc_) {}
-
+  ObDirectLoadEasyQueue() : malloc_(ObMemAttr(MTL_ID(), "TLD_EasyQueue")), queue_(malloc_), mutex_(common::ObLatchIds::OB_DIRECT_LOAD_EASY_QUEUE_MUTEX) {}
   int push(const T &e) {
     int ret = OB_SUCCESS;
     lib::ObMutexGuard guard(mutex_);
@@ -43,7 +42,6 @@ public:
   }
 
   void pop_one(T &value) {
-    value = nullptr;
     lib::ObMutexGuard guard(mutex_);
     if (!queue_.empty()) {
       value = queue_.get_first();
@@ -54,6 +52,15 @@ public:
   void pop_all(common::ObIArray<T> &values) {
     lib::ObMutexGuard guard(mutex_);
     while (!queue_.empty()) {
+      T &e = queue_.get_first();
+      values.push_back(e);
+      queue_.pop_front();
+    }
+  }
+
+  void pop_count(common::ObIArray<T> &values, int count) {
+    lib::ObMutexGuard guard(mutex_);
+    while (!queue_.empty() && count--) {
       T &e = queue_.get_first();
       values.push_back(e);
       queue_.pop_front();

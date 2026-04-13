@@ -55,26 +55,26 @@ int ObInterruptUtil::broadcast_dfo(ObDfo *dfo, int code)
                            GCTX.self_addr(),
                            "PX ABORT DFO");
   ObGlobalInterruptManager *manager = ObGlobalInterruptManager::getInstance();
-  ObSEArray<ObPxSqcMeta *, 32> sqcs;
   if (OB_ISNULL(dfo)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("NULL ptr unexpected", K(ret));
-  } else if (OB_FAIL(dfo->get_sqcs(sqcs))) {
-    LOG_WARN("fail to get addrs", K(ret));
   } else {
+    const ObIArray<ObPxSqcMeta> &sqcs = dfo->get_sqcs();
     // 暂存上次的 id，inc_seqnum 将修改 px_interrupt_id_
     ObInterruptibleTaskID interrupt_id = dfo->get_interrupt_id().px_interrupt_id_;
+    ObSEArray<ObAddr, 8> interrupt_addrs;
     for (int64_t j = 0; j < sqcs.count(); ++j) {
-      const ObAddr &addr = sqcs.at(j)->get_exec_addr();
-      if(OB_SUCCESS != (tmp_ret = manager->interrupt(addr, interrupt_id, int_code))) {
+      const ObAddr &addr = sqcs.at(j).get_exec_addr();
+      if (OB_SUCCESS != (tmp_ret = manager->interrupt(addr, interrupt_id, int_code))) {
         ret = tmp_ret;
         LOG_WARN("fail to send interrupt message to other server",
                 K(ret), K(int_code), K(addr), K(interrupt_id));
-      } else {
-        LOG_INFO("success to send interrupt message",
-                  K(int_code), K(addr), K(interrupt_id));
+      } else if (OB_FAIL(interrupt_addrs.push_back(addr))) {
+        LOG_WARN("fail to push back", K(j), K(ret));
       }
     }
+    LOG_INFO("success to send interrupt message",
+            K(int_code), K(interrupt_id), K(sqcs.count()), K(interrupt_addrs));
   }
   return ret;
 }
@@ -82,17 +82,13 @@ int ObInterruptUtil::broadcast_dfo(ObDfo *dfo, int code)
 int ObInterruptUtil::regenerate_interrupt_id(ObDfo &dfo)
 {
   int ret = OB_SUCCESS;
-  ObSEArray<ObPxSqcMeta *, 32> sqcs;
-  if (OB_FAIL(dfo.get_sqcs(sqcs))) {
-    LOG_WARN("fail to get addrs", K(ret));
-  } else {
-    // 每次发送完中断后，需要将中断号的 sequence 加 1，并设置到 sqc 结构中，
-    // 避免误中断重试的 sqc
-    ObDfoInterruptIdGen::inc_seqnum(dfo.get_interrupt_id().px_interrupt_id_);
+  ObIArray<ObPxSqcMeta> &sqcs = dfo.get_sqcs();
+  // 每次发送完中断后，需要将中断号的 sequence 加 1，并设置到 sqc 结构中，
+  // 避免误中断重试的 sqc
+  ObDfoInterruptIdGen::inc_seqnum(dfo.get_interrupt_id().px_interrupt_id_);
 
-    ARRAY_FOREACH_X(sqcs, j, cnt, OB_SUCC(ret)) {
-      sqcs.at(j)->set_interrupt_id(dfo.get_interrupt_id());
-    }
+  ARRAY_FOREACH_X(sqcs, j, cnt, OB_SUCC(ret)) {
+    sqcs.at(j).set_interrupt_id(dfo.get_interrupt_id());
   }
   return ret;
 }
@@ -117,6 +113,7 @@ int ObInterruptUtil::interrupt_tasks(ObPxSqcMeta &sqc, int code)
   return ret;
 }
 
+ERRSIM_POINT_DEF(ERRSIM_SCHEMA_ERROR_NEED_RETRY);
 void ObInterruptUtil::update_schema_error_code(ObExecContext *exec_ctx, int &code, int64_t px_worker_execute_start_schema_version)
 {
   int ret = OB_SUCCESS;
@@ -130,6 +127,9 @@ void ObInterruptUtil::update_schema_error_code(ObExecContext *exec_ctx, int &cod
     if (query_tenant_begin_schema_version == OB_INVALID_VERSION) {
       code = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid tenant_schema_version", K(ret), K(query_tenant_begin_schema_version));
+    } else if (OB_UNLIKELY(ERRSIM_SCHEMA_ERROR_NEED_RETRY)) {
+      code = ERRSIM_SCHEMA_ERROR_NEED_RETRY;
+      LOG_INFO("ERRSIM here", KR(ret));
     } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(
                  tenant_id, current_moment_schema_guard))) {
       LOG_WARN("get tenant schema guard failed", K(ret));
@@ -150,16 +150,7 @@ void ObInterruptUtil::update_schema_error_code(ObExecContext *exec_ctx, int &cod
              || (px_worker_execute_start_schema_version != OB_INVALID_VERSION
                  && px_worker_execute_start_schema_version != query_tenant_begin_schema_version)))
         || ret == OB_TENANT_NOT_EXIST || ret == OB_SCHEMA_ERROR || ret == OB_SCHEMA_EAGAIN) {
-      bool overwrite_error_code = true;
-      ObPhysicalPlanCtx *plan_ctx = exec_ctx->get_physical_plan_ctx();
-      if (OB_NOT_NULL(plan_ctx) && plan_ctx->get_is_direct_insert_plan()
-          && (OB_NO_PARTITION_FOR_GIVEN_VALUE_SCHEMA_ERROR == code)) {
-        // overwriting error code would cause retry for direct load
-        overwrite_error_code = false;
-      }
-      if (overwrite_error_code) {
-        code = OB_ERR_WAIT_REMOTE_SCHEMA_REFRESH;
-      }
+      code = OB_ERR_WAIT_REMOTE_SCHEMA_REFRESH;
     }
 
     // overwrite to make sure sql will retry

@@ -71,6 +71,13 @@ static const char *ObDmlTypeStr[DF_TYPE_MAX] = {
     "I_D"
 };
 
+enum ObDmlRowUpdateType
+{
+  NOT_ORIGIN_UPDATE = 0,
+  IS_ORIGIN_UPDATE = 1,
+  ORIGIN_UPDATE_MAX,
+};
+
 const char *get_dml_str(ObDmlFlag dml_flag);
 void format_dml_str(const int32_t flag, char *str, int len);
 
@@ -219,8 +226,9 @@ private:
   union
   {
     uint8_t whole_flag_;
-    struct {
-      uint8_t flag_      : 7;  // store ObDmlFlag
+    struct {  // FARM COMPAT WHITELIST
+      uint8_t flag_      : 6;  // store ObDmlFlag
+      uint8_t is_origin_update_ : 1;  // mark is normal row or split from update
       uint8_t flag_type_ : 1;  // mark is pure_delete or insert_delete
     };
   };
@@ -258,6 +266,8 @@ public:
       uint8_t reserved_        : 2;
     };
   };
+  // 00101001: first, committed, compacted, last, not shadow, not ghost
+  constexpr static uint8_t MAJOR_FLAG = 0b00101001;
 
   ObMultiVersionRowFlag() : flag_(0) {}
   ObMultiVersionRowFlag(uint8_t flag) : flag_(flag) {}
@@ -286,6 +296,10 @@ public:
   {
     is_shadow_ = is_shadow_row;
   }
+  inline void set_major()
+  {
+    flag_ = MAJOR_FLAG;
+  }
   inline bool is_valid() const
   {
     return !is_first_multi_version_row() || is_uncommitted_row() || is_last_multi_version_row() || is_ghost_row() || is_shadow_row();
@@ -309,6 +323,15 @@ public:
                K_(flag));
 };
 
+struct MultiVersionInfo
+{
+  transaction::ObTransID trans_id_;
+  ObMultiVersionRowFlag mvcc_row_flag_;
+  ObDmlRowFlag dml_row_flag_;
+
+  TO_STRING_KV(K_(dml_row_flag), K_(mvcc_row_flag), K_(trans_id));
+};
+
 struct ObDatumRow
 {
   OB_UNIS_VERSION(1);
@@ -323,6 +346,7 @@ public:
   int deep_copy(const ObDatumRow &src, common::ObIAllocator &allocator);
   int from_store_row(const storage::ObStoreRow &store_row);
   int shallow_copy(const ObDatumRow &other);
+  int shallow_copy_with_local_storage_datum(const ObDatumRow &other);
   //only for unittest
   bool operator==(const ObDatumRow &other) const;
   bool operator==(const common::ObNewRow &other) const;
@@ -509,7 +533,7 @@ OB_INLINE int64_t ObStorageDatumWrapper::to_string(char *buf, const int64_t buf_
 {
   int64_t pos = 0;
   if (nullptr != buf && buf_len > 0) {
-    pos = datum_.storage_to_string(buf, buf_len - 1, for_dump_);
+    pos = datum_.storage_to_string(buf, buf_len - 1, for_dump_, hex_length_);
     if (pos >= 0 && pos < buf_len) {
       buf[pos] = '\0';
     }

@@ -25,10 +25,15 @@ namespace storage
 struct ObUpdateTabletPointerParam final
 {
 public:
-  ObUpdateTabletPointerParam() = default;
+  ObUpdateTabletPointerParam()
+    : resident_info_(),
+      accelerate_info_(),
+      update_last_match_meta_version_(false)
+  {}
   ObUpdateTabletPointerParam(const ObTabletReplayItem &item)
     : resident_info_(item.info_),
-      accelerate_info_(item.accelerate_info_)
+      accelerate_info_(item.accelerate_info_),
+      update_last_match_meta_version_(false)
   {}
   ~ObUpdateTabletPointerParam() = default;
   bool is_valid() const { return resident_info_.addr_.is_valid(); }
@@ -36,16 +41,21 @@ public:
   const lib::Worker::CompatMode &compat_mode() const { return accelerate_info_.compat_mode_; }
   const ObTabletTransferInfo &transfer_info() const { return accelerate_info_.transfer_info_; }
   const ObMetaDiskAddr &tablet_addr() const { return resident_info_.addr_; }
-  void refresh_tablet_cache()
+  int refresh_tablet_cache();
+  void set_update_last_match_meta_version()
   {
-    resident_info_.attr_.refresh_cache(accelerate_info_.clog_checkpoint_scn_,
-                                       accelerate_info_.ddl_checkpoint_scn_,
-                                       accelerate_info_.mds_checkpoint_scn_);
+    update_last_match_meta_version_ = true;
   }
-  TO_STRING_KV(K_(resident_info), K_(accelerate_info));
+  bool update_last_match_meta_version() const
+  {
+    return update_last_match_meta_version_;
+  }
+
+  TO_STRING_KV(K_(resident_info), K_(accelerate_info), K_(update_last_match_meta_version));
 public:
   ObTabletResidentInfo resident_info_;
   ObStartupTabletAccelerateInfo accelerate_info_;
+  bool update_last_match_meta_version_;
 };
 
 } // end namespace storage

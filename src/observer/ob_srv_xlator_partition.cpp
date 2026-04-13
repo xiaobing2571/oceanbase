@@ -31,9 +31,13 @@
 #include "observer/table/ob_table_ls_execute_processor.h"
 #include "observer/table/ob_redis_execute_processor.h"
 #include "observer/table/ob_redis_execute_processor_v2.h"
+#include "observer/table/ob_hbase_execute_processor.h"
+#include "observer/table/ob_table_meta_processor.h"
+#include "observer/table/common/ob_table_query_session_id_rpc.h"
 #include "storage/ob_storage_rpc.h"
 
 #include "rootserver/freeze/ob_major_freeze_rpc_define.h"        // ObTenantMajorFreezeP
+#include "rootserver/freeze/window/ob_window_compaction_rpc_define.h"
 #include "storage/tx/ob_xa_rpc.h"
 
 #include "observer/table_load/ob_table_load_rpc_processor.h"
@@ -82,7 +86,9 @@ void oceanbase::observer::init_srv_xlator_for_partition(ObSrvRpcXlator *xlator) 
   RPC_PROCESSOR(ObAddDiskP, gctx_);
   RPC_PROCESSOR(ObDropDiskP, gctx_);
   RPC_PROCESSOR(ObForceSetServerListP, gctx_);
+  RPC_PROCESSOR(ObCheckServerAliveP, gctx_);
 #ifdef OB_BUILD_TDE_SECURITY
+  RPC_PROCESSOR(ObSetMasterKeyP, gctx_);
   RPC_PROCESSOR(ObGetMasterKeyP, gctx_);
   RPC_PROCESSOR(ObRestoreKeyP, gctx_);
   RPC_PROCESSOR(ObSetRootKeyP, gctx_);
@@ -139,6 +145,8 @@ void oceanbase::observer::init_srv_xlator_for_migration(ObSrvRpcXlator *xlator)
   RPC_PROCESSOR(ObFetchLSMemberListP);
   RPC_PROCESSOR(ObFetchSSTableMacroInfoP, gctx_.bandwidth_throttle_);
   RPC_PROCESSOR(ObStorageFetchLSViewP, gctx_.bandwidth_throttle_);
+  RPC_PROCESSOR(ObFetchSSTableMacroLogicIdInfoP, gctx_.bandwidth_throttle_);
+  RPC_PROCESSOR(ObAdvanceSrcLSCheckpointP);
 
   // restore
   RPC_PROCESSOR(ObNotifyRestoreTabletsP, gctx_.bandwidth_throttle_);
@@ -148,8 +156,8 @@ void oceanbase::observer::init_srv_xlator_for_migration(ObSrvRpcXlator *xlator)
   //transfer
   RPC_PROCESSOR(ObCheckStartTransferTabletsP);
   RPC_PROCESSOR(ObGetLSActiveTransCountP, gctx_.bandwidth_throttle_);
-  RPC_PROCESSOR(ObGetTransferStartScnP, gctx_.bandwidth_throttle_);
   RPC_PROCESSOR(ObFetchLSReplayScnP);
+  RPC_PROCESSOR(ObGetTransferStartScnP, gctx_.bandwidth_throttle_);
   RPC_PROCESSOR(ObCheckTransferTabletsBackfillP);
   RPC_PROCESSOR(ObStorageGetConfigVersionAndTransferScnP);
   RPC_PROCESSOR(ObStorageSubmitTxLogP, gctx_.bandwidth_throttle_);
@@ -169,6 +177,12 @@ void oceanbase::observer::init_srv_xlator_for_migration(ObSrvRpcXlator *xlator)
   RPC_PROCESSOR(ObFetchMicroBlockP, gctx_.bandwidth_throttle_);
   RPC_PROCESSOR(ObGetMicroBlockCacheInfoP);
   RPC_PROCESSOR(ObGetMigrationCacheJobInfoP);
+  RPC_PROCESSOR(ObNotifySSWriterDoBackfillP);
+  RPC_PROCESSOR(ObCheckTransferOutTabletStatusP);
+  RPC_PROCESSOR(ObHAGetLocalCacheInfoP);
+  RPC_PROCESSOR(ObHAGetCacheJobInfoP);
+  RPC_PROCESSOR(ObGetLocalCacheKeyP);
+  RPC_PROCESSOR(ObFetchLocalCacheBlockP, gctx_.bandwidth_throttle_);
 #endif
 
   //rebuild tablet
@@ -209,6 +223,9 @@ void oceanbase::observer::init_srv_xlator_for_others(ObSrvRpcXlator *xlator) {
   RPC_PROCESSOR(ObTableLSExecuteP, gctx_);
   RPC_PROCESSOR(ObRedisExecuteP, gctx_);
   RPC_PROCESSOR(ObRedisExecuteV2P, gctx_);
+  RPC_PROCESSOR(ObHbaseExecuteP, gctx_);
+  RPC_PROCESSOR(ObTableMetaP, gctx_);
+  RPC_PROCESSOR(ObTableSessIDP);
 
   // HA GTS
   RPC_PROCESSOR(ObHaGtsPingRequestP, gctx_);
@@ -247,6 +264,7 @@ void oceanbase::observer::init_srv_xlator_for_others(ObSrvRpcXlator *xlator) {
   RPC_PROCESSOR(ObHighPriorityBatchLockTaskP, gctx_);
   RPC_PROCESSOR(ObAdminRemoveLockP);
   RPC_PROCESSOR(ObAdminUpdateLockP);
+  RPC_PROCESSOR(ObAdminRemoveLockPriorityP);
 
   // Region Ratelimit rpc
   RPC_PROCESSOR(ObRLGetRegionBWP, gctx_);
@@ -261,9 +279,10 @@ void oceanbase::observer::init_srv_xlator_for_others(ObSrvRpcXlator *xlator) {
   // Remote fetch log rpc
   RPC_PROCESSOR(ObRemoteFetchLogP);
 
-  // tenant major freeze
+  // tenant freeze rpc
   RPC_PROCESSOR(ObTenantMajorFreezeP);
   RPC_PROCESSOR(ObTenantAdminMergeP);
+  RPC_PROCESSOR(ObTenantWindowCompactionP);
 
   // checkpoint slog rpc
   RPC_PROCESSOR(ObCheckpointSlogP, gctx_);
@@ -298,6 +317,7 @@ void oceanbase::observer::init_srv_xlator_for_others(ObSrvRpcXlator *xlator) {
   RPC_PROCESSOR(ObRpcGetLSReplayedScnP, gctx_);
   RPC_PROCESSOR(ObUpdateTenantInfoCacheP, gctx_);
   RPC_PROCESSOR(ObRefreshServiceNameP, gctx_);
+  RPC_PROCESSOR(ObClearFetchedLogCacheP, gctx_);
 
   RPC_PROCESSOR(ObSyncRewriteRulesP, gctx_);
 
@@ -320,6 +340,7 @@ void oceanbase::observer::init_srv_xlator_for_others(ObSrvRpcXlator *xlator) {
   RPC_PROCESSOR(ObWrAsyncPurgeSnapshotTaskP, gctx_);
   RPC_PROCESSOR(ObWrSyncUserSubmitSnapshotTaskP, gctx_);
   RPC_PROCESSOR(ObWrSyncUserModifySettingsTaskP, gctx_);
+  RPC_PROCESSOR(ObWrAsyncUpdateSqlStatTaskP, gctx_);
 
   // share storage net throt
   RPC_PROCESSOR(ObSharedStorageNetThrotRegisterP, gctx_);
@@ -345,5 +366,8 @@ void oceanbase::observer::init_srv_xlator_for_others(ObSrvRpcXlator *xlator) {
 
   //sql optimizer estimate skip rate
   RPC_PROCESSOR(ObEstimateSkipRateP, gctx_);
+  RPC_PROCESSOR(ObCheckNestedMViewMdsP, gctx_);
 
+  // dump data_dict
+  RPC_PROCESSOR(ObRPcTriggerDumpDataDictP, gctx_);
 }

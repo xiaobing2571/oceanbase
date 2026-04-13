@@ -71,6 +71,7 @@ void ObTableQueryP::reset_ctx()
   result_row_count_ = 0;
   ObTableApiProcessorBase::reset_ctx();
   tb_ctx_.reset();
+  result_.reset(); // need to reset property_name considering retry
 }
 
 int ObTableQueryP::init_tb_ctx(ObTableApiCacheGuard &cache_guard)
@@ -106,9 +107,10 @@ int ObTableQueryP::init_tb_ctx(ObTableApiCacheGuard &cache_guard)
     LOG_WARN("fail to alloc expr memory", K(ret));
   } else if (OB_FAIL(tb_ctx_.init_exec_ctx())) {
     LOG_WARN("fail to init exec ctx", K(ret), K(tb_ctx_));
+  } else if (OB_FAIL(tb_ctx_.init_expr_frame_info(expr_frame_info))) { // init expr op for scan with substring index
+    LOG_WARN("fail to init expr frame info", K(ret));
   } else {
     tb_ctx_.set_init_flag(true);
-    tb_ctx_.set_expr_info(expr_frame_info);
   }
 
   return ret;
@@ -223,6 +225,7 @@ int ObTableQueryP::query_and_result(ObTableApiScanExecutor *executor)
 int ObTableQueryP::before_process()
 {
   is_tablegroup_req_ = ObHTableUtils::is_tablegroup_req(arg_.table_name_, arg_.entity_type_);
+  retry_policy_.allow_route_retry_ = arg_.server_can_retry();
   // In HBase model, scan range columns only for odp routing, useless in server
   if (arg_.entity_type_ == ObTableEntityType::ET_HKV) {
     arg_.query_.get_scan_range_columns().reset();
@@ -270,7 +273,7 @@ int ObTableQueryP::old_try_process()
 
   if (OB_NOT_NULL(spec)) {
     spec->destroy_executor(executor);
-    tb_ctx_.set_expr_info(nullptr);
+    tb_ctx_.reset_expr_frame_info();
   }
 
   ObTableTransUtils::release_read_trans(trans_param_.trans_desc_);
@@ -283,12 +286,16 @@ int ObTableQueryP::new_try_process()
   int ret = OB_SUCCESS;
   ObModelGuard model_guard;
   ObIModel *model = nullptr;
-  exec_ctx_.set_table_name(arg_.table_name_);
-  exec_ctx_.set_table_id(arg_.table_id_);
-  exec_ctx_.set_timeout_ts(get_timeout_ts());
-  exec_ctx_.set_audit_ctx(audit_ctx_);
-  if (OB_FAIL(init_schema_info(arg_.table_name_))) {
-    LOG_WARN("fail to init schema info", K(ret), K(arg_.table_name_));
+  if (OB_FAIL(init_table_schema_info(arg_.table_name_, arg_.table_id_))) {
+    LOG_WARN("fail to init schema info", K(ret), K(arg_.table_name_), K(arg_.table_id_));
+  } else {
+    exec_ctx_.set_table_name(arg_.table_name_);
+    exec_ctx_.set_table_id(arg_.table_id_);
+    exec_ctx_.set_timeout_ts(get_timeout_ts());
+    exec_ctx_.set_audit_ctx(audit_ctx_);
+    exec_ctx_.set_table_schema(table_schema_);
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(ObModelFactory::get_model_guard(allocator_, arg_.entity_type_, model_guard))) {
     LOG_WARN("fail to get model guard", K(ret), K(arg_.entity_type_));
   } else if (FALSE_IT(model = model_guard.get_model())) {
@@ -307,6 +314,10 @@ int ObTableQueryP::new_try_process()
     LOG_WARN("fail to inti trans param", K(ret));
   } else if (OB_FAIL(ObTableTransUtils::init_read_trans(trans_param_))) {
     LOG_WARN("fail to init read trans", K(ret));
+  } else if (!trans_param_.tx_snapshot_.is_ls_snapshot()
+             && tablet_id_.is_valid()
+             && OB_FAIL(check_local_execute(tablet_id_))) {
+    LOG_WARN("fail to check local execute", K(ret));
   } else if (OB_FAIL(model->work(exec_ctx_, arg_, result_))) {
     if (ret != OB_ITER_END) {
       LOG_WARN("model fail to work", K(ret), K_(exec_ctx), K_(arg));
@@ -315,6 +326,8 @@ int ObTableQueryP::new_try_process()
 
   ObTableTransUtils::release_read_trans(trans_param_.trans_desc_);
 
+  // record ob rows
+  stat_row_count_ = exec_ctx_.get_stat_row_count();
   if (ret == OB_ITER_END) {
     ret = OB_SUCCESS; // cover ret
   }
@@ -326,8 +339,22 @@ int ObTableQueryP::try_process()
   int ret = OB_SUCCESS;
   // statis
   bool is_hkv = (ObTableEntityType::ET_HKV == arg_.entity_type_);
+  bool is_hbase_op_valid = (OHOperationType::INVALID != arg_.hbase_op_type_);
   if (is_hkv) {
-    stat_process_type_ = ObTableProccessType::TABLE_API_HBASE_QUERY; // hbase query
+    if (is_hbase_op_valid) {
+      switch(arg_.hbase_op_type_) {
+        case OHOperationType::GET:
+        case OHOperationType::EXISTS:
+        case OHOperationType::GET_LIST:
+        case OHOperationType::EXISTS_LIST:
+          stat_process_type_ = ObTableProccessType::TABLE_API_HBASE_GET;
+          break;
+        default:
+          break;
+      }
+    } else {
+      stat_process_type_ = ObTableProccessType::TABLE_API_HBASE_QUERY; // hbase query
+    }
   } else {
     stat_process_type_ = ObTableProccessType::TABLE_API_TABLE_QUERY;// table query
   }
@@ -346,6 +373,7 @@ int ObTableQueryP::try_process()
 bool ObTableQueryP::is_new_try_process()
 {
   return arg_.entity_type_ == ObTableEntityType::ET_HKV &&
-         !arg_.tablet_id_.is_valid() &&
+         (!arg_.tablet_id_.is_valid() ||
+         (arg_.tablet_id_.is_valid() && arg_.distribute_need_tablet_id())) &&
          TABLEAPI_OBJECT_POOL_MGR->is_support_distributed_execute();
 }

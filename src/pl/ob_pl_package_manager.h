@@ -63,6 +63,7 @@ class ObPLPackageState;
 class ObPLCondition;
 class ObPLCursor;
 class ObPLCacheCtx;
+class ObPLPackageGuard;
 
 struct ObSysPackageFile {
   const char *const package_name;
@@ -127,8 +128,6 @@ public:
   int get_package_var_val(const ObPLResolveCtx &resolve_ctx,
                           sql::ObExecContext &exec_ctx,
                           uint64_t package_id,
-                          int64_t spec_version,
-                          int64_t body_version,
                           const int64_t var_idx,
                           common::ObObj &var_val);
   int set_package_var_val(const ObPLResolveCtx &resolve_ctx,
@@ -177,9 +176,19 @@ public:
                                 ObPLPackage *&package_spec,
                                 ObPLPackage *&package_body,
                                 bool for_static_member = false);
-
+  int get_cached_package_body(const ObPLResolveCtx &resolve_ctx,
+                                  uint64_t package_body_id,
+                                  ObPLPackage *&package_body,
+                                  bool for_static_member = false);
   static int notify_package_variable_deserialize(sql::ObBasicSessionInfo *session, const ObString &name, const sql::ObSessionVariable &value);
-
+  static int get_cached_package_body_for_trigger(uint64_t tenant_id,
+                                                 uint64_t trigger_id,
+                                                 pl::ObPLPackageGuard &package_guard,
+                                                 common::ObIAllocator &allocator,
+                                                 share::schema::ObSchemaGetterGuard &schema_guard,
+                                                 sql::ObSQLSessionInfo &session_info,
+                                                 common::ObMySQLProxy &sql_proxy,
+                                                 ObPLPackage *&package_body);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObPLPackageManager);
 
@@ -201,6 +210,10 @@ private:
   int get_cached_package_spec(const ObPLResolveCtx &resolve_ctx, uint64_t package_id,
                               ObPLPackage *&package_spec);
 
+  int try_get_package_state_direct(const ObPLResolveCtx &resolve_ctx,
+                                    uint64_t package_id,
+                                    ObPLPackageState *&package_state);
+
   int get_package_item_state(const ObPLResolveCtx &resolve_ctx,
                              sql::ObExecContext &exec_ctx,
                              ObPLPackage &package,
@@ -208,9 +221,10 @@ private:
                              ObPLPackageState *&package_state,
                              const ObPLPackage *package_for_verify);
 
-  int update_special_package_status(const ObPLResolveCtx &resolve_ctx,
+  int update_special_package_status(sql::ObSQLSessionInfo &session_info,
                                     uint64_t package_id,
-                                    const ObPLVar &var,
+                                    ObPLPackageState &package_state,
+                                    bool is_run_status,
                                     const ObObj &old_val,
                                     const ObObj &new_val);
 };

@@ -168,8 +168,8 @@ int LogRequestHandler::handle_sync_request<LogConfigChangeCmd, LogConfigChangeCm
     logservice::ObLogHandler *log_handler = nullptr;
     if (OB_FAIL(get_log_handler_(palf_id, ls_handle, log_handler))) {
       CLOG_LOG(WARN, "get_log_handler_ failed", K(ret), K(palf_id), K(server));
-    } else if (OB_FAIL(log_handler->handle_config_change_cmd(req, resp))) {
-      CLOG_LOG(WARN, "handle_config_change_cmd failed", KR(ret), K(palf_id), K(server), K(req));
+    } else if (OB_FAIL(log_handler->handle_config_change_cmd_rpc(req, resp))) {
+      CLOG_LOG(WARN, "handle_config_change_cmd_rpc failed", KR(ret), K(palf_id), K(server), K(req));
     }
   }
 
@@ -382,6 +382,48 @@ int LogRequestHandler::handle_sync_request<LogGetCkptReq, LogGetCkptResp>(
   }
   return ret;
 }
+
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+template <>
+int LogRequestHandler::handle_request<LogFollowerReportReplayReachingMachineReq>(const LogFollowerReportReplayReachingMachineReq &req)
+{
+  int ret = OB_SUCCESS;
+  storage::ObLSHandle ls_handle;
+  logservice::ObLogHandler *log_handler = nullptr;
+  if (false == req.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    CLOG_LOG(ERROR, "Invalid argument!!!", K(ret), K(req));
+  } else if (OB_FAIL(get_log_handler_(req.ls_id_.id(), ls_handle, log_handler))) {
+    CLOG_LOG(WARN, "get_log_handler_ failed", K(ret), K(req.ls_id_));
+  } else if (OB_FAIL(log_handler->report_replica_replay_process(req.src_, req.ls_id_, req.replay_reaching_machine_.unwrap()))) {
+    CLOG_LOG(WARN, "report_replica_replay_process failed", K(ret), K(req));
+  } else {
+    CLOG_LOG(INFO, "report_replica_replay_process successfully", K(ret), K(req));
+  }
+  return ret;
+}
+
+template <>
+int LogRequestHandler::handle_request<LogNotifyFollowerMoveOutFromRTOGroupResp>(const LogNotifyFollowerMoveOutFromRTOGroupResp &req)
+{
+  int ret = OB_SUCCESS;
+  ObLogReplayService *replay_srv = nullptr;
+  if (false == req.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    CLOG_LOG(ERROR, "Invalid argument!!!", K(ret), K(req));
+  } else if (!GCONF.enable_logservice) {
+    ret = OB_NOT_SUPPORTED;
+    CLOG_LOG(WARN, "shared log service is not enabled", K(ret));
+  } else if (OB_FAIL(get_replay_service_(replay_srv))) {
+    CLOG_LOG(WARN, "get_replay_service_ failed", K(ret), K(req.ls_id_));
+  } else if (OB_FAIL(replay_srv->notify_follower_move_out_from_rto_group(req.ls_id_, req.replica_last_reach_to_sync_scn_))) {
+    CLOG_LOG(WARN, "notify_follower_move_out_from_rto_group failed", K(ret), K(req));
+  } else {
+    CLOG_LOG(INFO, "notify_follower_move_out_from_rto_group successfully", K(ret), K(req));
+  }
+  return ret;
+}
+#endif // OB_BUILD_SHARED_LOG_SERVICE
 
 } // end namespace logservice
 } // end namespace oceanbase

@@ -342,12 +342,14 @@ int ObRpcLoadDataTaskExecuteP::process()
     int64_t major_freeze_trigger = 0;
     int64_t memstore_limit = 0;
     int64_t freeze_cnt = 0;
+    int64_t unused_throttle_trigger = 0;
     if (OB_UNLIKELY(OB_SUCCESS != (memory_check_ret =
                                    freezer->get_tenant_memstore_cond(active_memstore_used,
                                                                      total_memstore_used,
                                                                      major_freeze_trigger,
                                                                      memstore_limit,
-                                                                     freeze_cnt)))) {
+                                                                     freeze_cnt,
+                                                                     unused_throttle_trigger)))) {
       LOG_WARN("fail to get memstore used", K(memory_check_ret));
     } else {
       if (static_cast<double>(total_memstore_used)
@@ -482,7 +484,7 @@ int ObParallelTaskController::init(int64_t max_parallelism)
 {
   int ret = OB_SUCCESS;
   max_parallelism_ = max_parallelism;
-  if (OB_FAIL(vacant_cond_.init(common::ObWaitEventIds::ASYNC_RPC_PROXY_COND_WAIT))) {
+  if (OB_FAIL(vacant_cond_.init(common::ObWaitEventIds::PARALLEL_TASK_CONTROLLER_COND_WAIT))) {
     LOG_WARN("init vacant cond failed", K(ret));
   }
   return ret;

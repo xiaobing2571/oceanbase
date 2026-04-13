@@ -35,7 +35,7 @@ public:
       common::ObISQLClient &sql_proxy,
       obrpc::ObSrvRpcProxy &rpc_proxy,
       ObBackupTaskScheduler &task_scheduler,
-      ObBackupCleanService &backup_service);
+      ObBackupMgrService &backup_service);
   int persist_ls_task();
   int do_ls_task();
   int do_cleanup();
@@ -43,6 +43,10 @@ public:
   int process();
 private:
   int do_cancel_();
+#ifdef OB_BUILD_SHARED_STORAGE
+  int do_cancel_for_ss_set_();
+#endif
+  int do_cancel_for_ls_tasks_();
   int advance_task_status_(
       common::ObISQLClient &sql_proxy,
       const share::ObBackupCleanStatus &next_status, 
@@ -80,6 +84,7 @@ private:
   int delete_user_data_info_dir_();
   int delete_minor_data_info_dir_();
   int delete_major_data_info_dir_();
+  int delete_data_info_dir_(const share::ObBackupDataType &backup_data_type, int64_t max_turn_id);
   int delete_table_list_dir_();
   int get_set_ls_ids_(common::ObIArray<share::ObLSID> &ls_ids);
   int get_piece_ls_ids_(common::ObIArray<share::ObLSID> &ls_ids);
@@ -95,6 +100,9 @@ private:
   int delete_backup_set_meta_info_files_();
   int delete_backup_piece_meta_info_files_();
   int delete_backup_dir_(const share::ObBackupPath &path);
+  int check_backup_dir_clean_ready_(const share::ObBackupPath &path, bool &is_clean_ready);
+  int check_backup_set_dir_empty_();
+  int check_backup_piece_dir_empty_();
   int delete_backup_set_dir_();
   int delete_meta_info_dir_();
   int delete_single_piece_info_();
@@ -103,6 +111,12 @@ private:
   int delete_piece_inner_placeholder_file_();
   int delete_piece_checkpoint_file_();
   bool is_can_retry_(const int error);
+#ifdef OB_BUILD_SHARED_STORAGE
+  int backup_clean_ss_set_macro_tasks_();
+  int delete_ss_backup_set_meta_info_files_();
+  int delete_ss_backup_logstream_();
+  int init_clean_macro_task_mgr_();
+#endif
 
 private:
   bool is_inited_;
@@ -115,7 +129,7 @@ private:
   common::ObISQLClient *sql_proxy_;
   obrpc::ObSrvRpcProxy *rpc_proxy_;
   ObBackupTaskScheduler *task_scheduler_;
-  ObBackupCleanService *backup_service_;
+  ObBackupMgrService *backup_service_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObBackupCleanTaskMgr); 
 };

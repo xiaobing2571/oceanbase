@@ -29,7 +29,7 @@ struct ObTableScanRange
 public:
   ObTableScanRange();
   ~ObTableScanRange() { reset(); }
-  int init(ObTableScanParam &scan_param, const ObTablet &tablet, const bool is_tablet_spliting);
+  int init(ObTableScanParam &scan_param, const ObTablet &tablet, const bool is_tablet_spliting, const bool cannot_be_false_range = false);
   int init(ObTableScanParam &scan_param,
            const common::ObSimpleBatch &simple_batch,
            common::ObIAllocator &allocator);
@@ -40,10 +40,10 @@ public:
   OB_INLINE bool is_empty() const { return EMPTY == status_; }
   OB_INLINE void set_empty() { status_ = EMPTY; }
   OB_INLINE const ObIArray<blocksstable::ObDatumRange> &get_ranges() const { return ranges_; }
-  OB_INLINE const ObIArray<blocksstable::ObDatumRange> &get_suffix_ranges() const { return skip_scan_ranges_; }
   OB_INLINE const ObIArray<blocksstable::ObDatumRowkey> &get_rowkeys() const { return rowkeys_; }
-  int get_query_iter_type(ObQRIterType &iter_type) const;
-  TO_STRING_KV(K_(rowkeys), K_(ranges), K_(status), K_(is_inited));
+  OB_INLINE bool has_valid_suffix_ranges() const { return 1 == skip_scan_ranges_.count(); }
+  OB_INLINE const blocksstable::ObDatumRange &get_suffix_range() const { return skip_scan_ranges_.at(0); }
+  TO_STRING_KV(K_(rowkeys), K_(ranges), K_(status), K_(is_inited), K_(enable_new_false_range));
 private:
   int init_rowkeys(
       const ObTablet &tablet,
@@ -56,7 +56,8 @@ private:
       const bool is_tablet_spliting,
       const common::ObIArray<common::ObNewRange> &ranges,
       const common::ObQueryFlag &scan_flag,
-      const blocksstable::ObStorageDatumUtils *datum_utils);
+      const blocksstable::ObStorageDatumUtils *datum_utils,
+      const bool cannot_be_false_range = false);
   int init_ranges_in_skip_scan(
       const ObTablet &tablet,
       const bool is_tablet_spliting,
@@ -98,6 +99,7 @@ private:
   common::ObSEArray<blocksstable::ObDatumRange, DEFAULT_RANGE_CNT> skip_scan_ranges_;
   ObIAllocator *allocator_;
   RangeStatus status_;
+  bool enable_new_false_range_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTableScanRange);
 };

@@ -116,6 +116,7 @@ int ObTransformLateMaterialization::check_stmt_need_late_materialization(const O
   } else if (stmt.has_hierarchical_query() ||
              stmt.has_group_by()||
              stmt.has_rollup() ||
+             stmt.has_grouping_sets() ||
              stmt.has_having() ||
              stmt.has_window_function() ||
              stmt.has_distinct() ||
@@ -518,6 +519,7 @@ int ObTransformLateMaterialization::evaluate_stmt_cost(ObIArray<ObParentDMLStmt>
          .set_page_size(OB_MALLOC_NORMAL_BLOCK_SIZE);
     CREATE_WITH_TEMP_CONTEXT(param) {
       ObRawExprFactory tmp_expr_factory(CURRENT_CONTEXT->get_arena_allocator());
+      eval_cost_helper.tmp_expr_factory_ = &tmp_expr_factory;
       HEAP_VAR(ObOptimizerContext,
                optctx,
                ctx_->session_info_,
@@ -704,6 +706,8 @@ int ObTransformLateMaterialization::generate_late_materialization_stmt(
     LOG_WARN("failed to adjust pseudo column like exprs", K(ret));
   } else if (OB_FAIL(select_stmt->formalize_stmt(ctx_->session_info_, false))) {
     LOG_WARN("failed to formalize stmt", K(ret));
+  } else if (OB_FAIL(select_stmt->formalize_special_domain_index_fields())) {
+    LOG_WARN("failed to formalize special domain index fields", K(ret));
   } else if (OB_FAIL(select_stmt->formalize_stmt_expr_reference(ctx_->expr_factory_,
                                                                 ctx_->session_info_))) {
     LOG_WARN("failed to formalize stmt expr reference", K(ret));
@@ -831,7 +835,6 @@ int ObTransformLateMaterialization::generate_pk_join_conditions(const uint64_t r
   const ObTableSchema *table_schema = NULL;
   ObSEArray<uint64_t, 4> key_col_ids;
   ObSEArray<uint64_t, 4> part_col_ids;
-  const bool is_mysql_mode = lib::is_mysql_mode();
   if (OB_ISNULL(ctx_) || OB_ISNULL(ctx_->expr_factory_) ||
       OB_ISNULL(schema_guard = ctx_->sql_schema_guard_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -884,7 +887,7 @@ int ObTransformLateMaterialization::generate_pk_join_conditions(const uint64_t r
         }
       } else {
         if (OB_FAIL(ObRawExprUtils::create_null_safe_equal_expr(*ctx_->expr_factory_,
-                            ctx_->session_info_, is_mysql_mode, table_col, view_col, equal_expr))) {
+                            ctx_->session_info_, table_col, view_col, equal_expr))) {
           LOG_WARN("failed to create null safe equal expr", K(ret));
         } else if (OB_FAIL(select_stmt.get_condition_exprs().push_back(equal_expr))) {
           LOG_WARN("push back join condition failed", K(ret));
@@ -1389,5 +1392,13 @@ int ObTransformLateMaterialization::check_is_allow_column_store(const ObSelectSt
   return ret;
 }
 
+int ObTransformLateMaterialization::adjust_transform_types(uint64_t &transform_types)
+{
+  int ret = OB_SUCCESS;
+  if (cost_based_trans_tried_) {
+    transform_types &= (~(1ULL << transformer_type_));
+  }
+  return ret;
+}
 }
 }

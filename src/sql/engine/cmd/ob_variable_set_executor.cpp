@@ -18,6 +18,8 @@
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "sql/rewrite/ob_transform_pre_process.h"
 #include "sql/engine/cmd/ob_set_names_executor.h"
+#include "share/ob_unit_table_operator.h"
+#include "share/system_variable/ob_sys_var_class_type.h"
 using namespace oceanbase::common;
 using namespace oceanbase::share;
 using namespace oceanbase::share::schema;
@@ -212,7 +214,14 @@ int ObVariableSetExecutor::execute(ObExecContext &ctx, ObVariableSetStmt &stmt)
             } else if (!lib::is_oracle_mode() && sys_var->is_oracle_only()) {
               //ignore set oracle only variables in mysql mode
             } else {
-              if (OB_FAIL(check_and_convert_sys_var(
+              // Check protected system variables BEFORE value validation
+              // This ensures permission check happens before any business logic processing
+              if (OB_FAIL(check_protected_sys_variable(session, set_var, ret))) {
+                LOG_WARN("fail to check protected system variable", K(ret), K(set_var.var_name_));
+              }
+              // Proceed with value validation only if permission check passes
+              if (OB_FAIL(ret)) {
+              } else if (OB_FAIL(check_and_convert_sys_var(
                           ctx, set_var, *sys_var, value_obj, out_obj, is_set_stmt))) {
                 LOG_WARN("fail to check", K(ret), K(node), K(*sys_var), K(value_obj));
               } else if (FALSE_IT(value_obj = out_obj)) {
@@ -394,6 +403,9 @@ int ObVariableSetExecutor::calc_var_value_static_engine(
                                 param_store,
                                 &exec_ctx))) {
     LOG_WARN("calc const expr failed", K(ret));
+  } else if (value_obj.is_pl_extend()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("pl extend type is not supported in set stmt", K(ret), K(value_obj));
   }
   return ret;
 }
@@ -727,6 +739,23 @@ int ObVariableSetExecutor::update_global_variables(ObExecContext &ctx,
       if (OB_FAIL(ObBasicSessionInfo::check_optimizer_features_enable_valid(val))) {
         LOG_WARN("fail check privilege_features_enable valid", K(val), K(ret));
       }
+#ifdef OB_BUILD_CLOSE_MODULES
+    } else if (set_var.var_name_ == OB_SV_EARLY_LOCK_RELEASE) {
+      int64_t early_lock_release = 0;
+      if (OB_FAIL(val.get_int(early_lock_release))) {
+        LOG_WARN("fail get int", K(ret), K(val));
+      } else if (OB_FAIL(do_early_lock_release(ctx, *session, early_lock_release > 0))) {
+        LOG_WARN("fail do early lock release ", K(ret), K(early_lock_release), K(val));
+      }
+#endif
+    } else if (set_var.var_name_ == OB_SV_PARALLEL_SERVERS_TARGET) {
+      // 当用户修改 parallel_servers_target 时，同步更新 px_target_workers_per_cpu 配置项
+      int64_t parallel_servers_target = 0;
+      if (OB_FAIL(val.get_int(parallel_servers_target))) {
+        LOG_WARN("fail get int", K(ret), K(val));
+      } else if (OB_FAIL(sync_update_px_target_workers_per_cpu(ctx, arg.tenant_id_, parallel_servers_target))) {
+        LOG_WARN("fail to sync update px_target_workers_per_cpu", K(ret), K(arg.tenant_id_), K(parallel_servers_target));
+      }
     }
 
     if (OB_SUCC(ret) && should_update_extra_var) {
@@ -916,13 +945,14 @@ int ObVariableSetExecutor::check_and_convert_sys_var(ObExecContext &ctx,
   if (OB_FAIL(ret)) {
   } else if (set_var.var_name_ == OB_SV_DEFAULT_STORAGE_ENGINE) {
     static const common::ObString DEFAULT_VALUE_STORAGE_ENGINE("OceanBase");
+    static const common::ObString INNODB_STORAGE_ENGINE("InnoDB");
     const ObString new_value = out_val.get_string();
-    if (new_value.case_compare(DEFAULT_VALUE_STORAGE_ENGINE) != 0) {
+    if (new_value.case_compare(DEFAULT_VALUE_STORAGE_ENGINE) != 0
+        && new_value.case_compare(INNODB_STORAGE_ENGINE) != 0) {
       ret = OB_ERR_PARAM_VALUE_INVALID;
       LOG_USER_ERROR(OB_ERR_PARAM_VALUE_INVALID);
     }
   }
-
   return ret;
 }
 
@@ -1217,7 +1247,7 @@ int ObVariableSetExecutor::switch_to_session_variable(const ObExprCtx &expr_ctx,
     sess_var.value_ = value;
     sess_var.meta_.set_type(value.get_type());
     sess_var.meta_.set_scale(value.get_scale());
-    sess_var.meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+    sess_var.meta_.set_collation_level(value.get_collation_level());
     sess_var.meta_.set_collation_type(value.get_collation_type());
   }
   return ret;
@@ -1238,7 +1268,7 @@ int ObVariableSetExecutor::switch_to_session_variable(const ObObj &value,
     sess_var.value_ = value;
     sess_var.meta_.set_type(value.get_type());
     sess_var.meta_.set_scale(value.get_scale());
-    sess_var.meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+    sess_var.meta_.set_collation_level(value.get_collation_level());
     sess_var.meta_.set_collation_type(value.get_collation_type());
   }
   return ret;
@@ -1354,6 +1384,63 @@ int ObVariableSetExecutor::cascade_set_validate_password(ObExecContext &ctx,
   return ret;
 }
 
+int ObVariableSetExecutor::check_protected_sys_variable(ObSQLSessionInfo *session,
+                                                          const share::ObSetVar &set_var,
+                                                          int &ret)
+{
+  // Check protected system variables BEFORE value validation
+  // This ensures permission check happens before any business logic processing
+  // Only check GLOBAL scope variables, SESSION scope variables are not restricted
+  if (OB_SUCC(ret) && set_var.set_scope_ == ObSetVar::SET_SCOPE_GLOBAL) {
+    // System tenant is not affected by protected variable restrictions
+    const uint64_t tenant_id = session->get_effective_tenant_id();
+    if (is_sys_tenant(tenant_id)) {
+      // System tenant can set any variable, skip protection check
+    } else {
+      ObString system_protected_sys_variables = GCONF.system_protected_sys_variables.get_value_string();
+      if (!system_protected_sys_variables.empty()) {
+        // Only MySQL root user and Oracle sys user are allowed to modify protected variables
+        bool is_sys_admin = (!session->is_oracle_compatible() && session->is_mysql_root_user())
+                            || (session->is_oracle_compatible() && session->is_oracle_sys_user());
+        if (!is_sys_admin) {
+          // Check if variable name exactly matches any variable in the comma-separated list
+          bool is_protected = false;
+          const int64_t MAX_LEN = 4096;
+          int64_t config_len = system_protected_sys_variables.length();
+          if (config_len > 0 && config_len <= MAX_LEN) {
+            HEAP_VAR(char[MAX_LEN + 1], tmp_str) {
+              MEMCPY(tmp_str, system_protected_sys_variables.ptr(), config_len);
+              tmp_str[config_len] = '\0';
+              char *save_ptr = NULL;
+              char *token = STRTOK_R(tmp_str, ",", &save_ptr);
+              while (!is_protected && OB_NOT_NULL(token)) {
+                // Trim leading spaces
+                while (*token == ' ') {
+                  token++;
+                }
+                // Trim trailing spaces
+                size_t token_len = STRLEN(token);
+                while (token_len > 0 && token[token_len - 1] == ' ') {
+                  token[--token_len] = '\0';
+                }
+                if (token_len > 0 && 0 == set_var.var_name_.case_compare(token)) {
+                  is_protected = true;
+                }
+                token = STRTOK_R(NULL, ",", &save_ptr);
+              }
+            }
+          }
+          if (is_protected) {
+            ret = OB_ERR_NO_PRIVILEGE;
+            LOG_WARN("no privilege to set protected tenant variable", KR(ret), K(set_var.var_name_));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObVariableSetExecutor::is_support(const share::ObSetVar &set_var)
 {
   int ret = OB_SUCCESS;
@@ -1380,6 +1467,62 @@ int ObVariableSetExecutor::is_support(const share::ObSetVar &set_var)
   }
   return ret;
 }
+
+int ObVariableSetExecutor::sync_update_px_target_workers_per_cpu(ObExecContext &ctx,
+                                                                  uint64_t tenant_id,
+                                                                  int64_t parallel_servers_target)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = NULL;
+  common::ObMySQLProxy *sql_proxy = NULL;
+
+  if (OB_ISNULL(session = ctx.get_my_session())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session is NULL", K(ret));
+  } else if (OB_ISNULL(sql_proxy = ctx.get_sql_proxy())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql proxy is NULL", K(ret));
+  } else if (!is_user_tenant(tenant_id) && !is_sys_tenant(tenant_id)) {
+    // 只处理用户租户和系统租户
+    LOG_DEBUG("not user or sys tenant, skip sync px_target_workers_per_cpu", K(tenant_id));
+  } else {
+    // 获取租户的单元配置
+    ObArray<ObUnitConfig> unit_configs;
+    ObUnitTableOperator unit_operator;
+    double min_cpu = 0.0;
+    double px_target_workers_per_cpu = 0.0;
+    if (OB_FAIL(unit_operator.init(*sql_proxy))) {
+      LOG_WARN("fail to init unit operator", K(ret), K(tenant_id));
+    } else if (OB_FAIL(unit_operator.get_unit_configs_by_tenant(tenant_id, unit_configs))) {
+      LOG_WARN("fail to get unit configs by tenant", K(ret), K(tenant_id));
+    } else if (OB_UNLIKELY(unit_configs.empty())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unit config is empty", K(ret), K(tenant_id));
+    } else if (FALSE_IT(min_cpu = unit_configs.at(0).min_cpu())) {
+    } else if (OB_UNLIKELY(min_cpu < 1)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid min_cpu", K(ret), K(tenant_id), K(min_cpu));
+    } else {
+      // 计算 px_target_workers_per_cpu = parallel_servers_target / min_cpu
+      px_target_workers_per_cpu = static_cast<double>(parallel_servers_target) / min_cpu;
+      ObSqlString sql;
+      int64_t affected_rows = 0;
+      if (OB_FAIL(sql.assign_fmt("ALTER SYSTEM SET px_target_workers_per_cpu = %.2f",
+                                 px_target_workers_per_cpu))) {
+        LOG_WARN("fail to assign sql", K(ret), K(tenant_id), K(px_target_workers_per_cpu));
+      } else if (OB_FAIL(sql_proxy->write(tenant_id, sql.ptr(), affected_rows))) {
+        LOG_WARN("fail to execute sql", K(ret), K(tenant_id), K(sql));
+      } else {
+        LOG_INFO("sync update px_target_workers_per_cpu when setting parallel_servers_target",
+                 K(tenant_id), K(parallel_servers_target), K(min_cpu),
+                 K(px_target_workers_per_cpu), K(affected_rows));
+      }
+    }
+  }
+
+  return ret;
+}
+
 #undef DEFINE_CAST_CTX
 
 }/* ns sql*/

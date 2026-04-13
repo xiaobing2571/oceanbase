@@ -30,8 +30,11 @@
 #include "sql/engine/expr/ob_expr_json_func_helper.h"
 #include "lib/udt/ob_collection_type.h"
 #include "share/config/ob_server_config.h"
-#include "sql/engine/connector/ob_java_env.h"
+#include "lib/jni_env/ob_java_env.h"
 #include "sql/engine/table/ob_odps_jni_table_row_iter.h"
+#include "sql/engine/expr/ob_expr_uuid.h"
+#include "sql/table_format/iceberg/write/ob_snapshot_producer.h"
+#include "sql/table_format/iceberg/ob_iceberg_table_metadata.h"
 
 #include <arrow/c/bridge.h>
 #include <arrow/array.h>
@@ -42,14 +45,14 @@ namespace oceanbase
 using namespace common;
 namespace sql
 {
-
+#define ARROW_FAIL(statement) (OB_UNLIKELY(!(statement).ok()))
 
 OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
     field_str_, // FARM COMPAT WHITELIST FOR filed_str_: renamed
     line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, file_partition_expr_, buffer_size_, is_overwrite_,
-    external_properties_, external_partition_, alias_names_);
+    external_properties_, external_partition_, alias_names_, field_ids_, lake_table_format_);
 
 
 int ObSelectIntoOp::inner_open()
@@ -114,14 +117,14 @@ int ObSelectIntoOp::inner_open()
       case ObExternalFileFormat::FormatType::PARQUET_FORMAT:
       {
         if (OB_FAIL(init_parquet_env())) {
-          LOG_WARN("failed to init csv env", K(ret));
+          LOG_WARN("failed to init parquet env", K(ret));
         }
         break;
       }
       case ObExternalFileFormat::FormatType::ORC_FORMAT:
       {
         if (OB_FAIL(init_orc_env())) {
-          LOG_WARN("failed to init csv env", K(ret));
+          LOG_WARN("failed to init orc env", K(ret));
         }
         break;
       }
@@ -222,7 +225,7 @@ int ObSelectIntoOp::init_odps_tunnel()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("input is unexpected null", K(ret));
   } else if (is_in_px) {
-    ObOdpsPartitionDownloaderMgr &odps_mgr = ctx_.get_sqc_handler()->get_sqc_ctx().gi_pump_.get_odps_mgr();
+    ObOdpsPartitionUploaderMgr &odps_mgr = ctx_.get_sqc_handler()->get_sqc_ctx().gi_pump_.get_odps_uploader_mgr();
     if (OB_FAIL(odps_mgr.get_odps_uploader(input->task_id_, upload_, record_writer_))) {
       LOG_WARN("failed to get odps uploader", K(ret));
     }
@@ -231,7 +234,7 @@ int ObSelectIntoOp::init_odps_tunnel()
   } else {
     ObMallocHookAttrGuard guard(ObMemAttr(MTL_ID(), "IntoOdps"));
     try {
-      if (OB_FAIL(ObOdpsPartitionDownloaderMgr::create_upload_session(external_properties_.odps_format_,
+      if (OB_FAIL(ObOdpsPartitionUploaderMgr::create_upload_session(external_properties_.odps_format_,
                                                                       MY_SPEC.external_partition_.str_,
                                                                       MY_SPEC.is_overwrite_,
                                                                       upload_))) {
@@ -259,6 +262,23 @@ int ObSelectIntoOp::init_odps_tunnel()
       }
     }
   }
+  if (OB_SUCC(ret)) {
+    const ObIArray<ObExpr *> &select_exprs = MY_SPEC.select_exprs_;
+    for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {
+      ObODPSArrayHelper *array_helper = nullptr;
+      ObExpr *cur_expr = select_exprs.at(i);
+      if (OB_ISNULL(cur_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null");
+      } else if (ObCollectionSQLType == cur_expr->datum_meta_.get_type() &&
+                 OB_FAIL(ObODPSTableUtils::create_array_helper(eval_ctx_.exec_ctx_, ctx_.get_allocator(),
+                                                               *cur_expr, array_helper))) {
+        LOG_WARN("failed to init array helper");
+      } else if (OB_FAIL(array_helpers_.push_back(array_helper))) {
+        LOG_WARN("failed to push back array_helper to array");
+      }
+    }
+  }
   if (OB_FAIL(ret)) {
     need_commit_ = false;
   }
@@ -278,32 +298,27 @@ int ObSelectIntoOp::init_odps_jni_tunnel()
   }
   arrow_alloc_.init(MTL_ID());
 
-  ObJavaEnv &java_env = ObJavaEnv::getInstance();
-  // This entry is first time to setup java env
   if (OB_FAIL(ret)) {
-    // do nothing
-  } else if (!java_env.is_env_inited()) {
-    if (OB_FAIL(java_env.setup_java_env())) {
-      LOG_WARN("failed to setup java env", K(ret));
-    }
-  }
-
-  if (OB_FAIL(ret)) {
-    // do nothing
+  } else if (OB_FAIL(ObJniConnector::java_env_init())) {
+    LOG_WARN("failed to env init", K(ret));
   } else if (is_in_px) {
     int task_id = input->task_id_;
-    ObOdpsJniUploaderMgr &odps_mgr = ctx_.get_sqc_handler()->get_sqc_ctx().gi_pump_.get_odps_jni_uploader_mgr();
-    if (OB_FAIL(odps_mgr.get_odps_uploader_in_px(task_id, MY_SPEC.select_exprs_, uploader_))) {
+    block_id_ = task_id;
+    ObOdpsPartitionJNIUploaderMgr &odps_jni_mgr
+      = ctx_.get_sqc_handler()->get_sqc_ctx().gi_pump_.get_odps_jni_uploader_mgr();
+    if (OB_FAIL(odps_jni_mgr.get_odps_uploader_in_px(task_id, MY_SPEC.select_exprs_, uploader_))) {
       LOG_WARN("failed to get odps writer from global config", K(ret));
     } else if (OB_FAIL(create_odps_schema())) {
       LOG_WARN("failed to create the odps schema", K(ret));
+    } else if (OB_FALSE_IT(odps_jni_mgr.inc_block())) {
+      // do nothing
     }
   } else {
     common::hash::ObHashMap<ObString, ObString> writer_params;
 
     if (OB_FAIL(external_properties_.odps_format_.decrypt())) {
       LOG_WARN("failed to decrypt odps format", K(ret));
-    } else if (OB_FAIL(ObOdpsJniUploaderMgr::create_writer_params_map(ctx_.get_allocator(),
+    } else if (OB_FAIL(ObOdpsPartitionJNIUploaderMgr::create_writer_params_map(ctx_.get_allocator(),
                                                                       external_properties_.odps_format_,
                                                                       MY_SPEC.external_partition_.str_,
                                                                       MY_SPEC.is_overwrite_,
@@ -356,11 +371,20 @@ int ObSelectIntoOp::init_orc_env()
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("compress block is too low or too high", K(external_properties_.orc_format_.compression_block_size_));
   } else {
-    options_.setStripeSize(external_properties_.orc_format_.stripe_size_)
-            .setRowIndexStride(external_properties_.orc_format_.row_index_stride_)
-            .setCompressionBlockSize(external_properties_.orc_format_.compression_block_size_)
-            .setCompression(static_cast<orc::CompressionKind>(external_properties_.orc_format_.compress_type_index_))
-            .setMemoryPool(&orc_alloc_);
+    try {
+      options_.setStripeSize(external_properties_.orc_format_.stripe_size_)
+        .setRowIndexStride(external_properties_.orc_format_.row_index_stride_)
+        .setCompressionBlockSize(external_properties_.orc_format_.compression_block_size_)
+        .setCompression(
+          static_cast<orc::CompressionKind>(external_properties_.orc_format_.compress_type_index_))
+        .setMemoryPool(&orc_alloc_);
+    } catch (const std::exception &e) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected error", K(ret), "Info", e.what());
+    } catch (...) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected error", K(ret));
+    }
   }
   return ret;
 }
@@ -395,6 +419,11 @@ int ObSelectIntoOp::init_env_common()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected column count", K(MY_SPEC.select_exprs_.count()),
               K(MY_SPEC.alias_names_.strs_.count()), K(ret));
+  } else if (share::ObLakeTableFormat::ICEBERG == MY_SPEC.lake_table_format_
+             && ObExternalFileFormat::FormatType::PARQUET_FORMAT != format_type_
+             && ObExternalFileFormat::FormatType::ORC_FORMAT != format_type_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected format type", K(format_type_), K(ret));
   }
   return ret;
 }
@@ -409,30 +438,87 @@ int ObSelectIntoOp::calc_url_and_set_access_info()
     file_location_ = IntoFileLocation::REMOTE_OSS;
   } else if (path.prefix_match_ci(OB_COS_PREFIX)) {
     file_location_ = IntoFileLocation::REMOTE_COS;
-  } else if (path.prefix_match_ci(OB_S3_PREFIX)) {
+  } else if (path.prefix_match_ci(OB_S3_PREFIX)
+             || path.prefix_match(OB_S3A_PREFIX)
+             || path.prefix_match(OB_S3N_PREFIX)) {
     file_location_ = IntoFileLocation::REMOTE_S3;
+  } else if (path.prefix_match_ci(OB_HDFS_PREFIX)) {
+    file_location_ = IntoFileLocation::REMOTE_HDFS;
+  } else if (path.prefix_match_ci(OB_AZBLOB_PREFIX)) {
+    file_location_ = IntoFileLocation::REMOTE_AZBLOB;
   } else {
     file_location_ = IntoFileLocation::SERVER_DISK;
+    if (path.prefix_match_ci(OB_FILE_PREFIX)) {
+      path += strlen(OB_FILE_PREFIX);
+    }
   }
-  if (file_location_ == IntoFileLocation::SERVER_DISK && do_partition_) {
+  int64_t tenant_id = MTL_ID();
+  uint64_t tenant_version = 0;
+  if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, tenant_version))) {
+    LOG_WARN("failed to get data version", KR(ret), K(tenant_id));
+  } else if (tenant_version < DATA_VERSION_4_4_0_0 &&
+             IntoFileLocation::REMOTE_HDFS == file_location_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("select into hdfs is not supported before 4.4.0.0", K(ret),
+             K(tenant_version));
+  }
+
+  if (OB_FAIL(ret)) {
+    /* do nothing */
+  } else if (file_location_ == IntoFileLocation::SERVER_DISK && do_partition_) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("not support partition option on server disk", K(ret));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "partition option on server disk");
   } else if (T_INTO_OUTFILE == into_type && !MY_SPEC.is_single_ && OB_FAIL(calc_first_file_path(path))) {
     LOG_WARN("failed to calc first file path", K(ret));
   } else if (file_location_ != IntoFileLocation::SERVER_DISK) {
-    ObString temp_url = path.split_on('?');
-    temp_url.trim();
+    const char *storage_ptr = path.reverse_find('?');
     ObString storage_info;
-    if (OB_FAIL(ob_write_string(ctx_.get_allocator(), temp_url, basic_url_, true))) {
-      LOG_WARN("failed to append string", K(ret));
-    } else if (OB_FAIL(ob_write_string(ctx_.get_allocator(), path, storage_info, true))) {
-      LOG_WARN("failed to append string", K(ret));
-    } else if (OB_FAIL(access_info_.set(basic_url_.ptr(), storage_info.ptr()))) {
-      LOG_WARN("failed to set access info", K(ret), K(path));
-    } else if (basic_url_.empty() || !access_info_.is_valid()) {
+    access_info_ = (file_location_ == IntoFileLocation::REMOTE_HDFS)
+                    ? static_cast<ObObjectStorageInfo*>(&hdfs_info_)
+                    : static_cast<ObObjectStorageInfo*>(&backup_info_);
+    if (OB_ISNULL(storage_ptr)) {
+      ObSQLSessionInfo *session = NULL;
+      ObSessionPrivInfo session_priv;
+      share::schema::ObSchemaGetterGuard *schema_guard = NULL;
+      const ObLocationSchema *schema_ptr = NULL;
+      if (OB_ISNULL(session = ctx_.get_my_session())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get session failed", K(ret));
+      } else if (OB_ISNULL(schema_guard = ctx_.get_sql_ctx()->schema_guard_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("schema guard is null", K(ret));
+      } else if (OB_FAIL(session->get_session_priv_info(session_priv))) {
+        LOG_WARN("get session priv failed", K(ret));
+      } else if (OB_FAIL(schema_guard->get_location_schema_by_prefix_match_with_priv(
+                                session_priv,
+                                session->get_enable_role_array(),
+                                session->get_effective_tenant_id(),
+                                path,
+                                schema_ptr,
+                                true))) {
+        LOG_WARN("get location schema failed", K(ret), K(session->get_effective_tenant_id()), K(path));
+      } else if (OB_FAIL(ob_write_string(ctx_.get_allocator(), path, basic_url_, true))) {
+        LOG_WARN("failed to append string", K(ret));
+      } else if (OB_NOT_NULL(schema_ptr) && OB_FAIL(ob_write_string(ctx_.get_allocator(),
+                                                                    schema_ptr->get_location_access_info(),
+                                                                    storage_info, true))) {
+        LOG_WARN("failed to append string", K(ret));
+      }
+    } else {
+      ObString temp_url = path.split_on('?').trim();
+      if (OB_FAIL(ob_write_string(ctx_.get_allocator(), temp_url, basic_url_, true))) {
+        LOG_WARN("failed to append string", K(ret));
+      } else if (OB_FAIL(ob_write_string(ctx_.get_allocator(), path, storage_info, true))) {
+        LOG_WARN("failed to append string", K(ret));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(access_info_->set(basic_url_.ptr(), storage_info.ptr()))) {
+      LOG_WARN("failed to set access info", K(ret), K(storage_info));
+    } else if (basic_url_.empty() || !access_info_->is_valid()) {
       ret = OB_FILE_NOT_EXIST;
-      LOG_WARN("file path not exist", K(ret), K(basic_url_), K(access_info_));
+      LOG_WARN("file path not exist", K(ret), K(basic_url_), KP(access_info_));
     }
   } else { // IntoFileLocation::SERVER_DISK
     if (OB_FAIL(ob_write_string(ctx_.get_allocator(), path, basic_url_, true))) {
@@ -520,6 +606,7 @@ int ObSelectIntoOp::inner_get_next_row()
       }
     }
   } //end while
+  ret = OB_E(EventTable::EN_SQL_SELECT_INTO_OP_RETRY) ret;
   if (OB_ITER_END == ret || OB_SUCC(ret)) { // set affected rows
     phy_plan_ctx->set_affected_rows(row_count);
   }
@@ -642,6 +729,7 @@ int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
       }
     }
   } //end while
+  ret = OB_E(EventTable::EN_SQL_SELECT_INTO_OP_RETRY) ret;
   if (OB_SUCC(ret)) { // set affected rows
     phy_plan_ctx->set_affected_rows(row_count);
   }
@@ -660,6 +748,11 @@ int ObSelectIntoOp::inner_rescan()
 int ObSelectIntoOp::inner_close()
 {
   int ret = OB_SUCCESS;
+  int old_errcode = ctx_.get_errcode();
+  bool need_retry = true;
+  if (OB_SUCCESS == old_errcode || OB_ITER_END == old_errcode) {
+    need_retry = false;
+  }
   ObExternalFileWriter *data_writer = NULL;
   int64_t estimated_bytes = 0;
   if (ObExternalFileFormat::FormatType::ODPS_FORMAT == format_type_) {
@@ -688,13 +781,61 @@ int ObSelectIntoOp::inner_close()
       if (OB_ISNULL(data_writer = iter->second)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("data writer is unexpected null", K(ret));
-      } else if (OB_FAIL(data_writer->close_data_writer())) {
+      } else if (OB_FAIL(data_writer->close_data_writer(need_retry))) {
         LOG_WARN("failed to close data writer", K(ret));
       }
     }
-  } else if (OB_NOT_NULL(data_writer_) && OB_FAIL(data_writer_->close_data_writer())) {
-    LOG_WARN("failed to close data writer", K(ret));
+  } else if (OB_NOT_NULL(data_writer_)) {
+    if (OB_FAIL(data_writer_->close_data_writer(need_retry))) {
+      LOG_WARN("failed to close data writer", K(ret));
+    }
+    // insert into iceberg table not support partition now
+    if (OB_SUCC(ret) && share::ObLakeTableFormat::ICEBERG == MY_SPEC.lake_table_format_) {
+      const ObIcebergDataGenerator& iceberg_data_generator =
+                            static_cast<ObBatchFileWriter*>(data_writer_)->get_datafile_generator();
+      if (iceberg_data_generator.get_data_files().empty()) {
+        // do nothing
+      } else if (ctx_.get_sqc_handler() != NULL) {
+        ObSqcCtx& sqc_ctx = ctx_.get_sqc_handler()->get_sqc_ctx();
+        ObLockGuard<ObSpinLock> lock_guard(sqc_ctx.iceberg_data_file_lock_);
+        for (int64_t i = 0; OB_SUCC(ret) && i < iceberg_data_generator.get_data_files().size(); ++i) {
+          iceberg::DataFile* data_file = OB_NEWx(iceberg::DataFile,
+                                                &ctx_.get_sqc_handler()->get_exec_ctx().get_allocator(),
+                                                ctx_.get_sqc_handler()->get_exec_ctx().get_allocator());
+          if (OB_ISNULL(data_file)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("failed to allocate memory for data file", K(ret));
+          } else {
+            OZ(data_file->assign(*iceberg_data_generator.get_data_files().at(i)));
+            OZ(sqc_ctx.iceberg_data_files_.push_back(data_file));
+          }
+        }
+      } else {
+        ObPhysicalPlanCtx *phy_plan_ctx = NULL;
+        if (OB_ISNULL(phy_plan_ctx = ctx_.get_physical_plan_ctx())
+            || OB_ISNULL(phy_plan_ctx->get_lake_table_metadata())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected null", K(ret));
+        } else {
+          const iceberg::ObIcebergTableMetadata& iceberg_table_metadata =
+            *static_cast<const iceberg::ObIcebergTableMetadata*>(phy_plan_ctx->get_lake_table_metadata());
+          ObArenaAllocator tmp_allocator;
+          iceberg::ObSnapshotProducer snapshot_producer(iceberg_table_metadata,
+                                                        tmp_allocator,
+                                                        iceberg_data_generator.get_data_files());
+          OZ(snapshot_producer.init());
+          OZ(snapshot_producer.commit());
+        }
+      }
+    }
   }
+  for (int64_t i = 0; i < array_helpers_.count(); ++i) {
+    if (array_helpers_.at(i) != nullptr) {
+      array_helpers_.at(i)->~ObODPSArrayHelper();
+      ctx_.get_allocator().free(array_helpers_.at(i));
+    }
+  }
+  array_helpers_.reset();
   return ret;
 }
 
@@ -755,26 +896,55 @@ int ObSelectIntoOp::calc_first_file_path(ObString &path)
   ObSqlString file_name_with_suffix;
   ObString file_extension;
   ObSelectIntoOpInput *input = static_cast<ObSelectIntoOpInput*>(input_);
-  ObString input_file_name = file_location_ != IntoFileLocation::SERVER_DISK
-                             ? path.split_on('?').trim()
-                             : path;
+  ObString input_file_name;
+  ObString access_info_str;
+  if (OB_UNLIKELY(file_location_ != IntoFileLocation::SERVER_DISK)) {
+    // Handle simple auth
+    if (OB_LIKELY(!path.contains(path.find('?')))) {
+      input_file_name = path.trim();
+      access_info_str = ObString();
+    } else {
+      input_file_name = path.split_on('?').trim();
+      access_info_str = path;
+    }
+  } else {
+    input_file_name = path;
+  }
+
   if (OB_ISNULL(input)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("op input is null", K(ret));
-  } else if (input_file_name.length() == 0 || path.length() == 0) {
+  } else if (input_file_name.empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid outfile path");
     LOG_WARN("invalid outfile path", K(ret));
   } else {
-    if (input_file_name.ptr()[input_file_name.length() - 1] == '/'){
-      OZ(file_name_with_suffix.append_fmt("%.*sdata", input_file_name.length(), input_file_name.ptr()));
+    if (share::ObLakeTableFormat::ICEBERG != MY_SPEC.lake_table_format_) {
+      if (input_file_name.ptr()[input_file_name.length() - 1] == '/') {
+        OZ(file_name_with_suffix.append_fmt("%.*sdata", input_file_name.length(), input_file_name.ptr()));
+      } else {
+        OZ(file_name_with_suffix.append_fmt("%.*s", input_file_name.length(), input_file_name.ptr()));
+      }
+      if (MY_SPEC.parallel_ > 1) {
+        OZ(file_name_with_suffix.append_fmt("_%ld_%ld_0", input->sqc_id_, input->task_id_));
+      } else {
+        OZ(file_name_with_suffix.append("_0"));
+      }
     } else {
-      OZ(file_name_with_suffix.append_fmt("%.*s", input_file_name.length(), input_file_name.ptr()));
-    }
-    if (MY_SPEC.parallel_ > 1) {
-      OZ(file_name_with_suffix.append_fmt("_%ld_%ld_%d", input->sqc_id_, input->task_id_, 0));
-    } else {
-      OZ(file_name_with_suffix.append_fmt("_%d", 0));
+      if (input_file_name.ptr()[input_file_name.length() - 1] != '/') {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid outfile path", K(ret));
+      } else {
+        OZ(file_name_with_suffix.append_fmt("%.*sdata/", input_file_name.length(), input_file_name.ptr()));
+      }
+      if (MY_SPEC.parallel_ > 1) {
+        OZ(file_name_with_suffix.append_fmt("%05ld-%ld-", input->sqc_id_, input->task_id_));
+      } else {
+        OZ(file_name_with_suffix.append("00000-0-"));
+      }
+      char commit_uuid[UuidCommon::LENGTH_UUID] = {0};
+      OZ(ObExprUuid::gen_server_uuid(commit_uuid, UuidCommon::LENGTH_UUID));
+      OZ(file_name_with_suffix.append_fmt("%.*s-0-00001", UuidCommon::LENGTH_UUID, commit_uuid));
     }
     OZ(external_properties_.get_format_file_extension(format_type_, file_extension));
     if (!file_extension.empty() && file_extension.ptr()[0] != '.') {
@@ -784,12 +954,10 @@ int ObSelectIntoOp::calc_first_file_path(ObString &path)
     if (format_type_ == ObExternalFileFormat::FormatType::CSV_FORMAT) {
       OZ(file_name_with_suffix.append(compression_algorithm_to_suffix(external_properties_.csv_format_.compression_algorithm_)));
     }
-    if (file_location_ != IntoFileLocation::SERVER_DISK) {
-      OZ(file_name_with_suffix.append_fmt("?%.*s", path.length(), path.ptr()));
+    if (!access_info_str.empty()) {
+      OZ(file_name_with_suffix.append_fmt("?%.*s", access_info_str.length(), access_info_str.ptr()));
     }
-    if (OB_SUCC(ret) && OB_FAIL(ob_write_string(ctx_.get_allocator(), file_name_with_suffix.string(), path))) {
-      LOG_WARN("failed to write string", K(ret));
-    }
+    OZ(ob_write_string(ctx_.get_allocator(), file_name_with_suffix.string(), path));
   }
   return ret;
 }
@@ -800,7 +968,10 @@ int ObSelectIntoOp::calc_next_file_path(ObExternalFileWriter &data_writer)
   ObSqlString url_with_suffix;
   ObString file_path;
   data_writer.split_file_id_++;
-  if (data_writer.split_file_id_ > 0) {
+  if (OB_UNLIKELY(data_writer.split_file_id_ <= 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected split file id", K(ret));
+  } else {
     if (MY_SPEC.is_single_ && IntoFileLocation::SERVER_DISK != file_location_) {
       file_path = (data_writer.split_file_id_ > 1)
                   ? data_writer.url_.split_on(data_writer.url_.reverse_find('.'))
@@ -811,11 +982,20 @@ int ObSelectIntoOp::calc_next_file_path(ObExternalFileWriter &data_writer)
         LOG_WARN("failed to append string", K(ret));
       }
     } else if (!MY_SPEC.is_single_) {
-      file_path = data_writer.url_.split_on(data_writer.url_.reverse_find('_'));
-      if (OB_FAIL(url_with_suffix.assign(file_path))) {
-        LOG_WARN("failed to assign string", K(ret));
-      } else if (OB_FAIL(url_with_suffix.append_fmt("_%ld", data_writer.split_file_id_))) {
-        LOG_WARN("failed to append string", K(ret));
+      if (share::ObLakeTableFormat::ICEBERG != MY_SPEC.lake_table_format_) {
+        file_path = data_writer.url_.split_on(data_writer.url_.reverse_find('_'));
+        if (OB_FAIL(url_with_suffix.assign(file_path))) {
+          LOG_WARN("failed to assign string", K(ret));
+        } else if (OB_FAIL(url_with_suffix.append_fmt("_%ld", data_writer.split_file_id_))) {
+          LOG_WARN("failed to append string", K(ret));
+        }
+      } else {
+        file_path = data_writer.url_.split_on(data_writer.url_.reverse_find('-'));
+        if (OB_FAIL(url_with_suffix.assign(file_path))) {
+          LOG_WARN("failed to assign string", K(ret));
+        } else if (OB_FAIL(url_with_suffix.append_fmt("-%05ld", data_writer.split_file_id_ + 1))) {
+          LOG_WARN("failed to append string", K(ret));
+        }
       }
     } else {
       ret = OB_ERR_UNEXPECTED;
@@ -829,18 +1009,10 @@ int ObSelectIntoOp::calc_next_file_path(ObExternalFileWriter &data_writer)
       }
       OZ(url_with_suffix.append(file_extension));
     }
-    if (!MY_SPEC.is_single_
-        && format_type_ == ObExternalFileFormat::FormatType::CSV_FORMAT) {
+    if (!MY_SPEC.is_single_ && format_type_ == ObExternalFileFormat::FormatType::CSV_FORMAT) {
       OZ(url_with_suffix.append(compression_algorithm_to_suffix(external_properties_.csv_format_.compression_algorithm_)));
     }
-    if (OB_SUCC(ret) && OB_FAIL(ob_write_string(ctx_.get_allocator(),
-                                                url_with_suffix.string(),
-                                                data_writer.url_, true))) {
-      LOG_WARN("failed to write string", K(ret));
-    }
-  } else {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get unexpected split file id", K(ret));
+    OZ(ob_write_string(ctx_.get_allocator(), url_with_suffix.string(), data_writer.url_, true));
   }
   return ret;
 }
@@ -1890,6 +2062,32 @@ int ObSelectIntoOp::set_odps_column_value_mysql(apsara::odps::sdk::ODPSTableReco
           }
           break;
         }
+        case apsara::odps::sdk::ODPS_ARRAY:
+        {
+          ObODPSArrayHelper *array_helper = array_helpers_.at(col_idx);
+          ObString array_bin_string;
+          if (OB_ISNULL(array_helper)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("get unexpected null", K(array_helper));
+          } else {
+            array_helper->array_->clear();
+            shared_ptr<apsara::odps::sdk::ODPSArray> odps_array =
+                        std::make_shared<apsara::odps::sdk::ODPSArray>(table_record.GetSchema()->GetTableColumn(col_idx).GetTypeInfo());
+            if (OB_FAIL(ObTextStringHelper::read_real_string_data(allocator, datum, datum_meta,
+                                                                  obj_meta.has_lob_header(),
+                                                                  array_bin_string, &ctx_))) {
+              LOG_WARN("failed to read string", K(ret));
+            } else if (OB_FAIL(array_helper->array_->init(array_bin_string))) {
+              LOG_WARN("failed to init array", K(ret));
+            } else if (OB_FAIL(recursive_fill_list_record(odps_array, array_helper,
+                                                          allocator, is_strict_mode, date_sql_mode))) {
+              LOG_WARN("failed to recursice fill list builder");
+            } else {
+              table_record.SetArrayValue(col_idx, odps_array);
+            }
+          }
+          break;
+        }
         default:
         {
           ret = OB_ERR_UNEXPECTED;
@@ -1914,6 +2112,193 @@ int ObSelectIntoOp::set_odps_column_value_mysql(apsara::odps::sdk::ODPSTableReco
       ret = OB_ODPS_ERROR;
       LOG_WARN("caught exception when set odps column value mysql", K(ret));
     }
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::recursive_fill_list_record(shared_ptr<apsara::odps::sdk::ODPSArray> odps_array,
+                                                ObODPSArrayHelper *array_helper,
+                                                ObIAllocator &alloc,
+                                                const bool is_strict_mode,
+                                                const ObDateSqlMode date_sql_mode)
+{
+  int ret = OB_SUCCESS;
+  ObIArrayType *child_array = nullptr;
+  apsara::odps::sdk::ODPSColumnType child_odps_type = apsara::odps::sdk::ODPS_UNKNOWN;
+  if (OB_ISNULL(odps_array) || OB_ISNULL(array_helper) ||
+      OB_ISNULL(child_array = array_helper->array_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(child_array), K(array_helper));
+  } else if (OB_FALSE_IT(child_odps_type = odps_array->GetElementType())) {
+  } else if (apsara::odps::sdk::ODPS_ARRAY == child_odps_type &&
+             ObCollectionSQLType == array_helper->element_type_) {
+    ObArrayNested *nested_array = static_cast<ObArrayNested *>(array_helper->array_);
+    ObIArrayType *child_array = nullptr;
+    if (OB_ISNULL(array_helper->child_helper_) || OB_ISNULL(child_array = array_helper->child_helper_->array_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null", K(array_helper->child_helper_), KP(child_array));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < nested_array->size(); ++i) {
+        shared_ptr<apsara::odps::sdk::ODPSArray> child_odps_array =
+                        std::make_shared<apsara::odps::sdk::ODPSArray>(odps_array->GetTypeInfo().mSubTypes.at(0));
+        child_array->clear();
+        if (nested_array->is_null(i)) {
+          odps_array->AppendNull();
+        } else if (OB_FAIL(nested_array->at(i, *child_array))) {
+          LOG_WARN("failed to get elem", K(ret), K(i));
+        } else if (OB_FAIL(SMART_CALL(recursive_fill_list_record(child_odps_array,
+                                                                array_helper->child_helper_,
+                                                                alloc, is_strict_mode, date_sql_mode)))) {
+          LOG_WARN("failed to recursive fill list builder");
+        } else {
+          odps_array->AppendArrayValue(child_odps_array);
+        }
+      }
+    }
+  } else if (apsara::odps::sdk::ODPS_BIGINT == child_odps_type &&
+             ObIntType == array_helper->element_type_) {
+    if (!is_oracle_mode()) {
+      ObArrayFixedSize<int64_t> *int_array = static_cast<ObArrayFixedSize<int64_t> *>(child_array);
+      for (int64_t i = 0; OB_SUCC(ret) && i < int_array->size(); ++i) {
+        if (int_array->is_null(i)) {
+          odps_array->AppendNull();
+        } else {
+          odps_array->AppendBigIntValue((*int_array)[i]);
+        }
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("array(number) not support in oracle mode", K(child_odps_type));
+    }
+  } else if (apsara::odps::sdk::ODPS_INTEGER == child_odps_type &&
+             ObInt32Type == array_helper->element_type_) {
+    if (!is_oracle_mode()) {
+      ObArrayFixedSize<int32_t> *int_array = static_cast<ObArrayFixedSize<int32_t> *>(child_array);
+      for (int64_t i = 0; OB_SUCC(ret) && i < int_array->size(); ++i) {
+        if (int_array->is_null(i)) {
+          odps_array->AppendNull();
+        } else {
+          odps_array->AppendIntegerValue((*int_array)[i]);
+        }
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("array(number) not support in oracle mode", K(child_odps_type));
+    }
+  } else if (apsara::odps::sdk::ODPS_SMALLINT == child_odps_type &&
+             ObSmallIntType == array_helper->element_type_) {
+    if (!is_oracle_mode()) {
+      ObArrayFixedSize<int16_t> *int_array = static_cast<ObArrayFixedSize<int16_t> *>(child_array);
+      for (int64_t i = 0; OB_SUCC(ret) && i < int_array->size(); ++i) {
+        if (int_array->is_null(i)) {
+          odps_array->AppendNull();
+        } else {
+          odps_array->AppendSmallIntValue((*int_array)[i]);
+        }
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("array(number) not support in oracle mode", K(child_odps_type));
+    }
+  } else if (apsara::odps::sdk::ODPS_TINYINT == child_odps_type &&
+             ObTinyIntType == array_helper->element_type_) {
+    if (!is_oracle_mode()) {
+      ObArrayFixedSize<int8_t> *int_array = static_cast<ObArrayFixedSize<int8_t> *>(child_array);
+      for (int64_t i = 0; OB_SUCC(ret) && i < int_array->size(); ++i) {
+        if (int_array->is_null(i)) {
+          odps_array->AppendNull();
+        } else {
+          odps_array->AppendTinyIntValue((*int_array)[i]);
+        }
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("array(number) not support in oracle mode", K(child_odps_type));
+    }
+  } else if (apsara::odps::sdk::ODPS_DOUBLE == child_odps_type &&
+             ObDoubleType == array_helper->element_type_) {
+    ObArrayFixedSize<double> *double_array = static_cast<ObArrayFixedSize<double> *>(child_array);
+    for (int64_t i = 0; OB_SUCC(ret) && i < double_array->size(); ++i) {
+      if (double_array->is_null(i)) {
+        odps_array->AppendNull();
+      } else {
+        odps_array->AppendDoubleValue((*double_array)[i]);
+      }
+    }
+  } else if (apsara::odps::sdk::ODPS_FLOAT == child_odps_type &&
+             ObFloatType == array_helper->element_type_) {
+    ObArrayFixedSize<float> *double_array = static_cast<ObArrayFixedSize<float> *>(child_array);
+    for (int64_t i = 0; OB_SUCC(ret) && i < double_array->size(); ++i) {
+      if (double_array->is_null(i)) {
+        odps_array->AppendNull();
+      } else {
+        odps_array->AppendFloatValue((*double_array)[i]);
+      }
+    }
+  } else if (apsara::odps::sdk::ODPS_BOOLEAN == child_odps_type) {
+    if (!is_oracle_mode()) {
+      if (ObTinyIntType == array_helper->element_type_) {
+        ObArrayFixedSize<int8_t> *int_array = static_cast<ObArrayFixedSize<int8_t> *>(child_array);
+        for (int64_t i = 0; OB_SUCC(ret) && i < int_array->size(); ++i) {
+          if (int_array->is_null(i)) {
+            odps_array->AppendNull();
+          } else {
+            odps_array->AppendBoolValue((*int_array)[i] != 0);
+          }
+        }
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("arrow type not match with ob type", K(child_odps_type));
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("array(number) not support in oracle mode", K(child_odps_type));
+    }
+  } else if ((apsara::odps::sdk::ODPS_VARCHAR == child_odps_type ||
+              apsara::odps::sdk::ODPS_STRING == child_odps_type) &&
+             ObVarcharType == array_helper->element_type_) {
+    ObArrayBinary * string_array = static_cast<ObArrayBinary *>(child_array);
+    for (int64_t i = 0; OB_SUCC(ret) && i < string_array->size(); ++i) {
+      if (string_array->is_null(i)) {
+        odps_array->AppendNull();
+      } else {
+        ObString lob_str = (*string_array)[i];
+        uint32_t res_len = 0;
+        char *buf = NULL;
+        int64_t buf_size = 0;
+        if (CHARSET_UTF8MB4 == ObCharset::charset_type_by_coll(array_helper->element_collation_) ||
+            CS_TYPE_BINARY == array_helper->element_collation_) {
+          res_len = static_cast<uint32_t>(lob_str.length());
+          buf = const_cast<char *>(lob_str.ptr());
+        } else if (OB_FALSE_IT(buf_size = lob_str.length() * ObCharset::MAX_MB_LEN)) {
+        } else if (OB_ISNULL(buf = static_cast<char *>(alloc.alloc(buf_size)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to alloc memory", K(ret));
+        } else if (OB_FAIL(ObCharset::charset_convert(array_helper->element_collation_,
+                                                      lob_str.ptr(),
+                                                      lob_str.length(),
+                                                      CS_TYPE_UTF8MB4_BIN,
+                                                      buf,
+                                                      buf_size,
+                                                      res_len,
+                                                      false,
+                                                      false))) {
+          LOG_WARN("failed to convert charset", K(ret));
+        }
+        if (OB_FAIL(ret)) {
+          // do nothing
+        } else if (OB_ISNULL(buf) && res_len == 0) {
+          odps_array->AppendNull();
+        } else if (apsara::odps::sdk::ODPS_VARCHAR == child_odps_type) {
+          odps_array->AppendVarcharValue(std::string(buf, res_len));
+        } else {
+          odps_array->AppendStringValue(std::string(buf, res_len));
+        }
+      }
+    }
+  } else {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("array not support", K(child_odps_type), K(array_helper->element_type_));
   }
   return ret;
 }
@@ -2182,7 +2567,7 @@ int ObSelectIntoOp::create_odps_schema()
 {
   int ret = OB_SUCCESS;
   const ObIArray<ObExpr *> &select_exprs = MY_SPEC.select_exprs_;
-  const ObIArray<JniWriter::OdpsType> &col_type_from_odps = uploader_.writer_ptr->get_schema_from_odps();
+  const ObIArray<ObOdpsJniConnector::OdpsType> &col_type_from_odps = uploader_.writer_ptr->get_schema_from_odps();
   intptr_t export_schema_ptr = uploader_.writer_ptr->get_export_schema_ptr();
 
   if (export_schema_ptr == 0) {
@@ -2201,6 +2586,20 @@ int ObSelectIntoOp::create_odps_schema()
       arrow_schema_ = arrow::schema(tableStructType->fields());
     }
   }
+  for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {
+      ObODPSArrayHelper *array_helper = nullptr;
+      ObExpr *cur_expr = select_exprs.at(i);
+      if (OB_ISNULL(cur_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null");
+      } else if (ObCollectionSQLType == cur_expr->datum_meta_.get_type() &&
+                 OB_FAIL(ObODPSTableUtils::create_array_helper(eval_ctx_.exec_ctx_, ctx_.get_allocator(),
+                                                               *cur_expr, array_helper))) {
+        LOG_WARN("failed to init array helper");
+      } else if (OB_FAIL(array_helpers_.push_back(array_helper))) {
+        LOG_WARN("failed to push back array_helper to array");
+      }
+    }
   return ret;
 }
 
@@ -2228,771 +2627,12 @@ inline T arrow_get(ObIVector& expr_vector, int64_t idx)
       }                                                                      \
   } while(false);
 
-int ObSelectIntoOp::set_odps_column_value_mysql_jni(arrow::ArrayBuilder *builder,
-                                                    JniWriter::OdpsType odps_type,
-                                                    const ObDatum &datum,
-                                                    const ObDatumMeta &datum_meta,
-                                                    const ObObjMeta &obj_meta,
-                                                    arrow::Field &arrow_field,
-                                                    uint32_t col_idx,
-                                                    const bool is_strict_mode,
-                                                    const ObDateSqlMode date_sql_mode)
-{
-  int ret = OB_SUCCESS;
-  ObObjType ob_type = datum_meta.get_type();
-  uint32_t res_len = 0;
-  char *buf = NULL;
-  int64_t buf_size = 0;
-  ObArenaAllocator allocator("IntoOdps", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
-
-  if (OB_ISNULL(builder)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("UNEXPECTED null builder ptr", K(ret));
-  } else if (datum.is_null()) {
-    arrow::Status st = builder->AppendNull();
-    if (!st.ok()) {
-      ret = OB_ODPS_ERROR;
-      LOG_WARN("failed to append null value", K(ret));
-    }
-  } else {
-    switch (odps_type)
-    {
-      case JniWriter::OdpsType::BOOLEAN:
-      {
-        if (ObTinyIntType == ob_type) {
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::BooleanBuilder, datum.get_tinyint() != 0);
-        } else if (ObSmallIntType == ob_type) {
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::BooleanBuilder, datum.get_smallint() != 0)
-        } else if (ObMediumIntType == ob_type || ObInt32Type == ob_type) {
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::BooleanBuilder, datum.get_int32() != 0);
-        } else if (ObIntType == ob_type) {
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::BooleanBuilder, datum.get_int() != 0);
-        }
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::BooleanBuilder, false);
-        break;
-      }
-      case JniWriter::OdpsType::TINYINT:
-      {
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int8Builder, datum.get_tinyint());
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int8Builder, 0);
-        break;
-      }
-      case JniWriter::OdpsType::SMALLINT:
-      {
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int16Builder, datum.get_smallint());
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int16Builder, 0);
-        break;
-      }
-      case JniWriter::OdpsType::INT:
-      {
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int32Builder, datum.get_int32());
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int32Builder, 0);
-        break;
-      }
-      case JniWriter::OdpsType::BIGINT:
-      {
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int64Builder, datum.get_int());
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int64Builder, 0);
-        break;
-      }
-      case JniWriter::OdpsType::FLOAT:
-      {
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::FloatBuilder, datum.get_float());
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::FloatBuilder, 0);
-        break;
-      }
-      case JniWriter::OdpsType::DOUBLE:
-      {
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::DoubleBuilder, datum.get_double());
-        PUT_DATUM_INTO_ARROW_BUILDER(arrow::DoubleBuilder, 0);
-        break;
-      }
-      case JniWriter::OdpsType::DECIMAL:
-      {
-        std::string dec;
-        if (OB_FAIL(decimal_to_string(datum, datum_meta, dec, allocator))) {
-          LOG_WARN("failed to get string", K(ret));
-        } else {
-          if (arrow_field.type()->id() == arrow::Type::DECIMAL || arrow_field.type()->id() == arrow::Type::DECIMAL128) {
-            arrow::Result<arrow::Decimal128> res = arrow::Decimal128::FromString(dec);
-            if (!res.ok()) {
-              ret = OB_ODPS_ERROR;
-              LOG_WARN("failed to convert decimal", K(ret), K(dec.c_str()));
-            } else {
-              arrow::Decimal128Builder *builder_ref = dynamic_cast<arrow::Decimal128Builder*>(builder);
-              arrow::Status st = builder_ref->Append(res.ValueOrDie());
-              if (!st.ok()) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to append decimal value", K(ret));
-              }
-            }
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Decimal128Builder, arrow::Decimal128::FromString("0").ValueOrDie());
-          } else if (arrow_field.type()->id() == arrow::Type::DECIMAL256) {
-            arrow::Result<arrow::Decimal256> res = arrow::Decimal256::FromString(dec);
-            if (!res.ok()) {
-              ret = OB_ODPS_ERROR;
-              LOG_WARN("failed to convert decimal", K(ret), K(dec.c_str()));
-            } else {
-              arrow::Decimal256Builder *builder_ref = dynamic_cast<arrow::Decimal256Builder*>(builder);
-              arrow::Status st = builder_ref->Append(res.ValueOrDie());
-              if (!st.ok()) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to append decimal value", K(ret));
-              }
-            }
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Decimal256Builder, arrow::Decimal256::FromString("0").ValueOrDie());
-          }
-        }
-        break;
-      }
-      case JniWriter::OdpsType::CHAR:
-      case JniWriter::OdpsType::VARCHAR:
-      case JniWriter::OdpsType::STRING:
-      case JniWriter::OdpsType::BINARY:
-      {
-        ObString lob_str;
-        if (OB_FAIL(ObTextStringHelper::read_real_string_data(allocator,
-                                                              datum,
-                                                              datum_meta,
-                                                              obj_meta.has_lob_header(),
-                                                              lob_str,
-                                                              &ctx_))) {
-            LOG_WARN("failed to read string", K(ret));
-        } else if (CHARSET_UTF8MB4 == ObCharset::charset_type_by_coll(datum_meta.cs_type_)
-            || JniWriter::OdpsType::BINARY == odps_type
-            || CS_TYPE_BINARY == datum_meta.cs_type_
-        ) {
-          res_len = static_cast<uint32_t>(lob_str.length());
-          buf = const_cast<char *>(lob_str.ptr());
-        } else if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(lob_str.length() * ObCharset::MAX_MB_LEN)))) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
-          LOG_WARN("failed to alloc memory", K(ret));
-        } else if (OB_FAIL(ObCharset::charset_convert(datum_meta.cs_type_,
-                                                      lob_str.ptr(),
-                                                      lob_str.length(),
-                                                      CS_TYPE_UTF8MB4_BIN,
-                                                      buf,
-                                                      buf_size,
-                                                      res_len,
-                                                      false,
-                                                      false))) {
-          LOG_WARN("failed to convert charset", K(ret));
-        }
-        if (OB_FAIL(ret)) {
-        } else if ((JniWriter::OdpsType::CHAR == odps_type && res_len > 255) ||
-                   (JniWriter::OdpsType::VARCHAR == odps_type && res_len > 65535) ||
-                   (JniWriter::OdpsType::STRING == odps_type && res_len > 8 * 1024 * 1024) ||
-                   (JniWriter::OdpsType::BINARY == odps_type && res_len > 8 * 1024 * 1024)) {
-          ret = OB_DATA_OUT_OF_RANGE;
-          LOG_WARN("string length out of range", K(res_len));
-        } else if (OB_ISNULL(buf) && res_len == 0) {
-          if (JniWriter::OdpsType::BINARY != odps_type) {
-            arrow::StringBuilder* builder_ref = dynamic_cast<arrow::StringBuilder *>(builder);
-            if (OB_ISNULL(builder_ref)) {
-              ret = OB_ODPS_ERROR;
-              LOG_WARN("failed to append null value", K(ret));
-            } else {
-              arrow::Status st = builder_ref->Append(buf, res_len);
-              if (!st.ok()) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to append null value", K(ret));
-              }
-            }
-
-            if (OB_SUCC(ret)) {
-              arrow::Status st = builder_ref->Append("_magic", 6);
-              if (!st.ok()) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to append null value", K(ret));
-              }
-            }
-          } else {
-            arrow::BinaryBuilder* builder_ref = dynamic_cast<arrow::BinaryBuilder *>(builder);
-            if (OB_ISNULL(builder_ref)) {
-              ret = OB_ODPS_ERROR;
-              LOG_WARN("failed to append null value", K(ret));
-            } else {
-              arrow::Status st = builder_ref->Append(buf, res_len);
-              if (!st.ok()) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to append null value", K(ret));
-              }
-            }
-
-            if (OB_SUCC(ret)) {
-              arrow::Status st = builder_ref->Append("_magic", 6);
-              if (!st.ok()) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to append null value", K(ret));
-              }
-            }
-          }
-        }
-        break;
-      }
-      case JniWriter::OdpsType::JSON:
-      {
-        ObString json_str;
-        ObIJsonBase *j_base = NULL;
-        ObJsonBuffer jbuf(&allocator);
-        ObJsonInType in_type = ObJsonInType::JSON_BIN;
-        uint32_t parse_flag = lib::is_mysql_mode() ? 0 : ObJsonParser::JSN_RELAXED_FLAG;
-        if (OB_FAIL(ObTextStringHelper::read_real_string_data(allocator,
-                                                              datum,
-                                                              datum_meta,
-                                                              obj_meta.has_lob_header(),
-                                                              json_str,
-                                                              &ctx_))) {
-          LOG_WARN("failed to read string", K(ret));
-        } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator, json_str, in_type,
-                                                            in_type, j_base, parse_flag,
-                                                            ObJsonExprHelper::get_json_max_depth_config()))) {
-          COMMON_LOG(WARN, "fail to get json base", K(ret), K(in_type));
-        } else if (OB_FAIL(j_base->print(jbuf, false))) { // json binary to string
-          COMMON_LOG(WARN, "fail to convert json to string", K(ret));
-        } else if (jbuf.length() > UINT32_MAX) {
-          ret = OB_DATA_OUT_OF_RANGE;
-          LOG_WARN("data out of range", K(odps_type), K(jbuf.length()), K(ret));
-        } else {
-          LOG_DEBUG("debug select into json", K(datum_meta.cs_type_), K(ObString(jbuf.length(), jbuf.ptr())));
-          arrow::StringBuilder* builder_ref = dynamic_cast<arrow::StringBuilder *>(builder);
-          if (OB_ISNULL(builder_ref)) {
-            ret = OB_ODPS_ERROR;
-            LOG_WARN("failed to append null value", K(ret));
-          } else {
-            arrow::Status st = builder_ref->Append(jbuf.ptr(), jbuf.length());
-            if (!st.ok()) {
-              ret = OB_ODPS_ERROR;
-              LOG_WARN("failed to append null value", K(ret));
-            }
-          }
-
-          if (OB_SUCC(ret)) {
-            arrow::Status st = builder_ref->Append("{}", 2);
-            if (!st.ok()) {
-              ret = OB_ODPS_ERROR;
-              LOG_WARN("failed to append null value", K(ret));
-            }
-          }
-        }
-        break;
-      }
-      case JniWriter::OdpsType::TIMESTAMP:
-      case JniWriter::OdpsType::TIMESTAMP_NTZ:
-      {
-        int64_t datetime = datum.get_datetime();
-        ObMySQLDateTime mdatetime = datetime;
-        if (ob_is_mysql_datetime(ob_type)
-            && CAST_FAIL(ObTimeConverter::mdatetime_to_datetime(mdatetime, datetime, date_sql_mode))) {
-          LOG_WARN("mdatetime_to_datetime fail", K(ret));
-        }
-        int64_t us = JniWriter::OdpsType::TIMESTAMP == odps_type
-                     ? datum.get_timestamp()
-                     : datetime;
-        int64_t sec = us / 1000000;
-        int32_t ns = (us % 1000000) * 1000;
-
-        if (OB_FAIL(ret)) {
-        } else if (us < ORACLE_DATETIME_MIN_VAL) {
-          ret = OB_DATETIME_FUNCTION_OVERFLOW;
-          LOG_WARN("odps timestamp min value is 0001-01-01 00:00:00", K(ret), K(us));
-        } else {
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::TimestampBuilder, us * 1000);
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::TimestampBuilder, 0);
-        }
-        break;
-      }
-      case JniWriter::OdpsType::DATE:
-      {
-        int32_t date = datum.get_date();
-        ObMySQLDate mdate = date;
-        if (ob_is_mysql_date_tc(ob_type)
-            && CAST_FAIL(ObTimeConverter::mdate_to_date(mdate, date, date_sql_mode))) {
-          LOG_WARN("mdate_to_date fail", K(ret));
-        } else if (date < ODPS_DATE_MIN_VAL) {
-          ret = OB_DATETIME_FUNCTION_OVERFLOW;
-          LOG_WARN("odps date min value is 0001-01-01", K(ret));
-        } else {
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::Date32Builder, date);
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::Date32Builder, 0);
-        }
-        break;
-      }
-      case JniWriter::OdpsType::DATETIME:
-      {
-        int32_t tmp_offset = 0;
-        int64_t datetime = datum.get_datetime();
-        ObMySQLDateTime mdatetime(datetime);
-        if (OB_ISNULL(ctx_.get_my_session()) || OB_ISNULL(ctx_.get_my_session()->get_timezone_info())) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("get unexpected null", K(ret));
-        } else if (OB_FAIL(ctx_.get_my_session()->get_timezone_info()->get_timezone_offset(0, tmp_offset))) {
-          LOG_WARN("failed to get timezone offset", K(ret));
-        } else if (ob_is_mysql_datetime(ob_type)
-                && CAST_FAIL( ObTimeConverter::mdatetime_to_datetime(mdatetime, datetime, date_sql_mode))) {
-          LOG_WARN("mdatetime_to_datetime fail", K(ret));
-        } else if (datetime < ORACLE_DATETIME_MIN_VAL + SEC_TO_USEC(tmp_offset)) {
-          ret = OB_DATETIME_FUNCTION_OVERFLOW;
-          LOG_WARN("odps datetime min value is 0001-01-01 00:00:00", K(ret));
-        } else {
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::Date64Builder, ((datetime - SEC_TO_USEC(tmp_offset)) / 1000));
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::Date64Builder, 0);
-        }
-        break;
-      }
-      default:
-      {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected type", K(ob_type), K(odps_type), K(ret));
-      }
-    }
-  }
-  return ret;
-}
-
-
-int ObSelectIntoOp::set_odps_column_value_oracle_jni(arrow::ArrayBuilder *builder,
-                                                 JniWriter::OdpsType odps_type,
-                                                 const ObDatum &datum,
-                                                 const ObDatumMeta &datum_meta,
-                                                 const ObObjMeta &obj_meta,
-                                                 arrow::Field &arrow_field,
-                                                 uint32_t col_idx)
-{
-  int ret = OB_SUCCESS;
-  ObObjType ob_type = datum_meta.get_type();
-  int64_t int_value = 0;
-  uint32_t res_len = 0;
-  char *buf = NULL;
-  int64_t buf_size = 0;
-  ObArenaAllocator allocator("IntoOdps", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
-  if (OB_ISNULL(builder)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("UNEXPECTED null builder ptr", K(ret));
-  } else if (datum.is_null()) {
-    arrow::Status st = builder->AppendNull();
-    if (!st.ok()) {
-      ret = OB_ODPS_ERROR;
-      LOG_WARN("failed to append null value", K(ret));
-    }
-  } else {
-      switch (odps_type)
-      {
-        case JniWriter::OdpsType::BOOLEAN:
-        {
-          if (OB_FAIL(decimal_or_number_to_int64(datum, datum_meta, int_value))) {
-            LOG_WARN("failed to get int64", K(ret));
-          } else {
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::BooleanBuilder, int_value != 0);
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::BooleanBuilder, false);
-          }
-          break;
-        }
-        case JniWriter::OdpsType::TINYINT:
-        {
-          if (OB_FAIL(decimal_or_number_to_int64(datum, datum_meta, int_value))) {
-            LOG_WARN("failed to get int64", K(ret));
-          } else if (int_value < INT8_MIN || int_value > INT8_MAX) {
-            ret = OB_DATA_OUT_OF_RANGE;
-            LOG_WARN("data out of range", K(odps_type), K(ret));
-          } else {
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int8Builder, int_value);
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int8Builder, 0);
-          }
-          break;
-        }
-        case JniWriter::OdpsType::SMALLINT:
-        {
-          if (OB_FAIL(decimal_or_number_to_int64(datum, datum_meta, int_value))) {
-            LOG_WARN("failed to get int64", K(ret));
-          } else if (int_value < INT16_MIN || int_value > INT16_MAX) {
-            ret = OB_DATA_OUT_OF_RANGE;
-            LOG_WARN("data out of range", K(odps_type), K(ret));
-          } else {
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int16Builder, int_value);
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int16Builder, 0);
-          }
-          break;
-        }
-        case JniWriter::OdpsType::INT:
-        {
-          if (OB_FAIL(decimal_or_number_to_int64(datum, datum_meta, int_value))) {
-            LOG_WARN("failed to get int64", K(ret));
-          } else if (int_value < INT32_MIN || int_value > INT32_MAX) {
-            ret = OB_DATA_OUT_OF_RANGE;
-            LOG_WARN("data out of range", K(odps_type), K(ret));
-          } else {
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int32Builder, int_value);
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int32Builder, 0);
-          }
-          break;
-        }
-        case JniWriter::OdpsType::BIGINT:
-        {
-          if (OB_FAIL(decimal_or_number_to_int64(datum, datum_meta, int_value))) {
-            LOG_WARN("failed to get int64", K(ret));
-          } else {
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int64Builder, int_value);
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Int64Builder, 0);
-          }
-          break;
-        }
-        case JniWriter::OdpsType::FLOAT:
-        {
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::FloatBuilder, datum.get_float());
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::FloatBuilder, 0);
-          break;
-        }
-        case JniWriter::OdpsType::DOUBLE:
-        {
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::DoubleBuilder, datum.get_double());
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::DoubleBuilder, 0);
-          break;
-        }
-        case JniWriter::OdpsType::DECIMAL:
-        {
-          std::string dec;
-          if (OB_FAIL(decimal_to_string(datum, datum_meta, dec, allocator))) {
-            LOG_WARN("failed to get string", K(ret));
-          } else {
-            if (arrow_field.type()->id() == arrow::Type::DECIMAL || arrow_field.type()->id() == arrow::Type::DECIMAL128) {
-              arrow::Result<arrow::Decimal128> res = arrow::Decimal128::FromString(dec);
-              if (!res.ok()) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to convert decimal", K(ret), K(dec.c_str()));
-              } else {
-                arrow::Decimal128Builder *builder_ref = dynamic_cast<arrow::Decimal128Builder*>(builder);
-                arrow::Status st = builder_ref->Append(res.ValueOrDie());
-                if (!st.ok()) {
-                  ret = OB_ODPS_ERROR;
-                  LOG_WARN("failed to append decimal value", K(ret));
-                }
-              }
-              PUT_DATUM_INTO_ARROW_BUILDER(arrow::Decimal128Builder, arrow::Decimal128::FromString("0").ValueOrDie());
-            } else if (arrow_field.type()->id() == arrow::Type::DECIMAL256) {
-              arrow::Result<arrow::Decimal256> res = arrow::Decimal256::FromString(dec);
-              if (!res.ok()) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to convert decimal", K(ret), K(dec.c_str()));
-              } else {
-                arrow::Decimal256Builder *builder_ref = dynamic_cast<arrow::Decimal256Builder*>(builder);
-                arrow::Status st = builder_ref->Append(res.ValueOrDie());
-                if (!st.ok()) {
-                  ret = OB_ODPS_ERROR;
-                  LOG_WARN("failed to append decimal value", K(ret));
-                }
-              }
-              PUT_DATUM_INTO_ARROW_BUILDER(arrow::Decimal256Builder, arrow::Decimal256::FromString("0").ValueOrDie());
-            }
-          }
-          break;
-        }
-        case JniWriter::OdpsType::CHAR:
-        case JniWriter::OdpsType::VARCHAR:
-        case JniWriter::OdpsType::STRING:
-        case JniWriter::OdpsType::BINARY: {
-          ObString lob_str;
-          if (OB_FAIL(ObTextStringHelper::read_real_string_data(
-                  allocator, datum, datum_meta, obj_meta.has_lob_header(), lob_str, &ctx_))) {
-            LOG_WARN("failed to read string", K(ret));
-          } else if (CHARSET_UTF8MB4 == ObCharset::charset_type_by_coll(datum_meta.cs_type_) ||
-                     JniWriter::OdpsType::BINARY == odps_type || CS_TYPE_BINARY == datum_meta.cs_type_) {
-            res_len = static_cast<uint32_t>(lob_str.length());
-            buf = const_cast<char *>(lob_str.ptr());
-          } else if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(lob_str.length() * ObCharset::MAX_MB_LEN)))) {
-            ret = OB_ALLOCATE_MEMORY_FAILED;
-            LOG_WARN("failed to alloc memory", K(ret));
-          } else if (OB_FAIL(ObCharset::charset_convert(datum_meta.cs_type_,
-                         lob_str.ptr(),
-                         lob_str.length(),
-                         CS_TYPE_UTF8MB4_BIN,
-                         buf,
-                         buf_size,
-                         res_len,
-                         false,
-                         false))) {
-            LOG_WARN("failed to convert charset", K(ret));
-          }
-          if (OB_FAIL(ret)) {
-          } else if ((JniWriter::OdpsType::CHAR == odps_type && res_len > 255) ||
-                     (JniWriter::OdpsType::VARCHAR == odps_type && res_len > 65535) ||
-                     (JniWriter::OdpsType::STRING == odps_type && res_len > 8 * 1024 * 1024) ||
-                     (JniWriter::OdpsType::BINARY == odps_type && res_len > 8 * 1024 * 1024)) {
-            ret = OB_DATA_OUT_OF_RANGE;
-            LOG_WARN("string length out of range", K(res_len));
-          } else if (OB_ISNULL(buf) && res_len == 0) {
-            if (JniWriter::OdpsType::BINARY != odps_type) {
-              arrow::StringBuilder *builder_ref = dynamic_cast<arrow::StringBuilder *>(builder);
-              if (OB_ISNULL(builder_ref)) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to append null value", K(ret));
-              } else {
-                arrow::Status st = builder_ref->Append("", 0);
-                if (!st.ok()) {
-                  ret = OB_ODPS_ERROR;
-                  LOG_WARN("failed to append null value", K(ret));
-                }
-              }
-              if (OB_SUCC(ret)) {
-                arrow::Status status = builder_ref->Append("_magic", 6);
-                if (!status.ok()) {
-                  ret = OB_ALLOCATE_MEMORY_FAILED;
-                  LOG_WARN("fail to append null", K(ret), K(status.ToString().c_str()));
-                }
-              }
-            } else {
-              arrow::BinaryBuilder *builder_ref = dynamic_cast<arrow::BinaryBuilder *>(builder);
-              if (OB_ISNULL(builder_ref)) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to append null value", K(ret));
-              } else {
-                arrow::Status st = builder_ref->Append("", 0);
-                if (!st.ok()) {
-                  ret = OB_ODPS_ERROR;
-                  LOG_WARN("failed to append null value", K(ret));
-                }
-              }
-              if (OB_SUCC(ret)) {
-                arrow::Status status = builder_ref->Append("_magic", 6);
-                if (!status.ok()) {
-                  ret = OB_ALLOCATE_MEMORY_FAILED;
-                  LOG_WARN("fail to append null", K(ret), K(status.ToString().c_str()));
-                }
-              }
-            }
-          } else {
-            if (JniWriter::OdpsType::BINARY != odps_type) {
-              arrow::StringBuilder *builder_ref = dynamic_cast<arrow::StringBuilder *>(builder);
-              if (OB_ISNULL(builder_ref)) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to append null value", K(ret));
-              } else {
-                arrow::Status st = builder_ref->Append(buf, res_len);
-                if (!st.ok()) {
-                  ret = OB_ODPS_ERROR;
-                  LOG_WARN("failed to append null value", K(ret));
-                }
-              }
-
-              if (OB_SUCC(ret)) {
-                arrow::Status status = builder_ref->Append("_magic", 6);
-                if (!status.ok()) {
-                  ret = OB_ALLOCATE_MEMORY_FAILED;
-                  LOG_WARN("fail to append null", K(ret), K(status.ToString().c_str()));
-                }
-              }
-            } else {
-              arrow::BinaryBuilder *builder_ref = dynamic_cast<arrow::BinaryBuilder *>(builder);
-              if (OB_ISNULL(builder_ref)) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to append null value", K(ret));
-              } else {
-                arrow::Status st = builder_ref->Append(buf, res_len);
-                if (!st.ok()) {
-                  ret = OB_ODPS_ERROR;
-                  LOG_WARN("failed to append null value", K(ret));
-                }
-              }
-
-              if (OB_SUCC(ret)) {
-                arrow::Status status = builder_ref->Append("_magic", 6);
-                if (!status.ok()) {
-                  ret = OB_ALLOCATE_MEMORY_FAILED;
-                  LOG_WARN("fail to append null", K(ret), K(status.ToString().c_str()));
-                }
-              }
-            }
-          }
-          break;
-        }
-        case JniWriter::OdpsType::JSON: {
-          ObString json_str;
-          ObIJsonBase *j_base = NULL;
-          ObJsonBuffer jbuf(&allocator);
-          ObJsonInType in_type = ObJsonInType::JSON_BIN;
-          uint32_t parse_flag = lib::is_mysql_mode() ? 0 : ObJsonParser::JSN_RELAXED_FLAG;
-          if (OB_FAIL(ObTextStringHelper::read_real_string_data(
-                  allocator, datum, datum_meta, obj_meta.has_lob_header(), json_str, &ctx_))) {
-            LOG_WARN("failed to read string", K(ret));
-          } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator,
-                         json_str,
-                         in_type,
-                         in_type,
-                         j_base,
-                         parse_flag,
-                         ObJsonExprHelper::get_json_max_depth_config()))) {
-            COMMON_LOG(WARN, "fail to get json base", K(ret), K(in_type));
-          } else if (OB_FAIL(j_base->print(jbuf, false))) {  // json binary to string
-            COMMON_LOG(WARN, "fail to convert json to string", K(ret));
-          } else if (jbuf.length() > UINT32_MAX) {
-            ret = OB_DATA_OUT_OF_RANGE;
-            LOG_WARN("data out of range", K(odps_type), K(jbuf.length()), K(ret));
-          } else {
-            LOG_DEBUG("debug select into json", K(datum_meta.cs_type_), K(ObString(jbuf.length(), jbuf.ptr())));
-            arrow::StringBuilder *builder_ref = dynamic_cast<arrow::StringBuilder *>(builder);
-            if (OB_ISNULL(builder_ref)) {
-              ret = OB_ODPS_ERROR;
-              LOG_WARN("failed to append null value", K(ret));
-            } else {
-              arrow::Status st = builder_ref->Append(jbuf.ptr(), jbuf.length());
-              if (!st.ok()) {
-                ret = OB_ODPS_ERROR;
-                LOG_WARN("failed to append null value", K(ret));
-              }
-            }
-
-            if (OB_SUCC(ret)) {
-              arrow::Status status = builder_ref->Append("{}", 6);
-              if (!status.ok()) {
-                ret = OB_ALLOCATE_MEMORY_FAILED;
-                LOG_WARN("fail to append null", K(ret), K(status.ToString().c_str()));
-              }
-            }
-          }
-          break;
-        }
-        case JniWriter::OdpsType::TIMESTAMP:
-        case JniWriter::OdpsType::TIMESTAMP_NTZ:
-        {
-          ObOTimestampData timestamp = datum.get_otimestamp_tiny();
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::TimestampBuilder, timestamp.time_us_ * 1000 + timestamp.time_ctx_.tail_nsec_);
-          PUT_DATUM_INTO_ARROW_BUILDER(arrow::TimestampBuilder, 0);
-          break;
-        }
-        case JniWriter::OdpsType::DATE:
-        {
-          int64_t day = datum.get_datetime() / 1000000 / 3600 / 24;
-          if (datum.get_date() < ODPS_DATE_MIN_VAL) {
-            ret = OB_DATETIME_FUNCTION_OVERFLOW;
-            LOG_WARN("odps date min value is 0001-01-01", K(ret));
-          } else {
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Date32Builder, day);
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Date32Builder, 0);
-          }
-          break;
-        }
-        case JniWriter::OdpsType::DATETIME:
-        {
-          ObOTimestampData timestamp = datum.get_otimestamp_tiny();
-          int32_t tmp_offset = 0;
-          if (OB_ISNULL(ctx_.get_my_session()) || OB_ISNULL(ctx_.get_my_session()->get_timezone_info())) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("get unexpected null", K(ret));
-          } else if (OB_FAIL(ctx_.get_my_session()->get_timezone_info()->get_timezone_offset(0, tmp_offset))) {
-            LOG_WARN("failed to get timezone offset", K(ret));
-          } else {
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Date64Builder, ((datum.get_datetime() - SEC_TO_USEC(tmp_offset)) / 1000));
-            PUT_DATUM_INTO_ARROW_BUILDER(arrow::Date64Builder, 0);
-          }
-          break;
-        }
-        default:
-        {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected type", K(ob_type), K(odps_type), K(ret));
-        }
-      }
-    }
-
-  return ret;
-}
-
-int ObSelectIntoOp::into_odps_jni()
-{
-  int ret = OB_SUCCESS;
-  ObSQLMode sql_mode = eval_ctx_.exec_ctx_.get_my_session()->get_sql_mode();
-  ObDateSqlMode date_sql_mode;
-  date_sql_mode.init(sql_mode);
-  bool is_strict_mode = common::is_strict_mode(sql_mode);
-  const ObIArray<ObExpr*> &select_exprs = MY_SPEC.select_exprs_;
-  const ObIArray<JniWriter::OdpsType> &col_type_from_odps = uploader_.writer_ptr->get_schema_from_odps();
-  const arrow::FieldVector &type_vec = arrow_schema_->fields();
-  ObDatum *datum = NULL;
-  arrow::Result<std::shared_ptr<arrow::RecordBatchBuilder> > rbatchRes =
-        arrow::RecordBatchBuilder::Make(arrow_schema_, &arrow_alloc_);
-  if (!rbatchRes.ok()) {
-    ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-    LOG_WARN("fail to make empty record batch", K(ret));
-  } else if (OB_FAIL(uploader_.writer_ptr->get_current_block_addr())) {
-    LOG_WARN("failed to get bloock addr");
-  } else {
-    std::shared_ptr<arrow::RecordBatchBuilder> rbatch = rbatchRes.ValueOrDie();
-    for (int64_t col_idx = 0; OB_SUCC(ret) && col_idx < select_exprs.count(); ++col_idx) {
-      ObDatumMeta &meta = select_exprs.at(col_idx)->datum_meta_;
-      ObObjMeta &obj_meta = select_exprs.at(col_idx)->obj_meta_;
-      arrow::ArrayBuilder *array_builder = rbatch->GetField(col_idx);
-      JniWriter::OdpsType odps_type = col_type_from_odps.at(col_idx);
-
-      if (OB_ISNULL(select_exprs.at(col_idx)) || OB_ISNULL(array_builder) || OB_ISNULL(type_vec.at(col_idx))) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("select expr is unexpected null", K(ret));
-      } else if (OB_FAIL(select_exprs.at(col_idx)->eval(eval_ctx_, datum))) {
-        LOG_WARN("eval expr failed", K(ret));
-      } else if (OB_ISNULL(datum)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("datum is unexpected null", K(ret));
-      } else if (lib::is_mysql_mode() && OB_FAIL(set_odps_column_value_mysql_jni(array_builder,
-                                             odps_type,
-                                             *datum,
-                                             select_exprs.at(col_idx)->datum_meta_,
-                                             select_exprs.at(col_idx)->obj_meta_,
-                                             *type_vec.at(col_idx),
-                                             col_idx, is_strict_mode, date_sql_mode))) {
-        LOG_WARN("failed to set odps column value", K(ret));
-      } else if (lib::is_oracle_mode()
-                   && OB_FAIL(set_odps_column_value_oracle_jni(array_builder, odps_type, *datum,
-                                                           select_exprs.at(col_idx)->datum_meta_,
-                                                           select_exprs.at(col_idx)->obj_meta_,
-                                                           *type_vec.at(col_idx),
-                                                           col_idx))) {
-        LOG_WARN("failed to set odps column value", K(ret));
-      }
-    }
-
-    arrow::Result<std::shared_ptr<arrow::RecordBatch>> res;
-    if (OB_FAIL(ret)) {
-      LOG_WARN("failed to build the batch", K(ret));
-    } else if (FALSE_IT(res = rbatch->Flush())) {
-      // do nothing
-    } else if (!res.ok()) {
-      ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-      std::ostringstream stream;
-      stream << res.status();
-      LOG_WARN("fail to export array", K(ret), K(stream.str().c_str()));
-    } else {
-      struct ArrowSchema *c_schema = reinterpret_cast<struct ArrowSchema *>(uploader_.writer_ptr->get_schema_ptr());
-      struct ArrowArray *c_array = reinterpret_cast<struct ArrowArray *>(uploader_.writer_ptr->get_array_ptr());
-      std::shared_ptr<arrow::RecordBatch> record_batch_ptr = res.ValueOrDie();
-      if (OB_SUCC(ret)) {
-        if (OB_ISNULL(c_array) || OB_ISNULL(c_schema)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("array ptr is unexpected null", K(ret));
-        } else {
-          arrow::Status c_array_status = arrow::ExportRecordBatch(*record_batch_ptr, c_array, c_schema);
-          if (!c_array_status.ok()) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("fail to export scheam", K(ret));
-          }
-        }
-      }
-      if (OB_FAIL(ret)) {
-        // do nothing
-      } else if (OB_FAIL(uploader_.writer_ptr->do_write_next_brs(0, 1))) {
-        LOG_WARN("failed to write data");
-      } else {
-        need_commit_ = true;
-      }
-    }
-  }
-  return ret;
-}
 
 using DaysChecker = std::function<bool(int32_t)>;
 template <typename ArrowType, typename ObType>
 int vectorize_fill_int_mysql(arrow::ArrayBuilder *builder, const ObBatchRows &brs,
                              ObIVector &expr_vector, ObDatumMeta &datum_meta, int &act_cnt,
-                             const bool is_strict_mode, const ObDateSqlMode date_sql_mode,
-                             std::shared_ptr<std::function<bool(ObType)>> filter = nullptr)
+                             const bool is_strict_mode, const ObDateSqlMode date_sql_mode)
 {
   int ret = OB_SUCCESS;
   act_cnt = 0;
@@ -3013,42 +2653,12 @@ int vectorize_fill_int_mysql(arrow::ArrayBuilder *builder, const ObBatchRows &br
           }
         } else {
           ObType value = arrow_get<ObType>(expr_vector, i);
-          if (ob_is_mysql_date_tc(datum_meta.get_type())) {
-            ObMySQLDate md_value(value);
-            int32_t d_value = 0;
-            if (CAST_FAIL(ObTimeConverter::mdate_to_date(md_value, d_value, date_sql_mode))) {
-              LOG_WARN("mdate_to_date fail", K(ret));
-            } else {
-              value = d_value;
-            }
-          }
-          if (OB_FAIL(ret)) {
-          } else if (OB_LIKELY(filter == nullptr)) {
-            arrow::Status status = builder_ref->Append(value);
-            if (OB_UNLIKELY(!status.ok())) {
+          arrow::Status status = builder_ref->Append(value);
+          if (OB_UNLIKELY(!status.ok())) {
               ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
               LOG_WARN("fail to append null", K(ret));
-            }
-          } else {
-            if ((*filter)(value)) {
-              arrow::Status status = builder_ref->Append(value);
-              if (OB_UNLIKELY(!status.ok())) {
-                ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-                LOG_WARN("fail to append null", K(ret));
-              }
-            } else {
-              ret = OB_DATA_OUT_OF_RANGE;
-              LOG_WARN("data out of range", K(ret));
-            }
           }
         }
-      }
-    }
-    if (OB_SUCC(ret)) {
-      arrow::Status status = builder_ref->Append(0);
-      if (!status.ok()) {
-        ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-        LOG_WARN("fail to append null", K(ret));
       }
     }
   }
@@ -3113,13 +2723,6 @@ int vectorize_fill_int_oracle(arrow::ArrayBuilder *builder, const ObBatchRows &b
         }
       }
     }
-    if (OB_SUCC(ret)) {
-      arrow::Status status = builder_ref->Append(0);
-      if (!status.ok()) {
-        ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-        LOG_WARN("fail to append null", K(ret));
-      }
-    }
   }
   return ret;
 }
@@ -3150,13 +2753,6 @@ int vectorize_fill_bool_mysql(arrow::ArrayBuilder *builder, const ObBatchRows &b
             LOG_WARN("fail to append null", K(ret));
           }
         }
-      }
-    }
-    if (OB_SUCC(ret)) {
-      arrow::Status status = builder_ref->Append(false);
-      if (!status.ok()) {
-        ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-        LOG_WARN("fail to append null", K(ret));
       }
     }
   }
@@ -3217,13 +2813,6 @@ int vectorize_fill_bool_oracle(arrow::ArrayBuilder *builder, const ObBatchRows &
         }
       }
     }
-    if (OB_SUCC(ret)) {
-      arrow::Status status = builder_ref->Append(false);
-      if (!status.ok()) {
-        ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-        LOG_WARN("fail to append null", K(ret));
-      }
-    }
   }
   return ret;
 }
@@ -3254,13 +2843,6 @@ int vectorize_fill_double(arrow::ArrayBuilder *builder, const ObBatchRows &brs, 
             LOG_WARN("fail to append null", K(ret));
           }
         }
-      }
-    }
-    if (OB_SUCC(ret)) {
-      arrow::Status status = builder_ref->Append(0.0);
-      if (!status.ok()) {
-        ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-        LOG_WARN("fail to append null", K(ret));
       }
     }
   }
@@ -3316,20 +2898,13 @@ int vectorize_fill_decimal(arrow::ArrayBuilder *builder, const ObBatchRows &brs,
         }
       }
     }
-    if (OB_SUCC(ret)) {
-      arrow::Status status = builder_ref->Append(ArrowBuilderType::ValueType::FromString("0").ValueOrDie());
-      if (!status.ok()) {
-        ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-        LOG_WARN("fail to append null", K(ret));
-      }
-    }
   }
   return ret;
 }
 
 template <typename ArrowBuilderType>
 int vectorize_fill_string(arrow::ArrayBuilder *builder, const ObBatchRows &brs, ObIVector &expr_vector, ObDatumMeta &meta,
-    const ObObjMeta &obj_meta, ObIAllocator &alloc, JniWriter::OdpsType odps_type, int& act_cnt)
+    const ObObjMeta &obj_meta, ObIAllocator &alloc, ObOdpsJniConnector::OdpsType odps_type, int& act_cnt)
 {
   int ret = OB_SUCCESS;
   act_cnt = 0;
@@ -3379,10 +2954,10 @@ int vectorize_fill_string(arrow::ArrayBuilder *builder, const ObBatchRows &brs, 
           }
           if (OB_FAIL(ret)) {
             // do nothing
-          } else if ((JniWriter::OdpsType::CHAR == odps_type && res_len > 255) ||
-                     (JniWriter::OdpsType::VARCHAR == odps_type && res_len > 65535) ||
-                     (JniWriter::OdpsType::STRING == odps_type && res_len > 8 * 1024 * 1024) ||
-                     (JniWriter::OdpsType::BINARY == odps_type && res_len > 8 * 1024 * 1024)) {
+          } else if ((ObOdpsJniConnector::OdpsType::CHAR == odps_type && res_len > 255) ||
+                     (ObOdpsJniConnector::OdpsType::VARCHAR == odps_type && res_len > 65535) ||
+                     (ObOdpsJniConnector::OdpsType::STRING == odps_type && res_len > 8 * 1024 * 1024) ||
+                     (ObOdpsJniConnector::OdpsType::BINARY == odps_type && res_len > 8 * 1024 * 1024)) {
             ret = OB_DATA_OUT_OF_RANGE;
             LOG_WARN("string length out of range", K(res_len));
           } else if (OB_ISNULL(buf) && res_len == 0) {
@@ -3401,28 +2976,19 @@ int vectorize_fill_string(arrow::ArrayBuilder *builder, const ObBatchRows &brs, 
         }
       }
     }
-
-    if (OB_SUCC(ret)) {
-      arrow::Status status = builder_ref->Append("_magic", 6);
-      if (!status.ok()) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("fail to append null", K(ret), K(status.ToString().c_str()));
-      }
-    }
   }
   return ret;
 }
 
-bool ObSelectIntoOp::day_number_checker(int32_t days) { return days > ODPS_DATE_MIN_VAL; }
 
-int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::OdpsType odps_type,
+int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, ObOdpsJniConnector::OdpsType odps_type,
     arrow::Field &arrow_field, ObDatumMeta &meta, ObObjMeta &obj_meta, ObIVector &expr_vector,
     arrow::ArrayBuilder *builder, const ObBatchRows &brs, int &act_cnt, ObIAllocator &alloc,
     const bool is_strict_mode, const ObDateSqlMode date_sql_mode)
 {
   int ret = OB_SUCCESS;
   switch (odps_type) {
-    case JniWriter::OdpsType::BIGINT:
+    case ObOdpsJniConnector::OdpsType::BIGINT:
       if (!is_oracle_mode()) {
         if (OB_FAIL((vectorize_fill_int_mysql<arrow::Int64Type, int64_t>(builder, brs, expr_vector, meta, act_cnt, is_strict_mode, date_sql_mode)))) {
           LOG_WARN("fail to fill int64", K(ret));
@@ -3433,7 +2999,7 @@ int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::Odps
         }
       }
       break;
-    case JniWriter::OdpsType::TINYINT:
+    case ObOdpsJniConnector::OdpsType::TINYINT:
       if (!is_oracle_mode()) {
         if (OB_FAIL((vectorize_fill_int_mysql<arrow::Int8Type, int8_t>(builder, brs, expr_vector, meta, act_cnt, is_strict_mode, date_sql_mode)))) {
           LOG_WARN("fail to fill int64", K(ret));
@@ -3445,7 +3011,7 @@ int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::Odps
       }
 
       break;
-    case JniWriter::OdpsType::SMALLINT:
+    case ObOdpsJniConnector::OdpsType::SMALLINT:
       if (!is_oracle_mode()) {
         if (OB_FAIL((vectorize_fill_int_mysql<arrow::Int16Type, int16_t>(builder, brs, expr_vector, meta, act_cnt, is_strict_mode, date_sql_mode)))) {
           LOG_WARN("fail to fill int64", K(ret));
@@ -3457,7 +3023,7 @@ int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::Odps
       }
 
       break;
-    case JniWriter::OdpsType::INT:
+    case ObOdpsJniConnector::OdpsType::INT:
       if (!is_oracle_mode()) {
         if (OB_FAIL((vectorize_fill_int_mysql<arrow::Int32Type, int32_t>(builder, brs, expr_vector, meta, act_cnt, is_strict_mode, date_sql_mode)))) {
           LOG_WARN("fail to fill int64", K(ret));
@@ -3468,17 +3034,17 @@ int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::Odps
         }
       }
       break;
-    case JniWriter::OdpsType::DOUBLE:
+    case ObOdpsJniConnector::OdpsType::DOUBLE:
       if (OB_FAIL((vectorize_fill_double<arrow::DoubleType, double>(builder, brs, expr_vector, act_cnt)))) {
         LOG_WARN("fail to fill double", K(ret));
       }
       break;
-    case JniWriter::OdpsType::FLOAT:
+    case ObOdpsJniConnector::OdpsType::FLOAT:
       if (OB_FAIL((vectorize_fill_double<arrow::FloatType, float>(builder, brs, expr_vector, act_cnt)))) {
         LOG_WARN("fail to fill float", K(ret));
       }
       break;
-    case JniWriter::OdpsType::BOOLEAN:
+    case ObOdpsJniConnector::OdpsType::BOOLEAN:
       if (!is_oracle_mode()) {
         if (obj_meta.get_type() == ObTinyIntType) {
           if (OB_FAIL((vectorize_fill_bool_mysql<int8_t>(builder, brs, expr_vector, act_cnt, meta)))) {
@@ -3503,15 +3069,19 @@ int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::Odps
         }
       }
       break;
-    case JniWriter::OdpsType::VARCHAR:
-    case JniWriter::OdpsType::CHAR:
-    case JniWriter::OdpsType::STRING:
-      vectorize_fill_string<arrow::StringBuilder>(builder, brs, expr_vector, meta, obj_meta, alloc, odps_type, act_cnt);
+    case ObOdpsJniConnector::OdpsType::VARCHAR:
+    case ObOdpsJniConnector::OdpsType::CHAR:
+    case ObOdpsJniConnector::OdpsType::STRING:
+      if (OB_FAIL(vectorize_fill_string<arrow::StringBuilder>(builder, brs, expr_vector, meta, obj_meta, alloc, odps_type, act_cnt))) {
+        LOG_WARN("failed to vectorize fill string");
+      }
       break;
-    case JniWriter::OdpsType::BINARY:
-      vectorize_fill_string<arrow::BinaryBuilder>(builder, brs, expr_vector, meta, obj_meta, alloc, odps_type, act_cnt);
+    case ObOdpsJniConnector::OdpsType::BINARY:
+      if (OB_FAIL(vectorize_fill_string<arrow::BinaryBuilder>(builder, brs, expr_vector, meta, obj_meta, alloc, odps_type, act_cnt))) {
+        LOG_WARN("failed to vectorize fill string");
+      }
       break;
-    case JniWriter::OdpsType::DECIMAL:
+    case ObOdpsJniConnector::OdpsType::DECIMAL:
       if (arrow_field.type()->id() == arrow::Type::DECIMAL || arrow_field.type()->id() == arrow::Type::DECIMAL128) {
         if (OB_FAIL(vectorize_fill_decimal<arrow::Decimal128Builder>(builder, brs, expr_vector, act_cnt, meta))) {
           LOG_WARN("fail to vectorize decimal", K(ret));
@@ -3522,15 +3092,9 @@ int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::Odps
         }
       }
       break;
-    case JniWriter::OdpsType::DATE:  // arrowType = new ArrowType.Date(DateUnit.DAY);
+    case ObOdpsJniConnector::OdpsType::DATE:  // arrowType = new ArrowType.Date(DateUnit.DAY);
     {
-      std::shared_ptr<DaysChecker> filter = std::make_shared<DaysChecker>(day_number_checker);
       if (!is_oracle_mode()) {
-        if (OB_FAIL((vectorize_fill_int_mysql<arrow::Date32Type, int32_t>(builder, brs, expr_vector, meta, act_cnt, is_strict_mode, date_sql_mode, filter)))) {
-          LOG_WARN("fail to vectorize date", K(ret));
-        }
-      } else {
-        act_cnt = 0;
         arrow::NumericBuilder<arrow::Date32Type> *builder_ref =
             dynamic_cast<arrow::NumericBuilder<arrow::Date32Type> *>(builder);
         if (OB_ISNULL(builder_ref)) {
@@ -3540,7 +3104,38 @@ int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::Odps
           for (int64_t i = 0; OB_SUCC(ret) && i < brs.size_; ++i) {
             if (brs.skip_->contain(i)) {
             } else {
-              ++act_cnt;
+              if (expr_vector.is_null(i)) {
+                arrow::Status status = builder_ref->AppendNull();
+                if (!status.ok()) {
+                  ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+                  LOG_WARN("fail to append null", K(ret));
+                }
+              } else {
+                int32_t days = expr_vector.get_date(i);
+                if (days >= ODPS_DATE_MIN_VAL) {
+                  arrow::Status status = builder_ref->Append(days);
+                  if (OB_UNLIKELY(!status.ok())) {
+                    ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+                    LOG_WARN("fail to append null", K(ret));
+                  }
+                } else {
+                  ret = OB_DATETIME_FUNCTION_OVERFLOW;
+                  LOG_WARN("data out of range", K(ret));
+                }
+              }
+            }
+          }
+        }
+      } else {
+        arrow::NumericBuilder<arrow::Date32Type> *builder_ref =
+            dynamic_cast<arrow::NumericBuilder<arrow::Date32Type> *>(builder);
+        if (OB_ISNULL(builder_ref)) {
+          ret = OB_ERR_TYPE_MISMATCH;
+          LOG_WARN("builder is unexpected null", K(ret));
+        } else {
+          for (int64_t i = 0; OB_SUCC(ret) && i < brs.size_; ++i) {
+            if (brs.skip_->contain(i)) {
+            } else {
               if (expr_vector.is_null(i)) {
                 arrow::Status status = builder_ref->AppendNull();
                 if (!status.ok()) {
@@ -3549,32 +3144,24 @@ int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::Odps
                 }
               } else {
                 int32_t days = expr_vector.get_datetime(i) / 1000000 / 3600 / 24;
-                if ((*filter)(arrow_get<int32_t>(expr_vector, days))) {
+                if (days >= ODPS_DATE_MIN_VAL) {
                   arrow::Status status = builder_ref->Append(days);
                   if (OB_UNLIKELY(!status.ok())) {
                     ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
                     LOG_WARN("fail to append null", K(ret));
                   }
                 } else {
-                  ret = OB_DATA_OUT_OF_RANGE;
+                  ret = OB_DATETIME_FUNCTION_OVERFLOW;
                   LOG_WARN("data out of range", K(ret));
                 }
               }
-            }
-          }
-
-          if (OB_SUCC(ret)) {
-            arrow::Status status = builder_ref->Append(0);
-            if (!status.ok()) {
-              ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-              LOG_WARN("fail to finish", K(ret));
             }
           }
         }
       }
       break;
     }
-    case JniWriter::OdpsType::DATETIME:  // arrowType = new ArrowType.Date(DateUnit.MILLISECOND);
+    case ObOdpsJniConnector::OdpsType::DATETIME:  // arrowType = new ArrowType.Date(DateUnit.MILLISECOND);
     {
       arrow::NumericBuilder<arrow::Date64Type> *builder_ref =
           dynamic_cast<arrow::NumericBuilder<arrow::Date64Type> *>(builder);
@@ -3582,65 +3169,55 @@ int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::Odps
         ret = OB_ERR_TYPE_MISMATCH;
         LOG_WARN("builder is unexpected null", K(ret));
       } else {
+        int32_t tmp_offset = 0;
+        if (OB_ISNULL(ctx_.get_my_session()) || OB_ISNULL(ctx_.get_my_session()->get_timezone_info())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected null", K(ret));
+        } else if (OB_FAIL(ctx_.get_my_session()->get_timezone_info()->get_timezone_offset(0, tmp_offset))) {
+          LOG_WARN("failed to get timezone offset", K(ret));
+        }
         for (int64_t i = 0; OB_SUCC(ret) && i < brs.size_; ++i) {
           if (brs.skip_->contain(i)) {
-          } else {
-            if (expr_vector.is_null(i)) {
+          } else if (expr_vector.is_null(i)) {
               arrow::Status status = builder_ref->AppendNull();
               if (!status.ok()) {
                 ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
                 LOG_WARN("fail to append null", K(ret));
               }
-            } else {
-              int32_t tmp_offset = 0;
-              if (OB_ISNULL(ctx_.get_my_session()) || OB_ISNULL(ctx_.get_my_session()->get_timezone_info())) {
-                ret = OB_ERR_UNEXPECTED;
-                LOG_WARN("get unexpected null", K(ret));
-              } else if (OB_FAIL(ctx_.get_my_session()->get_timezone_info()->get_timezone_offset(0, tmp_offset))) {
-                LOG_WARN("failed to get timezone offset", K(ret));
+          } else {
+
+            if (!is_oracle_mode()) {
+              int64_t datetime = expr_vector.get_datetime(i);
+              ObMySQLDateTime mdatetime = datetime;
+              if (ob_is_mysql_datetime_tc(obj_meta.get_type())
+                  && CAST_FAIL(ObTimeConverter::mdatetime_to_datetime(mdatetime, datetime,
+                                                                      date_sql_mode))) {
+                LOG_WARN("mdatetime_to_datetime fail", K(ret));
+              } else if (datetime < ORACLE_DATETIME_MIN_VAL + SEC_TO_USEC(tmp_offset)) {
+                ret = OB_DATETIME_FUNCTION_OVERFLOW;
+                LOG_WARN("odps datetime min value is 0001-01-01 00:00:00", K(ret));
               } else {
-                if (!is_oracle_mode()) {
-                  int32_t tmp_offset = 0;
-                  int64_t datetime = expr_vector.get_datetime(i);
-                  ObMySQLDateTime mdatetime = datetime;
-                  if (ob_is_mysql_datetime_tc(obj_meta.get_type())
-                      && CAST_FAIL(ObTimeConverter::mdatetime_to_datetime(mdatetime, datetime,
-                                                                          date_sql_mode))) {
-                    LOG_WARN("mdatetime_to_datetime fail", K(ret));
-                  } else if (datetime < ORACLE_DATETIME_MIN_VAL + SEC_TO_USEC(tmp_offset)) {
-                    ret = OB_DATETIME_FUNCTION_OVERFLOW;
-                    LOG_WARN("odps datetime min value is 0001-01-01 00:00:00", K(ret));
-                  } else {
-                    arrow::Status status = builder_ref->Append((datetime - SEC_TO_USEC(tmp_offset)) / 1000);
-                    if (OB_UNLIKELY(!status.ok())) {
-                      ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-                      LOG_WARN("fail to append null", K(ret));
-                    }
-                  }
-                } else {
-                  ObOTimestampTinyData timestamp = expr_vector.get_otimestamp_tiny(i);
-                  arrow::Status status = builder_ref->Append((timestamp.time_us_ - SEC_TO_USEC(tmp_offset)) / 1000);
-                  if (OB_UNLIKELY(!status.ok())) {
-                    ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-                    LOG_WARN("fail to append null", K(ret));
-                  }
+                arrow::Status status = builder_ref->Append((datetime - SEC_TO_USEC(tmp_offset)) / 1000);
+                if (OB_UNLIKELY(!status.ok())) {
+                  ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+                  LOG_WARN("fail to append null", K(ret));
                 }
               }
+            } else {
+              ObOTimestampTinyData timestamp = expr_vector.get_otimestamp_tiny(i);
+              arrow::Status status = builder_ref->Append((timestamp.time_us_ - SEC_TO_USEC(tmp_offset)) / 1000);
+              if (OB_UNLIKELY(!status.ok())) {
+                ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+                LOG_WARN("fail to append null", K(ret));
+              }
             }
-          }
-        }
-        if (OB_SUCC(ret)) {
-          arrow::Status status = builder_ref->Append(0);
-          if (!status.ok()) {
-            ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-            LOG_WARN("fail to finish", K(ret));
           }
         }
       }
       break;
     }
-    case JniWriter::OdpsType::TIMESTAMP:
-    case JniWriter::OdpsType::TIMESTAMP_NTZ:
+    case ObOdpsJniConnector::OdpsType::TIMESTAMP:
+    case ObOdpsJniConnector::OdpsType::TIMESTAMP_NTZ:
       // arrowType = new ArrowType.Timestamp(TimeUnit.NANOSECOND, null);
       // arrowType = new ArrowType.Timestamp(TimeUnit.NANOSECOND, null);
     {
@@ -3653,60 +3230,49 @@ int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::Odps
       } else {
         for (int64_t i = 0; OB_SUCC(ret) && i < brs.size_; ++i) {
           if (brs.skip_->contain(i)) {
-          } else {
-            if (expr_vector.is_null(i)) {
-              arrow::Status status = builder_ref->AppendNull();
+          } else if (expr_vector.is_null(i)) {
+            arrow::Status status = builder_ref->AppendNull();
+            if (!status.ok()) {
+              ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+              LOG_WARN("fail to append null", K(ret));
+            }
+          } else if (!is_oracle_mode()) {
+            int64_t datetime = expr_vector.get_datetime(i);
+            ObMySQLDateTime mdatetime = datetime;
+            if (ob_is_mysql_datetime_tc(obj_meta.get_type())
+                && CAST_FAIL(
+                  ObTimeConverter::mdatetime_to_datetime(mdatetime, datetime, date_sql_mode))) {
+              LOG_WARN("mdatetime_to_datetime fail", K(ret));
+            }
+            int64_t us = ObOdpsJniWriter::OdpsType::TIMESTAMP == odps_type
+                   ? expr_vector.get_timestamp(i)
+                   : datetime;
+            int64_t sec = us / 1000000;
+            int32_t ns = (us % 1000000) * 1000;
+            if (OB_FAIL(ret)) {
+            } else if (us < ORACLE_DATETIME_MIN_VAL) {
+              ret = OB_DATETIME_FUNCTION_OVERFLOW;
+              LOG_WARN("odps timestamp min value is 0001-01-01 00:00:00", K(ret), K(us));
+            } else {
+              arrow::Status status = builder_ref->Append(us * 1000);
               if (!status.ok()) {
                 ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
                 LOG_WARN("fail to append null", K(ret));
               }
-            } else {
-              if (!is_oracle_mode()) {
-                int64_t datetime = expr_vector.get_datetime(i);
-                ObMySQLDateTime mdatetime = datetime;
-                if (ob_is_mysql_datetime_tc(obj_meta.get_type())
-                    && CAST_FAIL(
-                      ObTimeConverter::mdatetime_to_datetime(mdatetime, datetime, date_sql_mode))) {
-                  LOG_WARN("mdatetime_to_datetime fail", K(ret));
-                }
-                int64_t us = JniWriter::OdpsType::TIMESTAMP == odps_type
-                       ? expr_vector.get_timestamp(i)
-                       : datetime;
-                int64_t sec = us / 1000000;
-                int32_t ns = (us % 1000000) * 1000;
-                if (OB_FAIL(ret)) {
-                } else if (us < ORACLE_DATETIME_MIN_VAL) {
-                  ret = OB_DATETIME_FUNCTION_OVERFLOW;
-                  LOG_WARN("odps timestamp min value is 0001-01-01 00:00:00", K(ret), K(us));
-                } else {
-                  arrow::Status status = builder_ref->Append(us * 1000);
-                  if (!status.ok()) {
-                    ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-                    LOG_WARN("fail to append null", K(ret));
-                  }
-                }
-              } else {
-                ObOTimestampData&& timestamp = const_cast<ObOTimestampTinyData*>(&expr_vector.get_otimestamp_tiny(i))->to_timestamp_data();
-                arrow::Status status = builder_ref->Append(timestamp.time_us_ * 1000 + timestamp.time_ctx_.tail_nsec_);
-                if (!status.ok()) {
-                  ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-                  LOG_WARN("fail to append null", K(ret));
-                }
-              }
             }
-          }
-        }
-        if (OB_SUCC(ret)) {
-          arrow::Status status = builder_ref->Append(0);
-          if (!status.ok()) {
-            ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-            LOG_WARN("fail to append null", K(ret));
+          } else {
+            ObOTimestampData&& timestamp = const_cast<ObOTimestampTinyData*>(&expr_vector.get_otimestamp_tiny(i))->to_timestamp_data();
+            arrow::Status status = builder_ref->Append(timestamp.time_us_ * 1000 + timestamp.time_ctx_.tail_nsec_);
+            if (!status.ok()) {
+              ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+              LOG_WARN("fail to append null", K(ret));
+            }
           }
         }
       }
       break;
     }
-    case JniWriter::OdpsType::JSON:
+    case ObOdpsJniConnector::OdpsType::JSON:
     {
       arrow::StringBuilder *builder_ref =
           dynamic_cast<arrow::StringBuilder *>(builder);
@@ -3717,64 +3283,382 @@ int ObSelectIntoOp::into_odps_jni_batch_one_col(int64_t col_idx, JniWriter::Odps
       } else {
         for (int64_t i = 0; OB_SUCC(ret) && i < brs.size_; ++i) {
           if (brs.skip_->contain(i)) {
+          } else if (expr_vector.is_null(i)) {
+            arrow::Status status = builder_ref->AppendNull();
+            if (!status.ok()) {
+              ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+              LOG_WARN("fail to append null", K(ret));
+            }
           } else {
-            if (expr_vector.is_null(i)) {
-              arrow::Status status = builder_ref->AppendNull();
+            ObString json_str;
+            ObIJsonBase *j_base = NULL;
+            ObJsonBuffer jbuf(&alloc);
+            ObJsonInType in_type = ObJsonInType::JSON_BIN;
+            uint32_t parse_flag = lib::is_mysql_mode() ? 0 : ObJsonParser::JSN_RELAXED_FLAG;
+            if (OB_FAIL(ObTextStringHelper::read_real_string_data(alloc,
+                                                                  &expr_vector,
+                                                                  meta,
+                                                                  obj_meta.has_lob_header(),
+                                                                  json_str,
+                                                                  i))) {
+              LOG_WARN("failed to read string", K(ret));
+            } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(&alloc, json_str, in_type,
+                                                                in_type, j_base, parse_flag,
+                                                                ObJsonExprHelper::get_json_max_depth_config()))) {
+              COMMON_LOG(WARN, "fail to get json base", K(ret), K(in_type));
+            } else if (OB_FAIL(j_base->print(jbuf, false))) { // json binary to string
+              COMMON_LOG(WARN, "fail to convert json to string", K(ret));
+            } else if (jbuf.length() > UINT32_MAX) {
+              ret = OB_DATA_OUT_OF_RANGE;
+              LOG_WARN("data out of range", K(odps_type), K(jbuf.length()), K(ret));
+            } else {
+              arrow::Status status = builder_ref->Append(jbuf.ptr(), jbuf.length());
               if (!status.ok()) {
                 ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
                 LOG_WARN("fail to append null", K(ret));
               }
-            } else {
-              ObString json_str;
-              ObIJsonBase *j_base = NULL;
-              ObJsonBuffer jbuf(&alloc);
-              ObJsonInType in_type = ObJsonInType::JSON_BIN;
-              uint32_t parse_flag = lib::is_mysql_mode() ? 0 : ObJsonParser::JSN_RELAXED_FLAG;
-              if (OB_FAIL(ObTextStringHelper::read_real_string_data(alloc,
-                                                                    &expr_vector,
-                                                                    meta,
-                                                                    obj_meta.has_lob_header(),
-                                                                    json_str,
-                                                                    i))) {
-                LOG_WARN("failed to read string", K(ret));
-              } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(&alloc, json_str, in_type,
-                                                                  in_type, j_base, parse_flag,
-                                                                  ObJsonExprHelper::get_json_max_depth_config()))) {
-                COMMON_LOG(WARN, "fail to get json base", K(ret), K(in_type));
-              } else if (OB_FAIL(j_base->print(jbuf, false))) { // json binary to string
-                COMMON_LOG(WARN, "fail to convert json to string", K(ret));
-              } else if (jbuf.length() > UINT32_MAX) {
-                ret = OB_DATA_OUT_OF_RANGE;
-                LOG_WARN("data out of range", K(odps_type), K(jbuf.length()), K(ret));
-              } else {
-                arrow::Status status = builder_ref->Append(jbuf.ptr(), jbuf.length());
-                if (!status.ok()) {
-                  ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-                  LOG_WARN("fail to append null", K(ret));
-                }
-              }
-            }
-          }
-          if (OB_SUCC(ret)) {
-            arrow::Status status = builder_ref->Append("{}", 2);
-            if (!status.ok()) {
-              ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
-              LOG_WARN("fail to append null", K(ret));
             }
           }
         }
       }
       break;
     }
-    case JniWriter::OdpsType::ARRAY:
-    case JniWriter::OdpsType::STRUCT:
-    case JniWriter::OdpsType::INTERVAL_DAY_TIME:
-    case JniWriter::OdpsType::INTERVAL_YEAR_MONTH:
-    case JniWriter::OdpsType::MAP:
+    case ObOdpsJniConnector::OdpsType::ARRAY:
+    {
+      arrow::ListBuilder *list_builder = dynamic_cast<arrow::ListBuilder *>(builder);
+      arrow::ArrayBuilder *child_builder = nullptr;
+      ObODPSArrayHelper *array_helper = array_helpers_.at(col_idx);
+      if (OB_ISNULL(list_builder)) {
+        ret = OB_ERR_TYPE_MISMATCH;
+        LOG_WARN("builder is unexpected null", K(ret));
+      } else if (OB_ISNULL(child_builder = list_builder->value_builder()) || OB_ISNULL(array_helper)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null", K(child_builder), K(array_helper));
+      } else {
+        arrow::Type::type child_type_id = child_builder->type()->id();
+        for (int64_t i = 0; OB_SUCC(ret) && i < brs.size_; ++i) {
+          if (brs.skip_->contain(i)) {
+          } else if (expr_vector.is_null(i)) {
+            if (ARROW_FAIL(list_builder->AppendNull())) {
+              ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+              LOG_WARN("fail to append null", K(ret));
+            }
+          } else {
+            ++act_cnt;
+            array_helper->array_->clear();
+            ObString array_bin_string;
+            if (OB_FAIL(ObTextStringHelper::read_real_string_data(alloc, &expr_vector, meta,
+                                                                  obj_meta.has_lob_header(),
+                                                                  array_bin_string, i))) {
+              LOG_WARN("failed to read string", K(ret));
+            } else if (OB_FAIL(array_helper->array_->init(array_bin_string))) {
+              LOG_WARN("failed to init array", K(ret));
+            } else if (OB_FAIL(recursive_fill_list_builder(list_builder, child_builder, array_helper,
+                                                           alloc, is_strict_mode, date_sql_mode))) {
+              LOG_WARN("failed to recursice fill list builder");
+            }
+          }
+        }
+      }
+      break;
+    }
+    case ObOdpsJniConnector::OdpsType::STRUCT:
+    case ObOdpsJniConnector::OdpsType::INTERVAL_DAY_TIME:
+    case ObOdpsJniConnector::OdpsType::INTERVAL_YEAR_MONTH:
+    case ObOdpsJniConnector::OdpsType::MAP:
     default:
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected type", K(odps_type), K(ret));
       break;
+  }
+  return ret;
+}
+
+template <typename ArrowType, typename ObType>
+int vectorize_fill_array_int_mysql(arrow::ArrayBuilder *child_builder,
+                                   ObIArrayType *child_array,
+                                   ObObjType &element_type,
+                                   const bool is_strict_mode,
+                                   const ObDateSqlMode date_sql_mode,
+                                   std::shared_ptr<std::function<bool(ObType)>> filter = nullptr)
+{
+  int ret = OB_SUCCESS;
+  arrow::NumericBuilder<ArrowType> *builder = dynamic_cast<arrow::NumericBuilder<ArrowType>*>(child_builder);
+  ObArrayFixedSize<ObType> *int_array = static_cast<ObArrayFixedSize<ObType> *>(child_array);
+  if (!is_oracle_mode()) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < int_array->size(); ++i) {
+      if (int_array->is_null(i)) {
+        if (ARROW_FAIL(builder->AppendNull())) {
+          ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+          LOG_WARN("fail to append null", K(ret));
+        }
+      } else {
+        ObType value = (*int_array)[i];
+        if (ob_is_mysql_date_tc(element_type)) {
+          ObMySQLDate md_value(value);
+          int32_t d_value = 0;
+          if (CAST_FAIL(ObTimeConverter::mdate_to_date(md_value, d_value, date_sql_mode))) {
+            LOG_WARN("mdate_to_date fail", K(ret));
+          } else {
+            value = d_value;
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_LIKELY(filter == nullptr) || ((*filter)(value))) {
+          if (ARROW_FAIL(builder->Append(value))) {
+            ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+            LOG_WARN("fail to append int value", K(ret));
+          }
+        } else {
+          ret = OB_DATETIME_FUNCTION_OVERFLOW;
+          LOG_WARN("data out of range", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+template<typename ArrowType, typename ObType>
+int vectorize_fill_array_double(arrow::ArrayBuilder *child_builder,
+                                ObIArrayType *child_array)
+{
+  int ret = OB_SUCCESS;
+  arrow::NumericBuilder<ArrowType> *builder = dynamic_cast<arrow::NumericBuilder<ArrowType>*>(child_builder);
+  ObArrayFixedSize<ObType> *double_array = static_cast<ObArrayFixedSize<ObType> *>(child_array);
+  if (OB_ISNULL(builder)) {
+    ret = OB_ERR_TYPE_MISMATCH;
+    LOG_WARN("builder is unexpected null", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < double_array->size(); ++i) {
+      if (double_array->is_null(i)) {
+        if (ARROW_FAIL(builder->AppendNull())) {
+          ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+          LOG_WARN("fail to append null", K(ret));
+        }
+      } else if (ARROW_FAIL(builder->Append((*double_array)[i]))) {
+        ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+        LOG_WARN("fail to append int value", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int vectorize_fill_array_bool(arrow::ArrayBuilder *child_builder,
+                              ObIArrayType *child_array) {
+  int ret = OB_SUCCESS;
+  arrow::BooleanBuilder *builder = dynamic_cast<arrow::BooleanBuilder*>(child_builder);
+  ObArrayFixedSize<int8_t> *int_array = static_cast<ObArrayFixedSize<int8_t> *>(child_array);
+  if (OB_ISNULL(builder)) {
+    ret = OB_ERR_TYPE_MISMATCH;
+    LOG_WARN("builder is unexpected null", K(ret));
+  } else if (!is_oracle_mode()) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < int_array->size(); ++i) {
+      if (int_array->is_null(i)) {
+        if (ARROW_FAIL(builder->AppendNull())) {
+          ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+          LOG_WARN("fail to append null", K(ret));
+        }
+      } else {
+        bool v = ((*int_array)[i] != 0);
+        if (ARROW_FAIL(builder->Append(v))) {
+          ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+          LOG_WARN("fail to append int value", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+template <typename ArrowBuilderType>
+int vectorize_fill_array_string(arrow::ArrayBuilder *child_builder,
+                                ObIArrayType *child_array,
+                                ObODPSArrayHelper *array_helper,
+                                ObIAllocator &alloc)
+                                // ObOdpsJniWriter::OdpsType odps_type)
+{
+  int ret = OB_SUCCESS;
+  ArrowBuilderType *builder = dynamic_cast<ArrowBuilderType *>(child_builder);
+  ObArrayBinary * string_array = static_cast<ObArrayBinary *>(child_array);
+  if (OB_ISNULL(builder)) {
+    ret = OB_ERR_TYPE_MISMATCH;
+    LOG_WARN("builder is unexpected null", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < string_array->size(); ++i) {
+      if (string_array->is_null(i)) {
+        if (ARROW_FAIL(builder->AppendNull())) {
+          ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+          LOG_WARN("fail to append null", K(ret));
+        }
+      } else {
+        ObString lob_str = (*string_array)[i];
+        uint32_t res_len = 0;
+        char *buf = NULL;
+        int64_t buf_size = 0;
+
+        if (CHARSET_UTF8MB4 == ObCharset::charset_type_by_coll(array_helper->element_collation_) ||
+            CS_TYPE_BINARY == array_helper->element_collation_) {
+          res_len = static_cast<uint32_t>(lob_str.length());
+          buf = const_cast<char *>(lob_str.ptr());
+        } else if (OB_FALSE_IT(buf_size = lob_str.length() * ObCharset::MAX_MB_LEN)) {
+        } else if (OB_ISNULL(buf = static_cast<char *>(alloc.alloc(buf_size)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to alloc memory", K(ret));
+        } else if (OB_FAIL(ObCharset::charset_convert(array_helper->element_collation_,
+                                                      lob_str.ptr(),
+                                                      lob_str.length(),
+                                                      CS_TYPE_UTF8MB4_BIN,
+                                                      buf,
+                                                      buf_size,
+                                                      res_len,
+                                                      false,
+                                                      false))) {
+          LOG_WARN("failed to convert charset", K(ret));
+        }
+        if (OB_FAIL(ret)) {
+          // do nothing
+        // } else if ((ObOdpsJniWriter::OdpsType::CHAR == odps_type && res_len > 255) ||
+        //            (ObOdpsJniWriter::OdpsType::VARCHAR == odps_type && res_len > 65535) ||
+        //            (ObOdpsJniWriter::OdpsType::STRING == odps_type && res_len > 8 * 1024 * 1024) ||
+        //            (ObOdpsJniWriter::OdpsType::BINARY == odps_type && res_len > 8 * 1024 * 1024)) {
+        //   ret = OB_DATA_OUT_OF_RANGE;
+        //   LOG_WARN("string length out of range", K(res_len));
+        } else if (OB_ISNULL(buf) && res_len == 0) {
+          if (ARROW_FAIL(builder->Append("", 0))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("fail to append empty string");
+          }
+        } else if (ARROW_FAIL(builder->Append(buf, res_len))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("fail to append string");
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSelectIntoOp::recursive_fill_list_builder(arrow::ListBuilder *list_builder,
+                                                arrow::ArrayBuilder *child_builder,
+                                                ObODPSArrayHelper *array_helper,
+                                                ObIAllocator &alloc,
+                                                const bool is_strict_mode,
+                                                const ObDateSqlMode date_sql_mode)
+{
+  int ret = OB_SUCCESS;
+  arrow::Type::type child_type_id = child_builder->type()->id();
+  ObIArrayType *child_array = nullptr;
+  if (OB_ISNULL(list_builder) || OB_ISNULL(child_builder) ||
+      OB_ISNULL(array_helper) || OB_ISNULL(child_array = array_helper->array_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(list_builder), K(child_builder), K(array_helper), K(child_array));
+  } else if (ARROW_FAIL(list_builder->Append())) {
+    ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+    LOG_WARN("fail to append list vlaue", K(ret));
+  } else if (arrow::Type::LIST == child_type_id) {
+    if (ObCollectionSQLType == array_helper->element_type_) {
+      arrow::ListBuilder *child_list_builder = dynamic_cast<arrow::ListBuilder*>(child_builder);
+      ObArrayNested *nested_array = static_cast<ObArrayNested *>(array_helper->array_);
+      ObIArrayType *child_array = nullptr;
+      if (OB_ISNULL(array_helper->child_helper_) || OB_ISNULL(child_array = array_helper->child_helper_->array_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null", K(array_helper->child_helper_), KP(child_array));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < nested_array->size(); ++i) {
+        child_array->clear();
+        if (nested_array->is_null(i)) {
+          if (ARROW_FAIL(child_list_builder->AppendNull())) {
+            ret = OB_EXTERNAL_ODPS_UNEXPECTED_ERROR;
+            LOG_WARN("fail to append null", K(ret));
+          }
+        } else if (OB_FAIL(nested_array->at(i, *child_array))) {
+          LOG_WARN("failed to get elem", K(ret), K(i));
+        } else if (OB_FAIL(SMART_CALL(recursive_fill_list_builder(child_list_builder,
+                                                                  child_list_builder->value_builder(),
+                                                                  array_helper->child_helper_,
+                                                                  alloc, is_strict_mode, date_sql_mode)))) {
+          LOG_WARN("failed to recursive fill list builder");
+        }
+      }
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("arrow type not match with ob type", K(array_helper->element_type_));
+    }
+  } else if (arrow::Type::INT64 == child_type_id && ObIntType == array_helper->element_type_) {
+    if (!is_oracle_mode()) {
+      if (OB_FAIL((vectorize_fill_array_int_mysql<arrow::Int64Type, int64_t>(child_builder, child_array,
+                                                                             array_helper->element_type_,
+                                                                             is_strict_mode, date_sql_mode)))) {
+        LOG_WARN("fail to fill array int64", K(ret));
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("array(number) not support in oracle mode", K(child_type_id), K(ret));
+    }
+  } else if (arrow::Type::INT32 == child_type_id && ObInt32Type == array_helper->element_type_) {
+    if (!is_oracle_mode()) {
+      if (OB_FAIL((vectorize_fill_array_int_mysql<arrow::Int32Type, int32_t>(child_builder, child_array,
+                                                                             array_helper->element_type_,
+                                                                             is_strict_mode, date_sql_mode)))) {
+        LOG_WARN("fail to fill array int64", K(ret));
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("array(number) not support in oracle mode", K(child_type_id), K(ret));
+    }
+  } else if (arrow::Type::INT16 == child_type_id && ObSmallIntType == array_helper->element_type_) {
+    if (!is_oracle_mode()) {
+      if (OB_FAIL((vectorize_fill_array_int_mysql<arrow::Int16Type, int16_t>(child_builder, child_array,
+                                                                             array_helper->element_type_,
+                                                                             is_strict_mode, date_sql_mode)))) {
+        LOG_WARN("fail to fill array int64", K(ret));
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("array(number) not support in oracle mode", K(child_type_id), K(ret));
+    }
+  } else if (arrow::Type::INT8 == child_type_id && ObTinyIntType == array_helper->element_type_) {
+    if (!is_oracle_mode()) {
+      if (OB_FAIL((vectorize_fill_array_int_mysql<arrow::Int8Type, int8_t>(child_builder, child_array,
+                                                                           array_helper->element_type_,
+                                                                           is_strict_mode, date_sql_mode)))) {
+        LOG_WARN("fail to fill array int64", K(ret));
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("array(number) not support in oracle mode", K(child_type_id), K(ret));
+    }
+  } else if (arrow::Type::DOUBLE == child_type_id && ObDoubleType == array_helper->element_type_) {
+    if (OB_FAIL((vectorize_fill_array_double<arrow::DoubleType, double>(child_builder, child_array)))) {
+      LOG_WARN("fail to fill array double", K(ret));
+    }
+  } else if (arrow::Type::FLOAT == child_type_id && ObFloatType == array_helper->element_type_) {
+    if (OB_FAIL((vectorize_fill_array_double<arrow::FloatType, float>(child_builder, child_array)))) {
+      LOG_WARN("fail to fill array double", K(ret));
+    }
+  } else if (arrow::Type::BOOL == child_type_id) {
+    if (!is_oracle_mode()) {
+      if (ObTinyIntType == array_helper->element_type_) {
+        if (OB_FAIL(vectorize_fill_array_bool(child_builder, child_array))) {
+          LOG_WARN("fail to fill int8", K(ret));
+        }
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("arrow type not match with ob type", K(child_type_id), K(ret));
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("array(number) not support in oracle mode", K(child_type_id), K(ret));
+    }
+  } else if (arrow::Type::STRING == child_type_id) {
+    if (OB_FAIL(vectorize_fill_array_string<arrow::StringBuilder>(child_builder, child_array, array_helper, alloc))) {
+      LOG_WARN("failed to vectorize fill array string");
+    }
+  } else {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("array not support", K(child_type_id), K(array_helper->element_type_));
   }
   return ret;
 }
@@ -3790,12 +3674,16 @@ int ObSelectIntoOp::into_odps_jni_batch(const ObBatchRows &brs)
   bool is_strict_mode = common::is_strict_mode(sql_mode);
   ObArray<common::ObIVector *> expr_vectors;
   for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {
-    if (OB_ISNULL(select_exprs.at(i))) {
+    ObExpr *cur_expr = select_exprs.at(i);
+    if (OB_ISNULL(cur_expr)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("get unexpected null", K(ret));
-    } else if (OB_FAIL(select_exprs.at(i)->eval_vector(eval_ctx_, brs))) {
+    } else if (OB_FAIL(cur_expr->eval_vector(eval_ctx_, brs))) {
       LOG_WARN("failed to eval vector", K(ret));
-    } else if (OB_FAIL(expr_vectors.push_back(select_exprs.at(i)->get_vector(eval_ctx_)))) {
+    } else if (cur_expr->is_nested_expr() && !is_uniform_format(cur_expr->get_format(eval_ctx_)) &&
+               OB_FAIL(cur_expr->cast_to_uniform(brs.size_, eval_ctx_))) {
+      LOG_WARN("failed to cast to uniform");
+    } else if (OB_FAIL(expr_vectors.push_back(cur_expr->get_vector(eval_ctx_)))) {
       LOG_WARN("failed to push back vector", K(ret));
     }
   }
@@ -3813,10 +3701,7 @@ int ObSelectIntoOp::into_odps_jni_batch(const ObBatchRows &brs)
     ObArenaAllocator allocator("IntoOdps", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
     ObMallocHookAttrGuard guard(ObMemAttr(MTL_ID(), "IntoOdps"));//???
 
-    int act_cnt = 0;
-    ObDatum *datum = NULL;
-
-    const ObIArray<JniWriter::OdpsType> &col_type_from_odps = uploader_.writer_ptr->get_schema_from_odps();
+    const ObIArray<ObOdpsJniConnector::OdpsType> &col_type_from_odps = uploader_.writer_ptr->get_schema_from_odps();
     const arrow::FieldVector &type_vec = arrow_schema_->fields();
 
     arrow::Result<std::shared_ptr<arrow::RecordBatchBuilder> > rbatchRes =
@@ -3882,8 +3767,22 @@ int ObSelectIntoOp::into_odps_jni_batch(const ObBatchRows &brs)
         if (OB_FAIL(ret)) {
           // do nothing
         } else if (OB_FAIL(uploader_.writer_ptr->do_write_next_brs(0, act_cnt))) {
-          LOG_WARN("failed to write data");
+          LOG_WARN("failed to write data", K(ret));
         } else {
+          bool is_in_px = (NULL != ctx_.get_sqc_handler());
+          if (is_in_px) {
+            ObOdpsPartitionJNIUploaderMgr &odps_jni_mgr
+              = ctx_.get_sqc_handler()->get_sqc_ctx().gi_pump_.get_odps_jni_uploader_mgr();
+            if (OB_FAIL(odps_jni_mgr.append_block_id(block_id_))) {
+              LOG_WARN("failed to append block id", K(ret));
+            }
+          } else {
+            if (OB_FAIL(uploader_.writer_ptr->append_block_id(block_id_))) {
+              LOG_WARN("failed to append block id", K(ret));
+            }
+          }
+        }
+        if (OB_SUCC(ret)) {
           need_commit_ = true;
         }
       }
@@ -4018,7 +3917,8 @@ int ObSelectIntoOp::into_outfile_batch_csv(const ObBatchRows &brs, ObExternalFil
 int ObSelectIntoOp::get_parquet_logical_type(std::shared_ptr<const parquet::LogicalType> &logical_type,
                                              const ObObjType &obj_type,
                                              const int32_t precision,
-                                             const int32_t scale)
+                                             const int32_t scale,
+                                             const ObCollationType cs_type)
 {
   int ret = OB_SUCCESS;
   if (ObTinyIntType == obj_type) {
@@ -4054,7 +3954,11 @@ int ObSelectIntoOp::get_parquet_logical_type(std::shared_ptr<const parquet::Logi
   } else if (ob_is_year_tc(obj_type)) {
     logical_type = parquet::LogicalType::Int(8, false);
   } else if (ob_is_string_type(obj_type) || ObNullType == obj_type || ObRawType == obj_type) {
-    logical_type = parquet::LogicalType::String();
+    if (CS_TYPE_BINARY == cs_type) {
+      logical_type = parquet::LogicalType::None();
+    } else {
+      logical_type = parquet::LogicalType::String();
+    }
   } else if (ob_is_bit_tc(obj_type) /*uint64_t*/) {
     logical_type = parquet::LogicalType::Int(64, false);
   } else if (ob_is_enum_or_set_type(obj_type) /*uint64_t*/) {
@@ -4230,13 +4134,23 @@ int ObSelectIntoOp::setup_parquet_schema()
   std::shared_ptr<const parquet::LogicalType> logical_type;
   parquet::Type::type physical_type;
   parquet::schema::NodePtr node;
+  ObDatumMeta meta;
+  ObObjType obj_type;
+  ObString alias_name;
+  int primitive_length = -1;
+  int field_id = -1;
+  if (share::ObLakeTableFormat::ICEBERG == MY_SPEC.lake_table_format_
+      && MY_SPEC.field_ids_.count() != select_exprs.count()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected column count", K(MY_SPEC.select_exprs_.count()),
+              K(MY_SPEC.field_ids_.count()), K(ret));
+  }
   try {
     for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {
-      ObDatumMeta meta = select_exprs.at(i)->datum_meta_;
-      ObObjType obj_type = meta.get_type();
-      ObString alias_name = MY_SPEC.alias_names_.strs_.at(i);
-      std::string column_name(alias_name.ptr(), alias_name.length());
-      int primitive_length = -1;
+      meta = select_exprs.at(i)->datum_meta_;
+      obj_type = meta.get_type();
+      alias_name = MY_SPEC.alias_names_.strs_.at(i);
+      primitive_length = -1;
       if (OB_FAIL(check_oracle_number(obj_type,
                                       select_exprs.at(i)->datum_meta_.precision_,
                                       select_exprs.at(i)->datum_meta_.scale_))) {
@@ -4244,17 +4158,22 @@ int ObSelectIntoOp::setup_parquet_schema()
       } else if (OB_FAIL(get_parquet_logical_type(logical_type,
                                                   obj_type,
                                                   select_exprs.at(i)->datum_meta_.precision_,
-                                                  select_exprs.at(i)->datum_meta_.scale_))) {
+                                                  select_exprs.at(i)->datum_meta_.scale_,
+                                                  select_exprs.at(i)->datum_meta_.cs_type_))) {
         LOG_WARN("failed to get related logical type", K(ret));
       } else if (OB_FAIL(get_parquet_physical_type(physical_type, obj_type))) {
         LOG_WARN("failed to get related physical type", K(ret));
       } else if (ob_is_number_or_decimal_int_tc(obj_type)
                 && OB_FALSE_IT(primitive_length = calc_parquet_decimal_length(
                                                       select_exprs.at(i)->datum_meta_.precision_))) {
+      } else if (share::ObLakeTableFormat::ICEBERG == MY_SPEC.lake_table_format_
+                && OB_FALSE_IT(field_id = MY_SPEC.field_ids_.at(i))) {
       } else {
         //todo@linyi repetition level
-        node = parquet::schema::PrimitiveNode::Make(column_name, parquet::Repetition::OPTIONAL,
-                                                    logical_type, physical_type, primitive_length);
+        node = parquet::schema::PrimitiveNode::Make(std::string(alias_name.ptr(), alias_name.length()),
+                                                    parquet::Repetition::OPTIONAL,
+                                                    logical_type, physical_type,
+                                                    primitive_length, field_id);
         fields.push_back(node);
       }
     }
@@ -4349,7 +4268,12 @@ int ObSelectIntoOp::into_outfile_batch_parquet(const ObBatchRows &brs, ObExterna
         }
         parquet_data_writer->set_batch_written(false);
         parquet_data_writer->increase_row_batch_offset();
+        parquet_data_writer->increase_record_count();
         if (OB_FAIL(ret)) {
+          // discard unwritten data if an error occurs
+          parquet_data_writer->set_batch_written(true);
+          parquet_data_writer->reset_row_batch_offset();
+          parquet_data_writer->reset_value_offsets();
         } else if (parquet_data_writer->reach_batch_end()) {
           if (OB_FAIL(parquet_data_writer->write_file())) {
             LOG_WARN("failed to write parquet row batch", K(ret));
@@ -4487,7 +4411,11 @@ int ObSelectIntoOp::into_outfile_batch_orc(const ObBatchRows &brs, ObExternalFil
         }
         orc_data_writer->set_batch_written(false);
         orc_data_writer->increase_row_batch_offset();
+        orc_data_writer->increase_record_count();
         if (OB_FAIL(ret)) {
+          // discard unwritten data if an error occurs
+          orc_data_writer->set_batch_written(true);
+          orc_data_writer->reset_row_batch_offset();
         } else if (orc_data_writer->reach_batch_end()) {
           if (OB_FAIL(orc_data_writer->write_file())) {
             LOG_WARN("failed to write parquet row batch", K(ret));
@@ -4848,175 +4776,6 @@ int ObSelectIntoOp::check_parquet_file_size(ObParquetFileWriter &data_writer)
   }
   return ret;
 }
-int ObSelectIntoOp::build_parquet_column_vector(parquet::RowGroupWriter* rg_writer,
-                                                int col_idx,
-                                                const ObBatchRows &brs,
-                                                const ObDatumMeta &datum_meta,
-                                                const ObObjMeta &obj_meta,
-                                                const common::ObIVector* expr_vector,
-                                                int64_t &estimated_bytes)
-{
-  int ret = OB_SUCCESS;
-  int16_t null_definition_level = 0;
-  int16_t normal_definition_level = 1;
-  int16_t def_levels[brs.size_];
-  int value_idx = 0;
-  int def_idx = 0;
-  std::shared_ptr<parquet::schema::PrimitiveNode> p_node;
-  ObArenaAllocator allocator("IntoParquet", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
-  parquet::ColumnWriter *col_writer = nullptr;
-  if (OB_ISNULL(expr_vector) || !parquet_writer_schema_ || OB_ISNULL(rg_writer)
-      || OB_ISNULL(col_writer = rg_writer->column(col_idx))
-      || !(p_node = std::static_pointer_cast<parquet::schema::PrimitiveNode>(parquet_writer_schema_->field(col_idx)))) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get null ptr", K(ret));
-  } else if (p_node->is_group()) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "group type in parquet");
-    LOG_WARN("not support group type in parquet", K(ret));
-  } else {
-    switch (p_node->physical_type()) {
-      case parquet::Type::BYTE_ARRAY:
-      {
-        parquet::ByteArray values[brs.size_];
-        parquet::ByteArrayWriter *writer = static_cast<parquet::ByteArrayWriter *>(col_writer);
-        char *buf = nullptr;
-        uint32_t res_len = 0;
-        for (int64_t row_idx = 0; OB_SUCC(ret) && row_idx < brs.size_; row_idx++) {
-          if (brs.skip_->contain(row_idx)) {
-            // do nothing
-          } else if (expr_vector->is_null(row_idx)) {
-            def_levels[def_idx++] = null_definition_level;
-          } else if (OB_FAIL(calc_byte_array(expr_vector,
-                                             row_idx,
-                                             datum_meta,
-                                             obj_meta,
-                                             allocator,
-                                             buf,
-                                             res_len))) {
-            LOG_WARN("failed to calc parquet byte array", K(ret));
-          } else {
-            values[value_idx].ptr = reinterpret_cast<const uint8_t *>(buf);
-            values[value_idx].len = res_len;
-            value_idx++;
-            def_levels[def_idx++] = normal_definition_level;
-          }
-        }
-        if (OB_SUCC(ret)) {
-          writer->WriteBatch(def_idx, def_levels, nullptr, values);
-          estimated_bytes += writer->EstimatedBufferedValueBytes();
-        }
-        break;
-      }
-      case parquet::Type::FIXED_LEN_BYTE_ARRAY:
-      {
-        parquet::FixedLenByteArray values[brs.size_];
-        parquet::FixedLenByteArrayWriter *writer = static_cast<parquet::FixedLenByteArrayWriter *>(col_writer);
-        int parquet_decimal_length = writer->descr()->type_length();
-        uint8 parquet_flba_ptr[brs.size_][parquet_decimal_length];
-        for (int64_t row_idx = 0; OB_SUCC(ret) && row_idx < brs.size_; row_idx++) {
-          if (brs.skip_->contain(row_idx)) {
-            // do nothing
-          } else if (expr_vector->is_null(row_idx)) {
-            def_levels[def_idx++] = null_definition_level;
-          } else if (OB_FAIL(calc_parquet_decimal_array(expr_vector,
-                                                        row_idx,
-                                                        datum_meta,
-                                                        parquet_decimal_length,
-                                                        parquet_flba_ptr[row_idx]))) {
-            LOG_WARN("failed to calc parquet decimal", K(ret));
-          } else {
-            values[value_idx++].ptr = parquet_flba_ptr[row_idx];
-            def_levels[def_idx++] = normal_definition_level;
-          }
-        }
-        if (OB_SUCC(ret)) {
-          writer->WriteBatch(def_idx, def_levels, nullptr, values);
-          estimated_bytes += writer->EstimatedBufferedValueBytes();
-        }
-        break;
-      }
-      case parquet::Type::DOUBLE:
-      {
-        double values[brs.size_];
-        parquet::DoubleWriter *writer = static_cast<parquet::DoubleWriter *>(col_writer);
-        for (int64_t row_idx = 0; row_idx < brs.size_; row_idx++) {
-          if (brs.skip_->contain(row_idx)) {
-            // do nothing
-          } else if (expr_vector->is_null(row_idx)) {
-            def_levels[def_idx++] = null_definition_level;
-          } else {
-            values[value_idx++] = expr_vector->get_double(row_idx);
-            def_levels[def_idx++] = normal_definition_level;
-          }
-        }
-        writer->WriteBatch(def_idx, def_levels, nullptr, values);
-        estimated_bytes += writer->EstimatedBufferedValueBytes();
-        break;
-      }
-      case parquet::Type::FLOAT:
-      {
-        float values[brs.size_];
-        parquet::FloatWriter *writer = static_cast<parquet::FloatWriter *>(col_writer);
-        for (int64_t row_idx = 0; row_idx < brs.size_; row_idx++) {
-          if (brs.skip_->contain(row_idx)) {
-            // do nothing
-          } else if (expr_vector->is_null(row_idx)) {
-            def_levels[def_idx++] = null_definition_level;
-          } else {
-            values[value_idx++] = expr_vector->get_float(row_idx);
-            def_levels[def_idx++] = normal_definition_level;
-          }
-        }
-        writer->WriteBatch(def_idx, def_levels, nullptr, values);
-        estimated_bytes += writer->EstimatedBufferedValueBytes();
-        break;
-      }
-      case parquet::Type::INT32:
-      {
-        int32_t values[brs.size_];
-        parquet::Int32Writer *writer = static_cast<parquet::Int32Writer *>(col_writer);
-        for (int64_t row_idx = 0; row_idx < brs.size_; row_idx++) {
-          if (brs.skip_->contain(row_idx)) {
-            // do nothing
-          } else if (expr_vector->is_null(row_idx)) {
-            def_levels[def_idx++] = null_definition_level;
-          } else {
-            values[value_idx++] = expr_vector->get_int32(row_idx);
-            def_levels[def_idx++] = normal_definition_level;
-          }
-        }
-        writer->WriteBatch(def_idx, def_levels, nullptr, values);
-        estimated_bytes += writer->EstimatedBufferedValueBytes();
-        break;
-      }
-      case parquet::Type::INT64:
-      {
-        int64_t values[brs.size_];
-        parquet::Int64Writer *writer = static_cast<parquet::Int64Writer *>(col_writer);
-        for (int64_t row_idx = 0; row_idx < brs.size_; row_idx++) {
-          if (brs.skip_->contain(row_idx)) {
-            // do nothing
-          } else if (expr_vector->is_null(row_idx)) {
-            def_levels[def_idx++] = null_definition_level;
-          } else {
-            values[value_idx++] = expr_vector->get_int(row_idx);
-            def_levels[def_idx++] = normal_definition_level;
-          }
-        }
-        writer->WriteBatch(def_idx, def_levels, nullptr, values);
-        estimated_bytes += writer->EstimatedBufferedValueBytes();
-        break;
-      }
-      default:
-      {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected type", K(p_node->physical_type()), K(ret));
-      }
-    }
-  }
-  return ret;
-}
 
 int ObSelectIntoOp::build_parquet_cell(parquet::RowGroupWriter* rg_writer,
                                        const ObDatumMeta &datum_meta,
@@ -5129,6 +4888,10 @@ int ObSelectIntoOp::build_parquet_cell(parquet::RowGroupWriter* rg_writer,
         value += value_offset;
         if (expr_vector->is_null(row_idx)) {
           definition_levels[row_offset] = null_definition_level;
+        } else if (ob_is_year_tc(datum_meta.type_)) {
+          *value = static_cast<int32_t>(expr_vector->get_year(row_idx));
+          value_offset++;
+          definition_levels[row_offset] = normal_definition_level;
         } else if (ob_is_mysql_date_tc(datum_meta.type_)) {
           ObMySQLDate mdate(expr_vector->get_int32(row_idx));
           if (CAST_FAIL(ObTimeConverter::mdate_to_date(mdate, *value, date_sql_mode))) {
@@ -5363,6 +5126,7 @@ int ObSelectIntoOp::check_secure_file_path(ObString file_name)
   ObString file_path = file_name.split_on(file_name.reverse_find('/'));
   char full_path_buf[PATH_MAX+1];
   char *actual_path = nullptr;
+  ObArenaAllocator allocator;
   ObSqlString sql_str;
   ObString secure_file_priv;
   int64_t tenant_id = MTL_ID();
@@ -5373,7 +5137,7 @@ int ObSelectIntoOp::check_secure_file_path(ObString file_name)
     LOG_WARN("file not exist", K(ret), K(sql_str));
   } else if (OB_FAIL(ObSchemaUtils::get_tenant_varchar_variable(tenant_id,
                                                                 SYS_VAR_SECURE_FILE_PRIV,
-                                                                ctx_.get_allocator(),
+                                                                allocator,
                                                                 secure_file_priv))) {
     LOG_WARN("fail get tenant variable", K(tenant_id), K(secure_file_priv), K(ret));
   } else if (OB_FAIL(ObResolverUtils::check_secure_path(secure_file_priv, actual_path))) {
@@ -5471,37 +5235,35 @@ int ObSelectIntoOp::create_the_only_data_writer(ObExternalFileWriter *&data_writ
 int ObSelectIntoOp::new_data_writer(ObExternalFileWriter *&data_writer)
 {
   int ret = OB_SUCCESS;
-  void *ptr = NULL;
   switch (format_type_)
   {
     case ObExternalFileFormat::FormatType::CSV_FORMAT:
     {
-      if (OB_ISNULL(ptr = ctx_.get_allocator().alloc(sizeof(ObCsvFileWriter)))) {
+      if (OB_ISNULL(data_writer = OB_NEWx(ObCsvFileWriter, &ctx_.get_allocator(),
+                                          access_info_, file_location_, use_shared_buf_,
+                                          has_compress_, has_lob_, write_offset_))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("failed to allocate data writer", K(ret), K(sizeof(ObCsvFileWriter)));
-      } else {
-        data_writer = new(ptr) ObCsvFileWriter(access_info_, file_location_, use_shared_buf_,
-                                               has_compress_, has_lob_, write_offset_);
+        LOG_WARN("failed to allocate csv data writer", K(ret), K(sizeof(ObCsvFileWriter)));
       }
       break;
     }
     case ObExternalFileFormat::FormatType::PARQUET_FORMAT:
     {
-      if (OB_ISNULL(ptr = ctx_.get_allocator().alloc(sizeof(ObParquetFileWriter)))) {
+      if (OB_ISNULL(data_writer = OB_NEWx(ObParquetFileWriter, &ctx_.get_allocator(),
+                                          access_info_, file_location_, parquet_writer_schema_,
+                                          MY_SPEC.lake_table_format_))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("failed to allocate data writer", K(ret), K(sizeof(ObParquetFileWriter)));
-      } else {
-        data_writer = new(ptr) ObParquetFileWriter(access_info_, file_location_, parquet_writer_schema_);
+        LOG_WARN("failed to allocate parquet data writer", K(ret), K(sizeof(ObParquetFileWriter)));
       }
       break;
     }
     case ObExternalFileFormat::FormatType::ORC_FORMAT:
     {
-      if (OB_ISNULL(ptr = ctx_.get_allocator().alloc(sizeof(ObOrcFileWriter)))) {
+      if (OB_ISNULL(data_writer = OB_NEWx(ObOrcFileWriter, &ctx_.get_allocator(),
+                                          access_info_, file_location_,
+                                          MY_SPEC.lake_table_format_))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("failed to allocate data writer", K(ret), K(sizeof(ObOrcFileWriter)));
-      } else {
-        data_writer = new(ptr) ObOrcFileWriter(access_info_, file_location_);
+        LOG_WARN("failed to allocate orc data writer", K(ret), K(sizeof(ObOrcFileWriter)));
       }
       break;
     }
@@ -5520,7 +5282,7 @@ int ObSelectIntoOp::odps_commit_upload()
   int ret = OB_SUCCESS;
   bool is_in_px = (NULL != ctx_.get_sqc_handler());
   if (is_in_px) {
-    ObOdpsPartitionDownloaderMgr &odps_mgr = ctx_.get_sqc_handler()->get_sqc_ctx().gi_pump_.get_odps_mgr();
+    ObOdpsPartitionUploaderMgr &odps_mgr = ctx_.get_sqc_handler()->get_sqc_ctx().gi_pump_.get_odps_uploader_mgr();
     if (!need_commit_) {
       odps_mgr.set_fail();
     }
@@ -5572,30 +5334,38 @@ int ObSelectIntoOp::odps_commit_upload()
 int ObSelectIntoOp::odps_jni_commit_upload()
 {
   int ret = OB_SUCCESS;
-
   bool is_in_px = (NULL != ctx_.get_sqc_handler());
   if (is_in_px) {
-    ObOdpsJniUploaderMgr &odps_upload_mgr = ctx_.get_sqc_handler()->get_sqc_ctx().gi_pump_.get_odps_jni_uploader_mgr();
+    ObOdpsPartitionJNIUploaderMgr &odps_jni_mgr
+              = ctx_.get_sqc_handler()->get_sqc_ctx().gi_pump_.get_odps_jni_uploader_mgr();
     if (!need_commit_) {
-      odps_upload_mgr.set_fail();
+      odps_jni_mgr.set_fail();
     }
     {
       __sync_synchronize();
+      int64_t num_block = odps_jni_mgr.block_num();
       if (OB_ISNULL(uploader_.writer_ptr.get())) {
         ret = OB_ODPS_ERROR;
         LOG_WARN("failed to get the writer by sid", K(ret));
       } else if (OB_FAIL(uploader_.writer_ptr->finish_write())) {
         LOG_WARN("failed to finish write");
+      }
+      if (OB_FAIL(ret)) {
+        odps_jni_mgr.release_hold_session();
       } else {
-        int64_t ref = odps_upload_mgr.dec_ref();
+        int64_t ref = odps_jni_mgr.dec_ref();
         if (0 > ref) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("get unexpected ref", K(ref), K(ret));
-        } else if (0 == ref && odps_upload_mgr.could_commit()) {
-          uploader_.writer_ptr->commit_session();
+        } else if (0 == ref && odps_jni_mgr.could_commit()) {
+          if (OB_FAIL(odps_jni_mgr.commit_session(0))) {
+            LOG_WARN("failed to commit the parallel write", K(ret));
+          }
+        }
+        if (0 == ref) {
+          odps_jni_mgr.release_hold_session();
         }
       }
-      odps_upload_mgr.release_hold_session();
     }
   } else {
     if (OB_ISNULL(uploader_.writer_ptr.get())) {
@@ -5604,7 +5374,7 @@ int ObSelectIntoOp::odps_jni_commit_upload()
     } else if (OB_FAIL(uploader_.writer_ptr->finish_write())) {
       LOG_WARN("failed to finish write", K(ret));
     } else if (need_commit_) {
-      if (OB_FAIL(uploader_.writer_ptr->commit_session())) {
+      if (OB_FAIL(uploader_.writer_ptr->commit_session(0))) {
         ret = OB_ODPS_ERROR;
         LOG_WARN("commmit failed in odps write");
       }
@@ -5628,6 +5398,7 @@ void ObSelectIntoOp::destroy()
 #if defined(OB_BUILD_JNI_ODPS)
       if (OB_NOT_NULL(uploader_.writer_ptr.get())) {
         uploader_.writer_ptr->do_close();
+        uploader_.writer_ptr.reset();
       }
       if (OB_NOT_NULL(arrow_schema_.get())) {
         arrow_schema_.reset();
@@ -5658,8 +5429,7 @@ void ObSelectIntoOp::destroy()
   ObOperator::destroy();
 }
 
-
-
+#undef ARROW_FAIL
 }
 }
 #undef CAST_FAIL

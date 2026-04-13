@@ -35,6 +35,7 @@ namespace oceanbase
 namespace storage
 {
 struct ObTransNodeDMLStat;
+class ObISkipScanner;
 }
 
 namespace memtable
@@ -49,7 +50,6 @@ public:
   virtual int get_next_row(const blocksstable::ObDatumRow *&row) {
     int ret = common::OB_SUCCESS;
     if (OB_SUCC(inner_get_next_row(row))) {
-      EVENT_INC(ObStatEventIds::MEMSTORE_READ_ROW_COUNT);
     }
     return ret;
   }
@@ -85,7 +85,8 @@ public:
 
 protected:
   virtual int inner_get_next_row(const blocksstable::ObDatumRow *&row);
-
+public:
+  TO_STRING_KV(K_(is_inited), K_(rowkey_iter), KPC_(rowkey), K_(cur_row));
 private:
   // means GETITER
   static const uint64_t VALID_MAGIC_NUM = 0x5245544954454700;
@@ -112,7 +113,7 @@ public:
                    const void *query_range) override;
   virtual void reset();
   virtual void reuse() override { reset(); }
-
+  virtual int advance_scan(const blocksstable::ObDatumRange &range) override;
 protected:
   virtual int inner_get_next_row(const blocksstable::ObDatumRow *&row);
   int base_init_(const storage::ObTableIterParam &param,
@@ -137,6 +138,7 @@ protected:
   ObMemtableBlockRowScanner *mt_blk_scanner_;
   ObMemtableSingleRowReader single_row_reader_;
   blocksstable::ObDatumRange cur_range_;
+  ObMemtable *memtable_;
 private:
   static const uint64_t VALID_MAGIC_NUM = 0x524554494e414353;
   DISALLOW_COPY_AND_ASSIGN(ObMemtableScanIterator);
@@ -157,6 +159,8 @@ public:
       const void *query_range) override;
   virtual void reset();
   virtual void reuse() override { reset(); }
+  TO_STRING_KV(K_(is_inited), K_(rowkey_iter), KPC_(rowkeys), K_(cur_row));
+public:
   static const int64_t ROW_ALLOCATOR_PAGE_SIZE = common::OB_MALLOC_NORMAL_BLOCK_SIZE;
 
 protected:
@@ -253,6 +257,7 @@ protected:
   int iterate_uncommitted_row_value_(blocksstable::ObDatumRow &row);
   int iterate_multi_version_row_value_(blocksstable::ObDatumRow &row);
   int iterate_delete_insert_compacted_row_value_(blocksstable::ObDatumRow &row);
+  void fill_default_values_for_row_(blocksstable::ObDatumRow &row);
 
 protected:
   struct ObOuputRowValidateChecker
@@ -285,8 +290,41 @@ protected:
   ScanState scan_state_;
   int32_t trans_version_col_idx_;
   int32_t sql_sequence_col_idx_;
-  blocksstable::ObRowReader row_reader_;
+  blocksstable::ObCompatRowReader row_reader_;
   ObOuputRowValidateChecker row_checker_;
+  const blocksstable::ObDatumRow *default_row_;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class ObMemtableSkipScanIterator : public ObMemtableScanIterator
+{
+public:
+  ObMemtableSkipScanIterator();
+  virtual ~ObMemtableSkipScanIterator();
+  int init(
+      const storage::ObTableIterParam &param,
+      storage::ObTableAccessContext &context,
+      storage::ObITable *table,
+      const void *query_range) override;
+  virtual void reset() override;
+  virtual void reuse() override { reset(); }
+  virtual int advance_scan(const blocksstable::ObDatumRange &range) override
+  {
+    return OB_NOT_SUPPORTED;
+  }
+  int skip_to_range(const ObDatumRange &range);
+  int check_always_false(const ObDatumRange &range, bool &is_false);
+  int get_next_skip_row(const blocksstable::ObDatumRow *&row);
+protected:
+  virtual int inner_get_next_row(const blocksstable::ObDatumRow *&row) override;
+private:
+  bool is_end_;
+  bool is_skip_start_;
+  bool is_false_range_;
+  const storage::ObTableIterParam *param_;
+  storage::ObTableAccessContext *context_;
+  storage::ObISkipScanner *skip_scanner_;
+  DISALLOW_COPY_AND_ASSIGN(ObMemtableSkipScanIterator);
 };
 
 }  // namespace memtable

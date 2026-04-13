@@ -59,17 +59,23 @@ int ObServerConnectionPool::acquire(ObMySQLConnection *&conn, uint32_t sessid)
       ret = OB_RESOURCE_OUT;
     } else if (free_conn_count_ > 0) {
       if (OB_FAIL(connection_pool_ptr_->get_cached(connection, sessid))) {
-        ATOMIC_DEC(&free_conn_count_);
-        LOG_WARN("fail get conn", K(free_conn_count_), K(busy_conn_count_), K(ret));
+        if (OB_ENTRY_NOT_EXIST == ret) {
+          // cached connection consumed by other session concurrently.
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("fail get conn", K(free_conn_count_), K(busy_conn_count_), K(ret));
+        }
       } else {
         connection->init(this);
         ATOMIC_INC(&busy_conn_count_);
         ATOMIC_DEC(&free_conn_count_);
       }
+    }
+    if (OB_FAIL(ret) || NULL != connection) {
+      // do nothing.
     } else if (busy_conn_count_ < max_allowed_conn_count_) {
       ret = connection_pool_ptr_->alloc(connection, sessid);
       if (OB_ERR_ALREADY_EXISTS == ret) {
-
         connection->init(this);
         ATOMIC_INC(&busy_conn_count_);
         ATOMIC_DEC(&free_conn_count_);
@@ -221,14 +227,14 @@ int ObServerConnectionPool::init_dblink(uint64_t tenant_id, uint64_t dblink_id, 
              || 0 == port
              || db_tenant.empty() || db_user.empty() || db_pass.empty()
              || (!lib::is_oracle_mode() && db_name.empty())
-             || OB_UNLIKELY(cluster_str.length() >= OB_MAX_CLUSTER_NAME_LENGTH)
-             || OB_UNLIKELY(db_tenant.length() >= OB_MAX_TENANT_NAME_LENGTH)
-             || OB_UNLIKELY(db_user.length() >= OB_MAX_USER_NAME_LENGTH)
-             || OB_UNLIKELY(db_pass.length() >= OB_MAX_PASSWORD_LENGTH)
-             || OB_UNLIKELY(db_name.length() >= OB_MAX_DATABASE_NAME_LENGTH)
+             || OB_UNLIKELY(cluster_str.length() > OB_MAX_CLUSTER_NAME_LENGTH)
+             || OB_UNLIKELY(db_tenant.length() > OB_MAX_TENANT_NAME_LENGTH)
+             || OB_UNLIKELY(db_user.length() > OB_MAX_USER_NAME_LENGTH)
+             || OB_UNLIKELY(db_pass.length() > OB_MAX_PASSWORD_LENGTH)
+             || OB_UNLIKELY(db_name.length() > OB_MAX_DATABASE_NAME_LENGTH)
              || OB_UNLIKELY(host_name.length() > OB_MAX_DOMIN_NAME_LENGTH)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("db param buffer is not enough", K(ret),
+    LOG_WARN("db param buffer is not enough or param is empty", K(ret),
              K(dblink_id), K(db_tenant), K(db_user), K(db_pass), K(db_name), K(port), K(host_name));
   } else {
     dblink_id_ = dblink_id;

@@ -95,6 +95,7 @@ int ObAllVirtualSysStat::update_all_stats_(const int64_t tenant_id, common::ObDi
     SERVER_LOG(WARN, "Fail to get cache size", K(ret));
   } else {
     int64_t unused = 0;
+    int64_t unused_throttle_trigger;
     //ignore ret
     if (is_virtual_tenant_id(tenant_id)) {
       ObVirtualTenantManager &tenant_mgr = common::ObVirtualTenantManager::get_instance();
@@ -104,11 +105,12 @@ int ObAllVirtualSysStat::update_all_stats_(const int64_t tenant_id, common::ObDi
     } else {
         storage::ObTenantFreezer *freezer = MTL(storage::ObTenantFreezer *);
         freezer->get_tenant_memstore_cond(
-            stat_events.get(ObStatEventIds::ACTIVE_MEMSTORE_USED - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_,
-            stat_events.get(ObStatEventIds::TOTAL_MEMSTORE_USED - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_,
-            stat_events.get(ObStatEventIds::MAJOR_FREEZE_TRIGGER - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_,
-            stat_events.get(ObStatEventIds::MEMSTORE_LIMIT - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_,
-            unused);
+            stat_events.get(ObStatEventIds::ACTIVE_MEMSTORE_USED - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_,
+            stat_events.get(ObStatEventIds::TOTAL_MEMSTORE_USED - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_,
+            stat_events.get(ObStatEventIds::MAJOR_FREEZE_TRIGGER - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_,
+            stat_events.get(ObStatEventIds::MEMSTORE_LIMIT - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_,
+            unused,
+            unused_throttle_trigger);
         freezer->get_tenant_mem_limit(
             stat_events.get(ObStatEventIds::MIN_MEMORY_SIZE - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_,
             stat_events.get(ObStatEventIds::MAX_MEMORY_SIZE - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_);
@@ -141,7 +143,10 @@ int ObAllVirtualSysStat::update_all_stats_(const int64_t tenant_id, common::ObDi
         (OB_SYS_TENANT_ID == tenant_id) ? OB_LOGGER.get_dropped_debug_log_count() : 0;
     stat_events.get(ObStatEventIds::ASYNC_LOG_FLUSH_SPEED - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_ =
         (OB_SYS_TENANT_ID == tenant_id) ? OB_LOGGER.get_async_flush_log_speed() : 0;
-
+    stat_events.get(ObStatEventIds::OB_LOGGER_ALLOC_FROM_CACHE_COUNT - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_ =
+        (OB_SYS_TENANT_ID == tenant_id) ? OB_LOGGER.get_alloc_item_from_cache_count() : 0;
+    stat_events.get(ObStatEventIds::OB_LOGGER_ALLOC_FROM_ALLCATOR_COUNT - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_ =
+        (OB_SYS_TENANT_ID == tenant_id) ? OB_LOGGER.get_alloc_item_from_allocator_count() : 0;
 
     stat_events.get(ObStatEventIds::ASYNC_GENERIC_LOG_WRITE_COUNT - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_ =
         (OB_SYS_TENANT_ID == tenant_id) ? OB_LOGGER.get_generic_log_write_count() : 0;
@@ -197,18 +202,12 @@ int ObAllVirtualSysStat::update_all_stats_(const int64_t tenant_id, common::ObDi
         (OB_SYS_TENANT_ID == tenant_id) ? GMEMCONF.get_reserved_server_memory() : 0;
     stat_events.get(ObStatEventIds::HIDDEN_SYS_MEMORY - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_ =
         (OB_SYS_TENANT_ID == tenant_id) ? GMEMCONF.get_hidden_sys_memory() : 0;
-#ifdef OB_BUILD_SHARED_STORAGE
-    if (GCTX.is_shared_storage_mode()) {
-      stat_events.get(ObStatEventIds::HIDDEN_SYS_DATA_DISK_SIZE - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_ =
-        (OB_SYS_TENANT_ID == tenant_id) ? OB_SERVER_DISK_SPACE_MGR.get_hidden_sys_data_disk_config_size() : 0;
-    }
-#endif
     stat_events.get(ObStatEventIds::UNMANAGED_MEMORY_SIZE - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_ =
         (OB_SYS_TENANT_ID == tenant_id) ? get_unmanaged_memory_size() : 0;
 #ifdef OB_BUILD_SHARED_STORAGE
     if (GCTX.is_shared_storage_mode()) {
       stat_events.get(ObStatEventIds::HIDDEN_SYS_DATA_DISK_SIZE - ObStatEventIds::STAT_EVENT_ADD_END -1)->stat_value_ =
-        (OB_SYS_TENANT_ID == tenant_id) ? OB_SERVER_DISK_SPACE_MGR.get_hidden_sys_data_disk_config_size() : 0;
+        (OB_SYS_TENANT_ID == tenant_id) ? OB_SERVER_DISK_SPACE_MGR.get_hidden_sys_data_disk_size() : 0;
     }
 #endif
 
@@ -262,6 +261,42 @@ int ObAllVirtualSysStat::update_all_stats_(const int64_t tenant_id, common::ObDi
       // it is ok to not have any records
     }
 
+    int64_t default_group_cpu_time = 0;
+    if (OB_SUCC(GCTX.omt_->get_tenant_group_cpu_time(tenant_id, share::OB_THREAD_GROUP_DEFAULT, default_group_cpu_time))) {
+      stat_events.get(ObStatEventIds::DEFAULT_GROUP_CPU_TIME - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_
+          = default_group_cpu_time;
+    } else {}
+
+    int64_t olap_group_cpu_time = 0;
+    if (OB_SUCC(GCTX.omt_->get_tenant_group_cpu_time(tenant_id, share::OB_THREAD_GROUP_OLAP_ASYNC, olap_group_cpu_time))) {
+      stat_events.get(ObStatEventIds::OLAP_ASYN_JOB_GROUP_CPU_TIME - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_
+          = olap_group_cpu_time;
+    } else {}
+
+    int64_t dbms_sche_group_cpu_time = 0;
+    if (OB_SUCC(GCTX.omt_->get_tenant_group_cpu_time(tenant_id, share::OB_THREAD_GROUP_DBMS_SCHE, dbms_sche_group_cpu_time))) {
+      stat_events.get(ObStatEventIds::DBMS_SCHED_JOB_GROUP_CPU_TIME - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_
+          = dbms_sche_group_cpu_time;
+    } else {}
+
+    int64_t large_query_group_cpu_time = 0;
+    if (OB_SUCC(GCTX.omt_->get_tenant_group_cpu_time(tenant_id, share::OB_THREAD_GROUP_LARGE_QUERY, large_query_group_cpu_time))) {
+      stat_events.get(ObStatEventIds::LARGE_QUERY_GROUP_CPU_TIME - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_
+          = large_query_group_cpu_time;
+    } else {}
+
+    int64_t px_group_cpu_time = 0;
+    if (OB_SUCC(GCTX.omt_->get_tenant_group_cpu_time(tenant_id, share::OB_THREAD_GROUP_PX, px_group_cpu_time))) {
+      stat_events.get(ObStatEventIds::PX_GROUP_CPU_TIME - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_
+          = px_group_cpu_time;
+    } else {}
+
+    int64_t dag_group_cpu_time = 0;
+    if (OB_SUCC(GCTX.omt_->get_tenant_group_cpu_time(tenant_id, share::OB_THREAD_GROUP_DAG, dag_group_cpu_time))) {
+      stat_events.get(ObStatEventIds::DAG_GROUP_CPU_TIME - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_
+          = dag_group_cpu_time;
+    } else {}
+
     if (!is_virtual_tenant_id(tenant_id)) { // skip virtual tenant
       omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
       if (tenant_config.is_valid()) {
@@ -279,6 +314,26 @@ int ObAllVirtualSysStat::update_all_stats_(const int64_t tenant_id, common::ObDi
         SERVER_LOG(ERROR, "fail to set ss stats", KR(ret), KR(tmp_ret), K(tenant_id));
       }
 #endif
+    }
+
+    if (is_sys_tenant(tenant_id) || is_user_tenant(tenant_id)) {
+      int tmp_ret = OB_SUCCESS;
+      sql::ObPCachedExternalFileService *ext_file_service = MTL(sql::ObPCachedExternalFileService *);
+      if (OB_NOT_NULL(ext_file_service)) {
+        ObStorageCacheHitStat hit_stat;
+        if (OB_TMP_FAIL(ext_file_service->get_hit_stat(hit_stat))) {
+          SERVER_LOG(WARN, "fail to get external table cache hit stat", KR(ret), KR(tmp_ret));
+        } else {
+          stat_events.get(ObStatEventIds::EXTERNAL_TABLE_DISK_CACHE_HIT_CNT - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_ =
+              hit_stat.cache_hit_cnt_;
+          stat_events.get(ObStatEventIds::EXTERNAL_TABLE_DISK_CACHE_MISS_CNT - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_ =
+              hit_stat.cache_miss_cnt_;
+          stat_events.get(ObStatEventIds::EXTERNAL_TABLE_DISK_CACHE_HIT_BYTES - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_ =
+              hit_stat.cache_hit_bytes_;
+          stat_events.get(ObStatEventIds::EXTERNAL_TABLE_DISK_CACHE_MISS_BYTES - ObStatEventIds::STAT_EVENT_ADD_END - 1)->stat_value_ =
+              hit_stat.cache_miss_bytes_;
+        }
+      }
     }
 
     ret = ret_bk;

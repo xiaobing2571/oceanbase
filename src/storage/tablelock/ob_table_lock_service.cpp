@@ -806,7 +806,8 @@ int ObTableLockService::lock_partition_or_subpartition(ObTxDesc &tx_desc,
 int ObTableLockService::lock(ObTxDesc &tx_desc,
                              const ObTxParam &tx_param,
                              const ObLockRequest &arg,
-                             const bool is_for_replace)
+                             const bool is_for_replace,
+                             const bool force_use_priority)
 {
   int ret = OB_SUCCESS;
 
@@ -825,9 +826,8 @@ int ObTableLockService::lock(ObTxDesc &tx_desc,
     if (OB_FAIL(ctx.set_by_lock_req(arg))) {
       LOG_WARN("set ObTableLockCtx failed", K(ret), K(arg));
     } else {
-      if (is_for_replace) {
-        ctx.is_for_replace_ = true;
-      }
+      ctx.is_for_replace_ = is_for_replace;
+      ctx.is_enable_lock_priority_ = ctx.is_enable_lock_priority_ ? true : force_use_priority;
       ctx.is_in_trans_ = true;
       ctx.tx_desc_ = &tx_desc;
       ctx.tx_param_ = tx_param;
@@ -1526,24 +1526,24 @@ int ObTableLockService::deal_with_deadlock_(ObTableLockCtx &ctx)
 {
   int ret = OB_SUCCESS;
   SessionGuard session_guard;
-  const uint32_t sess_id = ctx.tx_desc_->get_session_id();
-  if (OB_FAIL(ObTransDeadlockDetectorAdapter::get_session_info(sess_id, session_guard))) {
-    LOG_WARN("get session info failed", K(ret), K(sess_id));
+  transaction::SessionIDPair sess_id_pair(ctx.tx_desc_->get_session_id(), ctx.tx_desc_->get_assoc_session_id());
+  if (OB_FAIL(ObTransDeadlockDetectorAdapter::get_session_info(sess_id_pair, session_guard))) {
+    LOG_WARN("get session info failed", K(ret), K(sess_id_pair));
   } else if (!session_guard.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("session guard invalid", K(ret), K(sess_id));
+    LOG_WARN("session guard invalid", K(ret), K(sess_id_pair));
   } else if (ObCompatibilityMode::MYSQL_MODE == session_guard->get_compatibility_mode()) {
-    ret = ObTransDeadlockDetectorAdapter::kill_tx(sess_id);
+    ret = ObTransDeadlockDetectorAdapter::kill_tx(sess_id_pair);
   } else if (ObCompatibilityMode::ORACLE_MODE == session_guard->get_compatibility_mode()) {
-    ret = ObTransDeadlockDetectorAdapter::kill_stmt(sess_id);
+    ret = ObTransDeadlockDetectorAdapter::kill_stmt(sess_id_pair);
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("unknown mode", K(ret), K(session_guard->get_compatibility_mode()));
   }
   if (!OB_SUCC(ret)) {
-    LOG_WARN("kill trans or stmt failed", K(ret), K(sess_id));
+    LOG_WARN("kill trans or stmt failed", K(ret), K(sess_id_pair));
   }
-  LOG_DEBUG("ObTableLockService::deal_with_deadlock_", K(ret), K(sess_id));
+  LOG_DEBUG("ObTableLockService::deal_with_deadlock_", K(ret), K(sess_id_pair));
   return ret;
 }
 
@@ -1934,7 +1934,9 @@ int ObTableLockService::process_table_tablet_lock_(ObTableLockCtx &ctx,
 
   if (OB_FAIL(process_obj_lock_(ctx, table_ls_lock_map))) {
     LOG_WARN("lock table failed", K(ret), K(ctx), K(table_lock_mode));
-  } else if (OB_FAIL(get_tablet_ls_lock_map_(lock_mode, ctx, tablet_ls_lock_map))) {
+  }
+  DEBUG_SYNC(TABLE_LOCK_AFTER_LOCK_TABLE_BEFORE_LOCK_TABLET);
+  if (FAILEDx(get_tablet_ls_lock_map_(lock_mode, ctx, tablet_ls_lock_map))) {
     LOG_WARN("get tablet ls_lock_map failed", K(ret), K(ctx), K(lock_mode));
   } else if (FALSE_IT(ctx.lock_mode_ = lock_mode)) {
   } else  if (!ctx.is_enable_lock_priority_ && OB_FAIL(pre_check_lock_(ctx, tablet_ls_lock_map))) {

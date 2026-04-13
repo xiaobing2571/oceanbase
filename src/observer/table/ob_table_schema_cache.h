@@ -23,7 +23,7 @@
 #include "lib/hash/ob_hashmap.h"
 #include "src/share/table/ob_ttl_util.h"
 #include "share/schema/ob_schema_utils.h"
-#include "ob_htable_utils.h"
+#include "utils/ob_htable_utils.h"
 
 namespace oceanbase
 {
@@ -96,6 +96,7 @@ struct ObTableColumnInfo
   OB_INLINE bool is_word_segment_column() const { return ObSchemaUtils::is_word_segment_column(column_flags_); }
   OB_INLINE bool is_word_count_column() const { return ObSchemaUtils::is_word_count_column(column_flags_); }
   OB_INLINE bool is_doc_length_column() const { return ObSchemaUtils::is_doc_length_column(column_flags_); }
+  OB_INLINE bool is_pos_list_column() const { return ObSchemaUtils::is_pos_list_column(column_flags_); }
 
   uint64_t col_idx_;
   uint64_t column_id_;
@@ -149,7 +150,8 @@ union ObTableSchemaFlags{
     bool has_fts_index_         : 1;
     bool has_hbase_ttl_column_  : 1;
     bool is_secondary_part_     : 1;
-    uint64_t reserved_          : 54;
+    bool is_heap_table_         : 1;
+    uint64_t reserved_          : 53;
   };
 };
 
@@ -207,6 +209,7 @@ public:
     column_cnt_ = 0;
     rowkey_cnt_ = 0;
     auto_inc_cache_size_ = 0;
+    lob_inrow_threshold_ = OB_DEFAULT_LOB_INROW_THRESHOLD;
   }
   virtual ~ObKvSchemaCacheObj();
   int cons_table_info(const ObTableSchema *table_schema);
@@ -235,6 +238,8 @@ public:
   OB_INLINE const ObString& get_ttl_definition() { return ttl_definition_; }
   OB_INLINE int64_t get_auto_inc_cache_size() { return auto_inc_cache_size_; }
   OB_INLINE ObHbaseModeType get_hbase_mode_type() { return hbase_mode_type_; }
+  OB_INLINE void set_is_heap_table(bool is_heap_table) { flags_.is_heap_table_ = is_heap_table; }
+  OB_INLINE int64_t get_lob_inrow_threshold() { return lob_inrow_threshold_; }
 private:
   int build_index_map();
 private:
@@ -256,6 +261,7 @@ private:
   int64_t auto_inc_cache_size_;
   ObKVAttr kv_attributes_;
   ObHbaseModeType hbase_mode_type_;
+  int64_t lob_inrow_threshold_;
 };
 
 class ObKvSchemaCacheGuard
@@ -297,6 +303,8 @@ public:
   int create_schema_cache_obj(ObSchemaGetterGuard &schema_guard);
   int is_redis_ttl_table(bool &is_redis_ttl_table);
   int get_all_column_name(common::ObIArray<common::ObString> &col_names);
+  int get_hbase_column_infos(ObIArray<const ObTableColumnInfo *> &col_infos);
+  int is_secondary_part_table(bool &is_secondary_part_table);
   void reset();
   OB_INLINE bool is_use_cache() { return is_use_cache_; }
   OB_INLINE bool is_inited() { return is_init_; }
@@ -327,6 +335,10 @@ public:
   OB_INLINE ObHbaseModeType get_hbase_mode_type()
   {
     return static_cast<ObKvSchemaCacheObj *>(cache_guard_.get_cache_obj())->get_hbase_mode_type();
+  }
+  OB_INLINE int64_t get_lob_inrow_threshold()
+  {
+    return static_cast<ObKvSchemaCacheObj *>(cache_guard_.get_cache_obj())->get_lob_inrow_threshold();
   }
 private:
   bool is_init_;

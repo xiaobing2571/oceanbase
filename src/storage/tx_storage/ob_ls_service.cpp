@@ -20,6 +20,7 @@
 #include "storage/meta_store/ob_server_storage_meta_service.h"
 #include "storage/meta_store/ob_tenant_storage_meta_service.h"
 #include "storage/tx/ob_trans_service.h"
+#include "storage/high_availability/ob_tenant_startup_status.h"
 
 namespace oceanbase
 {
@@ -29,6 +30,8 @@ using namespace lib;
 using namespace logservice;
 namespace storage
 {
+ERRSIM_POINT_DEF(EN_CREATE_LS_FAILED_BEFORE_ADD_MIGRATION_TASK);
+
 #define OB_BREAK_FAIL(statement) (OB_UNLIKELY(((++process_point) && break_point == process_point && OB_FAIL(OB_BREAK_BY_TEST)) || OB_FAIL(statement)))
 
 static inline void prepare_palf_base_info(const obrpc::ObCreateLSArg &arg,
@@ -135,13 +138,14 @@ int ObLSService::get_resource_constraint_value(ObResoureConstraintValue &constra
   return ret;
 }
 
-int ObLSService::get_resource_constraint_value_(ObResoureConstraintValue &constraint_value)
+int ObLSService::get_resource_constraint_value_(ObResoureConstraintValue &constraint_value,
+                                                const bool is_check_for_logonly)
 {
   int ret = OB_SUCCESS;
   int64_t config_value = OB_MAX_LS_NUM_PER_TENANT_PER_SERVER;
   int64_t memory_value = INT64_MAX;
   int64_t clog_disk_value = INT64_MAX;
-  const int64_t per_palf_size = GCTX.is_shared_storage_mode() ? SHARED_STORAGE_MIN_DISK_SIZE_PER_PALF_INSTANCE : MIN_DISK_SIZE_PER_PALF_INSTANCE;
+  const int64_t per_palf_size = MIN_DISK_SIZE_PER_PALF_INSTANCE;
   // 1. configuration
   omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
   if (OB_LIKELY(tenant_config.is_valid())) {
@@ -151,13 +155,19 @@ int ObLSService::get_resource_constraint_value_(ObResoureConstraintValue &constr
 
   // 2. memory
   const int64_t tenant_memory = lib::get_tenant_memory_limit(MTL_ID());
-  memory_value = OB_MAX(tenant_memory - SMALL_TENANT_MEMORY_LIMIT, 0) / TENANT_MEMORY_PER_LS_NEED +
-    OB_MAX_LS_NUM_PER_TENANT_PER_SERVER_FOR_SMALL_TENANT;
+  const int64_t memory_per_ls = is_check_for_logonly ? TENANT_MEMORY_PER_LOGONLY_LS_NEED : TENANT_MEMORY_PER_LS_NEED;
+  if (is_check_for_logonly) {
+    memory_value = tenant_memory / memory_per_ls;
+    LOG_TRACE("memory check for logonly replica", K(memory_value), K(tenant_memory), K(memory_per_ls));
+  } else {
+    memory_value = OB_MAX(tenant_memory - SMALL_TENANT_MEMORY_LIMIT, 0) / memory_per_ls +
+      OB_MAX_LS_NUM_PER_TENANT_PER_SERVER_FOR_SMALL_TENANT;
+  }
 
   // 3. clog disk
   palf::PalfDiskOptions disk_opts;
 #ifdef OB_BUILD_SHARED_LOG_SERVICE
-  if (GCONF.enable_logservice) { // do nothing
+  if (GCTX.is_shared_storage_mode()) { // do nothing
   } else
 #endif
   if (OB_FAIL(MTL(ObLogService*)->get_palf_disk_options(disk_opts))) {
@@ -229,7 +239,7 @@ int ObLSService::cal_min_phy_resource_needed_(const int64_t num,
   int64_t ls_cnt = num;
   int64_t clog_disk_bytes = 0;
   int64_t memory_bytes = 0;
-  const int64_t per_palf_size = GCTX.is_shared_storage_mode() ? SHARED_STORAGE_MIN_DISK_SIZE_PER_PALF_INSTANCE : MIN_DISK_SIZE_PER_PALF_INSTANCE;
+  const int64_t per_palf_size = MIN_DISK_SIZE_PER_PALF_INSTANCE;
   // 1. memory
   // if the ls num is smaller than OB_MAX_LS_NUM_PER_TENANT_PER_SERVER_FOR_SMALL_TENANT,
   // just return SMALL_TENANT_MEMORY_LIMIT.
@@ -242,6 +252,8 @@ int ObLSService::cal_min_phy_resource_needed_(const int64_t num,
 
   if (OB_FAIL(min_phy_res.set_type_value(PHY_RESOURCE_MEMORY, memory_bytes))) {
     LOG_WARN("set type value failed", K(PHY_RESOURCE_MEMORY), K(memory_bytes));
+  } else if (GCTX.is_shared_storage_mode()) {
+    // skip check clog disk size
   } else if (OB_FAIL(min_phy_res.set_type_value(PHY_RESOURCE_CLOG_DISK, clog_disk_bytes))) {
     LOG_WARN("set type value failed", K(PHY_RESOURCE_CLOG_DISK), K(clog_disk_bytes));
   }
@@ -377,12 +389,12 @@ int ObLSService::start()
   return ret;
 }
 
-int ObLSService::check_tenant_ls_num_()
+int ObLSService::check_tenant_ls_num_(const bool is_check_for_logonly)
 {
   int ret = OB_SUCCESS;
   ObResoureConstraintValue constraint_value;
-  if (OB_FAIL(get_resource_constraint_value_(constraint_value))) {
-    LOG_WARN("get resource constraint value failed", K(ret));
+  if (OB_FAIL(get_resource_constraint_value_(constraint_value, is_check_for_logonly))) {
+    LOG_WARN("get resource constraint value failed", K(ret), K(is_check_for_logonly));
   } else {
     int64_t min_constraint_value = 0;
     int64_t min_constraint_type = 0;
@@ -391,7 +403,7 @@ int ObLSService::check_tenant_ls_num_()
     constraint_value.get_min_constraint(min_constraint_type, min_constraint_value);
     if (normal_ls_count + removeing_ls_count + 1 > min_constraint_value) {
       ret = OB_TOO_MANY_TENANT_LS;
-      LOG_WARN("too many ls of a tenant", K(ret), K(normal_ls_count), K(removeing_ls_count),
+      LOG_WARN("too many ls of a tenant", K(ret), K(normal_ls_count), K(removeing_ls_count), K(is_check_for_logonly),
                K(min_constraint_type), K(get_constraint_type_name(min_constraint_type)), K(min_constraint_value));
       LOG_DBA_WARN_(OB_STORAGE_LS_COUNT_REACH_UPPER_LIMIT, ret,
                     "The current tenant has too many log streams. ",
@@ -413,6 +425,8 @@ int ObLSService::inner_create_ls_(const share::ObLSID &lsid,
                                   const SCN &create_scn,
                                   const ObMajorMVMergeInfo &major_mv_merge_info,
                                   const ObLSStoreFormat &store_format,
+                                  const ObReplicaType &replica_type,
+                                  const uint64_t data_version,
                                   ObLS *&ls)
 {
   int ret = OB_SUCCESS;
@@ -432,7 +446,9 @@ int ObLSService::inner_create_ls_(const share::ObLSID &lsid,
                               create_scn,
                               major_mv_merge_info,
                               store_format,
-                              rs_reporter_))) {
+                              replica_type,
+                              rs_reporter_,
+                              data_version))) {
     LOG_WARN("fail to init ls", K(ret), K(lsid));
   }
   if (OB_FAIL(ret) && NULL != ls) {
@@ -494,7 +510,13 @@ int ObLSService::create_ls(const obrpc::ObCreateLSArg &arg)
   if (OB_UNLIKELY(!arg.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(arg));
-  } else {
+  }
+#ifdef OB_BUILD_SHARED_STORAGE
+  else if (!is_tenant_sslog_ls(MTL_ID(), arg.get_ls_id()) && OB_FAIL(check_sslog_ls_exist())) {
+    LOG_WARN("failed to check sslog ls exist", K(ret), K(arg));
+  }
+#endif
+  else {
     palf::PalfBaseInfo palf_base_info;
     prepare_palf_base_info(arg, palf_base_info);
 
@@ -511,6 +533,7 @@ int ObLSService::create_ls(const obrpc::ObCreateLSArg &arg)
     common_arg.create_type_ = get_create_type_by_tenant_role_(arg.get_tenant_info().get_tenant_role());
     common_arg.need_create_inner_tablet_ = need_create_inner_tablets_(arg);
     common_arg.major_mv_merge_info_ = arg.get_major_mv_merge_info();
+    common_arg.data_version_ = arg.get_data_version();
 
     if (OB_FAIL(create_ls_(common_arg, mig_arg))) {
       LOG_WARN("create ls failed", K(ret), K(arg));
@@ -531,7 +554,9 @@ int ObLSService::post_create_ls_(const int64_t create_type,
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
   bool need_online = false;
-  if (OB_FAIL(ls->check_ls_need_online(need_online))) {
+  if (OB_FAIL(ls->start())) {
+    LOG_WARN("ls start failed", K(ret));
+  } else if (OB_FAIL(ls->check_ls_need_online(need_online))) {
     LOG_WARN("check ls need online failed", K(ret));
   } else if (need_online &&
              OB_FAIL(ls->online_without_lock())) {
@@ -563,6 +588,7 @@ int ObLSService::post_create_ls_(const int64_t create_type,
       break;
     }
     case ObLSCreateType::MIGRATE: {
+      // ATTENTION! when migration, set_start_ha_state must be the last step in this function that can fail
       if (OB_FAIL(ls->set_start_ha_state())) {
         LOG_ERROR("ls set start ha state failed", KR(ret), KPC(ls));
       }
@@ -788,9 +814,9 @@ int ObLSService::gc_ls_after_replay_slog()
               ob_usleep(SLEEP_TS);
             }
           } while (tmp_ret != OB_SUCCESS);
-          remove_ls_(ls, true/*remove_from_disk*/, false/*write_slog*/);
+          remove_ls_(ls, true/*remove_from_disk*/);
         } else if (ls_status.is_zombie_state()) {
-          remove_ls_(ls, true/*remove_from_disk*/, false/*write_slog*/);
+          remove_ls_(ls, true/*remove_from_disk*/);
         }
       }
     }
@@ -809,7 +835,6 @@ int ObLSService::online_ls()
   int tmp_ret = OB_SUCCESS;
   common::ObSharedGuard<ObLSIterator> ls_iter;
   ObLS *ls = nullptr;
-  int64_t create_type = ObLSCreateType::NORMAL;
   if (OB_FAIL(get_ls_iter(ls_iter, ObLSGetMod::TXSTORAGE_MOD))) {
     LOG_WARN("failed to get ls iter", K(ret));
   } else {
@@ -821,17 +846,16 @@ int ObLSService::online_ls()
       } else if (nullptr == ls) {
         ret = OB_ERR_UNEXPECTED;
         LOG_ERROR("ls is null", K(ret));
-      } else {
-        ObLSLockGuard lock_ls(ls);
-        if (OB_FAIL(ls->get_create_type(create_type))) {
-          LOG_WARN("get ls create type failed", K(ret));
-        } else if (OB_FAIL(post_create_ls_(create_type, ls))) {
-          LOG_WARN("post create ls failed", K(ret));
-        }
+      } else if (OB_FAIL(online_ls_(ls))) {
+        LOG_WARN("failed to online ls", K(ret), KPC(ls));
       }
     }
     if (OB_ITER_END == ret) {
       ret = OB_SUCCESS;
+    }
+
+    if (OB_SUCC(ret)) {
+      TENANT_STARTUP_STATUS.start_service();
     }
   }
 
@@ -884,7 +908,7 @@ int ObLSService::replay_remove_ls_(const share::ObLSID &ls_id)
   } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls is null", K(ls_id));
-  } else if (OB_FAIL(ls->set_remove_state())) {
+  } else if (OB_FAIL(ls->set_remove_state(false /*write_slog*/))) {
     LOG_ERROR("ls set remove state failed", KR(ret), K(ls_id));
   } else {
   }
@@ -914,6 +938,8 @@ int ObLSService::replay_create_ls_(const int64_t ls_epoch, const ObLSMeta &ls_me
                                       ls_meta.get_clog_checkpoint_scn(),
                                       ls_meta.get_major_mv_merge_info(),
                                       ls_meta.get_store_format(),
+                                      ls_meta.get_replica_type(),
+                                      ls_meta.get_data_version(),
                                       ls))) {
     LOG_WARN("fail to inner create ls", K(ret), K(ls_meta.ls_id_));
   } else if (FALSE_IT(state = ObLSCreateState::CREATE_STATE_INNER_CREATED)) {
@@ -1019,7 +1045,7 @@ int ObLSService::get_ls_replica(
   } else if (OB_FAIL(log_service->get_palf_role(ls_id, role, proposal_id))) {
     LOG_WARN("failed to get role from palf", KR(ret), K(tenant_id), K(ls_id));
   } else if (OB_FAIL(get_replica_type_(GCTX.self_addr(), ob_member_list, learner_list,
-                                       ls->get_store_format(), replica_type))) {
+                                       ls->get_store_format(), ls_handle.get_ls()->get_ls_meta(), replica_type))) {
     LOG_WARN("fail to get replica_type by member and learner list", KR(ret));
   } else if (OB_FAIL(ObLSReplica::transform_ob_member_list(ob_member_list, member_list))) {
     LOG_WARN("fail to transfrom ob_member_list into member_list", KR(ret), K(ob_member_list));
@@ -1065,9 +1091,9 @@ int ObLSService::remove_ls(const share::ObLSID &ls_id)
   } else if (OB_UNLIKELY(!is_running_)) {
     ret = OB_NOT_RUNNING;
     LOG_WARN("ls service is not running.", K(ret));
-  } else if (OB_UNLIKELY(!SERVER_STORAGE_META_SERVICE.is_started())) {
+  } else if (OB_UNLIKELY(!TENANT_STARTUP_STATUS.is_in_service())) {
     ret = OB_NOT_RUNNING;
-    LOG_WARN("ls service does not service before slog replay finished", K(ret));
+    LOG_WARN("ls service does not service before tenant in service", K(ret));
   } else if (OB_UNLIKELY(!ls_id.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(ls_id));
@@ -1119,7 +1145,7 @@ int ObLSService::safe_remove_ls_(ObLSHandle handle, const bool remove_from_disk)
   if (OB_ISNULL(ls = handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("log stream is null, unexpected error");
-  } else if (OB_BREAK_FAIL(ls->offline())) {
+  } else if (OB_BREAK_FAIL(ls->offline(remove_from_disk))) {
     LOG_WARN("ls offline failed", K(ret), KP(ls));
   } else if (OB_BREAK_FAIL(ls->stop())) {
     LOG_WARN("stop ls failed", K(ret), KP(ls));
@@ -1130,7 +1156,6 @@ int ObLSService::safe_remove_ls_(ObLSHandle handle, const bool remove_from_disk)
     const ObLSID &ls_id = ls->get_ls_id();
     static const int64_t SLEEP_TS = 100_ms;
     ObLSLockGuard lock_ls(ls);
-    const bool write_slog = remove_from_disk;
     if (OB_ISNULL(task = (ObLSSafeDestroyTask*)ob_malloc(sizeof(ObLSSafeDestroyTask),
                                                          "LSSafeDestroy"))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -1138,14 +1163,14 @@ int ObLSService::safe_remove_ls_(ObLSHandle handle, const bool remove_from_disk)
     } else if (FALSE_IT(task = new(task) ObLSSafeDestroyTask())) {
     } else if (OB_BREAK_FAIL(ret)) {
       LOG_WARN("break fail for malloc", K(ret));
-    } else if (remove_from_disk && OB_BREAK_FAIL(ls->set_remove_state())) {
+    } else if (remove_from_disk && OB_BREAK_FAIL(ls->set_remove_state(remove_from_disk))) {
       LOG_WARN("ls set remove state failed", KR(ret), K(ls_id));
     } else if (OB_BREAK_FAIL(task->init(MTL_ID(),
                                         handle,
                                         this))) {
       LOG_WARN("init safe destroy task failed", K(ret));
     } else {
-      remove_ls_(ls, remove_from_disk, write_slog);
+      remove_ls_(ls, remove_from_disk);
       // try until success.
       while (OB_BREAK_FAIL(gc_service->add_safe_destroy_task(*task))) {
         if (REACH_TIME_INTERVAL(1_min)) { // every minute
@@ -1162,7 +1187,7 @@ int ObLSService::safe_remove_ls_(ObLSHandle handle, const bool remove_from_disk)
   return ret;
 }
 
-void ObLSService::remove_ls_(ObLS *ls, const bool remove_from_disk, const bool write_slog)
+void ObLSService::remove_ls_(ObLS *ls, const bool remove_from_disk)
 {
   int ret = OB_SUCCESS;
   const share::ObLSID &ls_id = ls->get_ls_id();
@@ -1193,7 +1218,7 @@ void ObLSService::remove_ls_(ObLS *ls, const bool remove_from_disk, const bool w
     }
     if (success_step < 2 && OB_SUCC(ret)) {
       // todo zk250686_ copy tablet_id_set to tablet_free_pending_array
-      if(write_slog && OB_FAIL(TENANT_STORAGE_META_SERVICE.delete_ls(ls_id, ls->get_ls_epoch()))) {
+      if(remove_from_disk && OB_FAIL(TENANT_STORAGE_META_SERVICE.delete_ls(ls_id, ls->get_ls_epoch()))) {
         LOG_WARN("fail to write remove ls slog", K(ret));
       } else {
         success_step = 2;
@@ -1249,9 +1274,9 @@ int ObLSService::create_ls_(const ObCreateLSCommonArg &arg,
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("the ls service has not been inited", K(ret));
-  } else if (OB_UNLIKELY(!SERVER_STORAGE_META_SERVICE.is_started())) {
+  } else if (OB_UNLIKELY(!TENANT_STARTUP_STATUS.is_in_service())) {
     ret = OB_NOT_RUNNING;
-    LOG_WARN("ls service does not service before slog replay finished", K(ret));
+    LOG_WARN("ls service does not service before tenant in service", K(ret));
   } else if (OB_BREAK_FAIL(ObShareUtil::get_abs_timeout(DEFAULT_LOCK_TIMEOUT /* default timeout */,
                                                   abs_timeout_ts))) {
     LOG_WARN("get timeout ts failed", KR(ret));
@@ -1274,7 +1299,7 @@ int ObLSService::create_ls_(const ObCreateLSCommonArg &arg,
     } else if (waiting_destroy) {
       ret = OB_LS_WAITING_SAFE_DESTROY;
       LOG_WARN("ls waiting for destroy, need retry later", K(ret), K(arg.ls_id_));
-    } else if (OB_BREAK_FAIL(check_tenant_ls_num_())) {
+    } else if (OB_BREAK_FAIL(check_tenant_ls_num_(ObReplicaTypeCheck::is_log_replica(arg.replica_type_)))) {
       LOG_WARN("too many ls", K(ret));
     } else if (OB_BREAK_FAIL(inner_create_ls_(arg.ls_id_,
                                               arg.migration_status_,
@@ -1282,8 +1307,10 @@ int ObLSService::create_ls_(const ObCreateLSCommonArg &arg,
                                               arg.create_scn_,
                                               arg.major_mv_merge_info_,
                                               ls_store_format,
+                                              arg.replica_type_,
+                                              arg.data_version_,
                                               ls))) {
-      LOG_WARN("create ls failed", K(ret), K(arg.ls_id_), K(ls_store_format));
+      LOG_WARN("create ls failed", K(ret), K(arg.ls_id_), K(ls_store_format), K(arg.replica_type_));
     } else {
       state = ObLSCreateState::CREATE_STATE_INNER_CREATED;
       int64_t ls_epoch = 0;
@@ -1314,15 +1341,20 @@ int ObLSService::create_ls_(const ObCreateLSCommonArg &arg,
       } else if (OB_BREAK_FAIL(ls->finish_create_ls())) {
         LOG_WARN("finish create ls failed", KR(ret));
       } else if (FALSE_IT(state = ObLSCreateState::CREATE_STATE_FINISH)) {
-      } else if (OB_BREAK_FAIL(post_create_ls_(arg.create_type_, ls))) {
-        LOG_WARN("post create ls failed", K(ret), K(ls_meta));
+#ifdef ERRSIM
+      } else if (OB_FAIL(EN_CREATE_LS_FAILED_BEFORE_ADD_MIGRATION_TASK)) {
+        LOG_INFO("[ERRSIM] create ls failed before add migration task", K(ret));
+#endif
       } else if (ObLSCreateType::MIGRATE == arg.create_type_ &&
                  OB_BREAK_FAIL(ls->get_ls_migration_handler()->add_ls_migration_task(arg.task_id_,
                                                                                      mig_arg))) {
         LOG_WARN("failed to add ls migration task", K(ret), K(mig_arg));
+      } else if (OB_BREAK_FAIL(post_create_ls_(arg.create_type_, ls))) {
+        LOG_WARN("post create ls failed", K(ret), K(ls_meta));
       }
     }
     if (OB_BREAK_FAIL(ret)) {
+      DEBUG_SYNC(BEFORE_DEL_LS_AFTER_CREATE_LS_FAILED);
       del_ls_after_create_ls_failed_(state, ls);
     }
   }
@@ -1340,14 +1372,22 @@ int ObLSService::create_ls_for_ha(
   if (task_id.is_invalid() || !arg.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("create ls for ha get invalid argument", K(ret), K(task_id), K(arg));
-  } else if (ObMigrationOpType::MIGRATE_LS_OP != arg.type_ && ObMigrationOpType::ADD_LS_OP != arg.type_) {
+  } else if (ObMigrationOpType::MIGRATE_LS_OP != arg.type_
+             && ObMigrationOpType::ADD_LS_OP != arg.type_
+             && ObMigrationOpType::REPLACE_LS_OP != arg.type_) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("create ls for migration get unexpected op type", K(ret), K(task_id), K(arg));
   } else if (OB_FAIL(ObMigrationStatusHelper::trans_migration_op(arg.type_, migration_status))) {
     LOG_WARN("failed to trans migration op", K(ret), K(arg), K(task_id));
   } else if (OB_FAIL(get_restore_status_(restore_status))) {
     LOG_WARN("failed to get restore status", K(ret), K(arg), K(task_id));
-  } else {
+  }
+#ifdef OB_BUILD_SHARED_STORAGE
+  else if (!is_tenant_sslog_ls(MTL_ID(), arg.ls_id_) && OB_FAIL(check_sslog_ls_exist())) {
+    LOG_WARN("failed to check sslog ls exist", K(ret), K(arg));
+  }
+#endif
+  else {
     palf::PalfBaseInfo palf_base_info;
     palf_base_info.generate_by_default();
 
@@ -1364,6 +1404,7 @@ int ObLSService::create_ls_for_ha(
     common_arg.task_id_ = task_id;
     common_arg.need_create_inner_tablet_ = false;
     common_arg.major_mv_merge_info_.reset();
+    common_arg.data_version_ = 0;
 
     if (OB_FAIL(create_ls_(common_arg, arg))) {
       LOG_WARN("failed to create ls", K(ret), K(arg));
@@ -1413,7 +1454,7 @@ void ObLSService::del_ls_after_create_ls_failed_(ObLSCreateState& in_ls_create_s
         }
         if (OB_TMP_FAIL(tmp_ret)) {
         } else if (ls_create_state >= ObLSCreateState::CREATE_STATE_WRITE_PREPARE_SLOG) {
-          if (OB_TMP_FAIL(ls->set_remove_state())) {
+          if (OB_TMP_FAIL(ls->set_remove_state(remove_from_disk))) {
             need_retry = true;
             LOG_ERROR("fail to set ls remove state", K(tmp_ret), KPC(ls));
           } else if (OB_TMP_FAIL(TENANT_STORAGE_META_SERVICE.abort_create_ls(ls->get_ls_id(), ls->get_ls_epoch()))) {
@@ -1628,6 +1669,11 @@ ObLSRestoreStatus ObLSService::get_restore_status_by_tenant_role_(const ObTenant
 
   if (tenant_role.is_restore()) {
     restore_status = ObLSRestoreStatus::RESTORE_START;
+#ifdef OB_BUILD_SHARED_STORAGE
+    if (GCTX.is_shared_storage_mode()) {
+      restore_status = ObLSRestoreStatus::SS_RESTORE_START;
+    }
+#endif
   } else if (tenant_role.is_clone()) {
     restore_status = ObLSRestoreStatus::CLONE_START;
   } else {
@@ -1687,16 +1733,24 @@ int ObLSService::get_replica_type_(
     const ObMemberList &ob_member_list,
     const GlobalLearnerList &learner_list,
     const common::ObLSStoreFormat &ls_store_format,
+    const ObLSMeta &ls_meta,
     ObReplicaType &replica_type)
 {
   int ret = OB_SUCCESS;
   const bool is_columnstore = ls_store_format.is_columnstore();
+  const bool is_logonly = REPLICA_TYPE_LOGONLY == ls_meta.get_replica_type();
   const bool in_member_list = ob_member_list.contains(addr);
   const bool in_learner_list = learner_list.contains(addr);
   if (is_columnstore) {
     replica_type = REPLICA_TYPE_COLUMNSTORE;
     if (in_member_list) {
       LOG_WARN("columnstore replica member in member_list is unexpected",
+               K(addr), K(ob_member_list), K(learner_list));
+    }
+  } else if (is_logonly) {
+    replica_type = REPLICA_TYPE_LOGONLY;
+    if (in_learner_list) {
+      LOG_WARN("logonly replica member in learner_list is unexpected",
                K(addr), K(ob_member_list), K(learner_list));
     }
   } else {
@@ -1706,6 +1760,116 @@ int ObLSService::get_replica_type_(
       replica_type = REPLICA_TYPE_READONLY;
     } else {
       replica_type = REPLICA_TYPE_FULL;
+    }
+  }
+  return ret;
+}
+
+#ifdef OB_BUILD_SHARED_STORAGE
+int ObLSService::check_sslog_ls_exist()
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = MTL_ID();
+  bool is_exist = false;
+  if (!GCTX.is_shared_storage_mode()) {
+    is_exist = true;
+  } else {
+    const ObLSID sslog_ls_id(ObLSID::SSLOG_LS_ID);
+    const uint64_t meta_tenant_id = gen_meta_tenant_id(tenant_id);
+    MTL_SWITCH(meta_tenant_id) {
+      ObMigrationStatus migration_status = ObMigrationStatus::OB_MIGRATION_STATUS_MAX;
+      ObLSHandle ls_handle;
+      ObLSService *ls_service = nullptr;
+      ObLS *ls = nullptr;
+      ObMemberList ob_member_list;
+      ObLSReplica::MemberList member_list;
+      GlobalLearnerList learner_list;
+      int64_t proposal_id = 0;
+      int64_t paxos_replica_number = 0;
+      const ObAddr &addr = GCTX.self_addr();
+      common::ObMember learner_member;
+      if (OB_ISNULL(ls_service = MTL(ObLSService *))) {
+        ret = OB_ERR_UNEXPECTED;
+        STORAGE_LOG(WARN, "ls service should not be null", K(ret), KP(ls_service));
+      } else if (OB_FAIL(ls_service->get_ls(sslog_ls_id, ls_handle, ObLSGetMod::STORAGE_MOD))) {
+        if (OB_LS_NOT_EXIST == ret) {
+          ret = OB_SSLOG_LS_NOT_EXIST;
+        }
+        LOG_WARN("failed to get ls", K(ret), K(sslog_ls_id));
+      } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("src ls should not be NULL", K(ret), K(sslog_ls_id), KP(ls));
+      } else if (OB_FAIL(ls->get_migration_status(migration_status))) {
+        LOG_WARN("failed to get migration status", K(ret), K(sslog_ls_id));
+      } else if (ObMigrationStatus::OB_MIGRATION_STATUS_NONE != migration_status
+          && !ObMigrationStatusHelper::is_in_replace(migration_status)
+          && !ObMigrationStatusHelper::is_in_rebuild(migration_status)) {
+        is_exist = false;
+        LOG_WARN("sslog ls migration status is not right", K(migration_status), KPC(ls), K(sslog_ls_id));
+      } else if (OB_FAIL(ls->get_paxos_member_list_and_learner_list(ob_member_list, paxos_replica_number, learner_list))) {
+        LOG_WARN("get member list and learner list from ObLS failed", KR(ret));
+      } else if (ob_member_list.contains(addr)) {
+        is_exist = true;
+      } else if (!learner_list.contains(addr)) {
+        is_exist = false;
+      } else if (OB_FAIL(learner_list.get_learner_by_addr(addr, learner_member))) {
+        LOG_WARN("failed to get learner by addr", K(ret), K(addr));
+      } else if (learner_member.is_migrating()) {
+        is_exist = false;
+      } else {
+        is_exist = true;
+      }
+
+      if (OB_SUCC(ret) && !is_exist) {
+        ret = OB_SSLOG_LS_NOT_EXIST;
+        LOG_WARN("sslog ls do not exist, cannot migrate in", K(ret), K(tenant_id), K(ob_member_list), K(learner_list));
+      }
+    }
+  }
+  return ret;
+}
+#endif
+
+int ObLSService::online_ls(const ObLSID &ls_id)
+{
+  int ret = OB_SUCCESS;
+  ObLSHandle ls_handle;
+  ObLS *ls = nullptr;
+  int64_t create_type = ObLSCreateType::NORMAL;
+
+  if (!is_inited_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("ls service do not init", K(ret));
+  } else if (!ls_id.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("online  ls get invalid argument", K(ret), K(ls_id));
+  } else if (OB_FAIL(get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD))) {
+    LOG_WARN("failed to get ls", K(ret), K(ls_id));
+  } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ls should not be NULL", K(ret), K(ls_handle), K(ls_id));
+  } else if (OB_FAIL(online_ls_(ls))) {
+    LOG_WARN("failed to online ls", K(ret), KPC(ls), K(ls_id));
+  }
+  return ret;
+}
+
+int ObLSService::online_ls_(ObLS *ls)
+{
+  int ret = OB_SUCCESS;
+  int64_t create_type = ObLSCreateType::NORMAL;
+  if (!is_inited_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("ls service do not init", K(ret));
+  } else if (OB_ISNULL(ls)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("online ls get invalid argument", K(ret), KPC(ls));
+  } else {
+    ObLSLockGuard lock_ls(ls);
+    if (OB_FAIL(ls->get_create_type(create_type))) {
+      LOG_WARN("get ls create type failed", K(ret));
+    } else if (OB_FAIL(post_create_ls_(create_type, ls))) {
+      LOG_WARN("post create ls failed", K(ret));
     }
   }
   return ret;

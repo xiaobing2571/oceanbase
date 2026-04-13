@@ -16,6 +16,7 @@
 #include "lib/container/ob_array.h"
 #include "share/ob_unit_table_operator.h"
 #include "share/ob_unit_stat.h"
+#include "share/ob_share_util.h"
 #include "share/ob_check_stop_provider.h"
 #include "share/rc/ob_tenant_base.h"
 
@@ -74,7 +75,8 @@ public:
              const bool has_memstore,
              const bool is_remove,
              const int64_t hidden_sys_data_disk_config_size,
-             const int64_t actual_data_disk_size);
+             const int64_t actual_data_disk_size,
+             const common::ObReplicaType &replica_type);
 
     int divide_meta_tenant(ObTenantConfig& meta_tenant_config);
 
@@ -86,7 +88,7 @@ public:
                  "unit_status", get_unit_status_str(unit_status_),
                  K_(config), K_(mode), K_(create_timestamp), K_(is_removed),
                  K_(hidden_sys_data_disk_config_size),
-                 K_(actual_data_disk_size));
+                 K_(actual_data_disk_size), K_(replica_type));
 
     bool is_valid() const
     {
@@ -96,11 +98,12 @@ public:
           config_.is_valid() && mode_ != lib::Worker::CompatMode::INVALID &&
           hidden_sys_data_disk_config_size_ >= 0 &&
           actual_data_disk_size_ >= 0;
+          ObShareUtil::is_valid_replica_type_for_unit(replica_type_);
     }
 
-    int64_t get_effective_actual_data_disk_size() const
+    int64_t get_actual_data_disk_size() const
     {
-      return 0 == config_.data_disk_size() ? actual_data_disk_size_ : config_.data_disk_size();
+      return actual_data_disk_size_;
     }
 
     int64_t gen_init_actual_data_disk_size(const share::ObUnitConfig &config) const;
@@ -122,6 +125,7 @@ public:
     //   For sys tenant, config_.data_disk_size() can not be 0, and actual_data_disk_size_ is always 0.
     // In SN mode, actual_data_disk_size_ is always 0.
     int64_t actual_data_disk_size_;
+    common::ObReplicaType replica_type_;
   };
 
   struct ObServerConfig

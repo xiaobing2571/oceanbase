@@ -170,6 +170,7 @@ public:
   static int create_expr_constraint(ObQueryCtx &query_ctx,
                                     ObExecContext &exec_ctx,
                                     const ObIArray<ObHiddenColumnItem> &pre_calc_exprs,
+                                    const ObIArray<ObConstraintExtra> &cons_extras,
                                     const PreCalcExprExpectResult expect_result);
   //simplyfy and rewrite stmt
   static int transform_stmt(ObSqlSchemaGuard *sql_schema_guard,
@@ -194,7 +195,8 @@ public:
                          ObSqlCtx &context,
                          ObResultSet &result,
                          ParamStore &params,
-                         PlanCacheMode mode);
+                         PlanCacheMode mode,
+                         ObPlanCacheCtx &pc_ctx);
 
   int handle_pl_prepare(const ObString &sql,
                         ObSPIService::PLPrepareCtx &pl_prepare_ctx,
@@ -207,9 +209,37 @@ public:
                         ObResultSet &result,
                         ObSqlCtx &context,
                         bool is_prepare_protocol,
-                        bool is_dynamic_sql);
+                        bool is_dynamic_sql,
+                        bool try_paramlize = false);
+
+  int inner_handle_pl_execute(const ObString &sql,
+                             ObSQLSessionInfo &session_info,
+                             ParamStore &params,
+                             ObResultSet &result,
+                             ObSqlCtx &context,
+                             bool is_prepare_protocol,
+                             bool is_dynamic_sql,
+                             ObPlanCacheCtx &pc_ctx);
   static int construct_parameterized_params(const ParamStore &params,
                                             ObPlanCacheCtx &phy_ctx);
+
+public:
+  /* @brief: parse sql and get stmt_type and input_param_cnt,
+   *         designed for prexecute protocol
+   * @param session_info [in] sql session info
+   * @param context [in] sql context
+   * @param sql [in] sql string to be parsed
+   * @param parse_result [out] parse result, contains syntax tree and other info
+   * @param stmt_type [out] stmt type
+   * @param input_param_cnt [out] input param count
+   * @return oceanbase error code defined in lib/ob_errno.def
+   */
+  int handle_prexec_parse_sql(ObSQLSessionInfo &session_info,
+                              ObSqlCtx &context,
+                              const ObString &sql,
+                              ParseResult &parse_result,
+                              stmt::StmtType &stmt_type,
+                              int64_t &input_param_cnt);
 
 public:
   //for sql test only
@@ -320,6 +350,13 @@ private:
                            ObResultSet &result,
                            ObPlanCacheCtx &pc_ctx,
                            const int get_plan_err);
+
+  int deal_generate_physical_plan_error(ObExecContext &exec_ctx, ObPlanCacheCtx &pc_ctx, int ret);
+#ifdef OB_BUILD_SPM
+  int pc_add_spm_plan(ObPlanCacheCtx &pc_ctx,
+                      ObResultSet &result, ObOutlineState &outline_state,
+                      ObPlanCache *plan_cache);
+#endif
   // @brief  Generate 'stmt' from syntax tree
   // @param parse_result[in]     syntax tree
   // @param select_item_param_infos           select_item_param_infos from fast parser
@@ -335,7 +372,8 @@ private:
                     ObIAllocator &allocator,
                     ObResultSet &result,
                     ObStmt *&basic_stmt,
-                    ParseResult *outline_parse_result = NULL);
+                    ParseResult *outline_parse_result = NULL,
+                    ObOutlineState *outline_state = NULL);
 
   // Generate Physical Plan for given syntax tree
   // called by handle_text_query
@@ -352,7 +390,8 @@ private:
                              ObResultSet &result,
                              const bool is_begin_commit_stmt,
                              const PlanCacheMode mode,
-                             ParseResult *outline_parse_result = NULL);
+                             ParseResult *outline_parse_result = NULL,
+                             ObOutlineState *outline_state = NULL);
 
   int generate_plan(ParseResult &parse_result,
                     ObPlanCacheCtx *pc_ctx,

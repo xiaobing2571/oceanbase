@@ -15,6 +15,9 @@
 #include "ob_backup_base_job.h"
 #include "share/backup/ob_backup_clean_struct.h"
 #include "share/backup/ob_archive_struct.h"
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "share/backup/ob_ss_ha_macro_block_table_operator.h"
+#endif
 
 namespace oceanbase
 {
@@ -32,8 +35,10 @@ namespace rootserver
 {
 class ObIBackupDeleteMgr;
 class ObBackupTaskScheduler;
-class ObBackupCleanService;
+class ObBackupMgrService;
 class ObServerManager;
+
+
 class ObBackupCleanScheduler : public ObIBackupJobScheduler
 {
 public:
@@ -41,12 +46,12 @@ public:
   virtual ~ObBackupCleanScheduler() {};
 public:
   virtual int process() override;
-  virtual int force_cancel(const uint64_t &tenant_id) override; // for lease 
+  virtual int force_cancel(const uint64_t tenant_id) override; // for lease
   virtual int handle_execute_over(
       const ObBackupScheduleTask *task,
       const share::ObHAResultInfo &result_info,
       bool &can_remove) override;
-  virtual int get_need_reload_task(common::ObIAllocator &allocator, common::ObIArray<ObBackupScheduleTask *> &tasks) override; // reload tasks after switch master happend
+  virtual int reload_task(common::ObIAllocator &allocator, ObBackupTaskSchedulerQueue &queue) override; // reload tasks after switch master happend
 public:
   int init(
       const uint64_t tenant_id,
@@ -54,7 +59,7 @@ public:
       obrpc::ObSrvRpcProxy &rpc_proxy,
       share::schema::ObMultiVersionSchemaService &schema_service,
       ObBackupTaskScheduler &task_scheduler,
-      ObBackupCleanService &backup_service);
+      ObBackupMgrService &backup_service);
   int start_schedule_backup_clean(const obrpc::ObBackupCleanArg &in_arg);
   int cancel_backup_clean_job(const obrpc::ObBackupCleanArg &in_arg);
   int add_delete_policy(const obrpc::ObDeletePolicyArg &in_arg);
@@ -69,14 +74,32 @@ private:
       common::ObIArray<share::ObBackupCleanJobAttr> &job_attrs);
   int get_next_job_id_(common::ObISQLClient &trans, const uint64_t tenant_id, int64_t &job_id);
   int get_job_need_reload_task(
-      const share::ObBackupCleanJobAttr &job, 
-      common::ObIAllocator &allocator, 
-      common::ObIArray<ObBackupScheduleTask *> &tasks);
-  int do_get_need_reload_task_(
-      const share::ObBackupCleanTaskAttr &task_attr,
-      const ObArray<share::ObBackupCleanLSTaskAttr> &ls_tasks, 
+      const share::ObBackupCleanJobAttr &job,
       common::ObIAllocator &allocator,
-      ObIArray<ObBackupScheduleTask *> &tasks);
+      ObBackupTaskSchedulerQueue &queue);
+  int do_reload_for_task_(
+      const share::ObBackupCleanTaskAttr &task_attr,
+      common::ObIAllocator &allocator,
+      ObBackupTaskSchedulerQueue &queue);
+  int do_reload_single_clean_ls_task_(
+      const share::ObBackupCleanTaskAttr &task_attr,
+      const share::ObBackupCleanLSTaskAttr &ls_task,
+      common::ObIAllocator &allocator,
+      ObBackupTaskSchedulerQueue &queue);
+#ifdef OB_BUILD_SHARED_STORAGE
+  int build_macro_block_task_(
+      const share::ObBackupCleanJobAttr &job_attr,
+      const share::ObBackupCleanTaskAttr &task_attr,
+      const share::ObSSHAMacroBlockTaskAttr &macro_task_attr,
+      common::ObIAllocator &allocator,
+      ObBackupScheduleTask *&task);
+  int do_reload_macro_block_tasks_(
+      const share::ObBackupCleanJobAttr &job_attr,
+      const share::ObBackupCleanTaskAttr &task_attr,
+      const ObArray<share::ObSSHAMacroBlockTaskAttr> &macro_tasks,
+      common::ObIAllocator &allocator,
+      ObBackupTaskSchedulerQueue &queue);
+#endif
   int build_task_(
       const share::ObBackupCleanTaskAttr &task_attr, 
       const share::ObBackupCleanLSTaskAttr &ls_task, 
@@ -95,7 +118,22 @@ private:
   int fill_template_delete_policy_(
       const obrpc::ObDeletePolicyArg &in_arg,
       share::ObDeletePolicyAttr &policy_attr);
+  int add_delete_policy_(const share::ObDeletePolicyAttr &policy_attr);
+  int drop_delete_policy_(const share::ObDeletePolicyAttr &policy_attr);
   int handle_failed_job_(const uint64_t tenant_id, const int64_t result, ObIBackupDeleteMgr &job_mgr, share::ObBackupCleanJobAttr &job_attr);
+  int set_tenant_obsolete_parameter_(share::ObBackupCleanJobAttr &job_attr);
+  int parse_time_interval_(const char *str, int64_t &val);
+  int get_delete_policy_parameter_(const share::ObDeletePolicyAttr &delete_policy, int64_t &recovery_window);
+  int backup_clean_pre_checker_(share::ObBackupCleanJobAttr &job_attr, const bool is_sys_tenant);
+  int handle_macro_block_task_execute_over_(
+      const ObBackupScheduleTask *task,
+      const share::ObHAResultInfo &result_info,
+      bool &can_remove);
+  int handle_ls_task_execute_over_(
+      const ObBackupScheduleTask *task,
+      const share::ObHAResultInfo &result_info,
+      bool &can_remove);
+  bool check_need_cancel_job_(const ObIArray<share::ObBackupCleanJobAttr> &clean_jobs);
 private:
   bool is_inited_;
   uint64_t tenant_id_;
@@ -103,7 +141,7 @@ private:
   obrpc::ObSrvRpcProxy                       *rpc_proxy_;
   share::schema::ObMultiVersionSchemaService *schema_service_;
   ObBackupTaskScheduler                      *task_scheduler_;
-  ObBackupCleanService                            *backup_service_;
+  ObBackupMgrService                            *backup_service_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObBackupCleanScheduler);        
 };
@@ -123,7 +161,7 @@ public:
       obrpc::ObSrvRpcProxy &rpc_proxy,
       ObBackupTaskScheduler &task_scheduler,
       share::schema::ObMultiVersionSchemaService &schema_service_,
-      ObBackupCleanService &backup_service);
+      ObBackupMgrService &backup_service);
   void reset();
   uint64_t get_tenant_id() const { return tenant_id_; }
   bool is_can_retry(const int err) const;
@@ -135,7 +173,7 @@ protected:
   obrpc::ObSrvRpcProxy *rpc_proxy_;
   ObBackupTaskScheduler *task_scheduler_;
   share::schema::ObMultiVersionSchemaService *schema_service_;
-  ObBackupCleanService *backup_service_;
+  ObBackupMgrService *backup_service_;
   DISALLOW_COPY_AND_ASSIGN(ObIBackupDeleteMgr);
 };
 
@@ -151,15 +189,18 @@ private:
   int get_need_cleaned_backup_infos_(
       ObArray<share::ObBackupSetFileDesc> &set_list,
       ObArray<share::ObTenantArchivePieceAttr> &piece_list);
-  int get_delete_backup_set_infos_(ObArray<share::ObBackupSetFileDesc> &set_list);
-  int get_delete_backup_piece_infos_(ObArray<share::ObTenantArchivePieceAttr> &piece_list);
+  int get_delete_backup_set_infos_(ObIArray<share::ObBackupSetFileDesc> &set_list);
+  int get_delete_backup_piece_infos_(ObIArray<share::ObTenantArchivePieceAttr> &piece_list);
   int get_delete_obsolete_backup_infos_(
       ObArray<share::ObBackupSetFileDesc> &set_list,
       ObArray<share::ObTenantArchivePieceAttr> &piece_list);
   int check_can_delete_set_();
   int check_can_delete_piece_();
   int insert_backup_task_attr_(common::ObISQLClient &sql_proxy, bool &is_exist);
-  int get_next_task_id_(int64_t &task_id);
+  int get_next_task_id_(const int64_t batch_size, int64_t &start_task_id);
+  int delete_rounds_placeholders_(const ObArray<share::ObBackupCleanTaskAttr> &task_attrs);
+  int get_round_range_to_delete_(const ObArray<share::ObBackupCleanTaskAttr> &task_attrs,
+      ObIArray<int64_t> &round_ids, common::hash::ObHashMap<int64_t, share::ObBackupPathString> &piece_round_to_backup_path);
   int do_backup_clean_task_();
   int do_cleanup_();
   int cancel_();
@@ -174,17 +215,17 @@ private:
   int get_backup_dest_(share::ObBackupCleanJobAttr &job_attr);
   int set_current_backup_dest_();
   int check_can_backup_clean_();
-  int get_backup_piece_task_(const share::ObTenantArchivePieceAttr &backup_piece_info, share::ObBackupCleanTaskAttr &task_attr);
-  int get_backup_clean_task_(const share::ObBackupSetFileDesc &backup_set_info, share::ObBackupCleanTaskAttr &task_attr);
+  int generate_backup_clean_set_task_(const share::ObBackupSetFileDesc &backup_set_info,
+                                      const int64_t task_id,
+                                      share::ObBackupCleanTaskAttr &task_attr);
+  int generate_backup_clean_piece_task_(const share::ObTenantArchivePieceAttr &backup_piece_info,
+                                        const int64_t task_id,
+                                        share::ObBackupCleanTaskAttr &task_attr);
   int update_task_to_canceling_(ObArray<share::ObBackupCleanTaskAttr> &task_attrs);
   int do_backup_clean_tasks_(const ObArray<share::ObBackupCleanTaskAttr> &task_attrs);
-  int get_delete_obsolete_backup_piece_infos_(
-      const share::ObBackupSetFileDesc &clog_data_clean_point,
-      ObArray<share::ObTenantArchivePieceAttr> &piece_list);
-  int get_delete_obsolete_backup_set_infos_(
-      share::ObBackupSetFileDesc &clog_data_clean_point,
-      ObArray<share::ObBackupSetFileDesc> &set_list);
-  bool can_backup_pieces_be_deleted(const share::ObArchivePieceStatus &status);
+  int get_delete_backup_all_infos_(
+      ObIArray<share::ObBackupSetFileDesc> &set_list,
+      ObIArray<share::ObTenantArchivePieceAttr> &piece_list);
   int persist_backup_clean_tasks_(common::ObISQLClient &trans, const ObArray<share::ObBackupSetFileDesc> &set_list);
   int persist_backup_piece_task_(common::ObISQLClient &trans, const ObArray<share::ObTenantArchivePieceAttr> &piece_list);
   int handle_backup_clean_task(
@@ -198,9 +239,11 @@ private:
   int check_data_backup_dest_validity_();
   int check_log_archive_dest_validity_();
   int check_dest_validity_();
-  int get_all_dest_backup_piece_infos_(
-    const share::ObBackupSetFileDesc &clog_data_clean_point,
-    ObArray<share::ObTenantArchivePieceAttr> &backup_piece_infos);
+  int delete_backup_all_meta_info_files_();
+  int delete_backup_dest_meta_info_files_(share::ObBackupDest &backup_dest);
+  int delete_archive_dest_meta_info_files_(share::ObBackupDest &log_archive_dest);
+  int check_delete_all_dest_path_in_use_(common::ObISQLClient &trans);
+
   struct CompareBackupSetInfo
   {
     bool operator()(const share::ObBackupSetFileDesc &lhs,
@@ -220,6 +263,8 @@ private:
 private:
   DISALLOW_COPY_AND_ASSIGN(ObUserTenantBackupDeleteMgr);    
 };
+
+
 
 class ObSysTenantBackupDeleteMgr : public ObIBackupDeleteMgr
 {
@@ -265,13 +310,9 @@ public:
       obrpc::ObSrvRpcProxy &rpc_proxy,
       share::schema::ObMultiVersionSchemaService &schema_service,
       ObBackupTaskScheduler &task_scheduler,
-      ObBackupCleanService &backup_service);
+      ObBackupMgrService &backup_service);
 private:
   int start_auto_delete_obsolete_data_();
-  int get_delete_policy_parameter_(
-      const share::ObDeletePolicyAttr &delete_policy,
-      int64_t &recovery_window);
-  int parse_time_interval_(const char *str, int64_t &val);
 private:
   bool is_inited_;
   uint64_t tenant_id_;
@@ -279,7 +320,7 @@ private:
   obrpc::ObSrvRpcProxy                       *rpc_proxy_;
   share::schema::ObMultiVersionSchemaService *schema_service_;
   ObBackupTaskScheduler                      *task_scheduler_;
-  ObBackupCleanService                            *backup_service_;
+  ObBackupMgrService                            *backup_service_;
   DISALLOW_COPY_AND_ASSIGN(ObBackupAutoObsoleteDeleteTrigger); 
 };
 

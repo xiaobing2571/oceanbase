@@ -201,7 +201,15 @@ public:
   virtual bool is_needed() const { return col_param_ != NULL && col_param_->need_avg_len(); }
   const char *get_fmt() const
   {
-    return lib::is_oracle_mode() ? " SUM_OPNSIZE(\"%.*s\")/decode(COUNT(*),0,1,COUNT(*))" : " SUM_OPNSIZE(`%.*s`)/(case when COUNT(*) = 0 then 1 else COUNT(*) end)";
+    const char* fmt = nullptr;
+    if (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_3_1_0) {
+      fmt = lib::is_oracle_mode() ? " SUM_OPNSIZE(\"%.*s\")/decode(COUNT(*),0,1,COUNT(*))"
+                                  : " SUM_OPNSIZE(`%.*s`)/(case when COUNT(*) = 0 then 1 else COUNT(*) end)";
+    } else {
+      fmt = lib::is_oracle_mode() ? " AVG(SYS_OP_OPNSIZE(\"%.*s\"))"
+                                  : " AVG(SYS_OP_OPNSIZE(`%.*s`))";
+    }
+    return fmt;
   }
   virtual int decode(ObObj &obj) override;
   virtual int gen_expr(char *buf, const int64_t buf_len, int64_t &pos) override;
@@ -302,6 +310,38 @@ public:
   virtual int decode(ObObj &obj, ObIAllocator &allocator) override;
 };
 
+class ObStatLobInrowCount : public ObStatColItem
+{
+public:
+  ObStatLobInrowCount() {}
+  ObStatLobInrowCount(const ObColumnStatParam *param,
+                      ObOptColumnStat *stat) :
+    ObStatColItem(param, stat)
+  {}
+  virtual bool is_needed() const override
+  {
+    bool bret = false;
+    if (col_param_ != NULL) {
+      bret = col_param_->need_basic_stat() &&
+      (col_param_->is_string_column() || col_param_->is_text_column());
+    }
+    return bret;
+  }
+  const char *get_fmt() const
+  {
+    const char *fmt = nullptr;
+    if (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_5_1_0) {
+      fmt = lib::is_oracle_mode() ? " SYS_COUNT_INROW(\"%.*s\")"
+                                  : " SYS_COUNT_INROW(`%.*s`)";
+    } else {
+      fmt = lib::is_oracle_mode() ? " COUNT(\"%.*s\")"
+                                  : " COUNT(`%.*s`)";
+    }
+    return fmt;
+  }
+
+  virtual int decode(ObObj &obj, ObIAllocator &allocator) override;
+};
 class ObGlobalTableStat
 {
 public:
@@ -312,7 +352,8 @@ public:
       sstable_row_cnt_(0), memtable_row_cnt_(0)
   {}
 
-  void add(int64_t rc, int64_t rs, int64_t ds, int64_t mac, int64_t mic);
+  void add(int64_t rc, int64_t rs, int64_t ds, int64_t mac, int64_t mic,
+           int64_t scnt, int64_t mcnt);
   int add(int64_t rc, int64_t rs, int64_t ds, int64_t mac, int64_t mic,
           ObIArray<int64_t> &cg_macro_arr, ObIArray<int64_t> &cg_micro_arr,
           int64_t scnt, int64_t mcnt);
@@ -375,6 +416,8 @@ public:
   int merge();
   TO_STRING_KV(K(skip_sample_cnt_arr_), K(cg_skip_rate_arr_));
 
+  uint64_t count() {return count_;}
+
 private:
   uint64_t count_; //increment when add
   ObArray<uint64_t> skip_sample_cnt_arr_;
@@ -406,7 +449,7 @@ class ObGlobalNdvEval
   const int64_t NUM_LLC_BUCKET = ObOptColumnStat::NUM_LLC_BUCKET;
 
 public:
-  ObGlobalNdvEval() : global_ndv_(0), part_cnt_(0)
+  ObGlobalNdvEval() : global_ndv_(0), part_cnt_(0), liner_ndv_(0)
   {
     MEMSET(global_llc_bitmap_, 0, ObOptColumnStat::NUM_LLC_BUCKET);
   }
@@ -414,7 +457,7 @@ public:
   void add(int64_t ndv, const char *llc_bitmap);
 
   int64_t get() const;
-
+  int64_t get_liner_ndv() const;
   void get_llc_bitmap(char *llc_bitmap, const int64_t llc_bitmap_size) const;
 
   static double select_alpha_value(const int64_t num_bucket);
@@ -425,6 +468,7 @@ private:
   int64_t global_ndv_;
   int64_t part_cnt_;
   char global_llc_bitmap_[ObOptColumnStat::NUM_LLC_BUCKET];
+  int64_t liner_ndv_;
 };
 
 class ObGlobalMaxEval
@@ -519,6 +563,31 @@ public:
 
 private:
   int64_t global_num_not_null_;
+};
+
+class ObGlobalLobInrowCountEval
+{
+public:
+  ObGlobalLobInrowCountEval() : global_lob_inrow_count_(0), is_valid_(false)
+  {
+  }
+
+  void add(int64_t lob_inrow_count)
+  {
+    if (lob_inrow_count > 0) {
+      global_lob_inrow_count_ += lob_inrow_count;
+      is_valid_ = true;
+    }
+  }
+
+  int64_t get() const
+  {
+    return is_valid_ ? global_lob_inrow_count_ : -1;
+  }
+
+private:
+  int64_t global_lob_inrow_count_;
+  bool is_valid_;
 };
 
 class ObGlobalCgBlockCntEval {

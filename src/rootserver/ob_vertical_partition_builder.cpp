@@ -68,6 +68,7 @@ int ObVertialPartitionBuilder::generate_aux_vp_table_schema(
       } else {
         aux_vp_table_schema.set_micro_index_clustered(data_schema.get_micro_index_clustered());
         aux_vp_table_schema.set_enable_macro_block_bloom_filter(data_schema.get_enable_macro_block_bloom_filter());
+        aux_vp_table_schema.set_micro_block_format_version(data_schema.get_micro_block_format_version());
       }
     }
   }
@@ -134,12 +135,17 @@ int ObVertialPartitionBuilder::set_basic_infos(
   }
   aux_vp_table_schema.set_autoinc_column_id(0);
   aux_vp_table_schema.set_progressive_merge_num(data_schema.get_progressive_merge_num());
-  aux_vp_table_schema.set_table_mode(data_schema.get_table_mode());
+  aux_vp_table_schema.set_table_mode_struct(data_schema.get_table_mode_struct());
   aux_vp_table_schema.set_block_size(data_schema.get_block_size());
   aux_vp_table_schema.set_pctfree(data_schema.get_pctfree());
   aux_vp_table_schema.set_storage_format_version(data_schema.get_storage_format_version());
   aux_vp_table_schema.set_progressive_merge_round(data_schema.get_progressive_merge_round());
-  if (OB_FAIL(aux_vp_table_schema.set_compress_func_name(data_schema.get_compress_func_name()))) {
+  aux_vp_table_schema.set_merge_engine_type(data_schema.get_merge_engine_type());
+  if (OB_FAIL(aux_vp_table_schema.set_ttl_definition(
+      data_schema.get_ttl_definition(),
+      data_schema.get_ttl_flag()))) {
+    LOG_WARN("set ttl definition failed", K(ret));
+  } else if (OB_FAIL(aux_vp_table_schema.set_compress_func_name(data_schema.get_compress_func_name()))) {
     LOG_WARN("set_compress_func_name failed", K(data_schema));
   }
 

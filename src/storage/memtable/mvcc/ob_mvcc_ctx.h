@@ -90,7 +90,6 @@ public: // for mvcc engine invoke
   virtual common::ObIAllocator &get_query_allocator() = 0;
   virtual void set_conflict_trans_id(const uint32_t descriptor)
   { UNUSED(descriptor); }
-  virtual int add_conflict_trans_id(const transaction::ObTransID conflict_trans_id) = 0;
   virtual int read_lock_yield() { return common::OB_SUCCESS; }
   virtual int write_lock_yield() { return common::OB_SUCCESS; }
   virtual int append_callback(ObITransCallback *cb) = 0;
@@ -181,13 +180,16 @@ public:
       ObMemCtxLockOpLinkNode *lock_op,
       const share::SCN scn);
   int register_ext_info_commit_cb(
+      storage::ObStoreCtx &store_ctx,
       const int64_t timeout,
       const blocksstable::ObDmlFlag dml_flag,
       const transaction::ObTxSEQ &seq_no_st,
       const int64_t seq_no_cnt,
       const ObString &index_data,
       const ObObjType index_data_type,
+      const transaction::ObTxReadSnapshot &snapshot,
       const storage::ObExtInfoLogHeader &header,
+      const ObTabletID &tabelt_id,
       ObObj &ext_info_data);
 public:
   virtual void reset()
@@ -229,7 +231,6 @@ public:
                                                         transaction::tablelock::ObLockMemtable *memtable) = 0;
   virtual void free_table_lock_callback(ObITransCallback *cb) = 0;
   ObMvccRowCallback *alloc_row_callback(ObIMvccCtx &ctx, ObMvccRow &value, ObMemtable *memtable);
-  ObMvccRowCallback *alloc_row_callback(ObMvccRowCallback &cb, ObMemtable *memtable);
 private:
   void check_row_callback_registration_between_stmt_();
   int register_table_lock_cb_(
@@ -261,7 +262,8 @@ public:
       memtable_(NULL),
       write_ret_(NULL),
       write_seq_no_(),
-      try_flush_redo_(true)
+      try_flush_redo_(true),
+      is_lob_ext_info_log_(false)
   {}
   ObMvccWriteGuard(const int &ret, const bool exclusive = false)
     : ObMvccWriteGuard(exclusive)
@@ -272,6 +274,8 @@ public:
   void set_memtable(ObMemtable *memtable) {
     memtable_ = memtable;
   }
+
+  void set_is_lob_ext_info_log(const bool val) { is_lob_ext_info_log_ = val; }
   /*
    * purpose of ensure replica writable
    *
@@ -289,6 +293,7 @@ private:
   const int *write_ret_;        // used to sense write result is ok or fail
   transaction::ObTxSEQ write_seq_no_;
   bool try_flush_redo_;
+  bool is_lob_ext_info_log_;
 };
 }
 }

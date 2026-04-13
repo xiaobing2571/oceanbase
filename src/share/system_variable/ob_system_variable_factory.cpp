@@ -12,6 +12,11 @@
 
 #define USING_LOG_PREFIX SQL_SESSION
 #include "share/system_variable/ob_system_variable_factory.h"
+#include "src/observer/omt/ob_tenant_config_mgr.h"
+#include "share/ob_server_struct.h"
+#include "src/sql/engine/expr/ob_expr_operator.h"
+#include "src/sql/session/ob_basic_session_info.h"
+
 using namespace oceanbase::common;
 
 namespace oceanbase
@@ -557,6 +562,18 @@ const char *ObSysVarEnableOptimizerRowgoal::ENABLE_OPTIMIZER_ROWGOAL_NAMES[] = {
   "ON",
   0
 };
+const char *ObSysVarSqlTranspiler::SQL_TRANSPILER_NAMES[] = {
+  "OFF",
+  "ON",
+  "BASIC",
+  0
+};
+const char *ObSysVarApQueryRoutePolicy::AP_QUERY_ROUTE_POLICY_NAMES[] = {
+  "OFF",
+  "AUTO",
+  "FORCE",
+  0
+};
 
 const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "__ob_client_capability_flag",
@@ -577,6 +594,8 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "_force_parallel_dml_dop",
   "_force_parallel_query_dop",
   "_groupby_nopushdown_cut_ratio",
+  "_idp_step_reduction_threshold",
+  "_join_order_enum_threshold",
   "_nlj_batching_enabled",
   "_ob_enable_role_ids",
   "_ob_ols_policy_session_labels",
@@ -586,6 +605,7 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "_ob_px_slave_mapping_threshold",
   "_optimizer_cost_based_transformation",
   "_optimizer_gather_stats_on_load",
+  "_optimizer_max_permutations",
   "_optimizer_null_aware_antijoin",
   "_oracle_sql_select_limit",
   "_priv_control",
@@ -603,6 +623,9 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "_show_ddl_in_compat_mode",
   "_windowfunc_optimization_settings",
   "activate_all_roles_on_login",
+  "ap_query_cost_threshold",
+  "ap_query_replica_fallback",
+  "ap_query_route_policy",
   "auto_generate_certs",
   "auto_increment_cache_size",
   "auto_increment_increment",
@@ -631,6 +654,7 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "binlog_transaction_dependency_tracking",
   "block_encryption_mode",
   "bulk_insert_buffer_size",
+  "caching_sha2_password_digest_rounds",
   "cardinality_estimation_model",
   "character_set_client",
   "character_set_connection",
@@ -1096,6 +1120,7 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "ob_enable_index_direct_select",
   "ob_enable_jit",
   "ob_enable_parameter_anonymous_block",
+  "ob_enable_pl_async_commit",
   "ob_enable_pl_cache",
   "ob_enable_plan_cache",
   "ob_enable_ps_parameter_anonymous_block",
@@ -1207,6 +1232,7 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "performance_schema_show_processlist",
   "performance_schema_users_size",
   "pid_file",
+  "plsql_can_transform_sql_to_assign",
   "plsql_ccflags",
   "plsql_optimize_level",
   "plsql_warnings",
@@ -1337,6 +1363,7 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "sql_throttle_network",
   "sql_throttle_priority",
   "sql_throttle_rt",
+  "sql_transpiler",
   "sql_warnings",
   "ssl_ca",
   "ssl_capath",
@@ -1418,6 +1445,8 @@ const ObSysVarClassType ObSysVarFactory::SYS_VAR_IDS_SORTED_BY_NAME[] = {
   SYS_VAR__FORCE_PARALLEL_DML_DOP,
   SYS_VAR__FORCE_PARALLEL_QUERY_DOP,
   SYS_VAR__GROUPBY_NOPUSHDOWN_CUT_RATIO,
+  SYS_VAR__IDP_STEP_REDUCTION_THRESHOLD,
+  SYS_VAR__JOIN_ORDER_ENUM_THRESHOLD,
   SYS_VAR__NLJ_BATCHING_ENABLED,
   SYS_VAR__OB_ENABLE_ROLE_IDS,
   SYS_VAR__OB_OLS_POLICY_SESSION_LABELS,
@@ -1427,6 +1456,7 @@ const ObSysVarClassType ObSysVarFactory::SYS_VAR_IDS_SORTED_BY_NAME[] = {
   SYS_VAR__OB_PX_SLAVE_MAPPING_THRESHOLD,
   SYS_VAR__OPTIMIZER_COST_BASED_TRANSFORMATION,
   SYS_VAR__OPTIMIZER_GATHER_STATS_ON_LOAD,
+  SYS_VAR__OPTIMIZER_MAX_PERMUTATIONS,
   SYS_VAR__OPTIMIZER_NULL_AWARE_ANTIJOIN,
   SYS_VAR__ORACLE_SQL_SELECT_LIMIT,
   SYS_VAR__PRIV_CONTROL,
@@ -1444,6 +1474,9 @@ const ObSysVarClassType ObSysVarFactory::SYS_VAR_IDS_SORTED_BY_NAME[] = {
   SYS_VAR__SHOW_DDL_IN_COMPAT_MODE,
   SYS_VAR__WINDOWFUNC_OPTIMIZATION_SETTINGS,
   SYS_VAR_ACTIVATE_ALL_ROLES_ON_LOGIN,
+  SYS_VAR_AP_QUERY_COST_THRESHOLD,
+  SYS_VAR_AP_QUERY_REPLICA_FALLBACK,
+  SYS_VAR_AP_QUERY_ROUTE_POLICY,
   SYS_VAR_AUTO_GENERATE_CERTS,
   SYS_VAR_AUTO_INCREMENT_CACHE_SIZE,
   SYS_VAR_AUTO_INCREMENT_INCREMENT,
@@ -1472,6 +1505,7 @@ const ObSysVarClassType ObSysVarFactory::SYS_VAR_IDS_SORTED_BY_NAME[] = {
   SYS_VAR_BINLOG_TRANSACTION_DEPENDENCY_TRACKING,
   SYS_VAR_BLOCK_ENCRYPTION_MODE,
   SYS_VAR_BULK_INSERT_BUFFER_SIZE,
+  SYS_VAR_CACHING_SHA2_PASSWORD_DIGEST_ROUNDS,
   SYS_VAR_CARDINALITY_ESTIMATION_MODEL,
   SYS_VAR_CHARACTER_SET_CLIENT,
   SYS_VAR_CHARACTER_SET_CONNECTION,
@@ -1937,6 +1971,7 @@ const ObSysVarClassType ObSysVarFactory::SYS_VAR_IDS_SORTED_BY_NAME[] = {
   SYS_VAR_OB_ENABLE_INDEX_DIRECT_SELECT,
   SYS_VAR_OB_ENABLE_JIT,
   SYS_VAR_OB_ENABLE_PARAMETER_ANONYMOUS_BLOCK,
+  SYS_VAR_OB_ENABLE_PL_ASYNC_COMMIT,
   SYS_VAR_OB_ENABLE_PL_CACHE,
   SYS_VAR_OB_ENABLE_PLAN_CACHE,
   SYS_VAR_OB_ENABLE_PS_PARAMETER_ANONYMOUS_BLOCK,
@@ -2048,6 +2083,7 @@ const ObSysVarClassType ObSysVarFactory::SYS_VAR_IDS_SORTED_BY_NAME[] = {
   SYS_VAR_PERFORMANCE_SCHEMA_SHOW_PROCESSLIST,
   SYS_VAR_PERFORMANCE_SCHEMA_USERS_SIZE,
   SYS_VAR_PID_FILE,
+  SYS_VAR_PLSQL_CAN_TRANSFORM_SQL_TO_ASSIGN,
   SYS_VAR_PLSQL_CCFLAGS,
   SYS_VAR_PLSQL_OPTIMIZE_LEVEL,
   SYS_VAR_PLSQL_WARNINGS,
@@ -2178,6 +2214,7 @@ const ObSysVarClassType ObSysVarFactory::SYS_VAR_IDS_SORTED_BY_NAME[] = {
   SYS_VAR_SQL_THROTTLE_NETWORK,
   SYS_VAR_SQL_THROTTLE_PRIORITY,
   SYS_VAR_SQL_THROTTLE_RT,
+  SYS_VAR_SQL_TRANSPILER,
   SYS_VAR_SQL_WARNINGS,
   SYS_VAR_SSL_CA,
   SYS_VAR_SSL_CAPATH,
@@ -3078,7 +3115,17 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_ID[] = {
   "ob_enable_ps_parameter_anonymous_block",
   "ob_hnsw_extra_info_max_size",
   "_push_join_predicate",
-  "ob_sparse_drop_ratio_search"
+  "ob_sparse_drop_ratio_search",
+  "sql_transpiler",
+  "plsql_can_transform_sql_to_assign",
+  "_join_order_enum_threshold",
+  "_optimizer_max_permutations",
+  "_idp_step_reduction_threshold",
+  "ob_enable_pl_async_commit",
+  "caching_sha2_password_digest_rounds",
+  "ap_query_route_policy",
+  "ap_query_cost_threshold",
+  "ap_query_replica_fallback"
 };
 
 bool ObSysVarFactory::sys_var_name_case_cmp(const char *name1, const ObString &name2)
@@ -4121,6 +4168,16 @@ int ObSysVarFactory::create_all_sys_vars()
         + sizeof(ObSysVarObHnswExtraInfoMaxSize)
         + sizeof(ObSysVarPushJoinPredicate)
         + sizeof(ObSysVarObSparseDropRatioSearch)
+        + sizeof(ObSysVarSqlTranspiler)
+        + sizeof(ObSysVarPlsqlCanTransformSqlToAssign)
+        + sizeof(ObSysVarJoinOrderEnumThreshold)
+        + sizeof(ObSysVarOptimizerMaxPermutations)
+        + sizeof(ObSysVarIdpStepReductionThreshold)
+        + sizeof(ObSysVarObEnablePlAsyncCommit)
+        + sizeof(ObSysVarCachingSha2PasswordDigestRounds)
+        + sizeof(ObSysVarApQueryRoutePolicy)
+        + sizeof(ObSysVarApQueryCostThreshold)
+        + sizeof(ObSysVarApQueryReplicaFallback)
         ;
     void *ptr = NULL;
     if (OB_ISNULL(ptr = allocator_.alloc(total_mem_size))) {
@@ -11669,6 +11726,96 @@ int ObSysVarFactory::create_all_sys_vars()
       } else {
         store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR_OB_SPARSE_DROP_RATIO_SEARCH))] = sys_var_ptr;
         ptr = (void *)((char *)ptr + sizeof(ObSysVarObSparseDropRatioSearch));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarSqlTranspiler())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarSqlTranspiler", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR_SQL_TRANSPILER))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarSqlTranspiler));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarPlsqlCanTransformSqlToAssign())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarPlsqlCanTransformSqlToAssign", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR_PLSQL_CAN_TRANSFORM_SQL_TO_ASSIGN))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarPlsqlCanTransformSqlToAssign));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarJoinOrderEnumThreshold())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarJoinOrderEnumThreshold", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR__JOIN_ORDER_ENUM_THRESHOLD))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarJoinOrderEnumThreshold));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarOptimizerMaxPermutations())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarOptimizerMaxPermutations", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR__OPTIMIZER_MAX_PERMUTATIONS))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarOptimizerMaxPermutations));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarIdpStepReductionThreshold())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarIdpStepReductionThreshold", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR__IDP_STEP_REDUCTION_THRESHOLD))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarIdpStepReductionThreshold));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarObEnablePlAsyncCommit())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarObEnablePlAsyncCommit", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR_OB_ENABLE_PL_ASYNC_COMMIT))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarObEnablePlAsyncCommit));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarCachingSha2PasswordDigestRounds())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarCachingSha2PasswordDigestRounds", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR_CACHING_SHA2_PASSWORD_DIGEST_ROUNDS))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarCachingSha2PasswordDigestRounds));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarApQueryRoutePolicy())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarApQueryRoutePolicy", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR_AP_QUERY_ROUTE_POLICY))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarApQueryRoutePolicy));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarApQueryCostThreshold())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarApQueryCostThreshold", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR_AP_QUERY_COST_THRESHOLD))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarApQueryCostThreshold));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarApQueryReplicaFallback())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarApQueryReplicaFallback", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR_AP_QUERY_REPLICA_FALLBACK))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarApQueryReplicaFallback));
       }
     }
 
@@ -20899,6 +21046,116 @@ int ObSysVarFactory::create_sys_var(ObIAllocator &allocator_, ObSysVarClassType 
       }
       break;
     }
+    case SYS_VAR_SQL_TRANSPILER: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarSqlTranspiler)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarSqlTranspiler)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarSqlTranspiler())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarSqlTranspiler", K(ret));
+      }
+      break;
+    }
+    case SYS_VAR_PLSQL_CAN_TRANSFORM_SQL_TO_ASSIGN: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarPlsqlCanTransformSqlToAssign)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarPlsqlCanTransformSqlToAssign)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarPlsqlCanTransformSqlToAssign())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarPlsqlCanTransformSqlToAssign", K(ret));
+      }
+      break;
+    }
+    case SYS_VAR__JOIN_ORDER_ENUM_THRESHOLD: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarJoinOrderEnumThreshold)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarJoinOrderEnumThreshold)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarJoinOrderEnumThreshold())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarJoinOrderEnumThreshold", K(ret));
+      }
+      break;
+    }
+    case SYS_VAR__OPTIMIZER_MAX_PERMUTATIONS: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarOptimizerMaxPermutations)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarOptimizerMaxPermutations)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarOptimizerMaxPermutations())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarOptimizerMaxPermutations", K(ret));
+      }
+      break;
+    }
+    case SYS_VAR__IDP_STEP_REDUCTION_THRESHOLD: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarIdpStepReductionThreshold)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarIdpStepReductionThreshold)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarIdpStepReductionThreshold())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarIdpStepReductionThreshold", K(ret));
+      }
+      break;
+    }
+    case SYS_VAR_OB_ENABLE_PL_ASYNC_COMMIT: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarObEnablePlAsyncCommit)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarObEnablePlAsyncCommit)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarObEnablePlAsyncCommit())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarObEnablePlAsyncCommit", K(ret));
+      }
+      break;
+    }
+    case SYS_VAR_CACHING_SHA2_PASSWORD_DIGEST_ROUNDS: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarCachingSha2PasswordDigestRounds)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarCachingSha2PasswordDigestRounds)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarCachingSha2PasswordDigestRounds())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarCachingSha2PasswordDigestRounds", K(ret));
+      }
+      break;
+    }
+    case SYS_VAR_AP_QUERY_ROUTE_POLICY: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarApQueryRoutePolicy)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarApQueryRoutePolicy)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarApQueryRoutePolicy())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarApQueryRoutePolicy", K(ret));
+      }
+      break;
+    }
+    case SYS_VAR_AP_QUERY_COST_THRESHOLD: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarApQueryCostThreshold)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarApQueryCostThreshold)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarApQueryCostThreshold())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarApQueryCostThreshold", K(ret));
+      }
+      break;
+    }
+    case SYS_VAR_AP_QUERY_REPLICA_FALLBACK: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarApQueryReplicaFallback)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarApQueryReplicaFallback)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarApQueryReplicaFallback())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarApQueryReplicaFallback", K(ret));
+      }
+      break;
+    }
 
     default: {
       ret = OB_ERR_UNEXPECTED;
@@ -20949,6 +21206,54 @@ int ObSysVarFactory::create_sys_var(ObSysVarClassType sys_var_id, ObBasicSysVar 
   if (OB_FAIL(ret) && sys_var_ptr != nullptr) {
     sys_var_ptr->~ObBasicSysVar();
     sys_var_ptr = NULL;
+  }
+  return ret;
+}
+
+int ObSysVarParallelServersTarget::inner_to_select_obj(common::ObIAllocator &allocator,
+                                                       const sql::ObBasicSessionInfo &session,
+                                                       common::ObObj &select_obj) const
+{
+  int ret = OB_SUCCESS;
+  uint64_t tenant_id = MTL_ID();
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
+  double min_cpu = 0.0;
+  double max_cpu = 0.0;
+  if (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_5_1_0 &&
+      tenant_config.is_valid() &&
+      NULL != GCTX.omt_ &&
+      OB_SUCC(GCTX.omt_->get_tenant_cpu(tenant_id, min_cpu, max_cpu))) {
+    int64_t val = static_cast<int64_t>(min_cpu * tenant_config->px_target_workers_per_cpu + 0.5);
+    select_obj.set_int(val);
+  } else {
+    ret = ObIntSysVar::inner_to_select_obj(allocator, session, select_obj);
+  }
+  return ret;
+}
+
+int ObSysVarParallelServersTarget::inner_to_show_str(common::ObIAllocator &allocator,
+                                const sql::ObBasicSessionInfo &session,
+                                common::ObString &show_str) const
+{
+  int ret = OB_SUCCESS;
+  ObObj value;
+  if (OB_FAIL(inner_to_select_obj(allocator, session, value))) {
+    LOG_WARN("inner to select obj failed", K(ret));
+  } else {
+    const ObObj *res_obj = NULL;
+    const ObDataTypeCastParams dtc_params = sql::ObBasicSessionInfo::create_dtc_params(&session);
+    ObCastCtx cast_ctx(&allocator, &dtc_params, CM_NONE, ObCharset::get_system_collation());
+    EXPR_CAST_OBJ_V2(ObVarcharType, value, res_obj);
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(res_obj)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("sys var casted obj ptr is NULL", K(ret), K(value), K(get_name()));
+    } else if (OB_UNLIKELY(ObVarcharType != res_obj->get_type())) {
+      LOG_WARN("sys var casted obj is not ObVarcharType",
+              K(ret), K(value), K(*res_obj), K(get_name()));
+    } else {
+      show_str = res_obj->get_varchar();
+    }
   }
   return ret;
 }

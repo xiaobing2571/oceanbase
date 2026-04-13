@@ -16,6 +16,7 @@
 #include "ob_resource_mgr.h"
 #include "lib/utility/utility.h"
 #include "lib/resource/ob_affinity_ctrl.h"
+#include "lib/utility/ob_tracepoint.h"
 
 namespace oceanbase
 {
@@ -188,15 +189,17 @@ void ObTenantMemoryMgr::update_cache_hold(const int64_t size)
   }
 }
 
+ERRSIM_POINT_DEF(EN_TENANT_HOLD_REACH_LIMIT);
 bool ObTenantMemoryMgr::update_hold(const int64_t size, const uint64_t ctx_id,
                                     const lib::ObLabel &label, bool &reach_ctx_limit)
 {
   bool updated = true;
   reach_ctx_limit = false;
-  if (!limiter_.acquire(size)) {
+  bool is_errsim = false;
+  if ((size > 0 && (is_errsim = EN_TENANT_HOLD_REACH_LIMIT)) || !limiter_.acquire(size)) {
     updated = false;
     auto &afc = g_alloc_failed_ctx();
-    afc.reason_ = TENANT_HOLD_REACH_LIMIT;
+    afc.reason_ = is_errsim ? ERRSIM_TENANT_HOLD_REACH_LIMIT : TENANT_HOLD_REACH_LIMIT;
     afc.alloc_size_ = size;
     afc.tenant_id_ = tenant_id_;
     afc.tenant_hold_ = get_sum_hold();
@@ -212,18 +215,19 @@ bool ObTenantMemoryMgr::update_hold(const int64_t size, const uint64_t ctx_id,
   }
   return updated;
 }
-
+ERRSIM_POINT_DEF(EN_CTX_HOLD_REACH_LIMIT);
 bool ObTenantMemoryMgr::update_ctx_hold(const uint64_t ctx_id, const int64_t size)
 {
   bool updated = false;
   if (ctx_id < ObCtxIds::MAX_CTX_ID) {
     volatile int64_t &hold = hold_bytes_[ctx_id];
     volatile int64_t &limit = limit_bytes_[ctx_id];
+    bool is_errsim = false;
     if (size <= 0) {
       ATOMIC_AAF(&hold, size);
       updated = true;
     } else {
-      if (hold + size <= limit) {
+      if (!(is_errsim = EN_CTX_HOLD_REACH_LIMIT) && hold + size <= limit) {
         const int64_t nvalue = ATOMIC_AAF(&hold, size);
         if (nvalue > limit) {
           ATOMIC_AAF(&hold, -size);
@@ -234,7 +238,7 @@ bool ObTenantMemoryMgr::update_ctx_hold(const uint64_t ctx_id, const int64_t siz
     }
     if (!updated) {
       auto &afc = g_alloc_failed_ctx();
-      afc.reason_ = CTX_HOLD_REACH_LIMIT;
+      afc.reason_ = is_errsim ? ERRSIM_CTX_HOLD_REACH_LIMIT : CTX_HOLD_REACH_LIMIT;
       afc.alloc_size_ = size;
       afc.ctx_id_ = ctx_id;
       afc.ctx_hold_ = hold;
@@ -355,11 +359,10 @@ const ObTenantMemoryMgr *ObTenantResourceMgrHandle::get_memory_mgr() const
 }
 
 ObResourceMgr::ObResourceMgr()
-  : inited_(false), cache_washer_(NULL), locks_(), tenant_resource_mgrs_()
+  : inited_(false), cache_washer_(NULL), tenant_resource_mgrs_()
 {
   for (int64_t i = 0; i < MAX_TENANT_COUNT; ++i) {
-    locks_[i].enable_record_stat(false);
-    locks_[i].set_latch_id(common::ObLatchIds::TENANT_RES_MGR_LIST_LOCK);
+    locks_[i].lock_.enable_record_stat(false);
   }
 }
 
@@ -394,7 +397,7 @@ ObResourceMgr &ObResourceMgr::get_instance()
   if (!resource_mgr.inited_) {
     // use first lock to avoid concurrent init of resource mgr
     ObDisableDiagnoseGuard disable_diagnose_guard;
-    SpinWLockGuard guard(resource_mgr.locks_[0]);
+    SpinWLockGuard guard(resource_mgr.locks_[0].lock_);
     if (!resource_mgr.inited_) {
       int ret = OB_SUCCESS;
       if (OB_FAIL(resource_mgr.init())) {
@@ -415,7 +418,7 @@ int ObResourceMgr::set_cache_washer(ObICacheWasher &cache_washer)
     cache_washer_ = &cache_washer;
     for (int64_t pos = 0; pos < MAX_TENANT_COUNT; ++pos) {
       ObDisableDiagnoseGuard disable_diagnose_guard;
-      SpinWLockGuard guard(locks_[pos]);
+      SpinWLockGuard guard(locks_[pos].lock_);
       ObTenantResourceMgr *tenant_resource_mgr = tenant_resource_mgrs_[pos];
       while (NULL != tenant_resource_mgr) {
         tenant_resource_mgr->memory_mgr_.set_cache_washer(cache_washer);
@@ -442,7 +445,7 @@ int ObResourceMgr::get_tenant_resource_mgr(const uint64_t tenant_id,
     ObDisableDiagnoseGuard disable_diagnose_guard;
     ObTenantResourceMgr *tenant_resource_mgr = NULL;
     {
-      SpinRLockGuard guard(locks_[pos]);
+      SpinRLockGuard guard(locks_[pos].lock_);
       if (OB_FAIL(get_tenant_resource_mgr_unsafe(tenant_id, tenant_resource_mgr))) {
         if (OB_ENTRY_NOT_EXIST != ret) {
           LOG_WARN("get_tenant_resource_mgr_unsafe failed", K(ret), K(tenant_id));
@@ -455,7 +458,7 @@ int ObResourceMgr::get_tenant_resource_mgr(const uint64_t tenant_id,
     }
 
     if (OB_SUCC(ret) && !handle.is_valid()) {
-      SpinWLockGuard guard(locks_[pos]);
+      SpinWLockGuard guard(locks_[pos].lock_);
       // maybe other thread create, so retry get here
       if (OB_FAIL(get_tenant_resource_mgr_unsafe(tenant_id, tenant_resource_mgr))) {
         if (OB_ENTRY_NOT_EXIST != ret) {
@@ -487,16 +490,18 @@ void ObResourceMgr::inc_ref(ObTenantResourceMgr *tenant_resource_mgr)
 void ObResourceMgr::dec_ref(ObTenantResourceMgr *tenant_resource_mgr)
 {
   if (NULL != tenant_resource_mgr) {
+    const int64_t tenant_id = tenant_resource_mgr->tenant_id_;
     int64_t ref_cnt = 0;
     if (0 == (ref_cnt = ATOMIC_SAF(&tenant_resource_mgr->ref_cnt_, 1))) {
-      const int64_t pos = tenant_resource_mgr->tenant_id_ % MAX_TENANT_COUNT;
+      const int64_t pos = tenant_id % MAX_TENANT_COUNT;
       ObDisableDiagnoseGuard disable_diagnose_guard;
-      SpinWLockGuard guard(locks_[pos]);
-      if (0 == ATOMIC_LOAD(&tenant_resource_mgr->ref_cnt_)) {
-        int ret = OB_SUCCESS;
-        if (OB_FAIL(remove_tenant_resource_mgr_unsafe(tenant_resource_mgr->tenant_id_))) {
-          LOG_WARN("remove_tenant_resource_mgr_unsafe failed", K(ret),
-              "tenant_id", tenant_resource_mgr->tenant_id_);
+      SpinWLockGuard guard(locks_[pos].lock_);
+      int ret = OB_SUCCESS;
+      if (OB_FAIL(get_tenant_resource_mgr_unsafe(tenant_id, tenant_resource_mgr))) {
+        LOG_WARN("get_tenant_resource_mgr_unsafe failed", K(ret), K(tenant_id));
+      } else if (0 == ATOMIC_LOAD(&tenant_resource_mgr->ref_cnt_)) {
+        if (OB_FAIL(remove_tenant_resource_mgr_unsafe(tenant_id))) {
+          LOG_WARN("remove_tenant_resource_mgr_unsafe failed", K(ret), K(tenant_id));
         }
       }
     } else if (ref_cnt < 0) {

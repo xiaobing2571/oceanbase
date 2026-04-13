@@ -120,6 +120,7 @@ private:
   int remove_strict_opt_in_pl(ParseNode *node, int8_t expr_flag);
   int remove_format_json_opt_in_pl(ParseNode *node, int8_t expr_flag);
   int process_json_value_node(const ParseNode *node, ObRawExpr *&expr);
+  int process_json_extract_node(const ParseNode *node, ObRawExpr *&expr);
   int pre_check_json_path_valid(const ParseNode *node);
   int get_column_raw_text_from_node(const ParseNode *node, ObString &col_name);
   int process_ora_json_object_node(const ParseNode *node, ObRawExpr *&expr);
@@ -144,6 +145,8 @@ private:
   int resolve_udf_param_expr(const ParseNode *node,
                              common::ObIArray<ObRawExpr*> &param_exprs);
   int process_match_against(const ParseNode *node, ObRawExpr *&expr);
+  int process_match(const ParseNode *node, ObRawExpr *&expr);
+  int process_match_score(const ParseNode *node, ObRawExpr *&expr);
   int process_window_function_node(const ParseNode *node, ObRawExpr *&expr);
   int process_sort_list_node(const ParseNode *node, common::ObIArray<OrderItem> &order_items);
   int process_frame_node(const ParseNode *node,
@@ -165,6 +168,7 @@ private:
   int process_geo_func_node(const ParseNode *node, ObRawExpr *&expr);
   int set_geo_func_name(ObSysFunRawExpr *func_expr, const ObItemType func_type);
   int process_vector_func_node(const ParseNode *node, ObRawExpr *&expr);
+  int process_vector_similarity_func_node(const ParseNode *node, ObRawExpr *&expr);
   bool is_win_expr_valid_scope(ObStmtScope scope) const;
   int check_and_canonicalize_window_expr(ObRawExpr *expr);
   int process_ident_node(const ParseNode &node, ObRawExpr *&expr);
@@ -228,12 +232,12 @@ private:
   int process_array_map_func_node(const ParseNode *node, ObRawExpr *&expr);
   int check_replace_lambda_params_node(const ParseNode *params_node, ParseNode *func_node);
   int process_lambda_var_node(const ParseNode *node, ObRawExpr *&expr);
+  int process_split_node(const ParseNode *node, ObRawExpr *&expr);
   int extract_var_exprs(ObRawExpr *expr, ObIArray<ObVarRawExpr *> &var_exprs);
   int check_lambda_params_duplicated(const ParseNode *params_node);
 private:
   int process_sys_func_params(ObSysFunRawExpr &func_expr, int current_columns_count);
   int transform_ratio_afun_to_arg_div_sum(const ParseNode *ratio_to_report, ParseNode *&div);
-  int convert_any_or_all_expr(ObRawExpr *&expr, bool &happened);
   int get_opposite_string(const common::ObString &orig_string, common::ObString &new_string, common::ObIAllocator &allocator);
   int reset_keep_aggr_sort_direction(ObIArray<OrderItem> &aggr_sort_item);
   int reset_aggr_sort_nulls_first(ObIArray<OrderItem> &aggr_sort_item);
@@ -247,11 +251,21 @@ private:
                                     const ObRawExpr *left_expr,
                                     const bool is_root_condition,
                                     ObRawExpr *&right_expr);
+
+  int check_internal_function_by_type(ObItemType type);
+
+  int try_cast_expr_to_int(ObRawExprFactory *expr_factory,
+                           const ObSQLSessionInfo *session,
+                           ObSysFunRawExpr *&expr);
+  ObItemType get_mapping_func_type(ObItemType func_type);
+  int fold_cnn_expr(ObOpRawExpr *ori_cnn_expr, ObOpRawExpr *&folded_cnn_expr);
+  int create_cnn_expr_with_same_type(ObOpRawExpr *ori_cnn_expr, const ObIArray<ObRawExpr*> &group, ObIArray<ObRawExpr*> &final_groups);
 private:
   // data members
   ObExprResolveContext &ctx_;
   bool is_contains_assignment_;
   bool is_udf_param_syntax_err_ = false;
+  bool clickhouse_func_exposed_;
 };
 template <class T>
 int ObRawExprResolverImpl::process_node_with_children(const ParseNode *node,

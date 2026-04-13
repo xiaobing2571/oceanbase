@@ -41,6 +41,7 @@ class ObAlterTableResolver : public ObDDLResolver
   static const int64_t SPECIAL_TABLE_TYPE = 2;   // 2. special table type
   static const int64_t ALTER_HINT = 3; // the hint.
   static const int64_t ALTER_INDEX_CHILD_NUM = 6;
+  static const int64_t MAX_CLUSTERING_KEY_COLUMNS = OB_USER_MAX_ROWKEY_COLUMN_NUMBER - 1;  // 63
 public:
   explicit ObAlterTableResolver(ObResolverParams &params);
   virtual ~ObAlterTableResolver();
@@ -73,6 +74,8 @@ public:
                                   const ObColumnResolveStat &stat);
   int check_alter_geo_column_allowed(const share::schema::AlterColumnSchema &alter_column_schema,
                                      const share::schema::ObColumnSchemaV2 &origin_col_schema);
+  int check_alter_rb_column_allowed(const share::schema::AlterColumnSchema &alter_column_schema,
+                                    const share::schema::ObColumnSchemaV2 &origin_col_schema);
   int check_alter_multivalue_depend_column_allowed(const share::schema::AlterColumnSchema &alter_column_schema,
                                                    const share::schema::ObColumnSchemaV2 &data_column_schema);
   int resolve_modify_column(const ParseNode &node,
@@ -95,7 +98,6 @@ public:
   ObAlterTableStmt *get_alter_table_stmt() { return static_cast<ObAlterTableStmt*>(stmt_); };
   int resolve_column_index(const common::ObString &column_name);
   int resolve_modify_all_trigger(const ParseNode &node);
-  int resolve_set_interval(ObAlterTableStmt *stmt, const ParseNode &node);
 
   int add_udt_hidden_column(ObAlterTableStmt *alter_table_stmt, AlterColumnSchema &column_schema);
   int check_sdo_geom_default_value(ObAlterTableStmt *alter_table_stmt, AlterColumnSchema &column_schema);
@@ -132,6 +134,11 @@ private:
   int resolve_alter_index_parallel_mysql(const ParseNode &node);
   int check_is_drop_primary_key(const ParseNode &node, bool &is_drop_primary_key);
   int resolve_drop_primary(const ParseNode &action_node_list);
+  int resolve_drop_clustering_key(const ParseNode &action_node_list);
+  int resolve_modify_clustering_key(const ParseNode &action_node_list,
+                                    const ParseNode &node);
+  int resolve_add_clustering_key(const ParseNode &action_node_list);
+  int check_is_drop_clustering_key(const ParseNode &node, bool &is_drop_clustering_key);
   int resolve_add_primary(const ParseNode &node);
   int resolve_alter_primary(const ParseNode &action_node_list, const ParseNode &node);
   int resolve_alter_index_tablespace_oracle(const ParseNode &node);
@@ -161,6 +168,16 @@ private:
                                 const share::schema::ObTableSchema &orig_table_schema);
   int resolve_exchange_partition(const ParseNode &node,
                                  const share::schema::ObTableSchema &orig_table_schema);
+  int resolve_exchange_subpartition(const ParseNode &node,
+                                    const share::schema::ObTableSchema &orig_table_schema);
+  int resolve_exchange_partition_stmt(const ParseNode &node,
+                                      const share::schema::ObTableSchema &orig_table_schema,
+                                      const share::schema::ObTableSchema *&exchange_table_schema,
+                                      common::ObString &orig_partition_name);
+  int generate_exchange_partition_arg(const ObTableSchema &orig_table_schema,
+                                      const ObTableSchema &exchange_table_schema,
+                                      const ObString &orig_part_name,
+                                      const ObPartitionLevel exchange_part_level);
   int resolve_rename_partition(const ParseNode &node,
                              const share::schema::ObTableSchema &orig_table_schema);
   int resolve_rename_subpartition(const ParseNode &node,
@@ -195,10 +212,10 @@ private:
                                    const share::schema::ObTableSchema &origin_table_schema);
   int resolve_split_partition(const ParseNode *node,
                               const share::schema::ObTableSchema &origin_table_schema);
-  int fill_split_source_tablet_id(const ObString& source_part_name,
+  int fill_split_source_tablet_info(const ObString& source_part_name,
                                   const share::schema::ObTableSchema &origin_table_schema,
                                   share::schema::AlterTableSchema &alter_table_schema);
-  virtual int get_table_schema_for_check(share::schema::ObTableSchema &table_schema) override;
+  virtual int get_table_schema_for_check(const share::schema::ObTableSchema *&table_schema) override;
   //int generate_new_schema(const share::schema::ObTableSchema &origin_table_schema,
   //                        share::schema::AlterTableSchema &new_table_schema);
   int check_column_definition_node(const ParseNode *node);

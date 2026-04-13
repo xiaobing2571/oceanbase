@@ -23,8 +23,19 @@
 
 namespace oceanbase
 {
+#ifdef OB_BUILD_SHARED_STORAGE
+namespace common
+{
+class ObTableDevice;
+}
+#endif
+
 namespace share
 {
+
+/*
+ * ObGetFileIdRangeFunctor is used for geting slog min id and slog max id
+ */
 class ObGetFileIdRangeFunctor : public common::ObBaseDirEntryOperator
 {
 public:
@@ -47,6 +58,9 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObGetFileIdRangeFunctor);
 };
 
+/*
+ * ObGetFileSizeFunctor is used for geting slog file size
+ */
 class ObGetFileSizeFunctor : public common::ObBaseDirEntryOperator
 {
 public:
@@ -178,6 +192,7 @@ public:
   static int exist(const char *pathname, bool &is_exist);
   static int stat(const char *pathname, common::ObIODFileStat &statbuf);
   static int fstat(const common::ObIOFd &fd, common::ObIODFileStat &statbuf);
+  static int get_dir_create_time(const char *pathname, int64_t &create_time_s);
 
   static int read(
     const common::ObIOFd &fd,

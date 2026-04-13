@@ -188,8 +188,8 @@ int ObShowCreateCatalog::print_catalog_definition(const uint64_t tenant_id,
   } else if (OB_FAIL(databuff_printf(buf,
                                      buf_len,
                                      pos,
-                                     is_oracle_mode ? "CREATE CATALOG "
-                                                    : "CREATE CATALOG IF NOT EXISTS "))) {
+                                     is_oracle_mode ? "CREATE EXTERNAL CATALOG "
+                                                    : "CREATE EXTERNAL CATALOG IF NOT EXISTS "))) {
     LOG_WARN("failed to print create catalog prefix",
              K(ret),
              K(catalog_schema->get_catalog_name()));
@@ -237,6 +237,33 @@ int ObShowCreateCatalog::print_catalog_definition(const uint64_t tenant_id,
           }
           break;
         }
+        case ObCatalogProperties::CatalogType::FILESYSTEM_TYPE: {
+          ObFilesystemCatalogProperties properties;
+          if (OB_FAIL(properties.load_from_string(properties_string, allocator))) {
+            LOG_WARN("failed to load from string", K(ret));
+          } else if (OB_FAIL(print_filesystem_catalog_definition(properties, buf, buf_len, pos))) {
+            LOG_WARN("failed to print odps catalog definition", K(ret));
+          }
+          break;
+        }
+        case ObCatalogProperties::CatalogType::HMS_TYPE: {
+          ObHMSCatalogProperties properties;
+          if (OB_FAIL(properties.load_from_string(properties_string, allocator))) {
+            LOG_WARN("failed to load from string", K(ret));
+          } else if (OB_FAIL(print_hive_catalog_definition(properties, buf, buf_len, pos))) {
+            LOG_WARN("failed to print hms catalog definition", K(ret));
+          }
+          break;
+        }
+        case ObCatalogProperties::CatalogType::REST_TYPE: {
+          ObRestCatalogProperties properties;
+          if (OB_FAIL(properties.load_from_string(properties_string, allocator))) {
+            LOG_WARN("failed to load from string", K(ret));
+          } else if (OB_FAIL(print_rest_catalog_definition(properties, buf, buf_len, pos))) {
+            LOG_WARN("failed to print rest catalog definition", K(ret));
+          }
+          break;
+        }
         default: {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("invalid catalog type", K(ret), K(catalog_type));
@@ -254,7 +281,7 @@ int ObShowCreateCatalog::print_odps_catalog_definition(const ObODPSCatalogProper
                                                        int64_t &pos) const
 {
   int ret = OB_SUCCESS;
-  ObString scret_str("********");
+  ObString secret_str("********");
   int64_t option_names_idx = 0;
   if (OB_FAIL(databuff_printf(buf,
                               buf_len,
@@ -271,8 +298,8 @@ int ObShowCreateCatalog::print_odps_catalog_definition(const ObODPSCatalogProper
                                      "\n  %s = '%.*s',",
                                      ObODPSCatalogProperties::OPTION_NAMES[static_cast<size_t>(
                                          ObODPSCatalogProperties::ObOdpsCatalogOptions::ACCESSID)],
-                                     scret_str.length(),
-                                     scret_str.ptr()))) {
+                                     secret_str.length(),
+                                     secret_str.ptr()))) {
     LOG_WARN("failed to print ODPS_INFO", K(ret));
   } else if (OB_FAIL(databuff_printf(buf,
                                      buf_len,
@@ -280,8 +307,8 @@ int ObShowCreateCatalog::print_odps_catalog_definition(const ObODPSCatalogProper
                                      "\n  %s = '%.*s',",
                                      ObODPSCatalogProperties::OPTION_NAMES[static_cast<size_t>(
                                          ObODPSCatalogProperties::ObOdpsCatalogOptions::ACCESSKEY)],
-                                     scret_str.length(),
-                                     scret_str.ptr()))) {
+                                     secret_str.length(),
+                                     secret_str.ptr()))) {
     LOG_WARN("failed to print ODPS_INFO", K(ret));
   } else if (OB_FAIL(databuff_printf(buf,
                                      buf_len,
@@ -289,8 +316,8 @@ int ObShowCreateCatalog::print_odps_catalog_definition(const ObODPSCatalogProper
                                      "\n  %s = '%.*s',",
                                      ObODPSCatalogProperties::OPTION_NAMES[static_cast<size_t>(
                                          ObODPSCatalogProperties::ObOdpsCatalogOptions::STSTOKEN)],
-                                     scret_str.length(),
-                                     scret_str.ptr()))) {
+                                     secret_str.length(),
+                                     secret_str.ptr()))) {
     LOG_WARN("failed to print ODPS_INFO", K(ret));
   } else if (OB_FAIL(databuff_printf(buf,
                                      buf_len,
@@ -357,6 +384,331 @@ int ObShowCreateCatalog::print_odps_catalog_definition(const ObODPSCatalogProper
       LOG_WARN("failed to print )", K(ret));
     }
   }
+  return ret;
+}
+
+int ObShowCreateCatalog::print_filesystem_catalog_definition(
+    const share::ObFilesystemCatalogProperties &properties,
+    char *buf,
+    const int64_t &buf_len,
+    int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(databuff_printf(
+            buf,
+            buf_len,
+            pos,
+            "\n  %s = '%.*s',",
+            ObFilesystemCatalogProperties::OPTION_NAMES[static_cast<size_t>(
+                ObFilesystemCatalogProperties::ObFilesystemCatalogOptions::WAREHOUSE)],
+            properties.warehouse_.length(),
+            properties.warehouse_.ptr()))) {
+      LOG_WARN("failed to print filesystem catalog info", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    --pos;
+    if (OB_FAIL(databuff_printf(buf, buf_len, pos, "\n) "))) {
+      LOG_WARN("failed to print )", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObShowCreateCatalog::print_hive_catalog_definition(
+    const ObHMSCatalogProperties &hms, char *buf, const int64_t &buf_len,
+    int64_t &pos) const {
+  int ret = OB_SUCCESS;
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%.*s',",
+                                ObHMSCatalogProperties::OPTION_NAMES[ObHMSCatalogProperties::URI],
+                                hms.uri_.length(),
+                                hms.uri_.ptr()))) {
+      LOG_WARN("failed to print HMS_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (hms.principal_.length() > 0) {
+      if (OB_FAIL(databuff_printf(
+              buf,
+              buf_len,
+              pos,
+              "\n  %s = '%.*s',",
+              ObHMSCatalogProperties::OPTION_NAMES[ObHMSCatalogProperties::PRINCIPAL],
+              hms.principal_.length(),
+              hms.principal_.ptr()))) {
+        LOG_WARN("failed to print HMS_INFO", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (hms.keytab_.length() > 0) {
+      if (OB_FAIL(
+              databuff_printf(buf,
+                              buf_len,
+                              pos,
+                              "\n  %s = '%.*s',",
+                              ObHMSCatalogProperties::OPTION_NAMES[ObHMSCatalogProperties::KEYTAB],
+                              hms.keytab_.length(),
+                              hms.keytab_.ptr()))) {
+        LOG_WARN("failed to print HMS_INFO", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (hms.krb5conf_.length() > 0) {
+      if (OB_FAIL(databuff_printf(
+              buf,
+              buf_len,
+              pos,
+              "\n  %s = '%.*s',",
+              ObHMSCatalogProperties::OPTION_NAMES[ObHMSCatalogProperties::KRB5CONF],
+              hms.krb5conf_.length(),
+              hms.krb5conf_.ptr()))) {
+        LOG_WARN("failed to print HMS_INFO", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (hms.max_client_pool_size_ > 0) {
+      if (OB_FAIL(databuff_printf(buf, buf_len, pos, "\n  %s = %ld,",
+                                  ObHMSCatalogProperties::OPTION_NAMES[ObHMSCatalogProperties::MAX_CLIENT_POOL_SIZE],
+                                  hms.max_client_pool_size_))) {
+        LOG_WARN("failed to print HMS_INFO", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (hms.socket_timeout_ > 0) {
+      if (OB_FAIL(databuff_printf(buf, buf_len, pos, "\n  %s = %ld,",
+                                  ObHMSCatalogProperties::OPTION_NAMES[ObHMSCatalogProperties::SOCKET_TIMEOUT],
+                                  hms.socket_timeout_))) {
+        LOG_WARN("failed to print HMS_INFO", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (hms.is_set_cache_refresh_interval_sec()) {
+      if (OB_FAIL(databuff_printf(buf,
+                                  buf_len,
+                                  pos,
+                                  "\n  %s = %ld,",
+                                  ObHMSCatalogProperties::OPTION_NAMES
+                                      [ObHMSCatalogProperties::CACHE_REFRESH_INTERVAL_SEC],
+                                  hms.get_cache_refresh_interval_sec()))) {
+        LOG_WARN("failed to print HMS_INFO", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (hms.hms_catalog_name_.length() > 0) {
+      if (OB_FAIL(databuff_printf(
+              buf,
+              buf_len,
+              pos,
+              "\n  %s = '%.*s',",
+              ObHMSCatalogProperties::OPTION_NAMES[ObHMSCatalogProperties::HMS_CATALOG_NAME],
+              hms.hms_catalog_name_.length(),
+              hms.hms_catalog_name_.ptr()))) {
+        LOG_WARN("failed to print HMS_INFO", K(ret));
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    --pos;
+    if (OB_FAIL(databuff_printf(buf, buf_len, pos, "\n) "))) {
+      LOG_WARN("failed to print )", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObShowCreateCatalog::print_rest_catalog_definition(const ObRestCatalogProperties &rest,
+                                                       char *buf, const int64_t &buf_len, int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%.*s',",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::URI],
+                                rest.uri_.length(),
+                                rest.uri_.ptr()))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && !rest.prefix_.empty()) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%.*s',",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::PREFIX],
+                                rest.prefix_.length(),
+                                rest.prefix_.ptr()))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && rest.auth_type_ != ObRestCatalogProperties::ObRestAuthType::INVALID_TYPE) {
+    ObString auth_type_str;
+    if (OB_FAIL(rest.get_auth_type_str(auth_type_str))) {
+      LOG_WARN("failed to get auth type str", K(ret));
+    } else if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%.*s',",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::AUTH_TYPE],
+                                auth_type_str.length(),
+                                auth_type_str.ptr()))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && !rest.accessid_.empty()) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%.*s',",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::ACCESSID],
+                                rest.accessid_.length(),
+                                rest.accessid_.ptr()))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && !rest.accesskey_.empty()) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%.*s',",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::ACCESSKEY],
+                                rest.accesskey_.length(),
+                                rest.accesskey_.ptr()))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && !rest.scope_.empty()) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%.*s',",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::SCOPE],
+                                rest.scope_.length(),
+                                rest.scope_.ptr()))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && !rest.oauth2_svr_uri_.empty()) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%.*s',",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::OAUTH2_SVR_URI],
+                                rest.oauth2_svr_uri_.length(),
+                                rest.oauth2_svr_uri_.ptr()))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && !rest.sign_name_.empty()) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%.*s',",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::SIGN_NAME],
+                                rest.sign_name_.length(),
+                                rest.sign_name_.ptr()))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && !rest.sign_region_.empty()) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%.*s',",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::SIGN_REGION],
+                                rest.sign_region_.length(),
+                                rest.sign_region_.ptr()))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && !rest.token_.empty()) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%.*s',",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::TOKEN],
+                                rest.token_.length(),
+                                rest.token_.ptr()))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = '%s',",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::VENDED_CREDENTAIL_ENABLED],
+                                rest.vended_credential_enabled_ ? "true" : "false"))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = %ld,",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::MAX_CLIENT_POOL_SIZE],
+                                rest.max_client_pool_size_))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = %ld,",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::HTTP_TIMEOUT],
+                                rest.http_timeout_))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(databuff_printf(buf,
+                                buf_len,
+                                pos,
+                                "\n  %s = %ld,",
+                                ObRestCatalogProperties::OPTION_NAMES[ObRestCatalogProperties::HTTP_KEEPALIVE_TIME],
+                                rest.http_keep_alive_time_))) {
+      LOG_WARN("failed to print REST_INFO", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    --pos;
+    if (OB_FAIL(databuff_printf(buf, buf_len, pos, "\n) "))) {
+      LOG_WARN("failed to print )", K(ret));
+    }
+  }
+
   return ret;
 }
 

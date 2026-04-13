@@ -16,8 +16,9 @@
 #include "lib/list/ob_dlist.h"
 #include "lib/lock/ob_latch.h"
 #include "lib/list/ob_dlink_node.h"
-#include "lib/objectpool/ob_concurrency_objpool.h"
 #include "ob_trans_end_trans_callback.h"
+#include "ob_trans_id.h"
+#include "share/ob_ls_id.h"
 
 namespace oceanbase
 {
@@ -58,25 +59,24 @@ public:
 
 class CtxLock
 {
+  friend class CtxLockGuard;
 public:
 CtxLock() : ctx_lock_(), access_lock_(), flush_redo_lock_(),
             ctx_(NULL), lock_start_ts_(0), waiting_lock_cnt_(0) {}
   ~CtxLock() {}
   int init(ObTransCtx *ctx);
   void reset();
-  int lock(const int64_t timeout_us = -1);
-  int try_lock();
-  void unlock();
-  int try_rdlock_ctx();
-  int wrlock_ctx();
-  int wrlock_access();
-  int wrlock_flush_redo();
-  int rdlock_flush_redo();
-  void unlock_ctx();
-  void unlock_access();
+  int wrlock_ctx(const int64_t timeout = INT64_MAX);
+  int wrlock_access(const int64_t timeout = INT64_MAX);
+  int wrlock_flush_redo(const int64_t timeout = INT64_MAX);
+  int rdlock_flush_redo(const int64_t timeout = INT64_MAX);
+  int try_wrlock_access();
   int try_wrlock_flush_redo();
   int try_rdlock_flush_redo();
+  int try_wrlock_ctx();
   void unlock_flush_redo();
+  void unlock_ctx();
+  void unlock_access();
   void before_unlock(CtxLockArg &arg);
   void after_unlock(CtxLockArg &arg);
   ObTransCtx *get_ctx() { return ctx_; }
@@ -98,51 +98,29 @@ class CtxLockGuard
 {
 public:
   enum MODE { CTX = 1, ACCESS = 2, REDO_FLUSH_X = 4, REDO_FLUSH_R = 8, ALL = (CTX | REDO_FLUSH_X | ACCESS) };
-  CtxLockGuard() : lock_(NULL), mode_(0), request_ts_(0), hold_ts_(0) {}
-  explicit CtxLockGuard(CtxLock &lock, int mode, bool need_lock = true): lock_(&lock), mode_(mode)
-  { do_lock_(need_lock); }
-  void do_lock_(bool need_lock)
-  {
-    request_ts_ = ObTimeUtility::fast_current_time();
-    if (mode_ & ACCESS) {
-      if (need_lock) {
-        lock_->wrlock_access();
-      }
-    }
-    if (mode_ & REDO_FLUSH_X) {
-      if (need_lock) {
-        lock_->wrlock_flush_redo();
-      }
-    }
-    if (mode_ & REDO_FLUSH_R) {
-      if (need_lock) {
-        lock_->rdlock_flush_redo();
-      }
-    }
-    if (mode_ & CTX) {
-      if (need_lock) {
-        lock_->wrlock_ctx();
-      }
-    }
-    hold_ts_ = ObTimeUtility::fast_current_time();
-  }
-  explicit CtxLockGuard(CtxLock &lock, const bool need_lock = true)
-    : CtxLockGuard(lock, MODE::ALL, need_lock) {}
+  CtxLockGuard() : lock_(NULL), mode_(0), request_ts_(0), hold_ts_(0), locked_(false) {}
+  explicit CtxLockGuard(CtxLock &lock, int mode, bool try_lock = false, int64_t timeout_us = 0): lock_(&lock), mode_(0), request_ts_(0), hold_ts_(0), locked_(false)
+  { do_lock_(mode, try_lock, timeout_us); }
+  explicit CtxLockGuard(CtxLock &lock, const bool try_lock = false, int64_t timeout_us = 0)
+    : CtxLockGuard(lock, MODE::ALL, try_lock, timeout_us) {}
   ~CtxLockGuard();
   void set(CtxLock &lock, uint8_t mode = MODE::ALL);
   void reset();
   int64_t get_hold_ts() { return hold_ts_; }
+  bool is_locked() const { return locked_; }
   int64_t get_lock_acquire_used_time() const
   {
     return hold_ts_ - request_ts_;
   }
 private:
+  void do_lock_(int mode, bool try_lock, int64_t timeout_us);
   DISALLOW_COPY_AND_ASSIGN(CtxLockGuard);
 private:
   CtxLock *lock_;
   uint8_t mode_;
   int64_t request_ts_;
   int64_t hold_ts_;
+  bool locked_;
 };
 
 

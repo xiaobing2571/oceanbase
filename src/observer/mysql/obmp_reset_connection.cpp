@@ -208,6 +208,7 @@ int ObMPResetConnection::process()
 #ifdef OB_BUILD_ORACLE_PL
       session->reset_pl_debugger_resource();
       session->reset_pl_profiler_resource();
+      session->reset_pl_code_coverage_resource();
 #endif
 
       // 10.2 非分布式需要的话，分布式也需要，用于清理package的全局变量值
@@ -232,6 +233,11 @@ int ObMPResetConnection::process()
 
       // 10.8 clean mem context for context (dbms_session.create_context)
       session->destory_mem_context();
+
+      // 10.9 reset query level info (affected_rows, found_rows)
+      // Reset to initial values. Proxy will clear old query info after resetconn.
+      session->set_affected_rows(-1);
+      session->set_found_rows(1);
     }
 
 
@@ -265,6 +271,10 @@ int ObMPResetConnection::process()
                K(need_disconnect));
     }
     force_disconnect();
+  }
+  int tmp_ret = OB_SUCCESS;
+  if (OB_NOT_NULL(session)) {
+    tmp_ret = do_after_process(*session, false/*async_resp_used*/);
   }
 
   THIS_WORKER.set_session(NULL);

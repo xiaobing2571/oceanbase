@@ -122,6 +122,48 @@ private:
   common::ObSEArray <Item, 4> outputs_;
 };
 
+class ScanResumePoint
+{
+public:
+  int init(bool *is_paused, int64_t tenant_id);
+
+  void destroy()
+  {
+    reset_ranges();
+    allocator_.reset();
+  }
+
+  inline bool is_paused() const
+  {
+    return OB_NOT_NULL(is_paused_) && ATOMIC_LOAD(is_paused_);
+  }
+
+  void set_paused()
+  {
+    if (OB_NOT_NULL(is_paused_)) {
+      ATOMIC_STORE(is_paused_, true);
+    }
+  }
+
+  void clear_paused() {
+    if (OB_NOT_NULL(is_paused_)) {
+      ATOMIC_STORE(is_paused_, false);
+    }
+  }
+
+  bool empty() const { return ranges_.empty(); }
+  int add_range(const ObITableReadInfo& read_info, const blocksstable::ObDatumRange& datum_range);
+  void reset_ranges() { ranges_.reset(); }
+  ObSEArray<ObNewRange, 1>& get_ranges() { return ranges_; }
+
+private:
+  // is_paused_ reference to ObGITaskReBalancer.worker_paused_flags_[worker_id]
+  bool *is_paused_{nullptr};
+  // range return by storage layer
+  ObSEArray<ObNewRange, 1> ranges_;
+  ObArenaAllocator allocator_;
+};
+
 class ObTableScanParam : public common::ObVTableScanParam
 {
 public:
@@ -141,8 +183,15 @@ public:
         tx_seq_base_(-1),
         read_version_range_(),
         need_update_tablet_param_(false),
+        in_bf_cache_threshold_(common::DEFAULT_MAX_MULTI_GET_CACHE_AWARE_ROW_NUM),
+        in_fuse_row_cache_threshold_(common::DEFAULT_MAX_MULTI_GET_CACHE_AWARE_ROW_NUM),
         in_row_cache_threshold_(common::DEFAULT_MAX_MULTI_GET_CACHE_AWARE_ROW_NUM),
-        mds_collector_(nullptr)
+        scan_resume_point_(nullptr),
+        mds_collector_(nullptr),
+        row_scan_cnt_(NULL),
+        enable_new_false_range_(false),
+        est_row_count_param_(),
+        range_prefix_in_advance_scan_(0)
   {}
   virtual ~ObTableScanParam() {}
 public:
@@ -161,7 +210,11 @@ public:
     return  snapshot_.valid_ && ObVTableScanParam::is_valid() && (!is_mds_query_ || nullptr != mds_collector_);
   }
   OB_INLINE bool use_index_skip_scan() const {
-    return (1 == ss_key_ranges_.count()) && (!ss_key_ranges_.at(0).is_whole_range());
+    return 1 == ss_key_ranges_.count() &&
+           !ss_key_ranges_.at(0).is_whole_range() &&
+           sample_info_.is_no_sample() &&
+           !is_mview_query() &&
+           scan_flag_.is_ordered_scan(); // not mow query(ObQueryFlag::NoOrder)
   }
   OB_INLINE bool is_mview_query() const {
     return nullptr != op_filters_ && scan_flag_.is_mr_mview_query();
@@ -178,8 +231,15 @@ public:
   int64_t tx_seq_base_;  // used by lob when main table is read_latest
   ObVersionRange read_version_range_;
   bool need_update_tablet_param_; // whether need to update tablet-level param, such as split filter param
+  int64_t in_bf_cache_threshold_;
+  int64_t in_fuse_row_cache_threshold_;
   int64_t in_row_cache_threshold_;
+  ScanResumePoint *scan_resume_point_; // for scan pause
   ObMdsReadInfoCollector *mds_collector_; // used for collect mds info when query mds sstable
+  uint64_t *row_scan_cnt_;
+  bool enable_new_false_range_;
+  common::ObEstRowCountParam est_row_count_param_;
+  int8_t range_prefix_in_advance_scan_;
 
   DECLARE_VIRTUAL_TO_STRING;
 private:
@@ -211,7 +271,8 @@ struct ObDMLBaseParam
         check_schema_version_(true),
         ddl_task_id_(0),
         lob_allocator_(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
-        data_row_for_lob_(nullptr)
+        data_row_for_lob_(nullptr),
+        is_main_table_in_fts_ddl_(false)
   {
   }
 
@@ -248,6 +309,7 @@ struct ObDMLBaseParam
   int64_t ddl_task_id_;
   mutable ObArenaAllocator lob_allocator_;
   const blocksstable::ObDatumRow *data_row_for_lob_; // for tablet split
+  bool is_main_table_in_fts_ddl_; // whether the main table is in fts ddl when dml is executed
   bool is_valid() const { return (timeout_ > 0 && schema_version_ >= 0) && nullptr != store_ctx_guard_; }
   DECLARE_TO_STRING;
 };

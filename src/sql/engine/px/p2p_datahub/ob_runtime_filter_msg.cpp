@@ -98,7 +98,8 @@ OB_DEF_DESERIALIZE(ObRFRangeFilterMsg)
               cmp_funcs_,
               query_range_info_,
               build_obj_metas_);
-  if (OB_FAIL(adjust_cell_size())) {
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(adjust_cell_size())) {
     LOG_WARN("fail do adjust cell size", K(ret));
   }
   return ret;
@@ -239,6 +240,16 @@ int ObRFBloomFilterMsg::process_msg_internal(bool &need_free)
       need_free = true;
     } else {
       need_merge = false; // set success, not need to merge
+      if (is_first_phase() && get_msg_receive_expect_cnt() == 1 && expect_first_phase_count_ == 1) {
+        // for the bloom filter which only contain one piece, we should forward
+        // the second phase message directly, otherwise, we will forward the
+        // second phase message in the process of merge.
+        if (OB_FAIL(forward_second_phase_message(bloom_filter_.get_begin_idx(),
+                                                 bloom_filter_.get_end_idx(),
+                                                 get_next_phase_addrs()))) {
+          LOG_WARN("failed to forward second phase message");
+        }
+      }
       int reg_dm_ret = OB_SUCCESS;
 #ifdef ERRSIM
       reg_dm_ret = OB_E(EventTable::EN_PX_P2P_MSG_REG_DM_FAILED) OB_SUCCESS;
@@ -310,7 +321,6 @@ int ObRFBloomFilterMsg::reuse()
   int ret = OB_SUCCESS;
   is_empty_ = true;
   bloom_filter_.reset_filter();
-  need_send_msg_ = true;
   is_active_ = true;
   return ret;
 }
@@ -349,6 +359,36 @@ int ObRFBloomFilterMsg::process_first_phase_recieve_count(
   return ret;
 }
 
+int ObRFBloomFilterMsg::forward_second_phase_message(
+    int64_t begin_idx,
+    int64_t end_idx, const ObIArray<ObAddr> &next_phase_addrs) {
+  int ret = OB_SUCCESS;
+  obrpc::ObP2PDhRpcProxy &rpc_proxy = PX_P2P_DH.get_proxy();
+  ObPxP2PDatahubArg arg;
+  ObRFBloomFilterMsg second_phase_msg;
+  arg.msg_ = &second_phase_msg;
+  if (OB_FAIL(second_phase_msg.shadow_copy(*this))) {
+    LOG_WARN("fail to shadow copy second phase msg", K(ret));
+  } else {
+    second_phase_msg.phase_ = SECOND_LEVEL;
+    second_phase_msg.set_msg_cur_cnt(expect_first_phase_count_);
+    second_phase_msg.bloom_filter_.set_begin_idx(begin_idx);
+    second_phase_msg.bloom_filter_.set_end_idx(end_idx);
+  }
+  for (int i = 0; OB_SUCC(ret) && i < next_phase_addrs.count(); ++i) {
+    if (next_phase_addrs.at(i) != GCTX.self_addr()) {
+      if (OB_FAIL(rpc_proxy.to(next_phase_addrs.at(i))
+                      .by(get_tenant_id())
+                      .timeout(get_timeout_ts())
+                      .compressed(ObCompressorType::LZ4_COMPRESSOR)
+                      .send_p2p_dh_message(arg, NULL))) {
+        LOG_WARN("fail to send bloom filter", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObRFBloomFilterMsg::process_receive_count(ObP2PDatahubMsgBase &rf_msg)
 {
   int ret = OB_SUCCESS;
@@ -373,28 +413,10 @@ int ObRFBloomFilterMsg::process_receive_count(ObP2PDatahubMsgBase &rf_msg)
     if (OB_FAIL(process_first_phase(bf_msg))) {
       LOG_WARN("fail to process first phase", K(ret));
     } else if (first_phase_end && !bf_msg.get_next_phase_addrs().empty()) {
-      obrpc::ObP2PDhRpcProxy &rpc_proxy = PX_P2P_DH.get_proxy();
-      ObPxP2PDatahubArg arg;
-      ObRFBloomFilterMsg second_phase_msg;
-      arg.msg_ = &second_phase_msg;
-      if (OB_FAIL(second_phase_msg.shadow_copy(*this))) {
-        LOG_WARN("fail to shadow copy second phase msg", K(ret));
-      } else {
-        second_phase_msg.phase_ = SECOND_LEVEL;
-        second_phase_msg.set_msg_cur_cnt(expect_first_phase_count_);
-        second_phase_msg.bloom_filter_.set_begin_idx(bf_msg.bloom_filter_.get_begin_idx());
-        second_phase_msg.bloom_filter_.set_end_idx(bf_msg.bloom_filter_.get_end_idx());
-      }
-      for (int i = 0; OB_SUCC(ret) && i < bf_msg.get_next_phase_addrs().count(); ++i) {
-        if (bf_msg.get_next_phase_addrs().at(i) != GCTX.self_addr()) {
-          if (OB_FAIL(rpc_proxy.to(bf_msg.get_next_phase_addrs().at(i))
-              .by(bf_msg.get_tenant_id())
-              .timeout(bf_msg.get_timeout_ts())
-              .compressed(ObCompressorType::LZ4_COMPRESSOR)
-              .send_p2p_dh_message(arg, NULL))) {
-            LOG_WARN("fail to send bloom filter", K(ret));
-          }
-        }
+      if (OB_FAIL(forward_second_phase_message(bf_msg.bloom_filter_.get_begin_idx(),
+                                               bf_msg.bloom_filter_.get_end_idx(),
+                                               bf_msg.get_next_phase_addrs()))) {
+        LOG_WARN("failed to forward second phase message");
       }
       (void)check_finish_receive();
     } else if (bf_msg.get_next_phase_addrs().empty()) {
@@ -1065,15 +1087,13 @@ int ObRFBloomFilterMsg::broadcast(ObIArray<ObAddr> &target_addrs,
   ObPxP2PDatahubArg arg;
 
   arg.msg_ = &msg;
-  while (!create_finish_ && need_send_msg_ && OB_SUCC(ret)) {
+  while (!create_finish_ && OB_SUCC(ret)) {
     if (OB_FAIL(THIS_WORKER.check_status())) {
       LOG_WARN("fail to check status", K(ret));
     }
     ob_usleep(10);
   }
   if (OB_FAIL(ret)) {
-  } else if (!need_send_msg_) {
-    // when drain_exch, not need to send msg
   } else if (OB_FAIL(msg.shadow_copy(*this))) {
     LOG_WARN("fail to shadow copy second phase msg", K(ret));
   } else {
@@ -1456,7 +1476,7 @@ int ObRFRangeFilterMsg::dynamic_copy_cell(const ObDatum &src, ObDatum &target, i
   int ret = OB_SUCCESS;
   int64_t need_size = src.len_;
   if (src.is_null()) {
-    target.null_ = 1;
+    target.set_null();
   } else {
     if (need_size > cell_size) {
       need_size = need_size * 2;

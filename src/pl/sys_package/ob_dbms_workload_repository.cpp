@@ -343,7 +343,7 @@ int ObDbmsWorkloadRepository::modify_snapshot_settings(
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("tenant data version is too low for wr", K(ctx.exec_ctx_->get_my_session()->get_effective_tenant_id()), K(data_version));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "version is less than 4.2.1, workload repository not supported");
-  } else if (OB_UNLIKELY(3 != params.count())) {
+  } else if (OB_UNLIKELY(4 != params.count())) {
     ret = OB_INVALID_ARGUMENT_NUM;
     LOG_WARN("parameters number is wrong", K(ret), K(params.count()));
   } else if (OB_FAIL(GCTX.location_service_->get_leader(
@@ -400,9 +400,24 @@ int ObDbmsWorkloadRepository::modify_snapshot_settings(
       }
     }
 
+    int64_t sqlstat_interval = 0;
+    if (OB_SUCC(ret)) {
+      if (params.at(3).is_null()) {
+        sqlstat_interval = -1;  // null
+      } else {
+        sqlstat_interval = params.at(3).get_int();
+        if (sqlstat_interval < 1) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("Invalid value range, sqlstat_interval can not be less than 1.", K(ret));
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+              "Invalid value range, sqlstat_interval can not be less than 1.");
+        }
+      }
+    }
+
     if (OB_SUCC(ret)) {
       ObWrUserModifySettingsArg wr_user_modify_settings_arg(
-          ctx.exec_ctx_->get_my_session()->get_effective_tenant_id(), retention, interval, topnsql);
+          ctx.exec_ctx_->get_my_session()->get_effective_tenant_id(), retention, interval, topnsql, sqlstat_interval);
       if (OB_FAIL(wr_proxy.to(leader)
                       .by(OB_SYS_TENANT_ID)
                       .group_id(share::OBCG_WR)
@@ -419,15 +434,22 @@ int ObDbmsWorkloadRepository::generate_ash_report_text(
     ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result)
 {
   int ret = OB_SUCCESS;
-  AshReportParams ash_report_params(ctx.exec_ctx_->get_my_session()->get_timezone_info());
+  AshReportParams ash_report_params(ctx.exec_ctx_->get_my_session()->get_timezone_info(),
+      ctx.exec_ctx_->get_my_session()->get_tz_info_wrap());
+  const ObTimeZoneInfo *cur_tz_info = get_timezone_info(ctx.exec_ctx_->get_my_session());
   uint64_t data_version = OB_INVALID_VERSION;
   ObStringBuffer buff(&ctx.exec_ctx_->get_allocator());
-  if (OB_FAIL(GET_MIN_DATA_VERSION(ctx.exec_ctx_->get_my_session()->get_effective_tenant_id(), data_version))) {
-    LOG_WARN("get min data_version failed", KR(ret), K(ctx.exec_ctx_->get_my_session()->get_effective_tenant_id()));
+  ash_report_params.session_param.tz_info_wrap_ = const_cast<common::ObTimeZoneInfoWrap*>(&ash_report_params.session_tz_wrap);
+  if (OB_FAIL(GET_MIN_DATA_VERSION(
+                 ctx.exec_ctx_->get_my_session()->get_effective_tenant_id(), data_version))) {
+    LOG_WARN("get min data_version failed", KR(ret),
+        K(ctx.exec_ctx_->get_my_session()->get_effective_tenant_id()));
   } else if (data_version < DATA_VERSION_4_2_1_0) {
     ret = OB_NOT_SUPPORTED;
-    LOG_WARN("tenant data version is too low for wr", K(ctx.exec_ctx_->get_my_session()->get_effective_tenant_id()), K(data_version));
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "version is less than 4.2.1, workload repository not supported");
+    LOG_WARN("tenant data version is too low for wr",
+        K(ctx.exec_ctx_->get_my_session()->get_effective_tenant_id()), K(data_version));
+    LOG_USER_ERROR(
+        OB_NOT_SUPPORTED, "version is less than 4.2.1, workload repository not supported");
   } else if (OB_FAIL(process_ash_report_params(data_version, params, ash_report_params))) {
     LOG_WARN("failed to process ash report params", K(ret), K(data_version), K(params));
   } else {
@@ -625,18 +647,20 @@ int ObDbmsWorkloadRepository::get_ash_bound_sql_time(const AshReportParams &ash_
   int64_t ash_end_time = ash_report_params.ash_end_time > 0 ? ash_report_params.ash_end_time : ash_report_params.wr_end_time;
   char ash_begin_time_buf[time_buf_len] = "";
   char ash_end_time_buf[time_buf_len] = "";
+  // Oracle TO_DATE does not support microseconds, use scale 0 for Oracle mode
+  const int scale = is_oracle_mode() ? 0 : 6;
   if (OB_FAIL(usec_to_string(ash_report_params.tz_info,
                              ash_begin_time,
                              ash_begin_time_buf,
                              time_buf_len,
-                             time_buf_pos))) {
+                             time_buf_pos, scale))) {
     LOG_WARN_RET(OB_ERR_UNEXPECTED, "fail to print time as str", K(ret));
   } else if (FALSE_IT(time_buf_pos = 0)) {
   } else if (OB_FAIL(usec_to_string(ash_report_params.tz_info,
                                     ash_end_time,
                                     ash_end_time_buf,
                                     time_buf_len,
-                                    time_buf_pos))) {
+                                    time_buf_pos, scale))) {
     LOG_WARN_RET(OB_ERR_UNEXPECTED, "fail to print time as str", K(ret));
   } else if (is_oracle_mode()) {
     snprintf(start_time_buf, start_buf_len, "TO_DATE('%s')", ash_begin_time_buf);
@@ -648,15 +672,16 @@ int ObDbmsWorkloadRepository::get_ash_bound_sql_time(const AshReportParams &ash_
   return ret;
 }
 
+/// scale 0 for user interface. scale 6 for query ash table.
 int ObDbmsWorkloadRepository::usec_to_string(const common::ObTimeZoneInfo *tz_info,
-    const int64_t usec, char *buf, int64_t buf_len, int64_t &pos)
+    const int64_t usec, char *buf, int64_t buf_len, int64_t &pos, int scale = 0)
 {
   int ret = OB_SUCCESS;
   ObTime time;
   if (OB_FAIL(ObTimeConverter::datetime_to_ob_time(usec, tz_info, time))) {
     LOG_WARN("failed to usec to ob time", K(ret), K(usec));
   } else if (OB_FAIL(ObTimeConverter::ob_time_to_str(time,
-                 lib::is_oracle_mode() ? DT_TYPE_ORACLE_TIMESTAMP : DT_TYPE_DATETIME, 0 /*scale*/,
+                 lib::is_oracle_mode() ? DT_TYPE_ORACLE_TIMESTAMP : DT_TYPE_DATETIME, scale /*scale*/,
                  buf, buf_len, pos, true /*with_delim*/))) {
     LOG_WARN("fail to change time to string", K(ret), K(time), K(pos));
   }
@@ -671,6 +696,132 @@ const char *wr_mysql_sys_table_421 = " FROM oceanbase.CDB_WR_ACTIVE_SESSION_HIST
 const char *oracle_table = " FROM SYS.GV$ACTIVE_SESSION_HISTORY ASH";
 const char *wr_oracle_table = " FROM SYS.DBA_WR_ACTIVE_SESSION_HISTORY WR LEFT JOIN SYS.DBA_WR_EVENT_NAME WR_EVENT_NAME ON WR.EVENT_ID = WR_EVENT_NAME.EVENT_ID";
 const char *wr_oracle_table_421 = " FROM SYS.DBA_WR_ACTIVE_SESSION_HISTORY WR";
+
+const char *ASH_VIEW_SQL_442 =
+"SELECT"
+" /*+ LEADING(CDB_WR_ACTIVE_SESSION_HISTORY, CDB_WR_EVENT_NAME) USE_HASH(WR WR_EVENT_NAME) */ "
+"  ASH.TIME_MODEL AS TIME_MODEL,"
+"  ASH.SVR_IP AS SVR_IP,"
+"  ASH.SVR_PORT AS SVR_PORT,"
+"  ASH.SAMPLE_TIME AS SAMPLE_TIME,"
+"  ASH.CON_ID AS TENANT_ID,"
+"  ASH.USER_ID AS USER_ID,"
+"  ASH.SESSION_ID AS SESSION_ID,"
+"  ASH.SESSION_TYPE AS SESSION_TYPE,"
+"  ASH.SQL_ID AS SQL_ID,"
+"  ASH.PLAN_ID AS PLAN_ID,"
+"  ASH.TRACE_ID AS TRACE_ID,"
+// EVENT
+"  %s"
+"  ASH.EVENT_NO AS EVENT_NO,"
+"  ASH.EVENT_ID AS EVENT_ID,"
+"  ASH.P1 AS P1,"
+"  ASH.P1TEXT AS P1TEXT,"
+"  ASH.P2 AS P2,"
+"  ASH.P2TEXT AS P2TEXT,"
+"  ASH.P3 AS P3,"
+"  ASH.P3TEXT AS P3TEXT,"
+// WAIT_CLASS
+"  %s"
+"  ASH.WAIT_CLASS_ID AS WAIT_CLASS_ID,"
+"  ASH.TIME_WAITED AS TIME_WAITED,"
+"  ASH.SQL_PLAN_LINE_ID AS SQL_PLAN_LINE_ID,"
+"  ASH.GROUP_ID AS GROUP_ID,"
+"  ASH.PLAN_HASH AS PLAN_HASH,"
+"  ASH.THREAD_ID AS THREAD_ID,"
+"  ASH.STMT_TYPE AS STMT_TYPE,"
+"  ASH.PROGRAM AS PROGRAM,"
+"  ASH.MODULE AS MODULE,"
+"  ASH.ACTION AS ACTION,"
+"  ASH.CLIENT_ID AS CLIENT_ID,"
+"  ASH.TOP_LEVEL_SQL_ID AS TOP_LEVEL_SQL_ID,"
+"  ASH.PLSQL_ENTRY_OBJECT_ID AS PLSQL_ENTRY_OBJECT_ID,"
+"  ASH.PLSQL_ENTRY_SUBPROGRAM_ID AS PLSQL_ENTRY_SUBPROGRAM_ID,"
+"  ASH.PLSQL_ENTRY_SUBPROGRAM_NAME AS PLSQL_ENTRY_SUBPROGRAM_NAME,"
+"  ASH.PLSQL_OBJECT_ID AS PLSQL_OBJECT_ID,"
+"  ASH.PLSQL_SUBPROGRAM_ID AS PLSQL_SUBPROGRAM_ID,"
+"  ASH.PLSQL_SUBPROGRAM_NAME AS PLSQL_SUBPROGRAM_NAME,"
+"  ASH.BLOCKING_SESSION_ID AS BLOCKING_SESSION_ID,"
+"  ASH.TABLET_ID AS TABLET_ID,"
+"  ASH.TM_DELTA_TIME AS TM_DELTA_TIME, "
+"  ASH.TM_DELTA_CPU_TIME AS TM_DELTA_CPU_TIME, "
+"  ASH.TM_DELTA_DB_TIME AS TM_DELTA_DB_TIME, "
+"  ASH.PROXY_SID AS PROXY_SID, "
+"  ASH.TX_ID AS TX_ID, "
+"  ASH.DELTA_READ_IO_REQUESTS AS DELTA_READ_IO_REQUESTS,"
+"  ASH.DELTA_READ_IO_BYTES AS DELTA_READ_IO_BYTES,"
+"  ASH.DELTA_WRITE_IO_REQUESTS AS DELTA_WRITE_IO_REQUESTS,"
+"  ASH.DELTA_WRITE_IO_BYTES AS DELTA_WRITE_IO_BYTES,"
+"  ASH.WEIGHT AS WEIGHT,"
+"  ASH.WEIGHT AS COUNT_WEIGHT"
+// FROM which table
+" %s"
+" WHERE sample_time between '%.*s' and '%.*s'";
+
+const char *WR_VIEW_SQL_442 =
+"SELECT"
+" /*+ LEADING(CDB_WR_ACTIVE_SESSION_HISTORY, CDB_WR_EVENT_NAME) USE_HASH(WR WR_EVENT_NAME) */ "
+" WR.TIME_MODEL AS TIME_MODEL,"
+" WR.SVR_IP AS SVR_IP,"
+" WR.SVR_PORT AS SVR_PORT,"
+" WR.SAMPLE_TIME AS SAMPLE_TIME,"
+" WR.TENANT_ID AS TENANT_ID,"
+" WR.USER_ID AS USER_ID,"
+" WR.SESSION_ID AS SESSION_ID,"
+// SESSION_TYPE
+" %s"
+" WR.SQL_ID AS SQL_ID,"
+" WR.PLAN_ID AS PLAN_ID,"
+" WR.TRACE_ID AS TRACE_ID,"
+// EVENT
+" %s"
+" WR.EVENT_NO AS EVENT_NO,"
+" WR.EVENT_ID AS EVENT_ID,"
+" WR.P1 AS P1,"
+" WR_EVENT_NAME.PARAMETER1 AS P1TEXT,"
+" WR.P2 AS P2,"
+" WR_EVENT_NAME.PARAMETER2 AS P2TEXT,"
+" WR.P3 AS P3,"
+" WR_EVENT_NAME.PARAMETER3 AS P3TEXT,"
+// WAIT_CLASS
+" %s"
+" WR_EVENT_NAME.WAIT_CLASS_ID AS WAIT_CLASS_ID,"
+" WR.TIME_WAITED AS TIME_WAITED,"
+" WR.SQL_PLAN_LINE_ID AS SQL_PLAN_LINE_ID,"
+" WR.GROUP_ID AS GROUP_ID,"
+" WR.PLAN_HASH AS PLAN_HASH,"
+" WR.THREAD_ID AS THREAD_ID,"
+" WR.STMT_TYPE AS STMT_TYPE,"
+" WR.PROGRAM AS PROGRAM,"
+" WR.MODULE AS MODULE,"
+" WR.ACTION AS ACTION,"
+" WR.CLIENT_ID AS CLIENT_ID,"
+" WR.TOP_LEVEL_SQL_ID AS TOP_LEVEL_SQL_ID,"
+" WR.PLSQL_ENTRY_OBJECT_ID AS PLSQL_ENTRY_OBJECT_ID,"
+" WR.PLSQL_ENTRY_SUBPROGRAM_ID AS PLSQL_ENTRY_SUBPROGRAM_ID,"
+" WR.PLSQL_ENTRY_SUBPROGRAM_NAME AS PLSQL_ENTRY_SUBPROGRAM_NAME,"
+" WR.PLSQL_OBJECT_ID AS PLSQL_OBJECT_ID,"
+" WR.PLSQL_SUBPROGRAM_ID AS PLSQL_SUBPROGRAM_ID,"
+" WR.PLSQL_SUBPROGRAM_NAME AS PLSQL_SUBPROGRAM_NAME,"
+" WR.IN_SQL_EXECUTION AS IN_SQL_EXECUTION, "
+" WR.IN_PLSQL_COMPILATION AS IN_PLSQL_COMPILATION, "
+" WR.IN_PLSQL_EXECUTION AS IN_PLSQL_EXECUTION, "
+" WR.BLOCKING_SESSION_ID AS BLOCKING_SESSION_ID,"
+" WR.TABLET_ID AS TABLET_ID,"
+" WR.TM_DELTA_TIME AS TM_DELTA_TIME, "
+" WR.TM_DELTA_CPU_TIME AS TM_DELTA_CPU_TIME, "
+" WR.TM_DELTA_DB_TIME AS TM_DELTA_DB_TIME, "
+" WR.PROXY_SID AS PROXY_SID, "
+" WR.TX_ID AS TX_ID, "
+" WR.DELTA_READ_IO_REQUESTS AS DELTA_READ_IO_REQUESTS,"
+" WR.DELTA_READ_IO_BYTES AS DELTA_READ_IO_BYTES,"
+" WR.DELTA_WRITE_IO_REQUESTS AS DELTA_WRITE_IO_REQUESTS,"
+" WR.DELTA_WRITE_IO_BYTES AS DELTA_WRITE_IO_BYTES,"
+" WR.WEIGHT AS WEIGHT,"
+" WR.WEIGHT * 10 AS COUNT_WEIGHT"
+// FROM which table
+" %s"
+" WHERE sample_time between '%.*s' and '%.*s'";
 
 const char *ASH_VIEW_SQL_4352 =
  "SELECT"
@@ -726,6 +877,7 @@ const char *ASH_VIEW_SQL_4352 =
  "  ASH.DELTA_READ_IO_BYTES AS DELTA_READ_IO_BYTES,"
  "  ASH.DELTA_WRITE_IO_REQUESTS AS DELTA_WRITE_IO_REQUESTS,"
  "  ASH.DELTA_WRITE_IO_BYTES AS DELTA_WRITE_IO_BYTES,"
+ "  1 AS WEIGHT,"
  "  1 AS COUNT_WEIGHT"
  // FROM which table
  " %s"
@@ -786,6 +938,7 @@ const char *ASH_VIEW_SQL_4352 =
  " WR.DELTA_READ_IO_BYTES AS DELTA_READ_IO_BYTES,"
  " WR.DELTA_WRITE_IO_REQUESTS AS DELTA_WRITE_IO_REQUESTS,"
  " WR.DELTA_WRITE_IO_BYTES AS DELTA_WRITE_IO_BYTES,"
+ " 1 AS WEIGHT,"
  " 10 AS COUNT_WEIGHT"
  // FROM which table
  " %s"
@@ -845,6 +998,7 @@ const char *ASH_VIEW_SQL_4352 =
  "  NULL AS DELTA_READ_IO_BYTES,"
  "  NULL AS DELTA_WRITE_IO_REQUESTS,"
  "  NULL AS DELTA_WRITE_IO_BYTES,"
+ "  1 AS WEIGHT,"
  "  1 AS COUNT_WEIGHT "
  // FROM which table
  " %s "
@@ -853,6 +1007,7 @@ const char *ASH_VIEW_SQL_4352 =
 
 const char *ASH_VIEW_SQL_425 =
 "SELECT"
+" /*+ LEADING(CDB_WR_ACTIVE_SESSION_HISTORY, CDB_WR_EVENT_NAME) USE_HASH(WR WR_EVENT_NAME) */ "
 "  ASH.TIME_MODEL AS TIME_MODEL,"
 "  ASH.SVR_IP AS SVR_IP,"
 "  ASH.SVR_PORT AS SVR_PORT,"
@@ -905,6 +1060,7 @@ const char *ASH_VIEW_SQL_425 =
 "  ASH.DELTA_READ_IO_BYTES AS DELTA_READ_IO_BYTES,"
 "  ASH.DELTA_WRITE_IO_REQUESTS AS DELTA_WRITE_IO_REQUESTS,"
 "  ASH.DELTA_WRITE_IO_BYTES AS DELTA_WRITE_IO_BYTES,"
+"  1 AS WEIGHT,"
 "  1 AS COUNT_WEIGHT"
 // FROM which table
 " %s"
@@ -912,6 +1068,7 @@ const char *ASH_VIEW_SQL_425 =
 
 const char *WR_VIEW_SQL_425 =
 "SELECT"
+" /*+ LEADING(CDB_WR_ACTIVE_SESSION_HISTORY, CDB_WR_EVENT_NAME) USE_HASH(WR WR_EVENT_NAME) */ "
 " WR.TIME_MODEL AS TIME_MODEL,"
 " WR.SVR_IP AS SVR_IP,"
 " WR.SVR_PORT AS SVR_PORT,"
@@ -968,6 +1125,7 @@ const char *WR_VIEW_SQL_425 =
 " WR.DELTA_READ_IO_BYTES AS DELTA_READ_IO_BYTES,"
 " WR.DELTA_WRITE_IO_REQUESTS AS DELTA_WRITE_IO_REQUESTS,"
 " WR.DELTA_WRITE_IO_BYTES AS DELTA_WRITE_IO_BYTES,"
+" 1 AS WEIGHT,"
 " 10 AS COUNT_WEIGHT"
 // FROM which table
 " %s"
@@ -1028,6 +1186,7 @@ const char *ASH_VIEW_SQL_424 =
 "  NULL AS DELTA_READ_IO_BYTES,"
 "  NULL AS DELTA_WRITE_IO_REQUESTS,"
 "  NULL AS DELTA_WRITE_IO_BYTES,"
+"  1 AS WEIGHT,"
 "  1 AS COUNT_WEIGHT"
 // FROM which table
 " %s"
@@ -1089,6 +1248,7 @@ const char *WR_VIEW_SQL_424 =
 " NULL AS DELTA_READ_IO_BYTES,"
 " NULL AS DELTA_WRITE_IO_REQUESTS,"
 " NULL AS DELTA_WRITE_IO_BYTES,"
+" 1 AS WEIGHT,"
 " 10 AS COUNT_WEIGHT"
 // FROM which table
 " %s"
@@ -1149,6 +1309,7 @@ const char *ASH_VIEW_SQL_423 =
 "  NULL AS DELTA_READ_IO_BYTES,"
 "  NULL AS DELTA_WRITE_IO_REQUESTS,"
 "  NULL AS DELTA_WRITE_IO_BYTES,"
+"  1 AS WEIGHT,"
 "  1 AS COUNT_WEIGHT"
 // FROM which table
 " %s"
@@ -1210,6 +1371,7 @@ const char *WR_VIEW_SQL_423 =
 " NULL AS DELTA_READ_IO_BYTES,"
 " NULL AS DELTA_WRITE_IO_REQUESTS,"
 " NULL AS DELTA_WRITE_IO_BYTES,"
+" 1 AS WEIGHT,"
 " 10 AS COUNT_WEIGHT"
 // FROM which table
 " %s"
@@ -1270,6 +1432,7 @@ const char *ASH_VIEW_SQL_422 =
 "  NULL AS DELTA_READ_IO_BYTES,"
 "  NULL AS DELTA_WRITE_IO_REQUESTS,"
 "  NULL AS DELTA_WRITE_IO_BYTES,"
+"  1 AS WEIGHT,"
 "  1 AS COUNT_WEIGHT"
 // FROM which table
 " %s"
@@ -1331,6 +1494,7 @@ const char *WR_VIEW_SQL_422 =
 " NULL AS DELTA_READ_IO_BYTES,"
 " NULL AS DELTA_WRITE_IO_REQUESTS,"
 " NULL AS DELTA_WRITE_IO_BYTES,"
+" 1 AS WEIGHT,"
 " 10 AS COUNT_WEIGHT"
 // FROM which table
 " %s"
@@ -1391,6 +1555,7 @@ const char *ASH_VIEW_SQL_421 =
 "  NULL AS DELTA_READ_IO_BYTES,"
 "  NULL AS DELTA_WRITE_IO_REQUESTS,"
 "  NULL AS DELTA_WRITE_IO_BYTES,"
+"  1 AS WEIGHT,"
 "  1 AS COUNT_WEIGHT"
 // FROM which table
 " %s"
@@ -1450,10 +1615,56 @@ const char *WR_VIEW_SQL_421 =
 " NULL AS DELTA_READ_IO_BYTES,"
 " NULL AS DELTA_WRITE_IO_REQUESTS,"
 " NULL AS DELTA_WRITE_IO_BYTES,"
+" 1 AS WEIGHT,"
 " 10 AS COUNT_WEIGHT"
 // FROM which table
 " %s"
 " WHERE sample_time between '%.*s' and '%.*s'";
+
+
+const char *SQLSTAT_VIEW_SQL_4257 =
+"SELECT"
+" SQL_ID,"
+" PLAN_HASH,"
+" TENANT_ID,"
+" QUERY_SQL,"
+" PLAN_CACHE_HIT_DELTA,"
+" RPC_DELTA,"
+" PARTITION_DELTA,"
+" ROUTE_MISS_DELTA,"
+" DISK_READS_DELTA,"
+" MUTI_QUERY_DELTA,"
+" MUTI_QUERY_BATCH_DELTA,"
+" ERROR_COUNT_DELTA,"
+" FULL_TABLE_SCAN_DELTA,"
+" RETRY_DELTA,"
+" EXECUTIONS_DELTA,"
+" ELAPSED_TIME_DELTA,"
+" FIRST_LOAD_TIME"
+//FROM which table
+" FROM %s ";
+
+const char *SQLSTAT_VIEW_SQL_4256 =
+"SELECT"
+" SQL_ID,"
+" PLAN_HASH,"
+" TENANT_ID,"
+" QUERY_SQL,"
+" PLAN_CACHE_HIT_DELTA,"
+" RPC_DELTA,"
+" PARTITION_DELTA,"
+" ROUTE_MISS_DELTA,"
+" DISK_READS_DELTA,"
+" 0 AS MUTI_QUERY_DELTA,"
+" 0 AS MUTI_QUERY_BATCH_DELTA,"
+" 0 AS ERROR_COUNT_DELTA,"
+" 0 AS FULL_TABLE_SCAN_DELTA,"
+" RETRY_DELTA,"
+" EXECUTIONS_DELTA,"
+" ELAPSED_TIME_DELTA,"
+" FIRST_LOAD_TIME"
+//FROM which table
+" FROM %s ";
 
 #define EXTRACT_INT_FIELD_FOR_ASH(result, column_name, field, type)              \
   if (OB_SUCC(ret)) {                                                            \
@@ -1462,6 +1673,21 @@ const char *WR_VIEW_SQL_421 =
       LOG_WARN("get column type from result failed", K(ret), K(column_name));    \
     } else if (_col_type.is_number() || _col_type.is_decimal_int()) {            \
       EXTRACT_INT_FIELD_FROM_NUMBER_SKIP_RET(result, column_name, field , type); \
+    } else if (_col_type.is_double() || _col_type.is_udouble() ||                \
+               _col_type.is_float() || _col_type.is_ufloat()) {                  \
+      double double_value = 0;                                                   \
+      if (OB_FAIL((result).get_double(column_name, double_value))) {             \
+        if (OB_ERR_NULL_VALUE == ret || OB_ERR_COLUMN_NOT_FOUND == ret) {        \
+          ret = OB_SUCCESS;                                                      \
+          field = static_cast<type>(0);                                          \
+        } else {                                                                 \
+          LOG_WARN("get double column from result failed", K(ret), K(column_name)); \
+        }                                                                        \
+      } else {                                                                   \
+        double_value = double_value >= 0 ? double_value + 0.5                    \
+                                         : double_value - 0.5;                   \
+        field = static_cast<type>(double_value);                                 \
+      }                                                                          \
     } else {                                                                     \
       EXTRACT_INT_FIELD_MYSQL_SKIP_RET(result, column_name, field, type);        \
     }                                                                            \
@@ -1476,6 +1702,21 @@ const char *WR_VIEW_SQL_421 =
       LOG_WARN("get column type from result failed", K(ret), K(column_name));   \
     } else if (col_type.is_number() || col_type.is_decimal_int()) {             \
       EXTRACT_INT_FIELD_FROM_NUMBER_SKIP_RET(result, column_name, field, type); \
+    } else if (col_type.is_double() || col_type.is_udouble() ||                 \
+               col_type.is_float() || col_type.is_ufloat()) {                   \
+      double double_value = 0;                                                  \
+      if (OB_FAIL((result).get_double(column_name, double_value))) {            \
+        if (OB_ERR_NULL_VALUE == ret || OB_ERR_COLUMN_NOT_FOUND == ret) {       \
+          ret = OB_SUCCESS;                                                     \
+          field = static_cast<type>(0);                                         \
+        } else {                                                                \
+          LOG_WARN("get double column from result failed", K(ret), K(column_name)); \
+        }                                                                       \
+      } else {                                                                  \
+        double_value = double_value >= 0 ? double_value + 0.5                   \
+                                         : double_value - 0.5;                  \
+        field = static_cast<type>(double_value);                                \
+      }                                                                         \
     } else {                                                                    \
       EXTRACT_INT_FIELD_MYSQL_SKIP_RET(result, column_name, field, type);       \
     }                                                                           \
@@ -1489,6 +1730,19 @@ const char *WR_VIEW_SQL_421 =
       LOG_WARN("get column type from result failed", K(ret), K(column_name));                              \
     } else if (_col_type.is_unumber() || _col_type.is_number() || _col_type.is_decimal_int()) {            \
       EXTRACT_UINT_FIELD_FROM_NUMBER_SKIP_RET(result, column_name, field , type);                          \
+    } else if (_col_type.is_double() || _col_type.is_udouble() || _col_type.is_float() ||                  \
+               _col_type.is_ufloat()) {                                                                    \
+      double double_value = 0;                                                                             \
+      if (OB_FAIL((result).get_double(column_name, double_value))) {                                       \
+        if (OB_ERR_NULL_VALUE == ret || OB_ERR_COLUMN_NOT_FOUND == ret) {                                  \
+          ret = OB_SUCCESS;                                                                                \
+          field = static_cast<type>(0);                                                                    \
+        } else {                                                                                           \
+          LOG_WARN("get double column from result failed", K(ret), K(column_name));                        \
+        }                                                                                                  \
+      } else {                                                                                             \
+        field = static_cast<type>(double_value < 0 ? 0 : (double_value + 0.5));                            \
+      }                                                                                                    \
     } else {                                                                                               \
       EXTRACT_UINT_FIELD_MYSQL_SKIP_RET(result, column_name, field, type);                                 \
     }                                                                                                      \
@@ -1503,10 +1757,46 @@ const char *WR_VIEW_SQL_421 =
       LOG_WARN("get column type from result failed", K(ret), K(column_name));                             \
     } else if (col_type.is_unumber() || col_type.is_number() || col_type.is_decimal_int()) {              \
       EXTRACT_UINT_FIELD_FROM_NUMBER_SKIP_RET(result, column_name, field, type);                          \
+    } else if (col_type.is_double() || col_type.is_udouble() || col_type.is_float() ||                    \
+               col_type.is_ufloat()) {                                                                    \
+      double double_value = 0;                                                                            \
+      if (OB_FAIL((result).get_double(column_name, double_value))) {                                      \
+        if (OB_ERR_NULL_VALUE == ret || OB_ERR_COLUMN_NOT_FOUND == ret) {                                 \
+          ret = OB_SUCCESS;                                                                               \
+          field = static_cast<type>(0);                                                                   \
+        } else {                                                                                          \
+          LOG_WARN("get double column from result failed", K(ret), K(column_name));                       \
+        }                                                                                                 \
+      } else {                                                                                            \
+        field = static_cast<type>(double_value < 0 ? 0 : (double_value + 0.5));                           \
+      }                                                                                                   \
     } else {                                                                                              \
       EXTRACT_UINT_FIELD_MYSQL_SKIP_RET(result, column_name, field, type);                                \
     }                                                                                                     \
     sprintf(field##_char, "%lu", field);                                                                  \
+  }
+
+#define EXTRACT_DATETIME_FIELD_FOR_ASH_STR(result, column_name, field, type,   \
+                                           tz_info)                            \
+  type field = 0;                                                              \
+  int64_t pos = 0;                                                             \
+  char field##_char[64] = "";                                                  \
+  if (OB_SUCC(ret)) {                                                          \
+    if (OB_FAIL((result).get_timestamp(column_name, tz_info, field))) {        \
+      if (OB_ERR_NULL_VALUE == ret || OB_ERR_COLUMN_NOT_FOUND == ret) {        \
+        ret = OB_SUCCESS;                                                      \
+        field = 0;                                                             \
+      } else {                                                                 \
+        LOG_WARN("get column type from result failed", K(ret),                 \
+                 K(column_name));                                              \
+      }                                                                        \
+    }                                                                          \
+    if (OB_FAIL(ret)) {                                                        \
+    } else if (OB_FAIL(usec_to_string(tz_info, field, field##_char,            \
+                                      static_cast<int64_t>(64),                \
+                                      pos))) {                                 \
+      LOG_WARN_RET(OB_ERR_UNEXPECTED, "fail to print time as str", K(ret));    \
+    }                                                                          \
   }
 
 #define ASH_FIELD_CHAR(field) field##_char
@@ -1538,7 +1828,7 @@ int ObDbmsWorkloadRepository::append_fmt_ash_view_sql(
       } else {
         ash_view_ptr = ASH_VIEW_SQL_421;
       }
-    } else {
+    } else if (data_version < DATA_VERSION_4_4_0_0) {
       // v4.3
       if (data_version >= DATA_VERSION_4_3_5_2) {
         ash_view_ptr = ASH_VIEW_SQL_4352;
@@ -1546,6 +1836,20 @@ int ObDbmsWorkloadRepository::append_fmt_ash_view_sql(
         ash_view_ptr = ASH_VIEW_SQL_4350;
       } else {
         ash_view_ptr = ASH_VIEW_SQL_421;
+      }
+    } else if (data_version < DATA_VERSION_4_5_0_0) {
+      //v4.4
+      if (data_version >= MOCK_DATA_VERSION_4_4_2_0) {
+        ash_view_ptr = ASH_VIEW_SQL_442;
+      } else {
+        ash_view_ptr = ASH_VIEW_SQL_4352;
+      }
+    } else {
+      //v4.5
+      if (data_version >= DATA_VERSION_4_5_1_0) {
+        ash_view_ptr = ASH_VIEW_SQL_442;
+      } else {
+        ash_view_ptr = ASH_VIEW_SQL_4352;
       }
     }
   }
@@ -1555,11 +1859,11 @@ int ObDbmsWorkloadRepository::append_fmt_ash_view_sql(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ash view ptr is nullptr", K(ret), K(ash_view_ptr));
   } else if (OB_FAIL(usec_to_string(ash_report_params.tz_info, ash_report_params.ash_begin_time,
-                 ash_begin_time_buf, time_buf_len, time_buf_pos))) {
+                 ash_begin_time_buf, time_buf_len, time_buf_pos, 6))) {
     LOG_WARN_RET(OB_ERR_UNEXPECTED, "fail to print time as str", K(ret));
   } else if (FALSE_IT(time_buf_pos = 0)) {
   } else if (OB_FAIL(usec_to_string(ash_report_params.tz_info, ash_report_params.ash_end_time,
-                 ash_end_time_buf, time_buf_len, time_buf_pos))) {
+                 ash_end_time_buf, time_buf_len, time_buf_pos, 6))) {
     LOG_WARN_RET(OB_ERR_UNEXPECTED, "fail to print time as str", K(ret));
   } else if (FALSE_IT(sprintf(port_buf, "%ld", ash_report_params.port))) {
   } else if (OB_FAIL(sql_string.append_fmt(ash_view_ptr,
@@ -1766,11 +2070,11 @@ int ObDbmsWorkloadRepository::append_fmt_wr_view_sql(
   if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
     LOG_WARN("get_min_data_version failed", K(ret), K(MTL_ID()));
   } else if (OB_FAIL(usec_to_string(ash_report_params.tz_info, ash_report_params.wr_begin_time,
-                 wr_begin_time_buf, time_buf_len, time_buf_pos))) {
+                 wr_begin_time_buf, time_buf_len, time_buf_pos, 6))) {
     LOG_WARN_RET(OB_ERR_UNEXPECTED, "fail to print time as str", K(ret));
   } else if (FALSE_IT(time_buf_pos = 0)) {
   } else if (OB_FAIL(usec_to_string(ash_report_params.tz_info, ash_report_params.wr_end_time,
-                 wr_end_time_buf, time_buf_len, time_buf_pos))) {
+                 wr_end_time_buf, time_buf_len, time_buf_pos, 6))) {
     LOG_WARN_RET(OB_ERR_UNEXPECTED, "fail to print time as str", K(ret));
   } else if (FALSE_IT(sprintf(port_buf, "%ld", ash_report_params.port))) {
   } else if ((data_version < DATA_VERSION_4_2_2_0) &&
@@ -1806,7 +2110,59 @@ int ObDbmsWorkloadRepository::append_fmt_wr_view_sql(
                  static_cast<int>(time_buf_pos),
                  wr_end_time_buf))) {
     LOG_WARN("failed to assign query string", K(ret));
-  } else if ((data_version >= DATA_VERSION_4_3_5_2) && OB_FAIL(sql_string.append_fmt(WR_VIEW_SQL_4352,
+  } else if ((data_version >= DATA_VERSION_4_3_5_2) && (data_version < MOCK_DATA_VERSION_4_4_2_0) &&
+             OB_FAIL(sql_string.append_fmt(WR_VIEW_SQL_4352,
+                 lib::is_oracle_mode()
+                     ? " CAST(DECODE(SESSION_TYPE, 0, 'FOREGROUND', 'BACKGROUND') AS VARCHAR2(10)) AS SESSION_TYPE,"
+                     : " CAST(IF (SESSION_TYPE = 0, 'FOREGROUND', 'BACKGROUND') AS CHAR(10)) AS SESSION_TYPE,",
+                 lib::is_oracle_mode() ? "CAST(DECODE(EVENT_NO, 0, 'ON CPU', EVENT_NAME) AS VARCHAR2(64)) AS EVENT,"
+                                       : "CAST(IF (EVENT_NO = 0, 'ON CPU', EVENT_NAME) AS CHAR(64)) AS EVENT,",
+                 lib::is_oracle_mode() ? "CAST(DECODE(EVENT_NO, 0, 'NULL', WAIT_CLASS) AS VARCHAR2(64)) AS WAIT_CLASS,"
+                                       : "CAST(IF (EVENT_NO = 0, 'NULL', WAIT_CLASS) AS CHAR(64)) AS WAIT_CLASS,",
+                 lib::is_oracle_mode()                                 ? wr_oracle_table
+                 : ash_report_params.cur_tenant_id == OB_SYS_TENANT_ID ? wr_mysql_sys_table
+                                                                       : wr_mysql_tenant_table,
+                 static_cast<int>(time_buf_pos),
+                 wr_begin_time_buf,
+                 static_cast<int>(time_buf_pos),
+                 wr_end_time_buf))) {
+    LOG_WARN("failed to assign query string", K(ret));
+  } else if ((data_version >= MOCK_DATA_VERSION_4_4_2_0 && data_version < DATA_VERSION_4_5_0_0) &&
+             OB_FAIL(sql_string.append_fmt(WR_VIEW_SQL_442,
+                 lib::is_oracle_mode()
+                     ? " CAST(DECODE(SESSION_TYPE, 0, 'FOREGROUND', 'BACKGROUND') AS VARCHAR2(10)) AS SESSION_TYPE,"
+                     : " CAST(IF (SESSION_TYPE = 0, 'FOREGROUND', 'BACKGROUND') AS CHAR(10)) AS SESSION_TYPE,",
+                 lib::is_oracle_mode() ? "CAST(DECODE(EVENT_NO, 0, 'ON CPU', EVENT_NAME) AS VARCHAR2(64)) AS EVENT,"
+                                       : "CAST(IF (EVENT_NO = 0, 'ON CPU', EVENT_NAME) AS CHAR(64)) AS EVENT,",
+                 lib::is_oracle_mode() ? "CAST(DECODE(EVENT_NO, 0, 'NULL', WAIT_CLASS) AS VARCHAR2(64)) AS WAIT_CLASS,"
+                                       : "CAST(IF (EVENT_NO = 0, 'NULL', WAIT_CLASS) AS CHAR(64)) AS WAIT_CLASS,",
+                 lib::is_oracle_mode()                                 ? wr_oracle_table
+                 : ash_report_params.cur_tenant_id == OB_SYS_TENANT_ID ? wr_mysql_sys_table
+                                                                       : wr_mysql_tenant_table,
+                 static_cast<int>(time_buf_pos),
+                 wr_begin_time_buf,
+                 static_cast<int>(time_buf_pos),
+                 wr_end_time_buf))) {
+    LOG_WARN("failed to assign query string", K(ret));
+  } else if ((data_version >= DATA_VERSION_4_5_0_0 && data_version < DATA_VERSION_4_5_1_0) &&
+             OB_FAIL(sql_string.append_fmt(WR_VIEW_SQL_4352,
+                 lib::is_oracle_mode()
+                     ? " CAST(DECODE(SESSION_TYPE, 0, 'FOREGROUND', 'BACKGROUND') AS VARCHAR2(10)) AS SESSION_TYPE,"
+                     : " CAST(IF (SESSION_TYPE = 0, 'FOREGROUND', 'BACKGROUND') AS CHAR(10)) AS SESSION_TYPE,",
+                 lib::is_oracle_mode() ? "CAST(DECODE(EVENT_NO, 0, 'ON CPU', EVENT_NAME) AS VARCHAR2(64)) AS EVENT,"
+                                       : "CAST(IF (EVENT_NO = 0, 'ON CPU', EVENT_NAME) AS CHAR(64)) AS EVENT,",
+                 lib::is_oracle_mode() ? "CAST(DECODE(EVENT_NO, 0, 'NULL', WAIT_CLASS) AS VARCHAR2(64)) AS WAIT_CLASS,"
+                                       : "CAST(IF (EVENT_NO = 0, 'NULL', WAIT_CLASS) AS CHAR(64)) AS WAIT_CLASS,",
+                 lib::is_oracle_mode()                                 ? wr_oracle_table
+                 : ash_report_params.cur_tenant_id == OB_SYS_TENANT_ID ? wr_mysql_sys_table
+                                                                       : wr_mysql_tenant_table,
+                 static_cast<int>(time_buf_pos),
+                 wr_begin_time_buf,
+                 static_cast<int>(time_buf_pos),
+                 wr_end_time_buf))) {
+    LOG_WARN("failed to assign query string", K(ret));
+  } else if ((data_version >= DATA_VERSION_4_5_1_0) &&
+             OB_FAIL(sql_string.append_fmt(WR_VIEW_SQL_442,
                  lib::is_oracle_mode()
                      ? " CAST(DECODE(SESSION_TYPE, 0, 'FOREGROUND', 'BACKGROUND') AS VARCHAR2(10)) AS SESSION_TYPE,"
                      : " CAST(IF (SESSION_TYPE = 0, 'FOREGROUND', 'BACKGROUND') AS CHAR(10)) AS SESSION_TYPE,",
@@ -1889,7 +2245,7 @@ int ObDbmsWorkloadRepository::get_ash_begin_and_end_time(AshReportParams &ash_re
       } else if (OB_FAIL(sql_string.append_fmt(") top_event  GROUP BY svr_ip, svr_port ORDER BY ASH_BEGIN_TIME DESC %s",
                          lib::is_oracle_mode() ? "FETCH FIRST 1 ROW ONLY" : "LIMIT 1"))) {
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("failed to execute sql", KR(ret), K(tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -1904,14 +2260,14 @@ int ObDbmsWorkloadRepository::get_ash_begin_and_end_time(AshReportParams &ash_re
               LOG_WARN("fail to get next row", KR(ret));
             }
           } else {
-            if (OB_FAIL(result->get_timestamp("ASH_BEGIN_TIME", nullptr, ash_begin_time))) {
+            if (OB_FAIL(result->get_timestamp("ASH_BEGIN_TIME", ash_report_params.tz_info, ash_begin_time))) {
               if (OB_ERR_NULL_VALUE == ret || OB_ERR_COLUMN_NOT_FOUND == ret) {
                 ret = OB_SUCCESS;
                 ash_begin_time = 0;
               } else {
                 LOG_WARN("failed to get timestamp", K(ret));
               }
-            } else if (OB_FAIL(result->get_timestamp("ASH_END_TIME", nullptr, ash_end_time))) {
+            } else if (OB_FAIL(result->get_timestamp("ASH_END_TIME", ash_report_params.tz_info, ash_end_time))) {
               if (OB_ERR_NULL_VALUE == ret || OB_ERR_COLUMN_NOT_FOUND == ret) {
                 ret = OB_SUCCESS;
                 ash_end_time = 0;
@@ -1965,7 +2321,7 @@ int ObDbmsWorkloadRepository::get_wr_begin_and_end_time(AshReportParams &ash_rep
       } else if (OB_FAIL(sql_string.append(") top_event "))) {
         LOG_WARN("append sql failed", K(ret));
       }
-      if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr()))) {
+      if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("failed to execute sql", KR(ret), K(tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -1980,14 +2336,14 @@ int ObDbmsWorkloadRepository::get_wr_begin_and_end_time(AshReportParams &ash_rep
               LOG_WARN("fail to get next row", KR(ret));
             }
           } else {
-            if (OB_FAIL(result->get_timestamp("WR_BEGIN_TIME", nullptr, wr_begin_time))) {
+            if (OB_FAIL(result->get_timestamp("WR_BEGIN_TIME", ash_report_params.tz_info, wr_begin_time))) {
               if (OB_ERR_NULL_VALUE == ret || OB_ERR_COLUMN_NOT_FOUND == ret) {
                 ret = OB_SUCCESS;
                 wr_begin_time = 0;
               } else {
                 LOG_WARN("failed to get timestamp", K(ret));
               }
-            } else if (OB_FAIL(result->get_timestamp("WR_END_TIME", nullptr, wr_end_time))) {
+            } else if (OB_FAIL(result->get_timestamp("WR_END_TIME", ash_report_params.tz_info, wr_end_time))) {
               if (OB_ERR_NULL_VALUE == ret || OB_ERR_COLUMN_NOT_FOUND == ret) {
                 ret = OB_SUCCESS;
                 wr_end_time = 0;
@@ -2030,13 +2386,13 @@ int ObDbmsWorkloadRepository::get_ash_num_samples(
     {
       common::sqlclient::ObMySQLResult *result = nullptr;
       if (OB_FAIL(sql_string.append_fmt(
-              "SELECT COUNT(1) AS NUM_SAMPLES FROM   ("))) {
+              "SELECT COUNT(weight) AS NUM_SAMPLES FROM   ("))) {
         LOG_WARN("append sql failed", K(ret));
       } else if (OB_FAIL(append_fmt_ash_view_sql(ash_report_params, sql_string))) {
         LOG_WARN("failed to append fmt ash view sql", K(ret));
       } else if (OB_FAIL(sql_string.append(") top_event "))) {
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("failed to execute sql", KR(ret), K(tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -2082,13 +2438,13 @@ int ObDbmsWorkloadRepository::get_wr_num_samples(
     {
       ObMySQLResult *result = nullptr;
       if (OB_FAIL(sql_string.append_fmt(
-              "SELECT COUNT(1) AS WR_NUM_SAMPLES FROM   ("))) {
+              "SELECT COUNT(weight) AS WR_NUM_SAMPLES FROM   ("))) {
         LOG_WARN("append sql failed", K(ret));
       } else if (OB_FAIL(append_fmt_wr_view_sql(ash_report_params, sql_string))) {
         LOG_WARN("failed to append fmt wr view sql", K(ret));
       } else if (OB_FAIL(sql_string.append(") top_event "))) {
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("failed to execute sql", KR(ret), K(tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -2381,7 +2737,7 @@ int ObDbmsWorkloadRepository::print_ash_top_active_tenants(const AshReportParams
           "GROUP BY tenant_id, session_type "
           "ORDER BY cnt DESC"))) {
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -2526,7 +2882,7 @@ int ObDbmsWorkloadRepository::print_ash_top_node_load(const AshReportParams &ash
           "GROUP BY te.svr_ip, te.svr_port, te.session_type "
           "ORDER BY cnt DESC"))) {
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -2666,7 +3022,7 @@ int ObDbmsWorkloadRepository::print_ash_foreground_db_time(const AshReportParams
           "FROM top_event te JOIN top_node tn ON te.node = tn.node "
           "ORDER BY tn.node_time DESC, te.event_rank"))) {
         LOG_WARN("append sql string failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -2756,8 +3112,9 @@ const char *tm_columns[] = {"IN_PARSE",
                             "IN_RESOLVE",
                             "IN_REWRITE",
                             "IN_DUPLICATE_CONFLICT_RESOLVE",
-                            "IN_FOREIGN_KEY_CASCADING"};
-int32_t tm_flags[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23};
+                            "IN_FOREIGN_KEY_CASCADING",
+                            "IN_EXTRACT_QUERY_RANGE"};
+int32_t tm_flags[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
 
 int ObDbmsWorkloadRepository::print_ash_top_execution_phase(
     const AshReportParams &ash_report_params, const int64_t num_samples, ObStringBuffer &buff)
@@ -2837,7 +3194,7 @@ int ObDbmsWorkloadRepository::print_ash_top_execution_phase(
           "WHERE sql_rank = 1 "
           "ORDER BY SESSION_TYPE DESC, PHASE_RANK ASC"))) {
         LOG_WARN("unpivot time model column sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -2988,7 +3345,7 @@ int ObDbmsWorkloadRepository::print_ash_background_db_time(const AshReportParams
           "FROM top_event te JOIN top_node tn ON te.node = tn.node "
           "ORDER BY tn.node_time DESC, te.event_rank"))) {
         LOG_WARN("append sql string failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -3172,7 +3529,7 @@ int ObDbmsWorkloadRepository::print_ash_top_sessions(const AshReportParams &ash_
               lib::is_oracle_mode() ? "ts.svr_ip||':'||ts.svr_port" : "CONCAT(ts.svr_ip, ':', ts.svr_port)"//%s AS node
               ))) {
         LOG_WARN("append the main topic failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -3367,7 +3724,7 @@ int ObDbmsWorkloadRepository::print_ash_top_group(const AshReportParams &ash_rep
         ") ta "
         "ORDER BY row_order"))) {
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -3641,7 +3998,7 @@ int ObDbmsWorkloadRepository::print_action_activity_over_time(const AshReportPar
                   "(SELECT svr_ip, svr_port, tenant_id, group_id, program, module, action FROM action_key) "
           "ORDER BY ts.slot_begin_time, ts.interval_time, ta.action_rank"))) {
         LOG_WARN("append sql string failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -3799,7 +4156,7 @@ int ObDbmsWorkloadRepository::print_ash_top_latches(const AshReportParams &ash_r
       } else if (OB_FAIL(sql_string.append_fmt(
         "%s", lib::is_oracle_mode() ? "FETCH FIRST 30 ROWS ONLY" : "LIMIT 30"))) {
         LOG_WARN("failed to append fmt ash view sql", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -3978,7 +4335,7 @@ int ObDbmsWorkloadRepository::print_ash_activity_over_time(const AshReportParams
             "ORDER BY ts.slot_begin_time, ts.interval_time, te.event_rank "
             "%s", lib::is_oracle_mode() ? "FETCH FIRST 50 ROWS ONLY" : "LIMIT 50"))) {
         LOG_WARN("append sql string failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -4120,7 +4477,7 @@ int ObDbmsWorkloadRepository::print_top_sql_with_top_db_time(
         LOG_WARN("append sql failed", K(ret));
       } else if (!lib::is_oracle_mode() && OB_FAIL(sql_string.append(" LIMIT 30 "))) {
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("failed to execute sql", KR(ret), K(tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -4407,7 +4764,7 @@ int ObDbmsWorkloadRepository::print_top_sql_with_top_wait_events(
         lib::is_oracle_mode() ? "id || ':' || operator || ':' || object_alias" : "CONCAT(id, ':', operator, ':', object_alias)" //CASE WHEN object_alias...ELSE %s END
         ))) { //FROM %s) sp
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("failed to execute sql", KR(ret), K(tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -4668,7 +5025,7 @@ int ObDbmsWorkloadRepository::print_top_sql_with_top_operator(
         lib::is_oracle_mode() ? "id || ':' || operator || ':' || object_alias" : "CONCAT(id, ':', operator, ':', object_alias)" //CASE WHEN object_alias...ELSE %s END
         ))) { //FROM %s) sp
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("failed to execute sql", KR(ret), K(tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -4907,7 +5264,7 @@ int ObDbmsWorkloadRepository::print_top_sql_command_type(const AshReportParams &
         " ORDER BY total_samples DESC, node_rank ASC",
         lib::is_oracle_mode() ? "FETCH FIRST 15 ROWS ONLY" : "LIMIT 15"))) {
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -5180,7 +5537,7 @@ int ObDbmsWorkloadRepository::print_top_plsql(const AshReportParams &ash_report_
                   ? "sub_obj.object_name"
                   : "nvl(sub_obj.object_name, mysql_proc_info(ts.plsql_object_id, 'name'))"))) {
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("failed to execute sql", KR(ret), K(tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -5295,16 +5652,35 @@ int ObDbmsWorkloadRepository::print_top_sql_text(const AshReportParams &ash_repo
     const int64_t num_samples, ObStringBuffer &buff)
 {
   int ret = OB_SUCCESS;
-  const int64_t column_size = 2;
-  const int64_t column_widths[column_size] = {64, 64};
-  AshColumnItem column_headers[column_size] = {"SQL ID", "SQL Text"};
+  const int64_t column_size = 16;
+  const int64_t column_widths[column_size] = {64, 16, 27, 64, 19, 7, 13, 15, 14, 15, 21, 15, 20, 9, 16, 17};
+  AshColumnItem column_headers[column_size] = {"SQL ID", "Plan Hash", "First Load Time", "SQL Text",  "Plan Cache Hit Rate", "AVG RPC", "AVG Partition", "Route Miss Rate", "AVG Disk Reads", "Muti Query Rate", "Muti Query Batch Rate", "AVG Error", "Full Table Scan Rate", "AVG Retry", "Executions", "AVG Elapsed Time"};
   AshColumnHeader headers(column_size, column_headers, column_widths);
-
+  const char *contents[] = {
+    "Complete List of SQL Text And Status",
+    "This Section lists the SQL statements and status, but some top sql statements may be eliminated",
+    "First Load Time: plan generation time",
+    "Plan Cache Hit Rate: Percentage of plan cache hits",
+    "AVG RPC: Average number of RPC calls per execution",
+    "AVG Partition: Average number of partitions accessed per execution",
+    "Route Miss Rate: Percentage of partition routing errors",
+    "AVG Disk Reads: Average bytes of disk data read per execution",
+    "Muti Query Rate: Percentage of multi-statement queries",
+    "Muti Query Batch Rate: Percentage of batch executions",
+    "AVG Error: Average number of errors per request",
+    "Full Table Scan Rate: Percentage of full table scans",
+    "AVG Retry: Average number of retries per execution",
+    "Executions: Number of executions",
+    "AVG Elapsed Time: Average execution time per execution(nanoseconds)"
+  };
   bool with_color = true;
-  if (OB_ISNULL(GCTX.sql_proxy_)) {
+  uint64_t data_version = 0;
+  if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
+    LOG_WARN("get_min_data_version failed", K(ret), K(MTL_ID()));
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("sql_proxy_ is nullptr", K(ret));
-  } else if (OB_FAIL(print_section_header(ash_report_params, buff, "Complete List of SQL Text"))) {
+  } else if (OB_FAIL(print_section_header_and_explaination(ash_report_params, buff, contents, ARRAYSIZEOF(contents)))) {
     LOG_WARN("failed to push string into buff", K(ret));
   } else {
     ObOracleSqlProxy oracle_proxy(*(static_cast<ObMySQLProxy *>(GCTX.sql_proxy_)));
@@ -5316,13 +5692,59 @@ int ObDbmsWorkloadRepository::print_top_sql_text(const AshReportParams &ash_repo
       ObMySQLResult *result = nullptr;
       const ObArray<SqlIdArray> &top_sql_ids = ash_report_params.top_sql_ids_;
       if (OB_FAIL(sql_string.append_fmt(
-        "SELECT sql_id AS SQL_ID, SUBSTR(query_sql, 1, 4000) AS QUERY_SQL "
-        "FROM ( "
-          "SELECT sql_id, query_sql, elapsed_time_total, "
-                  "ROW_NUMBER() OVER(PARTITION BY sql_id ORDER BY NULL) AS sql_rank "
-          "FROM %s "
-          "WHERE query_sql IS NOT NULL ",
-        lib::is_oracle_mode() ? "SYS.GV$OB_SQLSTAT" : "oceanbase.gv$ob_sqlstat"))) {
+        "SELECT * "
+        "FROM( "
+          "SELECT sql_id AS SQL_ID, PLAN_HASH AS PLAN_HASH, "
+              "FIRST_LOAD_TIME AS FIRST_LOAD_TIME, SUBSTR(query_sql, 1, 4000) AS QUERY_SQL, "
+              "SUM(PLAN_CACHE_HIT_DELTA) OVER (PARTITION BY SQL_ID, PLAN_HASH "
+              "ORDER BY NULL ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "
+              "PLAN_CACHE_HIT_DELTA, "
+              "SUM(RPC_DELTA) OVER (PARTITION BY SQL_ID, PLAN_HASH ORDER BY NULL ROWS "
+              "BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "
+              "RPC_DELTA, "
+              "SUM(PARTITION_DELTA) OVER (PARTITION BY SQL_ID, PLAN_HASH ORDER BY NULL ROWS "
+              "BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "
+              "PARTITION_DELTA, "
+              "SUM(ROUTE_MISS_DELTA) OVER (PARTITION BY SQL_ID, PLAN_HASH ORDER BY NULL ROWS "
+              "BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "
+              "ROUTE_MISS_DELTA, "
+              "SUM(DISK_READS_DELTA) OVER (PARTITION BY SQL_ID, PLAN_HASH ORDER BY NULL ROWS "
+              "BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "
+              "DISK_READS_DELTA, "
+              "SUM(MUTI_QUERY_DELTA) OVER (PARTITION BY SQL_ID, PLAN_HASH ORDER BY NULL ROWS "
+              "BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "
+              "MUTI_QUERY_DELTA, "
+              "SUM(MUTI_QUERY_BATCH_DELTA) OVER (PARTITION BY SQL_ID, "
+              "PLAN_HASH ORDER BY NULL ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED "
+              "FOLLOWING) AS MUTI_QUERY_BATCH_DELTA, "
+              "SUM(ERROR_COUNT_DELTA) OVER (PARTITION BY SQL_ID, PLAN_HASH ORDER BY NULL "
+              "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "
+              "ERROR_COUNT_DELTA, "
+              "SUM(FULL_TABLE_SCAN_DELTA) OVER (PARTITION BY SQL_ID, PLAN_HASH "
+              "ORDER BY NULL ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "
+              "FULL_TABLE_SCAN_DELTA, "
+              "SUM(RETRY_DELTA) OVER (PARTITION BY SQL_ID, PLAN_HASH ORDER BY NULL ROWS "
+              "BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "
+              "RETRY_DELTA, "
+              "SUM(EXECUTIONS_DELTA) OVER (PARTITION BY SQL_ID, PLAN_HASH ORDER BY NULL ROWS "
+              "BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "
+              "EXECUTIONS_DELTA, "
+              "SUM(ELAPSED_TIME_DELTA) OVER (PARTITION BY SQL_ID, PLAN_HASH "
+              "ORDER BY NULL ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "
+              "ELAPSED_TIME_DELTA, "
+              "ROW_NUMBER() OVER(PARTITION BY SQL_ID, PLAN_HASH ORDER BY NULL) AS SQL_RANK "
+           "FROM ( "))) {
+        LOG_WARN("append sql failed", K(ret));
+      } else if (OB_FAIL(sql_string.append_fmt(
+                     (data_version >= DATA_VERSION_4_5_1_0) ||
+                     (data_version >= MOCK_DATA_VERSION_4_4_2_0 && data_version < DATA_VERSION_4_5_0_0) ||
+                     (data_version >= MOCK_DATA_VERSION_4_2_5_7 && data_version < DATA_VERSION_4_3_0_0) ||
+                     (data_version >= MOCK_DATA_VERSION_4_3_5_5 && data_version < DATA_VERSION_4_4_0_0)
+                         ? SQLSTAT_VIEW_SQL_4257
+                         : SQLSTAT_VIEW_SQL_4256,
+                     lib::is_oracle_mode() ? "SYS.GV$OB_SQLSTAT" : "oceanbase.gv$ob_sqlstat"))) {
+        LOG_WARN("append sql failed", K(ret));
+      } else if (OB_FAIL(sql_string.append_fmt(" where query_sql is not null "))) {
         LOG_WARN("append sql failed", K(ret));
       } else if (!top_sql_ids.empty()) {
         if (OB_FAIL(sql_string.append(
@@ -5342,14 +5764,14 @@ int ObDbmsWorkloadRepository::print_top_sql_text(const AshReportParams &ash_repo
         }
       }
       if (OB_SUCC(ret) && OB_FAIL(sql_string.append(
-        ") tmp_sql "
-        "WHERE sql_rank = 1 "
-        "ORDER BY elapsed_time_total DESC"))) {
+            " )) tmp_sql "
+        "WHERE SQL_RANK = 1 "
+        "ORDER BY elapsed_time_delta DESC"))) {
         LOG_WARN("append sql string failed", K(ret));
       }
       if (OB_FAIL(ret)) {
         //do nothing
-      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("failed to execute sql", KR(ret), K(tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -5372,6 +5794,47 @@ int ObDbmsWorkloadRepository::print_top_sql_text(const AshReportParams &ash_repo
             int64_t tmp_real_str_len = 0;
             char sql_id[64] = "";
             EXTRACT_STRBUF_FIELD_MYSQL_SKIP_RET_AND_TRUNCATION(*result, "SQL_ID", sql_id, 64, tmp_real_str_len);
+            EXTRACT_UINT_FIELD_FOR_ASH_STR(*result, "PLAN_HASH", plan_hash, uint64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "PLAN_CACHE_HIT_DELTA", plan_cache_hit_delta, int64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "RPC_DELTA", rpc_delta, int64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "PARTITION_DELTA", partition_delta, int64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "ROUTE_MISS_DELTA", route_miss_delta, int64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "DISK_READS_DELTA", disk_reads_delta, int64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "MUTI_QUERY_DELTA", muti_query_delta, int64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "MUTI_QUERY_BATCH_DELTA", muti_query_batch_delta, int64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "ERROR_COUNT_DELTA", error_count_delta, int64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "FULL_TABLE_SCAN_DELTA", full_table_scan_delta, int64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "RETRY_DELTA", retry_delta, int64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "EXECUTIONS_DELTA", executions_delta, int64_t);
+            EXTRACT_INT_FIELD_FOR_ASH_STR(*result, "ELAPSED_TIME_DELTA", elapsed_time_delta, int64_t);
+            EXTRACT_DATETIME_FIELD_FOR_ASH_STR(*result, "FIRST_LOAD_TIME", first_load_time, int64_t, ash_report_params.tz_info);
+
+            char plan_cache_hit_rate[20] = "";
+            calc_ratio(plan_cache_hit_delta, executions_delta, plan_cache_hit_rate);
+            char avg_rpc[20] = "";
+            calc_avg_active_sessions(rpc_delta, executions_delta, avg_rpc);
+            char avg_partition[20] = "";
+            calc_avg_active_sessions(partition_delta, executions_delta, avg_partition);
+            char route_miss_rate[20] = "";
+            calc_ratio(route_miss_delta, executions_delta, route_miss_rate);
+            char avg_disk_reads[20] = "";
+            calc_avg_active_sessions(disk_reads_delta, executions_delta, avg_disk_reads);
+            char muti_query_rate[20] = "";
+            calc_ratio(muti_query_delta, executions_delta, muti_query_rate);
+            char muti_query_batch_rate[20] = "";
+            calc_ratio(muti_query_batch_delta, executions_delta, muti_query_batch_rate);
+            char avg_error[20] = "";
+            calc_avg_active_sessions(error_count_delta, executions_delta, avg_error);
+            char full_table_scan_rate[20] = "";
+            calc_ratio(full_table_scan_delta, executions_delta, full_table_scan_rate);
+            char avg_retry[20] = "";
+            calc_avg_active_sessions(retry_delta, executions_delta, avg_retry);
+            char avg_elapsed_time[20] = "";
+            calc_avg_active_sessions(elapsed_time_delta, executions_delta, avg_elapsed_time);
+
+            if (executions_delta == 0) {
+              continue;
+            }
 
             HEAP_VAR(char[4005], sql_text)
             {
@@ -5379,22 +5842,35 @@ int ObDbmsWorkloadRepository::print_top_sql_text(const AshReportParams &ash_repo
               EXTRACT_STRBUF_FIELD_MYSQL_SKIP_RET_AND_TRUNCATION(
                   *result, "QUERY_SQL", sql_text, 4000, tmp_real_str_len);
               if (!ash_report_params.is_html) {
-                if (OB_FAIL(ret)) {
-                } else if (OB_FAIL(buff.append("  SQL ID: "))) {
-                  LOG_WARN("failed to push string into buff", K(ret));
-                } else if (OB_FAIL(buff.append(sql_id))) {
-                  LOG_WARN("failed to push string into buff", K(ret));
-                } else if (OB_FAIL(buff.append("\n"))) {
-                  LOG_WARN("failed to push string into buff", K(ret));
-                } else if (OB_FAIL(buff.append("SQL Text: "))) {
-                  LOG_WARN("failed to push string into buff", K(ret));
-                } else if (OB_FAIL(buff.append(sql_text))) {
-                  LOG_WARN("failed to push string into buff", K(ret));
-                } else if (OB_FAIL(buff.append("\n"))) {
-                  LOG_WARN("failed to push string into buff", K(ret));
-                }
+                #define APPEND_STRING(buff, name, str) \
+                  if (OB_FAIL(ret)) { \
+                    LOG_WARN("failed to push string into buff", K(ret)); \
+                  } else if (OB_FAIL(buff.append(name))) { \
+                    LOG_WARN("failed to push string into buff", K(ret)); \
+                  } else if (OB_FAIL(buff.append(str))) { \
+                    LOG_WARN("failed to push string into buff", K(ret)); \
+                  } else if (OB_FAIL(buff.append("\n"))) { \
+                    LOG_WARN("failed to push string into buff", K(ret)); \
+                  }
+                APPEND_STRING(buff, "SQL ID:", sql_id);
+                APPEND_STRING(buff, "Plan Hash:", plan_hash_char);
+                APPEND_STRING(buff, "First Load Time:", first_load_time_char);
+                APPEND_STRING(buff, "SQL Text:", sql_text);
+                APPEND_STRING(buff, "Plan Cache Hit Rate:", plan_cache_hit_rate);
+                APPEND_STRING(buff, "AVG RPC:", avg_rpc);
+                APPEND_STRING(buff, "AVG Partition:", avg_partition);
+                APPEND_STRING(buff, "Route Miss Rate:", route_miss_rate);
+                APPEND_STRING(buff, "AVG Disk Reads:", avg_disk_reads);
+                APPEND_STRING(buff, "Muti Query Rate:", muti_query_rate);
+                APPEND_STRING(buff, "Muti Query Batch Rate:", muti_query_batch_rate);
+                APPEND_STRING(buff, "AVG Error:", avg_error);
+                APPEND_STRING(buff, "Full Table Scan Rate:", full_table_scan_rate);
+                APPEND_STRING(buff, "AVG Retry:", avg_retry);
+                APPEND_STRING(buff, "Executions:", executions_delta_char);
+                APPEND_STRING(buff, "AVG Elapsed Time:", avg_elapsed_time);
+                #undef APPEND_STRING
               } else {
-                AshColumnItem column_content[] = {sql_id, sql_text};
+                AshColumnItem column_content[] = {sql_id, plan_hash_char, first_load_time_char, sql_text,  plan_cache_hit_rate, avg_rpc, avg_partition, route_miss_rate, avg_disk_reads, muti_query_rate, muti_query_batch_rate, avg_error, full_table_scan_rate, avg_retry, executions_delta_char, avg_elapsed_time};
                 AshRowItem ash_row(column_size, column_content, column_widths, with_color);
                 if (OB_FAIL(print_sqltext_section_column_row(ash_report_params, buff, ash_row))) {
                   LOG_WARN("failed to format row", K(ret));
@@ -5403,14 +5879,14 @@ int ObDbmsWorkloadRepository::print_top_sql_text(const AshReportParams &ash_repo
                 }
               }
             }
+          }
 
-            if (OB_SUCC(ret)) {
-              if (OB_FAIL(buff.append("\n"))) {
-                LOG_WARN("failed to push string into buff", K(ret));
-              }
+          if (OB_SUCC(ret)) {
+            if (OB_FAIL(buff.append("\n"))) {
+              LOG_WARN("failed to push string into buff", K(ret));
             }
           }
-        }  // end while
+        }// end while
       }
     }
     if (OB_SUCC(ret) && ash_report_params.is_html) {
@@ -5561,7 +6037,7 @@ int ObDbmsWorkloadRepository::print_ash_report_header(
     if (OB_FAIL(buff.append(
         "<!DOCTYPE html><html lang=\"en\"><head><title>ASH Report</title> \
         <style type=\"text/css\"> \
-        body.ash_html {font:bold 10pt Arial,Helvetica,Geneva,sans-serif;color:black; background:rgb(246, 248, 251);} \
+        body.ash_html {font:bold 10pt Arial,Helvetica,Gen,sans-serif;color:black; background:rgb(246, 248, 251);} \
         pre.ash_html  {font:8pt Courier;color:black; background:rgb(246, 248, 251);} \
         pre_sqltext.ash_html  {white-space: pre-wrap;} \
         h1.ash_html   {font:bold 20pt Arial,Helvetica,Geneva,sans-serif;color:#336699;background-color:rgb(246, 248, 251);border-bottom:1px solid #cccc99;margin-top:0pt; margin-bottom:0pt;padding:0px 0px 0px 0px;} \
@@ -6335,7 +6811,7 @@ int ObDbmsWorkloadRepository::print_top_blocking_session(const AshReportParams &
         "ORDER BY t.session_samples DESC, t.event_samples DESC, t.sql_rank ASC",
         lib::is_oracle_mode() ? "SYS.GV$OB_SQL_AUDIT" : "oceanbase.gv$ob_sql_audit"))) {
         LOG_WARN("append sql failed", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -6755,7 +7231,7 @@ int ObDbmsWorkloadRepository::print_top_db_object(const AshReportParams &ash_rep
               " ORDER BY display_rank ASC; ",
               lib::is_oracle_mode() ? "tr.svr_ip || ':' || tr.svr_port " : "CONCAT(tr.svr_ip, ':', tr.svr_port)" ))) {
         LOG_WARN("failed to append sql string", K(ret));
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("falied to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -7010,7 +7486,7 @@ int ObDbmsWorkloadRepository::print_ash_top_io_bandwidth(const AshReportParams &
                               "SUM(delta_write_io_bytes * count_weight) AS write_bytes, tablet_id, "
                               "SUM(tm_delta_time * count_weight) AS tablet_tm_delta_time "
                       "FROM session_data sd "
-                      "WHERE sql_id IS NULL AND plan_hash IS NULL "
+                      "WHERE sql_id IS NULL OR plan_hash IS NULL "
                       "GROUP BY svr_ip, svr_port, program, module, action, tablet_id), "
                       "(SELECT ROW_NUMBER() OVER(ORDER BY NULL) AS rn_ FROM table(generator(2))) "
                   ") WHERE io_count > 0)"
@@ -7031,7 +7507,7 @@ int ObDbmsWorkloadRepository::print_ash_top_io_bandwidth(const AshReportParams &
         lib::is_oracle_mode() ? "FETCH FIRST 50 ROW ONLY" : "LIMIT 50"
       ))) {
         LOG_WARN("Failed to append top io sql");
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("Failed to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
@@ -7248,8 +7724,7 @@ int ObDbmsWorkloadRepository::print_ash_top_io_event(const AshReportParams &ash_
                                      "ORDER BY SUM(count_weight) DESC) AS event_rank "
           "FROM session_data sd "
           "LEFT JOIN event_name en ON sd.event_id = en.event_id "
-          "WHERE sql_id IS NULL "
-                "AND plan_hash IS NULL "
+          "WHERE (sql_id IS NULL OR plan_hash IS NULL)"
                 "AND program IS NOT NULL "
                 "AND module IS NOT NULL "
                 "AND (type='USER_IO' or type='SYSTEM_IO') "
@@ -7342,7 +7817,7 @@ int ObDbmsWorkloadRepository::print_ash_top_io_event(const AshReportParams &ash_
         lib::is_oracle_mode() ? "FETCH FIRST 30 ROWS ONLY" : "LIMIT 30"
       ))) {
         LOG_WARN("Failed to append top io sql");
-      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr()))) {
+      } else if (OB_FAIL(sql_proxy->read(res, request_tenant_id, sql_string.ptr(), &ash_report_params.session_param))) {
         LOG_WARN("Failed to execute sql", KR(ret), K(request_tenant_id), K(sql_string));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;

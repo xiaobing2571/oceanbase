@@ -230,12 +230,14 @@ int ObLoadDataBase::memory_check_remote(uint64_t tenant_id, bool &need_wait_mino
       int64_t major_freeze_trigger = 0;
       int64_t memstore_limit = 0;
       int64_t freeze_cnt = 0;
+      int64_t unused_throttle_trigger = 0;
 
       if (OB_FAIL(freezer->get_tenant_memstore_cond(active_memstore_used,
                                                     total_memstore_used,
                                                     major_freeze_trigger,
                                                     memstore_limit,
-                                                    freeze_cnt))) {
+                                                    freeze_cnt,
+                                                    unused_throttle_trigger))) {
         LOG_WARN("fail to get memstore used", K(ret));
       } else {
         if (total_memstore_used > (memstore_limit - major_freeze_trigger)/2 + major_freeze_trigger) {
@@ -442,6 +444,10 @@ int ObLoadDataBase::pre_parse_lines(ObLoadFileBuffer &buffer,
     const char *end = ptr + buffer.get_data_len();
     struct Functor {
       int operator()(ObCSVGeneralParser::HandleOneLineParam param) {
+        UNUSED(param);
+        return OB_SUCCESS;
+      }
+      int operator()(ObCSVGeneralParser::HandleBatchLinesParam param) {
         UNUSED(param);
         return OB_SUCCESS;
       }
@@ -802,7 +808,7 @@ int ObLoadDataSPImpl::gen_load_table_column_desc(ObExecContext &ctx,
 
   //step 1
   for (int64_t i = 0; OB_SUCC(ret) && i < load_stmt.get_field_or_var_list().count(); ++i) {
-    ObLoadDataStmt::FieldOrVarStruct &item = load_stmt.get_field_or_var_list().at(i);
+    FieldOrVarStruct &item = load_stmt.get_field_or_var_list().at(i);
     if (item.is_table_column_) {
       ObLoadTableColumnDesc tmp_info;
       tmp_info.is_set_values_ = false;
@@ -1013,6 +1019,10 @@ int ObLoadDataSPImpl::exec_shuffle(int64_t task_id, ObShuffleTaskHandle *handle)
 
     struct Functor {
       int operator()(ObCSVGeneralParser::HandleOneLineParam param) {
+        UNUSED(param);
+        return OB_SUCCESS;
+      }
+      int operator()(ObCSVGeneralParser::HandleBatchLinesParam param) {
         UNUSED(param);
         return OB_SUCCESS;
       }
@@ -2225,6 +2235,11 @@ int ObDataFragMgr::init(ObExecContext &ctx, uint64_t table_id)
   } else if (OB_ISNULL(table_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("table schema is NULL", K(ret));
+  } else if (table_schema->is_interval_part()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("direct-load does not support table with interval part", KR(ret),
+             K(ctx.get_my_session()->get_effective_tenant_id()), K(table_id));
+    FORWARD_USER_ERROR_MSG(ret, "direct-load does not support table with interval part");
   } else if (OB_FAIL(table_schema->get_all_tablet_and_object_ids(tablet_ids_, part_ids))) {
     LOG_WARN("failed to get partition ids", K(ret));
   } else {
@@ -2776,6 +2791,23 @@ int ObLoadDataSPImpl::ToolBox::init(ObExecContext &ctx, ObLoadDataStmt &load_stm
     }
   }
 
+  if (OB_SUCC(ret)) {
+    int64_t query_timeout = 0;
+    if (OB_FAIL(hint.get_value(ObLoadDataHint::QUERY_TIMEOUT, query_timeout))) {
+      LOG_WARN("fail to get value", K(ret));
+    } else if (0 == query_timeout) {
+      if (OB_FAIL(ctx.get_my_session()->get_query_timeout(query_timeout))) {
+        LOG_WARN("fail to get query timeout", KR(ret));
+      } else {
+        query_timeout = MAX(query_timeout, RPC_BATCH_INSERT_TIMEOUT_US);
+        THIS_WORKER.set_timeout_ts(ctx.get_my_session()->get_query_start_time() + query_timeout);
+      }
+    } else if (query_timeout > 0) {
+      THIS_WORKER.set_timeout_ts(ctx.get_my_session()->get_query_start_time() + query_timeout);
+    }
+  }
+
+
   if (OB_UNLIKELY(ObLoadFileLocation::OSS == load_file_storage &&
                     ObLoadDataFormat::CSV != load_args.access_info_.get_load_data_format())) {
     ret = OB_NOT_SUPPORTED;
@@ -2919,22 +2951,6 @@ int ObLoadDataSPImpl::ToolBox::init(ObExecContext &ctx, ObLoadDataStmt &load_stm
       }
     }
     LOG_DEBUG("batch size", K(hint_batch_size), K(batch_row_count), K(batch_buffer_size));
-  }
-
-  if (OB_SUCC(ret)) {
-    int64_t query_timeout = 0;
-    if (OB_FAIL(hint.get_value(ObLoadDataHint::QUERY_TIMEOUT, query_timeout))) {
-      LOG_WARN("fail to get value", K(ret));
-    } else if (0 == query_timeout) {
-      if (OB_FAIL(ctx.get_my_session()->get_query_timeout(query_timeout))) {
-        LOG_WARN("fail to get query timeout", KR(ret));
-      } else {
-        query_timeout = MAX(query_timeout, RPC_BATCH_INSERT_TIMEOUT_US);
-        THIS_WORKER.set_timeout_ts(ctx.get_my_session()->get_query_start_time() + query_timeout);
-      }
-    } else if (query_timeout > 0) {
-      THIS_WORKER.set_timeout_ts(ctx.get_my_session()->get_query_start_time() + query_timeout);
-    }
   }
 
   if (OB_SUCC(ret)) {
@@ -3287,10 +3303,10 @@ int ObLoadDataURLImpl::construct_sql(ObLoadDataStmt &load_stmt, ObSqlString &sql
   }
 
   // 获取字段列表
-  const ObIArray<ObLoadDataStmt::FieldOrVarStruct> &field_list = load_stmt.get_field_or_var_list();
+  const ObIArray<FieldOrVarStruct> &field_list = load_stmt.get_field_or_var_list();
   // 检查是否存在非table column
   for (int64_t i = 0; OB_SUCC(ret) && i < field_list.count(); ++i) {
-    const ObLoadDataStmt::FieldOrVarStruct &field = field_list.at(i);
+    const FieldOrVarStruct &field = field_list.at(i);
     if (OB_UNLIKELY(!field.is_table_column_)) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("var is not supported", KR(ret), K(field), K(i), K(field_list));
@@ -3303,7 +3319,7 @@ int ObLoadDataURLImpl::construct_sql(ObLoadDataStmt &load_stmt, ObSqlString &sql
       OZ (sql.append("("));
       bool first = true;
       for (int64_t i = 0; OB_SUCC(ret) && i < field_list.count(); ++i) {
-        const ObLoadDataStmt::FieldOrVarStruct &field = field_list.at(i);
+        const FieldOrVarStruct &field = field_list.at(i);
         if (!first) {
           OZ (sql.append(","));
         }
@@ -3349,12 +3365,23 @@ int ObLoadDataURLImpl::execute(ObExecContext &ctx, ObLoadDataStmt &load_stmt)
       LOG_WARN("session is null", K(ret));
     } else {
       if (load_stmt.get_load_arguments().is_diagnosis_enabled_) {
-        session->set_diagnosis_enabled(true);
-        session->set_diagnosis_limit_num(load_stmt.get_load_arguments().diagnosis_limit_num_);
+        ObDiagnosisInfo& diagnosis_info = session->get_diagnosis_info();
+        diagnosis_info.is_enabled_ = true;
+        diagnosis_info.limit_num_ = load_stmt.get_load_arguments().diagnosis_limit_num_;
+
+        common::ObString log_file = load_stmt.get_load_arguments().diagnosis_log_file_;
+        common::ObString bad_file = load_stmt.get_load_arguments().diagnosis_bad_file_;
+        if (!log_file.empty() && OB_FAIL(session->set_diagnosis_log_file(log_file))) {
+          LOG_WARN("failed to set diagnosis log file", K(ret), K(log_file));
+        } else if (!bad_file.empty() && OB_FAIL(session->set_diagnosis_bad_file(bad_file))) {
+          LOG_WARN("failed to set diagnosis bad file", K(ret), K(bad_file));
+        }
       }
-      if (session->is_in_external_catalog()
-          && OB_FAIL(session->set_internal_catalog_db(&switch_catalog_helper))) {
-        LOG_WARN("failed to set catalog", K(ret));
+      if (OB_SUCC(ret)) {
+        if (session->is_in_external_catalog()
+            && OB_FAIL(session->set_internal_catalog_db(&switch_catalog_helper))) {
+          LOG_WARN("failed to set catalog", K(ret));
+        }
       }
     }
   }
@@ -3382,8 +3409,7 @@ int ObLoadDataURLImpl::execute(ObExecContext &ctx, ObLoadDataStmt &load_stmt)
   }
 
   if (OB_NOT_NULL(session) && session->is_diagnosis_enabled()) {
-    session->set_diagnosis_enabled(false);
-    session->set_diagnosis_limit_num(0);
+    session->reset_diagnosis_info();
   }
 
   if (OB_NOT_NULL(session) && switch_catalog_helper.is_set()) {

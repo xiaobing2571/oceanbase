@@ -34,7 +34,8 @@ int ObDirectLoadRangeSplitUtils::construct_rowkey_iter(
   const ObDatumRange &scan_range,
   const ObITableReadInfo &index_read_info,
   ObIAllocator &allocator,
-  ObIDirectLoadDatumRowkeyIterator *&rowkey_iter)
+  ObIDirectLoadDatumRowkeyIterator *&rowkey_iter,
+  const ObTabletHandle &tablet_handle)
 {
   int ret = OB_SUCCESS;
   ObSSTableSecMetaIterator *macro_meta_iter = nullptr;
@@ -47,7 +48,7 @@ int ObDirectLoadRangeSplitUtils::construct_rowkey_iter(
                          OB_NEWx(ObDirectLoadMacroBlockEndKeyIterator, (&allocator)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("fail to new ObDirectLoadMacroBlockEndKeyIterator", KR(ret));
-  } else if (OB_FAIL(end_key_iter->init(macro_meta_iter))) {
+  } else if (OB_FAIL(end_key_iter->init(macro_meta_iter, tablet_handle))) {
     LOG_WARN("fail to init rowkey iter", KR(ret));
   } else {
     rowkey_iter = end_key_iter;
@@ -130,13 +131,17 @@ int ObDirectLoadRangeSplitUtils::construct_origin_table_rowkey_iters(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", KR(ret), KPC(origin_table), K(scan_range));
   } else {
-    const ObITableReadInfo &read_info =
-      origin_table->get_tablet_handle().get_obj()->get_rowkey_read_info();
-    if (nullptr != origin_table->get_major_sstable()) {
-      ObSSTable *major_sstable = origin_table->get_major_sstable();
+    ObTabletHandle tablet_handle;
+    ObArray<ObSSTable *> ddl_sstables;
+    blocksstable::ObSSTable *major_sstable = nullptr;
+    if (OB_FAIL(
+          origin_table->get_major_and_ddl_sstable(tablet_handle, major_sstable, ddl_sstables))) {
+      LOG_WARN("fail to get major sstable", KR(ret));
+    } else if (nullptr != major_sstable) {
+      const ObITableReadInfo &read_info = tablet_handle.get_obj()->get_rowkey_read_info();
       ObIDirectLoadDatumRowkeyIterator *rowkey_iter = nullptr;
       if (OB_FAIL(ObDirectLoadRangeSplitUtils::construct_rowkey_iter(
-            major_sstable, scan_range, read_info, allocator, rowkey_iter))) {
+            major_sstable, scan_range, read_info, allocator, rowkey_iter, tablet_handle))) {
         LOG_WARN("fail to construct rowkey iter", KR(ret));
       } else if (OB_FAIL(iter_guard.push_back(rowkey_iter))) {
         LOG_WARN("fail to push back rowkey iter", KR(ret));
@@ -149,12 +154,12 @@ int ObDirectLoadRangeSplitUtils::construct_origin_table_rowkey_iters(
         }
       }
     } else {
-      const ObIArray<ObSSTable *> &ddl_sstables = origin_table->get_ddl_sstables();
+      const ObITableReadInfo &read_info = tablet_handle.get_obj()->get_rowkey_read_info();
       for (int64_t i = 0; OB_SUCC(ret) && i < ddl_sstables.count(); ++i) {
         ObSSTable *ddl_sstable = ddl_sstables.at(i);
         ObIDirectLoadDatumRowkeyIterator *rowkey_iter = nullptr;
         if (OB_FAIL(ObDirectLoadRangeSplitUtils::construct_rowkey_iter(
-              ddl_sstable, scan_range, read_info, allocator, rowkey_iter))) {
+              ddl_sstable, scan_range, read_info, allocator, rowkey_iter, tablet_handle))) {
           LOG_WARN("fail to construct rowkey iter", KR(ret));
         } else if (OB_FAIL(iter_guard.push_back(rowkey_iter))) {
           LOG_WARN("fail to push back rowkey iter", KR(ret));
@@ -444,8 +449,13 @@ int ObDirectLoadSampleInfo::get_origin_info(ObDirectLoadOriginTable *origin_tabl
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", KR(ret), KP(origin_table));
   } else {
-    if (nullptr != origin_table->get_major_sstable()) {
-      ObSSTable *major_sstable = origin_table->get_major_sstable();
+    ObTabletHandle tablet_handle;
+    ObSSTable *major_sstable = nullptr;
+    ObArray<ObSSTable *> ddl_sstables;
+    if (OB_FAIL(
+                 origin_table->get_major_and_ddl_sstable(tablet_handle, major_sstable, ddl_sstables))) {
+      LOG_WARN("fail to get major sstable", KR(ret));
+    } else if (nullptr != major_sstable) {
       ObSSTableMetaHandle meta_handle;
       if (OB_FAIL(major_sstable->get_meta(meta_handle))) {
         LOG_WARN("fail to get sstable meta", K(ret), KPC(major_sstable));
@@ -459,7 +469,6 @@ int ObDirectLoadSampleInfo::get_origin_info(ObDirectLoadOriginTable *origin_tabl
     } else {
       int64_t data_macro_block_count = 0;
       int64_t row_count = 0;
-      const ObIArray<ObSSTable *> &ddl_sstables = origin_table->get_ddl_sstables();
       for (int64_t i = 0; OB_SUCC(ret) && i < ddl_sstables.count(); ++i) {
         ObSSTable *ddl_sstable = ddl_sstables.at(i);
         ObSSTableMetaHandle meta_handle;
@@ -487,7 +496,7 @@ int ObDirectLoadSampleInfo::get_sstable_info(
 {
   int ret = OB_SUCCESS;
   if (sstable_array.empty()) {
-    origin_sample_num_ = 0;
+    sstable_sample_num_ = 0;
     sstable_rows_per_sample_ = 0;
   } else {
     int64_t total_row_count = 0;

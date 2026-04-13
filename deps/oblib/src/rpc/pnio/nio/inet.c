@@ -128,6 +128,13 @@ int set_sock_opt(int fd, int option, int value)
 }
 
 void update_socket_keepalive_params(int fd, int64_t user_timeout) {
+#ifdef ERRSIM
+  int tmp_ret = OB_E(EventTable::EN_RPC_DISABLE_RPC_SOCKET_KEEPALIVE) OB_SUCCESS;
+  if (OB_SUCCESS != tmp_ret) {
+    rk_warn("disable rpc socket keepalive for errsim, fd=%d, tmp_ret=%d", fd, tmp_ret);
+    return;
+  }
+#endif
   int tcp_keepalive = (user_timeout > 0) ? 1: 0;
   int tcp_keepidle = user_timeout/5000000;
   if (tcp_keepidle < 1) {
@@ -171,6 +178,21 @@ const char* sock_fd_str(int fd, char *buf, int buf_len) {
     (void) snprintf(buf, buf_len, "fd:%d:local:%s:remote:%s", fd,
         addr_str(local, local_addr_buf, sizeof(local_addr_buf)),
         addr_str(remote, remote_addr_buf, sizeof(remote_addr_buf)));
+  }
+  return buf;
+}
+
+const char* sock_t_str(sock_t* sock, socket_diag_info_t* info, char *buf, int buf_len) {
+  if (NULL != buf && buf_len > 0) {
+    int fd = sock->fd;
+    addr_t local = info->local_addr;
+    addr_t peer = sock->peer;
+    char local_addr_buf[PNIO_NIO_ADDR_LEN] = {'\0'};
+    char remote_addr_buf[PNIO_NIO_ADDR_LEN] = {'\0'};
+    (void) snprintf(buf, buf_len, "fd:%d,local:%s,peer:%s,tid:%d,conn_ok:%d,etime:%ld", fd,
+        addr_str(local, local_addr_buf, sizeof(local_addr_buf)),
+        addr_str(peer, remote_addr_buf, sizeof(remote_addr_buf)),
+        sock->tid, sock->conn_ok, info->establish_time);
   }
   return buf;
 }

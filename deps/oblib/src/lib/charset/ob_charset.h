@@ -632,6 +632,7 @@ public:
       || CHARSET_GB18030 == charset_type
       || CHARSET_GB18030_2022 == charset_type;
   }
+  static int is_pad_charset(ObCollationType coll_type, bool &is_pad);
   static ObCharsetType charset_type_by_coll(ObCollationType coll_type);
   static int check_valid_implicit_convert(ObCollationType src_type, ObCollationType dst_type);
   static int charset_name_by_coll(const ObString &coll_name, common::ObString &cs_name);
@@ -859,6 +860,25 @@ public:
         }
         COMMON_LOG(DEBUG, "foreach char", K(encoding),
                    KPHEX(encoding.ptr(), encoding.length()), K(wchar));
+      }
+    }
+    return ret;
+  }
+
+  // Iterate over string byte by byte without charset conversion
+  // func signature: int func(unsigned char byte, int64_t index)
+  template<typename foreach_byte_func>
+  static int foreach_byte(const common::ObString &str, foreach_byte_func &func)
+  {
+    int ret = common::OB_SUCCESS;
+    if (OB_LIKELY(!str.empty())) {
+      const unsigned char *ptr = reinterpret_cast<const unsigned char *>(str.ptr());
+      const unsigned char *end = ptr + str.length();
+      int64_t index = 0;
+      for (; OB_SUCC(ret) && ptr < end; ++ptr, ++index) {
+        if (OB_FAIL(func(*ptr, index))) {
+          COMMON_LOG(WARN, "fail to call func", K(ret), K(*ptr), K(index));
+        }
       }
     }
     return ret;

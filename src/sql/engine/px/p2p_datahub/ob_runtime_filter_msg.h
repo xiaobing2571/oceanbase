@@ -39,7 +39,7 @@ public:
   ObRFBloomFilterMsg() : phase_(), bloom_filter_(),
       next_peer_addrs_(allocator_), expect_first_phase_count_(0),
       piece_size_(0), filter_indexes_(allocator_), receive_count_array_(allocator_),
-      filter_idx_(0), create_finish_(false), need_send_msg_(true), is_finish_regen_(false),
+      filter_idx_(0), create_finish_(false), is_finish_regen_(false),
       use_rich_format_(false) {}
   ~ObRFBloomFilterMsg() { destroy(); }
   virtual int assign(const ObP2PDatahubMsgBase &) final;
@@ -94,6 +94,8 @@ public:
     int64_t addr_cnt, int64_t piece_size);
   int process_first_phase_recieve_count(
       ObRFBloomFilterMsg &msg, bool &first_phase_end);
+  int forward_second_phase_message(int64_t begin_idx, int64_t end_idx,
+                                   const ObIArray<ObAddr> &next_phase_addrs);
   virtual int process_msg_internal(bool &need_free);
   virtual int regenerate() override;
   int atomic_merge(ObP2PDatahubMsgBase &other_msg);
@@ -134,7 +136,6 @@ public:
   common::ObFixedArray<BloomFilterReceiveCount, common::ObIAllocator> receive_count_array_;
   int64_t filter_idx_; //for shared msg
   bool create_finish_; //for shared msg
-  bool need_send_msg_;  //for shared msg, when drain_exch, msg is not need to be sent
   bool is_finish_regen_;
   bool use_rich_format_;
   bool use_hash_join_seed_ {false};

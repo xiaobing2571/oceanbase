@@ -37,10 +37,15 @@
 #include "share/schema/ob_security_audit_mgr.h"
 #include "share/schema/ob_dblink_mgr.h"
 #include "share/schema/ob_directory_mgr.h"
+#include "share/schema/ob_location_mgr.h"
 #include "share/schema/ob_context_mgr.h"
 #include "share/schema/ob_mock_fk_parent_table_mgr.h"
 #include "share/schema/ob_rls_mgr.h"
 #include "share/schema/ob_catalog_mgr.h"
+#include "share/schema/ob_external_resource_mgr.h"
+#include "share/schema/ob_ai_model_mgr.h"
+#include "share/schema/ob_ccl_rule_mgr.h"
+#include "share/schema/ob_sensitive_rule_mgr.h"
 
 namespace oceanbase
 {
@@ -258,7 +263,8 @@ public:
                K_(tablegroup_name),
                K_(partition_status),
                K_(partition_schema_version),
-               K_(sharding));
+               K_(sharding),
+               K_(scope));
   virtual void reset();
   bool is_valid() const;
   inline int64_t get_convert_size() const;
@@ -274,7 +280,10 @@ public:
   inline const common::ObString &get_tablegroup_name() const { return tablegroup_name_; }
   inline int set_sharding(const common::ObString &sharding)
   { return deep_copy_str(sharding, sharding_); }
+  inline int set_scope(const common::ObString &scope)
+  { return deep_copy_str(scope, scope_); }
   inline const common::ObString &get_sharding() const { return sharding_; }
+  inline const common::ObString &get_scope() const { return scope_; }
   inline ObTenantTablegroupId get_tenant_tablegroup_id() const
   { return ObTenantTablegroupId(tenant_id_, tablegroup_id_); }
 
@@ -303,6 +312,7 @@ private:
   ObPartitionStatus partition_status_;
   int64_t partition_schema_version_;
   common::ObString sharding_;
+  common::ObString scope_;
 };
 
 template<class K, class V>
@@ -602,6 +612,7 @@ public:
       const ObSimpleTableSchemaV2 *&table_schema) const;
   int get_hidden_table_schema(const uint64_t tenant_id,
                               const uint64_t database_id,
+                              const uint64_t session_id,
                               const common::ObString &table_name,
                               const ObSimpleTableSchemaV2 *&table_schema) const;
   int get_index_schema(
@@ -730,6 +741,10 @@ public:
       const uint64_t tenant_id,
       const uint64_t schema_id,
       const ObDirectorySchema *&schema) const;
+  int get_location_schema(
+      const uint64_t tenant_id,
+      const uint64_t schema_id,
+      const ObLocationSchema *&schema) const;
 
   int get_keystore_schema(
       const uint64_t tenant_id,
@@ -751,6 +766,29 @@ public:
   // {
   //   return rls_context_mgr_.get_rls_context_schema_by_id(schema_id, schema);
   // }
+
+  // external resource
+  int get_external_resource_schema(
+      const uint64_t &tenant_id,
+      const uint64_t &external_resource_id,
+      const ObSimpleExternalResourceSchema *&external_resource_schema) const;
+    // external resource
+  int get_external_resource_schema(
+      const uint64_t &tenant_id,
+      const uint64_t &database_id,
+      const ObString &external_resource_name,
+      const ObSimpleExternalResourceSchema *&external_resource_schema) const;
+
+  // ai model
+  int get_ai_model_schema(
+      const uint64_t &tenant_id,
+      const uint64_t &ai_model_id,
+      const ObAiModelSchema *&ai_model_schema) const;
+  int get_ai_model_schema(
+      const uint64_t &tenant_id,
+      const ObString &ai_model_name,
+      const common::ObNameCaseMode &case_mode,
+      const ObAiModelSchema *&ai_model_schema) const;
 
   // other
   int get_tenant_schemas(common::ObIArray<const ObSimpleTenantSchema *> &tenant_schemas) const;
@@ -775,6 +813,9 @@ public:
       const uint64_t tenant_id,
       common::ObIArray<const ObSimpleTableSchemaV2 *> &schema_array) const;
   #undef GET_TABLE_SCHEMAS_IN_DST_SCHEMA_FUNC_DECLARE
+  int get_vector_index_schemas_in_tenant(
+      const uint64_t tenant_id,
+      common::ObIArray<const ObSimpleTableSchemaV2 *> &schema_array) const;
   int get_primary_table_schema_in_tablegroup(
       const uint64_t tenant_id,
       const uint64_t tablegroup_id,
@@ -819,6 +860,9 @@ private:
   inline bool check_inner_stat() const;
 
   int remove_aux_table(const ObSimpleTableSchemaV2 &schema_to_del, const bool is_aux_vp);
+  int collect_aux_schemas_by_data_table_id(const TableInfos &infos,
+                                           const ObTenantTableId &tenant_data_table_id,
+                                           common::ObIArray<const ObSimpleTableSchemaV2 *> &aux_schemas) const;
 
   int add_foreign_keys_in_table(const common::ObIArray<ObSimpleForeignKeyInfo> &fk_info_array,
                                 const int over_write);
@@ -920,6 +964,22 @@ private:
   int add_catalogs(const common::ObIArray<ObCatalogSchema> &catalog_schemas);
   int add_catalog(const ObCatalogSchema &catalog_schema);
   int del_catalog(const ObTenantCatalogId &id);
+  // location
+  int add_locations(const common::ObIArray<ObLocationSchema> &location_schemas);
+  int add_location(const ObLocationSchema &location_schema);
+  int del_location(const ObTenantLocationId &id);
+  // ai model
+  int add_ai_models(const common::ObIArray<ObAiModelSchema> &ai_model_schemas);
+  int add_ai_model(const ObAiModelSchema &ai_model_schema);
+  int del_ai_model(const ObTenantAiModelId &tenant_ai_model_id);
+  // ccl
+  int add_ccl_rules(const common::ObIArray<ObSimpleCCLRuleSchema> &ccl_schemas);
+  int add_ccl_rule(const ObSimpleCCLRuleSchema &ccl_schema);
+  int del_ccl_rule(const ObTenantCCLRuleId &id);
+  // sensitive rule
+  int add_sensitive_rules(const common::ObIArray<ObSensitiveRuleSchema> &sensitive_rule_schemas);
+  int add_sensitive_rule(const ObSensitiveRuleSchema &sensitive_rule_schema);
+  int del_sensitive_rule(const ObTenantSensitiveRuleId &id);
 private:
   common::ObArenaAllocator local_allocator_;
   common::ObIAllocator &allocator_;
@@ -933,6 +993,7 @@ private:
   TablegroupInfos tablegroup_infos_;
   TableInfos table_infos_;
   TableInfos index_infos_;
+  TableInfos vec_index_infos_;
   TableInfos aux_vp_infos_;
   TableInfos lob_meta_infos_;
   TableInfos lob_piece_infos_;
@@ -971,15 +1032,20 @@ private:
   IndexNameMap built_in_index_name_map_;
   ObDbLinkMgr dblink_mgr_;
   ObDirectoryMgr directory_mgr_;
+  ObLocationMgr location_mgr_;
   ObContextMgr context_mgr_;
   ObMockFKParentTableMgr mock_fk_parent_table_mgr_;
   ObRlsPolicyMgr rls_policy_mgr_;
   ObRlsGroupMgr rls_group_mgr_;
   ObRlsContextMgr rls_context_mgr_;
   ObCatalogMgr catalog_mgr_;
+  ObCCLRuleMgr ccl_rule_mgr_;
+  ObSensitiveRuleMgr sensitive_rule_mgr_;
   int64_t timestamp_in_slot_; // when schema mgr put in slot, we will set the timestamp
   int64_t allocator_idx_;
   TableInfos mlog_infos_;
+  ObExternalResourceMgr external_resource_mgr_;
+  ObAiModelMgr ai_model_mgr_;
 };
 
 }//end of namespace schema

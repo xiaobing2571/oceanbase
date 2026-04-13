@@ -128,10 +128,22 @@ private:
 public:
   ObLogicMacroBlockId()
     : data_seq_(), logic_version_(0), tablet_id_(0 /* ObTabletID::INVALID_TABLET_ID */), info_(0)
-  {}
+  {
+#if defined(__x86_64__)
+  // The size of ObLogicMacroBlockId affects the size of the index row at the end of the macro block.
+  // Must pay attention to the backward and forward compatibility when adding new fields.
+  static_assert(sizeof(ObLogicMacroBlockId) == 32, "The size of ObLogicMacroBlockId affects the size of the index row at the end of the macro block.");
+#endif
+  }
   ObLogicMacroBlockId(const int64_t data_seq, const uint64_t logic_version, const int64_t tablet_id)
     : data_seq_(data_seq), logic_version_(logic_version), tablet_id_(tablet_id), info_(0)
-  {}
+  {
+#if defined(__x86_64__)
+  // The size of ObLogicMacroBlockId affects the size of the index row at the end of the macro block.
+  // Must pay attention to the backward and forward compatibility when adding new fields.
+  static_assert(sizeof(ObLogicMacroBlockId) == 32, "The size of ObLogicMacroBlockId affects the size of the index row at the end of the macro block.");
+#endif
+  }
 
   int64_t hash() const;
   int hash(uint64_t &hash_val) const { hash_val = hash(); return OB_SUCCESS; }
@@ -145,7 +157,7 @@ public:
     return data_seq_.is_valid() && logic_version_ > 0 && tablet_id_ > 0;
   }
 
-  TO_STRING_KV(K_(data_seq), K_(logic_version), K_(tablet_id), K_(column_group_idx), K_(is_mds));
+  TO_STRING_KV(K_(data_seq), K_(logic_version), K_(tablet_id), K_(column_group_idx), K_(is_mds), K_(merge_type));
 
 public:
   ObMacroDataSeq data_seq_;
@@ -157,8 +169,9 @@ public:
     struct {
       uint64_t column_group_idx_ : 16;
       bool is_mds_               :  1;
-      uint64_t reserved_         : 47;
-    };
+      uint8_t merge_type_        :  8;
+      uint64_t reserved_         : 39;
+    } __attribute__((packed));
   };
   OB_UNIS_VERSION(LOGIC_BLOCK_ID_VERSION);
 };

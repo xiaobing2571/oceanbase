@@ -161,6 +161,11 @@ ob_set_subtarget(oblib_lib roaringbitmap
   roaringbitmap/ob_rb_memory_mgr.cpp
 )
 
+ob_set_subtarget(oblib_lib ai_split_document
+  ai_split_document/ob_ai_split_document.cpp
+  ai_split_document/ob_ai_split_document_util.cpp
+)
+
 ob_set_subtarget(oblib_lib encode
   encode/ob_base64_encode.cpp
   encode/ob_quoted_printable_encode.cpp
@@ -195,6 +200,10 @@ ob_set_subtarget(oblib_lib common_mixed
   encode/ob_quoted_printable_encode.cpp
   encode/ob_uuencode.cpp
   encrypt/ob_encrypted_helper.cpp
+  encrypt/ob_sha256_crypt.cpp
+  encrypt/ob_caching_sha2_cache.cpp
+  encrypt/ob_caching_sha2_cache_mgr.cpp
+  encrypt/ob_rsa_getter.cpp
   file/file_directory_utils.cpp
   file/ob_file.cpp
   file/ob_string_util.cpp
@@ -244,6 +253,7 @@ ob_set_subtarget(oblib_lib common_mixed
   stat/ob_diagnostic_info_container.cpp
   stat/ob_diagnostic_info_guard.cpp
   string/ob_hex_utils_base.cpp
+  string/ob_occam_regex.cpp
   string/ob_sql_string.cpp
   string/ob_string.cpp
   string/ob_strings.cpp
@@ -291,6 +301,10 @@ ob_set_subtarget(oblib_lib common_mixed
   locale/ob_locale_type.cc
   locale/ob_locale.cpp
   enumset/ob_enum_set_meta.cpp
+  jni_env/ob_java_helper.cpp
+  jni_env/ob_java_env.cpp
+  jni_env/ob_java_native_method.cpp
+  jni_env/ob_jni_connector.cpp
   other/recursion.cpp
 )
 
@@ -395,6 +409,7 @@ ob_set_subtarget(oblib_lib vtoa
 
 ob_set_subtarget(oblib_lib ob_vector_util
   vector/ob_vector_util.cpp
+  vector/ob_vsag_adaptor.cpp
 )
 
 ob_lib_add_target(oblib_lib)
@@ -439,7 +454,6 @@ ob_set_subtarget(ob_malloc_object_list common_alloc
   allocator/ob_malloc.cpp
   allocator/ob_mem_leak_checker.cpp
   allocator/ob_mod_define.cpp
-  allocator/ob_page_manager.cpp
   allocator/ob_slice_alloc.cpp
   allocator/ob_sql_mem_leak_checker.cpp
   allocator/ob_tc_malloc.cpp
@@ -463,7 +477,7 @@ if (BUILD_CDC_ONLY)
   set_target_properties(malloc_hook PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 
-target_link_libraries(malloc_hook oblib_base)
+target_link_libraries(malloc_hook oblib_base_without_pass)
 
 if(OB_BUILD_CLOSE_MODULES)
   target_link_libraries(oblib_lib PUBLIC
@@ -473,9 +487,8 @@ if(OB_BUILD_CLOSE_MODULES)
   )
 endif()
 
-if(CPP_STANDARD_20)
-  target_compile_options(oblib_lib PUBLIC -D_GLIBCXX_USE_CXX11_ABI=0)
-endif()
+target_compile_options(oblib_lib PUBLIC -D_GLIBCXX_USE_CXX11_ABI=0)
+
 target_link_libraries(oblib_lib
   PUBLIC ob_malloc compress restore
   ${DEP_DIR}/lib/libxml2.a
@@ -492,7 +505,6 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fopenmp")
 if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
   target_link_libraries(oblib_lib
     PUBLIC
-    libob_vsag_static.a
     libcpuinfo.a
     libsimd.a
     libvsag_static.a
@@ -502,11 +514,13 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
     libquadmath_static.a
     libgomp_static.a
     libroaring.a
+    libantlr4-runtime.a
+    libantlr4-autogen.a
+    libfmt.a
   )
 elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
   target_link_libraries(oblib_lib
     PUBLIC
-    libob_vsag_static.a
     libcpuinfo.a
     libsimd.a
     libvsag_static.a
@@ -515,6 +529,9 @@ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
     libgfortran_static.a
     libgomp_static.a
     libroaring.a
+    libantlr4-runtime.a
+    libantlr4-autogen.a
+    libfmt.a
   )
 else()
     message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")

@@ -55,13 +55,17 @@ struct ObMicroBlockDesc
   bool has_string_out_row_;
   bool has_lob_out_row_;
   bool is_last_row_last_flag_;
+  bool is_first_row_first_flag_;
+  bool single_version_rows_;  // only used for delta sstable
 
   ObMicroBlockDesc() { reset(); }
   bool is_valid() const;
   void reset();
+  bool is_complete_micro_block_memory() const;
   int64_t get_block_size() const { return buf_size_ + header_->header_size_; }
-  const char *get_block_buf() const { return reinterpret_cast<const char *>(header_); }
-
+  // just for compat
+  // buf_ point to data playload after micro header
+  const char *get_block_buf() const { return buf_ - header_->header_size_; }
   int deep_copy(
     common::ObIAllocator& allocator,
     ObMicroBlockDesc& dst) const;
@@ -86,6 +90,8 @@ struct ObMicroBlockDesc
       K_(has_string_out_row),
       K_(has_lob_out_row),
       K_(is_last_row_last_flag),
+      K_(is_first_row_first_flag),
+      K_(single_version_rows),
       K_(original_size));
 
   DISALLOW_COPY_AND_ASSIGN(ObMicroBlockDesc);
@@ -108,7 +114,6 @@ public:
     : ObCompactionBuffer("MicroBuffer", page_size)
   {}
   virtual ~ObMicroBufferWriter() { reset(); };
-  int write_row(const ObDatumRow &row, const int64_t rowkey_cnt, int64_t &len);
 };
 
 // Some common interface of ObMicroBlockWriter and ObMicroBlockEncoder, not all features.
@@ -117,6 +122,8 @@ class ObIMicroBlockWriter
   static const int64_t DEFAULT_UPPER_BOUND = 1 << 30;
 public:
   ObIMicroBlockWriter() :
+    micro_header_(),
+    column_checksum_buffer_(),
     row_count_delta_(0),
     last_rows_count_(0),
     micro_block_merge_verify_level_(MICRO_BLOCK_MERGE_VERIFY_LEVEL::ENCODING_AND_COMPRESSION),
@@ -128,6 +135,7 @@ public:
     has_lob_out_row_(false),
     need_check_lob_(false),
     is_last_row_last_flag_(false),
+    is_first_row_first_flag_(false),
     checksum_helper_()
   {
   }
@@ -148,8 +156,10 @@ public:
   virtual int64_t get_column_count() const = 0;
   virtual void reset()
   {
+    micro_header_.reset();
     ObIMicroBlockWriter::reuse();
     checksum_helper_.reset();
+    column_checksum_buffer_.reset();
   }
   virtual void dump_diagnose_info() { STORAGE_LOG(INFO, "IMicroBlockWriter", K(checksum_helper_)); }
   virtual int append_hash_index(ObMicroBlockHashIndexBuilder& hash_index_builder)
@@ -174,6 +184,9 @@ public:
     has_string_out_row_ = false;
     has_lob_out_row_ = false;
     is_last_row_last_flag_ = false;
+    is_first_row_first_flag_ = false;
+    micro_header_.reuse();
+    column_checksum_buffer_.reuse();
   }
   virtual bool micro_block_row_data_buffered() const
   {
@@ -182,6 +195,7 @@ public:
   virtual int get_pre_agg_param(const int64_t col_idx, ObMicroDataPreAggParam &pre_agg_param) const;
   void set_block_size_upper_bound(const int64_t &size) { block_size_upper_bound_ = size; }
   int build_micro_block_desc(ObMicroBlockDesc &micro_block_desc);
+  int build_micro_block_desc_in_unittest(ObMicroBlockDesc &micro_block_desc); // only for unittest
   int32_t get_row_count_delta() const { return row_count_delta_; }
   int64_t get_micro_block_merge_verify_level() const
   {
@@ -195,7 +209,7 @@ public:
     update_max_merged_trans_version(merged_trans_version);
     update_min_merged_trans_version(merged_trans_version);
   }
-  void update_max_merged_trans_version(const int64_t max_merged_trans_version)
+  inline void update_max_merged_trans_version(const int64_t max_merged_trans_version)
   {
     if (max_merged_trans_version > max_merged_trans_version_) {
       max_merged_trans_version_ = max_merged_trans_version;
@@ -211,6 +225,7 @@ public:
   inline bool has_string_out_row() const { return has_string_out_row_; }
   inline bool has_lob_out_row() const { return has_lob_out_row_; }
   inline bool is_last_row_last_flag() const { return is_last_row_last_flag_; }
+  inline bool is_first_row_first_flag() const { return is_first_row_first_flag_; }
   void set_contain_uncommitted_row()
   {
     contain_uncommitted_row_ = true;
@@ -221,7 +236,7 @@ public:
     micro_block_merge_verify_level_ = verify_level;
   }
   VIRTUAL_TO_STRING_KV(K_(row_count_delta), K_(contain_uncommitted_row),
-      K_(max_merged_trans_version), K_(checksum_helper));
+      K_(max_merged_trans_version), K_(min_merged_trans_version), K_(checksum_helper));
 
 protected:
   OB_INLINE void cal_row_stat(const ObDatumRow &row)
@@ -238,6 +253,9 @@ protected:
       ++last_rows_count_;
     }
     is_last_row_last_flag_ = row.is_last_multi_version_row();
+    if (1 == get_row_count()) {
+      is_first_row_first_flag_ = row.is_first_multi_version_row();
+    }
     STORAGE_LOG(DEBUG, "cal row stat", K(row), K(row.mvcc_row_flag_), K_(row_count_delta), K_(last_rows_count));
   }
 
@@ -245,26 +263,12 @@ protected:
   {
     return MICRO_BLOCK_MERGE_VERIFY_LEVEL::NONE < micro_block_merge_verify_level_;
   }
-
-  OB_INLINE ObMicroBlockHeader* get_header(ObMicroBufferWriter &data_buffer)
-  {
-    ObMicroBlockHeader *header = reinterpret_cast<ObMicroBlockHeader*>(data_buffer.data());
-    calc_column_checksums_ptr(data_buffer);
-    return header;
-  }
-
-  OB_INLINE void calc_column_checksums_ptr(ObMicroBufferWriter &data_buffer)
-  {
-    ObMicroBlockHeader *header = reinterpret_cast<ObMicroBlockHeader*>(data_buffer.data());
-    if (header->column_checksums_ != nullptr && header->has_column_checksum_) {
-      header->column_checksums_ = reinterpret_cast<int64_t *>(
-            data_buffer.data() + ObMicroBlockHeader::COLUMN_CHECKSUM_PTR_OFFSET);
-    }
-  }
+  int reserve_micro_header_col_ckm_buffer();
 public:
   static const int64_t DEFAULT_MICRO_MAX_SIZE = 256 * 1024; //256K
-
+  ObMicroBlockHeader micro_header_;
 protected:
+  ObMicroBufferWriter column_checksum_buffer_;
   // row count delta of the current micro block
   int32_t row_count_delta_;
   // count of rows contain last flag
@@ -278,6 +282,7 @@ protected:
   bool has_lob_out_row_;
   bool need_check_lob_;
   bool is_last_row_last_flag_;
+  bool is_first_row_first_flag_;
   ObMicroBlockChecksumHelper checksum_helper_;
 };
 

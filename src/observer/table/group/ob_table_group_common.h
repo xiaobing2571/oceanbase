@@ -13,7 +13,7 @@
 #ifndef OCEANBASE_OBSERVER_OB_TABLE_GROUP_COMMON_H_
 #define OCEANBASE_OBSERVER_OB_TABLE_GROUP_COMMON_H_
 
-#include "observer/table/ob_table_trans_utils.h"
+#include "observer/table/utils/ob_table_trans_utils.h"
 #include "observer/table/ob_table_schema_cache.h"
 #include "observer/table/object_pool/ob_table_object_pool.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
@@ -168,6 +168,7 @@ public:
   static const int64_t DEFAULT_FAILED_GROUP_SIZE = 200;
   ObTableFailedGroups(common::ObIAllocator &allocator)
       : is_inited_(false),
+        lock_(common::ObLatchIds::OB_TABLE_FAILED_GROUPS_LOCK),
         failed_ops_(allocator),
         group_info_()
   {}
@@ -196,6 +197,7 @@ public:
   static const int64_t DEFAULT_EXPIRED_LS_GROUP_SIZE = 100;
    ObTableExpiredGroups()
       : is_inited_(false),
+        lock_(common::ObLatchIds::OB_TABLE_EXPIRED_GROUPS_LOCK),
         allocator_(MTL_ID()),
         expired_groups_(allocator_),
         clean_groups_(allocator_)

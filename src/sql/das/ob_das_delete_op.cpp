@@ -14,6 +14,8 @@
 #include "sql/das/ob_das_delete_op.h"
 #include "sql/das/ob_das_domain_utils.h"
 #include "sql/engine/dml/ob_dml_service.h"
+#include "share/schema/ob_schema_struct.h"
+#include "sql/das/ob_das_search_index_utils.h"
 namespace oceanbase
 {
 namespace common
@@ -54,6 +56,24 @@ int ObDASIndexDMLAdaptor<DAS_OP_TABLE_DELETE, ObDASDMLIterator>::write_rows(cons
                                 ctdef.column_ids_, &iter, affected_rows))) {
       if (OB_TRY_LOCK_ROW_CONFLICT != ret) {
         LOG_WARN("insert rows to access service failed", K(ret), K(ls_id), K(tablet_id));
+      }
+    }
+  } else if (ctdef.table_param_.get_data_table().is_hybrid_vector_index() &&
+             !ctdef.is_access_mlog_as_master_table_) {
+    // For hybrid vector index, check if it's embedded table
+    if (share::schema::is_hybrid_vec_index_embedded_type(ctdef.table_param_.get_data_table().get_index_type())) {
+      // For embedded table, perform actual delete operation
+      if (OB_FAIL(as->delete_rows(ls_id, tablet_id, *tx_desc_, dml_param_, ctdef.column_ids_, &iter, affected_rows))) {
+        if (OB_TRY_LOCK_ROW_CONFLICT != ret) {
+          LOG_WARN("delete rows to access service failed", K(ret), K(ls_id), K(tablet_id));
+        }
+      }
+    } else if (share::schema::is_hybrid_vec_index_log_type(ctdef.table_param_.get_data_table().get_index_type())) {
+      // For other hybrid vector index tables (like log table), perform insert to record delete mark
+      if (OB_FAIL(as->insert_rows(ls_id, tablet_id, *tx_desc_, dml_param_, ctdef.column_ids_, &iter, affected_rows))) {
+        if (OB_TRY_LOCK_ROW_CONFLICT != ret) {
+          LOG_WARN("insert rows to access service failed", K(ret), K(ls_id), K(tablet_id));
+        }
       }
     }
   } else if (ctdef.table_param_.get_data_table().is_mlog_table()
@@ -116,6 +136,7 @@ int ObDASDeleteOp::open_op()
   del_adaptor.tablet_id_ = tablet_id_;
   del_adaptor.ls_id_ = ls_id_;
   del_adaptor.related_tablet_ids_ = &related_tablet_ids_;
+  del_adaptor.is_do_gts_opt_ = das_gts_opt_info_.use_specify_snapshot_;
   del_adaptor.das_allocator_ = &op_alloc_;
   del_adaptor.ft_doc_word_infos_ = &doc_word_infos;
   if (OB_FAIL(ObDASDomainUtils::build_ft_doc_word_infos(ls_id_, trans_desc_, snapshot_, related_ctdefs_, related_tablet_ids_,

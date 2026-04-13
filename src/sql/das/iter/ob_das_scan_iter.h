@@ -15,6 +15,7 @@
 
 #include "sql/das/iter/ob_das_iter.h"
 #include "sql/das/ob_das_scan_op.h"
+#include "sql/das/search/ob_das_scalar_define.h"
 namespace oceanbase
 {
 namespace common {
@@ -36,12 +37,30 @@ struct ObDASScanIterParam : public ObDASIterParam
 public:
   ObDASScanIterParam()
     : ObDASIterParam(ObDASIterType::DAS_ITER_SCAN),
-      scan_ctdef_(nullptr)
+      scan_ctdef_(nullptr),
+      scalar_scan_ctdef_(nullptr),
+      use_scalar_ctdef_(false)
   {}
   const ObDASScanCtDef *scan_ctdef_;
+  const ObDASScalarScanCtDef *scalar_scan_ctdef_;
+  bool use_scalar_ctdef_;
   virtual bool is_valid() const override
   {
-    return nullptr != scan_ctdef_ && ObDASIterParam::is_valid();
+    const bool ctdef_valid = (!use_scalar_ctdef_ && nullptr != scan_ctdef_)
+                          || (use_scalar_ctdef_ && nullptr != scalar_scan_ctdef_);
+    return ctdef_valid && ObDASIterParam::is_valid();
+  }
+  const ExprFixedArray &get_result_output() const
+  {
+    return use_scalar_ctdef_ ? scalar_scan_ctdef_->result_output_ : scan_ctdef_->result_output_;
+  }
+  common::ObTableID get_ref_table_id() const
+  {
+    return use_scalar_ctdef_ ? scalar_scan_ctdef_->ref_table_id_ : scan_ctdef_->ref_table_id_;
+  }
+  bool is_external_table() const
+  {
+    return use_scalar_ctdef_ ? false : scan_ctdef_->is_external_table_;
   }
 };
 
@@ -52,33 +71,55 @@ public:
     : ObDASIter(ObDASIterType::DAS_ITER_SCAN),
       tsc_service_(nullptr),
       result_(nullptr),
-      scan_param_(nullptr)
+      scan_param_(nullptr),
+      skip_vectorized_print_(false),
+      try_check_tick_(0),
+      try_check_tick_rows_(0),
+      vec_start_scan_ts_us_(-1),
+      vec_pre_filtering_timeout_us_(-1)
   {}
   virtual ~ObDASScanIter() {}
   common::ObNewRowIterator *&get_output_result_iter() { return result_; }
 
   void set_scan_param(storage::ObTableScanParam &scan_param) { scan_param_ = &scan_param; }
   storage::ObTableScanParam &get_scan_param() { return *scan_param_; }
+  OB_INLINE void set_skip_vectorized_print() { skip_vectorized_print_ = true; }
+  OB_INLINE bool is_skip_vectorized_print() { return skip_vectorized_print_; }
 
   virtual int do_table_scan() override;
   virtual int rescan() override;
+  virtual int advance_scan() override;
   virtual void clear_evaluated_flag() override;
 
-  virtual int get_diagnosis_info(ObDiagnosisManager* diagnosis_manager) override {
-    return result_->get_diagnosis_info(diagnosis_manager);
-  };
+  virtual int set_scan_rowkey(ObEvalCtx *eval_ctx,
+                              const ObIArray<ObExpr *> &rowkey_exprs,
+                              const ObDASScanCtDef *lookup_ctdef,
+                              ObIAllocator *alloc,
+                              int64_t group_id) override;
+  OB_INLINE void set_pre_filtering_timeout(int64_t vec_pre_filtering_timeout) { vec_pre_filtering_timeout_us_ = vec_pre_filtering_timeout; }
+  OB_INLINE bool is_vec_pre_filtering_timeout_set() { return vec_pre_filtering_timeout_us_ > 0; }
 protected:
   virtual int inner_init(ObDASIterParam &param) override;
   virtual int inner_reuse() override;
   virtual int inner_release() override;
   virtual int inner_get_next_row() override;
   virtual int inner_get_next_rows(int64_t &count, int64_t capacity) override;
+  int try_check_vec_pre_filter_status(const int64_t row_count = 1);
+  int check_vec_pre_filter_status();
 
 private:
+  static const uint64_t CHECK_STATUS_ROWS = 500;
+  static const uint64_t CHECK_STATUS_TRY_TIMES = 50;
+
   common::ObITabletScan *tsc_service_;
   common::ObNewRowIterator *result_;
   // must ensure the lifecycle of scan param is longer than scan iter.
   storage::ObTableScanParam *scan_param_;
+  bool skip_vectorized_print_;
+  uint64_t try_check_tick_; // for check vector prefilter search status by times, default 0
+  uint64_t try_check_tick_rows_; // for check vector prefilter search status by rows, default 0
+  int64_t vec_start_scan_ts_us_; // the start timestamp of this scan for vector prefilter search, default -1
+  int64_t vec_pre_filtering_timeout_us_; // the pre-filtering timeout of vector prefilter search , default -1
 };
 
 

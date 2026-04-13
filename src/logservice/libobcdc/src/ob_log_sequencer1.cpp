@@ -74,11 +74,11 @@ ObLogSequencer::ObLogSequencer()
     global_seq_(0),
     br_committer_queue_seq_(0),
     ready_trans_queue_(),
-    trans_queue_lock_(),
+    trans_queue_lock_(common::ObLatchIds::OB_CDC_COMMON_LOCK),
     seq_trans_queue_(),
-    checkpoint_cond_(),
-    ready_queue_cond_(),
-    seq_queue_cond_(),
+    checkpoint_cond_(ObCond::SPIN_WAIT_NUM, common::ObWaitEventIds::CDC_COMMON_COND_WAIT),
+    ready_queue_cond_(ObCond::SPIN_WAIT_NUM, common::ObWaitEventIds::CDC_COMMON_COND_WAIT),
+    seq_queue_cond_(ObCond::SPIN_WAIT_NUM, common::ObWaitEventIds::CDC_COMMON_COND_WAIT),
     total_part_trans_task_count_(0),
     ddl_part_trans_task_count_(0),
     dml_part_trans_task_count_(0),
@@ -1014,7 +1014,7 @@ int ObLogSequencer::handle_multi_data_source_info_(
           if (OB_FAIL(part_mgr.apply_create_tablet_change(tablet_change_info))) {
             LOG_ERROR("apply_create_tablet_change failed", KR(ret), K(tablet_change_info), K(tenant), KPC(part_trans_task));
           } else {
-            LOG_DEBUG("CDC_CREATE_TABLET", KR(ret), K(tablet_change_info), K(part_trans_task), KPC(part_trans_task), K(tenant));
+            LOG_TRACE("CDC_CREATE_TABLET", KR(ret), K(tablet_change_info), K(part_trans_task), KPC(part_trans_task), K(tenant));
           }
         } else if (tablet_change_info.is_delete_tablet_op()) {
           const bool skip_delete_tablet_op = (1 == TCONF.skip_delete_tablet_op);
@@ -1034,7 +1034,7 @@ int ObLogSequencer::handle_multi_data_source_info_(
           } else if (OB_FAIL(part_mgr.apply_delete_tablet_change(tablet_change_info))) {
             LOG_ERROR("apply_delete_tablet_change failed", KR(ret), K(tablet_change_info), K(tenant), KPC(part_trans_task));
           } else {
-            LOG_DEBUG("CDC_DELETE_TABLET", KR(ret), K(tablet_change_info), K(part_trans_task), KPC(part_trans_task), K(tenant));
+            LOG_TRACE("CDC_DELETE_TABLET", KR(ret), K(tablet_change_info), K(part_trans_task), KPC(part_trans_task), K(tenant));
           }
         } else if (tablet_change_info.is_exchange_tablet_op()) {
           if (OB_FAIL(wait_until_parser_done_("exchange_tablet_op", stop_flag))) {
@@ -1401,7 +1401,8 @@ int ObLogSequencer::need_acquire_new_schema_(const PartTransTask &task, bool &ne
         LOG_ERROR("invalid DDL statement", KR(ret), KPC(stmt_task), K(ddl_stmt));
       } else if (OB_DDL_CREATE_TABLE == ddl_stmt->get_operation_type()
           || OB_DDL_ALTER_TABLE == ddl_stmt->get_operation_type()
-          || OB_DDL_TABLE_RENAME == ddl_stmt->get_operation_type()) {
+          || OB_DDL_TABLE_RENAME == ddl_stmt->get_operation_type()
+          || OB_DDL_RECOVER_TABLE_END == ddl_stmt->get_operation_type()) {
         need_new_schema = true;
         break;
       } else {
@@ -1434,7 +1435,8 @@ int ObLogSequencer::update_table_id_cache_(IObLogPartMgr &part_mgr, const PartTr
         break;
       }
       case TICUpdateInfo::TICUpdateReason::CREATE_TABLE:
-      case TICUpdateInfo::TICUpdateReason::RENAME_TABLE_ADD: {
+      case TICUpdateInfo::TICUpdateReason::RENAME_TABLE_ADD:
+      case TICUpdateInfo::TICUpdateReason::RECOVER_TABLE_END: {
         const uint64_t table_id = tic_update_info.table_id_;
         const uint64_t database_id = tic_update_info.database_id_;
         if (OB_FAIL(part_mgr.insert_table_id_into_cache(table_id, database_id))) {

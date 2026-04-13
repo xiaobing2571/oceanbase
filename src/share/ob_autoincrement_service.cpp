@@ -260,10 +260,6 @@ int ObAutoincrementService::init(ObAddr &addr,
     LOG_WARN("failed to init cache handle allocator", K(ret));
   } else if (OB_FAIL(node_map_.init(attr))) {
     LOG_WARN("failed to init table node map", K(ret));
-  } else {
-    for (int64_t i = 0; i < INIT_NODE_MUTEX_NUM; ++i) {
-      init_node_mutex_[i].set_latch_id(common::ObLatchIds::AUTO_INCREMENT_INIT_LOCK);
-    }
   }
   return ret;
 }
@@ -785,6 +781,9 @@ int ObAutoincrementService::calculate_idempotent_autoinc_val_for_ddl(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(autoinc_param),
              K(table_all_slice_count), K(table_level_slice_idx), K(slice_row_idx));
+  } else if (autoinc_param->global_value_to_sync_ >= UINT64_MAX) {
+    ret = OB_ERR_REACH_AUTOINC_MAX;
+    LOG_WARN("autoinc reach max", K(ret), K(autoinc_param->global_value_to_sync_));
   } else {
     const int64_t range_id = slice_row_idx / autoinc_range_interval;
     const int64_t row_id_in_range = slice_row_idx % autoinc_range_interval;
@@ -792,11 +791,19 @@ int ObAutoincrementService::calculate_idempotent_autoinc_val_for_ddl(
     // for now, only `offset` param is supported, `increment` param is not supported
     const uint64_t offset = autoinc_param->autoinc_offset_;
     const uint64_t max_value = get_max_value(column_type);
-    autoinc_value =
+    if (1 == table_all_slice_count) {
+      // if generate in only one thread, calc next value by prev value and increment step to compat MySQL
+      autoinc_value = OB_UNLIKELY(0 == slice_row_idx) ? offset : min(autoinc_param->global_value_to_sync_ + autoinc_param->autoinc_increment_, max_value);
+    } else {
+      autoinc_value =
         min(offset + table_level_slice_idx * autoinc_range_interval +
                 (table_all_slice_count * range_id * autoinc_range_interval) + row_id_in_range,
             max_value);
+    }
     autoinc_param->global_value_to_sync_ = max(autoinc_param->global_value_to_sync_, autoinc_value);
+    LOG_TRACE("ddl calc idem autoinc value", K(ret), K(autoinc_value),
+        K(table_all_slice_count), K(table_level_slice_idx), K(slice_row_idx), K(autoinc_range_interval),
+        K(autoinc_param->value_to_sync_), K(autoinc_param->global_value_to_sync_), K(autoinc_param->autoinc_increment_), K(offset));
   }
 
   return ret;
@@ -817,6 +824,7 @@ int ObAutoincrementService::clear_autoinc_cache_all(const uint64_t tenant_id,
     arg.tenant_id_ = tenant_id;
     arg.table_id_  = table_id;
     arg.column_id_ = column_id;
+    arg.autoinc_is_order_ = autoinc_is_order;
     ObHashSet<ObAddr> server_set;
     if (OB_FAIL(server_set.create(PARTITION_LOCATION_SET_BUCKET_NUM))) {
       LOG_WARN("failed to create hash set", K(ret));
@@ -867,7 +875,8 @@ int ObAutoincrementService::clear_autoinc_cache(const obrpc::ObAutoincSyncArg &a
     // do nothing; key does not exist
     ret = OB_SUCCESS;
   }
-  if (OB_SUCC(ret) && OB_FAIL(global_autoinc_service_.clear_global_autoinc_cache(key))) {
+  if (OB_SUCC(ret) && arg.autoinc_is_order_ &&
+      OB_FAIL(global_autoinc_service_.clear_global_autoinc_cache(key))) {
     LOG_WARN("failed to clear global autoinc cache", K(ret));
   }
   return ret;
@@ -935,7 +944,7 @@ int ObAutoincrementService::get_table_node(const AutoincParam &param, TableNode 
     if (ret != OB_ENTRY_NOT_EXIST) {
       LOG_ERROR("get from map failed", K(ret));
     } else {
-      lib::ObMutex &mutex = init_node_mutex_[table_id % INIT_NODE_MUTEX_NUM];
+      lib::ObMutex &mutex = init_node_mutex_[table_id % INIT_NODE_MUTEX_NUM].mutex_;
       if (OB_FAIL(mutex.lock())) {
         LOG_WARN("failed to get lock", K(ret));
       } else {

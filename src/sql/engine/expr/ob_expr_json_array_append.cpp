@@ -96,7 +96,6 @@ int ObExprJsonArrayAppend::eval_json_array_append(const ObExpr &expr, ObEvalCtx 
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
   uint64_t tenant_id = ObMultiModeExprHelper::get_tenant_id(ctx.exec_ctx_.get_my_session());
   MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator(), expr.type_, tenant_id, ret);
-  lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id, "JSONModule"));
   ObIJsonBase *j_base = NULL;
   bool is_null = false;
   ObJsonSeekResult hit;
@@ -118,6 +117,7 @@ int ObExprJsonArrayAppend::eval_json_array_append(const ObExpr &expr, ObEvalCtx 
 
   for (int32 i = 1; OB_SUCC(ret) && i < expr.arg_cnt_ && !is_null; i += 2) {
     ObExpr *arg = expr.args_[i];
+    bool is_const = arg->is_const_expr();
     ObDatum *json_datum = NULL;
     hit.reset();
     if (OB_FAIL(temp_allocator.eval_arg(expr.args_[i], ctx, json_datum))) {
@@ -129,7 +129,7 @@ int ObExprJsonArrayAppend::eval_json_array_append(const ObExpr &expr, ObEvalCtx 
       ObJsonPath *j_path = NULL;
       if (OB_FAIL(ObJsonExprHelper::get_json_or_str_data(arg, ctx, temp_allocator, j_path_text, is_null))) {
         LOG_WARN("fail to get real data.", K(ret), K(j_path_text));
-      } else if (OB_FAIL(ObJsonExprHelper::find_and_add_cache(path_cache, j_path, j_path_text, i, false))) {
+      } else if (OB_FAIL(ObJsonExprHelper::find_and_add_cache(temp_allocator, path_cache, j_path, j_path_text, i, false, is_const))) {
         LOG_WARN("failed: parse text to path.", K(j_path_text), K(ret));
       } else if (OB_FAIL(j_base->seek(*j_path, j_path->path_node_cnt(), true, true, hit))) {
         LOG_WARN("failed: json seek failed", K(j_path_text), K(ret));

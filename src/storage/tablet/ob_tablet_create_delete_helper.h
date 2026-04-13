@@ -53,7 +53,8 @@ public:
   static int get_tablet(
       const ObTabletMapKey &key,
       ObTabletHandle &handle,
-      const int64_t timeout_us = ObTabletCommon::DEFAULT_GET_TABLET_DURATION_US);
+      const int64_t timeout_us = ObTabletCommon::DEFAULT_GET_TABLET_DURATION_US,
+      const WashTabletPriority priority = WashTabletPriority::WTP_HIGH);
 
   // snapshot version is used for multi source data reading,
   // tablet's multi source data will infect its visibility.
@@ -171,6 +172,18 @@ public:
       const common::ObTabletID &tablet_id,
       const int64_t snapshot_version,
       ObTableHandleV2 &table_handle);
+  static int create_shared_empty_sstable(
+      common::ObArenaAllocator &allocator,
+      const ObStorageSchema &storage_schema,
+      const common::ObTabletID &tablet_id,
+      const int64_t snapshot_version,
+      ObTableHandleV2 &table_handle);
+  static int create_shared_empty_co_sstable(
+      common::ObArenaAllocator &allocator,
+      const ObStorageSchema &storage_schema,
+      const common::ObTabletID &tablet_id,
+      const int64_t snapshot_version,
+      ObTableHandleV2 &table_handle);
 
   template <typename T = blocksstable::ObSSTable>
   static int create_sstable(
@@ -192,6 +205,29 @@ public:
              const char *buf,
              const int64_t len,
              const transaction::ObMulSourceDataNotifyArg &notify_arg);
+
+  static int update_empty_mds_tablet_id_array_if_need(
+      const ObTablet &tablet,
+      common::ObIArray<common::ObTabletID> &empty_mds_tablet_id_array);
+  static int rollback_is_written(
+      const share::ObLSID &ls_id,
+      const common::ObIArray<common::ObTabletID> &empty_mds_tablet_id_array);
+
+private:
+  static int inner_create_empty_sstable(
+      common::ObArenaAllocator &allocator,
+      const ObStorageSchema &storage_schema,
+      const common::ObTabletID &tablet_id,
+      const int64_t snapshot_version,
+      const bool is_shared,
+      ObTableHandleV2 &table_handle);
+  static int inner_create_empty_co_sstable(
+      common::ObArenaAllocator &allocator,
+      const ObStorageSchema &storage_schema,
+      const common::ObTabletID &tablet_id,
+      const int64_t snapshot_version,
+      const bool is_shared,
+      ObTableHandleV2 &table_handle);
 
 private:
   class ReadMdsFunctor
@@ -232,7 +268,7 @@ int ObTabletCreateDeleteHelper::process_for_old_mds(
         if (notify_arg.for_replay_) {
           ret = OB_EAGAIN;
         } else {
-          usleep(100 * 1000);
+          ob_usleep(100 * 1000);
         }
       }
     } while (OB_FAIL(ret) && !notify_arg.for_replay_);
@@ -257,7 +293,7 @@ int ObTabletCreateDeleteHelper::process_for_old_mds(
         do {
           if (OB_FAIL(Helper::register_process(arg, mds_ctx))) {
             TRANS_LOG(ERROR, "fail to register_process, retry", K(ret), K(arg), K(notify_arg));
-            usleep(100 * 1000);
+            ob_usleep(100 * 1000);
           }
         } while (OB_FAIL(ret));
       }

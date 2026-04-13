@@ -18,6 +18,7 @@
 #include "ob_log_exchange.h"
 #include "ob_log_group_by.h"
 #include "ob_log_distinct.h"
+#include "ob_log_insert.h"
 #include "ob_log_sort.h"
 #include "ob_log_subplan_scan.h"
 #include "ob_log_window_function.h"
@@ -26,7 +27,9 @@
 #include "ob_log_monitoring_dump.h"
 #include "ob_log_subplan_filter.h"
 #include "ob_log_join_filter.h"
+#include "sql/optimizer/optimizer_plan_rewriter/ob_join_filter_pushdown_rewriter.h"
 #include "ob_log_temp_table_access.h"
+#include "ob_log_rescan.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_log_merge.h"
 #include "sql/optimizer/ob_del_upd_log_plan.h"
@@ -143,7 +146,7 @@ int ObExchangeInfo::append_hash_dist_expr(const common::ObIArray<ObRawExpr *> &e
   return ret;
 }
 
-int ObExchangeInfo::assign(ObExchangeInfo &other)
+int ObExchangeInfo::assign(const ObExchangeInfo &other)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(sort_keys_.assign(other.sort_keys_))) {
@@ -160,11 +163,14 @@ int ObExchangeInfo::assign(ObExchangeInfo &other)
     LOG_WARN("failed to assign exprs", K(ret));
   } else if (OB_FAIL(weak_sharding_.assign(other.weak_sharding_))) {
     LOG_WARN("failed to assign weak sharding", K(ret));
+  } else if (OB_FAIL(wf_hybrid_pby_exprs_cnt_array_.assign(other.wf_hybrid_pby_exprs_cnt_array_))) {
+    LOG_WARN("failed to assign hybrid phy exprs cnt array", K(ret));
   } else if (OB_FAIL(repart_all_tablet_ids_.assign(other.repart_all_tablet_ids_))) {
     LOG_WARN("failed to assign partition ids", K(ret));
   } else if (OB_FAIL(server_list_.assign(other.server_list_))) {
     LOG_WARN("failed to assign server list", K(ret));
   } else {
+    hidden_pk_expr_ = other.hidden_pk_expr_;
     is_remote_ = other.is_remote_;
     is_task_order_ = other.is_task_order_;
     is_merge_sort_ = other.is_merge_sort_;
@@ -178,9 +184,17 @@ int ObExchangeInfo::assign(ObExchangeInfo &other)
     dist_method_ = other.dist_method_;
     unmatch_row_dist_method_ = other.unmatch_row_dist_method_;
     null_row_dist_method_ = other.null_row_dist_method_;
+    slave_mapping_type_ = other.slave_mapping_type_;
     strong_sharding_ = other.strong_sharding_;
+    need_null_aware_shuffle_ = other.need_null_aware_shuffle_;
+    is_rollup_hybrid_ = other.is_rollup_hybrid_;
+    is_wf_hybrid_ = other.is_wf_hybrid_;
+    wf_hybrid_aggr_status_expr_ = other.wf_hybrid_aggr_status_expr_;
+    may_add_interval_part_ = other.may_add_interval_part_;
+    sample_type_ = other.sample_type_;
     parallel_ = other.parallel_;
     server_cnt_ = other.server_cnt_;
+    use_scatter_channel_for_pkey_hash_ = other.use_scatter_channel_for_pkey_hash_;
   }
   return ret;
 }
@@ -365,14 +379,21 @@ ObAllocExprContext::~ObAllocExprContext()
 }
 
 ObLogicalOperator::ObLogicalOperator(ObLogPlan &plan)
-  : child_(),
+  : child_(plan.get_allocator()),
+    equal_param_constraints_(plan.get_allocator()),
+    const_param_constraints_(plan.get_allocator()),
+    expr_constraints_(plan.get_allocator()),
     type_(LOG_OP_INVALID),
     my_plan_(&plan),
-    startup_exprs_(),
-    output_const_exprs_(),
+    output_exprs_(plan.get_allocator()),
+    filter_exprs_(plan.get_allocator()),
+    pushdown_filter_exprs_(plan.get_allocator()),
+    startup_exprs_(plan.get_allocator()),
+    output_const_exprs_(plan.get_allocator()),
     output_equal_sets_(NULL),
     fd_item_set_(NULL),
     table_set_(NULL),
+    ambient_card_(plan.get_allocator()),
     id_(OB_INVALID_ID),
     branch_id_(OB_INVALID_ID),
     op_id_(OB_INVALID_ID),
@@ -383,6 +404,10 @@ ObLogicalOperator::ObLogicalOperator(ObLogPlan &plan)
     card_(0.0),
     width_(0.0),
     traverse_ctx_(NULL),
+    strict_pwj_constraint_(plan.get_allocator()),
+    non_strict_pwj_constraint_(plan.get_allocator()),
+    location_constraint_(plan.get_allocator()),
+    multi_part_location_constraint_(plan.get_allocator()),
     exchange_allocated_(false),
     phy_plan_type_(ObPhyPlanType::OB_PHY_PLAN_UNINITIALIZED),
     location_type_(ObPhyPlanType::OB_PHY_PLAN_UNINITIALIZED),
@@ -395,13 +420,13 @@ ObLogicalOperator::ObLogicalOperator(ObLogPlan &plan)
     contain_das_op_(false),
     contain_match_all_fake_cte_(false),
     strong_sharding_(NULL),
-    weak_sharding_(),
+    weak_sharding_(plan.get_allocator()),
     is_pipelined_plan_(false),
     is_nl_style_pipelined_plan_(false),
     is_at_most_one_row_(false),
     is_local_order_(false),
     is_range_order_(false),
-    op_ordering_(),
+    op_ordering_(plan.get_allocator()),
     empty_expr_sets_(plan.get_empty_expr_sets()),
     empty_fd_item_set_(plan.get_empty_fd_item_set()),
     empty_table_set_(plan.get_empty_table_set()),
@@ -410,8 +435,9 @@ ObLogicalOperator::ObLogicalOperator(ObLogPlan &plan)
     op_parallel_rule_(OpParallelRule::OP_DOP_RULE_MAX),
     available_parallel_(ObGlobalHint::DEFAULT_PARALLEL),
     server_cnt_(1),
+    server_list_(plan.get_allocator()),
     need_late_materialization_(false),
-    op_exprs_(),
+    op_exprs_(plan.get_allocator()),
     inherit_sharding_index_(-1),
     need_osg_merge_(false),
     max_px_thread_branch_(OB_INVALID_INDEX),
@@ -1507,7 +1533,6 @@ int ObLogicalOperator::do_pre_traverse_operation(const TraverseOp &op, void *ctx
       break;
     }
     case ALLOC_GI: {
-      //do nothing
       AllocGIContext *alloc_gi_ctx = static_cast<AllocGIContext *>(ctx);
       if (OB_ISNULL(alloc_gi_ctx)) {
         ret = OB_ERR_UNEXPECTED;
@@ -1518,8 +1543,9 @@ int ObLogicalOperator::do_pre_traverse_operation(const TraverseOp &op, void *ctx
         }
         if (OB_FAIL(allocate_granule_pre(*alloc_gi_ctx))) {
           LOG_WARN("allocate granule pre failed", K(ret));
-        } else if (alloc_gi_ctx->alloc_gi_ && OB_FAIL(allocate_granule_nodes_above(*alloc_gi_ctx))) {
-          LOG_WARN("allocate granule iterator failed", K(ret));
+        } else if (OB_UNLIKELY(alloc_gi_ctx->alloc_gi_)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("should not allocate granule iterator after allocate granule pre", K(ret));
         }
       }
       break;
@@ -1552,6 +1578,12 @@ int ObLogicalOperator::do_pre_traverse_operation(const TraverseOp &op, void *ctx
       break;
     }
     case RUNTIME_FILTER: {
+      AllocBloomFilterContext *alloc_bf_ctx = static_cast<AllocBloomFilterContext *>(ctx);
+      CK( OB_NOT_NULL(alloc_bf_ctx));
+      OC( (check_in_px_scope_pre)(*alloc_bf_ctx));
+      break;
+    }
+    case RUNTIME_FILTER_PRUNING: {
       break;
     }
     case PROJECT_PRUNING: {
@@ -1660,7 +1692,7 @@ int ObLogicalOperator::do_post_traverse_operation(const TraverseOp &op, void *ct
     	      LOG_WARN("failed to allocate granule post", K(ret));
     	    } else if (alloc_gi_ctx->alloc_gi_ &&
     	               OB_FAIL(allocate_granule_nodes_above(*alloc_gi_ctx))) {
-    	      LOG_WARN("failed to allcoate granule nodes", K(ret));
+	      LOG_WARN("failed to allocate granule nodes", K(ret));
     	    }
     	  }
     		break;
@@ -1679,12 +1711,20 @@ int ObLogicalOperator::do_post_traverse_operation(const TraverseOp &op, void *ct
         AllocBloomFilterContext *alloc_bf_ctx = static_cast<AllocBloomFilterContext *>(ctx);
         CK( OB_NOT_NULL(alloc_bf_ctx));
         OC( (allocate_runtime_filter_for_hash_join)(*alloc_bf_ctx));
+        OC( (check_in_px_scope_post)(*alloc_bf_ctx));
         if (OB_FAIL(ret)) {
         } else if (LOG_SORT == get_type()
                    && get_plan()->get_optimizer_context().enable_topn_runtime_filter()
                    && OB_FAIL(static_cast<ObLogSort *>(this)
                                   ->try_allocate_pushdown_topn_runtime_filter())) {
           LOG_WARN("failed to allocate topn runtime filter for sort");
+        }
+        break;
+      }
+      case RUNTIME_FILTER_PRUNING: {
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(prune_unpaired_join_filter_create())) {
+          LOG_WARN("failed to prune unpaired join filter create", K(ret));
         }
         break;
       }
@@ -1869,6 +1909,119 @@ int ObLogicalOperator::collecte_inseparable_exprs(ObAllocExprContext &ctx)
   return ret;
 }
 
+int ObLogicalOperator::collect_and_prune_left_child(ObLogicalOperator*& root, ObIArray<uint64_t> &to_prune)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(root)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else if (LOG_JOIN_FILTER == root->get_type()) {
+    // handle the current join filter node (root)
+    bool pruned = false;
+    ObLogJoinFilter *join_filter = static_cast<ObLogJoinFilter *>(root);
+    if (join_filter->is_partition_filter() && join_filter->is_create_filter()) {
+      // do a check
+      // if it is not paired, set it to false
+      // other wise, recursively do this to its children
+      if (join_filter->get_paired_join_filter() == NULL) {
+        // delete this node by setting parent and child
+        if (OB_ISNULL(join_filter->get_parent()) || OB_ISNULL(join_filter->get_child(first_child))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected null", K(ret));
+        } else {
+          if (OB_FAIL(to_prune.push_back(join_filter->get_filter_id()))) {
+            LOG_WARN("failed to push back filter id", K(ret));
+          }
+          join_filter->get_parent()->set_child(first_child, join_filter->get_child(first_child));
+          join_filter->get_child(first_child)->set_parent(join_filter->get_parent());
+          root = join_filter->get_child(first_child);
+          pruned = true;
+        }
+      }
+    }
+    // recursively call collect to its children
+    if (!pruned && root->get_num_of_child() > 0) {
+      ObLogicalOperator *child = NULL;
+      if (OB_ISNULL(child = static_cast<ObLogicalOperator*>(root->get_child(first_child)))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null", K(ret));
+      } else if (OB_FAIL(SMART_CALL(collect_and_prune_left_child(child, to_prune)))) {
+        LOG_WARN("failed to collect and prune left child", K(ret));
+      } else {
+        root->set_child(first_child, child);
+        child->set_parent(root);
+      }
+    } else if (pruned) {
+      if (OB_FAIL(SMART_CALL(collect_and_prune_left_child(root, to_prune)))) {
+        LOG_WARN("failed to collect and prune left child", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObLogicalOperator::prune_unpaired_join_filter_create()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(get_plan())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else {
+    // for each join node. if it has partition join info
+    // search left for log_join_filter node
+    // if it is not paired, delete this node by setting parent and child
+    // other wise, recursively do this to its children
+    if (LOG_JOIN == get_type()) {
+      ObLogJoin *join = static_cast<ObLogJoin *>(this);
+      bool need_check = false;
+      if (join->get_join_filter_infos().count() > 0) {
+        for (int i = 0; i < join->get_join_filter_infos().count(); ++i) {
+          const JoinFilterInfo* info = join->get_join_filter_infos().at(i);
+          if (OB_ISNULL(info)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("join filter info is null", K(ret));
+          } else if (info->need_partition_join_filter_) {
+            // check and remove join filter create
+            need_check = true;
+            break;
+          }
+        }
+        if (need_check) {
+          // collect and prune left child
+          ObSEArray<uint64_t, 16> to_prune;
+          ObLogicalOperator *left_child = join->get_child(first_child);
+          if (OB_FAIL(collect_and_prune_left_child(left_child, to_prune))) {
+            LOG_WARN("failed to collect and prune left child", K(ret));
+          } else {
+            // set children
+            join->set_child(first_child, left_child);
+            left_child->set_parent(join);
+            // for each one in to prune
+            // disable partition join filter in join
+            for (int i = 0; i < to_prune.count(); ++i) {
+              for (int j = 0; j < join->get_join_filter_infos().count(); ++j) {
+                JoinFilterInfo *info = join->get_join_filter_infos().at(j);
+                if (OB_ISNULL(info)) {
+                  ret = OB_ERR_UNEXPECTED;
+                  LOG_WARN("join filter info is null", K(ret));
+                } else if (info->need_partition_join_filter_ && info->filter_id_ == to_prune.at(i)) {
+                  info->need_partition_join_filter_ = false;
+                  LOG_DEBUG("partition join filter got ignored", K(info->filter_id_));
+                  OPT_TRACE("partition join filter got ignored with rtf_id=", info->filter_id_);
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+
+  }
+  return ret;
+}
+
 int ObLogicalOperator::allocate_expr_pre(ObAllocExprContext &ctx)
 {
   int ret = OB_SUCCESS;
@@ -1899,7 +2052,8 @@ int ObLogicalOperator::get_op_exprs(ObIArray<ObRawExpr*> &all_exprs)
     LOG_WARN("failed to append filter exprs", K(ret));
   } else if (OB_FAIL(append_array_no_dup(all_exprs, get_startup_exprs()))) {
     LOG_WARN("failed to get start up exprs", K(ret));
-  } else if (is_plan_root() && OB_FAIL(append_array_no_dup(all_exprs, get_output_exprs()))) {
+  } else if ((is_plan_root() || (OB_NOT_NULL(get_parent()) && get_parent()->is_plan_root() && log_op_def::LOG_RESCAN == get_parent()->get_type()))
+              && OB_FAIL(append_array_no_dup(all_exprs, get_output_exprs()))) {
     LOG_WARN("failed to get output exprs", K(ret));
   } else { /*do noting*/ }
   return ret;
@@ -2071,7 +2225,7 @@ int ObLogicalOperator::add_expr_to_ctx(ObAllocExprContext &ctx,
     } else {
       ExprProducer expr_producer(raw_expr, consumer_id, real_producer_id);
       if (OB_FAIL(ctx.add(expr_producer))) {
-        LOG_WARN("failed to push balck raw_expr", K(ret));
+        LOG_WARN("failed to push back raw_expr", K(ret));
       } else {
         LOG_TRACE("succeed to add shared exprs", KP(raw_expr), K(producer_id), K(consumer_id),
                                                  K(expr_producer), K(get_name()));
@@ -2267,8 +2421,7 @@ int ObLogicalOperator::check_need_pushdown_expr(const uint64_t producer_id,
     // do nothing
   } else if (child_.empty()) {
     // do nothing
-  } else if (ObLogOpType::LOG_GROUP_BY == get_type() ||
-             ObLogOpType::LOG_SORT == get_type() ||
+  } else if (ObLogOpType::LOG_SORT == get_type() ||
              ObLogOpType::LOG_JOIN == get_type() ||
              ObLogOpType::LOG_DISTINCT == get_type() ||
              ObLogOpType::LOG_UPDATE == get_type() ||
@@ -2280,6 +2433,12 @@ int ObLogicalOperator::check_need_pushdown_expr(const uint64_t producer_id,
              ObLogOpType::LOG_COUNT == get_type() ||
              ObLogOpType::LOG_MERGE == get_type()) {
     need_pushdown = true;
+  } else if (ObLogOpType::LOG_GROUP_BY == get_type()) {
+    /**
+    * Select expr should not be calculated before scalar group by.
+    * The result might be different if the input is empty.
+    */
+    need_pushdown = static_cast<ObLogGroupBy *>(this)->get_algo() != SCALAR_AGGREGATE;
   }
   return ret;
 }
@@ -2298,6 +2457,9 @@ int ObLogicalOperator::check_can_pushdown_expr(const ObRawExpr *expr,
     // do nothing
   } else if (child_.count() > 1 && expr->has_flag(CNT_OP_PSEUDO_COLUMN)) {
     // do nothing, I have no idea to pushdown the op pseudo column into which child op
+  } else if (child_.count() > 1 && expr->has_flag(CNT_AGG)) {
+    // do nothing, I have no idea to pushdown the aggr into which child op
+    // for example t1.c1 * count(*)
   } else if (OB_FAIL(contain_my_fixed_expr(expr, is_contain))) {
     LOG_WARN("failed to check contain my fixed expr", K(ret));
   } else if (!is_contain) {
@@ -2394,6 +2556,15 @@ int ObLogicalOperator::allocate_expr_post(ObAllocExprContext &ctx)
     } else if (OB_FAIL(child->get_output_exprs().assign(parent->get_output_exprs()))) {
       LOG_WARN("failed to push back exprs", K(ret));
     } else { /*do nothing*/ }
+  } else if (log_op_def::LOG_RESCAN == type_) {
+    if (OB_ISNULL(child = get_child(ObLogicalOperator::first_child))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null", K(child), K(ret));
+    // } else if (OB_FAIL(output_exprs_.assign(parent->get_output_exprs()))) {
+    //   LOG_WARN("failed to assign output exprs", K(ret));
+    } else if (OB_FAIL(child->get_output_exprs().assign(get_output_exprs()))) {
+      LOG_WARN("failed to push back exprs", K(ret));
+    } else { /*do nothing*/ }
   } else {
     ObIArray<ExprProducer> &producers = ctx.expr_producers_;
 
@@ -2420,7 +2591,9 @@ int ObLogicalOperator::allocate_expr_post(ObAllocExprContext &ctx)
         } else { /*do nothing*/ }
 
         if (OB_SUCC(ret) && OB_INVALID_ID != producers.at(i).producer_branch_ && producers.at(i).consumer_id_ > id_) {
-          if (!is_plan_root() && (is_child_output_exprs(expr) || producers.at(i).producer_id_ == id_)) {
+          if (!is_plan_root()
+              && !(OB_NOT_NULL(get_parent()) && LOG_RESCAN == get_parent()->get_type() && get_parent()->is_plan_root())
+              && (is_child_output_exprs(expr) || producers.at(i).producer_id_ == id_)) {
             if (OB_FAIL(add_var_to_array_no_dup(output_exprs_, expr))) {
               LOG_WARN("failed to add expr to output", K(ret));
             } else {
@@ -2784,9 +2957,23 @@ int ObLogicalOperator::gen_location_constraint(void *ctx)
             || log_op_def::LOG_UPDATE == get_type()) {
           ObLogDelUpd *dml_log_op = static_cast<ObLogDelUpd *>(this);
           if (dml_log_op->is_pdml()) {
-            LocationConstraint loc_cons;
             is_pdml = true;
-            if (OB_FAIL(get_tbl_loc_cons_for_pdml_index(loc_cons))) {
+            LocationConstraint loc_cons;
+            bool is_scan_use_das = false;
+            ObIArray<ObTablePartitionInfo *> & partition_infos =
+                get_plan()->get_optimizer_context().get_table_partition_info();
+            for (int64_t i = 0; i < partition_infos.count(); ++i) {
+              const ObTablePartitionInfo *cur_info = partition_infos.at(i);
+              if (OB_NOT_NULL(cur_info) &&
+                  cur_info->get_table_id() == dml_log_op->get_loc_table_id() &&
+                  cur_info->get_ref_table_id() == dml_log_op->get_index_tid()) {
+                is_scan_use_das = cur_info->get_table_location().use_das();
+                break;
+              }
+            }
+            if (is_scan_use_das) {
+              // do nothing
+            } else if (OB_FAIL(get_tbl_loc_cons_for_pdml_index(loc_cons))) {
               LOG_WARN("failed to get table location constraint for pdml index",
                 K(ret), K(get_name()));
             } else if (OB_FAIL(loc_cons_ctx->base_table_constraints_.push_back(loc_cons))) {
@@ -3020,6 +3207,31 @@ int ObLogicalOperator::get_table_scan(ObLogicalOperator *&tsc, uint64_t table_id
   return ret;
 }
 
+int ObLogicalOperator::find_all_tsc_like_ops(ObIArray<ObLogicalOperator *> &tsc_ops, const ObLogicalOperator *root)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(root)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the log op is null", K(ret));
+  } else if (log_op_def::LOG_EXCHANGE != root->get_type()) {
+    for(int64_t i = 0; i < root->get_num_of_child(); i++) {
+      ObLogicalOperator *child = root->get_child(i);
+      if (OB_FAIL(find_all_tsc_like_ops(tsc_ops, child))) {
+        LOG_WARN("failed to find all tsc", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && log_op_def::LOG_TABLE_SCAN == root->get_type()) {
+    if (OB_FAIL(tsc_ops.push_back(const_cast<ObLogicalOperator *>(root)))) {
+      LOG_WARN("failed to push back tsc ops", K(ret));
+    }
+  } else if (OB_SUCC(ret) && log_op_def::LOG_TEMP_TABLE_ACCESS == root->get_type()) {
+    if (OB_FAIL(tsc_ops.push_back(const_cast<ObLogicalOperator *>(root)))) {
+      LOG_WARN("failed to push back tsc ops", K(ret));
+    }
+  }
+  return ret;
+}
 int ObLogicalOperator::find_all_tsc(ObIArray<ObLogicalOperator *> &tsc_ops,
                                     ObLogicalOperator *root)
 {
@@ -3389,16 +3601,11 @@ int ObLogicalOperator::px_estimate_size_factor_pre()
     }
   }
   if (LOG_GRANULE_ITERATOR == type_) {
-    bool partition_granule = false;
     ObLogGranuleIterator *log_gi = static_cast<ObLogGranuleIterator*>(this);
-    if (OB_FAIL(log_gi->is_partition_gi(partition_granule))) {
-      LOG_WARN("failed to judge partition gi", K(ret));
+    if (log_gi->is_partition_gi()) {
+      px_est_size_factor_.partition_granule_child_ = true;
     } else {
-      if (partition_granule) {
-        px_est_size_factor_.partition_granule_child_ = true;
-      } else {
-        px_est_size_factor_.block_granule_child_ = true;
-      }
+      px_est_size_factor_.block_granule_child_ = true;
     }
   }
   return ret;
@@ -3414,17 +3621,12 @@ int ObLogicalOperator::px_estimate_size_factor_post()
       px_est_size_factor_.single_partition_table_scan_ = true;
     }
   } else if (LOG_GRANULE_ITERATOR == type_) {
-    bool partition_granule = false;
     ObLogGranuleIterator *log_gi = static_cast<ObLogGranuleIterator*>(this);
     px_est_size_factor_.revert_leaf_factor();
-    if (OB_FAIL(log_gi->is_partition_gi(partition_granule))) {
-      LOG_WARN("failed to judge partition gi", K(ret));
+    if (log_gi->is_partition_gi()) {
+      px_est_size_factor_.partition_granule_parent_ = true;
     } else {
-      if (partition_granule) {
-        px_est_size_factor_.partition_granule_parent_ = true;
-      } else {
-        px_est_size_factor_.block_granule_parent_ = true;
-      }
+      px_est_size_factor_.block_granule_parent_ = true;
     }
   } else if (LOG_EXCHANGE == type_) {
     ObLogExchange *exchange = static_cast<ObLogExchange*>(this);
@@ -3605,6 +3807,7 @@ int ObLogicalOperator::project_pruning_pre()
   // delete exprs who appeared in current op's output_exprs
   // but not used by it's parent's output_exprs_
   if (NULL != parent_ && !is_plan_root() &&
+      LOG_RESCAN != parent_->type_ &&
       LOG_EXPR_VALUES != type_ &&
       !(LOG_EXCHANGE == type_ && static_cast<ObLogExchange*>(this)->get_is_remote()) &&
       LOG_VALUES_TABLE_ACCESS != type_) {
@@ -3659,8 +3862,7 @@ void ObLogicalOperator::do_project_pruning(ObIArray<ObRawExpr *> &exprs, PPDeps 
   int64_t j = 0;
   LOG_TRACE("start to do project pruning", K(type_), K(exprs), K(deps));
   for (i = 0, j = 0; i < exprs.count(); i++) {
-    if (deps.has_member(static_cast<int32_t>(i))
-        || T_ORA_ROWSCN == exprs.at(i)->get_expr_type()) {
+    if (deps.has_member(static_cast<int32_t>(i))) {
       exprs.at(j++) = exprs.at(i);
     } else {
       LOG_TRACE("project pruning remove expr", K(exprs.at(i)), K(*exprs.at(i)),
@@ -3732,12 +3934,28 @@ int ObLogicalOperator::adjust_plan_root_output_exprs()
     /*do nothing*/
   } else if (NULL == get_parent()) {
     bool need_pack = false;
-    if (OB_FAIL(check_stmt_can_be_packed(stmt, need_pack))) {
-      LOG_WARN("failed to check stmt can be pack", K(ret));
-    } else if (need_pack && OB_FAIL(build_and_put_pack_expr(output_exprs_))) {
-      LOG_WARN("failed to add pack expr to context", K(ret));
+    if (LOG_RESCAN == type_) {
+      ObLogicalOperator *child = NULL;
+      if (OB_ISNULL(child = get_child(first_child))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null", K(ret));
+      } else if (OB_FAIL(child->check_stmt_can_be_packed(stmt, need_pack))) {
+        LOG_WARN("failed to check stmt can be pack", K(ret));
+      } else if (need_pack && OB_FAIL(child->build_and_put_pack_expr(child->output_exprs_))) {
+        LOG_WARN("failed to add pack expr to context", K(ret));
+      } else if (OB_FAIL(output_exprs_.assign(child->output_exprs_))) {
+        LOG_WARN("failed to re-assign rescan op's output_exprs_");
+      } else {
+        LOG_TRACE("succeed to adjust plan root output exprs", K(child->output_exprs_));
+      }
+    } else {
+      if (OB_FAIL(check_stmt_can_be_packed(stmt, need_pack))) {
+        LOG_WARN("failed to check stmt can be pack", K(ret));
+      } else if (need_pack && OB_FAIL(build_and_put_pack_expr(output_exprs_))) {
+        LOG_WARN("failed to add pack expr to context", K(ret));
+      }
+      LOG_TRACE("succeed to adjust plan root output exprs", K(output_exprs_));
     }
-    LOG_TRACE("succeed to adjust plan root output exprs", K(output_exprs_));
   }
   return ret;
 }
@@ -3762,7 +3980,6 @@ int ObLogicalOperator::set_plan_root_output_exprs()
       LOG_WARN("failed to append returning exprs into output", K(ret));
     }
   } else { /*do nothing*/ }
-
   return ret;
 }
 
@@ -3860,9 +4077,9 @@ int ObLogicalOperator::check_sharding_compatible_with_reduce_expr(
   ObSEArray<ObRawExpr*, 4> part_exprs;
   ObSEArray<ObRawExpr*, 4> part_column_exprs;
   compatible = false;
-  bool is_groupby_with_hash_rollup =
+  bool is_groupby_from_expansion =
     dynamic_cast<const ObLogGroupBy *>(this) != nullptr
-    && static_cast<const ObLogGroupBy *>(this)->is_hash_rollup_groupby();
+    && static_cast<const ObLogGroupBy *>(this)->is_gby_from_expansion();
   if (NULL == strong_sharding_) {
     /*do nothing*/
   } else if (OB_FAIL(strong_sharding_->get_all_partition_keys(part_exprs, true))) {
@@ -3877,7 +4094,7 @@ int ObLogicalOperator::check_sharding_compatible_with_reduce_expr(
     /*do nothing*/
   } else if (OB_FAIL(ObRawExprUtils::extract_column_exprs(part_exprs,
                                                           part_column_exprs,
-                                                          is_groupby_with_hash_rollup))) {
+                                                          is_groupby_from_expansion))) {
     LOG_WARN("failed to extract column exprs", K(ret));
   } else if (ObOptimizerUtil::subset_exprs(part_column_exprs,
                                            reduce_exprs,
@@ -3934,6 +4151,8 @@ int ObLogicalOperator::explain_print_partitions(ObTablePartitionInfo &table_part
   ObOptimizerContext *opt_ctx = NULL;
   const share::schema::ObTableSchema *table_schema = NULL;
   const ObDMLStmt *stmt = NULL;
+  bool is_lake_table = table_partition_info.is_lake_table_partition_info();
+  int64_t file_count = -1;
   if (OB_ISNULL(get_plan())
       || OB_ISNULL(opt_ctx = &get_plan()->get_optimizer_context())
       || OB_ISNULL(schema_guard = opt_ctx->get_sql_schema_guard())
@@ -3944,8 +4163,11 @@ int ObLogicalOperator::explain_print_partitions(ObTablePartitionInfo &table_part
     // do nothing
   } else if (OB_FAIL(schema_guard->get_table_schema(ref_table_id, table_schema))) {
     LOG_WARN("fail to get index schema", K(ret), K(ref_table_id), K(table_id));
+  } else if (is_lake_table) {
+    file_count = 0;
   }
   int64_t N = partitions.count();
+  ObArray<int64_t> table_part_ids;
   for (int64_t i = 0; OB_SUCC(ret) && i < N; i++) {
     ObLogicalOperator::PartInfo part_info;
     const ObOptTabletLoc &part_loc = partitions.at(i).get_partition_location();
@@ -3956,6 +4178,10 @@ int ObLogicalOperator::explain_print_partitions(ObTablePartitionInfo &table_part
         part_info.part_id_ = part_loc.get_partition_id();
         OZ(part_infos.push_back(part_info));
       }
+    } else if (is_lake_table) {
+      part_info.part_id_ = part_loc.get_partition_id();
+      file_count += partitions.at(i).get_opt_lake_table_files().count();
+      OZ(part_infos.push_back(part_info));
     } else if (!table_schema->is_partitioned_table()) {
       part_info.part_id_ = 0;
       OZ(part_infos.push_back(part_info));
@@ -3978,23 +4204,33 @@ int ObLogicalOperator::explain_print_partitions(ObTablePartitionInfo &table_part
           }
         }
         OZ(part_infos.push_back(part_info));
+        LOG_TRACE("explain print partition", K(tablet_id), K(part_info), K(ref_table_id));
       } else {
-        OZ(table_schema->get_part_idx_by_tablet(tablet_id, part_info.part_id_, part_info.subpart_id_));
-        OZ(part_infos.push_back(part_info));
+        OZ(table_part_ids.push_back(part_loc.get_partition_id()));
       }
-      // if (OB_FAIL(ret) || part_info.part_id_ == OB_INVALID_INDEX) {
-      //   //do nothing
-      // } else if (!table_schema->is_external_table() || common::ObTabletID::INVALID_TABLET_ID == tablet_id.id()) {
-      //   //do nothing
-      // } else {
-      // }
-      LOG_TRACE("explain print partition", K(tablet_id), K(part_info), K(ref_table_id));
+    }
+  }
+  if (OB_SUCC(ret) && table_part_ids.count() > 0) {
+    ObArray<int64_t> part_idx;
+    ObArray<int64_t> subpart_idx;
+    if (OB_FAIL(table_schema->get_part_idx_by_part_id(table_part_ids, part_idx, subpart_idx))) {
+      LOG_WARN("failed to get part idx", K(ret));
+    } else if (OB_UNLIKELY(part_idx.count() != subpart_idx.count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected part idx", K(part_idx), K(subpart_idx));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < part_idx.count(); ++i) {
+      ObLogicalOperator::PartInfo part_info;
+      part_info.part_id_ = part_idx.at(i);
+      part_info.subpart_id_ = subpart_idx.at(i);
+      OZ(part_infos.push_back(part_info));
+      LOG_TRACE("explain print partition", K(part_info), K(ref_table_id));
     }
   }
   if (OB_SUCC(ret)) {
     Compare cmp;
     lib::ob_sort(part_infos.begin(), part_infos.end(), CopyableComparer(cmp));
-    if (OB_FAIL(ObLogicalOperator::explain_print_partitions(part_infos, two_level,
+    if (OB_FAIL(ObLogicalOperator::explain_print_partitions(part_infos, two_level, file_count,
                                                             buf, buf_len, pos))) {
       LOG_WARN("Failed to print partitions");
     } else { }//do nothing
@@ -4005,6 +4241,7 @@ int ObLogicalOperator::explain_print_partitions(ObTablePartitionInfo &table_part
 int ObLogicalOperator::explain_print_partitions(
     const ObIArray<ObLogicalOperator::PartInfo> &part_infos,
     const bool two_level,
+    int64_t file_count,
     char *buf,
     int64_t &buf_len,
     int64_t &pos)
@@ -4086,6 +4323,11 @@ int ObLogicalOperator::explain_print_partitions(
   }
   if (OB_SUCC(ret)) {
     ret = BUF_PRINTF(")");
+  }
+  if (OB_SUCC(ret) && file_count >= 0) {
+    if (OB_FAIL(BUF_PRINTF(", file_count=%lu", file_count))) {
+      LOG_WARN("Failed to printf file count");
+    }
   }
   return ret;
 }
@@ -4310,7 +4552,7 @@ int ObLogicalOperator::allocate_granule_nodes_above(AllocGIContext &ctx)
   } else if (has_temp_table_access || get_contains_fake_cte()) {
     // do not allocate granule nodes above temp table access now
     LOG_TRACE("do not allocate granule iterator due to temp table", K(get_name()));
-  } else if (LOG_TABLE_SCAN != get_type()
+  } else if (OB_UNLIKELY(LOG_TABLE_SCAN != get_type()
              && LOG_JOIN != get_type()
              && LOG_SET != get_type()
              && LOG_GROUP_BY != get_type()
@@ -4321,15 +4563,15 @@ int ObLogicalOperator::allocate_granule_nodes_above(AllocGIContext &ctx)
              && LOG_DELETE != get_type()
              && LOG_INSERT != get_type()
              && LOG_MERGE != get_type()
-             && LOG_FOR_UPD != get_type()) {
+             && LOG_FOR_UPD != get_type())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("Only special op can allocate a granule iterator", K(get_type()));
+    LOG_WARN("only special op can allocate a granule iterator", K(ret), K(get_type()));
   } else {
     ObLogicalOperator *log_op = NULL;
     ObLogOperatorFactory &factory = get_plan()->get_log_op_factory();
     if (OB_ISNULL(log_op = factory.allocate(*(get_plan()), LOG_GRANULE_ITERATOR))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_ERROR("failed to allocate exchange nodes", K(log_op));
+      LOG_ERROR("failed to allocate granule iterator node", K(log_op));
     } else {
       ObLogGranuleIterator *gi_op = static_cast<ObLogGranuleIterator *>(log_op);
       if (NULL != get_parent()) {
@@ -4367,23 +4609,12 @@ int ObLogicalOperator::allocate_granule_nodes_above(AllocGIContext &ctx)
         gi_op->add_flag(GI_AFFINITIZE);
         gi_op->add_flag(GI_PARTITION_WISE);
       }
-      if (LOG_TABLE_SCAN == get_type()) {
-        if (static_cast<ObLogTableScan*>(this)->is_text_retrieval_scan() || static_cast<ObLogTableScan*>(this)->is_vec_idx_scan_post_filter()) {
-          gi_op->add_flag(GI_FORCE_PARTITION_GRANULE);
-        }
-        if (static_cast<ObLogTableScan *>(this)->get_join_filter_info().is_inited_) {
-          ObLogTableScan *table_scan = static_cast<ObLogTableScan*>(this);
-          ObOpPseudoColumnRawExpr *tablet_id_expr = NULL;
-          if (OB_FAIL(generate_pseudo_partition_id_expr(tablet_id_expr))) {
-            LOG_WARN("fail alloc partition id expr", K(ret));
-          } else {
-            gi_op->set_tablet_id_expr(tablet_id_expr);
-            gi_op->set_join_filter_info(table_scan->get_join_filter_info());
-            ObLogJoinFilter *jf_create_op = gi_op->get_join_filter_info().log_join_filter_create_op_;
-            jf_create_op->set_paired_join_filter(gi_op);
-            gi_op->add_flag(GI_USE_PARTITION_FILTER);
-          }
-        }
+
+      if (OB_FAIL(fill_in_part_join_filter_info(this, gi_op))) {
+        LOG_WARN("failed to fill in part join filter info", K(ret));
+      }
+      if (OB_FAIL(ret)) {
+        /* do nothing */
       } else if (LOG_GROUP_BY == get_type()) {
         if (static_cast<ObLogGroupBy*>(this)->force_partition_gi()) {
           gi_op->add_flag(GI_PARTITION_WISE);
@@ -4398,22 +4629,23 @@ int ObLogicalOperator::allocate_granule_nodes_above(AllocGIContext &ctx)
 
       if (OB_SUCC(ret) && LOG_TABLE_SCAN == get_type()
           && EXTERNAL_TABLE == static_cast<ObLogTableScan *>(this)->get_table_type()) {
-        if (ctx.force_partition()) {
+        if (OB_UNLIKELY(ctx.is_force_partition())) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("external table do not support partition GI", K(ret));
         } else {
           gi_op->set_used_by_external_table();
         }
-      }
-
-      if (OB_SUCC(ret)) {
-        if (OB_FAIL(gi_op->is_partition_gi(partition_granule))) {
-          LOG_WARN("failed judge partition granule", K(ret));
+        if (static_cast<ObLogTableScan *>(this)->get_lake_table_type() == share::ObLakeTableFormat::ICEBERG
+            || static_cast<ObLogTableScan *>(this)->get_lake_table_type() == share::ObLakeTableFormat::HIVE) {
+          gi_op->set_used_by_lake_table();
         }
       }
 
-      if (ctx.force_partition() || partition_granule) {
-        gi_op->add_flag(GI_FORCE_PARTITION_GRANULE);
+      if (OB_SUCC(ret)) {
+        partition_granule = gi_op->is_partition_gi();
+        if (ctx.is_force_partition() || partition_granule) {
+          gi_op->add_flag(GI_FORCE_PARTITION_GRANULE);
+        }
       }
 
       if (OB_SUCC(ret)) {
@@ -4440,6 +4672,14 @@ int ObLogicalOperator::allocate_granule_nodes_above(AllocGIContext &ctx)
           LOG_WARN("failed to set px rf info", K(ret));
         }
       }
+
+      if (OB_FAIL(ret)) {
+      } else if (LOG_TABLE_SCAN == get_type()
+                 && OB_FAIL(gi_op->check_adaptive_task_splitting(
+                        static_cast<ObLogTableScan *>(this)))) {
+        LOG_WARN("failed to check adaptive task splitting");
+      }
+
       LOG_TRACE("succ to allocate granule iterator nodes above operator", K(get_name()),
                 K(get_cost()), K(get_card()), K(ctx.is_in_pw_affinity_state()),
                 K(ctx.is_in_partition_wise_state()));
@@ -4450,6 +4690,7 @@ int ObLogicalOperator::allocate_granule_nodes_above(AllocGIContext &ctx)
 	 * if we forget reset this var, may get some wrong log plan.
 	 * */
   ctx.alloc_gi_ = false;
+  ctx.is_force_partition_ = false; // force partition is only relevant to one layer of GI, hence reset it together with alloc_gi_
   return ret;
 }
 
@@ -4511,6 +4752,7 @@ int ObLogicalOperator::allocate_gi_recursively(AllocGIContext &ctx)
       ctx.alloc_gi_ = true;
     } else {
       ctx.alloc_gi_ = false;
+      ctx.is_force_partition_ = false; // force partition is only relevant to one layer of GI, hence reset it together with alloc_gi_
     }
     if (OB_FAIL(allocate_granule_nodes_above(ctx))) {
       LOG_WARN("allocate gi above table scan failed", K(ret));
@@ -4619,7 +4861,9 @@ int ObLogicalOperator::allocate_startup_expr_post(int64_t child_idx)
 {
   int ret = OB_SUCCESS;
   ObLogicalOperator *child = get_child(child_idx);
-  if (OB_ISNULL(child)) {
+  if (LOG_RESCAN == get_type()) {
+    // do nothing
+  } else if (OB_ISNULL(child)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpect null child", K(ret));
   } else if (is_dml_operator() ||
@@ -4754,6 +4998,121 @@ void ObLogicalOperator::set_parent(ObLogicalOperator *parent)
              "before", parent_, "after", parent, K(lbt()));
   }
   parent_ = parent;
+}
+
+int ObLogicalOperator::is_top_rescan_allowed(bool &allowed)
+{
+  int ret = OB_SUCCESS;
+  ObLogPlan *plan = NULL;
+  bool is_deterministic = false;
+  const ObDMLStmt *stmt = NULL;
+  ObSQLSessionInfo *session_info = NULL;
+  ObLogicalOperator *root = NULL;
+  allowed = true;
+
+  // filter inner sqls
+  if (OB_ISNULL(plan = get_plan())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else if (OB_ISNULL(session_info = plan->get_optimizer_context().get_session_info())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("Unexpected null", K(ret));
+  } else if (session_info->is_inner()) {
+    allowed = false;
+    // filter statements except for select
+  } else if (OB_ISNULL(stmt = get_stmt())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else if (!plan->is_final_root_plan()
+             || plan->get_optimizer_context().has_var_assign()
+             || stmt->has_sequence()
+             || !stmt->is_select_stmt()
+             || stmt::T_NONE != stmt->get_query_ctx()->get_literal_stmt_type()) {
+    allowed = false;
+  } else if (OB_FAIL(reinterpret_cast<const ObSelectStmt *>(stmt)->is_query_deterministic(is_deterministic))) {
+    LOG_WARN("failed to check is_query_deterministic", K(ret));
+  } else if (!is_deterministic) {
+    allowed = false;
+    // filter according to the plan nodes
+  } else if (OB_ISNULL(root = plan->get_plan_root())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else if (log_op_def::LOG_RESCAN == root->get_type()
+             || (NULL != root->get_parent() && log_op_def::LOG_RESCAN == root->get_parent()->get_type())
+             || log_op_def::LOG_TEMP_TABLE_TRANSFORMATION == root->get_type()
+             || log_op_def::LOG_SELECT_INTO == root->get_type()) {
+    allowed = false;
+    // filter remote execution plan, rescan is not allowed on top of EXCHANGE IN REMOTE
+  } else if (log_op_def::LOG_EXCHANGE == root->get_type()) {
+    ObLogExchange *exchange_op = static_cast<ObLogExchange*>(root);
+    if (exchange_op->is_consumer() && exchange_op->get_is_remote()) {
+      allowed = false;
+    }
+  }
+  return ret;
+}
+
+int ObLogicalOperator::allocate_rescan_as_top(ObLogicalOperator *&top,
+                                              const uint64_t rescan_cnt)
+{
+  int ret = OB_SUCCESS;
+  // add rescan operator on the top of the tree
+  ObLogRescan *rescan_op = NULL;
+  ObLogPlan *plan = NULL;
+  if (OB_ISNULL(top)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else if (OB_ISNULL(plan = get_plan())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret));
+  } else if (OB_ISNULL(rescan_op = static_cast<ObLogRescan*>(plan->get_log_op_factory().allocate(*plan, LOG_RESCAN)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate material operator", K(ret));
+  } else {
+    rescan_op->set_rescan_cnt(rescan_cnt);
+
+    if (NULL != top->get_parent()) {
+      ObLogicalOperator *parent = top->get_parent();
+      rescan_op->set_parent(parent);
+      for (int i = 0; i < parent->child_.count(); i++) {
+        if (parent->child_.at(i) == top) {
+          parent->child_.at(i) = rescan_op;
+          break;
+        }
+      }
+    }
+    rescan_op->set_child(ObLogicalOperator::first_child, top);
+    top = rescan_op;
+
+    if (OB_FAIL(rescan_op->compute_property())) {
+      LOG_WARN("failed to compute property", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObLogicalOperator::allocate_rescan_node_above(uint64_t rescan_cnt)
+{
+  int ret = OB_SUCCESS;
+  if (is_plan_root()) {
+    // If current node is the root node, allocate a rescan node as new root
+    ObLogicalOperator* top = this;
+    if (OB_ISNULL(get_plan())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("Get unexpected null", K(ret), K(get_plan()));
+    } else if (OB_FAIL(allocate_rescan_as_top(top, rescan_cnt))) {
+      LOG_WARN("failed to allocate rescan as top", K(ret));
+    } else if (OB_FAIL(top->get_output_exprs().assign(output_exprs_))) {
+      LOG_WARN("failed to assign output exprs", K(ret));
+    } else {
+      set_parent(top);
+      get_plan()->set_plan_root(top);
+      set_is_plan_root(false);
+      top->mark_is_plan_root();
+    }
+  } else { /*do nothing*/ }
+
+  return ret;
 }
 
 int ObLogicalOperator::allocate_material_node_above()
@@ -5237,6 +5596,117 @@ int ObLogicalOperator::create_runtime_filter_info(ObLogicalOperator *op,
   return ret;
 }
 
+int ObLogicalOperator::find_pkey_exchange_out(ObLogicalOperator* root_op,
+                                                 ObLogExchange* &exchange_output_op,
+                                                 bool &found)
+{
+  int ret = OB_SUCCESS;
+  // do not use a simple plan visitor here
+  // use a recursive function to find the first exchange that is a pkey exchange below the root_op
+  if (OB_ISNULL(root_op)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpect null logical operator", K(ret));
+  } else {
+    // switch case plan type
+    switch (root_op->get_type()) {
+      case LOG_EXCHANGE: {
+        if (found) {
+          // do nothing
+        } else {
+          ObLogExchange *exchange = static_cast<ObLogExchange*>(root_op);
+          ObLogicalOperator *child = exchange->get_child(0);
+          if (OB_ISNULL(child)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpect null logical operator", K(ret));
+          } else if (child->get_type() == LOG_EXCHANGE &&
+                     static_cast<ObLogExchange*>(child)->get_calc_part_id_expr() != NULL) {
+            found = true;
+            exchange_output_op = static_cast<ObLogExchange*>(child);
+          } else {
+            found = true;
+            exchange_output_op = NULL;
+          }
+        }
+        break;
+      }
+      default: {
+        // smart call its children
+        // for all children. call recursively to find the pkey exchange out
+        // stop if any one found
+        for (int64_t i = 0; OB_SUCC(ret) && !found && i < root_op->get_num_of_child(); ++i) {
+          bool child_found = false;
+          ObLogicalOperator *child = root_op->get_child(i);
+          if (OB_FAIL(SMART_CALL(find_pkey_exchange_out(child, exchange_output_op, child_found)))) {
+            LOG_WARN("failed to find pkey exchange out", K(ret));
+          } else if (child_found) {
+            found = true;
+            break;
+          }
+        }
+        break;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObLogicalOperator::fill_in_part_join_filter_info(const ObLogicalOperator *cur, ObLogGranuleIterator *&gi_op)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(cur) || OB_ISNULL(gi_op)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpect null logical operator", K(ret));
+  } else {
+    // collect all scans below cur
+    // note that we chould get cte scan
+    ObSEArray<ObLogicalOperator *, 4> scans;
+    if (OB_FAIL(find_all_tsc_like_ops(scans, cur))) {
+      LOG_WARN("failed to find all tsc", K(ret));
+    } else if (scans.count() > 1) {
+      // for each of the scan node
+      // we set join_filter to false
+      ObPxBFStaticInfo empty_info = ObPxBFStaticInfo();
+      for (int64_t i = 0; OB_SUCC(ret) && i < scans.count(); ++i) {
+        ObLogicalOperator *scan = scans.at(i);
+        if (LOG_TABLE_SCAN == scan->get_type()) {
+          ObLogTableScan *tsc = static_cast<ObLogTableScan *>(scan);
+          if (tsc->get_join_filter_info().is_inited_) {
+            tsc->set_join_filter_info(empty_info);
+            tsc->set_part_join_filter_created(false);
+            LOG_DEBUG("there are multiple scans below GI, disable part join-filter", K(tsc->get_join_filter_info().filter_id_));
+          }
+        }
+      }
+    } else if (scans.count() == 1) {
+      // pair join create and gi op
+      ObLogicalOperator *scan = scans.at(0);
+      ObLogTableScan *tsc = NULL;
+      ObOpPseudoColumnRawExpr *tablet_id_expr = NULL;
+      if (LOG_TABLE_SCAN != scan->get_type()) {
+        // do nothing
+      } else if (OB_ISNULL(tsc = static_cast<ObLogTableScan *>(scan))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected scan node", K(ret));
+      } else if (!tsc->get_join_filter_info().is_inited_) {
+        // do nothing
+      } else if (OB_FAIL(generate_pseudo_partition_id_expr(tablet_id_expr))) {
+        LOG_WARN("fail alloc partition id expr", K(ret));
+      } else {
+        gi_op->set_tablet_id_expr(tablet_id_expr);
+        gi_op->set_join_filter_info(tsc->get_join_filter_info());
+        gi_op->set_index_table_id(tsc->get_index_table_id());
+        ObLogJoinFilter *jf_create_op = gi_op->get_join_filter_info().log_join_filter_create_op_;
+        jf_create_op->set_paired_join_filter(gi_op);
+        gi_op->add_flag(GI_USE_PARTITION_FILTER);
+        if (OB_FAIL(gi_op->set_px_rf_info(tsc->get_px_rf_info()))) {
+          LOG_WARN("failed to set px rf info", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObLogicalOperator::find_table_scan(ObLogicalOperator* root_op,
                                        uint64_t table_id,
                                        ObLogicalOperator* &scan_op,
@@ -5345,6 +5815,10 @@ int ObLogicalOperator::check_sort_key_can_pushdown_to_tsc_detail(
             LOG_WARN("failed to has_exec_param");
           } else if (has_exec_param) {
             OPT_TRACE("[TopN Filter] can not pushdown to tsc with exec param");
+          } else if (scan->use_index_merge()) {
+            OPT_TRACE("[TopN Filter] can not pushdown to index merge table scan");
+          } else if (OB_NOT_NULL(scan->get_limit_expr())) {
+            OPT_TRACE("[TopN Filter] can not pushdown tsc with limit");
           } else {
             scan_op = op;
             find_table_scan = true;
@@ -5494,7 +5968,7 @@ int ObLogicalOperator::check_sort_key_can_pushdown_to_tsc_for_join(
 
 int ObLogicalOperator::check_sort_key_can_pushdown_to_tsc(
     ObLogicalOperator *root_op,
-    common::ObSEArray<ObRawExpr *, 8, common::ModulePageAllocator, true> &candidate_sk_exprs,
+    common::ObIArray<ObRawExpr *> &candidate_sk_exprs,
     uint64_t table_id, ObLogicalOperator *&scan_op, bool &table_scan_has_exchange,
     bool &has_px_coord, int64_t &effective_sk_cnt)
 {
@@ -5520,7 +5994,8 @@ int ObLogicalOperator::check_sort_key_can_pushdown_to_tsc(
   return ret;
 }
 
-int ObLogicalOperator::allocate_partition_join_filter(const ObIArray<JoinFilterInfo> &infos,
+
+int ObLogicalOperator::allocate_partition_join_filter(ObIArray<JoinFilterInfo*> &infos,
                                                       int64_t &filter_id)
 {
   int ret = OB_SUCCESS;
@@ -5537,22 +6012,29 @@ int ObLogicalOperator::allocate_partition_join_filter(const ObIArray<JoinFilterI
     filter_create = NULL;
     bool right_has_exchange = false;
     bool right_has_px_coord = false;
-    const JoinFilterInfo &info = infos.at(i);
+    bool can_reuse = false;
+    JoinFilterInfo *info = infos.at(i);
     ObLogTableScan *scan_op = NULL;
+    ObLogJoin *join_op = NULL;
     ObLogicalOperator *node = NULL;
-    if (!info.need_partition_join_filter_) {
+    if (OB_ISNULL(info)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("join filter info is null", K(ret));
+    } else if (!info->need_partition_join_filter_) {
       continue;
-    } else if (OB_ISNULL(info.sharding_)) {
+    } else if (OB_ISNULL(info->sharding_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpect null sharding", K(ret));
     } else if (OB_FAIL(find_table_scan(get_child(second_child),
-                                       info.table_id_,
+                                       info->table_id_,
                                        node,
                                        right_has_exchange,
                                        right_has_px_coord))) {
       LOG_WARN("failed to find table scan", K(ret));
     } else if (right_has_px_coord) {
       //not support now
+      LOG_DEBUG("join filter is disabled as right has px coord");
+      info->need_partition_join_filter_ = false;
     } else if (OB_ISNULL(node)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpect null table scan", K(ret));
@@ -5560,14 +6042,19 @@ int ObLogicalOperator::allocate_partition_join_filter(const ObIArray<JoinFilterI
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpect operator type", K(ret));
     } else if (FALSE_IT(scan_op = static_cast<ObLogTableScan*>(node))) {
-    } else if (scan_op->is_part_join_filter_created()) {
+    } else if (FALSE_IT(join_op = static_cast<ObLogJoin*>(this))) {
+    } else if (scan_op->is_part_join_filter_created() && info->force_part_filter_ == NULL) {
       /*do nothing*/
+      info->need_partition_join_filter_ = false;
+      LOG_DEBUG("partition join filter is disabled as tablescan already consumes another part join filter", K(filter_id));
     } else if (OB_ISNULL(filter_create = factory.allocate(*(get_plan()), LOG_JOIN_FILTER))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_ERROR("failed to allocate exchange nodes", K(ret));
     } else if (OB_FAIL(add_partition_join_filter_info(filter_create, RuntimeFilterType::BLOOM_FILTER))) {
       // only bloom filter.
-      LOG_WARN("fail to add parttition join filter info", K(ret));
+      LOG_WARN("fail to add partition join filter info", K(ret));
+    } else if (OB_FAIL(JoinFilterPruneAndUpdateRewriter::can_reuse_calc_id_expr(join_dist_algo, join_op, info, can_reuse))) {
+      LOG_WARN("failed to check reuse calc id expr", K(ret), K(filter_id));
     } else {
       bool is_shared_hash_join = static_cast<ObLogJoin*>(this)->is_shared_hash_join();
       ObPxBFStaticInfo bf_info;
@@ -5578,7 +6065,7 @@ int ObLogicalOperator::allocate_partition_join_filter(const ObIArray<JoinFilterI
       get_child(first_child)->set_parent(join_filter_create);
       join_filter_create->set_parent(this);
       set_child(first_child, join_filter_create);
-      join_filter_create->set_filter_length(info.sharding_->get_part_cnt() * 2);
+      join_filter_create->set_filter_length(info->sharding_->get_part_cnt() * 2);
       join_filter_create->set_is_use_filter_shuffle(right_has_exchange);
       if ((is_partition_wise_ || DistAlgo::DIST_PARTITION_NONE == join_dist_algo) && !right_has_exchange) {
           join_filter_create->set_is_no_shared_partition_join_filter();
@@ -5587,43 +6074,52 @@ int ObLogicalOperator::allocate_partition_join_filter(const ObIArray<JoinFilterI
       }
       if (get_plan()->get_optimizer_context().get_query_ctx()->check_opt_compat_version(COMPAT_VERSION_4_3_5) &&
           (DistAlgo::DIST_PARTITION_NONE == join_dist_algo || DistAlgo::DIST_PARTITION_HASH_LOCAL == join_dist_algo)) {
-        ObLogicalOperator* child = get_child(first_child);
+        ObLogExchange *exch_op = NULL;
+        ObLogicalOperator *child = get_child(first_child);
+        bool found = false;
         if (OB_ISNULL(child)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpect null child", K(ret));
-        } else if (OB_ISNULL(child=child->get_child(first_child))) {
+        } else if (OB_FAIL(find_pkey_exchange_out(child, exch_op, found))) {
+          LOG_WARN("failed to find pkey exchange out for partition join filter", K(ret));
+        } else if (!found || OB_ISNULL(exch_op)) {
           ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpect null child", K(ret));
-        } else if (OB_ISNULL(child=child->get_child(first_child))) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpect null child", K(ret));
-        } else if (LOG_EXCHANGE != child->get_type()) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpect child type", K(ret));
+          LOG_WARN("failed to find pkey exchange out for partition join filter", K(ret));
         } else {
-          ObLogExchange *exch_op = static_cast<ObLogExchange*>(child);
-          if (exch_op->get_calc_part_id_expr()->get_partition_id_calc_type() ==
-              info.calc_part_id_expr_->get_partition_id_calc_type()) {
+          if (OB_ISNULL(exch_op->get_calc_part_id_expr()) || OB_ISNULL(info->calc_part_id_expr_)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpect null calc part id expr", K(ret), K(exch_op->get_calc_part_id_expr()), K(info->calc_part_id_expr_));
+          } else if (can_reuse && exch_op->get_calc_part_id_expr()->get_partition_id_calc_type() ==
+              info->calc_part_id_expr_->get_partition_id_calc_type()) {
             join_filter_create->set_tablet_id_expr(exch_op->get_calc_part_id_expr());
           } else {
-            join_filter_create->set_tablet_id_expr(info.calc_part_id_expr_);
+            // todo this is only allowed when hint forced or partition num is large enough
+            join_filter_create->set_tablet_id_expr(info->calc_part_id_expr_);
+            LOG_DEBUG("part join filter can not share calc_part expr", K(filter_id));
           }
         }
       } else {
-        join_filter_create->set_tablet_id_expr(info.calc_part_id_expr_);
+        join_filter_create->set_tablet_id_expr(info->calc_part_id_expr_);
+        LOG_DEBUG("part join filter can not share calc_part expr", K(filter_id));
       }
       OZ(join_filter_create->compute_property());
+      // it chould be the case that this scannode already has a bfinfo
+      // in that case, if this info is forced. update to this one.
+      // other wise, we do an ignore here
+      // and remove that info from outline
       OZ(bf_info.init(get_plan()->get_optimizer_context().get_session_info()->get_effective_tenant_id(),
           filter_id, GCTX.get_server_id(),
           join_filter_create->is_shared_join_filter(),
-          info.skip_subpart_,
+          info->skip_subpart_,
           join_filter_create->get_p2p_sequence_ids().at(0),
           right_has_exchange, join_filter_create));
+
       scan_op->set_join_filter_info(bf_info);
       scan_op->set_part_join_filter_created(true);
+      info->filter_id_ = filter_id;
       filter_id++;
-      for (int j = 0; j < info.lexprs_.count() && OB_SUCC(ret); ++j) {
-        ObRawExpr *expr = info.lexprs_.at(j);
+      for (int j = 0; j < info->lexprs_.count() && OB_SUCC(ret); ++j) {
+        ObRawExpr *expr = info->lexprs_.at(j);
         CK(OB_NOT_NULL(expr));
         OZ(join_filter_create->get_join_exprs().push_back(expr));
       }
@@ -5632,7 +6128,7 @@ int ObLogicalOperator::allocate_partition_join_filter(const ObIArray<JoinFilterI
   return ret;
 }
 
-int ObLogicalOperator::allocate_normal_join_filter(const ObIArray<JoinFilterInfo> &infos,
+int ObLogicalOperator::allocate_normal_join_filter(ObIArray<JoinFilterInfo*> &infos,
                                                    int64_t &filter_id)
 {
   int ret = OB_SUCCESS;
@@ -5653,6 +6149,13 @@ int ObLogicalOperator::allocate_normal_join_filter(const ObIArray<JoinFilterInfo
       && GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_3_3_0) {
     can_join_filter_material = true;
   }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(get_plan()) || OB_ISNULL(get_plan()->get_optimizer_context().get_query_ctx())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpect null", K(ret));
+  }
+  bool enable_runtime_filter_adaptive_apply =
+      get_plan()->get_optimizer_context().enable_runtime_filter_adaptive_apply();
   int64_t last_valid_join_filter_info_idx = -1;
   if (OB_SUCC(ret)) {
     for (int i = 0; i < infos.count() && OB_SUCC(ret); ++i) {
@@ -5662,23 +6165,29 @@ int ObLogicalOperator::allocate_normal_join_filter(const ObIArray<JoinFilterInfo
       filter_use = NULL;
       join_filter_create = nullptr;
       join_filter_use = nullptr;
-      const JoinFilterInfo &info = infos.at(i);
+      JoinFilterInfo *info = infos.at(i);
       ObLogicalOperator *node = NULL;
-      if (!info.can_use_join_filter_) {
+      if (OB_ISNULL(info)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("join filter info is null", K(ret));
+      } else if (!info->can_use_join_filter_) {
         //do nothing
       } else if (OB_ISNULL(filter_create = factory.allocate(*(get_plan()), LOG_JOIN_FILTER))
           || OB_ISNULL(filter_use = factory.allocate(*(get_plan()), LOG_JOIN_FILTER))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_ERROR("failed to allocate join filter nodes", K(ret));
       } else if (OB_FAIL(find_table_scan(get_child(second_child),
-                                         info.table_id_,
+                                         info->table_id_,
                                          node,
                                          right_has_exchange,
                                          right_has_px_coord))) {
         LOG_WARN("failed to find table scan", K(ret));
       } else if (right_has_px_coord) {
-        //no support now
-      } else if (OB_ISNULL(node)) {
+        // no support now
+        // mark filterinfo false
+        LOG_DEBUG("join filter is disabled as right has px coord");
+        info->can_use_join_filter_ = false;
+      } else if (OB_ISNULL(node) || OB_ISNULL(get_child(first_child))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpect null table scan", K(ret));
       } else {
@@ -5690,6 +6199,7 @@ int ObLogicalOperator::allocate_normal_join_filter(const ObIArray<JoinFilterInfo
         join_filter_use->set_is_create_filter(false);
         join_filter_create->set_filter_id(filter_id);
         join_filter_use->set_filter_id(filter_id);
+        info->filter_id_ = filter_id;
         join_filter_create->set_child(first_child, get_child(first_child));
         get_child(first_child)->set_parent(join_filter_create);
         join_filter_create->set_parent(this);
@@ -5704,7 +6214,8 @@ int ObLogicalOperator::allocate_normal_join_filter(const ObIArray<JoinFilterInfo
 	          break;
           }
         }
-        if (OB_SUCC(ret)) {
+        if (OB_FAIL(ret)) {
+        } else  {
           join_filter_use->set_parent(node->get_parent());
           node->set_parent(join_filter_use);
           join_filter_use->set_child(first_child, node);
@@ -5712,16 +6223,18 @@ int ObLogicalOperator::allocate_normal_join_filter(const ObIArray<JoinFilterInfo
             join_filter_create->set_is_use_filter_shuffle(true);
             join_filter_use->set_is_use_filter_shuffle(true);
           }
-
           if ((DistAlgo::DIST_BC2HOST_NONE == join_dist_algo) || right_has_exchange) {
             join_filter_create->set_is_shared_join_filter();
             join_filter_use->set_is_shared_join_filter();
             has_shared_join_filter = true;
-            int64_t max_wait_time_ms = 0;
-            if (OB_FAIL(calc_rf_max_wait_time(node, info.filter_table_id_, max_wait_time_ms))) {
-              LOG_WARN("failed to calc_rf_max_wait_time");
+            if (LOG_TABLE_SCAN == node->get_type()) {
+              ObLogTableScan *scan = static_cast<ObLogTableScan*>(node);
+              join_filter_use->set_basic_table_row_count(scan->get_logical_query_range_row_count());
+              LOG_TRACE("calc rf basic table row count", K(node->get_width()),
+                        K(scan->get_logical_query_range_row_count()));
             } else {
-              join_filter_use->set_rf_max_wait_time(max_wait_time_ms);
+              join_filter_use->set_basic_table_row_count(info->right_origin_rows_);
+              LOG_TRACE("calc rf basic table row count", K(node->get_width()), K(info->right_origin_rows_));
             }
           } else {
             join_filter_create->set_is_non_shared_join_filter();
@@ -5747,23 +6260,31 @@ int ObLogicalOperator::allocate_normal_join_filter(const ObIArray<JoinFilterInfo
           OZ(join_filter_use->compute_property());
         }
         filter_id++;
-        for (int j = 0; j < info.lexprs_.count() && OB_SUCC(ret); ++j) {
-          ObRawExpr *lexpr = info.lexprs_.at(j);
-          ObRawExpr *rexpr = info.rexprs_.at(j);
+        for (int j = 0; j < info->lexprs_.count() && OB_SUCC(ret); ++j) {
+          ObRawExpr *lexpr = info->lexprs_.at(j);
+          ObRawExpr *rexpr = info->rexprs_.at(j);
           CK(OB_NOT_NULL(lexpr) && OB_NOT_NULL(rexpr));
           OZ(join_filter_create->get_join_exprs().push_back(lexpr));
           OZ(join_filter_use->get_join_exprs().push_back(rexpr));
         }
         OZ(create_runtime_filter_info(node,
-            join_filter_create, join_filter_use, info.join_filter_selectivity_));
+            join_filter_create, join_filter_use, info->join_filter_selectivity_));
         if (OB_FAIL(ret)) {
         } else if (OB_FAIL(try_prepare_rf_query_range_info(join_filter_create, join_filter_use,
-                                                           node, info))) {
+                                                           node, *info))) {
           LOG_WARN("failed to prepare_rf_query_range_info");
-        }
-        if (OB_SUCC(ret) && LOG_TABLE_SCAN == node->get_type()) {
+        } else if (get_plan()->get_optimizer_context().get_query_ctx()->check_opt_compat_version(COMPAT_VERSION_4_6_0) &&
+                   OB_FAIL(node->update_optimizer_info(*info))) {
+          LOG_WARN("failed to update optimizer info", K(ret));
+        } else if (!enable_runtime_filter_adaptive_apply) {
+          join_filter_use->set_runtime_filter_adaptive_apply(false);
+        } else if (LOG_TABLE_SCAN == node->get_type()) {
           ObLogTableScan *scan = static_cast<ObLogTableScan*>(node);
-          scan->set_use_column_store(info.use_column_store_);
+          scan->set_use_column_store(info->use_column_store_);
+          if (scan->get_scan_order() == common::ObQueryFlag::ScanOrder::NoOrder) {
+            // for table engine delete insert, we should disable runtime filter adaptive apply
+            join_filter_use->set_runtime_filter_adaptive_apply(false);
+          }
         }
 
         if (OB_SUCC(ret) && can_join_filter_material) {
@@ -5834,40 +6355,44 @@ int ObLogicalOperator::allocate_normal_join_filter(const ObIArray<JoinFilterInfo
     }
 
     // add full hash join key left exprs to join filter
-    const JoinFilterInfo &info = infos.at(last_valid_join_filter_info_idx);
-    if (OB_FAIL(join_filter_create->set_all_join_key_left_exprs(info.all_join_key_left_exprs_))) {
+    const JoinFilterInfo *info = infos.at(last_valid_join_filter_info_idx);
+    if (OB_ISNULL(info)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("join filter info is null", K(ret));
+    } else if (OB_FAIL(join_filter_create->set_all_join_key_left_exprs(info->all_join_key_left_exprs_))) {
       LOG_WARN("failed to set_all_join_key_left_exprs");
     }
   }
   return ret;
 }
-
-int ObLogicalOperator::calc_rf_max_wait_time(const ObLogicalOperator *node, uint64_t table_id,
-                                             int64_t &max_wait_time_ms)
+int ObLogicalOperator::check_in_px_scope_pre(AllocBloomFilterContext &ctx)
 {
   int ret = OB_SUCCESS;
-  static constexpr int64_t net_work_speed = 100 * 1000L; // Byte per ms, i.e 100MB/s
-  static constexpr int64_t max_wait_time_ms_upper_limit = INT64_MAX >> 10; // in case of overflow
-  double tsc_output_rows = 0;
-  double totol_probe_table_size = 0;
-  ObSQLSessionInfo *session = nullptr;
-  if (OB_ISNULL(session = get_plan()->get_optimizer_context().get_session_info())) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("session is null", K(ret));
-  } else if (table_id != OB_INVALID_ID && GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_3_3_0) {
-    max_wait_time_ms = 10; // at least 10ms
-    const OptTableMetas &table_metas = get_plan()->get_basic_table_metas();
-    const OptTableMeta *table_meta = nullptr;
-    if (OB_ISNULL(table_meta = table_metas.get_table_meta_by_table_id(table_id))) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("table_meta unexpected null", K(table_id));
-    } else if (FALSE_IT(tsc_output_rows = table_meta->get_rows())) {
-    } else {
-      totol_probe_table_size = node->get_width() * tsc_output_rows; // Unit: Byte
-      max_wait_time_ms = std::max((int64_t)(totol_probe_table_size / net_work_speed), max_wait_time_ms);
-      max_wait_time_ms = std::min(max_wait_time_ms_upper_limit, max_wait_time_ms);// in case of overflow
-      LOG_TRACE("print calc max wait ms", K(node->get_width()), K(tsc_output_rows),
-                K(totol_probe_table_size), K(max_wait_time_ms));
+  // once a px coordinator is found, set in px to true
+  if (LOG_EXCHANGE == get_type()) {
+    const ObLogExchange *op = static_cast<const ObLogExchange *>(this);
+    if (op->is_px_coord()) {
+      ctx.previous_px_scopes_.push_back(ctx.in_px_scope_);
+      ctx.in_px_scope_ = true;
+    }
+  }
+  return ret;
+}
+
+int ObLogicalOperator::check_in_px_scope_post(AllocBloomFilterContext &ctx)
+{
+  int ret = OB_SUCCESS;
+  // reset to parent's px scope mark
+  if (LOG_EXCHANGE == get_type()) {
+    const ObLogExchange *op = static_cast<const ObLogExchange *>(this);
+    if (op->is_px_coord()) {
+      if (ctx.previous_px_scopes_.count() > 0) {
+        ctx.in_px_scope_ = ctx.previous_px_scopes_.at(ctx.previous_px_scopes_.count() - 1);
+        ctx.previous_px_scopes_.remove(ctx.previous_px_scopes_.count() - 1);
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("px scope not exists", K(ret));
+      }
     }
   }
   return ret;
@@ -5881,12 +6406,29 @@ int ObLogicalOperator::allocate_runtime_filter_for_hash_join(AllocBloomFilterCon
     //do nothing
   } else if (join_op->get_join_filter_infos().empty()) {
     //do nothing
-  } else if (OB_FAIL(allocate_partition_join_filter(join_op->get_join_filter_infos(),
-                                                    ctx.filter_id_))) {
-    LOG_WARN("fail to allocate partition join filter", K(ret));
-  } else if (OB_FAIL(allocate_normal_join_filter(join_op->get_join_filter_infos(),
-                                                 ctx.filter_id_))) {
-    LOG_WARN("fail to allocate normal join filter", K(ret));
+  } else if (!ctx.in_px_scope_) {
+    ObIArray<JoinFilterInfo*> &join_filter_infos = join_op->get_join_filter_infos();
+    for (int i = 0; i < join_filter_infos.count() && OB_SUCC(ret); ++i) {
+      JoinFilterInfo *info = join_filter_infos.at(i);
+      if (OB_ISNULL(info)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("join filter info is null", K(ret));
+      } else {
+        info->need_partition_join_filter_ = false;
+        info->can_use_join_filter_ = false;
+      }
+    }
+  } else {
+    ObIArray<JoinFilterInfo*> &join_filter_infos = join_op->get_join_filter_infos();
+    if (join_filter_infos.empty()) {
+      //do nothing
+    } else if (OB_FAIL(allocate_partition_join_filter(join_filter_infos,
+                                                      ctx.filter_id_))) {
+      LOG_WARN("fail to allocate partition join filter", K(ret));
+    } else if (OB_FAIL(allocate_normal_join_filter(join_filter_infos,
+                                                   ctx.filter_id_))) {
+      LOG_WARN("fail to allocate normal join filter", K(ret));
+    }
   }
   return ret;
 }
@@ -6078,9 +6620,15 @@ int ObLogicalOperator::find_shuffle_join_filter(bool &find) const
   if (log_op_def::LOG_EXCHANGE == get_type()) {
     /* do nothing */
   } else if (log_op_def::LOG_JOIN == get_type()) {
-    const ObIArray<JoinFilterInfo> &infos = static_cast<const ObLogJoin*>(this)->get_join_filter_infos();
+    const ObIArray<JoinFilterInfo*> &infos = static_cast<const ObLogJoin*>(this)->get_join_filter_infos();
     for (int64_t i = 0; OB_SUCC(ret) && !find && i < infos.count(); ++i) {
-      find = !infos.at(i).in_current_dfo_;
+      const JoinFilterInfo *info = infos.at(i);
+      if (OB_ISNULL(info)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("join filter info is null", K(ret));
+      } else {
+        find = !info->in_current_dfo_;
+      }
     }
     const ObLogicalOperator *child = NULL;
     for (int64_t i = 0; !find && OB_SUCC(ret) && i < get_num_of_child(); i++) {

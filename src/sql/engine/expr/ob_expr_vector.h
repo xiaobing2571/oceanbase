@@ -42,6 +42,9 @@ namespace sql
 class ObExprVector : public ObFuncExprOperator
 {
 public:
+
+  static const int64_t MAX_VECTOR_DIM = 16000;
+
   struct VectorCastInfo
   {
     VectorCastInfo()
@@ -109,10 +112,39 @@ public:
   virtual int cg_expr(ObExprCGCtx &expr_cg_ctx,
                       const ObRawExpr &raw_expr,
                       ObExpr &rt_expr) const override;
+  virtual bool need_rt_ctx() const override { return true; }
   static int calc_distance(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datum);
   static int calc_distance(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datum, ObVecDisType dis_type);
+  static int get_normal_vector_data(const ObExpr *arg, ObEvalCtx &ctx,
+                           common::ObArenaAllocator &tmp_allocator,
+                           const float *&data, int64_t &size,
+                           ObCollectionArrayType *arr_type,
+                           bool &is_null);
 
 private:
+  class VectorConstCache : public ObExprOperatorCtx
+  {
+  public:
+    VectorConstCache(common::ObIAllocator *allocator);
+    virtual ~VectorConstCache() {}
+
+    const float *get_cached_data(int arg_idx) const;
+    int64_t get_cached_size(int arg_idx) const;
+    bool is_cached(int arg_idx) const;
+    int add_const_cache(int arg_idx, const float *data, int64_t size);
+
+  private:
+    common::ObIAllocator *allocator_;
+    const float *param1_data_;
+    int64_t param1_size_;
+    const float *param2_data_;
+    int64_t param2_size_;
+    bool param1_cached_;
+    bool param2_cached_;
+  };
+
+  static VectorConstCache* get_vector_const_cache(const uint64_t& id, ObExecContext *exec_ctx);
+
   DISALLOW_COPY_AND_ASSIGN(ObExprVectorDistance);
 };
 
@@ -155,6 +187,21 @@ public:
   static int calc_l2_distance(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datum);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObExprVectorL2Distance);
+};
+
+class ObExprVectorL2Squared : public ObExprVectorDistance
+{
+public:
+  explicit ObExprVectorL2Squared(common::ObIAllocator &alloc);
+  virtual ~ObExprVectorL2Squared() {};
+
+  virtual int cg_expr(ObExprCGCtx &expr_cg_ctx,
+                      const ObRawExpr &raw_expr,
+                      ObExpr &rt_expr) const override;
+
+  static int calc_l2_squared(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datum);
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObExprVectorL2Squared);
 };
 
 class ObExprVectorCosineDistance : public ObExprVectorDistance

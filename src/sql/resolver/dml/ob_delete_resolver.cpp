@@ -82,7 +82,7 @@ int ObDeleteResolver::resolve(const ParseNode &parse_tree)
 //      delete_stmt->set_ignore(true);
 //      session_info_->set_ignore_stmt(true);
 //    }
-    if (OB_FAIL(resolve_outline_data_hints())) {
+    if (OB_FAIL(pre_process_hints(parse_tree))) {
       LOG_WARN("resolve outline data hints failed", K(ret));
     } else if (is_mysql_mode() && OB_FAIL(resolve_with_clause(parse_tree.children_[WITH_MYSQL]))) {
       LOG_WARN("resolve with clause failed", K(ret));
@@ -94,6 +94,8 @@ int ObDeleteResolver::resolve(const ParseNode &parse_tree)
         if (OB_ISNULL(table_item)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("get unexpected null", K(ret));
+        } else if (OB_FAIL(resolve_check_merge_engine(table_item))) {
+          LOG_WARN("resolve check merge engine failed", K(ret));
         } else if (OB_FAIL(generate_delete_table_info(*table_item))) {
           LOG_WARN("failed to generate delete table info", K(ret));
         } else if (is_oracle_mode() && !delete_stmt->has_instead_of_trigger()) {
@@ -265,6 +267,11 @@ int ObDeleteResolver::resolve_table_list(const ParseNode &table_list, bool &is_m
          */
         LOG_DEBUG("succ to add from item", KPC(table_item));
       }
+      if (OB_ISNULL(table_item) || (session_info_->is_inner() && OB_ISNULL(session_info_->get_job_info()))) {
+      } else if (OB_UNLIKELY(table_item->is_system_table_ && table_item->table_name_.case_compare(OB_ALL_LICENSE_TNAME) == 0)) {
+        ret = OB_OP_NOT_ALLOW;
+        LOG_WARN("modify license table is not allowed", KR(ret), K(table_item->table_name_), K(table_item->is_system_table_));
+      }
     }
   }
 
@@ -410,6 +417,8 @@ int ObDeleteResolver::generate_delete_table_info(const TableItem &table_item)
   } else if (OB_ISNULL(table_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(ret));
+  } else if (OB_FAIL(check_is_mview_refresh_sql(*table_schema))) {
+    LOG_WARN("failed to check is mview refresh sql", K(ret));
   } else if (OB_FAIL(schema_checker_->get_can_write_index_array(params_.session_info_->get_effective_tenant_id(),
                                                                 base_table_item.ref_id_,
                                                                 index_tid, gindex_cnt, true))) {
@@ -420,14 +429,17 @@ int ObDeleteResolver::generate_delete_table_info(const TableItem &table_item)
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate table info", K(ret));
   } else {
-    table_info = new(ptr) ObDeleteTableInfo();
+    table_info = new(ptr) ObDeleteTableInfo(*allocator_);
     if (OB_FAIL(table_info->part_ids_.assign(base_table_item.part_ids_))) {
       LOG_WARN("failed to assign part ids", K(ret));
     } else if (!delete_stmt->has_instead_of_trigger()) {
       // todo @zimiao error logging also need all columns ?
+      bool need_all_cols = true;
       if (OB_FAIL(add_all_rowkey_columns_to_stmt(table_item, table_info->column_exprs_))) {
         LOG_WARN("add all rowkey columns to stmt failed", K(ret));
-      } else if (need_all_columns(*table_schema, binlog_row_image)) {
+      } else if (OB_FAIL(need_all_columns(*table_schema, binlog_row_image, need_all_cols))) {
+        LOG_WARN("failed to check need all columns", K(ret));
+      } else if (need_all_cols) {
         if (OB_FAIL(add_all_columns_to_stmt(table_item, table_info->column_exprs_))) {
           LOG_WARN("fail to add all column to stmt", K(ret), K(table_item));
         }
@@ -436,6 +448,26 @@ int ObDeleteResolver::generate_delete_table_info(const TableItem &table_item)
         LOG_WARN("fail to add relate column to stmt", K(ret), K(table_item));
       } else if (OB_FAIL(add_all_lob_columns_to_stmt(table_item, table_info->column_exprs_))) {
         LOG_WARN("fail to add lob column to stmt", K(ret), K(table_item));
+      } else if (table_schema->mv_container_table()) {
+        // always add following columns
+        //  1. unique key columns
+        //  2. partition key columns (only for tables without pk nor not-null uk)
+        bool has_not_null_uk = false;
+        bool need_check_part_key = false;
+        ObSchemaGetterGuard *schema_guard = NULL;
+        if (OB_ISNULL(schema_guard = schema_checker_->get_schema_guard())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected null", K(ret));
+        } else if (OB_FAIL(table_schema->has_not_null_unique_key(*schema_guard, has_not_null_uk))) {
+          LOG_WARN("failed to check has not null unique key", K(ret));
+        } else if (FALSE_IT(need_check_part_key = table_schema->is_table_without_pk() && !has_not_null_uk)) {
+        } else if (OB_FAIL(add_all_unique_key_columns_to_stmt(table_item, table_info->column_exprs_))) {
+          LOG_WARN("failed to add all unique key columns to stmt", K(ret));
+        } else if (OB_FAIL(add_all_mlog_columns_to_stmt(table_item, table_info->column_exprs_))) {
+          LOG_WARN("failed to add all mlog columns to stmt", K(ret));
+        } else if (need_check_part_key && OB_FAIL(add_all_partition_key_columns_to_stmt(table_item, table_info->column_exprs_))) {
+          LOG_WARN("fail to add partition key column to stmt", K(ret), K(table_item));
+        }
       }
       if (OB_SUCC(ret)) {
         table_info->table_id_ = table_item.table_id_;
@@ -530,6 +562,33 @@ int ObDeleteResolver::check_view_deletable()
         }
       }
     }
+  }
+
+  return ret;
+}
+
+int ObDeleteResolver::resolve_check_merge_engine(const TableItem* table_item)
+{
+  int ret = OB_SUCCESS;
+
+  const ObTableSchema *table_schema = NULL;
+  if (OB_ISNULL(table_item) || OB_ISNULL(schema_checker_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret), K(table_item), K(schema_checker_));
+  } else if (OB_ISNULL(session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session_info_ is null", K(ret));
+  } else if (OB_FAIL(schema_checker_->get_table_schema(session_info_->get_effective_tenant_id(),
+                                                       table_item->get_base_table_item().ref_id_,
+                                                       table_schema))) {
+    LOG_WARN("fail to get table schema", K(ret), K(table_item->get_base_table_item().ref_id_));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("fail to get tale schema", K(ret), K(table_schema));
+  } else if (table_schema->is_append_only_merge_engine()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("delete from append_only table is not supported", K(ret), KPC(table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "delete from append_only table is");
   }
 
   return ret;

@@ -12,6 +12,7 @@
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "ob_table_param.h"
+#include "share/ob_compute_property.h"
 #include "storage/column_store/ob_column_store_replica_util.h"
 
 namespace oceanbase
@@ -623,6 +624,7 @@ ObTableParam::ObTableParam(ObIAllocator &allocator)
     rowid_projector_(allocator),
     parser_name_(),
     parser_properties_(),
+    fts_index_type_(OB_FTS_INDEX_TYPE_INVALID),
     enable_lob_locator_v2_(false),
     is_spatial_index_(false),
     is_fts_index_(false),
@@ -633,7 +635,12 @@ ObTableParam::ObTableParam(ObIAllocator &allocator)
     is_normal_cgs_at_the_end_(false),
     is_mlog_table_(false),
     is_enable_semistruct_encoding_(false),
-    has_lob_column_pushdown_(false)
+    is_safe_filter_with_di_(true),
+    access_virtual_col_cnt_(0),
+    aggregate_param_props_(allocator),
+    plan_enable_rich_format_(false),
+    table_type_(ObTableType::MAX_TABLE_TYPE),
+    merge_engine_type_(ObMergeEngineType::OB_MERGE_ENGINE_UNKNOWN)
 {
   reset();
 }
@@ -658,6 +665,7 @@ void ObTableParam::reset()
   rowid_projector_.reset();
   parser_name_.reset();
   parser_properties_.reset();
+  fts_index_type_ = OB_FTS_INDEX_TYPE_INVALID;
   main_read_info_.reset();
   enable_lob_locator_v2_ = false;
   is_spatial_index_ = false;
@@ -669,7 +677,12 @@ void ObTableParam::reset()
   is_normal_cgs_at_the_end_ = false;
   is_mlog_table_ = false;
   is_enable_semistruct_encoding_ = false;
-  has_lob_column_pushdown_ = false;
+  is_safe_filter_with_di_ = true;
+  access_virtual_col_cnt_ = 0;
+  aggregate_param_props_.reset();
+  plan_enable_rich_format_ = false;
+  table_type_ = ObTableType::MAX_TABLE_TYPE;
+  merge_engine_type_ = ObMergeEngineType::OB_MERGE_ENGINE_UNKNOWN;
 }
 
 OB_DEF_SERIALIZE(ObTableParam)
@@ -727,7 +740,17 @@ OB_DEF_SERIALIZE(ObTableParam)
     LST_DO_CODE(OB_UNIS_ENCODE,
                 is_mlog_table_,
                 is_enable_semistruct_encoding_,
-                has_lob_column_pushdown_);
+                is_safe_filter_with_di_);
+  }
+  if (OB_SUCC(ret)) {
+    OB_UNIS_ENCODE(access_virtual_col_cnt_);
+    OB_UNIS_ENCODE(aggregate_param_props_);
+    OB_UNIS_ENCODE(plan_enable_rich_format_);
+    OB_UNIS_ENCODE(table_type_);
+    OB_UNIS_ENCODE(merge_engine_type_);
+  }
+  if (OB_SUCC(ret) && is_fts_index_) {
+    OB_UNIS_ENCODE(fts_index_type_);
   }
   return ret;
 }
@@ -841,7 +864,17 @@ OB_DEF_DESERIALIZE(ObTableParam)
     LST_DO_CODE(OB_UNIS_DECODE,
                 is_mlog_table_,
                 is_enable_semistruct_encoding_,
-                has_lob_column_pushdown_);
+                is_safe_filter_with_di_);
+  }
+  if (OB_SUCC(ret)) {
+    LST_DO_CODE(OB_UNIS_DECODE, access_virtual_col_cnt_);
+    LST_DO_CODE(OB_UNIS_DECODE, aggregate_param_props_);
+    LST_DO_CODE(OB_UNIS_DECODE, plan_enable_rich_format_);
+    LST_DO_CODE(OB_UNIS_DECODE, table_type_);
+    LST_DO_CODE(OB_UNIS_DECODE, merge_engine_type_);
+  }
+  if (OB_SUCC(ret) && is_fts_index_ && pos < data_len) {
+    OB_UNIS_DECODE(fts_index_type_);
   }
   return ret;
 }
@@ -907,7 +940,18 @@ OB_DEF_SERIALIZE_SIZE(ObTableParam)
     LST_DO_CODE(OB_UNIS_ADD_LEN,
                 is_mlog_table_,
                 is_enable_semistruct_encoding_,
-                has_lob_column_pushdown_);
+                is_safe_filter_with_di_);
+  }
+  if (OB_SUCC(ret)) {
+    LST_DO_CODE(OB_UNIS_ADD_LEN,
+                access_virtual_col_cnt_,
+                aggregate_param_props_,
+                plan_enable_rich_format_,
+                table_type_,
+                merge_engine_type_);
+  }
+  if (OB_SUCC(ret) && is_fts_index_) {
+    OB_UNIS_ADD_LEN(fts_index_type_);
   }
   return len;
 }
@@ -1007,19 +1051,22 @@ int ObTableParam::construct_columns_and_projector(
   ObSEArray<int32_t, COMMON_COLUMN_NUM> tmp_output_projector;
   ObSEArray<bool, COMMON_COLUMN_NUM> tmp_output_sel_mask;
   ObSEArray<int32_t, COMMON_COLUMN_NUM> tmp_cg_idxs;
-  ObSEArray<uint64_t, COMMON_COLUMN_NUM> truncate_col_ids;
+  ObSEArray<uint64_t, COMMON_COLUMN_NUM> mds_filter_col_ids;
   const ObIArray<uint64_t> *access_col_ids = &output_column_ids;
   share::schema::ObColDesc tmp_col_desc;
   share::schema::ObColExtend tmp_col_extend;
   int32_t cg_idx = 0;
+  bool is_cs_table = false;
   bool is_cs = false;
   bool has_all_column_group = false;
   bool need_truncate_filter = false;
+  bool has_ttl_definition = false;
   int64_t rowkey_count = 0;
   is_column_replica_table_ = false; // row store table schema does not contains cg, if true, need calculate cg idx by designed rules
 
-  if (OB_FAIL(table_schema.get_is_column_store(is_cs))) {
+  if (OB_FAIL(table_schema.get_is_column_store(is_cs_table))) {
     LOG_WARN("fail to get is table column store", K(ret), K(table_schema));
+  } else if (FALSE_IT(is_cs = is_cs_table)) {
   } else if (!is_cs && query_cs_replica) {
     is_cs = true;
     is_column_replica_table_ = true;
@@ -1065,6 +1112,11 @@ int ObTableParam::construct_columns_and_projector(
         tmp_col_desc.col_type_ = column->get_meta_type();
         tmp_col_desc.col_order_ = column->get_column_order();
         tmp_col_extend.skip_index_attr_ = column_schema->get_skip_index_attr();
+        int tmp_ret = OB_E(EventTable::EN_ROW_STORE_GEN_SKIP_INDEX_ADAPTIVELY) OB_SUCCESS;
+        if (!tmp_col_extend.skip_index_attr_.has_skip_index() && (is_cs || tmp_ret != OB_SUCCESS) &&
+            ObMergeEngineStoreFormat::is_merge_engine_support_delta_sstable_skip_index(table_schema.get_merge_engine_type())) {
+          tmp_col_extend.skip_index_attr_.set_min_max();
+        }
         if (tmp_col_desc.col_type_.is_lob_storage() && (!IS_CLUSTER_VERSION_BEFORE_4_1_0_0)) {
           tmp_col_desc.col_type_.set_has_lob_header();
         }
@@ -1081,13 +1133,13 @@ int ObTableParam::construct_columns_and_projector(
         }
       }
     }
-    if (OB_SUCC(ret) && !is_cs && table_schema.is_global_index_table()) {
+    if (OB_SUCC(ret) && !is_cs_table && table_schema.is_global_index_table()) {
       ObSEArray<ObColDesc, COMMON_COLUMN_NUM> non_rowkey_column_ids;
       if (OB_FAIL(table_schema.get_column_ids_without_rowkey(non_rowkey_column_ids, true))) {
         LOG_WARN("get column ids failed", K(ret));
-      } else if (OB_FAIL(truncate_col_ids.push_back(common::OB_HIDDEN_TRANS_VERSION_COLUMN_ID))) {
+      } else if (OB_FAIL(mds_filter_col_ids.push_back(common::OB_HIDDEN_TRANS_VERSION_COLUMN_ID))) {
         LOG_WARN("fail to push back trans version col to truncate col ids", K(ret));
-      } else if (OB_FAIL(truncate_col_ids.push_back(common::OB_HIDDEN_SQL_SEQUENCE_COLUMN_ID))) {
+      } else if (OB_FAIL(mds_filter_col_ids.push_back(common::OB_HIDDEN_SQL_SEQUENCE_COLUMN_ID))) {
         LOG_WARN("fail to push back sql sequence col to truncate col ids", K(ret));
       }
       for (int64_t i = 0; OB_SUCC(ret) && i < non_rowkey_column_ids.count(); ++i) {
@@ -1097,22 +1149,39 @@ int ObTableParam::construct_columns_and_projector(
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("The column is NULL", K(ret), K(table_schema.get_table_id()), K(column_id), K(i));
         } else if (column_schema->is_user_specified_storing_column()) {
-        } else if (OB_FAIL(truncate_col_ids.push_back(column_id))) {
+        } else if (OB_FAIL(mds_filter_col_ids.push_back(column_id))) {
           LOG_WARN("fail to push back non rowkey col id to truncate col ids");
         }
       }
+
+      if (OB_SUCC(ret)) {
+        need_truncate_filter = true;
+      }
+    }
+
+    has_ttl_definition = table_schema.get_ttl_flag().was_compaction_ttl_;
+    if (OB_SUCC(ret) && has_ttl_definition) {
+      // TODO(menglan): we need other column desc in ttl when ttl support non-rowscn column
+      if (!is_contain(mds_filter_col_ids, common::OB_HIDDEN_TRANS_VERSION_COLUMN_ID)
+          && OB_FAIL(mds_filter_col_ids.push_back(common::OB_HIDDEN_TRANS_VERSION_COLUMN_ID))) {
+        LOG_WARN("fail to push back rowscn col id to truncate col ids", K(ret));
+      }
+    }
+
+    if (OB_SUCC(ret) && (has_ttl_definition || need_truncate_filter)) {
+      // add output column ids
       for (int64_t i = 0; OB_SUCC(ret) && i < output_column_ids.count(); ++i) {
         const uint64_t column_id = output_column_ids.at(i);
-        if (is_contain(truncate_col_ids, column_id)) {
-        } else if (OB_FAIL(truncate_col_ids.push_back(column_id))) {
+        if (is_contain(mds_filter_col_ids, column_id)) {
+        } else if (OB_FAIL(mds_filter_col_ids.push_back(column_id))) {
           LOG_WARN("fail to push back output col id to truncate col ids");
         }
       }
       if (OB_SUCC(ret)) {
-        access_col_ids = &truncate_col_ids;
-        need_truncate_filter = true;
+        access_col_ids = &mds_filter_col_ids;
       }
     }
+
     //add other columns
     for (int32_t i = 0; OB_SUCC(ret) && i < access_col_ids->count(); ++i) {
       tmp_col_extend.reset();
@@ -1137,10 +1206,22 @@ int ObTableParam::construct_columns_and_projector(
         } else {
           meta_type.set_int();
         }
+
+        if (common::OB_HIDDEN_TRANS_VERSION_COLUMN_ID == column_id) {
+          tmp_col_extend.skip_index_attr_.set_min_max();
+        }
+
         column->set_column_id(column_id);
         column->set_meta_type(meta_type);
         col_index = -1;
         mem_col_index = -1;
+        if (common::OB_HIDDEN_TRANS_VERSION_COLUMN_ID != column_id &&
+            common::OB_HIDDEN_SQL_SEQUENCE_COLUMN_ID != column_id) {
+          access_virtual_col_cnt_++;
+        }
+        if (common::OB_HIDDEN_TRANS_VERSION_COLUMN_ID == column_id) {
+          tmp_col_extend.skip_index_attr_.set_min_max();
+        }
       } else if (OB_ISNULL(column_schema = table_schema.get_column_schema(column_id))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("The column is NULL", K(ret), K(table_schema.get_table_id()), K(column_id), K(i));
@@ -1162,6 +1243,11 @@ int ObTableParam::construct_columns_and_projector(
           }
           col_index = idx;
           tmp_col_extend.skip_index_attr_ = column_schema->get_skip_index_attr();
+          int tmp_ret = OB_E(EventTable::EN_ROW_STORE_GEN_SKIP_INDEX_ADAPTIVELY) OB_SUCCESS;
+          if (!tmp_col_extend.skip_index_attr_.has_skip_index() && (is_cs || tmp_ret != OB_SUCCESS) &&
+              ObMergeEngineStoreFormat::is_merge_engine_support_delta_sstable_skip_index(table_schema.get_merge_engine_type())) {
+            tmp_col_extend.skip_index_attr_.set_min_max();
+          }
         }
       }
 
@@ -1233,7 +1319,8 @@ int ObTableParam::construct_columns_and_projector(
           LOG_WARN("push back failed", K(ret));
         }
       }
-      if (OB_SUCC(ret) && 0 == output_count && 0 < tmp_output_sel_mask.count()) {
+      if (OB_SUCC(ret) && 0 == output_count && 0 < tmp_output_sel_mask.count() &&
+          !table_schema.is_external_table()) {
         // make sure one output expr at least
         tmp_output_sel_mask.at(0) = true;
       }
@@ -1259,9 +1346,11 @@ int ObTableParam::construct_columns_and_projector(
                                      is_cs ? &tmp_cg_idxs : nullptr,
                                      &tmp_access_cols_extend,
                                      has_all_column_group,
-                                     false/*is_cg_sstable*/,
+                                     false /*is_cg_sstable*/,
                                      need_truncate_filter,
-                                     table_schema.is_delete_insert_merge_engine()))) {
+                                     table_schema.is_delete_insert_merge_engine(),
+                                     table_schema.get_micro_block_format_version(),
+                                     has_ttl_definition))) {
       LOG_WARN("fail to init main read info", K(ret));
     } else if (OB_FAIL(output_projector_.assign(tmp_output_projector))) {
       LOG_WARN("assign failed", K(ret));
@@ -1307,6 +1396,8 @@ int ObTableParam::construct_columns_and_projector(
 
   if (FAILEDx(table_schema.check_is_normal_cgs_at_the_end(is_normal_cgs_at_the_end_))) {
     LOG_WARN("Fail to check whether normal cgs are at the end of schema array", K(ret), K(table_schema));
+  } else {
+    merge_engine_type_ = table_schema.get_merge_engine_type();
   }
   return ret;
 }
@@ -1378,6 +1469,7 @@ int ObTableParam::convert(const ObTableSchema &table_schema,
     // if mocked rowid index is used
     // because eventually, we use primary key to do table scan
   table_id_ = table_schema.get_table_id();
+  table_type_ = table_schema.get_table_type();
   bool is_oracle_mode = false;
   const common::ObIArray<ObColumnParam *> *cols_param = nullptr;
 
@@ -1412,12 +1504,15 @@ int ObTableParam::convert_group_by(const ObTableSchema &table_schema,
                                    const ObIArray<uint64_t> &output_column_ids,
                                    const common::ObIArray<uint64_t> &aggregate_column_ids,
                                    const common::ObIArray<uint64_t> &group_by_column_ids,
+                                   const common::ObIArray<share::ObAggrParamProperty> &aggregate_param_props,
                                    const sql::ObStoragePushdownFlag &pd_pushdown_flag)
 {
   int ret = OB_SUCCESS;
   if (aggregate_column_ids.count() > 0) {
-     if (OB_FAIL(aggregate_projector_.init(aggregate_column_ids.count()))) {
+    if (OB_FAIL(aggregate_projector_.init(aggregate_column_ids.count()))) {
       LOG_WARN("failed to init aggregate projector", K(ret), K(aggregate_column_ids.count()));
+    } else if (OB_FAIL(aggregate_param_props_.assign(aggregate_param_props))) {
+      LOG_WARN("failed to assign aggregate param mono array", K(ret), K(aggregate_param_props));
     }
     for (int32_t i = 0; OB_SUCC(ret) && i < aggregate_column_ids.count(); ++i) {
       if (OB_COUNT_AGG_PD_COLUMN_ID == aggregate_column_ids.at(i)) {
@@ -1429,7 +1524,7 @@ int ObTableParam::convert_group_by(const ObTableSchema &table_schema,
         int32_t j = 0;
         for ( ; OB_SUCC(ret) && j < output_column_ids.count(); ++j) {
           if (aggregate_column_ids.at(i) == output_column_ids.at(j)) {
-            if (j > output_projector_.count()) {
+            if (j >= output_projector_.count()) {
               ret = OB_ERR_UNEXPECTED;
               LOG_WARN("unexpected index", K(ret), K(j), K(output_column_ids.count()), K(output_projector_.count()));
             } else {
@@ -1438,9 +1533,9 @@ int ObTableParam::convert_group_by(const ObTableSchema &table_schema,
           }
         }
         if (OB_SUCC(ret)) {
-          if (OB_INVALID_INDEX == output_projector_.at(j)) {
+          if (OB_UNLIKELY(j >= output_projector_.count() || OB_INVALID_INDEX == output_projector_.at(j))) {
             ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("unexpected index", K(ret), K(output_column_ids), K(aggregate_column_ids), K(i));
+            LOG_WARN("unexpected index", K(ret), K(output_column_ids), K(aggregate_column_ids), K(i), K(j));
           } else if (OB_FAIL(aggregate_projector_.push_back(output_projector_.at(j)))) {
             LOG_WARN("failed to push aggregate projector", K(ret), K(i));
           }
@@ -1480,6 +1575,8 @@ int ObTableParam::convert_group_by(const ObTableSchema &table_schema,
   if (OB_SUCC(ret)) {
     if (table_schema.is_fts_index() && OB_FAIL(convert_fulltext_index_info(table_schema))) {
       LOG_WARN("fail to convert fulltext index info", K(ret));
+    } else {
+      merge_engine_type_ = table_schema.get_merge_engine_type();
     }
   }
   LOG_DEBUG("[GROUP BY PUSHDOWN]", K(ret), K(output_column_ids), K(aggregate_column_ids), K(group_by_column_ids),
@@ -1654,21 +1751,48 @@ int ObTableParam::convert_fulltext_index_info(const ObTableSchema &table_schema)
     LOG_WARN("failed to set parser name from table schema", K(ret));
   } else if (OB_FAIL(ob_write_string(allocator_, table_schema.get_parser_property_str(), parser_properties_))) {
     LOG_WARN("fail to set parser properties from table schema", K(ret));
+  } else {
+    share::schema::ObFTSIndexParams fts_index_params;
+    if (OB_FAIL(table_schema.get_fts_params_from_index_params(fts_index_params))) {
+      LOG_WARN("failed to get fts index params from table schema", K(ret), K(table_schema));
+    } else {
+      fts_index_type_ = fts_index_params.fts_index_type_;
+    }
   }
   return ret;
 }
 
-int ObTableParam::check_lob_column_pushdown(sql::ObPushdownFilterNode &pushdown_filters)
+int ObTableParam::check_is_safe_filter_with_di(
+    const common::ObIArray<sql::ObRawExpr *> &exprs,
+    sql::ObPushdownFilterNode &pushdown_filters)
 {
   int ret = OB_SUCCESS;
-  has_lob_column_pushdown_ = false;
+  bool has_lob_column_out = false;
+  is_safe_filter_with_di_ = true;
   if (OB_UNLIKELY(!main_read_info_.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("Unexpected not valid read info", K(ret), K_(main_read_info));
   } else {
-    has_lob_column_pushdown_ = pushdown_filters.check_filter_on_lob(main_read_info_);
+    const ObColDescIArray &out_cols = main_read_info_.get_columns_desc();
+    for (int64_t i = 0; !has_lob_column_out && i < out_cols.count(); i++) {
+      has_lob_column_out = (is_lob_storage(out_cols.at(i).col_type_.get_type()));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && is_safe_filter_with_di_ && i < exprs.count(); i++) {
+      const sql::ObRawExpr *expr = exprs.at(i);
+      if (OB_ISNULL(expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Unexpected null filter expr", K(ret), K(exprs));
+      } else if ((has_lob_column_out && expr->is_topn_filter()) || !expr->is_deterministic()) {
+        is_safe_filter_with_di_ = false;
+      }
+    }
+    if (OB_SUCC(ret) && is_safe_filter_with_di_) {
+      if (OB_FAIL(pushdown_filters.check_filter_info(main_read_info_,
+                                                     is_safe_filter_with_di_))) {
+        LOG_WARN("Fail to check filter info", K(ret));
+      }
+    }
   }
-
   return ret;
 }
 
@@ -1691,12 +1815,17 @@ int64_t ObTableParam::to_string(char *buf, const int64_t buf_len) const
        K_(is_fts_index),
        K_(parser_name),
        K_(parser_properties),
+       K_(fts_index_type),
        K_(is_vec_index),
        K_(is_column_replica_table),
        K_(is_normal_cgs_at_the_end),
        K_(is_mlog_table),
        K_(is_enable_semistruct_encoding),
-       K_(has_lob_column_pushdown));
+       K_(is_safe_filter_with_di),
+       K_(aggregate_param_props),
+       K_(access_virtual_col_cnt),
+       K_(plan_enable_rich_format),
+       K_(table_type));
   J_OBJ_END();
 
   return pos;

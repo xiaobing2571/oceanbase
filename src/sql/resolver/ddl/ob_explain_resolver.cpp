@@ -53,10 +53,13 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
       LOG_WARN("invalid stmt type for EXPLAIN", "type", child_node->type_);
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "stmt type for EXPLAIN");
     } else {
-      ObResolver resolver(params_);
-      if (OB_FAIL(resolver.resolve(ObResolver::IS_NOT_PREPARED_STMT,
-                                   *child_node,
-                                   child_stmt))) {
+      ObResolverParams params;
+      ObResolver resolver(params);
+      if (OB_FAIL(params.assign(params_))) {
+        LOG_WARN("fail to assign params", K(ret));
+      } else if (OB_FAIL(resolver.resolve(ObResolver::IS_NOT_PREPARED_STMT,
+                                          *child_node,
+                                          child_stmt))) {
         LOG_WARN("failed to resolve child stmt", K(ret));
       } else if (OB_ISNULL(child_stmt)) {
         ret = OB_ERR_UNEXPECTED;
@@ -84,6 +87,11 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
           case T_TRADITIONAL:
           {
             explain_stmt->set_explain_format(EXPLAIN_TRADITIONAL);
+            opt.with_tree_line_ = true;
+          } break;
+          case T_FORMAT_OBJECT_NAME_DISPLAY:
+          {
+            explain_stmt->set_explain_format(EXPLAIN_FORMAT_OBJECT_NAME_DISPLAY);
             opt.with_tree_line_ = true;
           } break;
           case T_FORMAT_JSON:

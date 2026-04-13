@@ -120,6 +120,13 @@ public:
     return (type_ == other.type_ && cs_level_ == other.cs_level_ && cs_type_ == other.cs_type_);
   }
   OB_INLINE bool operator !=(const ObObjMeta &other) const { return !this->operator ==(other); }
+  OB_INLINE int hash(uint64_t &res, uint64_t seed) const
+  {
+    res = murmurhash(&type_, sizeof(type_), seed);
+    res = murmurhash(&cs_level_, sizeof(cs_level_), seed);
+    res = murmurhash(&cs_type_, sizeof(cs_type_), seed);
+    return OB_SUCCESS;
+  }
   // this method is inefficient, you'd better use set_tinyint() etc. instead
   OB_INLINE void set_type(const ObObjType &type)
   {
@@ -131,7 +138,8 @@ public:
                || ObExtendType == type_) {
       set_collation_level(CS_LEVEL_INVALID);
       set_collation_type(CS_TYPE_INVALID);
-    } else if (ObHexStringType == type_) {
+    } else if (ObHexStringType == type_
+               || ob_is_geometry(static_cast<ObObjType>(type_))) {
       set_collation_type(CS_TYPE_BINARY);
     } else if (ObJsonType == type_) {
       set_collation_type(CS_TYPE_UTF8MB4_BIN);
@@ -142,7 +150,6 @@ public:
                && !ob_is_lob_locator(static_cast<ObObjType>(type_))
                && !ob_is_raw(static_cast<ObObjType>(type_))
                && !ob_is_enum_or_set_type(static_cast<ObObjType>(type_))
-               && !ob_is_geometry(static_cast<ObObjType>(type_))
                && !ob_is_roaringbitmap(static_cast<ObObjType>(type_))) {
       set_collation_level(CS_LEVEL_NUMERIC);
       set_collation_type(CS_TYPE_BINARY);
@@ -297,6 +304,8 @@ public:
   OB_INLINE bool is_year() const { return type_ == static_cast<uint8_t>(ObYearType); }
   OB_INLINE bool is_date() const { return type_ == static_cast<uint8_t>(ObDateType); }
   OB_INLINE bool is_mysql_date() const { return type_ == static_cast<uint8_t>(ObMySQLDateType); }
+  OB_INLINE bool is_mysql_date_or_date() const { return is_date() || is_mysql_date(); }
+  OB_INLINE bool is_mysql_datetime_or_datetime() const { return is_datetime() || is_mysql_datetime(); }
   OB_INLINE bool is_time() const { return type_ == static_cast<uint8_t>(ObTimeType); }
   OB_INLINE bool is_timestamp_tz() const { return type_ == static_cast<uint8_t>(ObTimestampTZType); }
   OB_INLINE bool is_timestamp_ltz() const { return type_ == static_cast<uint8_t>(ObTimestampLTZType); }
@@ -452,7 +461,12 @@ public:
     return (is_user_defined_sql_type() || is_collection_sql_type() || is_decimal_int()) ? CS_TYPE_BINARY:
               static_cast<ObCollationType>((uint16_t)cs_type_ | (((uint16_t)cs_level_ & 0xF0) << 4));
   }
-
+  OB_INLINE ObCollationType get_collation_type() const {
+    // ObUserDefinedSQLType reused cs_type as part of sub schema id,
+    // ObDecimalIntType reuse cs_type as precision, therefore always return CS_TYPE_BINARY.
+    return (is_user_defined_sql_type() || is_collection_sql_type() || is_decimal_int()) ? CS_TYPE_BINARY :
+                static_cast<ObCollationType>((uint16_t)cs_type_ | (((uint16_t)cs_level_ & 0xF0) << 4) );
+  }
   OB_INLINE void set_default_collation_type() { set_collation_type(ObCharset::get_default_collation(ObCharset::get_default_charset())); }
   OB_INLINE ObCollationLevel get_collation_level() const {
     // ObUserDefinedSQLType and ObCollectionSQLType reused cs_level as part of sub schema id,
@@ -460,12 +474,7 @@ public:
     return (is_user_defined_sql_type() || is_collection_sql_type()) ? CS_LEVEL_EXPLICIT:
               static_cast<ObCollationLevel>(cs_level_ & 0x0F);
   }
-  OB_INLINE ObCollationType get_collation_type() const {
-    // ObUserDefinedSQLType reused cs_type as part of sub schema id,
-    // ObDecimalIntType reuse cs_type as precision, therefore always return CS_TYPE_BINARY.
-    return (is_user_defined_sql_type() || is_collection_sql_type() || is_decimal_int()) ? CS_TYPE_BINARY :
-                static_cast<ObCollationType>((uint16_t)cs_type_ | (((uint16_t)cs_level_ & 0xF0) << 4) );
-  }
+
   OB_INLINE ObCharsetType get_charset_type() const {
     return ObCharset::charset_type_by_coll(get_collation_type());
   }
@@ -589,6 +598,11 @@ struct ObLobId
   bool operator !=(const ObLobId &other) const;
   bool operator <(const ObLobId &other) const;
   bool operator >(const ObLobId &other) const;
+  OB_INLINE void assign(const ObLobId &other)
+  {
+    tablet_id_ = other.tablet_id_;
+    lob_id_ = other.lob_id_;
+  }
   TO_STRING_KV(K_(tablet_id), K_(lob_id));
   void reset();
   inline bool is_valid() const {return tablet_id_ != 0 && lob_id_ != 0;}
@@ -633,13 +647,15 @@ struct ObLobDataOutRowCtx
   // and this field is added later when bug is found, and may be a random value
   uint32_t reserved_;
 
-  bool is_empty_sql() const { return OpType::EMPTY_SQL == op_; }
+  bool is_append() const { return OpType::APPEND == op_; }
+  bool is_insert() const { return OpType::INSERT == op_; }
+  bool is_write() const { return OpType::WRITE == op_; }
+  bool is_erase() const { return OpType::ERASE == op_; }
   bool is_diff_v1() const { return OpType::DIFF == op_;}
   bool is_diff() const { return OpType::DIFF == op_ || OpType::DIFF_V2 == op_; }
   bool is_ext_info_log() const { return OpType::EXT_INFO_LOG == op_; }
-  bool is_valid_old_value_ext_info_log() const { return OpType::VALID_OLD_VALUE_EXT_INFO_LOG == op_; }
   bool is_valid_old_value() const { return OpType::VALID_OLD_VALUE == op_; }
-
+  bool is_valid_old_value_ext_info_log() const { return OpType::VALID_OLD_VALUE_EXT_INFO_LOG == op_; }
   int64_t get_real_chunk_size() const;
 };
 
@@ -1126,6 +1142,7 @@ public:
                                         uint32_t disk_lob_full_size,
                                         uint32_t read_snapshot_size,
                                         bool is_simple);
+  static int update_payload_size(ObString &dst, int64_t header_size, bool is_lob_v1);
 
   // interfaces for write
   // fill empty lob locator
@@ -1257,6 +1274,13 @@ public:
   bool has_lob_header_; // for observer 4.0 compatibility
 };
 
+enum class ObDocIDType : uint16_t
+{
+  INVALID = 0,
+  TABLET_SEQUENCE,
+  HIDDEN_INC_PK,
+};
+
 class ObDocId final
 {
 public:
@@ -1302,6 +1326,30 @@ public:
   uint64_t tablet_id_;
   uint64_t center_id_;
 };
+
+class ObHiddenClusteringKey final
+{
+public:
+  ObHiddenClusteringKey();
+  ObHiddenClusteringKey(const uint64_t tablet_id, const uint64_t seq_id);
+  ~ObHiddenClusteringKey() = default;
+
+  void reset();
+  bool is_valid() const;
+
+  bool operator ==(const ObHiddenClusteringKey &other) const;
+  bool operator !=(const ObHiddenClusteringKey &other) const;
+  bool operator <(const ObHiddenClusteringKey &other) const;
+  bool operator >(const ObHiddenClusteringKey &other) const;
+  static int set_hidden_clustering_key_to_string(const ObHiddenClusteringKey &hidden_clustering_key,
+                                                 ObString &str);
+
+  TO_STRING_KV(K_(tablet_id), K_(seq_id));
+public:
+  uint64_t tablet_id_;
+  uint64_t seq_id_;
+};
+
 
 class ObPqCenterId final
 {
@@ -1354,7 +1402,7 @@ struct ObObjPrintParams
     ob_obj_type_(ObNullType),
     coll_meta_(NULL)
   {}
-  TO_STRING_KV(K_(tz_info), K_(cs_type),K_(print_flags), K_(ob_obj_type));
+  TO_STRING_KV(K_(tz_info), K_(cs_type), K_(accuracy), K_(print_flags), K_(ob_obj_type));
   const ObTimeZoneInfo *tz_info_;
   ObCollationType cs_type_;
   ObAccuracy accuracy_;
@@ -1374,7 +1422,7 @@ struct ObObjPrintParams
       uint32_t refine_range_max_value_:1;
       uint32_t character_hex_safe_represent_:1;
       uint32_t binary_string_print_base64_:1;
-      uint32_t print_view_definition_:1;
+      uint32_t not_print_internal_catalog_:1;
       uint32_t reserved_:19;
     };
   };
@@ -2198,6 +2246,9 @@ public:
                         const ObObjPrintParams &params = ObObjPrintParams()) const;
   /// print as SQL VARCHAR literal
   int print_varchar_literal(char *buffer, int64_t length, int64_t &pos, const ObObjPrintParams &params = ObObjPrintParams()) const;
+  int print_varchar_literal(char *&buffer, int64_t &length,
+                            int64_t &pos, ObIAllocator &alloc,
+                            const ObObjPrintParams &params = ObObjPrintParams()) const;
   //used for enum and set
   int print_varchar_literal(const ObIArray<ObString> &type_infos, char *buffer, int64_t length, int64_t &pos) const;
   /// print as plain string
@@ -2246,6 +2297,8 @@ public:
   int hash_wy(uint64_t &res, uint64_t seed = 0) const;
   // xx hash
   int hash_xx(uint64_t &res, uint64_t seed = 0) const;
+  // murmurhash3_x86_32 hash
+  int hash_murmur3_x86_32(uint64_t &res, uint64_t seed = 0) const;
   // mysql hash
   uint64_t varchar_hash(ObCollationType cs_type, uint64_t seed = 0) const;
   uint64_t varchar_murmur_hash(ObCollationType cs_type, uint64_t seed = 0) const;
@@ -2320,6 +2373,14 @@ struct ObXxHash : public ObjHashBase
   static uint64_t hash(const void *data, uint64_t len, uint64_t seed)
   {
     return XXH64(data, static_cast<size_t>(len), seed);
+  }
+};
+
+struct ObMurmurHash3_x86_32 : public ObjHashBase
+{
+  OB_INLINE static uint64_t hash(const void *data, uint64_t len, uint64_t seed)
+  {
+    return murmurhash3_x86_32(data, static_cast<int32_t>(len), static_cast<uint32_t>(seed));
   }
 };
 
@@ -4221,11 +4282,12 @@ struct ParamFlag
                 is_boolean_(false),
                 is_batch_parameter_(0),
                 ignore_scale_check_(false),
+                need_strict_type_match_(false),
                 reserved_(0)
   { }
   TO_STRING_KV(K_(need_to_check_type), K_(need_to_check_bool_value),
                K_(expected_bool_value), K_(is_pl_mock_default_param), K_(need_to_check_extend_type), K_(is_batch_parameter),
-               K_(ignore_scale_check));
+               K_(ignore_scale_check), K_(need_strict_type_match));
   void reset();
 
   static uint32_t flag_offset_bits() { return offsetof(ParamFlag, flag_) * 8; }
@@ -4250,7 +4312,8 @@ struct ParamFlag
     uint8_t extend_flag_;
     struct {
       uint8_t ignore_scale_check_ : 1; //TRUE if plan cache can reuse by different scale numbers, FALSE otherwise
-      uint8_t reserved_ : 7;
+      uint8_t need_strict_type_match_ : 1; //TRUE if need strict type match (for pl null param)
+      uint8_t reserved_ : 6;
     };
   };
   OB_UNIS_VERSION_V(1);
@@ -4316,6 +4379,8 @@ public:
 
   OB_INLINE void set_ignore_scale_check(bool flag) { flag_.ignore_scale_check_ = flag; }
   OB_INLINE bool ignore_scale_check() const { return flag_.ignore_scale_check_; }
+  OB_INLINE void set_need_strict_type_match(bool flag) { flag_.need_strict_type_match_ = flag; }
+  OB_INLINE bool need_strict_type_match() const { return flag_.need_strict_type_match_; }
 
   OB_INLINE void set_raw_text_info(int32_t pos, int32_t len)
   {
@@ -4564,6 +4629,7 @@ class ObObjCharacterUtil
   // Utils for safe hex representation of character types.
   // Only use for the character types that supported as primary key columns.
 public:
+  static bool can_print_safe_hex_represent(const ObObj &obj);
   static int print_safe_hex_represent_oracle(const ObObj &obj, char* buf, const int64_t buf_len, int64_t& pos, const ObAccuracy &accuracy);
   static int print_safe_hex_represent_mysql(const ObObj &obj, char *buffer, int64_t length, int64_t &pos);
   static int print_safe_hex_represent(const ObObj &obj, char *buffer, int64_t length, int64_t &pos, const ObAccuracy &accuracy);

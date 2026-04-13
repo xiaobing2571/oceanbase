@@ -33,7 +33,7 @@ public:
   int64_t round0_;
   int64_t value0_;
   ObLatch lock0_;
-  obsys::ObRWLock lock_;
+  obsys::ObRWLock<> lock_;
   pthread_mutex_t mutex_;
 };
 
@@ -41,7 +41,7 @@ TestLatchStress::TestLatchStress()
   : round0_(0),
     value0_(0),
     lock0_(),
-    lock_()
+    lock_(common::ObLatchIds::TEST_LATCH_LOCK)
 {
   pthread_mutex_init(&mutex_, NULL);
 }
@@ -78,7 +78,7 @@ void TestLatchStress::run(obsys::CThread *thread, void *arg)
       //ASSERT_EQ(0, ret);
       //pthread_mutex_unlock(&mutex_);
 
-      //obsys::ObWLockGuard guard(lock_);
+      //obsys::ObWLockGuard<> guard(lock_);
       //ASSERT_EQ(OB_SUCCESS, ret);
     }
   } else {
@@ -99,7 +99,7 @@ void TestLatchStress::run(obsys::CThread *thread, void *arg)
       //ASSERT_EQ(0, ret);
       //pthread_mutex_unlock(&mutex_);
 
-      //obsys::ObRLockGuard guard(lock_);
+      //obsys::ObRLockGuard<> guard(lock_);
       //ASSERT_EQ(OB_SUCCESS, ret);
     }
   }
@@ -161,21 +161,21 @@ TEST(ObLatch, normal)
   ASSERT_EQ(OB_SUCCESS, ret);
 
   //lock timeout
-  ret = latch.wrlock(ObLatchIds::DEFAULT_MUTEX);
+  ret = latch.wrlock(ObLatchIds::TEST_LATCH_LOCK);
   ASSERT_EQ(OB_SUCCESS, ret);
-  ret = latch.wrlock(ObLatchIds::DEFAULT_MUTEX, 1);
+  ret = latch.wrlock(ObLatchIds::TEST_LATCH_LOCK, 1);
   ASSERT_EQ(OB_TIMEOUT, ret);
-  ret = latch.rdlock(ObLatchIds::DEFAULT_MUTEX, 1);
+  ret = latch.rdlock(ObLatchIds::TEST_LATCH_LOCK, 1);
   ASSERT_EQ(OB_TIMEOUT, ret);
   ret = latch.unlock();
   ASSERT_EQ(OB_SUCCESS, ret);
 
   //lock bound
   for (int64_t i = 0; i < ObLatch::MAX_READ_LOCK_CNT; ++i) {
-    ret = latch.rdlock(ObLatchIds::DEFAULT_MUTEX);
+    ret = latch.rdlock(ObLatchIds::TEST_LATCH_LOCK);
     ASSERT_EQ(OB_SUCCESS, ret);
   }
-  ret = latch.rdlock(ObLatchIds::DEFAULT_MUTEX);
+  ret = latch.rdlock(ObLatchIds::TEST_LATCH_LOCK);
   ASSERT_NE(OB_SUCCESS, ret);
   for (int64_t i = 0; i < ObLatch::MAX_READ_LOCK_CNT; ++i) {
     ret = latch.unlock();
@@ -183,10 +183,10 @@ TEST(ObLatch, normal)
   }
 
   for (int64_t i = 0; i < ObLatch::MAX_READ_LOCK_CNT; ++i) {
-    ret = latch.try_rdlock(ObLatchIds::DEFAULT_MUTEX);
+    ret = latch.try_rdlock(ObLatchIds::TEST_LATCH_LOCK);
     ASSERT_EQ(OB_SUCCESS, ret);
   }
-  ret = latch.try_rdlock(ObLatchIds::DEFAULT_MUTEX);
+  ret = latch.try_rdlock(ObLatchIds::TEST_LATCH_LOCK);
   ASSERT_NE(OB_SUCCESS, ret);
   for (int64_t i = 0; i < ObLatch::MAX_READ_LOCK_CNT; ++i) {
     ret = latch.unlock();
@@ -194,9 +194,9 @@ TEST(ObLatch, normal)
   }
 
   //just print longer than 1s log
-  ret = latch.wrlock(ObLatchIds::DEFAULT_MUTEX);
+  ret = latch.wrlock(ObLatchIds::TEST_LATCH_LOCK);
   ASSERT_EQ(OB_SUCCESS, ret);
-  ret = latch.wrlock(ObLatchIds::DEFAULT_MUTEX, ObTimeUtility::current_time() + 2000 * 1000);
+  ret = latch.wrlock(ObLatchIds::TEST_LATCH_LOCK, ObTimeUtility::current_time() + 2000 * 1000);
   ASSERT_NE(OB_SUCCESS, ret);
   ret = latch.unlock();
   ASSERT_EQ(OB_SUCCESS, ret);

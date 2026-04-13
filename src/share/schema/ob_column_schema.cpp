@@ -213,6 +213,17 @@ bool ObColumnSchemaV2::is_prefix_column() const
   return bret;
 }
 
+bool ObColumnSchemaV2::is_prefix_index_column() const
+{
+  bool bret = false;
+  if (is_hidden() && !is_generated_column()) {
+    const char *prefix_str = "__substr";
+    int64_t min_len = min(column_name_.length(), static_cast<int64_t>(strlen(prefix_str)));
+    bret = (0 == strncasecmp(get_column_name(), prefix_str, min_len));
+  }
+  return bret;
+}
+
 bool ObColumnSchemaV2::is_func_idx_column() const
 {
   bool bret = false;
@@ -787,8 +798,10 @@ int ObColumnSchemaV2::get_each_column_group_name(ObString &cg_name) const {
   /* to avoid column_name_str not end with \0, write cg_name using ObString::write*/
   char tmp_cg_name[OB_MAX_COLUMN_GROUP_NAME_LENGTH] = {'\0'};
   int32_t write_len = snprintf(tmp_cg_name, OB_MAX_COLUMN_GROUP_NAME_LENGTH, "%.*s_%.*s",
-                               static_cast<int>(sizeof(OB_COLUMN_GROUP_NAME_PREFIX)),
-                               OB_COLUMN_GROUP_NAME_PREFIX, column_name_.length(), column_name_.ptr());
+                               static_cast<int>(strlen(OB_COLUMN_GROUP_NAME_PREFIX)),
+                               OB_COLUMN_GROUP_NAME_PREFIX,
+                               column_name_.length(),
+                               column_name_.ptr());
   if (write_len < 0) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("fail to format column group_name", K(ret), K(write_len));
@@ -821,6 +834,25 @@ int ObColumnSchemaV2::is_same_collection_column(const ObColumnSchemaV2 &other, b
     }
   }
   return ret;
+}
+
+bool ObColumnSchemaV2::can_set_on_update_column_type(const common::ObObjMeta &meta_type)
+{
+  return meta_type.is_timestamp() ||
+         meta_type.is_datetime() ||
+         meta_type.is_mysql_datetime();
+}
+
+bool ObColumnSchemaV2::is_minimal_mode_related_time_column() const
+{
+  const ObObjMeta &meta_type = get_meta_type();
+  // can_set_on_update_column_type should be enough for minimal mode,
+  // but for safety, we still consider other time types here for now
+  return can_set_on_update_column_type(meta_type) ||
+         meta_type.is_time() ||
+         meta_type.is_date() ||
+         meta_type.is_otimestamp_type() ||
+         meta_type.is_mysql_date();
 }
 
 } //end of namespace schema

@@ -31,6 +31,7 @@ public:
     SEQ_TYPE_MAX,
   };
   ObMacroSeqParam() : seq_type_(SEQ_TYPE_MAX), start_(0), interval_(0), step_(0) {}
+  void reset();
   bool is_valid() const;
   TO_STRING_KV(K_(seq_type), K_(start), K_(interval), K_(step));
 
@@ -45,6 +46,7 @@ class ObMacroSeqGenerator
 public:
   ObMacroSeqGenerator() {}
   virtual ~ObMacroSeqGenerator() {}
+  virtual void reset() = 0;
   virtual int init(const ObMacroSeqParam &seq_param) = 0;
   virtual int get_next(int64_t &seq_val) = 0;
   virtual int preview_next(const int64_t current_val, int64_t &next_val) const = 0;
@@ -57,6 +59,7 @@ class ObMacroIncSeqGenerator: public ObMacroSeqGenerator
 public:
   ObMacroIncSeqGenerator() : is_inited_(false), start_(0), current_(-1), seq_threshold_(0) {}
   virtual ~ObMacroIncSeqGenerator() {}
+  virtual void reset() override;
   virtual int init(const ObMacroSeqParam &seq_param) override;
   virtual int get_next(int64_t &seq_val) override;
   virtual int preview_next(const int64_t current_val, int64_t &next_val) const override;
@@ -74,6 +77,7 @@ class ObMacroSkipSeqGenerator: public ObMacroSeqGenerator
 public:
   ObMacroSkipSeqGenerator() : ddl_seq_generator_() {}
   virtual ~ObMacroSkipSeqGenerator() {}
+  virtual void reset() override;
   virtual int init(const ObMacroSeqParam &seq_param) override;
   virtual int get_next(int64_t &seq_val) override;
   virtual int preview_next(const int64_t current_val, int64_t &next_val) const override;

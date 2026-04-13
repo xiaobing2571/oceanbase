@@ -98,17 +98,16 @@ class ObILibCacheNode
 friend class ObLCNodeFactory;
 public:
   ObILibCacheNode(ObPlanCache *lib_cache, lib::MemoryContext &mem_context)
-    : mem_context_(mem_context),
+    : id_(OB_INVALID_ID),
+      mem_context_(mem_context),
       allocator_(mem_context->get_safe_arena_allocator()),
-      rwlock_(),
+      rwlock_(common::ObLatchIds::OB_ILIB_CACHE_NODE_LOCK),
       ref_count_(0),
       lib_cache_(lib_cache),
       co_list_lock_(common::ObLatchIds::PLAN_SET_LOCK),
       co_list_(allocator_),
       is_invalid_(false)
-  {
-    lock_timeout_ts_ = GCONF.large_query_threshold;
-  }
+  {}
   virtual ~ObILibCacheNode();
   /**
    * @brief initialize library cache node
@@ -149,7 +148,7 @@ public:
    * @return if success, return OB_SUCCESS, otherwise, return errno
    */
   //int erase_cache_obj(ObILibCacheCtx &context, ObILibCacheObject *cache_obj);
-  virtual int lock(bool is_rdlock);
+  virtual int lock(bool is_rdlock, int64_t timeout);
   virtual int update_node_stat(ObILibCacheCtx &ctx);
   StmtStat *get_node_stat() { return &node_stat_; }
   int unlock() { return rwlock_.unlock(); }
@@ -163,13 +162,9 @@ public:
   ObPlanCache *get_lib_cache() const { return lib_cache_; }
   bool is_invalid() const { return is_invalid_; }
 
-  VIRTUAL_TO_STRING_KV(K_(ref_count), K_(lock_timeout_ts));
+  VIRTUAL_TO_STRING_KV(K_(ref_count));
 
 protected:
-  void set_lock_timeout_threshold(int64_t threshold)
-  {
-    lock_timeout_ts_ = threshold;
-  }
   /**
    * @brief called by get_cache_obj(), each object in the ObLibCacheNameSpace enumeration structure
    * needs to inherit this interface and implement its own inner get implementation
@@ -200,7 +195,8 @@ protected:
    * @return if success, return OB_SUCCESS, otherwise, return errno
    */
   virtual int before_cache_evicted();
-
+public:
+  uint64_t id_;
 protected:
   lib::MemoryContext mem_context_;
   // Note: all memory allocations in ObILibCacheNode can only use allocator_, when the ObILibCacheNode
@@ -208,7 +204,6 @@ protected:
   common::ObIAllocator &allocator_;
   common::TCRWLock rwlock_;
   int64_t ref_count_;
-  int64_t lock_timeout_ts_;
   StmtStat node_stat_;
   ObPlanCache *lib_cache_;
   common::SpinRWLock co_list_lock_;

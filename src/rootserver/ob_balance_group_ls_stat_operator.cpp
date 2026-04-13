@@ -19,6 +19,8 @@
 #include "share/location_cache/ob_location_service.h" // ObLocationService
 #include "rootserver/ob_root_service.h"
 #include "rootserver/ob_primary_ls_service.h" // ObDupLSCreateHelper
+#include "share/schema/ob_latest_schema_guard.h"
+#include "storage/tablet/ob_session_tablet_info_map.h"
 
 namespace oceanbase
 {
@@ -75,7 +77,7 @@ ObBalanceGroupLSStatOperator::~ObBalanceGroupLSStatOperator()
 }
 
 int ObBalanceGroupLSStatOperator::init(
-    common::ObMySQLProxy *sql_proxy)
+    common::ObISQLClient *sql_proxy)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(inited_)) {
@@ -478,7 +480,7 @@ int ObBalanceGroupLSStatOperator::generate_insert_update_sql(
 ObNewTableTabletAllocator::ObNewTableTabletAllocator(
     const uint64_t tenant_id,
     share::schema::ObSchemaGetterGuard &schema_guard,
-    common::ObMySQLProxy *sql_proxy,
+    common::ObISQLClient *sql_proxy,
     const bool use_parallel_ddl /*= false*/,
     const share::schema::ObTableSchema *data_table_schema /*nullptr*/)
   : tenant_id_(tenant_id),
@@ -522,7 +524,8 @@ int ObNewTableTabletAllocator::prepare(
     ObMySQLTransaction &trans,
     const share::schema::ObTableSchema &table_schema,
     const share::schema::ObTablegroupSchema *tablegroup_schema,
-    bool is_add_partition)
+    bool is_add_partition,
+    share::schema::ObLatestSchemaGuard *latest_schema_guard /* NULL*/)
 {
   int ret = OB_SUCCESS;
   is_add_partition_ = is_add_partition;
@@ -576,7 +579,7 @@ int ObNewTableTabletAllocator::prepare(
         if (OB_ISNULL(tablegroup_schema)) {
           ret = OB_INVALID_ARGUMENT;
           LOG_WARN("tablegroup_schema is null", KR(ret), K(table_schema));
-        } else if (OB_FAIL(alloc_ls_for_in_tablegroup_tablet(table_schema, *tablegroup_schema))) {
+        } else if (OB_FAIL(alloc_ls_for_in_tablegroup_tablet(table_schema, *tablegroup_schema, latest_schema_guard))) {
           LOG_WARN("fail to alloc ls for in tablegroup tablet", KR(ret));
         }
       } else {
@@ -632,6 +635,54 @@ int ObNewTableTabletAllocator::prepare_like(
   return ret;
 }
 
+int ObNewTableTabletAllocator::prepare_for_oracle_temp_table(
+  ObMySQLTransaction &trans,
+  const share::schema::ObTableSchema &table_schema,
+  const share::schema::ObTablegroupSchema *tablegroup_schema,
+  const storage::ObSessionTabletInfo &data_table_info,
+  share::schema::ObLatestSchemaGuard *latest_schema_guard)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not init", KR(ret));
+  } else if (OB_UNLIKELY(!table_schema.is_oracle_tmp_table_v2()
+                      && !table_schema.is_oracle_tmp_table_v2_index_table())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("table is not oracle temp table v2 or oracle temp table v2 index table", KR(ret), K(table_schema));
+  } else if (MyStatus::WAIT_TO_PREPARE != status_) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("NewTableTabletAllocator state not match", KR(ret), K(status_));
+  } else if (table_schema.is_oracle_tmp_table_v2_index_table()) {
+    if (OB_FAIL(alloc_ls_for_local_index_tablet(table_schema, &data_table_info))) {
+      LOG_WARN("fail to alloc ls for oracle tmp table v2 index table", KR(ret), K(data_table_info), K(table_schema));
+    }
+  } else if (OB_INVALID_ID != table_schema.get_tablegroup_id()) {
+    if (OB_ISNULL(tablegroup_schema)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("tablegroup_schema is null", KR(ret), K(table_schema));
+    } else if (OB_FAIL(alloc_ls_for_in_tablegroup_tablet(table_schema, *tablegroup_schema, latest_schema_guard))) {
+      LOG_WARN("fail to alloc ls for in tablegroup tablet", KR(ret));
+    }
+  } else {
+    if (OB_FAIL(alloc_ls_for_normal_table_tablet(table_schema))) {
+      LOG_WARN("fail to alloc ls for normal table tablet", KR(ret));
+    }
+  }
+  DEBUG_SYNC(BEFORE_LOCK_LS_WHEN_CREATE_TABLE);
+  // If ls status is not normal or is blocking tablet in, choose new ls for tablet creating.
+  if (OB_FAIL(ret)) {
+  } else if (is_related_table(table_schema.get_table_type(), table_schema.get_index_type())) {
+    // skip lock ls
+  } else if (OB_FAIL(check_and_replace_ls_(trans, table_schema.get_tenant_id()))) {
+    LOG_WARN("lock user ls failed", KR(ret),
+             "tenant_id", table_schema.get_tenant_id(), K_(ls_id_array));
+  }
+  if (OB_SUCC(ret)) {
+    status_ = MyStatus::WAIT_TO_OUTPUT;
+  }
+  return ret;
+}
 int ObNewTableTabletAllocator::get_ls_id_array(
     common::ObIArray<share::ObLSID> &ls_id_array)
 {
@@ -688,7 +739,8 @@ int ObNewTableTabletAllocator::get_tablet_id_array(
 }
 
 int ObNewTableTabletAllocator::alloc_tablet_by_primary_schema(
-    const share::schema::ObTableSchema &table_schema)
+    const share::schema::ObTableSchema &table_schema,
+    const storage::ObSessionTabletInfo *data_table_info)
 {
   int ret = OB_SUCCESS;
   LOG_INFO("alloc tablet by primary schema",
@@ -700,6 +752,13 @@ int ObNewTableTabletAllocator::alloc_tablet_by_primary_schema(
   } else if (OB_UNLIKELY(nullptr == sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("sql_proxy_ ptr is null", KR(ret));
+  } else if (table_schema.is_oracle_tmp_table_v2()) {
+    if (OB_ISNULL(data_table_info)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("data_table_info is null", KR(ret), KPC(data_table_info));
+    } else if (OB_FAIL(ls_id_array_.push_back(data_table_info->ls_id_))) {
+      LOG_WARN("fail to push back", KR(ret), K(data_table_info->ls_id_));
+    }
   } else {
     common::ObArray<common::ObTabletID> tablet_id_array;
     if (OB_FAIL(get_tablet_id_array(table_schema, tablet_id_array))) {
@@ -898,13 +957,15 @@ int ObNewTableTabletAllocator::alloc_tablet_for_add_balance_group(
     } else {
       lib::ob_sort(final_ls_stat_array.begin(), final_ls_stat_array.end());
       for (int64_t alloc_seq = 0; OB_SUCC(ret) && alloc_seq < total_alloc_num; alloc_seq++) {
-        int64_t min_ls_tg_idx = 0;
-        int64_t min_ls_tg_cnt = final_ls_stat_array.at(0).get_tablet_group_count();
-        // find min
+        const int64_t start_idx = fetch_ls_offset() % final_ls_stat_array.count();
+        int64_t min_ls_tg_idx = start_idx;
+        int64_t min_ls_tg_cnt = final_ls_stat_array.at(start_idx).get_tablet_group_count();
+        // find min with rotation to avoid always choosing the same ls when multiple values are the same
         for (int64_t i = 1; OB_SUCC(ret) && i < final_ls_stat_array.count(); ++i) {
-          ObBalanceGroupLSStat &bg_ls_stat = final_ls_stat_array.at(i);
+          const int64_t idx = (start_idx + i) % final_ls_stat_array.count();
+          ObBalanceGroupLSStat &bg_ls_stat = final_ls_stat_array.at(idx);
           if (bg_ls_stat.get_tablet_group_count() < min_ls_tg_cnt) {
-            min_ls_tg_idx = i;
+            min_ls_tg_idx = idx;
             min_ls_tg_cnt = bg_ls_stat.get_tablet_group_count();
           }
         }
@@ -1216,7 +1277,8 @@ int ObNewTableTabletAllocator::alloc_ls_for_sys_tablet(
 }
 
 int ObNewTableTabletAllocator::alloc_ls_for_local_index_tablet(
-    const share::schema::ObTableSchema &index_schema)
+    const share::schema::ObTableSchema &index_schema,
+    const storage::ObSessionTabletInfo *data_table_info)
 {
   int ret = OB_SUCCESS;
   LOG_INFO("alloc ls for local index tablet",
@@ -1249,7 +1311,7 @@ int ObNewTableTabletAllocator::alloc_ls_for_local_index_tablet(
       ret = OB_TABLE_NOT_EXIST;
       LOG_WARN("table not exist", KR(ret), K(data_table_id));
     } else if (OB_FAIL(alloc_tablet_by_primary_schema(
-            *table_schema))) {
+            *table_schema, data_table_info))) {
       LOG_WARN("fail to alloc tablet by guard", KR(ret), K(data_table_id));
     }
   }
@@ -1275,7 +1337,8 @@ int ObNewTableTabletAllocator::alloc_ls_for_global_index_tablet(
 
 int ObNewTableTabletAllocator::alloc_ls_for_in_tablegroup_tablet(
     const share::schema::ObTableSchema &table_schema,
-    const share::schema::ObTablegroupSchema &tablegroup_schema)
+    const share::schema::ObTablegroupSchema &tablegroup_schema,
+    share::schema::ObLatestSchemaGuard *latest_schema_guard /* = NULL */)
 {
   int ret = OB_SUCCESS;
   LOG_INFO("alloc ls for in tablegroup tablet",
@@ -1313,11 +1376,22 @@ int ObNewTableTabletAllocator::alloc_ls_for_in_tablegroup_tablet(
     }
   } else {
     common::ObArray<const share::schema::ObTableSchema *> table_schema_array;
-    if (OB_FAIL(schema_guard_.get_table_schemas_in_tablegroup(
+    /*
+    scene of using latest_schema_guard:
+      When multiple tables are created in a DDL transaction, ObSchemaGetterGuard cannot obtain the latest schema,
+      causing the partition distribution of each table not comply with the constraints of tablegroup.
+    */
+    if (OB_ISNULL(latest_schema_guard) && OB_FAIL(schema_guard_.get_table_schemas_in_tablegroup(
             tenant_id_,
             tablegroup_schema.get_tablegroup_id(),
             table_schema_array))) {
       LOG_WARN("fail to get table schemas in tablegroup", KR(ret),
+               "tenant_id", tenant_id_,
+               "tablegroup_id", tablegroup_schema.get_tablegroup_id());
+    } else if (OB_NOT_NULL(latest_schema_guard) && OB_FAIL(latest_schema_guard->get_table_schemas_in_tablegroup(
+                  tablegroup_schema.get_tablegroup_id(),
+                  table_schema_array))) {
+      LOG_WARN("fail to get latest table schemas in tablegroup", KR(ret),
                "tenant_id", tenant_id_,
                "tablegroup_id", tablegroup_schema.get_tablegroup_id());
     } else if (table_schema_array.count() > 0) {
@@ -1325,8 +1399,16 @@ int ObNewTableTabletAllocator::alloc_ls_for_in_tablegroup_tablet(
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("table schema ptr is null", KR(ret), K(table_schema_array));
       } else if (!is_add_partition_ || tablegroup_schema.get_sharding() == OB_PARTITION_SHARDING_NONE) {
-        if (OB_FAIL(alloc_tablet_for_tablegroup(*table_schema_array.at(0), table_schema, tablegroup_schema))) {
-          LOG_WARN("fail to alloc tablet for tablegroup", KR(ret), K(is_add_partition_), K(tablegroup_schema), K(*table_schema_array.at(0)), K(table_schema));
+        if (table_schema_array.at(0)->get_table_id() == table_schema.get_table_id()) {
+          // In the scene of creating multi tables in one ddl transaction,
+          // the schema of the creating table will be getted by latest schema guard
+          if (OB_FAIL(alloc_tablet_for_tablegroup(table_schema, tablegroup_schema))) {
+            LOG_WARN("fail to alloc tablet for tablegroup", KR(ret), K(table_schema));
+          }
+        } else {
+          if (OB_FAIL(alloc_tablet_for_tablegroup(*table_schema_array.at(0), table_schema, tablegroup_schema))) {
+            LOG_WARN("fail to alloc tablet for tablegroup", KR(ret), K(is_add_partition_), K(tablegroup_schema), K(*table_schema_array.at(0)), K(table_schema));
+          }
         }
       } else if (tablegroup_schema.get_sharding() == OB_PARTITION_SHARDING_ADAPTIVE) {
         // add partition for tablegroup table may break the constraint of sharding ADAPTIVE

@@ -86,6 +86,7 @@ int ObPxTransmitOpInput::get_self_sqc_info(ObDtlSqcInfo &sqc_info)
 int ObPxTransmitOpInput::get_data_ch(ObPxTaskChSet &task_ch_set, int64_t timeout_ts, ObDtlChTotalInfo *&ch_info)
 {
   int ret = OB_SUCCESS;
+  common::ScopedTimer timer(ObMetricId::WAIT_CHANNEL_INFO_COST);
   ObPxSQCProxy *ch_provider = reinterpret_cast<ObPxSQCProxy *>(ch_provider_ptr_);
   if (OB_ISNULL(ch_provider)) {
     ret = OB_NOT_INIT;
@@ -100,7 +101,7 @@ int ObPxTransmitOpInput::get_data_ch(ObPxTaskChSet &task_ch_set, int64_t timeout
 OB_SERIALIZE_MEMBER((ObPxTransmitSpec, ObTransmitSpec),
     sample_type_, need_null_aware_shuffle_, tablet_id_expr_,
     random_expr_, sampling_saving_row_, repartition_table_id_,
-    wf_hybrid_aggr_status_expr_, wf_hybrid_pby_exprs_cnt_array_, ddl_slice_id_expr_);
+    wf_hybrid_aggr_status_expr_, wf_hybrid_pby_exprs_cnt_array_, ddl_slice_id_expr_, real_trans_exprs_);
 
 ObPxTransmitSpec::ObPxTransmitSpec(ObIAllocator &alloc, const ObPhyOperatorType type)
     : ObTransmitSpec(alloc, type),
@@ -112,7 +113,9 @@ ObPxTransmitSpec::ObPxTransmitSpec(ObIAllocator &alloc, const ObPhyOperatorType 
       repartition_table_id_(0),
       wf_hybrid_aggr_status_expr_(NULL),
       wf_hybrid_pby_exprs_cnt_array_(alloc),
-      ddl_slice_id_expr_(NULL)
+      ddl_slice_id_expr_(NULL),
+      dfo_expr_frame_info_(NULL),
+      real_trans_exprs_(alloc)
 {
 }
 
@@ -176,8 +179,28 @@ int ObPxTransmitOp::inner_open()
   // 所以如果inner_open里面嵌套了get_next_row，则opened_ flag就没有设置，这样在drain逻辑里面就会一直open
   // 导致函数栈溢出core掉
   opened_ = true;
+  ObPxTask *task_ptr = nullptr;
+  ctx_.get_sqc_handler()->get_sqc_ctx().get_task(ctx_.get_px_task_id(), task_ptr);
+  if (OB_NOT_NULL(task_ptr)) {
+    SET_METRIC_VAL(ObMetricId::PX_DISPATCH_TASK_COST, task_ptr->dispatch_task_cost_);
+    SET_METRIC_VAL(ObMetricId::PX_WORKER_PREPARE_COST, task_ptr->px_worker_prepare_cost_);
+  }
+  if (ctx_.get_px_task_id() == 0) {
+    const ObPxSqcMetrics &sqc_metrics = ctx_.get_sqc_handler()->get_sqc_metrics();
+    // record sqc metric to the first worker
+    SET_METRIC_VAL(ObMetricId::SQC_DESERIALIZE_COST, sqc_metrics.sqc_des_cost_);
+    // for fast init sqc we can not access rpc process time here
+    SET_METRIC_VAL(ObMetricId::SQC_RPC_PROCESS_COST,
+                   sqc_metrics.sqc_rpc_process_cost_);
+    if (sqc_metrics.sqc_rpc_after_cost_ > 0) {
+      SET_METRIC_VAL(ObMetricId::SQC_RPC_AFTER_PROCESS_COST,
+                     sqc_metrics.sqc_rpc_after_cost_);
+    }
+  }
   ObPxTransmitOpInput *trans_input = static_cast<ObPxTransmitOpInput*>(input_);
   metric_.set_id(get_spec().id_);
+  const ObPxTransmitSpec &spec = static_cast<const ObPxTransmitSpec &>(get_spec());
+  const ObIArray<ObExpr *> &trans_exprs = spec.real_trans_exprs_.count() > 0 ? spec.real_trans_exprs_ : spec.output_;
   if (OB_ISNULL(child_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("child op is NULL", K(ret));
@@ -188,11 +211,11 @@ int ObPxTransmitOp::inner_open()
     LOG_WARN("initialize operator context failed", K(ret));
   } else {
     if (get_spec().use_rich_format_) {
-      if (OB_FAIL(init_data_msg_type(get_spec().output_))) {
+      if (OB_FAIL(init_data_msg_type(trans_exprs))) {
         LOG_WARN("init data_msg_type failed", K(ret));
       } else if (OB_FAIL(params_.init_basic_params(get_spec().max_batch_size_,
                   task_channels_.count(),
-                  get_spec().output_.count(),
+                  trans_exprs.count(),
                   px_row_allocator_,
                   ctx_))) {
         LOG_WARN("failed to init basic params", K(ret));
@@ -201,7 +224,14 @@ int ObPxTransmitOp::inner_open()
     rand48_buf_[0] = 0x330E; // 0x330E is the arbitrary value of srand48
     rand48_buf_[1] = trans_input->get_sqc_id();
     rand48_buf_[2] = trans_input->get_task_id();
-    OZ(params_.meta_.init(get_spec().output_, 0, params_.reorder_fixed_expr_));
+
+    if ((ctx_.get_physical_plan_ctx()->get_phy_plan()->get_min_cluster_version() >= MOCK_CLUSTER_VERSION_4_3_5_3 &&
+         ctx_.get_physical_plan_ctx()->get_phy_plan()->get_min_cluster_version() < CLUSTER_VERSION_4_4_0_0) ||
+        ctx_.get_physical_plan_ctx()->get_phy_plan()->get_min_cluster_version() >= CLUSTER_VERSION_4_4_1_0) {
+      OZ(params_.meta_.init(trans_exprs, 0, params_.reorder_fixed_expr_, &px_row_allocator_));
+    } else {
+      OZ(params_.meta_.init(trans_exprs, 0, params_.reorder_fixed_expr_));
+    }
     if (is_object_sample()) {
       OZ(init_channel(*trans_input));
       OZ(set_expect_range_count());
@@ -211,6 +241,8 @@ int ObPxTransmitOp::inner_open()
       OZ(init_channel(*trans_input));
     }
     chs_agent_.set_row_meta(params_.meta_);
+    chs_agent_.set_plan_min_cluster_version(ctx_.get_physical_plan_ctx()->
+      get_phy_plan()->get_min_cluster_version());
     if (OB_SUCC(ret) && get_spec().use_rich_format_) {
       if (dtl::ObDtlMsgType::PX_VECTOR_FIXED == data_msg_type_) {
         int64_t size_per_buffer = GCONF.dtl_buffer_size;
@@ -221,7 +253,7 @@ int ObPxTransmitOp::inner_open()
       }
       if (OB_FAIL(params_.init_keep_order_params(get_spec().max_batch_size_,
                                                  task_channels_.count(),
-                                                 get_spec().output_.count(),
+                                                 trans_exprs.count(),
                                                  px_row_allocator_))) {
         LOG_WARN("failed to init keep order params", K(ret));
       }
@@ -232,7 +264,9 @@ int ObPxTransmitOp::inner_open()
 
 int ObPxTransmitOp::transmit()
 {
+  ObProfileSwitcher switcher(op_monitor_info_.profile_);
   begin_cpu_time_counting();
+  ASH_ITEM_ATTACH_GUARD(plan_line_id, spec_.id_);
   int ret = do_transmit();
   end_cpu_time_counting();
   return ret;
@@ -402,6 +436,7 @@ int ObPxTransmitOp::init_channel(ObPxTransmitOpInput &trans_input)
         ch->set_operator_owner();
         ch->set_thread_id(thread_id);
         ch->set_row_meta(params_.meta_);
+        ch->plan_min_cluster_version_ = min_cluster_version;
       }
       LOG_TRACE("Transmit channel", K(ch), KP(ch->get_id()), K(ch->get_peer()));
     }
@@ -708,7 +743,9 @@ void ObPxTransmitOp::fill_batch_ptrs_fixed(const int64_t *indexes)
       }
     }
   }
-  for (int64_t col_idx = 0; col_idx < get_spec().output_.count(); ++col_idx) {
+  const ObPxTransmitSpec &spec = static_cast<const ObPxTransmitSpec &>(get_spec());
+  const ObIArray<ObExpr *> &trans_exprs = spec.real_trans_exprs_.count() > 0 ? spec.real_trans_exprs_ : spec.output_;
+  for (int64_t col_idx = 0; col_idx < trans_exprs.count(); ++col_idx) {
     int64_t fixed_len = params_.column_lens_[col_idx];
     switch (params_.vectors_.at(col_idx)->get_format()) {
       case VEC_FIXED : {
@@ -807,7 +844,9 @@ void ObPxTransmitOp::fill_batch_ptrs_fixed(ObSliceIdxCalc::SliceIdxFlattenArray 
     // 使用fallback_array_来作为后面每行进行fallbacl时结尾的下标数组，和slice_idx_flatten_array一块进行fallback操作
     params_.fallback_array_[i] = params_.fallback_cnt_;
   }
-  for (int64_t col_idx = 0; col_idx < get_spec().output_.count(); ++col_idx) {
+  const ObPxTransmitSpec &spec = static_cast<const ObPxTransmitSpec &>(get_spec());
+  const ObIArray<ObExpr *> &trans_exprs = spec.real_trans_exprs_.count() > 0 ? spec.real_trans_exprs_ : spec.output_;
+  for (int64_t col_idx = 0; col_idx < trans_exprs.count(); ++col_idx) {
     int64_t fixed_len = params_.column_lens_[col_idx];
     switch (params_.vectors_.at(col_idx)->get_format()) {
       case VEC_FIXED : {
@@ -890,7 +929,9 @@ void ObPxTransmitOp::fill_broad_cast_ptrs_fixed(int64_t slice_idx)
       params_.selector_array_[params_.selector_cnt_++] = i;
     }
   }
-  for (int64_t col_idx = 0; col_idx < get_spec().output_.count(); ++col_idx) {
+  const ObPxTransmitSpec &spec = static_cast<const ObPxTransmitSpec &>(get_spec());
+  const ObIArray<ObExpr *> &trans_exprs = spec.real_trans_exprs_.count() > 0 ? spec.real_trans_exprs_ : spec.output_;
+  for (int64_t col_idx = 0; col_idx < trans_exprs.count(); ++col_idx) {
     int64_t fixed_len = params_.column_lens_[col_idx];
     switch (params_.vectors_.at(col_idx)->get_format()) {
       case VEC_FIXED : {
@@ -1097,9 +1138,11 @@ int ObPxTransmitOp::keep_order_send_batch(ObEvalCtx::BatchInfoScopeGuard &batch_
   ObObj tablet_id; //not used
   params_.fallback_cnt_ = 0;
   params_.selector_cnt_ = 0;
+  const ObPxTransmitSpec &spec = static_cast<const ObPxTransmitSpec &>(get_spec());
+  const ObIArray<ObExpr *> &trans_exprs = spec.real_trans_exprs_.count() > 0 ? spec.real_trans_exprs_ : spec.output_;
   if (params_.vectors_.empty()) {
-    for (int64_t i = 0; OB_SUCC(ret) && i < get_spec().output_.count(); ++i) {
-      OZ (params_.vectors_.push_back(get_spec().output_.at(i)->get_vector(eval_ctx_)));
+    for (int64_t i = 0; OB_SUCC(ret) && i < trans_exprs.count(); ++i) {
+      OZ (params_.vectors_.push_back(trans_exprs.at(i)->get_vector(eval_ctx_)));
     }
   }
   if (OB_FAIL(ret)) {
@@ -1117,7 +1160,7 @@ int ObPxTransmitOp::keep_order_send_batch(ObEvalCtx::BatchInfoScopeGuard &batch_
         for (int64_t i = 0; i < params_.selector_cnt_; ++i) {
           params_.return_rows_[i]->set_row_size(params_.row_size_array_[params_.selector_array_[i]]);
         }
-        for (int64_t idx = 0; OB_SUCC(ret) && idx < get_spec().output_.count(); ++idx) {
+        for (int64_t idx = 0; OB_SUCC(ret) && idx < trans_exprs.count(); ++idx) {
           ret = params_.vectors_.at(idx)->to_rows(params_.meta_, params_.return_rows_,
                                 params_.selector_array_, params_.selector_cnt_, idx);
         }
@@ -1160,7 +1203,7 @@ int ObPxTransmitOp::keep_order_send_batch(ObEvalCtx::BatchInfoScopeGuard &batch_
         for (int64_t i = 0; i < params_.selector_cnt_; ++i) {
           params_.return_rows_[i]->set_row_size(params_.row_size_array_[params_.selector_array_[i]]);
         }
-        for (int64_t idx = 0; OB_SUCC(ret) && idx < get_spec().output_.count(); ++idx) {
+        for (int64_t idx = 0; OB_SUCC(ret) && idx < trans_exprs.count(); ++idx) {
           ret = params_.vectors_.at(idx)->to_rows(params_.meta_, params_.return_rows_,
                                 params_.selector_array_, params_.selector_cnt_, idx);
         }
@@ -1215,9 +1258,11 @@ int ObPxTransmitOp::keep_order_send_batch_fixed(ObEvalCtx::BatchInfoScopeGuard &
   ObObj tablet_id; //not used
   params_.fallback_cnt_ = 0;
   params_.selector_cnt_ = 0;
+  const ObPxTransmitSpec &spec = static_cast<const ObPxTransmitSpec &>(get_spec());
+  const ObIArray<ObExpr *> &trans_exprs = spec.real_trans_exprs_.count() > 0 ? spec.real_trans_exprs_ : spec.output_;
   if (params_.vectors_.empty()) {
-    for (int64_t i = 0; OB_SUCC(ret) && i < get_spec().output_.count(); ++i) {
-      OZ (params_.vectors_.push_back(get_spec().output_.at(i)->get_vector(eval_ctx_)));
+    for (int64_t i = 0; OB_SUCC(ret) && i < trans_exprs.count(); ++i) {
+      OZ (params_.vectors_.push_back(trans_exprs.at(i)->get_vector(eval_ctx_)));
     }
   }
   if (OB_FAIL(ret)) {
@@ -1248,10 +1293,10 @@ int ObPxTransmitOp::keep_order_send_batch_fixed(ObEvalCtx::BatchInfoScopeGuard &
               (task_channels_.at(slice_idx))->get_vector_fixed_msg_writer().get_header(0);
             if (nullptr != params_.fixed_payload_headers_[slice_idx]) {
               if (!params_.offset_inited_) {
-                for (int64_t i = 1; i < get_spec().output_.count(); ++i) {
+                for (int64_t i = 1; i < trans_exprs.count(); ++i) {
                   params_.column_offsets_[i] = row_writer.get_header(i) - row_writer.get_header(0);
                 }
-                for (int64_t i = 0; i < get_spec().output_.count(); ++i) {
+                for (int64_t i = 0; i < trans_exprs.count(); ++i) {
                   params_.column_lens_[i] = row_writer.get_fixed_len(i);
                 }
                 params_.offset_inited_ = true;
@@ -1292,10 +1337,10 @@ int ObPxTransmitOp::keep_order_send_batch_fixed(ObEvalCtx::BatchInfoScopeGuard &
                 (task_channels_.at(slice_idx))->get_vector_fixed_msg_writer().get_header(0);
               if (nullptr != params_.fixed_payload_headers_[slice_idx]) {
                 if (!params_.offset_inited_) {
-                  for (int64_t k = 1; k < get_spec().output_.count(); ++k) {
+                  for (int64_t k = 1; k < trans_exprs.count(); ++k) {
                     params_.column_offsets_[k] = row_writer.get_header(k) - row_writer.get_header(0);
                   }
-                  for (int64_t k = 0; k < get_spec().output_.count(); ++k) {
+                  for (int64_t k = 0; k < trans_exprs.count(); ++k) {
                     params_.column_lens_[k] = row_writer.get_fixed_len(k);
                   }
                   params_.offset_inited_ = true;
@@ -1354,6 +1399,8 @@ int ObPxTransmitOp::send_row(int64_t slice_idx,
   if (OB_FAIL(try_wait_channel())) {
     LOG_WARN("failed to wait channel init", K(ret));
   } else {
+    const ObPxTransmitSpec &spec = static_cast<const ObPxTransmitSpec &>(get_spec());
+    const ObIArray<ObExpr *> &trans_exprs = spec.real_trans_exprs_.count() > 0 ? spec.real_trans_exprs_ : spec.output_;
     if (ObSliceIdxCalc::DEFAULT_CHANNEL_IDX_TO_DROP_ROW == slice_idx) {
       op_monitor_info_.otherstat_1_value_++;
       op_monitor_info_.otherstat_1_id_ = ObSqlMonitorStatIds::EXCHANGE_DROP_ROW_COUNT;
@@ -1371,7 +1418,7 @@ int ObPxTransmitOp::send_row(int64_t slice_idx,
           ObDtlVectorFixedMsgWriter &fixed_writer = channel->get_vector_fixed_msg_writer();
           if (!fixed_writer.is_inited()) {
             is_send_row_normal = true;
-          } else if (OB_FAIL(fixed_writer.append_row(spec.output_, vector_row_idx, eval_ctx_))) {
+          } else if (OB_FAIL(fixed_writer.append_row(trans_exprs, vector_row_idx, eval_ctx_))) {
             if (OB_BUF_NOT_ENOUGH != ret) {
               LOG_WARN("failed to append row", K(ret));
             } else {
@@ -1395,7 +1442,7 @@ int ObPxTransmitOp::send_row(int64_t slice_idx,
             ObDtlVectorRowMsgWriter &row_writer = channel->get_vector_row_writer();
             if (!row_writer.is_inited()) {
               is_send_row_normal = true;
-            } else if (OB_FAIL(row_writer.try_append_row(spec.output_, eval_ctx_))) {
+            } else if (OB_FAIL(row_writer.try_append_row(trans_exprs, eval_ctx_))) {
               if (OB_BUF_NOT_ENOUGH != ret) {
                 LOG_WARN("failed to append row", K(ret));
               } else {
@@ -1419,7 +1466,7 @@ int ObPxTransmitOp::send_row(int64_t slice_idx,
         if (NULL != spec.tablet_id_expr_) {
           update_row(spec.tablet_id_expr_, tablet_id);
         }
-        if (OB_FAIL(blk_buf.append_row(spec.output_, &eval_ctx_, 0, vector_row_idx))) {
+        if (OB_FAIL(blk_buf.append_row(trans_exprs, &eval_ctx_, 0, vector_row_idx))) {
           if (OB_BUF_NOT_ENOUGH != ret) {
             SQL_DTL_LOG(WARN, "failed to add row", K(ret));
           } else {
@@ -1467,7 +1514,9 @@ int ObPxTransmitOp::send_row_normal(int64_t slice_idx,
     if (NULL != spec.tablet_id_expr_ && !has_set_tablet_id_vector_) {
       update_row(spec.tablet_id_expr_, tablet_id);
     }
-    ObPxNewRow px_row(get_spec().output_, vector_row_idx, data_msg_type_);
+    const ObPxTransmitSpec &spec = static_cast<const ObPxTransmitSpec &>(get_spec());
+    const ObIArray<ObExpr *> &trans_exprs = spec.real_trans_exprs_.count() > 0 ? spec.real_trans_exprs_ : spec.output_;
+    ObPxNewRow px_row(trans_exprs, vector_row_idx, data_msg_type_);
     if (OB_FAIL(ch->send(px_row, phy_plan_ctx->get_timeout_timestamp(), &eval_ctx_))) {
       if (OB_ITER_END != ret) {
         LOG_WARN("fail send row to slice channel", K(px_row), K(slice_idx), K(ret));
@@ -1730,6 +1779,7 @@ int ObPxTransmitOp::wait_channel_ready_msg()
 int ObPxTransmitOp::try_wait_channel()
 {
   int ret = OB_SUCCESS;
+  common::ScopedTimer timer(ObMetricId::WAIT_CHANNEL_READY_COST);
   if (OB_UNLIKELY(!receive_channel_ready_) && OB_FAIL(wait_channel_ready_msg())) {
     LOG_WARN("failed to wait channel ready msg", K(ret));
   }

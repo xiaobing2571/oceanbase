@@ -61,7 +61,7 @@ int ObDMMultiDlist::init(int64_t tenant_id, int64_t bucket_num)
     LIB_LOG(WARN, "[DM] failed to init buckets_");
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < bucket_num_; ++i) {
-    ObLockWrapper *lock = OB_NEWx(ObLockWrapper, &allocator_);
+    ObLockWrapper *lock = OB_NEWx(ObLockWrapper, &allocator_, common::ObLatchIds::OB_DM_MULTI_DLIST_LOCK);
     ObDList<ObDetectableIdDNode> *dlist = OB_NEWx(ObDList<ObDetectableIdDNode>, &allocator_);
     if (OB_ISNULL(lock) || OB_ISNULL(dlist)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -473,7 +473,7 @@ void ObDetectManager::ObDetectCallbackAddCall::operator()(hash::HashMapPair<ObDe
   is_empty_ = dlist.is_empty();
   if (!is_empty_) {
     // before add, unlink callback from the original linked list
-    callback_->unlink();
+    callback_->reset();
     dlist.add_last(callback_);
     (void)dm_->dm_multi_list_.add_list_node_tail(id, &callback_->d_node_);
   }
@@ -619,7 +619,7 @@ int ObDetectManagerThread::init(const ObAddr &self, rpc::frame::ObReqTransport *
                                      "HashNodeDmReq"))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LIB_LOG(WARN, "[DM] create hash set failed", K(ret));
-  } else if (OB_FAIL(cond_.init(common::ObWaitEventIds::DEFAULT_COND_WAIT))) {
+  } else if (OB_FAIL(cond_.init(common::ObWaitEventIds::DETECT_MANAGER_COND_WAIT))) {
     LIB_LOG(WARN, "[DM] failed to init cond_", K(ret));
   } else if (OB_FAIL(TG_SET_RUNNABLE_AND_START(lib::TGDefIDs::DetectManager, *this))) {
     LIB_LOG(WARN, "[DM] schedule detect without timer failed", K(ret));

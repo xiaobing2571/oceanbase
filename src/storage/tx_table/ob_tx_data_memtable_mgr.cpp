@@ -30,9 +30,9 @@ namespace checkpoint
 ObTxDataMemtableMgr::ObTxDataMemtableMgr()
   : is_freezing_(false),
     ls_id_(),
-    mini_merge_recycle_commit_versions_ts_(0),
     tx_data_table_(nullptr),
-    ls_tablet_svr_(nullptr)
+    ls_tablet_svr_(nullptr),
+    lock_def_(common::ObLatchIds::OB_TX_DATA_MEMTABLE_MGR_SPIN_RW_LOCK)
 {
   lock_.lock_type_ = LockType::OB_SPIN_RWLOCK;
   lock_.lock_ = &lock_def_;
@@ -58,7 +58,6 @@ void ObTxDataMemtableMgr::destroy()
   tx_data_table_ = nullptr;
   ls_tablet_svr_ = nullptr;
   freezer_ = nullptr;
-  mini_merge_recycle_commit_versions_ts_ = 0;
   is_inited_ = false;
 }
 
@@ -78,6 +77,8 @@ int ObTxDataMemtableMgr::init(const common::ObTabletID &tablet_id,
     STORAGE_LOG(WARN, "invalid arguments", K(ret), K(tablet_id), KP(freezer), KP(t3m));
   } else if (OB_FAIL(MTL(ObLSService*)->get_ls(ls_id, ls_handle, ObLSGetMod::TRANS_MOD))){
     STORAGE_LOG(WARN, "Get ls from ls service failed.", KR(ret));
+  } else if (ls_handle.get_ls()->is_logonly_replica()) {
+    STORAGE_LOG(TRACE, "logonly replica do not need tx data mem table", KR(ret));
   } else if (OB_ISNULL(tx_table = ls_handle.get_ls()->get_tx_table())) {
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "Get tx table from ls failed.", KR(ret));
@@ -89,7 +90,6 @@ int ObTxDataMemtableMgr::init(const common::ObTabletID &tablet_id,
     freezer_ = freezer;
     tx_data_table_ = tx_table->get_tx_data_table();
     ls_tablet_svr_ = ls_handle.get_ls()->get_tablet_svr();
-    mini_merge_recycle_commit_versions_ts_ = 0;
     ObLSTxService *ls_tx_svr = nullptr;
     if (OB_ISNULL(ls_tx_svr = freezer_->get_ls_tx_svr())) {
       ret = OB_ERR_UNEXPECTED;
@@ -117,7 +117,6 @@ int ObTxDataMemtableMgr::offline()
   if (OB_FAIL(release_memtables())) {
     STORAGE_LOG(WARN, "release tx data memtables failed", KR(ret));
   } else {
-    mini_merge_recycle_commit_versions_ts_ = 0;
     memtable_head_ = 0;
     memtable_tail_ = 0;
   }
@@ -137,9 +136,6 @@ int ObTxDataMemtableMgr::release_head_memtable_(ObIMemtable *imemtable,
     if (nullptr != tables_[idx] && memtable == tables_[idx]) {
       memtable->set_state(ObTxDataMemtable::State::RELEASED);
       memtable->set_release_time();
-      if (true == memtable->do_recycled()) {
-        mini_merge_recycle_commit_versions_ts_ = ObClockGenerator::getClock();
-      }
       STORAGE_LOG(INFO, "[TX DATA MERGE]tx data memtable mgr release head memtable", K(ls_id_), KP(memtable), KPC(memtable));
       release_head_memtable();
     } else {
@@ -531,6 +527,34 @@ int ObTxDataMemtableMgr::get_memtable_range(int64_t &memtable_head, int64_t &mem
   memtable_tail = memtable_tail_;
   return ret;
 }
+
+int ObTxDataMemtableMgr::reuse()
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(freezer_)) {
+    ObLSTxService *ls_tx_svr = nullptr;
+    if (OB_ISNULL(ls_tx_svr = freezer_->get_ls_tx_svr())) {
+      ret = OB_ERR_UNEXPECTED;
+      STORAGE_LOG(WARN, "ls_tx_svr is null", K(ret), KP(freezer_));
+    } else if (OB_FAIL(ls_tx_svr->unregister_common_checkpoint(
+                         checkpoint::TX_DATA_MEMTABLE_TYPE, this))) {
+      STORAGE_LOG(WARN, "tx_data register_common_checkpoint failed", K(ret), K(ls_id_));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    reset_tables();
+    ls_id_.reset();
+    tablet_id_.reset();
+    t3m_ = nullptr;
+    freezer_ = nullptr;
+    tx_data_table_ = nullptr;
+    ls_tablet_svr_ = nullptr;
+    is_inited_ = false;
+  }
+  return ret;
+}
+
 
 }  // namespace storage
 

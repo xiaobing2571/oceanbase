@@ -262,17 +262,16 @@ int ObReplayServiceSubmitTask::next_log(const SCN &replayable_point,
       if (next_min_scn == next_to_submit_scn_
           || !replayable_point.is_valid()) {
         // do nothing
-      } else if (!next_min_scn.is_valid()) {
+      } else if (!next_min_scn.is_valid() || next_min_scn == SCN::base_scn()) {
         // should only occurs when palf has no log
         CLOG_LOG(INFO, "next_min_scn is invalid", K(type_), K(replayable_point),
                  K(next_min_scn), K(next_to_submit_scn_), K(ret), K(iterator_));
       } else if (OB_UNLIKELY(next_min_scn < next_to_submit_scn_)) {
-        // TODO @yunlong: 维护next_min_scn, 当前实现会导致replay卡住
-        ret = OB_SUCCESS;
-        // LSN unused_lsn;
+        ret = OB_ERR_UNEXPECTED;
+        LSN unused_lsn;
         // updating next to submit log info is failed, set fatal error for replay status.
-        // replay_status_->set_err_info(unused_lsn, next_min_scn, ObLogBaseType::INVALID_LOG_BASE_TYPE,
-        //                              0, true, ObClockGenerator::getClock(), ret);
+        replay_status_->set_err_info(unused_lsn, next_min_scn, ObLogBaseType::INVALID_LOG_BASE_TYPE,
+                                     0, true, ObClockGenerator::getClock(), ret);
         CLOG_LOG(ERROR, "failed to update next_to_submit_scn_", K(type_), K(replayable_point),
                  K(next_min_scn), K(next_to_submit_scn_), K(ret), K(iterator_));
       } else {
@@ -1115,6 +1114,50 @@ int ObReplayStatus::get_replay_process(int64_t &submitted_log_size,
   }
   return ret;
 }
+
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+int ObReplayStatus::get_replay_process(share::SCN &max_replayed_scn,
+                                       palf::LSN &min_unreplayed_lsn,
+                                       ObRole &role,
+                                       int64_t &proposal_id,
+                                       ObAddr &election_leader,
+                                       bool &is_active_follower,
+                                       bool &is_in_sync)
+{
+  int ret = OB_SUCCESS;
+  int64_t unused_replay_hint = 0;
+  ObLogBaseType unused_log_type = ObLogBaseType::INVALID_LOG_BASE_TYPE;
+  int64_t unused_first_handle_ts = 0;
+  int64_t unused_replay_cost = 0;
+  int64_t unused_retry_cost = 0;
+  bool is_pending_state = false;
+  bool local_is_in_sync = false;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    CLOG_LOG(ERROR, "replay status is not inited", K(ret));
+  } else if (!is_enabled_) {
+    ret = OB_STATE_NOT_MATCH;
+    CLOG_LOG(WARN, "replay status is not enabled", K(ret), KPC(this));
+  } else if (!GCONF.enable_logservice) {
+    ret = OB_NOT_SUPPORTED;
+    CLOG_LOG(WARN, "logservice is not enabled, no need to call this overwritten method", K(ret), KPC(this));
+  } else if (OB_FAIL(get_min_unreplayed_log_info(min_unreplayed_lsn, max_replayed_scn, unused_replay_hint, unused_log_type,
+                                                  unused_first_handle_ts, unused_replay_cost, unused_retry_cost))) {
+    CLOG_LOG(WARN, "get_min_unreplayed_log_info failed", K(ret), KPC(this));
+  } else if (OB_FAIL(palf_handle_->get_role(role, proposal_id, is_pending_state))) {
+    CLOG_LOG(WARN, "get_role failed", K(ret), KPC(this));
+  } else if (OB_FAIL(palf_handle_->get_election_leader(election_leader))) {
+    CLOG_LOG(WARN, "get_election_leader failed", K(ret), KPC(this));
+  } else if (OB_FAIL(static_cast<libpalf::LibPalfHandle*>(palf_handle_)->is_in_sync(max_replayed_scn, local_is_in_sync))) {
+    CLOG_LOG(WARN, "is_in_sync failed", K(ret), KPC(this), K(max_replayed_scn), K(local_is_in_sync));
+  } else {
+    max_replayed_scn = (max_replayed_scn > SCN::base_scn() ? SCN::scn_dec(max_replayed_scn) : SCN::min_scn());
+    is_active_follower = (is_enabled_ && role == ObRole::FOLLOWER && !is_pending_state);
+    is_in_sync = local_is_in_sync;
+  }
+  return ret;
+}
+#endif // OB_BUILD_SHARED_LOG_SERVICE
 
 int ObReplayStatus::push_log_replay_task(ObLogReplayTask &task)
 {

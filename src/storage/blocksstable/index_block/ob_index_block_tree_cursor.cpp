@@ -218,7 +218,7 @@ void ObIndexBlockTreePath::PathItemStack::reset()
       release_item_memory(fix_buf_[i]);
       fix_buf_[i].reset();
     }
-    for (int64_t i = 0; i < idx_ - MAX_TREE_FIX_BUF_LENGTH; ++i) {
+    for (int64_t i = 0; i <= idx_ - MAX_TREE_FIX_BUF_LENGTH; ++i) {
       release_item_memory(var_buf_[i]);
       var_buf_[i].reset();
     }
@@ -417,7 +417,8 @@ int ObIndexBlockTreeCursor::init(
     }
     }
 
-    if (OB_FAIL(ret)) {
+    if (FAILEDx(curr_path_item_->block_data_.prepare_micro_header())) {
+      LOG_WARN("failed to prepare micro header", K(ret), K(curr_path_item_->block_data_.micro_header_));
     } else if (FALSE_IT(root_row_store_type = curr_path_item_->block_data_.get_store_type())) {
     } else if (FALSE_IT(curr_path_item_->row_store_type_ = root_row_store_type)) {
     } else if (OB_FAIL(row_.init(allocator, rowkey_column_cnt_ + 1))) {
@@ -426,7 +427,7 @@ int ObIndexBlockTreeCursor::init(
        STORAGE_LOG(WARN, "Failed to init curr endkey", K(ret));
     } else if (nullptr != curr_path_item_->block_data_.get_extra_buf()) {
       curr_path_item_->is_block_transformed_ = true;
-    } else if (OB_FAIL(set_reader(root_row_store_type))) {
+    } else if (OB_FAIL(micro_reader_helper_.get_reader(*curr_path_item_->block_data_.get_micro_header(), reader_))) {
       LOG_WARN("Fail to set micro block reader", K(ret));
     } else if (OB_FAIL(reader_->init(curr_path_item_->block_data_, &(read_info_->get_datum_utils())))) {
       LOG_WARN("Fail to init micro block reader", K(ret));
@@ -606,7 +607,7 @@ int ObIndexBlockTreeCursor::drill_down()
       LOG_WARN("Fail to get micro block data handle", K(ret), KPC(idx_row_header), K(curr_row_offset));
     } else if (curr_path_item_->is_block_transformed_) {
       // No need to init micro reader
-    } else if (OB_FAIL(set_reader(static_cast<ObRowStoreType>(new_row_store_type)))) {
+    } else if (OB_FAIL(micro_reader_helper_.get_reader(*curr_path_item_->block_data_.get_micro_header(), reader_))) {
       LOG_WARN("Fail to set row reader", K(ret), K(new_row_store_type));
     } else if (OB_FAIL(reader_->init(
         curr_path_item_->block_data_, &(read_info_->get_datum_utils())))) {
@@ -721,7 +722,9 @@ int ObIndexBlockTreeCursor::search_rowkey_in_transformed_block(
 int ObIndexBlockTreeCursor::locate_range_in_curr_block(
     const ObDatumRange &ori_range,
     int64_t &begin_idx,
-    int64_t &end_idx)
+    int64_t &end_idx,
+    const bool is_left_border,
+    const bool is_right_border)
 {
   int ret = OB_SUCCESS;
   begin_idx = ObIMicroBlockReaderInfo::INVALID_ROW_INDEX;
@@ -735,7 +738,7 @@ int ObIndexBlockTreeCursor::locate_range_in_curr_block(
     LOG_WARN("Fail to trans to cg range", K(ret), K(ori_range));
   } else if (FALSE_IT(range = is_need_trans_range ? rowkey_helper_.get_result_range() : ori_range)) {
   } else if (!curr_path_item_->is_block_transformed_) {
-    if (OB_FAIL(reader_->locate_range(range, true, true, begin_idx, end_idx, true))) {
+    if (OB_FAIL(reader_->locate_range(range, is_left_border, is_right_border, begin_idx, end_idx, true))) {
       LOG_WARN("Fail to locate range with micro block reader", K(ret), K(range), KPC(curr_path_item_));
     }
   } else {
@@ -791,7 +794,7 @@ int ObIndexBlockTreeCursor::pull_up(const bool cascade, const bool is_reverse_sc
     if (OB_FAIL(read_next_level_row(curr_path_item_->curr_row_idx_))) {
       LOG_WARN("Fail to read next level row", K(ret), KPC(curr_path_item_));
     }
-  } else if (OB_FAIL(set_reader(static_cast<ObRowStoreType>(curr_path_item_->row_store_type_)))) {
+  } else if (OB_FAIL(micro_reader_helper_.get_reader(*curr_path_item_->block_data_.get_micro_header(), reader_))) {
     LOG_WARN("Fail to set row reader", K(ret));
   } else if (OB_FAIL(reader_->init(
       curr_path_item_->block_data_, &(read_info_->get_datum_utils())))) {
@@ -815,7 +818,7 @@ int ObIndexBlockTreeCursor::pull_up_to_root()
     }
   }
   if (OB_FAIL(ret) || curr_path_item_->is_block_transformed_) {
-  } else if (OB_FAIL(set_reader(static_cast<ObRowStoreType>(curr_path_item_->row_store_type_)))) {
+  } else if (OB_FAIL(micro_reader_helper_.get_reader(*curr_path_item_->block_data_.get_micro_header(), reader_))) {
     LOG_WARN("Fail to set reader");
   } else if (OB_FAIL(reader_->init(
       curr_path_item_->block_data_, &(read_info_->get_datum_utils())))) {
@@ -1172,7 +1175,7 @@ int ObIndexBlockTreeCursor::estimate_range_macro_count(const ObDatumRange &range
   } else {
     while (OB_SUCC(ret)) {
       if (0 == micro_count) {
-        if (OB_FAIL(locate_range_in_curr_block(range, begin_idx, end_idx))) {
+        if (OB_FAIL(locate_range_in_curr_block(range, begin_idx, end_idx, true, true))) {
           LOG_WARN("Fail to locate range in current block", K(ret), K(range));
         } else {
           micro_count = end_idx - begin_idx + 1;
@@ -1194,8 +1197,6 @@ int ObIndexBlockTreeCursor::estimate_range_macro_count(const ObDatumRange &range
       } else if (OB_FAIL(drill_down(range.get_start_key(), ONE_LEVEL, is_beyond_range))) {
         LOG_WARN("Fail to drill down one level", K(ret), K(range.get_start_key()));
       } else if (is_beyond_range) {
-        macro_count = 0;
-        micro_count = 0;
         break;
       }
     }
@@ -1213,11 +1214,186 @@ int ObIndexBlockTreeCursor::estimate_range_macro_count(const ObDatumRange &range
   return ret;
 }
 
-int ObIndexBlockTreeCursor::set_reader(const ObRowStoreType store_type)
+int ObIndexBlockTreeCursor::calc_range_macro_and_micro_count(const ObDatumRange &range,
+                                                             int64_t &macro_count,
+                                                             int64_t &micro_count)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(micro_reader_helper_.get_reader(store_type, reader_))) {
-    LOG_WARN("Fail to get micro block reader", K(ret), K(store_type));
+  int64_t begin_idx = 0;
+  int64_t end_idx = 0;
+  bool is_reach_leaf = false;
+  const bool is_min = range.get_start_key().is_min_rowkey();
+  const bool is_max = range.get_end_key().is_max_rowkey();
+  macro_count = 0;
+  micro_count = 0;
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("the index block tree cursor is not initialed", K(ret));
+  } else {
+    if (OB_FAIL(drill_down_lowest_node_by_range(range, begin_idx, end_idx, macro_count, micro_count, is_reach_leaf))) {
+      LOG_WARN("fail to drill down by range", K(ret), K(range));
+    } else if (!is_reach_leaf &&
+               OB_FAIL(calc_non_boundary_macro_and_micro_count(is_min ? begin_idx : begin_idx + 1,
+                                                               is_max ? end_idx : end_idx - 1,
+                                                               macro_count,
+                                                               micro_count))) {
+      LOG_WARN("fail to calc non boundary macro and micro count",
+          K(ret), K(begin_idx), K(end_idx), K(macro_count), K(micro_count));
+    } else if (!is_reach_leaf) {
+      if (!is_min &&
+          OB_FAIL(estimate_boundary_macro_and_micro_count(range, true/*is_left*/, macro_count, micro_count))) {
+        LOG_WARN("fail to estimate boundary macro and micro count",
+            K(ret), K(range), K(macro_count), K(micro_count), "is_left:", true);
+      } else if (!is_min && !is_max &&
+                 OB_FAIL(drill_down_lowest_node_by_range(range, begin_idx, end_idx, macro_count, micro_count, is_reach_leaf))) {
+        LOG_WARN("fail to drill down by range", K(ret));
+      } else if (!is_max &&
+                 OB_FAIL(estimate_boundary_macro_and_micro_count(range, false/*is_left*/, macro_count, micro_count))) {
+        LOG_WARN("fail to estimate boundary macro and micro count",
+            K(ret), K(range), K(macro_count), K(micro_count), "is_left:", false);
+      }
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+    LOG_WARN("estimate macro and micro count error", K(ret));
+  } else {
+    if (0 == macro_count) {
+      ++macro_count;
+    }
+    if (0 == micro_count) {
+      ++micro_count;
+    }
+  }
+  return ret;
+}
+
+int ObIndexBlockTreeCursor::drill_down_lowest_node_by_range(
+    const ObDatumRange &range,
+    int64_t &begin_idx,
+    int64_t &end_idx,
+    int64_t &macro_count,
+    int64_t &micro_count,
+    bool &is_reach_leaf)
+{
+  int ret = OB_SUCCESS;
+  bool is_beyond_range = false;
+  is_reach_leaf = false;
+  begin_idx = -1;
+  end_idx = -1;
+  const ObDatumRowkey& start_rowkey = range.get_start_key();
+  if (OB_FAIL(pull_up_to_root())) {
+    LOG_WARN("fail to pull up to root node", K(ret));
+  } else if (OB_FAIL(get_next_level_row_cnt(curr_path_item_->row_count_))) {
+    LOG_WARN("fail to get next level row count", K(ret));
+  } else if (OB_FAIL(locate_rowkey_in_curr_block(start_rowkey, is_beyond_range))) {
+    LOG_WARN("fail to read next level row", K(ret));
+  } else if (is_beyond_range) {
+    ret = OB_BEYOND_THE_RANGE;
+    LOG_WARN("fail to locate rowkey because beyond range", K(ret), K(range));
+  } else {
+    while (OB_SUCC(ret)) {
+      if (OB_FAIL(locate_range_in_curr_block(range, begin_idx, end_idx, true, true))){
+        LOG_WARN("fail to locate range in current block", K(ret), K(range));
+      } else if (OB_FAIL(check_reach_target_depth(LEAF, is_reach_leaf))) {
+        LOG_WARN("fail to check if cursor reach data node", K(ret));
+      } else if (is_reach_leaf || begin_idx != end_idx) {
+        if (is_reach_leaf) {
+          // the range cannot cross a micro block
+          micro_count += end_idx - begin_idx + 1;
+          ++macro_count;
+        }
+        break;
+      } else if (OB_FAIL(drill_down(start_rowkey, ONE_LEVEL, is_beyond_range))) {
+        LOG_WARN("fail to drill down", K(ret));
+      } else if (is_beyond_range) {
+        ret = OB_BEYOND_THE_RANGE;
+        LOG_WARN("fail to drill down because beyond range", K(ret), K(range));
+        break;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObIndexBlockTreeCursor::calc_non_boundary_macro_and_micro_count(const int64_t begin_idx,
+                                                                    const int64_t end_idx,
+                                                                    int64_t &macro_count,
+                                                                    int64_t &micro_count)
+{
+  int ret = OB_SUCCESS;
+  const ObIndexBlockRowHeader *index_block_row_header = nullptr;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("the index block tree cursor is not initialed", K(ret));
+  } else {
+    for (int64_t i = begin_idx; OB_SUCC(ret) && i <= end_idx; ++i) {
+      if (OB_FAIL(read_next_level_row(i))) {
+        LOG_WARN("fail to read next level row", K(ret), K(i), K(begin_idx), K(end_idx));
+      } else if (OB_FAIL(idx_row_parser_.get_header(index_block_row_header))) {
+        LOG_WARN("fail to get index block row header", K(ret), K(idx_row_parser_));
+      } else if (OB_ISNULL(index_block_row_header)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("index block row header is null", K(ret), K(idx_row_parser_));
+      } else {
+        macro_count += index_block_row_header->get_macro_block_count();
+        micro_count += index_block_row_header->get_micro_block_count();
+      }
+    }
+  }
+  return ret;
+}
+
+int ObIndexBlockTreeCursor::estimate_boundary_macro_and_micro_count(const ObDatumRange &range,
+                                                                    const bool is_left,
+                                                                    int64_t &macro_count,
+                                                                    int64_t &micro_count)
+{
+  int ret = OB_SUCCESS;
+  bool is_reach_leaf = false;
+  int64_t begin_idx = -1;
+  int64_t end_idx = -1;
+  const ObDatumRowkey& boundary_rowkey = is_left ?
+          range.get_start_key() : range.get_end_key();
+  bool is_beyond_range = false;
+  if (OB_FAIL(check_reach_target_depth(LEAF, is_reach_leaf))) {
+    LOG_WARN("fail to check if cursor reach data node", K(ret));
+  } else if (is_reach_leaf) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("fail to estimate boundary macro and micro count", K(ret));
+  } else if (OB_FAIL(drill_down(boundary_rowkey, ONE_LEVEL, is_beyond_range))) {
+    LOG_WARN("fail to drill down", K(ret));
+  } else if (is_beyond_range) {
+    LOG_INFO("drill down beyond range",
+        K(ret), K(is_left), K(range), K(macro_count), K(micro_count));
+  } else {
+    const bool is_left_and_non_min = is_left && !range.get_start_key().is_min_rowkey();
+    const bool is_right_and_non_max = !is_left && !range.get_end_key().is_max_rowkey();
+    while (OB_SUCC(ret)) {
+      // Processing the boundary index rows
+      if (OB_FAIL(locate_range_in_curr_block(range, begin_idx, end_idx, !is_left, is_left))){
+        LOG_WARN("fail to locate range in current block", K(ret), K(range));
+      } else if (OB_FAIL(check_reach_target_depth(LEAF, is_reach_leaf))) {
+        LOG_WARN("Fail to check if cursor reach macro depth", K(ret));
+      } else if (is_reach_leaf) {
+        micro_count += end_idx - begin_idx + 1;
+        ++macro_count;
+        break;
+      } else if (OB_FAIL(calc_non_boundary_macro_and_micro_count(is_left_and_non_min ? begin_idx + 1 : begin_idx,
+                                                                 is_right_and_non_max ? end_idx - 1 : end_idx,
+                                                                 macro_count,
+                                                                 micro_count))) {
+        LOG_WARN("fail to calc non boundary macro and micro count",
+            K(ret), K(begin_idx), K(end_idx), K(macro_count), K(micro_count));
+      } else if (OB_FAIL(drill_down(boundary_rowkey, ONE_LEVEL, is_beyond_range))) {
+        LOG_WARN("fail to drill down", K(ret));
+      } else if (is_beyond_range) {
+        LOG_INFO("drill down beyond range",
+            K(ret), K(is_left), K(range), K(macro_count), K(micro_count));
+        break;
+      }
+    }
   }
   return ret;
 }
@@ -1306,7 +1482,7 @@ int ObIndexBlockTreeCursor::load_micro_block_data(const MacroBlockId &macro_bloc
       } else if (ObStoreFormat::is_row_store_type_with_cs_encoding(static_cast<ObRowStoreType>(header.row_store_type_))) {
         if (OB_FAIL(macro_reader.decrypt_and_full_transform_data(
             header, block_des_meta, src_block_buf, src_buf_size,
-            curr_path_item_->block_data_.get_buf(), curr_path_item_->block_data_.get_buf_size(),
+            curr_path_item_->block_data_,
             cursor_path_.get_allocator()))) {
           LOG_WARN("fail to decrypt_and_full_transform_data", K(ret), K(header), K(block_des_meta));
         } else {
@@ -1317,8 +1493,7 @@ int ObIndexBlockTreeCursor::load_micro_block_data(const MacroBlockId &macro_bloc
         if (OB_FAIL(macro_reader.do_decrypt_and_decompress_data(
             header, block_des_meta,
             src_block_buf, src_buf_size,
-            curr_path_item_->block_data_.get_buf(),
-            curr_path_item_->block_data_.get_buf_size(),
+            curr_path_item_->block_data_,
             is_compressed,
             true, /* need deep copy */
             cursor_path_.get_allocator()))) {
@@ -1408,7 +1583,7 @@ int ObIndexBlockTreeCursor::get_micro_block_infos(
   int64_t end_idx = 0;
   const ObIndexBlockRowHeader *idx_row_header = nullptr;
   ObMicroIndexInfo index_info;
-  if (OB_FAIL(locate_range_in_curr_block(range, begin_idx, end_idx))) {
+  if (OB_FAIL(locate_range_in_curr_block(range, begin_idx, end_idx, true, true))) {
     LOG_WARN("Fail to locate range in micro block", K(ret), K(range), K(begin_idx), K(end_idx));
   }
   for (int64_t i = begin_idx; OB_SUCC(ret) && i <= end_idx; ++i) {
@@ -1422,18 +1597,9 @@ int ObIndexBlockTreeCursor::get_micro_block_infos(
     } else {
       index_info.row_header_ = idx_row_header;
       index_info.parent_macro_id_ = curr_path_item_->macro_block_id_;
-      if (!idx_row_header->is_data_index() || idx_row_header->is_major_node()) {
-      } else if (OB_FAIL(idx_row_parser_.get_minor_meta(index_info.minor_meta_info_))) {
-        LOG_WARN("Fail to get minor meta info", K(ret));
-      }
-
-      if (OB_SUCC(ret) && idx_row_header->is_pre_aggregated()) {
-        if (OB_FAIL(idx_row_parser_.get_agg_row(index_info.agg_row_buf_, index_info.agg_buf_size_))) {
-          LOG_WARN("Fail to get aggregated row", K(ret), K(index_info));
-        }
-      }
-
-      if (OB_FAIL(ret)) {
+      if (OB_FAIL(idx_row_parser_.parse_minor_meta_and_agg_row(
+          index_info.minor_meta_info_, index_info.agg_row_buf_, index_info.agg_buf_size_))) {
+        LOG_WARN("Fail to parse minor meta and agg row", K(ret));
       } else if (OB_FAIL(micro_index_infos.push_back(index_info))) {
         LOG_WARN("Fail to push index micro block info into array", K(ret), K(index_info));
       }
@@ -1452,7 +1618,7 @@ int ObIndexBlockTreeCursor::get_micro_block_endkeys(
   int64_t orig_end_key_cnt = end_keys.count();
   int64_t begin_idx = 0;
   int64_t end_idx = 0;
-  if (OB_FAIL(locate_range_in_curr_block(range, begin_idx, end_idx))) {
+  if (OB_FAIL(locate_range_in_curr_block(range, begin_idx, end_idx, true, true))) {
     LOG_WARN("Fail to locate range in micro block", K(ret), K(range), K(begin_idx), K(end_idx));
   } else if (curr_path_item_->is_block_transformed_) {
     const ObIndexBlockDataHeader *idx_data_header = nullptr;

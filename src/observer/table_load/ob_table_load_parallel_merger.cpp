@@ -30,6 +30,7 @@ namespace observer
 ObTableLoadParallelMerger::ObTableLoadParallelMerger()
   : store_ctx_(nullptr),
     op_(nullptr),
+    mutex_(common::ObLatchIds::OB_TABLE_LOAD_PARALLEL_MERGER_MUTEX),
     running_thread_cnt_(0),
     has_error_(false),
     is_stop_(false),
@@ -78,7 +79,7 @@ int ObTableLoadParallelMerger::init_merge_task(ObTableLoadMergeTableBaseOp *op)
     ObDirectLoadTableStore *table_store = op->merge_table_ctx_->table_store_;
     const int64_t thread_cnt = op->store_ctx_->thread_cnt_;
     if (op->merge_table_ctx_->is_del_lob_) {
-      if (OB_FAIL(merge_ctx_.build_del_lob_task(*table_store, thread_cnt))) {
+      if (OB_FAIL(merge_ctx_.build_del_lob_task(*table_store, thread_cnt, false/*for_dag*/))) {
         LOG_WARN("fail to build del lob task", KR(ret));
       }
     } else {

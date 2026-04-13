@@ -35,9 +35,9 @@ ObICopyMacroBlockReader::CopyMacroBlockReadData::CopyMacroBlockReadData()
   : data_type_(ObCopyMacroBlockDataType::MAX),
     is_reuse_macro_block_(false),
     macro_data_(),
-    macro_meta_(nullptr),
     macro_block_id_(),
-    allocator_("CopyMacroRead")
+    allocator_("CopyMacroRead"),
+    macro_meta_(nullptr)
 {
 }
 
@@ -48,12 +48,12 @@ ObICopyMacroBlockReader::CopyMacroBlockReadData::~CopyMacroBlockReadData()
 
 void ObICopyMacroBlockReader::CopyMacroBlockReadData::reset()
 {
-  data_type_ = ObCopyMacroBlockDataType::MAX;
-  is_reuse_macro_block_ = false;
-  macro_data_ = ObBufferReader(NULL, 0, 0);
   macro_meta_ = nullptr;
-  macro_block_id_.reset();
   allocator_.reset();
+  macro_block_id_.reset();
+  macro_data_ = ObBufferReader(NULL, 0, 0);
+  is_reuse_macro_block_ = false;
+  data_type_ = ObCopyMacroBlockDataType::MAX;
 }
 
 bool ObICopyMacroBlockReader::CopyMacroBlockReadData::is_valid() const
@@ -257,6 +257,8 @@ int ObCopyMacroBlockObReader::init(
         LOG_WARN("failed to alloc buffers", K(ret));
       } else if (OB_FAIL(arg.copy_macro_range_info_.assign(*param.copy_macro_range_info_))) {
         LOG_WARN("failed to assign copy macro range info", K(ret), K(param));
+      } else if (OB_FAIL(arg.copy_macro_block_infos_.assign(param.copy_macro_block_infos_))) {
+        LOG_WARN("failed to assign copy macro block infos", K(ret), K(param));
       } else {
         arg.tenant_id_ = param.tenant_id_;
         arg.ls_id_ = param.ls_id_;
@@ -450,7 +452,7 @@ int ObCopyMacroBlockObReader::get_read_info_(const ObCopyMacroBlockHeader &heade
     } else if (OB_ISNULL(macro_block_reuse_mgr_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("macro block reuse mgr is NULL", K(ret), KP(macro_block_reuse_mgr_));
-    } else if (OB_FAIL(macro_block_reuse_mgr_->get_macro_block_reuse_info(table_key_, macro_meta.get_logic_id(), macro_id, data_checksum))) {
+    } else if (OB_FAIL(macro_block_reuse_mgr_->get_macro_block_reuse_info(macro_meta.get_logic_id(), macro_id, data_checksum))) {
       LOG_WARN("failed to get macro block reuse info", K(ret), K(table_key_), K(macro_meta.get_logic_id()));
     } else if (macro_meta.get_meta_val().data_checksum_ != data_checksum) {
       ret = OB_CHECKSUM_ERROR;
@@ -644,7 +646,7 @@ int ObCopyMacroBlockRestoreReader::get_next_macro_block(ObICopyMacroBlockReader:
     const int64_t align_size = DIO_READ_ALIGN_SIZE;
     backup::ObBackupMacroBlockIndex macro_index;
     share::ObBackupStorageInfo storage_info;
-    share::ObRestoreBackupSetBriefInfo backup_set_brief_info;
+    share::ObBackupSetBriefInfo backup_set_brief_info;
     share::ObBackupDest backup_set_dest;
     MacroBlockId macro_block_id;
     ObStorageIdMod mod;
@@ -840,7 +842,7 @@ int ObCopyDDLMacroBlockRestoreReader::prepare_link_item_()
   const int64_t align_size = DIO_READ_ALIGN_SIZE;
   backup::ObBackupMacroBlockIndex macro_index;
   share::ObBackupStorageInfo storage_info;
-  share::ObRestoreBackupSetBriefInfo backup_set_brief_info;
+  share::ObBackupSetBriefInfo backup_set_brief_info;
   share::ObBackupDest backup_set_dest;
   ObStorageIdMod mod;
   mod.storage_used_mod_ = ObStorageUsedMod::STORAGE_USED_RESTORE;
@@ -936,7 +938,7 @@ int ObCopyDDLMacroBlockRestoreReader::get_next_macro_block(ObICopyMacroBlockRead
     const int64_t align_size = DIO_READ_ALIGN_SIZE;
     backup::ObBackupMacroBlockIndex macro_index;
     share::ObBackupStorageInfo storage_info;
-    share::ObRestoreBackupSetBriefInfo backup_set_brief_info;
+    share::ObBackupSetBriefInfo backup_set_brief_info;
     share::ObBackupDest backup_set_dest;
     ObStorageIdMod mod;
     mod.storage_used_mod_ = ObStorageUsedMod::STORAGE_USED_RESTORE;
@@ -1048,7 +1050,8 @@ int ObCopyMacroBlockObProducer::init(
     const ObITable::TableKey &table_key,
     const ObCopyMacroRangeInfo &copy_macro_range_info,
     const int64_t data_version,
-    const SCN backfill_tx_scn)
+    const SCN backfill_tx_scn,
+    const ObIArray<ObCopyMacroBlockInfo> &copy_macro_block_infos)
 {
   int ret = OB_SUCCESS;
   ObLSHandle ls_handle;
@@ -1071,6 +1074,9 @@ int ObCopyMacroBlockObProducer::init(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", K(ret), K(tenant_id), K(ls_id), K(table_key),
         K(copy_macro_range_info), K(data_version), K(backfill_tx_scn));
+  } else if (!copy_macro_block_infos.empty() && copy_macro_block_infos.count() != copy_macro_range_info.macro_block_count_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid copy macro block infos", K(ret), K(copy_macro_block_infos), K(copy_macro_range_info));
   } else if (OB_FAIL(guard.switch_to(tenant_id))) {
     LOG_WARN("switch tenant failed", K(ret), K(tenant_id));
   } else if (OB_ISNULL(ls_service = MTL(ObLSService *))) {
@@ -1114,6 +1120,8 @@ int ObCopyMacroBlockObProducer::init(
     } else if (OB_FAIL(second_meta_iterator_.open(datum_range_, blocksstable::DATA_BLOCK_META,
          *sstable_, *index_read_info, allocator_, is_reverse_scan))) {
       LOG_WARN("failed to open second meta iterator", K(ret), K(ls_id), K(table_key), K(copy_macro_range_info));
+    } else if (OB_FAIL(copy_macro_block_infos_.assign(copy_macro_block_infos))) {
+      LOG_WARN("failed to copy macro block info", K(ret), K(table_key), K(copy_macro_block_infos));
     } else {
       data_version_ = data_version;
       macro_idx_ = -1;
@@ -1251,28 +1259,53 @@ int ObCopyMacroBlockObProducer::prefetch_()
       LOG_WARN("failed to get next macro meta", K(ret), K(macro_idx_), K(copy_macro_range_info_));
     } else if (OB_FAIL(copy_macro_block_handle_[handle_idx_].set_macro_meta(macro_meta))) {
       LOG_WARN("failed to set macro meta", K(ret), K(macro_meta));
-    } else if (macro_meta.get_logic_id().logic_version_ <= data_version_
-               || macro_meta.get_macro_id().is_backup_id()) {
-      copy_macro_block_handle_[handle_idx_].is_reuse_macro_block_ = true;
-      // if macro block is local, reset macro meta id to default
-      // DEFAULT_IDX_ROW_MACRO_ID is also local id
-      if (macro_meta.get_macro_id().is_local_id()) {
-        copy_macro_block_handle_[handle_idx_].macro_meta_->val_.macro_id_ = ObIndexBlockRowHeader::DEFAULT_IDX_ROW_MACRO_ID;
-      }
     } else {
-      copy_macro_block_handle_[handle_idx_].is_reuse_macro_block_ = false;
+      bool reuse_macro_block = false;
+      ObCopyMacroBlockInfo copy_macro_block_info;
 
-      read_info.macro_block_id_ = macro_meta.get_macro_id();
-      read_info.offset_ = sstable_->get_macro_offset();
-      read_info.size_ = sstable_->get_macro_read_size();
-      read_info.io_desc_.set_mode(ObIOMode::READ);
-      read_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_MIGRATE_READ);
-      read_info.io_timeout_ms_ = GCONF._data_storage_io_timeout / 1000L;
-      read_info.buf_ = io_buf_[handle_idx_];
-      read_info.mtl_tenant_id_ = MTL_ID();
-      read_info.io_desc_.set_sys_module_id(ObIOModule::HA_COPY_MACRO_BLOCK_IO);
-      if (OB_FAIL(ObObjectManager::async_read_object(read_info, copy_macro_block_handle_[handle_idx_].read_handle_))) {
-        STORAGE_LOG(WARN, "Fail to async read block, ", K(ret), K(read_info));
+      if (copy_macro_block_infos_.empty()) {
+        // skip
+        reuse_macro_block = false;
+      } else if (macro_idx_ >= copy_macro_block_infos_.count()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("macro idx is bigger than copy macro block infos count", K(ret), K(macro_idx_), K(copy_macro_block_infos_));
+      } else if (FALSE_IT(copy_macro_block_info = copy_macro_block_infos_.at(macro_idx_))) {
+      } else if (copy_macro_block_info.logical_id_ != macro_meta.get_logic_id()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("logic id not match", K(ret), K(macro_idx_), K(macro_meta), K(copy_macro_block_infos_));
+      } else if (ObCopyMacroBlockDataType::MACRO_DATA == copy_macro_block_info.data_type_) {
+        reuse_macro_block = false;
+      } else if (ObCopyMacroBlockDataType::MACRO_META_ROW == copy_macro_block_info.data_type_) {
+        reuse_macro_block = true;
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid data type", K(ret), K(copy_macro_block_info));
+      }
+
+      if (OB_SUCC(ret)) {
+        if (reuse_macro_block || macro_meta.get_macro_id().is_backup_id()) {
+          copy_macro_block_handle_[handle_idx_].is_reuse_macro_block_ = true;
+          // if macro block is local, reset macro meta id to default
+          // DEFAULT_IDX_ROW_MACRO_ID is also local id
+          if (macro_meta.get_macro_id().is_local_id()) {
+            copy_macro_block_handle_[handle_idx_].macro_meta_->val_.macro_id_ = ObIndexBlockRowHeader::DEFAULT_IDX_ROW_MACRO_ID;
+          }
+        } else {
+          copy_macro_block_handle_[handle_idx_].is_reuse_macro_block_ = false;
+
+          read_info.macro_block_id_ = macro_meta.get_macro_id();
+          read_info.offset_ = sstable_->get_macro_offset();
+          read_info.size_ = sstable_->get_macro_read_size();
+          read_info.io_desc_.set_mode(ObIOMode::READ);
+          read_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_MIGRATE_READ);
+          read_info.io_timeout_ms_ = GCONF._data_storage_io_timeout / 1000L;
+          read_info.buf_ = io_buf_[handle_idx_];
+          read_info.mtl_tenant_id_ = MTL_ID();
+          read_info.io_desc_.set_sys_module_id(ObIOModule::HA_COPY_MACRO_BLOCK_IO);
+          if (OB_FAIL(ObObjectManager::async_read_object(read_info, copy_macro_block_handle_[handle_idx_].read_handle_))) {
+            STORAGE_LOG(WARN, "Fail to async read block, ", K(ret), K(read_info));
+          }
+        }
       }
     }
 
@@ -2376,7 +2409,6 @@ int ObCopySSTableInfoObProducer::init(
 {
   int ret = OB_SUCCESS;
   ObTablet *tablet = nullptr;
-  bool is_ready_for_read = false;
 
   if (is_inited_) {
     ret = OB_INIT_TWICE;
@@ -2395,22 +2427,13 @@ int ObCopySSTableInfoObProducer::init(
   } else if (OB_ISNULL(tablet = tablet_handle_.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet should not be NULL", K(ret), K(tablet_sstable_info));
-  } else if (!tablet_sstable_info.ddl_sstable_scn_range_.is_empty()) {
-    if (tablet->get_tablet_meta().get_ddl_sstable_start_scn() < tablet_sstable_info.ddl_sstable_scn_range_.start_scn_) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("ddl start scn fall back", K(ret), K(tablet->get_tablet_meta()), K(tablet_sstable_info));
-    } else if (tablet->get_tablet_meta().get_ddl_sstable_start_scn() == tablet_sstable_info.ddl_sstable_scn_range_.start_scn_) {
-      if (tablet->get_tablet_meta().ddl_checkpoint_scn_ < tablet_sstable_info.ddl_sstable_scn_range_.end_scn_) {
-        ret = OB_DDL_SSTABLE_RANGE_CROSS;
-        LOG_WARN("ddl sstable not exist", K(ret), K(tablet_sstable_info), KPC(tablet));
-      }
-    } else {
-      LOG_INFO("ddl start scn advanced, the expired ddl sstable has been cleaned", "tablet_id", tablet_sstable_info.tablet_id_,
-          K(tablet->get_tablet_meta().ddl_start_scn_), K(tablet_sstable_info.ddl_sstable_scn_range_));
-    }
+  } else if (OB_FAIL(check_ddl_sstable_scn_range_(*tablet, tablet_sstable_info.ddl_sstable_scn_range_))) {
+    LOG_WARN("failed to check ddl sstable scn range", KR(ret), K(tablet_sstable_info));
+  } else if (OB_FAIL(check_inc_major_ddl_sstable_end_scn_(*tablet, tablet_sstable_info.inc_major_ddl_sstable_end_scn_))) {
+    LOG_WARN("failed to check inc major ddl sstable end scn", KR(ret), K(tablet_sstable_info));
   }
   if (OB_SUCC(ret) && nullptr != tablet) {
-    if (OB_FAIL(tablet->get_ha_tables(iter_, is_ready_for_read))) {
+    if (OB_FAIL(tablet->get_ha_tables(iter_))) {
       LOG_WARN("failed to get read tables", K(ret));
     } else {
       status_ = ObCopyTabletStatus::TABLET_EXIST;
@@ -2493,30 +2516,18 @@ int ObCopySSTableInfoObProducer::check_need_copy_sstable_(
     if (sstable->is_major_sstable()) {
       need_copy_sstable = sstable->get_key().get_snapshot_version()
           > tablet_sstable_info_.max_major_sstable_snapshot_;
-    } else if (sstable->is_minor_sstable()) {
+    } else if (sstable->is_minor_sstable() || sstable->is_inc_major_type_sstable()) {
       need_copy_sstable = true;
     } else if (sstable->is_ddl_dump_sstable()) {
-      const SCN ddl_sstable_start_scn = tablet_sstable_info_.ddl_sstable_scn_range_.start_scn_;
-      const SCN ddl_sstable_end_scn = tablet_sstable_info_.ddl_sstable_scn_range_.end_scn_;
-      if (tablet_sstable_info_.ddl_sstable_scn_range_.is_empty()) {
-        need_copy_sstable = false;
-      } else if (sstable->get_key().scn_range_.start_scn_ >= ddl_sstable_end_scn) {
-        need_copy_sstable = false;
-      } else if (sstable->get_key().scn_range_.start_scn_ >= ddl_sstable_start_scn
-          && sstable->get_key().scn_range_.end_scn_ <= ddl_sstable_end_scn) {
-        need_copy_sstable = true;
-      } else {
-        ret = OB_DDL_SSTABLE_RANGE_CROSS;
-        LOG_WARN("ddl sstable version range across", K(ret), K(tablet_sstable_info_), KPC(sstable));
+      if (OB_FAIL(check_need_copy_ddl_sstable_(tablet_sstable_info_.tablet_id_,
+          *sstable, tablet_sstable_info_.ddl_sstable_scn_range_, need_copy_sstable))) {
+        LOG_WARN("failed to check need copy ddl sstable", K(ret), K(tablet_sstable_info_), KPC(sstable));
       }
-#ifdef ERRSIM
-      SERVER_EVENT_SYNC_ADD("storage_ha", "check_need_copy_ddl_sstable",
-                            "tablet_id", tablet_sstable_info_.tablet_id_.id(),
-                            "sstable_key", sstable->get_key(),
-                            "need_copy_sstable", need_copy_sstable,
-                            "need_copy_scn_range", tablet_sstable_info_.ddl_sstable_scn_range_);
-
-#endif
+    } else if (sstable->is_inc_major_ddl_dump_sstable()) {
+      if (OB_FAIL(check_need_copy_inc_major_ddl_sstable_(tablet_sstable_info_.tablet_id_,
+          *sstable, tablet_sstable_info_.inc_major_ddl_sstable_end_scn_, need_copy_sstable))) {
+        LOG_WARN("failed to check need copy inc major ddl sstable", K(ret), K(tablet_sstable_info_), KPC(sstable));
+      }
     } else if (sstable->is_mds_sstable()) {
       need_copy_sstable = true;
     } else {
@@ -2526,6 +2537,99 @@ int ObCopySSTableInfoObProducer::check_need_copy_sstable_(
           KPC(sstable), K(tablet_sstable_info_));
     }
   }
+  return ret;
+}
+
+int ObCopySSTableInfoObProducer::check_ddl_sstable_scn_range_(
+    const ObTablet &tablet,
+    const ObScnRange &ddl_sstable_scn_range)
+{
+  int ret = OB_SUCCESS;
+  if (ddl_sstable_scn_range.is_empty()) {
+    // do nothing
+  } else if (tablet.get_tablet_meta().get_ddl_sstable_start_scn() < ddl_sstable_scn_range.start_scn_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ddl start scn fall back", K(ret), K(tablet.get_tablet_meta()), K(ddl_sstable_scn_range));
+  } else if (tablet.get_tablet_meta().get_ddl_sstable_start_scn() == ddl_sstable_scn_range.start_scn_) {
+    if (OB_UNLIKELY(tablet.get_tablet_meta().ddl_checkpoint_scn_ < ddl_sstable_scn_range.end_scn_)) {
+      ret = OB_DDL_SSTABLE_RANGE_CROSS;
+      LOG_WARN("ddl sstable not exist", K(ret), K(ddl_sstable_scn_range), K(tablet));
+    }
+  } else {
+    LOG_INFO("ddl start scn advanced, the expired ddl sstable has been cleaned", "tablet_id", tablet.get_tablet_id(),
+        K(tablet.get_tablet_meta().ddl_start_scn_), K(ddl_sstable_scn_range));
+  }
+  return ret;
+}
+
+int ObCopySSTableInfoObProducer::check_inc_major_ddl_sstable_end_scn_(
+    const ObTablet &tablet,
+    const SCN &inc_major_ddl_sstable_end_scn)
+{
+  int ret = OB_SUCCESS;
+  if (!inc_major_ddl_sstable_end_scn.is_valid_and_not_min()) {
+    // do nothing
+  } else if (OB_UNLIKELY(tablet.get_tablet_meta().ddl_checkpoint_scn_ < inc_major_ddl_sstable_end_scn)) {
+    ret = OB_DDL_SSTABLE_RANGE_CROSS;
+    LOG_WARN("inc major ddl sstable not exist", K(ret), K(inc_major_ddl_sstable_end_scn), K(tablet));
+  }
+  return ret;
+}
+
+int ObCopySSTableInfoObProducer::check_need_copy_ddl_sstable_(
+    const ObTabletID &tablet_id,
+    const ObSSTable &sstable,
+    const ObScnRange &ddl_sstable_scn_range,
+    bool &need_copy_sstable)
+{
+  int ret = OB_SUCCESS;
+  const SCN ddl_sstable_start_scn = ddl_sstable_scn_range.start_scn_;
+  const SCN ddl_sstable_end_scn = ddl_sstable_scn_range.end_scn_;
+  if (ddl_sstable_scn_range.is_empty()) {
+    need_copy_sstable = false;
+  } else if (sstable.get_key().scn_range_.start_scn_ >= ddl_sstable_end_scn) {
+    need_copy_sstable = false;
+  } else if (sstable.get_key().scn_range_.start_scn_ >= ddl_sstable_start_scn
+      && sstable.get_key().scn_range_.end_scn_ <= ddl_sstable_end_scn) {
+    need_copy_sstable = true;
+  } else {
+    ret = OB_DDL_SSTABLE_RANGE_CROSS;
+    LOG_WARN("ddl sstable version range across", K(ret), K(ddl_sstable_scn_range), K(sstable));
+  }
+#ifdef ERRSIM
+  SERVER_EVENT_SYNC_ADD("storage_ha", "check_need_copy_ddl_sstable",
+                        "tablet_id", tablet_id.id(),
+                        "sstable_key", sstable.get_key(),
+                        "need_copy_sstable", need_copy_sstable,
+                        "need_copy_scn_range", ddl_sstable_scn_range);
+#endif
+  return ret;
+}
+
+int ObCopySSTableInfoObProducer::check_need_copy_inc_major_ddl_sstable_(
+    const ObTabletID &tablet_id,
+    const ObSSTable &sstable,
+    const SCN &inc_major_ddl_sstable_end_scn,
+    bool &need_copy_sstable)
+{
+  int ret = OB_SUCCESS;
+  if (!inc_major_ddl_sstable_end_scn.is_valid_and_not_min()) {
+    need_copy_sstable = false;
+  } else if (sstable.get_key().scn_range_.start_scn_ >= inc_major_ddl_sstable_end_scn) {
+    need_copy_sstable = false;
+  } else if (sstable.get_key().scn_range_.end_scn_ <= inc_major_ddl_sstable_end_scn) {
+    need_copy_sstable = true;
+  } else {
+    ret = OB_DDL_SSTABLE_RANGE_CROSS;
+    LOG_WARN("inc major ddl sstable version range across", K(ret), K(inc_major_ddl_sstable_end_scn), K(sstable));
+  }
+#ifdef ERRSIM
+  SERVER_EVENT_SYNC_ADD("storage_ha", "check_need_copy_inc_major_ddl_sstable",
+                        "tablet_id", tablet_id.id(),
+                        "sstable_key", sstable.get_key(),
+                        "need_copy_sstable", need_copy_sstable,
+                        "need_copy_end_scn", inc_major_ddl_sstable_end_scn);
+#endif
   return ret;
 }
 
@@ -2722,11 +2826,10 @@ int ObCopySSTableMacroObReader::fetch_sstable_macro_range_header_(
 
 int ObCopySSTableMacroObReader::fetch_sstable_macro_range_(
     const obrpc::ObCopySSTableMacroRangeInfoHeader &header,
-    common::ObIArray<ObCopyMacroRangeInfo> &macro_range_info_array)
+    common::ObIArray<ObCopyMacroRangeIdInfo> &macro_range_info_array)
 {
   int ret = OB_SUCCESS;
   macro_range_info_array.reset();
-  ObCopyMacroRangeInfo macro_range_info;
 
   if (!is_inited_) {
     ret = OB_NOT_INIT;
@@ -2735,15 +2838,16 @@ int ObCopySSTableMacroObReader::fetch_sstable_macro_range_(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("fetch sstable macro range get invalid argument", K(ret), K(header));
   } else {
+    ObCopyMacroRangeIdInfo macro_range_id_info;
     for (int64_t i = 0; OB_SUCC(ret) && i < header.macro_range_count_; ++i) {
-      macro_range_info.reuse();
+      macro_range_id_info.reuse();
 
-      if (OB_FAIL(rpc_reader_.fetch_and_decode(macro_range_info))) {
+      if (OB_FAIL(rpc_reader_.fetch_and_decode(macro_range_id_info.range_info_))) {
         LOG_WARN("failed to fetch and decode sstable macro range info", K(ret), K(header));
-      } else if (OB_FAIL(macro_range_info_array.push_back(macro_range_info))) {
-        LOG_WARN("failed to push macro range info into array", K(ret), K(macro_range_info));
+      } else if (OB_FAIL(macro_range_info_array.push_back(macro_range_id_info))) {
+        LOG_WARN("failed to push macro range info into array", K(ret), K(macro_range_id_info));
       } else {
-        LOG_INFO("succeed get macro range info", K(header), K(macro_range_info));
+        LOG_INFO("succeed get macro range info", K(header), K(macro_range_id_info));
       }
     }
   }
@@ -2861,7 +2965,7 @@ int ObCopySSTableMacroRestoreReader::get_next_sstable_range_info_from_local_(
 
 int ObCopySSTableMacroRestoreReader::fetch_sstable_macro_range_from_local_(
     const obrpc::ObCopySSTableMacroRangeInfoHeader &header,
-    common::ObIArray<ObCopyMacroRangeInfo> &macro_range_info_array)
+    common::ObIArray<ObCopyMacroRangeIdInfo> &macro_range_id_info_array)
 {
   int ret = OB_SUCCESS;
 
@@ -2869,7 +2973,7 @@ int ObCopySSTableMacroRestoreReader::fetch_sstable_macro_range_from_local_(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("fetch sstable macro range info get invalid argument", K(ret) ,K(header));
   } else {
-    SMART_VARS_2((ObCopySSTableMacroRangeObProducer, macro_range_producer), (ObCopyMacroRangeInfo, macro_range_info)) {
+    SMART_VARS_2((ObCopySSTableMacroRangeObProducer, macro_range_producer), (ObCopyMacroRangeIdInfo, macro_range_id_info)) {
       if (OB_FAIL(macro_range_producer.init(
                     rpc_arg_.tenant_id_,
                     rpc_arg_.ls_id_,
@@ -2879,16 +2983,16 @@ int ObCopySSTableMacroRestoreReader::fetch_sstable_macro_range_from_local_(
         LOG_WARN("failed to init macro range producer", K(ret), K(rpc_arg_), K(header));
       } else {
         while (OB_SUCC(ret)) {
-          macro_range_info.reuse();
-          if (OB_FAIL(macro_range_producer.get_next_macro_range_info(macro_range_info))) {
+          macro_range_id_info.reuse();
+          if (OB_FAIL(macro_range_producer.get_next_macro_range_info(macro_range_id_info.range_info_))) {
             if (OB_ITER_END == ret) {
               ret = OB_SUCCESS;
               break;
             } else {
               LOG_WARN("failed to get next macro range info", K(ret), K(header), K(rpc_arg_));
             }
-          } else if (OB_FAIL(macro_range_info_array.push_back(macro_range_info))) {
-            LOG_WARN("failed to push back macro range info", K(ret), K(macro_range_info), K(rpc_arg_));
+          } else if (OB_FAIL(macro_range_id_info_array.push_back(macro_range_id_info))) {
+            LOG_WARN("failed to push back macro range info", K(ret), K(macro_range_id_info), K(rpc_arg_));
           }
         }
       }
@@ -2975,9 +3079,10 @@ int ObCopySSTableMacroRestoreReader::build_sstable_range_info_using_iterator_(
   } else {
     int64_t macro_block_count = 0;
     SMART_VARS_3((blocksstable::ObDataMacroBlockMeta, macro_meta),
-                 (ObCopyMacroRangeInfo, macro_range_info),
+                 (ObCopyMacroRangeIdInfo, macro_range_id_info),
                  (ObDatumRowkey, end_key)) {
       while (OB_SUCC(ret)) {
+        ObCopyMacroRangeInfo &macro_range_info = macro_range_id_info.range_info_;
         macro_meta.reset();
         if (OB_FAIL(sstable_sec_meta_iterator->get_next(macro_meta))) {
           if (OB_ITER_END == ret) {
@@ -3005,19 +3110,19 @@ int ObCopySSTableMacroRestoreReader::build_sstable_range_info_using_iterator_(
           macro_range_info.end_macro_block_id_ = macro_meta.get_logic_id();
           macro_range_info.macro_block_count_ = macro_block_count;
           if (macro_block_count < rpc_arg_.macro_range_max_marco_count_) {
-          } else if (OB_FAIL(sstable_macro_range_info.copy_macro_range_array_.push_back(macro_range_info))) {
-            LOG_WARN("failed to push macro range info into array", K(ret), K(macro_range_info));
+          } else if (OB_FAIL(sstable_macro_range_info.copy_macro_range_array_.push_back(macro_range_id_info))) {
+            LOG_WARN("failed to push macro range info into array", K(ret), K(macro_range_id_info));
           } else {
             macro_block_count = 0;
-            macro_range_info.reuse();
+            macro_range_id_info.reuse();
           }
         }
       }
 
       if (OB_FAIL(ret)) {
       } else if (0 == macro_block_count) {
-      } else if (OB_FAIL(sstable_macro_range_info.copy_macro_range_array_.push_back(macro_range_info))) {
-        LOG_WARN("failed to push macro range info into array", K(ret), K(macro_range_info));
+      } else if (OB_FAIL(sstable_macro_range_info.copy_macro_range_array_.push_back(macro_range_id_info))) {
+        LOG_WARN("failed to push macro range info into array", K(ret), K(macro_range_id_info));
       }
     }
   }
@@ -3052,26 +3157,26 @@ int ObCopySSTableMacroRestoreReader::build_sstable_range_info_(
       //do nothing
       LOG_INFO("sstable do not has any macro block", K(table_key));
     } else {
-      ObCopyMacroRangeInfo macro_range_info;
+      ObCopyMacroRangeIdInfo macro_range_id_info;
       int64_t index = 0;
       while (OB_SUCC(ret) && index < block_id_array.count()) {
-        macro_range_info.reuse();
+        macro_range_id_info.reuse();
         int64_t macro_block_count = 0;
         for (; OB_SUCC(ret)
             && index < block_id_array.count()
             && macro_block_count < rpc_arg_.macro_range_max_marco_count_; ++index, ++macro_block_count) {
           const ObRestoreMacroBlockId &pair = block_id_array.at(index);
           if (0 == macro_block_count) {
-            macro_range_info.start_macro_block_id_ = pair.logic_block_id_;
+            macro_range_id_info.range_info_.start_macro_block_id_ = pair.logic_block_id_;
           }
-          macro_range_info.end_macro_block_id_ = pair.logic_block_id_;
+          macro_range_id_info.range_info_.end_macro_block_id_ = pair.logic_block_id_;
         }
 
         if (OB_SUCC(ret)) {
-          macro_range_info.is_leader_restore_ = true;
-          macro_range_info.macro_block_count_ = macro_block_count;
-          if (OB_FAIL(sstable_macro_range_info.copy_macro_range_array_.push_back(macro_range_info))) {
-            LOG_WARN("failed to push macro range info into array", K(ret), K(macro_range_info));
+          macro_range_id_info.range_info_.is_leader_restore_ = true;
+          macro_range_id_info.range_info_.macro_block_count_ = macro_block_count;
+          if (OB_FAIL(sstable_macro_range_info.copy_macro_range_array_.push_back(macro_range_id_info))) {
+            LOG_WARN("failed to push macro range info into array", K(ret), K(macro_range_id_info));
           }
         }
       }
@@ -3091,7 +3196,7 @@ int ObCopySSTableMacroRestoreReader::get_next_shared_ddl_sstable_range_info_(
   const backup::ObBackupMetaType meta_type = backup::ObBackupMetaType::BACKUP_SSTABLE_META;
   backup::ObBackupMetaIndex meta_index;
   share::ObBackupStorageInfo storage_info;
-  share::ObRestoreBackupSetBriefInfo backup_set_brief_info;
+  share::ObBackupSetBriefInfo backup_set_brief_info;
   share::ObBackupDest backup_set_dest;
   ObStorageIdMod mod;
   mod.storage_used_mod_ = ObStorageUsedMod::STORAGE_USED_RESTORE;
@@ -3148,12 +3253,13 @@ int ObCopySSTableMacroRestoreReader::build_shared_ddl_sstable_range_info_(
   } else if (link_item.empty()) {
     LOG_INFO("ddl sstable do not has any link item", K(table_key));
   } else {
-    SMART_VAR(ObCopyMacroRangeInfo, macro_range_info) {
+    SMART_VAR(ObCopyMacroRangeIdInfo, macro_range_id_info) {
       int64_t index = 0;
       while (OB_SUCC(ret) && index < link_item.count()) {
-        macro_range_info.reuse();
+        macro_range_id_info.reuse();
         macro_block_id_array.reset();
         int64_t macro_block_count = 0;
+        ObCopyMacroRangeInfo &macro_range_info = macro_range_id_info.range_info_;
         for (; OB_SUCC(ret)
             && index < link_item.count()
             && macro_block_count < MAX_DDL_MACRO_RANGE_MACRO_COUNT; ++index, ++macro_block_count) {
@@ -3180,7 +3286,7 @@ int ObCopySSTableMacroRestoreReader::build_shared_ddl_sstable_range_info_(
           MEMSET(buf, 0, buf_size);
           if (OB_FAIL(ObStorageHAUtils::make_macro_id_to_datum(macro_block_id_array, buf, buf_size, macro_range_info.start_macro_block_end_key_))) {
             LOG_WARN("failed to make macro id to datum", K(ret), K(table_key));
-          } else if (OB_FAIL(sstable_macro_range_info.copy_macro_range_array_.push_back(macro_range_info))) {
+          } else if (OB_FAIL(sstable_macro_range_info.copy_macro_range_array_.push_back(macro_range_id_info))) {
             LOG_WARN("failed to push macro range info into array", K(ret), K(macro_range_info));
           }
         }
@@ -3302,8 +3408,8 @@ int ObCopySSTableMacroObProducer::get_next_sstable_macro_range_info_(
       macro_block_count = sstable->get_data_macro_block_count();
     } else if (OB_FAIL(sstable->get_meta(meta_handle))) {
       LOG_WARN("failed to get meta", K(ret), K(copy_table_key), KPC(sstable));
-    } else {
-      macro_block_count = meta_handle.get_sstable_meta().get_macro_info().get_other_block_count();
+    } else if (OB_FAIL(meta_handle.get_sstable_meta().get_macro_info().get_other_block_count(macro_block_count))) {
+      LOG_WARN("failed to get other block count", K(ret), "macro_info", meta_handle.get_sstable_meta().get_macro_info());
     }
 
     if (OB_FAIL(ret)) {
@@ -3905,7 +4011,6 @@ int ObCopyRemoteSSTableInfoObProducer::init(
 {
   int ret = OB_SUCCESS;
   ObTablet *tablet = nullptr;
-  bool is_ready_for_read = false;
 
   if (is_inited_) {
     ret = OB_INIT_TWICE;
@@ -3919,7 +4024,7 @@ int ObCopyRemoteSSTableInfoObProducer::init(
   } else if (OB_ISNULL(tablet = tablet_handle_.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet should not be NULL", K(ret), K(tablet_handle_));
-  } else if (OB_FAIL(tablet->get_ha_tables(iter_, is_ready_for_read))) {
+  } else if (OB_FAIL(tablet->get_ha_tables(iter_))) {
     LOG_WARN("failed to get read tables", K(ret), KPC(tablet));
   } else {
     ls_id_ = ls->get_ls_id();
@@ -3935,9 +4040,6 @@ int ObCopyRemoteSSTableInfoObProducer::get_next_sstable_info(
 {
   int ret = OB_SUCCESS;
   sstable_info.reset();
-  ObLSTabletService *tablet_svr = nullptr;
-  ObITable *table = nullptr;
-  bool is_ready_for_read = false;
 
   if (!is_inited_) {
     ret = OB_NOT_INIT;
@@ -4220,14 +4322,24 @@ int ObCopyRemoteSSTableMacroBlockRestoreReader::get_next_macro_block(ObICopyMacr
     } else if (OB_FAIL(read_data.set_macro_meta(macro_meta, true /* is_reuse_macro_block */))){
       LOG_WARN("failed to set macro meta", K(ret), K(macro_meta));
     }
-  } else if (macro_meta.get_logic_id().logic_version_ <= data_version_) {
+  } else {
+    // This is a backup macro block.
     int64_t data_checksum = 0;
     MacroBlockId macro_id;
 
     if (OB_ISNULL(macro_block_reuse_mgr_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("macro block reuse mgr is NULL", K(ret), K(macro_meta), KP(macro_block_reuse_mgr_));
-    } else if (OB_FAIL(macro_block_reuse_mgr_->get_macro_block_reuse_info(table_key_, macro_meta.get_logic_id(), macro_id, data_checksum))) {
+    } else if (OB_FAIL(macro_block_reuse_mgr_->get_macro_block_reuse_info(macro_meta.get_logic_id(), macro_id, data_checksum))) {
+      if (OB_ENTRY_NOT_EXIST == ret) {
+        // if macro block not exist in reuse mgr, read from backup medium
+        ret = OB_SUCCESS;
+        if (OB_FAIL(read_backup_macro_block_data_(macro_meta, read_data))) {
+          LOG_WARN("failed to read backup macro block data", K(ret), K(macro_meta));
+        }
+      } else {
+        LOG_WARN("failed to get macro block", K(ret), K(macro_meta));
+      }
       LOG_WARN("failed to get macro block", K(ret), K(macro_meta));
     } else if (data_checksum != macro_meta.get_meta_val().data_checksum_) {
       ret = OB_INVALID_DATA;
@@ -4235,11 +4347,6 @@ int ObCopyRemoteSSTableMacroBlockRestoreReader::get_next_macro_block(ObICopyMacr
     } else if (FALSE_IT(macro_meta.val_.macro_id_ = macro_id)) {
     } else if (OB_FAIL(read_data.set_macro_meta(macro_meta, true /* is_reuse_macro_block */))) {
       LOG_WARN("failed to set macro meta", K(ret), K(macro_meta));
-    }
-  } else {
-    // This is a backup macro block.
-    if (OB_FAIL(read_backup_macro_block_data_(macro_meta, read_data))) {
-      LOG_WARN("failed to read backup macro block data", K(ret), K(macro_meta));
     }
   }
 
@@ -4388,7 +4495,7 @@ int ObCopyRemoteSSTableMacroBlockRestoreReader::do_read_backup_macro_block_data_
   const int64_t align_size = DIO_READ_ALIGN_SIZE;
   share::ObBackupDataType data_type;
   share::ObBackupStorageInfo storage_info;
-  share::ObRestoreBackupSetBriefInfo backup_set_brief_info;
+  share::ObBackupSetBriefInfo backup_set_brief_info;
   share::ObBackupDest backup_set_dest;
   share::ObBackupPath backup_path;
   ObStorageIdMod mod;
@@ -4707,6 +4814,319 @@ int ObRebuildTabletSSTableProducer::fake_deleted_tablet_meta_(
   } else if (OB_FAIL(tablet_meta.build_deleted_tablet_info(ls_id_, tablet_sstable_info_.tablet_id_))) {
     LOG_WARN("failed to build deleted tablet info", K(ret), K(ls_id_), K(tablet_sstable_info_));
   }
+  return ret;
+}
+
+ObCopySSTableMacroIdInfoReaderInitParam::ObCopySSTableMacroIdInfoReaderInitParam()
+   : tenant_id_(OB_INVALID_ID),
+    ls_id_(),
+    table_key_(),
+    src_info_(),
+    is_leader_restore_(false),
+    restore_action_(ObTabletRestoreAction::RESTORE_NONE),
+    bandwidth_throttle_(nullptr),
+    svr_rpc_proxy_(nullptr),
+    restore_base_info_(nullptr),
+    meta_index_store_(nullptr),
+    second_meta_index_store_(nullptr),
+    restore_macro_block_id_mgr_(nullptr),
+    need_check_seq_(false),
+    ls_rebuild_seq_(-1),
+    filled_tx_scn_()
+{
+}
+
+ObCopySSTableMacroIdInfoReaderInitParam::~ObCopySSTableMacroIdInfoReaderInitParam()
+{
+}
+
+void ObCopySSTableMacroIdInfoReaderInitParam::reset()
+{
+  tenant_id_ = OB_INVALID_ID;
+  ls_id_.reset();
+  table_key_.reset();
+  src_info_.reset();
+  is_leader_restore_ = false;
+  restore_action_ = ObTabletRestoreAction::RESTORE_NONE;
+  bandwidth_throttle_ = nullptr;
+  svr_rpc_proxy_ = nullptr;
+  restore_base_info_ = nullptr;
+  meta_index_store_ = nullptr;
+  second_meta_index_store_ = nullptr;
+  restore_macro_block_id_mgr_ = nullptr;
+  need_check_seq_ = false;
+  ls_rebuild_seq_ = -1;
+  filled_tx_scn_.reset();
+}
+
+bool ObCopySSTableMacroIdInfoReaderInitParam::is_valid() const
+{
+  bool bool_ret = false;
+  bool_ret = tenant_id_ != OB_INVALID_ID && ls_id_.is_valid() && table_key_.is_valid()
+    && ((need_check_seq_ && ls_rebuild_seq_ >= 0) || !need_check_seq_);
+  if (bool_ret) {
+    if (!is_leader_restore_) {
+      bool_ret = src_info_.is_valid() && OB_NOT_NULL(bandwidth_throttle_) && OB_NOT_NULL(svr_rpc_proxy_)
+        && filled_tx_scn_.is_valid();
+    } else if (OB_ISNULL(restore_base_info_) || OB_ISNULL(meta_index_store_) || OB_ISNULL(second_meta_index_store_)) {
+      bool_ret = false;
+    } else if (!ObTabletRestoreAction::is_restore_remote_sstable(restore_action_)
+               && !ObTabletRestoreAction::is_restore_replace_remote_sstable(restore_action_)
+               && OB_ISNULL(restore_macro_block_id_mgr_)) {
+      bool_ret = false;
+      LOG_WARN_RET(OB_INVALID_ARGUMENT, "restore_macro_block_id_mgr_ is null", K_(restore_action), KP_(restore_macro_block_id_mgr));
+     }
+  }
+  return bool_ret;
+}
+
+int ObCopySSTableMacroIdInfoReaderInitParam::assign(const ObCopySSTableMacroIdInfoReaderInitParam &param)
+{
+  int ret = OB_SUCCESS;
+  if (!param.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(param));
+  } else {
+    tenant_id_ = param.tenant_id_;
+    ls_id_ = param.ls_id_;
+    table_key_ = param.table_key_;
+    src_info_ = param.src_info_;
+    is_leader_restore_ = param.is_leader_restore_;
+    restore_action_ = param.restore_action_;
+    bandwidth_throttle_ = param.bandwidth_throttle_;
+    svr_rpc_proxy_ = param.svr_rpc_proxy_;
+    restore_base_info_ = param.restore_base_info_;
+    meta_index_store_ = param.meta_index_store_;
+    second_meta_index_store_ = param.second_meta_index_store_;
+    restore_macro_block_id_mgr_ = param.restore_macro_block_id_mgr_;
+    need_check_seq_ = param.need_check_seq_;
+    ls_rebuild_seq_ = param.ls_rebuild_seq_;
+    filled_tx_scn_ = param.filled_tx_scn_;
+  }
+  return ret;
+}
+
+ObCopySSTableMacroIdInfoObReader::ObCopySSTableMacroIdInfoObReader()
+  : is_inited_(false),
+    rpc_reader_()
+{
+}
+
+int ObCopySSTableMacroIdInfoObReader::init(const ObCopySSTableMacroIdInfoReaderInitParam &param)
+{
+  int ret = OB_SUCCESS;
+  int64_t rpc_timeout = FETCH_SSTABLE_MACRO_ID_INFO_TIMEOUT;
+
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("ObCopySSTableMacroIdInfoObReader init twice", K(ret));
+  } else if (OB_FAIL(rpc_reader_.init(*param.bandwidth_throttle_))) {
+    LOG_WARN("failed to init rpc reader", K(ret));
+  } else {
+    rpc_timeout = ObStorageHAUtils::get_rpc_timeout();
+    ObCopySSTableMacroLogicIdInfoArg arg;
+    arg.tenant_id_ = param.tenant_id_;
+    arg.ls_id_ = param.ls_id_;
+    arg.table_key_ = param.table_key_;
+    arg.version_ = 0;
+    arg.filled_tx_scn_ = param.filled_tx_scn_;
+    arg.need_check_seq_ = param.need_check_seq_;
+    arg.ls_rebuild_seq_ = param.ls_rebuild_seq_;
+    if (OB_FAIL(param.svr_rpc_proxy_->to(param.src_info_.src_addr_).by(param.tenant_id_)
+                  .timeout(rpc_timeout).dst_cluster_id(param.src_info_.cluster_id_)
+                  .ratelimit(true).bg_flow(obrpc::ObRpcProxy::BACKGROUND_FLOW)
+                  .group_id(share::OBCG_STORAGE_STREAM)
+                  .fetch_sstable_macro_logic_id_info(arg, rpc_reader_.get_rpc_buffer(), rpc_reader_.get_handle()))) {
+      LOG_WARN("failed to send fetch sstable macro logic id info rpc", K(ret), K(param));
+    } else {
+      is_inited_ = true;
+      LOG_INFO("succeed to init sstable macro logic id info ob reader", K(param));
+    }
+  }
+
+  return ret;
+}
+
+int ObCopySSTableMacroIdInfoObReader::get_sstable_macro_logic_ids(LogicIdArray &logic_id_array)
+{
+  int ret = OB_SUCCESS;
+  logic_id_array.reset();
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ObCopySSTableMacroIdInfoObReader not init", K(ret));
+  } else if (OB_FAIL(rpc_reader_.fetch_and_decode_list(logic_id_array))) {
+    LOG_WARN("failed to get next sstable macro logic ids", K(ret));
+  }
+
+  return ret;
+}
+
+/******************ObCopySSTableMacroIdInfoRestoreReader*********************/
+ObCopySSTableMacroIdInfoRestoreReader::ObCopySSTableMacroIdInfoRestoreReader()
+  : is_inited_(false),
+    producer_()
+{
+}
+
+int ObCopySSTableMacroIdInfoRestoreReader::init(const ObCopySSTableMacroIdInfoReaderInitParam &param)
+{
+  int ret = OB_SUCCESS;
+
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("cannot init twice", K(ret));
+  } else if (OB_FAIL(producer_.init(param.tenant_id_, param.ls_id_, param.table_key_, param.filled_tx_scn_))) {
+    LOG_WARN("failed to init producer", K(ret), K(param));
+  } else {
+    is_inited_ = true;
+    LOG_INFO("succeed to init sstable macro id info restore reader", K(param));
+  }
+
+  return ret;
+}
+
+int ObCopySSTableMacroIdInfoRestoreReader::get_sstable_macro_logic_ids(LogicIdArray &logic_id_array)
+{
+  int ret = OB_SUCCESS;
+  logic_id_array.reset();
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ObCopySSTableMacroIdInfoRestoreReader not init", K(ret));
+  } else {
+    ObLogicMacroBlockId logic_id;
+    ObDataMacroBlockMeta macro_meta;
+
+    while(OB_SUCC(ret)) {
+      logic_id.reset();
+      if (OB_FAIL(producer_.get_next_logic_id(logic_id))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+          break;
+        } else {
+          LOG_WARN("failed to get next macro block id", K(ret));
+        }
+      } else if (OB_FAIL(logic_id_array.push_back(logic_id))) {
+        LOG_WARN("failed to push back logic macro id", K(ret), K(logic_id));
+      }
+    }
+  }
+  return ret;
+}
+
+/******************ObCopyLogicMacroBlockIdInfoObProducer*********************/
+ObCopyLogicMacroBlockIdInfoObProducer::ObCopyLogicMacroBlockIdInfoObProducer()
+  : is_inited_(),
+    tablet_allocator_(),
+    tablet_handle_(),
+    sstable_handle_(),
+    sstable_(nullptr),
+    datum_range_(),
+    allocator_(),
+    second_meta_iterator_()
+{
+  ObMemAttr attr_tablet_alloc(MTL_ID(), "HaTabletHdl");
+  tablet_allocator_.set_attr(attr_tablet_alloc);
+  ObMemAttr attr_copy_macro_block(MTL_ID(), "CpMacroBlkId");
+  allocator_.set_attr(attr_copy_macro_block);
+}
+
+ObCopyLogicMacroBlockIdInfoObProducer::~ObCopyLogicMacroBlockIdInfoObProducer()
+{
+}
+
+int ObCopyLogicMacroBlockIdInfoObProducer::init(
+  const uint64_t tenant_id,
+  const share::ObLSID &ls_id,
+  const ObITable::TableKey &table_key,
+  const share::SCN filled_tx_scn)
+{
+  int ret = OB_SUCCESS;
+  ObLSHandle ls_handle;
+  ObLSService *ls_service = nullptr;
+  ObLS *ls = nullptr;
+  ObTablet* tablet = nullptr;
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(guard);
+  ObSSTableMetaHandle meta_handle;
+  common::ObSafeArenaAllocator allocator(allocator_);
+  ObTabletMapKey map_key;
+  map_key.ls_id_ = ls_id;
+  map_key.tablet_id_ = table_key.get_tablet_id();
+
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("cannot init twice", K(ret));
+  } else if (OB_INVALID_ID == tenant_id || !ls_id.is_valid() || !table_key.is_valid() || !filled_tx_scn.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid args", K(ret), K(tenant_id), K(ls_id), K(table_key), K(filled_tx_scn));
+  } else if (OB_FAIL(guard.switch_to(tenant_id))) {
+    LOG_WARN("switch tenant failed", K(ret), K(tenant_id));
+  } else if (OB_ISNULL(ls_service = MTL(ObLSService *))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ls service should not be null", K(ret), KP(ls_service));
+  } else if (OB_FAIL(ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::HA_MOD))) {
+    LOG_WARN("fail to get log stream", KR(ret), K(tenant_id), K(ls_id));
+  } else if (OB_UNLIKELY(nullptr == (ls = ls_handle.get_ls()))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("log stream should not be NULL", KR(ret), K(tenant_id), K(ls_id), KPC(ls));
+  } else if (OB_FAIL(ls->ha_get_tablet_without_memtables(WashTabletPriority::WTP_LOW, map_key, tablet_allocator_, tablet_handle_))) {
+    LOG_WARN("failed to ha get tablet with allocator without memtables", K(ret), K(map_key));
+  } else if (OB_UNLIKELY(nullptr == (tablet = tablet_handle_.get_obj()))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tablet not be NULL", KR(ret), K(tenant_id), K(ls_id), KPC(tablet));
+  } else if (OB_FAIL(tablet->get_table(table_key, sstable_handle_))) {
+    LOG_WARN("failed to get table", K(ret), K(table_key));
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = OB_SSTABLE_NOT_EXIST;
+    }
+  } else if (OB_FAIL(sstable_handle_.get_sstable(sstable_))) {
+    LOG_WARN("failed to get sstable", K(ret), K(table_key));
+  } else if (OB_FAIL(sstable_->get_meta(meta_handle, &allocator))) {
+    LOG_WARN("failed to get sstable meta", K(ret), K(table_key));
+  } else if (filled_tx_scn != meta_handle.get_sstable_meta().get_basic_meta().filled_tx_scn_) {
+    ret = OB_SSTABLE_NOT_EXIST;
+    LOG_WARN("sstable has been changed", K(ret), K(table_key), K(filled_tx_scn), KPC(sstable_));
+  } else {
+    const storage::ObITableReadInfo *index_read_info = nullptr;
+    const bool is_reverse_scan = false;
+
+    if (OB_FAIL(tablet->get_sstable_read_info(sstable_, index_read_info))) {
+      LOG_WARN("failed to get index read info ", KR(ret), K(sstable_));
+    } else if (FALSE_IT(datum_range_.set_whole_range())) {
+    } else if (OB_FAIL(second_meta_iterator_.open(datum_range_, blocksstable::DATA_BLOCK_META,
+        *sstable_, *index_read_info, allocator_, is_reverse_scan))) {
+      LOG_WARN("failed to open second meta iterator", K(ret), K(ls_id), K(table_key));
+    } else {
+      is_inited_ = true;
+      LOG_INFO("succeed to init logic macro block id info producer", K(table_key), K(filled_tx_scn));
+    }
+  }
+
+  return ret;
+}
+
+int ObCopyLogicMacroBlockIdInfoObProducer::get_next_logic_id(ObLogicMacroBlockId &logic_id)
+{
+  int ret = OB_SUCCESS;
+  blocksstable::ObDataMacroBlockMeta macro_meta;
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ObCopyLogicMacroBlockIdInfoObProducer not init", K(ret));
+  } else if (OB_FAIL(second_meta_iterator_.get_next(macro_meta))) {
+    if (OB_ITER_END == ret) {
+      LOG_INFO("get next logic id end", K(ret));
+    } else {
+      LOG_WARN("failed to get next logic id", K(ret));
+    }
+  } else if (!macro_meta.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid macro meta", K(ret), K(macro_meta));
+  } else {
+    logic_id = macro_meta.get_logic_id();
+  }
+
   return ret;
 }
 

@@ -39,6 +39,7 @@ ObIColumnCSEncoder::ObIColumnCSEncoder()
 
 int ObIColumnCSEncoder::init(const ObColumnCSEncodingCtx &ctx,
                              const int64_t column_index,
+                             const ObObjMeta col_type,
                              const int64_t row_count)
 {
   int ret = OB_SUCCESS;
@@ -54,10 +55,10 @@ int ObIColumnCSEncoder::init(const ObColumnCSEncodingCtx &ctx,
       LOG_WARN("sub column init common fail", K(ret), K(column_index), KPC(ctx.semistruct_ctx_));
     }
   } else if (!ctx.encoding_ctx_->is_valid() || column_index < 0
-      || column_index >= ctx.encoding_ctx_->column_cnt_ || 0 == row_count) {
+      || column_index > ctx.encoding_ctx_->column_cnt_ || 0 == row_count) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(ctx), K(column_index), K(row_count));
-  } else if (OB_FAIL(init_common_(ctx, column_index, ctx.encoding_ctx_->col_descs_->at(column_index).col_type_, row_count))) {
+  } else if (OB_FAIL(init_common_(ctx, column_index, col_type, row_count))) {
     LOG_WARN("init common fail", K(ret), K(column_index), K(ctx));
   }
   if (OB_SUCC(ret)) {
@@ -99,7 +100,7 @@ void ObIColumnCSEncoder::reuse()
 int ObIColumnCSEncoder::store_null_bitamp(ObMicroBufferWriter &buf_writer)
 {
   int ret = OB_SUCCESS;
-  if (!column_header_.has_null_bitmap()) {
+  if (!column_header_.has_null_or_nop_bitmap()) {
     // has no bitmap, do nothing
   } else {
     char *bitmap = buf_writer.current();
@@ -111,7 +112,32 @@ int ObIColumnCSEncoder::store_null_bitamp(ObMicroBufferWriter &buf_writer)
       MEMSET(bitmap, 0, bitmap_size);
       const ObColDatums &datums = *ctx_->col_datums_;
       for (int64_t row_id = 0; row_id < row_count_; ++row_id)  {
-        if (datums.at(row_id).is_null()) {
+        if (datums.at(row_id).is_null_or_nop()) {
+          bitmap[row_id / 8] |= (1 << (7 - row_id % 8));
+        }
+      }
+    }
+  }
+
+  return ret;
+}
+
+int ObIColumnCSEncoder::store_nop_bitmap(ObMicroBufferWriter &buf_writer)
+{
+  int ret = OB_SUCCESS;
+  if (!column_header_.has_nop_bitmap()) {
+    // has no bitmap, do nothing
+  } else {
+    char *bitmap = buf_writer.current();
+    int64_t bitmap_size = ObCSEncodingUtil::get_bitmap_byte_size(row_count_);
+
+    if (OB_FAIL(buf_writer.advance(bitmap_size))) {
+      LOG_WARN("buffer advance failed", K(ret), K(bitmap_size), K(row_count_));
+    } else {
+      MEMSET(bitmap, 0, bitmap_size);
+      const ObColDatums &datums = *ctx_->col_datums_;
+      for (int64_t row_id = 0; row_id < row_count_; ++row_id)  {
+        if (datums.at(row_id).is_nop()) {
           bitmap[row_id / 8] |= (1 << (7 - row_id % 8));
         }
       }

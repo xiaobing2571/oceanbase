@@ -22,12 +22,15 @@ namespace sql
 class ObDMLStmt;
 class ObLogInsert;
 class ObInsertStmt;
-typedef common::ObSEArray<common::ObSEArray<int64_t, 8, common::ModulePageAllocator, true>, 1, common::ModulePageAllocator, true> RowParamMap;
 class ObInsertLogPlan: public ObDelUpdLogPlan
 {
 public:
   ObInsertLogPlan(ObOptimizerContext &ctx, const ObInsertStmt *insert_stmt)
-      : ObDelUpdLogPlan(ctx, insert_stmt)
+      : ObDelUpdLogPlan(ctx, insert_stmt),
+        replace_del_index_del_infos_(allocator_),
+        insert_up_index_upd_infos_(allocator_),
+        uk_constraint_infos_(allocator_),
+        is_insertup_opt_for_column_store_(false)
   { }
   virtual ~ObInsertLogPlan()
   { }
@@ -38,6 +41,9 @@ public:
 
   virtual int prepare_dml_infos() override;
 
+  bool is_insertup_opt_for_column_store() const
+  { return is_insertup_opt_for_column_store_; }
+
   common::ObIArray<IndexDMLInfo *> &get_replace_del_index_del_infos()
   { return replace_del_index_del_infos_; }
   const common::ObIArray<IndexDMLInfo *> &get_replace_del_index_del_infos() const
@@ -47,7 +53,7 @@ public:
   { return insert_up_index_upd_infos_; }
   const common::ObIArray<IndexDMLInfo *> &get_insert_up_index_upd_infos() const
   { return insert_up_index_upd_infos_; }
-  common::ObIArray<ObUniqueConstraintInfo> &get_uk_constraint_infos()
+  common::ObIArray<ObUniqueConstraintInfo*> &get_uk_constraint_infos()
   { return uk_constraint_infos_; }
 
   virtual int perform_vector_assign_expr_replacement(ObDelUpdStmt *stmt)override;
@@ -91,9 +97,6 @@ protected:
   virtual int check_insert_plan_need_multi_partition_dml(ObTablePartitionInfo *insert_table_partition,
                                                         ObShardingInfo *insert_table_sharding,
                                                         bool &is_multi_part_dml);
-  int check_basic_sharding_for_insert_stmt(ObShardingInfo &target_sharding,
-                                           ObLogicalOperator &child,
-                                           bool &is_basic);
   int check_if_match_partition_wise_insert(ObShardingInfo &target_sharding,
                                            ObLogicalOperator &child,
                                            bool &is_partition_wise);
@@ -136,11 +139,13 @@ private:
   int get_index_part_ids(const ObInsertTableInfo& table_info, const ObTableSchema *&data_table_schema, const ObTableSchema *&index_schema, ObIArray<uint64_t> &index_part_ids);
   int generate_osg_share_info(OSGShareInfo *&info);
   int check_need_online_stats_gather(bool &need_osg);
+  int check_insertup_opt_for_column_store();
   DISALLOW_COPY_AND_ASSIGN(ObInsertLogPlan);
 private:
-  common::ObSEArray<IndexDMLInfo *, 1, common::ModulePageAllocator, true> replace_del_index_del_infos_;
-  common::ObSEArray<IndexDMLInfo *, 1, common::ModulePageAllocator, true> insert_up_index_upd_infos_;
-  common::ObSEArray<ObUniqueConstraintInfo, 8, common::ModulePageAllocator, true> uk_constraint_infos_;
+  ObSqlArray<IndexDMLInfo *> replace_del_index_del_infos_;
+  ObSqlArray<IndexDMLInfo *> insert_up_index_upd_infos_;
+  ObSqlArray<ObUniqueConstraintInfo*> uk_constraint_infos_;
+  bool is_insertup_opt_for_column_store_;
 };
 }
 }

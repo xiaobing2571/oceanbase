@@ -74,10 +74,20 @@ public:
       ObTableAccessContext &context,
       ObITable *table,
       const void *query_range);
+  virtual int advance_scan(const blocksstable::ObDatumRange &range)
+  {
+    UNUSED(range);
+    return OB_NOT_SUPPORTED;
+  }
   virtual bool is_sstable_iter() const { return is_sstable_iter_; }
   virtual int refresh_blockscan_checker(const blocksstable::ObDatumRowkey &rowkey)
   {
     UNUSED(rowkey);
+    return OB_NOT_SUPPORTED;
+  }
+  virtual int get_blockscan_border_rowkey(blocksstable::ObDatumRowkey &border_rowkey)
+  {
+    UNUSED(border_rowkey);
     return OB_NOT_SUPPORTED;
   }
   virtual int set_ignore_shadow_row() { return OB_NOT_SUPPORTED; }
@@ -116,16 +126,18 @@ public:
         IteratorCOMultiScan == iter_type;
   }
   OB_INLINE bool is_reclaimed() const { return is_reclaimed_; }
-  virtual int get_next_rowkey(blocksstable::ObDatumRowkey& rowkey,
-                               int64_t &curr_scan_index,
-                               blocksstable::ObDatumRowkey &border_rowkey,
-                               common::ObIAllocator &allocator,
-                               bool need_set_border_rowkey)
+  virtual int get_next_rowkey(int64_t &curr_scan_index,
+                              blocksstable::ObDatumRowkey& rowkey,
+                              common::ObIAllocator &allocator)
   {
-    UNUSEDx(rowkey, border_rowkey, allocator, need_set_border_rowkey);
+    UNUSEDx(curr_scan_index, rowkey, allocator);
     return OB_NOT_IMPLEMENT;
   }
-
+  virtual int get_next_border_rowkey(const blocksstable::ObDatumRowkey *&border_rowkey) const
+  {
+    UNUSED(border_rowkey);
+    return OB_NOT_IMPLEMENT;
+  }
   VIRTUAL_TO_STRING_KV(K_(type), K_(is_sstable_iter), K_(is_reclaimed), KP_(block_row_store), KP_(long_life_allocator));
 
 protected:
@@ -166,7 +178,9 @@ enum ObQRIterType
   T_SINGLE_GET,
   T_MULTI_GET,
   T_SINGLE_SCAN,
+  T_LEVEL_ORDER_SCAN,
   T_MULTI_SCAN,
+  T_LEVEL_ORDER_MULTI_SCAN,
   T_MAX_ITER_TYPE,
 };
 
@@ -191,6 +205,11 @@ public:
   {
     OB_ASSERT_MSG(false, "ObQueryRowIterator dose not impl reclaim");
   }
+  virtual int advance_scan(const blocksstable::ObDatumRange &range)
+  {
+    UNUSED(range);
+    return OB_NOT_SUPPORTED;
+  }
   // Iterate row interface for vectorized engine.
   virtual int get_next_rows(int64_t &count, int64_t capacity)
   {
@@ -213,7 +232,8 @@ public:
   VIRTUAL_TO_STRING_KV(K_(type));
 public:
   ObQRIterType get_type() const { return type_; }
-  bool is_scan() const { return type_ == T_SINGLE_SCAN || type_ == T_MULTI_SCAN; }
+  bool is_scan() const { return type_ == T_SINGLE_SCAN || type_ == T_MULTI_SCAN || type_ == T_LEVEL_ORDER_SCAN || type_ == T_LEVEL_ORDER_MULTI_SCAN; }
+  bool is_level_order_scan() const { return type_ == T_LEVEL_ORDER_SCAN || type_ == T_LEVEL_ORDER_MULTI_SCAN; }
 protected:
   ObQRIterType type_;
 
@@ -436,8 +456,8 @@ do {                                                                            
 
 #define FREE_TABLE_STORE_ROW_IETRATOR(ctx, ptr)                                                \
 do {                                                                                           \
-  if (NULL != ptr) {                                                                           \
-    ctx.get_long_life_allocator()->free(ptr);                                                  \
+  if (NULL != (ptr)) {                                                                           \
+    (ctx).get_long_life_allocator()->free(ptr);                                                  \
   }                                                                                            \
  } while(0)
 

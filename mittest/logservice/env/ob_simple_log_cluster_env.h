@@ -74,12 +74,12 @@ class MockLSAdapter;
   return RUN_ALL_TESTS();
 
 #define EXPECT_UNTIL_EQ(x, y) while(!(x == y))        \
-        { usleep(500);                                \
+        { ob_usleep(500);                             \
           SERVER_LOG(INFO, "EXPECT_UNTIL_EQ WAIT",    \
           "file", oceanbase::common::occam::get_file_name_without_dir(__FILE__), \
           "line", __LINE__); }
 #define EXPECT_UNTIL_NE(x, y) while(x == y)           \
-        { usleep(500);                                \
+        { ob_usleep(500);                             \
           SERVER_LOG(INFO, "EXPECT_UNTIL_NE WAIT",    \
           "file", oceanbase::common::occam::get_file_name_without_dir(__FILE__), \
           "line", __LINE__); }
@@ -284,7 +284,7 @@ private:
 
 class IOTaskCond : public LogIOTask {
 public:
-	IOTaskCond(const int64_t palf_id, const int64_t palf_epoch) : LogIOTask(palf_id, palf_epoch), count_(0) {}
+	IOTaskCond(const int64_t palf_id, const int64_t palf_epoch) : LogIOTask(palf_id, palf_epoch), cond_(ObCond::SPIN_WAIT_NUM, ObWaitEventIds::UNITEST_COND_WAIT), count_(0) {}
   virtual int do_task_(int tg_id, IPalfHandleImplGuard &guard) override final
   {
     PALF_LOG(INFO, "before cond_wait");
@@ -311,7 +311,7 @@ public:
 
 class IOTaskConsumeCond : public LogIOTask {
 public:
-	IOTaskConsumeCond(const int64_t palf_id, const int64_t palf_epoch) : LogIOTask(palf_id, palf_epoch) {}
+	IOTaskConsumeCond(const int64_t palf_id, const int64_t palf_epoch) : LogIOTask(palf_id, palf_epoch), cond_(ObCond::SPIN_WAIT_NUM, ObWaitEventIds::UNITEST_COND_WAIT) {}
   virtual int do_task_(int tg_id, IPalfHandleImplGuard &guard) override final
   {
     int ret = OB_SUCCESS;

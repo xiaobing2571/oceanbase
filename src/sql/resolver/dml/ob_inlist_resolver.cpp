@@ -119,7 +119,7 @@ int ObInListResolver::resolve_values_table_from_inlist(const ParseNode *in_list,
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("sub_query or table_buf is null", K(ret), KP(table_buf));
   } else {
-    table_def = new (table_buf) ObValuesTableDef();
+    table_def = new (table_buf) ObValuesTableDef(*allocator);
     table_def->column_cnt_ = column_cnt;
     table_def->row_cnt_ = row_cnt;
     table_def->access_type_ = access_type;
@@ -202,6 +202,7 @@ int ObInListResolver::get_inlist_rewrite_info(const ParseNode &in_list,
 {
   int64_t ret = OB_SUCCESS;
   int64_t row_cnt = -1;
+  bool enable_hybrid_inlist = ObTransformUtils::is_enable_hybrid_inlist_rewrite(helper.optimizer_features_enable_version_);
   if (OB_ISNULL(in_list.children_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid arguments", K(ret));
@@ -266,8 +267,14 @@ int ObInListResolver::get_inlist_rewrite_info(const ParseNode &in_list,
         } else if (0 == i) {
           rewrite_info.param_types_.at(col_idx) = cur_param_type;
         } else if (rewrite_info.param_types_.at(col_idx) == cur_param_type) {
+        } else if (enable_hybrid_inlist && ObNullType == cur_param_type.obj_type_) {
+          // ignore null type
+        } else if (enable_hybrid_inlist && ObNullType == rewrite_info.param_types_.at(col_idx).obj_type_) {
+          rewrite_info.param_types_.at(col_idx) = cur_param_type;
         } else {
           rewrite_info.is_valid_as_values_table_ = false;
+          LOG_WARN("get inconsistent param types in big inlist", K(column_cnt), K(row_cnt), K(i),
+                   K(col_idx), K(cur_param_type), K(rewrite_info.param_types_.at(col_idx)));
         }
       }
     }
@@ -374,7 +381,8 @@ int ObInListResolver::check_inlist_rewrite_enable(const ParseNode &in_list,
                                      nchar_collation,
                                      static_cast<ObCollationType>(server_collation),
                                      enable_decimal_int,
-                                     is_prepare_stmt);
+                                     is_prepare_stmt,
+                                     optimizer_features_enable_version);
       InListRewriteInfo rewrite_info;
       for (int64_t j = 0; OB_SUCC(ret) && is_enable && j < column_cnt; ++j) {
         if (OB_FAIL(get_inlist_rewrite_info(in_list, column_cnt, j, helper, rewrite_info))) {
@@ -386,11 +394,6 @@ int ObInListResolver::check_inlist_rewrite_enable(const ParseNode &in_list,
         } else if (rewrite_info.param_types_.count() <= j) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpected param types count", K(ret), K(j));
-        } else if (lib::is_oracle_mode() && ObCharType == rewrite_info.param_types_.at(j).obj_type_) {
-          // in oracle mode, inlist to values table rewrite may cast char types to varchar2
-          // but comparison behaviors for chars and varchar2s are different for trailing spaces
-          // which will lead to unexpect comparison result
-          is_enable = false;
         } else if (ob_is_enum_or_set_type(rewrite_info.param_types_.at(j).obj_type_)
                    || is_lob_locator(rewrite_info.param_types_.at(j).obj_type_)) {
           is_enable = false;
@@ -452,7 +455,7 @@ int ObInListResolver::resolve_access_param_values_table(const ParseNode &in_list
           LOG_WARN("failed to push back res type", K(ret));
         } else if (OB_FAIL(dummy_op.aggregate_result_type_for_merge(new_res_type,
                            &tmp_res_types.at(0), 2, lib::is_oracle_mode(), type_ctx,
-                           true, false, is_called_in_sql))) {
+                           false, false, is_called_in_sql))) {
           LOG_WARN("failed to aggregate result type for merge", K(ret));
         } else {
           table_def.column_types_.at(j) = new_res_type;
@@ -540,6 +543,7 @@ int ObInListResolver::resolve_access_obj_values_table(const ParseNode &in_list,
                                                  compat_type,
                                                  enable_mysql_compatible_dates,
                                                  session_info->get_min_const_integer_precision(),
+                                                 session_info->get_exec_min_cluster_version(),
                                                  is_from_pl))) {
         LOG_WARN("failed to resolve const", K(ret));
       } else if (OB_FAIL(table_def.access_objs_.push_back(obj_param))) {
@@ -573,7 +577,7 @@ int ObInListResolver::resolve_access_obj_values_table(const ParseNode &in_list,
             LOG_WARN("failed to push back res type", K(ret));
           } else if (OB_FAIL(dummy_op.aggregate_result_type_for_merge(new_res_type,
                             &tmp_res_types.at(0), 2, is_oracle_mode,
-                            type_ctx, true, false, is_called_in_sql))) {
+                            type_ctx, false, false, is_called_in_sql))) {
             LOG_WARN("failed to aggregate result type for merge", K(ret));
           } else {
             table_def.column_types_.at(j) = new_res_type;
@@ -914,7 +918,8 @@ int ObInListResolver::try_merge_inlists(ObExprResolveContext &resolve_ctx,
                                    nchar_collation,
                                    static_cast<ObCollationType>(server_collation),
                                    enable_decimal_int,
-                                   is_prepare_stmt);
+                                   is_prepare_stmt,
+                                   optimizer_features_enable_version);
     if (OB_FAIL(do_merge_inlists(alloc, helper, root_node, ret_node))) {
       LOG_WARN("fail to merge inlist", K(ret));
     }

@@ -55,7 +55,6 @@ public:
 
   int64_t captured_merge_time_cost_[ObFreezerMergeType::MAX_MERGE_TYPE];
   int64_t captured_merge_times_[ObFreezerMergeType::MAX_MERGE_TYPE];
-  int64_t captured_source_times_[MAX_FREEZE_SOURCE_TYPE_COUNT];
 
   int64_t last_captured_retire_clock_;
 
@@ -204,6 +203,7 @@ public:
                                int64_t &memstore_freeze_trigger,
                                int64_t &memstore_limit,
                                int64_t &freeze_cnt,
+                               int64_t &throttle_trigger_percentage,
                                const bool force_refresh = true);
   // get the tenant memstore used
   int get_tenant_memstore_used(int64_t &total_memstore_used,
@@ -238,6 +238,7 @@ public:
     retry_major_info_ = retry_major_info;
   }
   static int64_t get_freeze_trigger_interval() { return FREEZE_TRIGGER_INTERVAL; }
+  static int64_t get_freeze_trigger_percentage();
   bool exist_ls_freezing();
   bool exist_ls_throttle_is_skipping();
   bool memstore_remain_memory_is_exhausting();
@@ -261,6 +262,7 @@ private:
                                 int64_t &memstore_freeze_trigger,
                                 int64_t &memstore_limit,
                                 int64_t &freeze_cnt,
+                                int64_t &throttle_trigger_percentage,
                                 const bool force_refresh = true);
   int check_memstore_full_(bool &last_result,
                            int64_t &last_check_timestamp,
@@ -281,8 +283,8 @@ private:
   // unset tenant freezing flag.
   // @param[in] rollback_freeze_cnt, reduce the tenant's freeze count by 1, if true.
   int unset_tenant_freezing_(const bool rollback_freeze_cnt);
-  static int64_t get_freeze_trigger_percentage_();
   static int64_t get_memstore_limit_percentage_();
+  static int64_t get_throttle_trigger_percentage_();
   int post_freeze_request_(const storage::ObFreezeType freeze_type,
                            const int64_t try_frozen_version);
   int retry_failed_major_freeze_(bool &triggered);

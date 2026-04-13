@@ -45,6 +45,7 @@ public:
         out_type_owner_(),
         out_client_params_(),
         out_param_id_(),
+        question_mark_idx_(),
         db_name_(),
         is_udt_routine_(false),
         enum_set_ctx_(allocator_) {
@@ -70,6 +71,21 @@ public:
   inline bool is_client_out_param_by_out_param_id(int64_t i) const {
     return i < out_param_id_.count() && is_client_out_param_by_param_id(out_param_id_.at(i));
   }
+  inline bool is_out_param_by_question_mark_idx(int64_t i) const {
+    return i < question_mark_idx_.count() && is_out_param(question_mark_idx_.at(i));
+  }
+  int64_t get_out_mode_by_question_mark_idx(int64_t i) const {
+    // first locate the corresponding index of question mark idx in the `out_param_id_` array
+    // the array `out_param_id_` wouldn't be too long, so linear search is just ok
+    int64_t idx = OB_INVALID_INDEX;
+    for (int64_t j = 0; j < out_param_id_.count(); ++j) {
+      if (out_param_id_.at(j) == question_mark_idx_.at(i)) {
+        idx = j;
+        break;
+      }
+    }
+    return idx != OB_INVALID_INDEX ? out_mode_.at(idx) : ObRoutineParamInOut::SP_PARAM_INVALID;
+  }
   int add_out_param(int64_t i,
                     int64_t mode,
                     const ObString &name,
@@ -77,6 +93,7 @@ public:
                     const ObString &out_type_name,
                     const ObString &out_type_owner,
                     const bool is_client_out_param = true);
+  int add_question_mark_idx(int64_t idx);
 
   const ParamTypeInfoArray& get_type_infos() const {
     return in_type_infos_;
@@ -117,6 +134,7 @@ public:
                K_(out_type_owner),
                K_(out_client_params),
                K_(out_param_id),
+               K_(question_mark_idx),
                K_(is_udt_routine));
 private:
   bool can_direct_use_param_;
@@ -136,7 +154,15 @@ private:
   /* MySQL mode does not return out parameters to non-standard drivers (obclient, opensource MySQL
    * driver) unless the parameter is bound with "?" */
   ObBitSet<> out_client_params_;
+  /* record the question mark index of the out params
+   */
   ObSEArray<int64_t, 32> out_param_id_;
+  /* record corresponding param idx of the question marks, for example:
+   *     call proc(arg1, ?, arg3, ?, arg5);
+   *     question_mark_idx_ = [1, 3]
+   * means that the second and fourth parameters are question marks
+   */
+  ObSEArray<int64_t, 32> question_mark_idx_;
 
   ParamTypeInfoArray in_type_infos_;
   ObString db_name_;

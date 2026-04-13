@@ -245,7 +245,6 @@ public:
   ObTenantSuperBlock(const ObTenantSuperBlock &other);
   ObTenantSuperBlock &operator==(const ObTenantSuperBlock &other) = delete;
   ObTenantSuperBlock &operator!=(const ObTenantSuperBlock &other) = delete;
-  void copy_snapshots_from(const ObTenantSuperBlock &other);
   void reset();
   bool is_valid() const;
   int get_snapshot(const share::ObTenantSnapshotID &snapshot_id, ObTenantSnapshotMeta &snapshot) const;
@@ -298,14 +297,14 @@ public:
 // Due to the design of slog, the log_id_'s initial value must be 1
 #define SET_FIRST_VALID_SLOG_CURSOR(cursor) (set_cursor(cursor, 1/*file_id*/, 1/*log_id*/, 0/*offset*/))
 
-
+// UNUSED?
 struct ObActiveTabletItem
 {
 public:
   ObActiveTabletItem();
   ObActiveTabletItem(const common::ObTabletID tablet_id, const int64_t union_id);
   bool is_valid() const;
-  int64_t get_transfer_seq() const { return meta_transfer_seq_; }
+  int64_t get_transfer_epoch() const { return meta_transfer_seq_; }
   uint64_t get_tablet_meta_version() const { return meta_version_id_; }
 
   TO_STRING_KV(K_(tablet_id), K_(meta_transfer_seq), K_(meta_version_id));
@@ -317,7 +316,7 @@ public:
     int64_t union_id_;
     // for PRIVATE_TABLET_META
     struct {
-      int64_t meta_transfer_seq_  : blocksstable::MacroBlockId::SF_BIT_TRANSFER_SEQ;
+      int64_t meta_transfer_seq_  : blocksstable::MacroBlockId::SF_BIT_PRIVATE_TRANSFER_EPOCH;
       uint64_t meta_version_id_   : blocksstable::MacroBlockId::SF_BIT_META_VERSION_ID;
     };
   };
@@ -360,7 +359,8 @@ public:
       status_(ObPendingFreeTabletStatus::MAX),
       free_time_(0),
       gc_type_(GCTabletType::DropTablet),
-      tablet_transfer_seq_(share::OB_INVALID_TRANSFER_SEQ)
+      tablet_private_transfer_epoch_(share::OB_INVALID_TRANSFER_SEQ),
+      last_gc_version_(-1)
   {}
   ObPendingFreeTabletItem(
     const common::ObTabletID tablet_id,
@@ -368,26 +368,30 @@ public:
     const ObPendingFreeTabletStatus status,
     const int64_t free_time,
     const GCTabletType gc_type,
-    const int64_t tablet_transfer_seq)
+    const int32_t tablet_private_transfer_epoch,
+    const int64_t last_gc_version)
     : tablet_id_(tablet_id), tablet_meta_version_(tablet_meta_version),
       status_(status), free_time_(free_time),
-      gc_type_(gc_type), tablet_transfer_seq_(tablet_transfer_seq)
+      gc_type_(gc_type), tablet_private_transfer_epoch_(tablet_private_transfer_epoch),
+      last_gc_version_(last_gc_version)
   {}
 
   bool is_valid() const
   {
-    return tablet_id_.is_valid() && tablet_meta_version_ > 0 &&
+    return tablet_id_.is_valid() && tablet_meta_version_ >= 0 &&
         ObPendingFreeTabletStatus::MAX != status_ &&
-        tablet_transfer_seq_ != share::OB_INVALID_TRANSFER_SEQ;
+        tablet_private_transfer_epoch_!= share::OB_INVALID_TRANSFER_SEQ &&
+        last_gc_version_ >= -1 && last_gc_version_ < tablet_meta_version_;
   }
   bool operator == (const ObPendingFreeTabletItem &other) const {
     return tablet_id_ == other.tablet_id_ &&
            tablet_meta_version_ == other.tablet_meta_version_ &&
            status_ == other.status_ &&
-           tablet_transfer_seq_ == other.tablet_transfer_seq_;
+           tablet_private_transfer_epoch_== other.tablet_private_transfer_epoch_&&
+           last_gc_version_ == other.last_gc_version_;
   }
 
-  TO_STRING_KV(K_(tablet_id), K_(tablet_meta_version), K_(status), K_(gc_type), K_(tablet_transfer_seq));
+  TO_STRING_KV(K_(tablet_id), K_(tablet_meta_version), K_(status), K_(gc_type), K_(tablet_private_transfer_epoch), K_(last_gc_version));
   OB_UNIS_VERSION(1);
 
 public:
@@ -397,7 +401,8 @@ public:
   // pending_free_items in pending_free_tablet_arr are incremented according to free time
   int64_t free_time_;
   GCTabletType gc_type_;
-  int64_t tablet_transfer_seq_;
+  int64_t tablet_private_transfer_epoch_; // FARM COMPAT WHITELIST FOR tablet_transfer_seq_: renamed
+  int64_t last_gc_version_;
 };
 
 struct ObLSPendingFreeTabletArray final

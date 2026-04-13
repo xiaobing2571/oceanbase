@@ -167,6 +167,10 @@ void ObIHashPartInfrastructure::destroy()
     if (OB_NOT_NULL(alloc_)) {
       alloc_->free(my_skip_);
       my_skip_ = nullptr;
+      if (store_rows_ != nullptr) {
+        alloc_->free(store_rows_);
+        store_rows_ = nullptr;
+      }
     }
   }
 }
@@ -1116,8 +1120,21 @@ int ObIHashPartInfrastructure::get_left_next_batch(
   uint64_t *hash_values_for_batch)
 {
   int ret = OB_SUCCESS;
-  const ObCompactRow *store_rows[max_row_cnt];
-  if (OB_ISNULL(hash_values_for_batch)) {
+  if (store_rows_ == nullptr || store_rows_size_ < max_row_cnt) {
+    if (store_rows_ != nullptr) {
+      alloc_->free(store_rows_);
+      store_rows_ = nullptr;
+    }
+    if (OB_ISNULL(store_rows_ = static_cast<const ObCompactRow **>
+        (alloc_->alloc(max_row_cnt * sizeof(ObCompactRow *))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to alloc store rows", K(ret));
+    } else {
+      store_rows_size_ = max_row_cnt;
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(hash_values_for_batch)) {
     ret = OB_ERR_UNEXPECTED;
     SQL_ENG_LOG(WARN, "hash values vector is not init", K(ret));
   } else if (OB_ISNULL(cur_left_part_) || OB_ISNULL(eval_ctx_)) {
@@ -1127,7 +1144,7 @@ int ObIHashPartInfrastructure::get_left_next_batch(
                                                          *eval_ctx_,
                                                          max_row_cnt,
                                                          read_rows,
-                                                         &store_rows[0]))) {
+                                                         const_cast<const ObCompactRow **>(store_rows_)))) {
     if (OB_ITER_END != ret) {
       SQL_ENG_LOG(WARN, "failed to get next batch", K(ret));
     }
@@ -1135,7 +1152,7 @@ int ObIHashPartInfrastructure::get_left_next_batch(
   //we need to precalcucate the hash values for batch, if not iter_end
   if (OB_SUCC(ret)) {
     for (int64_t i = 0; i < read_rows; ++i) {
-      const ObHashPartItem *sr = static_cast<const ObHashPartItem *> (store_rows[i]);
+      const ObHashPartItem *sr = static_cast<const ObHashPartItem *> (store_rows_[i]);
       hash_values_for_batch[i] = sr->get_hash_value(preprocess_part_.store_.get_row_meta());
     }
   }
@@ -1395,6 +1412,8 @@ int ObHashPartInfrastructureVecImpl::init(uint64_t tenant_id,
   } else if (OB_FAIL(hp_infras_->init(tenant_id, enable_sql_dumped, unique,
     need_pre_part, ways, max_batch_size, exprs, sql_mem_processor, compressor_type, need_rewind))) {
     LOG_WARN("failed to init hash part infras", K(ret));
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to alloc store rows", K(ret));
   } else {
     is_inited_ = true;
   }
@@ -1403,18 +1422,12 @@ int ObHashPartInfrastructureVecImpl::init(uint64_t tenant_id,
 
 void ObHashPartInfrastructureVecImpl::set_io_event_observer(ObIOEventObserver *observer)
 {
-  HP_INFRAS_STATUS_CHECK
-  {
-    hp_infras_->set_io_event_observer(observer);
-  }
+  hp_infras_->set_io_event_observer(observer);
 }
 
 void ObHashPartInfrastructureVecImpl::set_push_down()
 {
-  HP_INFRAS_STATUS_CHECK
-  {
-    hp_infras_->set_push_down();
-  }
+  hp_infras_->set_push_down();
 }
 
 int64_t ObHashPartInfrastructureVecImpl::est_bucket_count(
@@ -1423,12 +1436,7 @@ int64_t ObHashPartInfrastructureVecImpl::est_bucket_count(
   const int64_t min_bucket_cnt,
   const int64_t max_bucket_cnt)
 {
-  int64_t est_bucket_cnt = 0;
-  HP_INFRAS_STATUS_CHECK
-  {
-    est_bucket_cnt = hp_infras_->est_bucket_count(rows, width, min_bucket_cnt, max_bucket_cnt);
-  }
-  return est_bucket_cnt;
+  return hp_infras_->est_bucket_count(rows, width, min_bucket_cnt, max_bucket_cnt);
 }
 
 int ObHashPartInfrastructureVecImpl::set_funcs(
@@ -1570,22 +1578,12 @@ int ObHashPartInfrastructureVecImpl::close_cur_part(InputSide input_side)
 
 int64_t ObHashPartInfrastructureVecImpl::get_cur_part_row_cnt(InputSide input_side)
 {
-  int64_t row_cnt = 0;
-  HP_INFRAS_STATUS_CHECK
-  {
-    row_cnt = hp_infras_->get_cur_part_row_cnt(input_side);
-  }
-  return row_cnt;
+  return hp_infras_->get_cur_part_row_cnt(input_side);
 }
 
 int64_t ObHashPartInfrastructureVecImpl::get_cur_part_file_size(InputSide input_side)
 {
-  int64_t part_file_size = 0;
-  HP_INFRAS_STATUS_CHECK
-  {
-    part_file_size = hp_infras_->get_cur_part_file_size(input_side);
-  }
-  return part_file_size;
+  return hp_infras_->get_cur_part_file_size(input_side);
 }
 
 int ObHashPartInfrastructureVecImpl::get_next_pair_partition(InputSide input_side)
@@ -1687,22 +1685,12 @@ int ObHashPartInfrastructureVecImpl::open_hash_table_part()
 
 int64_t ObHashPartInfrastructureVecImpl::get_hash_bucket_num()
 {
-  int64_t bucket_num = 0;
-  HP_INFRAS_STATUS_CHECK
-  {
-    bucket_num = hp_infras_->get_hash_bucket_num();
-  }
-  return bucket_num;
+  return hp_infras_->get_hash_bucket_num();
 }
 
 int64_t ObHashPartInfrastructureVecImpl::get_bucket_num() const
 {
-  int64_t bucket_num = 0;
-  HP_INFRAS_STATUS_CHECK
-  {
-    bucket_num = hp_infras_->get_bucket_num();
-  }
-  return bucket_num;
+  return hp_infras_->get_bucket_num();
 }
 
 void ObHashPartInfrastructureVecImpl::reset_hash_table_for_by_pass()
@@ -1714,12 +1702,7 @@ void ObHashPartInfrastructureVecImpl::reset_hash_table_for_by_pass()
 
 int64_t ObHashPartInfrastructureVecImpl::get_hash_table_size() const
 {
-  int64_t ht_size = 0;
-  HP_INFRAS_STATUS_CHECK
-  {
-    ht_size = hp_infras_->get_hash_table_size();
-  }
-  return ht_size;
+  return hp_infras_->get_hash_table_size();
 }
 
 int ObHashPartInfrastructureVecImpl::extend_hash_table_l3()
@@ -1733,33 +1716,17 @@ int ObHashPartInfrastructureVecImpl::extend_hash_table_l3()
 
 bool ObHashPartInfrastructureVecImpl::hash_table_full()
 {
-  bool ht_full = false;
-  HP_INFRAS_STATUS_CHECK
-  {
-    ht_full = hp_infras_->hash_table_full();
-  }
-  return ht_full;
+  return hp_infras_->hash_table_full();
 }
 
 int64_t ObHashPartInfrastructureVecImpl::get_hash_store_mem_used() const
 {
-  int64_t ht_mem_used = 0;
-  HP_INFRAS_STATUS_CHECK
-  {
-    ht_mem_used = hp_infras_->get_hash_store_mem_used();
-  }
-  return ht_mem_used;
+  return hp_infras_->get_hash_store_mem_used();
 }
 
 int64_t ObHashPartInfrastructureVecImpl::get_actual_mem_used() const
 {
-  int64_t actual_mem_used = 0;
-  HP_INFRAS_STATUS_CHECK
-  {
-    actual_mem_used = hp_infras_->get_hash_store_mem_used()
-      + hp_infras_->get_hash_table_mem_used();
-  }
-  return actual_mem_used;
+  return hp_infras_->get_hash_store_mem_used() + hp_infras_->get_hash_table_mem_used();
 }
 
 void ObHashPartInfrastructureVecImpl::destroy_my_skip()
@@ -1771,50 +1738,29 @@ void ObHashPartInfrastructureVecImpl::destroy_my_skip()
 
 int64_t ObHashPartInfrastructureVecImpl::estimate_total_count() const
 {
-  int64_t est_total_cnt = 0;
-  HP_INFRAS_STATUS_CHECK
-  {
-    est_total_cnt = hp_infras_->estimate_total_count();
-  }
-  return est_total_cnt;
+  return hp_infras_->estimate_total_count();
 }
 
 void ObHashPartInfrastructureVecImpl::reuse()
 {
-  HP_INFRAS_STATUS_CHECK
-  {
-    hp_infras_->reuse();
-  }
+  hp_infras_->reuse();
 }
 
 int64_t ObHashPartInfrastructureVecImpl::get_total_mem_used() const
 {
-  int64_t mem_used = 0;
-  HP_INFRAS_STATUS_CHECK
-  {
-    mem_used = hp_infras_->get_total_mem_used();
-  }
-  return mem_used;
+  return hp_infras_->get_total_mem_used();
 }
 
 bool ObHashPartInfrastructureVecImpl::is_equal_hash_infras(
   const common::ObIArray<ObExpr *> &compare_exprs)
 {
-  bool is_equal = true;
-  HP_INFRAS_STATUS_CHECK
-  {
-    is_equal = hp_infras_->is_equal_hash_infras(compare_exprs);
-  }
-  return is_equal;
+  return hp_infras_->is_equal_hash_infras(compare_exprs);
 }
 
 void ObHashPartInfrastructureVecImpl::set_hp_infras_group_func(HpGroupAggrFunc mem_calc_func,
                                                                HpGroupAggrFunc slice_calc_func)
 {
-  HP_INFRAS_STATUS_CHECK
-  {
-    hp_infras_->set_hp_infras_group_func(mem_calc_func, slice_calc_func);
-  }
+  hp_infras_->set_hp_infras_group_func(mem_calc_func, slice_calc_func);
 }
 
 int ObHashPartInfrastructureVecImpl::set_need_rewind(bool need_rewind)

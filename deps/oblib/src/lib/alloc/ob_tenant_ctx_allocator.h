@@ -60,8 +60,6 @@ public:
   }
   void print_usage(uint64_t min_print_size = 0) const;
   void update_wash_stat(int64_t related_chunks, int64_t blocks, int64_t size);
-  void set_req_chunkmgr_parallel(int32_t parallel);
-  void reset_req_chunk_mgr();
   int reset_idle();
   bool check_has_unfree(char *first_label, char *first_bt);
   void do_cleanup();
@@ -204,12 +202,7 @@ public:
   ChunkMgr(ObTenantCtxAllocator &ta) : ta_(ta) {}
   AChunk *alloc_chunk(const uint64_t size, const ObMemAttr &attr) override
   {
-    AChunk *chunk = ta_.alloc_chunk(size, attr);
-    if (OB_ISNULL(chunk)) {
-      ta_.req_chunk_mgr_.reclaim_chunks();
-      chunk = ta_.alloc_chunk(size, attr);
-    }
-    return chunk;
+    return ta_.alloc_chunk(size, attr);
   }
   void free_chunk(AChunk *chunk, const ObMemAttr &attr) override
   {
@@ -217,77 +210,6 @@ public:
   }
 private:
   ObTenantCtxAllocator &ta_;
-};
-
-class ReqChunkMgr : public IChunkMgr
-{
-public:
-  static constexpr int32_t MAX_PARALLEL = 64;
-  ReqChunkMgr(ObTenantCtxAllocator &ta)
-    : ta_(ta), parallel_(CTX_ATTR(ta_.get_ctx_id()).parallel_)
-  {
-    abort_unless(parallel_ <= ARRAYSIZEOF(chunks_));
-    MEMSET(chunks_, 0, sizeof(chunks_));
-  }
-  AChunk *alloc_chunk(const uint64_t size, const ObMemAttr &attr) override
-  {
-    AChunk *chunk = NULL;
-    if (INTACT_ACHUNK_SIZE == AChunk::calc_hold(size)) {
-      const uint64_t idx = common::get_itid() % parallel_;
-      chunk = ATOMIC_TAS(&chunks_[idx], NULL);
-    }
-    if (OB_ISNULL(chunk)) {
-      chunk = ta_.alloc_chunk(size, attr);
-    }
-    return chunk;
-  }
-  void free_chunk(AChunk *chunk, const ObMemAttr &attr) override
-  {
-    bool freed = false;
-    if (INTACT_ACHUNK_SIZE == chunk->hold()) {
-      const uint64_t idx = common::get_itid() % parallel_;
-      freed = ATOMIC_BCAS(&chunks_[idx], NULL, chunk);
-    }
-    if (!freed) {
-      ta_.free_chunk(chunk, attr);
-    }
-  }
-  void reclaim_chunks()
-  {
-    for (int i = 0; i < MAX_PARALLEL; i++) {
-      AChunk *chunk = ATOMIC_TAS(&chunks_[i], NULL);
-      if (chunk != NULL) {
-        ta_.free_chunk(chunk,
-                       ObMemAttr(ta_.get_tenant_id(), "unused", ta_.get_ctx_id()));
-      }
-    }
-  }
-  int64_t n_chunks() const
-  {
-    int64_t n = 0;
-    for (int i = 0; i < MAX_PARALLEL; i++) {
-      AChunk *chunk = ATOMIC_LOAD(&chunks_[i]);
-      if (chunk != NULL) {
-        n++;
-      }
-    }
-    return n;
-  }
-  void set_parallel(int32_t parallel)
-  {
-    int32_t min_parallel = CTX_ATTR(ta_.get_ctx_id()).parallel_;
-    if (parallel < min_parallel) {
-      parallel_ = min_parallel;
-    } else if (parallel > MAX_PARALLEL) {
-      parallel_ = MAX_PARALLEL;
-    } else {
-      parallel_ = parallel;
-    }
-  }
-private:
-  ObTenantCtxAllocator &ta_;
-  int32_t parallel_;
-  AChunk *chunks_[MAX_PARALLEL];
 };
 
 class AChunkUsingList
@@ -301,7 +223,8 @@ public:
   void insert(AChunk *chunk)
   {
     uint64_t index = get_index(chunk);
-    lib::ObMutexGuard guard(slots_[index].mutex_);
+    slots_[index].lock_.lock();
+    DEFER(slots_[index].lock_.unlock());
     AChunk &head = slots_[index].head_;
     chunk->prev2_ = &head;
     chunk->next2_ = head.next2_;
@@ -311,14 +234,16 @@ public:
   void remove(AChunk *chunk)
   {
     uint64_t index = get_index(chunk);
-    lib::ObMutexGuard guard(slots_[index].mutex_);
+    slots_[index].lock_.lock();
+    DEFER(slots_[index].lock_.unlock());
     chunk->prev2_->next2_ = chunk->next2_;
     chunk->next2_->prev2_ = chunk->prev2_;
   }
   void get_chunks(AChunk **chunks, int cap, int &cnt)
   {
     for (int i = 0; i < NWAY; ++i) {
-      lib::ObMutexGuard guard(slots_[i].mutex_);
+      slots_[i].lock_.lock();
+      DEFER(slots_[i].lock_.unlock());
       AChunk &head = slots_[i].head_;
       AChunk *cur = head.next2_;
       while (cur != &head && cnt < cap) {
@@ -330,14 +255,12 @@ public:
 private:
   struct Slot {
     Slot()
-      : mutex_(common::ObLatchIds::CHUNK_USING_LIST_LOCK),
-        head_()
+      : head_()
     {
-      mutex_.enable_record_stat(false);
       head_.prev2_ = &head_;
       head_.next2_ = &head_;
     }
-    ObMutex mutex_;
+    ObSimpleLock lock_;
     AChunk head_;
   } slots_[NWAY];
 };
@@ -348,34 +271,19 @@ public:
       tenant_id_(tenant_id), ctx_id_(ctx_id), numa_id_(numa_id), deleted_(false),
       obj_mgr_(*this,
                CTX_ATTR(ctx_id).enable_no_log_,
-               INTACT_NORMAL_AOBJECT_SIZE,
-               CTX_ATTR(ctx_id).parallel_,
-               CTX_ATTR(ctx_id).enable_dirty_list_,
-               NULL),
+               CTX_ATTR(ctx_id).parallel_),
       idle_size_(0), head_chunk_(), chunk_cnt_(0),
       chunk_freelist_mutex_(common::ObLatchIds::CHUNK_FREE_LIST_LOCK),
-      chunk_mgr_(*this), req_chunk_mgr_(*this)
+      chunk_mgr_(*this)
   {
     MEMSET(&head_chunk_, 0, sizeof(AChunk));
     ObMemAttr attr;
     attr.tenant_id_  = tenant_id;
     attr.ctx_id_ = ctx_id;
     chunk_freelist_mutex_.enable_record_stat(false);
-    for (int i = 0; i < ObSubCtxIds::MAX_SUB_CTX_ID; ++i) {
-      new (obj_mgrs_ + i) ObjectMgr(*this,
-                                    CTX_ATTR(ctx_id).enable_no_log_,
-                                    INTACT_MIDDLE_AOBJECT_SIZE,
-                                    4/*parallel*/,
-                                    false/*enable_dirty_list*/,
-                                    &obj_mgr_);
-    }
   }
   virtual ~ObTenantCtxAllocator()
-  {
-    for (int i = 0; i < ObSubCtxIds::MAX_SUB_CTX_ID; ++i) {
-      obj_mgrs_[i].~ObjectMgr();
-    }
-  }
+  {}
   ObTenantCtxAllocatorV2 *get_ctx_allocator()
   {
     return &ctx_allocator_;
@@ -429,7 +337,6 @@ public:
   int set_idle(const int64_t size, const bool reserve = false);
   IBlockMgr &get_block_mgr() { return obj_mgr_; }
   IChunkMgr &get_chunk_mgr() { return chunk_mgr_; }
-  IChunkMgr &get_req_chunk_mgr() { return req_chunk_mgr_; }
   void get_chunks(AChunk **chunks, int cap, int &cnt) { ctx_allocator_.get_chunks(chunks, cap, cnt); }
   using VisitFunc = std::function<int(ObLabel &label,
                                       common::LabelItem *l_item)>;
@@ -441,9 +348,6 @@ public:
     bool has_unfree = obj_mgr_.check_has_unfree();
     if (has_unfree) {
       bool tmp_has_unfree = obj_mgr_.check_has_unfree(first_label, first_bt);
-      for (int i = 0; i < ObSubCtxIds::MAX_SUB_CTX_ID && !tmp_has_unfree; ++i) {
-        tmp_has_unfree = obj_mgrs_[i].check_has_unfree(first_label, first_bt);
-      }
     }
     return has_unfree;
   }
@@ -452,11 +356,8 @@ public:
   {
     ctx_allocator_.update_wash_stat(related_chunks, blocks, size);
   }
-  void reset_req_chunk_mgr() { req_chunk_mgr_.reclaim_chunks(); }
-  void set_req_chunkmgr_parallel(int32_t parallel) { ctx_allocator_.set_req_chunkmgr_parallel(parallel); }
 private:
   void get_chunks_(AChunk **chunks, int cap, int &cnt) { using_list_.get_chunks(chunks, cap, cnt); }
-  void set_req_chunkmgr_parallel_(int32_t parallel) { req_chunk_mgr_.set_parallel(parallel); }
   int64_t sync_wash_(int64_t wash_size);
   int64_t inc_ref_cnt(int64_t cnt) { return ctx_allocator_.inc_ref_cnt(cnt); }
   int64_t get_ref_cnt() const { return ctx_allocator_.get_ref_cnt(); }
@@ -470,6 +371,7 @@ public:
     abort_unless(attr.numa_id_ == ta.get_numa_id());
     ObDisableDiagnoseGuard disable_diagnose_guard;
     SANITY_DISABLE_CHECK_RANGE();
+    ObAllocContextGuard alloc_guard;
     if (!attr.label_.is_valid()) {
       LIB_LOG_RET(ERROR, OB_INVALID_ARGUMENT, "OB_MOD_DO_NOT_USE_ME REALLOC", K(size));
     }
@@ -488,34 +390,41 @@ public:
         abort_unless(block->is_valid());
         abort_unless(block->in_use_);
         on_free(*obj, *block);
-        inner_attr.use_malloc_v2_ = block->is_malloc_v2_;
       }
-      ObLightBacktraceGuard light_backtrace_guard(is_memleak_light_backtrace_enabled()
-          && ObCtxIds::GLIBC != attr.ctx_id_);
       BASIC_TIME_GUARD(time_guard, "ObMalloc");
       DEFER(ObMallocTimeMonitor::get_instance().record_malloc_time(time_guard, size, inner_attr));
-      if (malloc_sample_allowed(size, inner_attr)) {
+      const bool light_backtrace_allowed = is_memleak_light_backtrace_enabled() && ObLightBacktraceGuard::is_enabled() && ObCtxIds::GLIBC != attr.ctx_id_;
+      bool sample_allowed = light_backtrace_allowed || malloc_sample_allowed(size, inner_attr);
+      if (sample_allowed) {
         inner_attr.extra_size_ = AOBJECT_EXTRA_INFO_SIZE;
       }
-      nobj = allocator.realloc_object(obj, size, inner_attr);
-      if (OB_ISNULL(nobj)) {
-        int64_t total_size = 0;
-        if (g_alloc_failed_ctx().need_wash_block()) {
-          total_size += ta.sync_wash();
-          BASIC_TIME_GUARD_CLICK("WASH_BLOCK_END");
-        } else if (g_alloc_failed_ctx().need_wash_chunk()) {
-          total_size += CHUNK_MGR.sync_wash();
-          BASIC_TIME_GUARD_CLICK("WASH_CHUNK_END");
+      do {
+        nobj = allocator.realloc_object(obj, size, inner_attr);
+        if (OB_ISNULL(nobj)) {
+          int64_t total_size = 0;
+          if (g_alloc_failed_ctx().need_wash_block()) {
+            total_size += ta.sync_wash();
+            BASIC_TIME_GUARD_CLICK("WASH_BLOCK_END");
+          } else if (g_alloc_failed_ctx().need_wash_chunk()) {
+            total_size += CHUNK_MGR.sync_wash();
+            BASIC_TIME_GUARD_CLICK("WASH_CHUNK_END");
+          }
+          if (total_size > 0) {
+            nobj = allocator.realloc_object(obj, size, inner_attr);
+          }
         }
-        if (total_size > 0) {
-          nobj = allocator.realloc_object(obj, size, inner_attr);
+        if (OB_UNLIKELY(OB_ISNULL(nobj) && inner_attr.enable_malloc_hang_)) {
+          ::usleep(10000);  // 10ms
+        } else {
+          break;
         }
-      }
+      } while (OB_ISNULL(nobj));
+
       if (OB_UNLIKELY(NULL == nobj && NULL != obj)) {
         SANITY_UNPOISON(obj->data_, obj->alloc_bytes_);
       }
       if (OB_NOT_NULL(nobj)) {
-        on_alloc(*nobj, inner_attr);
+        on_alloc(*nobj, inner_attr, light_backtrace_allowed);
         nptr = nobj->data_;
       }
     }
@@ -528,7 +437,7 @@ public:
   }
   static void common_free(void *ptr);
 private:
-  static void on_alloc(AObject& obj, const ObMemAttr& attr);
+  static void on_alloc(AObject& obj, const ObMemAttr& attr, const bool light_backtrace_allowed);
   static void on_free(AObject& obj, ABlock& block);
 
 private:
@@ -544,11 +453,7 @@ private:
   int64_t chunk_cnt_;
   ObMutex chunk_freelist_mutex_;
   AChunkUsingList using_list_;
-  union {
-    ObjectMgr obj_mgrs_[ObSubCtxIds::MAX_SUB_CTX_ID];
-  };
   ChunkMgr chunk_mgr_;
-  ReqChunkMgr req_chunk_mgr_;
 }; // end of class ObTenantCtxAllocator
 
 } // end of namespace lib

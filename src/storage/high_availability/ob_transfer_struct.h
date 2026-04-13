@@ -174,11 +174,12 @@ struct ObTXTransferUtils
       const bool get_commit,
       const ObTablet *tablet,
       ObTabletCreateDeleteMdsUserData &user_data);
-  static int create_empty_minor_sstable(
+  static int create_empty_mini_minor_sstable(
       const common::ObTabletID &tablet_id,
       const share::SCN start_scn,
       const share::SCN end_scn,
       const ObStorageSchema &table_schema,
+      const ObITable::TableType &table_type,
       common::ObArenaAllocator &allocator,
       ObTableHandleV2 &table_handle);
   static int set_tablet_freeze_flag(storage::ObLS &ls, ObTablet *tablet);
@@ -191,11 +192,12 @@ private:
       const bool get_commit,
       const ObTablet *tablet,
       ObTabletCreateDeleteMdsUserData &user_data);
-  static int build_empty_minor_sstable_param_(
+  static int build_empty_mini_minor_sstable_param_(
       const share::SCN start_scn,
       const share::SCN end_scn,
       const ObStorageSchema &table_schema,
       const common::ObTabletID &tablet_id,
+      const ObITable::TableType &table_type,
       ObTabletCreateSSTableParam &param);
 };
 
@@ -440,8 +442,21 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObTransferBuildTabletInfoCtx);
 };
 
+struct ObTransferLSInfo final
+{
+public:
+  ObTransferLSInfo() : src_is_duplicate_ls_(false), dest_is_duplicate_ls_(false) {}
+  ~ObTransferLSInfo() = default;
+  void reset();
+  bool allow_learner_list_not_same() const { return src_is_duplicate_ls_ != dest_is_duplicate_ls_; }
+  bool need_check_r_replica() const { return src_is_duplicate_ls_ && dest_is_duplicate_ls_; }
+  bool must_get_learner_list_from_src_ls() const { return dest_is_duplicate_ls_ && !src_is_duplicate_ls_; }
+  bool must_get_learner_list_from_dest_ls() const { return src_is_duplicate_ls_ && !dest_is_duplicate_ls_; }
+  TO_STRING_KV(K_(src_is_duplicate_ls), K_(dest_is_duplicate_ls));
 
-
+  bool src_is_duplicate_ls_;
+  bool dest_is_duplicate_ls_;
+};
 
 }
 }

@@ -13,6 +13,7 @@
 #ifndef OCEANBASE_SHARE_FTS_INDEX_BUILDER_UTIL_H_
 #define OCEANBASE_SHARE_FTS_INDEX_BUILDER_UTIL_H_
 
+#include "object/ob_object.h"
 #include "share/ob_rpc_struct.h"
 #include "share/schema/ob_schema_struct.h"
 #include "sql/resolver/ob_schema_checker.h"
@@ -20,21 +21,105 @@
 
 namespace oceanbase
 {
+namespace rootserver
+{
+class ObDDLService;
+} // namespace rootserver
+
 namespace share
 {
 class ObMulValueIndexBuilderUtil;
+
+static constexpr int64_t MIN_DATA_VERSION_FOR_DOC_ID_OPT = DATA_VERSION_4_4_1_0;
+static constexpr int64_t MIN_DATA_VERSION_FOR_FTS_INDEX_TYPE = DATA_VERSION_4_5_1_0;
+
+class ObDocIDUtils
+{
+public:
+  // for now, we can judge by it's col id, else we should make it compatiable.
+  static ObDocIDType get_type_by_col_id(const uint64_t col_id)
+  {
+    ObDocIDType type = ObDocIDType::TABLET_SEQUENCE;
+    if (col_id == OB_HIDDEN_PK_INCREMENT_COLUMN_ID) {
+      return ObDocIDType::HIDDEN_INC_PK;
+    }
+    return type;
+  }
+
+  static bool is_docid_col_id_valid(const uint64_t col_id)
+  {
+    bool bret = false;
+    if (OB_HIDDEN_PK_INCREMENT_COLUMN_ID == col_id) {
+      bret = true;
+    } else if ((col_id > OB_APP_MIN_COLUMN_ID) && (OB_INVALID_ID != col_id)) {
+      bret = true;
+    }
+    return bret;
+  }
+};
+
+
+class ObFTSConstants
+{
+public:
+  static constexpr const char *DOC_ROWKEY_NAME = "fts_doc_rowkey";
+  static constexpr const char *ROWKEY_DOC_NAME = "fts_rowkey_doc";
+  static constexpr const char *DOC_WORD_SUFFIX = "_fts_doc_word";
+
+  // FTS_INDEX table has 2 index columns: [WORD], [DOC_ID]
+  static const int64_t INVERTED_TABLE_INDEX_COL_CNT = 2;
+  // FTS_DOC_WORD table has 2 index columns: [DOC_ID], [WORD]
+  static const int64_t DOC_WORD_INDEX_COL_CNT = 2;
+
+  static constexpr const int64_t MAX_POSITION_LIST_COUNT = 512;
+  static constexpr const double POSITION_LIST_SAFE_COMPACTION_RATIO = 2.0;
+
+  // FTS_DOC_WORD table has 4 or 5 columns: [DOC_ID], [WORD], [WORD_COUNT], [DOC_LENGTH], [POS_LIST]
+  static constexpr const int64_t FT_WORD_DOC_COL_CNT_WITH_POS = 5;
+  static constexpr const int64_t FT_WORD_DOC_COL_CNT_WITHOUT_POS = 4;
+
+  // FTS_INDEX table has 4 or 5 columns: [WORD], [DOC_ID], [WORD_COUNT], [DOC_LENGTH], [POS_LIST]
+  static constexpr const int64_t INVERTED_COL_CNT_WITH_POS = 5;
+  static constexpr const int64_t INVERTED_COL_CNT_WITHOUT_POS = 4;
+
+  OB_INLINE static int64_t get_fts_index_col_cnt(const bool is_fts_index_aux, const bool need_pos_list)
+  {
+    int64_t col_cnt = 0;
+    if (is_fts_index_aux) {
+      col_cnt = need_pos_list ? INVERTED_COL_CNT_WITH_POS : INVERTED_COL_CNT_WITHOUT_POS;
+    } else {
+      col_cnt = need_pos_list ? FT_WORD_DOC_COL_CNT_WITH_POS : FT_WORD_DOC_COL_CNT_WITHOUT_POS;
+    }
+    return col_cnt;
+  }
+};
 
 class ObFtsIndexBuilderUtil
 {
   friend class ObMulValueIndexBuilderUtil;
 public:
-  static const int64_t OB_FTS_INDEX_TABLE_INDEX_COL_CNT = 2;
-  static const int64_t OB_FTS_DOC_WORD_TABLE_INDEX_COL_CNT = 2;
-  static const int64_t OB_FTS_INDEX_OR_DOC_WORD_TABLE_COL_CNT = 4;
-public:
+  // Check if we can use rowkey instead of doc id.
+  // if we want to add more types, make this one condition of them.
+  static int determine_docid_type(const ObTableSchema &table_schema, ObDocIDType &doc_id_type);
+  static int check_need_doc_id(
+      const ObTableSchema &table_schema,
+      bool &need_doc_id);
+  static int check_fts_aux_index_schema_exist(
+      const ObTableSchema &data_schema,
+      const obrpc::ObCreateIndexArg &arg,
+      const share::schema::ObIndexType index_type,
+      ObSchemaGetterGuard &schema_guard,
+      rootserver::ObDDLService &ddl_service,
+      ObIAllocator &allocator,
+      bool &is_exist);
   static int get_doc_id_column_id(
       const ObTableSchema *data_schema,
       uint64_t &doc_id_col_id);
+  static int check_has_valid_fts_or_multivalue_index(
+      const share::schema::ObTableSchema &table_schema,
+      sql::ObSqlSchemaGuard &schema_guard,
+     bool &has_valid_index);
+
   static int append_fts_rowkey_doc_arg(
       const obrpc::ObCreateIndexArg &index_arg,
       ObIAllocator *allocator,
@@ -87,6 +172,9 @@ public:
   static int get_doc_id_col(
       const ObTableSchema &data_schema,
       const ObColumnSchemaV2 *&doc_id_col);
+  static int get_fts_rowkey_col(
+      const ObTableSchema &data_schema,
+      const ObColumnSchemaV2 *&rowkey_col);
   static int get_index_column_ids_for_fts(
       const share::schema::ObTableSchema &data_schema,
       const share::schema::ObColumnSchemaV2 &column_schema,
@@ -110,10 +198,14 @@ public:
   static int check_supportability_for_building_index(
         const ObTableSchema *data_schema,
         const obrpc::ObCreateIndexArg *index_arg);
-  static int get_fts_multivalue_index_column_name(
+  static int get_fts_index_column_name(
       const ObTableSchema &data_table_schema,
       const ObTableSchema &index_table_schema,
       ObIArray<ObString> &col_names);
+  static int get_multivalue_index_column_name(
+        const ObTableSchema &data_table_schema,
+        const ObTableSchema &index_table_schema,
+        ObIArray<ObString> &col_names);
   static int generate_fts_mtv_index_aux_columns(
       const ObTableSchema &orig_table_schema,
       const ObTableSchema &index_table_schema,
@@ -129,15 +221,35 @@ public:
         const uint64_t col_id,
         ObTableSchema &data_schema, // not const since will add column to data schema
         ObColumnSchemaV2 *&doc_id_col);
-  static int decide_parallelism(
-        const share::schema::ObIndexType index_type,
-        const int64_t original_parallelism,
-        int64_t &decided_parallelism);
+  // Generate skip index attributes for FTS auxiliary table non-rowkey columns
+  // FTS auxiliary table has 4 fixed columns:
+  //   - doc_id (rowkey)
+  //   - word_segment (rowkey)
+  //   - word_count (stored, non-rowkey)
+  //   - doc_length (stored, non-rowkey)
+  // This method only generates skip index attributes for the last 2 columns (non-rowkey)
+  // @param[in] skip_idx_attrs  skip index attribute array
+  // @param[in] column_types    column types array
+  // @param[in] start_idx      start index in skip_idx_attrs array (points to first FTS column)
+  // @param[out] attr_idx      updated index pointer after processing
+  // @return OB_SUCCESS on success, other error codes on failure
+  static int generate_fts_aux_skip_index_attrs(
+      common::ObIArray<share::schema::ObSkipIndexColumnAttr> &skip_idx_attrs,
+      common::ObSEArray<common::ObObjMeta, 16> *column_types,
+      int64_t &attr_idx);
+  // generate non-rowkey column descs for FTS auxiliary table
+  // - word_count
+  // - doc_length
+  static int generate_fts_aux_non_rowkey_column_descs(
+      common::ObIArray<ObColDesc> &column_descs, const int64_t start_column_id);
+
 private:
-  static int get_multivalue_index_column_name(
-      const ObTableSchema &data_table_schema,
-      const ObTableSchema &index_table_schema,
-      ObIArray<ObString> &col_names);
+  static int build_fts_aux_index_name(
+    const ObIndexType type,
+    const ObString &index_name,
+    char *name_buf,
+    const int64_t buf_len,
+    int64_t &pos);
   static bool compare_index_column(const std::pair<int64_t, ObString> &lhs, const std::pair<int64_t, ObString> &rhs) { return lhs.first < rhs.first; }
   static int check_ft_cols(
       const obrpc::ObCreateIndexArg *index_arg,
@@ -167,6 +279,11 @@ private:
       const uint64_t col_id,
       ObTableSchema &data_schema, // not const since will add column to data schema
       ObColumnSchemaV2 *&doc_length_col);
+  static int generate_pos_list_column(
+      const obrpc::ObCreateIndexArg *index_arg,
+      const uint64_t col_id,
+      ObTableSchema &data_schema, // not const since will add column to data schema
+      ObColumnSchemaV2 *&pos_list_col);
   static int construct_doc_id_col_name(
       char *col_name_buf,
       const int64_t buf_len,
@@ -192,6 +309,13 @@ private:
       const int64_t buf_len,
       int64_t &name_pos,
       const uint64_t col_id);
+  static int construct_pos_list_col_name(
+      const obrpc::ObCreateIndexArg *index_arg,
+      const ObTableSchema &data_schema,
+      char *col_name_buf,
+      const int64_t buf_len,
+      int64_t &name_pos,
+      const uint64_t col_id);
   static int check_fts_gen_col(
       const ObTableSchema &data_schema,
       const uint64_t col_id,
@@ -210,6 +334,9 @@ private:
       const ObTableSchema &data_schema,
       const obrpc::ObCreateIndexArg *index_arg,
       const ObColumnSchemaV2 *&doc_len_col);
+  static int get_pos_list_col(const ObTableSchema &data_schema,
+                              const obrpc::ObCreateIndexArg *index_arg,
+                              const ObColumnSchemaV2 *&pos_col);
   static int push_back_gen_col(
       ObIArray<const ObColumnSchemaV2 *> &cols,
       const ObColumnSchemaV2 *existing_col,
@@ -237,6 +364,30 @@ private:
       const share::schema::ObTableSchema &data_schema,
       obrpc::ObCreateIndexArg &arg,
       ObIAllocator &allocator);
+  static int add_skip_index_for_index_column(schema::ObColumnSchemaV2 &column_schema);
+
+private:
+  enum class FTSColumnType {
+    INVALID = 0,
+    WORD_SEGMENT,
+    WORD_COUNT,
+    DOC_LENGTH,
+    POS_LIST,
+  };
+  static int construct_fts_col_name_with_ts_by_type(
+      const obrpc::ObCreateIndexArg *index_arg,
+      const ObTableSchema &data_schema,
+      const FTSColumnType column_type,
+      char *col_name_buf,
+      const int64_t buf_len,
+      int64_t &name_pos,
+      const uint64_t col_id);
+
+  static int get_fts_column_by_type(
+      const ObTableSchema &data_schema,
+      const obrpc::ObCreateIndexArg *index_arg,
+      FTSColumnType column_type,
+      const ObColumnSchemaV2 *&column);
 };
 
 class ObMulValueIndexBuilderUtil
@@ -257,12 +408,12 @@ public:
    ObIAllocator *allocator,
    ObIArray<obrpc::ObCreateIndexArg> &index_arg_list);
  static int is_multivalue_index_type(
-   const ObString& column_string,
-   bool& is_multi_value_index);
+   const ParseNode *expr_node,
+   bool &is_multi_value_index);
  static int adjust_index_type(
-   const ObString& column_string,
-   bool& is_multi_value_index,
-   int* index_keyname);
+   const ParseNode *expr_node,
+   bool &is_multi_value_index,
+   int *index_keyname);
  static int get_mulvalue_col(
    const ObTableSchema &data_schema,
    const obrpc::ObCreateIndexArg *index_arg,
@@ -298,10 +449,6 @@ public:
     bool force_rebuild,
     ObColumnSchemaV2 *&gen_col,
     ObColumnSchemaV2 *&gen_budy_col);
- static int inner_adjust_multivalue_arg(
-   obrpc::ObCreateIndexArg &index_arg,
-   const ObTableSchema &data_schema,
-   ObColumnSchemaV2 *doc_id_col);
  static int set_multivalue_index_table_columns(
    const obrpc::ObCreateIndexArg &arg,
    const ObTableSchema &data_schema,
@@ -316,6 +463,37 @@ public:
    const share::schema::ObColumnSchemaV2 &budy_column_schema);
  static bool is_multivalue_index_column(
    const share::schema::ObColumnSchemaV2 &budy_column_schema);
+};
+
+class ObFtsIndexTypePrinter
+{
+public:
+  static int fts_index_type_to_string(const ObFTSIndexType fts_index_type, ObString &fts_index_type_str);
+};
+class ObFtsIndexSchemaPrinter
+{
+public:
+  static int print_fts_parser_info(
+      const ObTableSchema &table_schema,
+      const bool strict_compat,
+      char *&buf,
+      const int64_t &buf_len,
+      int64_t &pos);
+
+  static int print_fts_index_params_info(
+      const ObTableSchema &table_schema,
+      const bool strict_compat,
+      char *&buf,
+      const int64_t &buf_len,
+      int64_t &pos);
+
+private:
+  OB_INLINE static int is_mysql_compat_parser(const ObString &parser_name, bool &compat)
+  {
+    int ret = OB_SUCCESS;
+    compat = (parser_name.case_compare(ObFTSLiteral::PARSER_NAME_NGRAM) == 0);
+    return ret;
+  }
 };
 
 }//end namespace share

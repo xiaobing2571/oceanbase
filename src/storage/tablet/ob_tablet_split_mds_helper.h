@@ -21,6 +21,7 @@
 #include "share/ob_ls_id.h"
 #include "share/ob_rpc_struct.h"
 #include "src/share/ob_tablet_autoincrement_param.h"
+#include "src/sql/engine/expr/ob_expr.h"
 #include "src/storage/tablet/ob_tablet_create_delete_mds_user_data.h"
 #include "src/storage/tablet/ob_tablet_split_mds_user_data.h"
 
@@ -42,9 +43,15 @@ class ObTableSchema;
 }
 }
 
+namespace sql
+{
+class ObPushdownOperator;
+}
+
 namespace storage
 {
 class ObTablet;
+class ObTabletSplitCacheValue;
 
 namespace mds
 {
@@ -67,11 +74,13 @@ public:
   void reset();
 
   static int prepare_basic_args(
+    const ObIArray<share::schema::ObTableSchema *> &new_table_schemas,
     const ObIArray<share::schema::ObTableSchema *> &upd_table_schemas,
     const ObIArray<const share::schema::ObTableSchema *> &inc_table_schemas,
     ObIArray<ObTabletID> &src_tablet_ids,
     ObIArray<ObArray<ObTabletID>> &dst_tablet_ids,
-    ObIArray<ObRowkey> &dst_high_bound_vals);
+    ObIArray<blocksstable::ObDatumRowkey> &dst_end_partkey_vals,
+    common::ObIAllocator &allocator);
 
   int init_split_start_src(
     const uint64_t tenant_id,
@@ -91,7 +100,7 @@ public:
     const ObIArray<const share::schema::ObTableSchema *> &inc_table_schemas,
     const ObIArray<ObTabletID> &src_tablet_ids,
     const ObIArray<ObArray<ObTabletID>> &dst_tablet_ids,
-    const ObIArray<ObRowkey> &dst_high_bound_vals);
+    const ObIArray<blocksstable::ObDatumRowkey> &dst_end_partkey_vals);
   int set_autoinc_seq_arg(const obrpc::ObBatchSetTabletAutoincSeqArg &arg);
   int init_split_end_src(
     const uint64_t tenant_id,
@@ -154,14 +163,19 @@ private:
 class ObTabletSplitMdsArgPrepareDstOp final
 {
 public:
-  ObTabletSplitMdsArgPrepareDstOp(const bool is_data_table, ObIArray<ObTabletID> &dst_tablet_ids, ObIArray<ObRowkey> &dst_high_bound_vals)
-    : is_data_table_(is_data_table), dst_tablet_ids_(dst_tablet_ids), dst_high_bound_vals_(dst_high_bound_vals) {}
+  ObTabletSplitMdsArgPrepareDstOp(const bool is_data_table, const ObPartitionKeyInfo &partition_key_info, ObIArray<ObTabletID> &dst_tablet_ids, ObIArray<blocksstable::ObDatumRowkey> &dst_end_partkey_vals, common::ObIAllocator &allocator)
+    : is_data_table_(is_data_table), dst_tablet_ids_(dst_tablet_ids), dst_end_partkey_vals_(dst_end_partkey_vals), allocator_(allocator), partition_key_info_(partition_key_info) {}
   ~ObTabletSplitMdsArgPrepareDstOp() = default;
   int operator()(const int64_t part_idx, share::schema::ObBasePartition &part);
+  int check_and_cast_end_partkey(const ObPartitionKeyInfo &partition_key_info,
+    blocksstable::ObDatumRowkey &end_partkey,
+    common::ObIAllocator &allocator);
 private:
   bool is_data_table_;
   ObIArray<ObTabletID> &dst_tablet_ids_;
-  ObIArray<ObRowkey> &dst_high_bound_vals_;
+  ObIArray<blocksstable::ObDatumRowkey> &dst_end_partkey_vals_;
+  common::ObIAllocator &allocator_;
+  const ObPartitionKeyInfo &partition_key_info_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTabletSplitMdsArgPrepareDstOp);
 };
@@ -208,13 +222,20 @@ public:
   static int get_valid_timeout(const int64_t abs_timeout_us, int64_t &valid_timeout_us);
   static int get_split_data_with_timeout(const ObTablet &tablet, ObTabletSplitMdsUserData &split_data, const int64_t abs_timeout_us);
   static int get_is_spliting(const ObTablet &tablet, bool &is_split_dst);
-  static int get_split_info_with_cache(const ObTablet &tablet, common::ObIAllocator &allocator, ObTabletSplitTscInfo &split_info);
+  static int get_split_info_with_cache(const ObTablet &tablet, ObIAllocator &allocator, ObTabletSplitTscInfo &split_info);
   static int prepare_calc_split_dst(ObLS &ls, ObTablet &tablet, const int64_t abs_timeout_us, ObTabletSplitMdsUserData &src_split_data, ObIArray<ObTabletSplitMdsUserData> &dst_split_datas);
   static int calc_split_dst(ObLS &ls, ObTablet &tablet, const blocksstable::ObDatumRowkey &rowkey, const int64_t abs_timeout_us, ObTabletID &dst_tablet_id);
   static int calc_split_dst_lob(ObLS &ls, ObTablet &tablet, const blocksstable::ObDatumRow &data_row, const int64_t abs_timeout_us, ObTabletID &dst_tablet_id);
+  static int check_split_filter_params(
+      const ObTablet &tablet,
+      sql::ObPushdownOperator *op,
+      const uint64_t filter_type,
+      sql::ExprFixedArray *filter_params);
 
 private:
   static int get_split_info(const ObTablet &tablet, common::ObIAllocator &allocator, ObTabletSplitTscInfo &split_info);
+  template<typename F>
+  static int for_split_dst_info(const ObTablet &tablet, F &op);
   template<typename F>
   static int modify_tablet_split_(
     const uint64_t tenant_id,
@@ -232,6 +253,30 @@ private:
     const ObTabletMdsUserDataType data_type,
     const share::SCN &replay_scn,
     mds::BufferCtx &ctx);
+};
+
+class ObDeepCopySplitInfoOp final {
+public:
+  ObDeepCopySplitInfoOp(ObIAllocator &allocator, ObTabletSplitTscInfo &split_info) : allocator_(allocator), split_info_(split_info) {}
+  ~ObDeepCopySplitInfoOp() = default;
+  int operator()(const ObTabletSplitCacheValue &split_info);
+private:
+  ObIAllocator &allocator_;
+  ObTabletSplitTscInfo &split_info_;
+  DISALLOW_COPY_AND_ASSIGN(ObDeepCopySplitInfoOp);
+};
+
+class ObCheckSplitFilterParamsOp final {
+public:
+  ObCheckSplitFilterParamsOp(sql::ObEvalCtx &eval_ctx, uint64_t filter_type, sql::ExprFixedArray *filter_params)
+    : eval_ctx_(eval_ctx), filter_type_(filter_type), filter_params_(filter_params) {}
+  ~ObCheckSplitFilterParamsOp() = default;
+  int operator()(const ObTabletSplitCacheValue &split_info);
+private:
+  sql::ObEvalCtx &eval_ctx_;
+  uint64_t filter_type_;
+  sql::ExprFixedArray *filter_params_;
+  DISALLOW_COPY_AND_ASSIGN(ObCheckSplitFilterParamsOp);
 };
 
 } // namespace storage

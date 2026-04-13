@@ -39,7 +39,7 @@ ObDataBlockMetaVal::ObDataBlockMetaVal()
     is_encrypted_(false),
     is_deleted_(false),
     contain_uncommitted_row_(false),
-    is_last_row_last_flag_(false),
+    data_flag_pack_(0),
     compressor_type_(ObCompressorType::INVALID_COMPRESSOR),
     master_key_id_(0),
     encrypt_id_(0),
@@ -80,7 +80,7 @@ ObDataBlockMetaVal::ObDataBlockMetaVal(ObIAllocator &allocator)
     is_encrypted_(false),
     is_deleted_(false),
     contain_uncommitted_row_(false),
-    is_last_row_last_flag_(false),
+    data_flag_pack_(0),
     compressor_type_(ObCompressorType::INVALID_COMPRESSOR),
     master_key_id_(0),
     encrypt_id_(0),
@@ -94,6 +94,7 @@ ObDataBlockMetaVal::ObDataBlockMetaVal(ObIAllocator &allocator)
     all_lob_in_row_(false),
     agg_row_len_(0),
     agg_row_buf_(nullptr),
+    ddl_end_row_offset_(-1),
     macro_block_bf_size_(0),
     macro_block_bf_buf_()
 {
@@ -124,7 +125,7 @@ void ObDataBlockMetaVal::reset()
   is_encrypted_ = false;
   is_deleted_ = false;
   contain_uncommitted_row_ = false;
-  is_last_row_last_flag_ = false;
+  data_flag_pack_ = 0;
   compressor_type_ = ObCompressorType::INVALID_COMPRESSOR;
   master_key_id_ = 0;
   encrypt_id_ = 0;
@@ -165,7 +166,7 @@ return (DATA_BLOCK_META_VAL_VERSION == version_ || DATA_BLOCK_META_VAL_VERSION_V
     && macro_id_.is_valid()
     && agg_row_len_ >= 0
     && ((0 == agg_row_len_ && nullptr == agg_row_buf_) || (0 < agg_row_len_ && nullptr != agg_row_buf_))
-    && (ddl_end_row_offset_ == -1 || (version_ >= DATA_BLOCK_META_VAL_VERSION_V2 && ddl_end_row_offset_ >= 0))
+    && ddl_end_row_offset_ >= -1
     && macro_block_bf_size_ >= 0
     && (0 == macro_block_bf_size_ || nullptr != macro_block_bf_buf_);
 }
@@ -181,6 +182,10 @@ int ObDataBlockMetaVal::assign(const ObDataBlockMetaVal &val)
     LOG_WARN("fail to assign column checksums", K(ret), K(val.column_checksums_));
   } else {
     version_ = val.version_;
+    if (DATA_BLOCK_META_VAL_VERSION == version_) {
+      // compat action: abandon old version 1
+      version_ = DATA_BLOCK_META_VAL_VERSION_V2;
+    }
     length_ = val.length_;
     data_checksum_ = val.data_checksum_;
     rowkey_count_ = val.rowkey_count_;
@@ -199,7 +204,7 @@ int ObDataBlockMetaVal::assign(const ObDataBlockMetaVal &val)
     is_encrypted_ = val.is_encrypted_;
     is_deleted_ = val.is_deleted_;
     contain_uncommitted_row_ = val.contain_uncommitted_row_;
-    is_last_row_last_flag_ = val.is_last_row_last_flag_;
+    data_flag_pack_ = val.data_flag_pack_;
     compressor_type_ = val.compressor_type_;
     master_key_id_ = val.master_key_id_;
     encrypt_id_ = val.encrypt_id_;
@@ -302,12 +307,12 @@ int ObDataBlockMetaVal::serialize(char *buf,
                   original_size_,
                   has_string_out_row_,
                   all_lob_in_row_,
-                  is_last_row_last_flag_,
+                  data_flag_pack_,
                   agg_row_len_);
       if (OB_SUCC(ret)) {
         MEMCPY(buf + pos, agg_row_buf_, agg_row_len_);
         pos += agg_row_len_;
-        if (version_ >= DATA_BLOCK_META_VAL_VERSION_V2) {
+        if (DATA_VERSION_4_3_1_0 <= data_version) {
           LST_DO_CODE(OB_UNIS_ENCODE, ddl_end_row_offset_);
         }
         // Determine whether to serialize the macro block bloom filter based on the current cluster's data version.
@@ -342,7 +347,12 @@ int ObDataBlockMetaVal::deserialize(const char *buf, const int64_t data_len, int
     } else if (OB_UNLIKELY(version_ != DATA_BLOCK_META_VAL_VERSION && version_ != DATA_BLOCK_META_VAL_VERSION_V2)) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("object version mismatch", K(ret), K(version_));
-    } else if (OB_FAIL(serialization::decode_i32(buf, data_len, pos, &length_))) {
+    } else if (DATA_BLOCK_META_VAL_VERSION == version_) {
+      // compat action: abandon old version 1
+      version_ = DATA_BLOCK_META_VAL_VERSION_V2;
+    }
+
+    if (FAILEDx(serialization::decode_i32(buf, data_len, pos, &length_))) {
       LOG_WARN("fail to decode length", K(ret), K(data_len), K(pos));
     } else if (OB_UNLIKELY(pos + sizeof(encrypt_key_) > data_len)) {
       ret = OB_ERR_UNEXPECTED;
@@ -379,7 +389,7 @@ int ObDataBlockMetaVal::deserialize(const char *buf, const int64_t data_len, int
                   original_size_,
                   has_string_out_row_,
                   all_lob_in_row_,
-                  is_last_row_last_flag_,
+                  data_flag_pack_,
                   agg_row_len_);
       if (OB_SUCC(ret)) {
         if (agg_row_len_ == 0) {
@@ -388,11 +398,7 @@ int ObDataBlockMetaVal::deserialize(const char *buf, const int64_t data_len, int
           agg_row_buf_ = buf + pos;
           pos += agg_row_len_;
         }
-        if (version_ >= DATA_BLOCK_META_VAL_VERSION_V2) {
-          LST_DO_CODE(OB_UNIS_DECODE, ddl_end_row_offset_);
-        } else {
-          ddl_end_row_offset_ = -1;
-        }
+        LST_DO_CODE(OB_UNIS_DECODE, ddl_end_row_offset_);
         // Deserialize macro block bloom filter.
         LST_DO_CODE(OB_UNIS_DECODE, macro_block_bf_size_);
         if (macro_block_bf_size_ > 0) {
@@ -418,7 +424,7 @@ int64_t ObDataBlockMetaVal::get_max_serialize_size(const int64_t data_version) c
   len += sizeof(int64_t); // serialize column count
   len += sizeof(int64_t) * column_count_; // serialize each checksum
   len += agg_row_len_;
-  if (version_ >= DATA_BLOCK_META_VAL_VERSION_V2) {
+  if (DATA_VERSION_4_3_1_0 <= data_version) {
     len += sizeof(int64_t);
   }
   // Get macro block bloom filter max serialize size.
@@ -464,10 +470,10 @@ int64_t ObDataBlockMetaVal::get_serialize_size(const int64_t data_version) const
               original_size_,
               has_string_out_row_,
               all_lob_in_row_,
-              is_last_row_last_flag_,
+              data_flag_pack_,
               agg_row_len_);
   len += agg_row_len_;
-  if (version_ >= DATA_BLOCK_META_VAL_VERSION_V2) {
+  if (DATA_VERSION_4_3_1_0 <= data_version) {
     LST_DO_CODE(OB_UNIS_ADD_LEN, ddl_end_row_offset_);
   }
   // Get macro block bloom filter serialize size.
@@ -485,7 +491,8 @@ ObDataMacroBlockMeta::ObDataMacroBlockMeta()
   : val_(),
     end_key_(),
     nested_offset_(0),
-    nested_size_(0)
+    nested_size_(0),
+    version_(ObDataMacroBlockMeta::MACRO_BLOCK_META_VERSION)
 {
 }
 
@@ -493,7 +500,8 @@ ObDataMacroBlockMeta::ObDataMacroBlockMeta(ObIAllocator &allocator)
   : val_(allocator),
     end_key_(),
     nested_offset_(0),
-    nested_size_(0)
+    nested_size_(0),
+    version_(ObDataMacroBlockMeta::MACRO_BLOCK_META_VERSION)
 {
 }
 
@@ -660,6 +668,83 @@ int ObDataMacroBlockMeta::parse_row(ObDatumRow &row)
   }
   return ret;
 }
-} // end namespace blocksstable
-} // end namespace blocksstable
 
+int ObDataMacroBlockMeta::serialize(char *buf, const int64_t buf_len, int64_t &pos, const int64_t data_version) const
+{
+  int ret = OB_SUCCESS;
+  int64_t serialize_size = 0;
+  const int64_t initial_pos = pos;
+  if (OB_ISNULL(buf) || OB_UNLIKELY(buf_len <= 0 || pos < 0 || data_version <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(buf), K(buf_len), K(pos), K(data_version));
+  } else if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("data block meta value is invalid", K(ret), KPC(this));
+  } else if (FALSE_IT(serialize_size = get_serialize_size(data_version))) {
+  } else if (OB_UNLIKELY(serialize_size > buf_len - pos)) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("macro block meta serialize size overflow", K(ret), K(buf_len), K(pos), K(serialize_size), KPC(this));
+  } else if (OB_FAIL(serialization::encode_i32(buf, buf_len, pos, version_))) {
+    LOG_WARN("fail to serialize version_", K(ret), K(buf_len), K(pos), K(version_));
+  } else if (OB_FAIL(serialization::encode_i64(buf, buf_len, pos, serialize_size))) {
+    LOG_WARN("fail to serialize serialize_size", K(ret), K(buf_len), K(pos), K(serialize_size));
+  } else if (OB_FAIL(val_.serialize(buf, buf_len, pos, data_version))) {
+    LOG_WARN("fail to serialize meta val", K(ret), KP(buf), K(buf_len), K(pos), K(data_version), K(val_));
+  } else if (OB_FAIL(end_key_.serialize(buf, buf_len, pos))) {
+    LOG_WARN("fail to serialize end key", K(ret), KP(buf), K(buf_len), K(pos), K(data_version), K(end_key_));
+  } else if (OB_UNLIKELY(pos - initial_pos != serialize_size)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("fail to serialize macro block meta, unexpected error",
+             K(ret), K(pos), K(initial_pos), K(serialize_size), K(buf_len), KPC(this));
+  }
+  return ret;
+}
+
+int ObDataMacroBlockMeta::deserialize(const char *buf, const int64_t data_len, ObIAllocator &allocator, int64_t& pos)
+{
+  int ret = OB_SUCCESS;
+  int64_t serialize_size = 0;
+  const int64_t initial_pos = pos;
+  ObStorageDatum *rowkey_datums = nullptr;
+  if (OB_ISNULL(buf) || OB_UNLIKELY(data_len <= 0 || pos < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(buf), K(data_len), K(pos));
+  } else if (OB_FAIL(serialization::decode_i32(buf, data_len, pos, &version_))) {
+    LOG_WARN("fail to deserialize version_", K(ret), K(data_len), K(pos));
+  } else if (OB_FAIL(serialization::decode_i64(buf, data_len, pos, &serialize_size))) {
+    LOG_WARN("fail to deserialize additional serialize_size", K(ret), K(data_len), K(pos));
+  } else if (OB_FAIL(val_.deserialize(buf, data_len, pos))) {
+    LOG_WARN("fail to deserialize meta val", K(ret), KP(buf), K(data_len), K(pos));
+  } else if (OB_UNLIKELY(val_.rowkey_count_ > OB_MAX_ROWKEY_COLUMN_NUMBER
+                        || val_.rowkey_count_ <= 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("rowkey count is invalid", K(ret), K(val_.rowkey_count_));
+  } else if (OB_ISNULL(rowkey_datums = static_cast<ObStorageDatum *>(
+                      allocator.alloc(sizeof(ObStorageDatum) * val_.rowkey_count_)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("fail to allocate rowkey datums", K(ret), K(val_.rowkey_count_));
+  } else if (OB_UNLIKELY(end_key_.datums_ != nullptr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("end key datums is not null", K(ret), KP(end_key_.datums_));
+  } else if (FALSE_IT(end_key_.datums_ = rowkey_datums)) {
+  } else if (OB_FAIL(end_key_.deserialize(buf, data_len, pos))) {
+    LOG_WARN("fail to deserialize end key", K(ret), KP(buf), K(data_len), K(pos));
+  } else if (OB_UNLIKELY(val_.rowkey_count_ != end_key_.datum_cnt_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("rowkey count mismatch", K(ret), K(val_.rowkey_count_), K(end_key_.datum_cnt_));
+  } else if (OB_UNLIKELY(pos - initial_pos != serialize_size || !is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("fail to deserialize macro block meta, unexpected error",
+             K(ret), K(pos), K(initial_pos), K(serialize_size), K(data_len), KPC(this));
+  }
+  return ret;
+}
+
+int64_t ObDataMacroBlockMeta::get_serialize_size(const int64_t data_version) const
+{
+  // encoding version and serialize_size (32 + 64)
+  return sizeof(version_) + sizeof(int64_t) + val_.get_serialize_size(data_version) + end_key_.get_serialize_size();
+}
+
+} // end namespace blocksstable
+} // end namespace blocksstable

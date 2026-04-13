@@ -53,6 +53,20 @@ int ObHDFSStorageInfo::assign(const ObObjectStorageInfo &storage_info)
   return ret;
 }
 
+int ObHDFSStorageInfo::clone(
+    common::ObIAllocator &allocator,
+    common::ObObjectStorageInfo *&storage_info) const
+{
+  int ret = OB_SUCCESS;
+  ObHDFSStorageInfo *tmp_storage_info = nullptr;
+  if (OB_FAIL(clone_impl_<ObHDFSStorageInfo>(allocator, *this, tmp_storage_info))) {
+    LOG_WARN("fail to clone backup storage info", KR(ret), KPC(this));
+  } else {
+    storage_info = tmp_storage_info;
+  }
+  return ret;
+}
+
 void ObHDFSStorageInfo::reset()
 {
   common::ObObjectStorageInfo::reset();
@@ -190,6 +204,14 @@ int ObHDFSStorageInfo::parse_storage_info_(const char *storage_info, bool &has_n
               K_(device_type), KP(token));
         } else if (OB_FAIL(set_storage_info_field_(token, hdfs_extension_, sizeof(hdfs_extension_)))) {
           LOG_WARN("failed to set configs", K(ret), KP(token));
+        }
+      } else if (0 == strncmp(HADOOP_USERNAME, token, strlen(HADOOP_USERNAME))) {
+        if (ObStorageType::OB_STORAGE_HDFS != device_type_) {
+          ret = OB_INVALID_BACKUP_DEST;
+          LOG_WARN("device don't support HDFS_CONFIGS yet", K(ret),
+              K_(device_type), KP(token));
+        } else if (OB_FAIL(set_storage_info_field_(token, hdfs_extension_, sizeof(hdfs_extension_)))) {
+          LOG_WARN("failed to set hadoop username", K(ret), KP(token));
         }
       }
     }

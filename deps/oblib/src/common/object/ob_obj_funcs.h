@@ -57,6 +57,7 @@ struct ObObjTypeFuncs
   ob_obj_crc64_v3 crc64_v3;
   ob_obj_hash xxhash64;
   ob_obj_hash murmurhash_v3;
+  ob_obj_hash murmurhash3_x86_32;
 };
 
 // function templates for the above functions
@@ -963,9 +964,13 @@ DEF_NUMBER_FUNCS(ObNumberFloatType, number_float);
                                             obj.get_scale(), buffer, length, pos); \
     }                                                                   \
     if (OB_SUCC(ret)) {                                            \
-      if (params.print_const_expr_type_ && !lib::is_oracle_mode() && ob_is_datetime_or_mysql_datetime(obj.get_type())) {                        \
-        ret = databuff_printf(buffer, length, pos, "' AS %s)", CAST_PREFIX_MYSQL_DATETIME);     \
-      } else {                                                                                  \
+      if (params.print_const_expr_type_ && !lib::is_oracle_mode() && ob_is_datetime_or_mysql_datetime(obj.get_type())) {                    \
+        if (obj.get_scale() > 0 && obj.get_scale() <= 6) {                                                                         \
+          ret = databuff_printf(buffer, length, pos, "' AS %s (%d))", CAST_PREFIX_MYSQL_DATETIME, obj.get_scale());                \
+        } else {                                                                                                                   \
+          ret = databuff_printf(buffer, length, pos, "' AS %s)", CAST_PREFIX_MYSQL_DATETIME);                                      \
+        }                                                                                                                          \
+      } else {                                                                                                                     \
         const char *fmt_suffix = params.need_cast_expr_ && lib::is_oracle_mode() ?              \
                                   CAST_SUFFIX_ORACLE : NORMAL_SUFFIX;                           \
         ret = databuff_printf(buffer, length, pos, "%s", fmt_suffix);     \
@@ -1206,9 +1211,8 @@ inline int obj_print_plain_str<ObHexStringType>(const ObObj &obj, char *buffer,
     ObCharsetType dst_type = ObCharset::charset_type_by_coll(params.cs_type_);              \
     if (CHARSET_BINARY == src_type && lib::is_mysql_mode()) {               \
       ret = obj_print_sql<ObHexStringType>(obj, buffer, length, pos, params);      \
-    } else if (params.character_hex_safe_represent_                                       \
-      && ob_is_character_type(obj.get_type(), obj.get_collation_type())) {                 \
-         ret = ObObjCharacterUtil::print_safe_hex_represent(obj, buffer, length, pos, params.accuracy_); \
+    } else if (params.character_hex_safe_represent_) {                 \
+      ret = ObObjCharacterUtil::print_safe_hex_represent(obj, buffer, length, pos, params.accuracy_); \
     } else if (OB_FAIL(databuff_printf(buffer, length, pos, "'"))) {                        \
     } else if (src_type == dst_type || src_type == CHARSET_INVALID) { \
       ObHexEscapeSqlStr sql_str(obj.get_string(), params.skip_escape_);                     \
@@ -1549,24 +1553,55 @@ DEF_ENUMSET_INNER_FUNCS(ObSetInnerType, set_inner, ObString);
   template <>                                                           \
   inline int obj_print_sql<OBJTYPE>(const ObObj &obj, char *buffer, int64_t length, \
                                     int64_t &pos, const ObObjPrintParams &params) \
-  {                                                                     \
-    UNUSED(params);                                                    \
+  {                                                                                         \
     int ret = OB_SUCCESS;                                        \
-    ObString str = obj.get_text_print_string(length - pos);             \
-    if (CS_TYPE_BINARY == obj.get_collation_type()) {                   \
-      if (!lib::is_oracle_mode() && OB_SUCCESS != (ret = databuff_printf(buffer, \
-                                                                        length, pos, "X'"))) { \
-      } else if (lib::is_oracle_mode() && OB_SUCCESS != (ret = databuff_printf(buffer, \
-                                                                            length, pos, "'"))) { \
-      } else if (OB_SUCCESS != (ret = hex_print(str.ptr(), str.length(), buffer, length, pos))) { \
-      } else {                                                            \
-        ret = databuff_printf(buffer, length, pos, "'");                  \
-      }                                                                   \
-    } else if (OB_FAIL(databuff_printf(buffer, length, pos, "'"))) {    \
-    } else {                                                            \
-      ObHexEscapeSqlStr sql_str(str);                      \
-      pos += sql_str.to_string(buffer + pos, length - pos);             \
-      ret = databuff_printf(buffer, length, pos, "'");                  \
+    ObString str;                                                \
+    ObString data;                                               \
+    ObArenaAllocator tmp_allocator(ObModIds::OB_LOB_ACCESS_BUFFER, OB_MALLOC_NORMAL_BLOCK_SIZE);  \
+    if (OB_FAIL(obj.read_lob_data(tmp_allocator, data))) {                                        \
+      COMMON_LOG(WARN, "read_lob_data fail", K(ret), K(obj));                                     \
+    } else if (OB_FALSE_IT(str.assign_ptr(data.ptr(), MIN(data.length(), length - pos)))) {       \
+    } else {                                                                                      \
+      ObCharsetType src_type = ObCharset::charset_type_by_coll(obj.get_collation_type());     \
+      ObCharsetType dst_type = ObCharset::charset_type_by_coll(params.cs_type_);              \
+      if (CS_TYPE_BINARY == obj.get_collation_type()) {                   \
+        if (!lib::is_oracle_mode() && OB_SUCCESS != (ret = databuff_printf(buffer, \
+                                                                           length, pos, "X'"))) { \
+        } else if (lib::is_oracle_mode() && OB_SUCCESS != (ret = databuff_printf(buffer, \
+                                                                                 length, pos, "'"))) { \
+        } else if (OB_SUCCESS != (ret = hex_print(str.ptr(), str.length(), buffer, length, pos))) { \
+        } else {                                                            \
+          ret = databuff_printf(buffer, length, pos, "'");                  \
+        }                                                                   \
+      } else if (params.character_hex_safe_represent_) {                 \
+        ret = ObObjCharacterUtil::print_safe_hex_represent(obj, buffer, length, pos, params.accuracy_); \
+      } else if (OB_FAIL(databuff_printf(buffer, length, pos, "'"))) {                        \
+      } else if (src_type == dst_type || src_type == CHARSET_INVALID) { \
+        ObHexEscapeSqlStr sql_str(str, params.skip_escape_);                     \
+        pos += sql_str.to_string(buffer + pos, length - pos);                                 \
+        ret = databuff_printf(buffer, length, pos, "'");                                      \
+      } else {                                                                                \
+        uint32_t result_len = 0;                                                              \
+        if (OB_FAIL(ObCharset::charset_convert(obj.get_collation_type(),                      \
+                                               str.ptr(),                          \
+                                               str.length(),                          \
+                                               params.cs_type_,                               \
+                                               buffer + pos,                                  \
+                                               length - pos,                                  \
+                                               result_len))) {                                \
+        } else {                                                                              \
+          ObHexEscapeSqlStr sql_str(ObString(result_len, buffer + pos), params.skip_escape_); \
+          int64_t temp_pos = pos + result_len;                                                \
+          int64_t data_len = sql_str.to_string(buffer + temp_pos, length - temp_pos);         \
+          if (OB_UNLIKELY(temp_pos + data_len >= length)) {                                   \
+            ret = OB_SIZE_OVERFLOW;                                                           \
+          } else {                                                                            \
+            MEMMOVE(buffer + pos, buffer + temp_pos, data_len);                               \
+            pos += data_len;                                                                  \
+            ret = databuff_printf(buffer, length, pos, "'");                                  \
+          }                                                                                   \
+        }                                                                                     \
+      }                                                                                       \
     }                                                                   \
     return ret;                                                         \
   }                                                                     \
@@ -1574,28 +1609,72 @@ DEF_ENUMSET_INNER_FUNCS(ObSetInnerType, set_inner, ObString);
   inline int obj_print_str<OBJTYPE>(const ObObj &obj, char *buffer, int64_t length, int64_t &pos, \
                                     const ObObjPrintParams &params) \
   {                                                                     \
-    UNUSED(params);                                                    \
     int ret = OB_SUCCESS;                                               \
     ObString str = obj.get_text_print_string(length - pos);             \
+    ObCharsetType src_type = ObCharset::charset_type_by_coll(obj.get_collation_type());     \
+    ObCharsetType dst_type = ObCharset::charset_type_by_coll(params.cs_type_);              \
     if (CS_TYPE_BINARY == obj.get_collation_type()) {                   \
       ret = databuff_printf(buffer, length, pos, "'%.*s", str.length(), str.ptr());  \
       if (OB_SUCC(ret)) {                                        \
         if (OB_FAIL(databuff_printf(buffer, length, pos, "'"))) {       \
         }                                                             \
       }                                                               \
-    } else {                                                            \
+    } else if (src_type == dst_type || src_type == CHARSET_INVALID) { \
       ret = databuff_printf(buffer, length, pos, "'%.*s'", str.length(), str.ptr()); \
+    } else {                                                                                \
+      uint32_t result_len = 0;                                                              \
+      if (OB_FAIL(databuff_printf(buffer, length, pos, "'"))) {                             \
+      } else if (OB_FAIL(ObCharset::charset_convert(obj.get_collation_type(),               \
+                                                    str.ptr(),                              \
+                                                    str.length(),                           \
+                                                    params.cs_type_,                        \
+                                                    buffer + pos,                           \
+                                                    length - pos,                           \
+                                                    result_len))) {                         \
+      } else {                                                                              \
+        pos += result_len;                                                                  \
+        ret = databuff_printf(buffer, length, pos, "'");                                    \
+      }                                                                                     \
     }                                                                   \
     return ret;                                                         \
   }                                                                     \
   template <>                                                           \
   inline int obj_print_plain_str<OBJTYPE>(const ObObj &obj, char *buffer, int64_t length, \
                                           int64_t &pos, const ObObjPrintParams &params) \
-  {                                                                     \
-    ObObj tmp_obj = obj; \
-    ObString str = obj.get_text_print_string(length - pos); \
-    tmp_obj.set_lob_value(obj.get_type(), str.ptr(), str.length()); \
-    return obj_print_plain_str<ObVarcharType>(tmp_obj, buffer, length, pos, params); \
+  {                                                                                         \
+    int ret = OB_SUCCESS;                                                                   \
+    ObString str = obj.get_text_print_string(length - pos);                                 \
+    ObCharsetType src_type = ObCharset::charset_type_by_coll(obj.get_collation_type());     \
+    ObCharsetType dst_type = ObCharset::charset_type_by_coll(params.cs_type_);              \
+    if (src_type == CHARSET_BINARY || src_type == dst_type || src_type == CHARSET_INVALID) {\
+      if (obj.get_collation_type() == CS_TYPE_BINARY && params.binary_string_print_hex_) {  \
+        ret = hex_print(str.ptr(), str.length(), buffer, length, pos);   \
+      } else if (obj.get_collation_type() == CS_TYPE_BINARY && params.binary_string_print_base64_) { \
+        ret = ObBase64Encoder::encode(reinterpret_cast<const uint8_t*>(str.ptr()), str.length(), buffer, length, pos);  \
+      } else if (params.use_memcpy_) {                                                      \
+        ret = databuff_memcpy(buffer, length, pos, str.length(), str.ptr());         \
+      } else {                                                                              \
+        ret = databuff_printf(buffer, length, pos, "%.*s", str.length(), str.ptr()); \
+      }                                                                                     \
+      if (OB_SUCC(ret) && params.refine_range_max_value_) {                                 \
+        int64_t tails = 0;                                                                  \
+        while (pos > 0 && (char)(0xff) == buffer[pos-1]) { pos--; tails++; }                \
+        if (tails > 0) { ret = databuff_printf(buffer, length, pos, "<FF><repeat %ld times>", tails); } \
+      }                                                                                     \
+    } else {                                                                                \
+      uint32_t result_len = 0;                                                              \
+      if (OB_FAIL(ObCharset::charset_convert(obj.get_collation_type(),                      \
+                                             str.ptr(),                          \
+                                             str.length(),                          \
+                                             params.cs_type_,                               \
+                                             buffer + pos,                                  \
+                                             length - pos,                                  \
+                                             result_len))) {                                \
+      } else {                                                                              \
+        pos += result_len;                                                                  \
+      }                                                                                     \
+    }                                                                                       \
+    return ret;                                                                             \
   }                                                                     \
   template <>                                                           \
   inline int obj_print_json<OBJTYPE>(const ObObj &obj, char *buf, int64_t buf_len, \
@@ -2805,9 +2884,8 @@ template <>
     ObCharsetType src_type = ObCharset::charset_type_by_coll(obj.get_collation_type());     \
     ObCharsetType dst_type = ObCharset::charset_type_by_coll(params.cs_type_);              \
     int ret = OB_SUCCESS;                                                            \
-    if (params.character_hex_safe_represent_                                                \
-      && ob_is_character_type(obj.get_type(), obj.get_collation_type())) {                  \
-         ret = ObObjCharacterUtil::print_safe_hex_represent(obj, buffer, length, pos, params.accuracy_); \
+    if (params.character_hex_safe_represent_) {                  \
+      ret = ObObjCharacterUtil::print_safe_hex_represent(obj, buffer, length, pos, params.accuracy_); \
     } else if (OB_FAIL(databuff_printf(buffer, length, pos, "n'"))) {                              \
     } else if (src_type == dst_type) {                                                      \
       ObHexEscapeSqlStr sql_str(obj.get_string(), params.skip_escape_);                     \

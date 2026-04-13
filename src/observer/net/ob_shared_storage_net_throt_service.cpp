@@ -21,7 +21,7 @@ namespace oceanbase
 {
 namespace rootserver
 {
-ObSharedStorageNetThrotManager::ObSharedStorageNetThrotManager() : is_inited_(false), lock_()
+ObSharedStorageNetThrotManager::ObSharedStorageNetThrotManager() : is_inited_(false), lock_(common::ObLatchIds::OB_SHARED_STORAGE_NET_THROT_MANAGER_LOCK)
 {}
 
 ObSharedStorageNetThrotManager::~ObSharedStorageNetThrotManager()
@@ -106,9 +106,13 @@ int ObSharedStorageNetThrotManager::register_endpoint(const ObSSNTEndpointArg &e
         } else if (OB_ISNULL(value)) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
           LOG_WARN("fail to new value", K(ret));
-        } else if (OB_SUCCESS != quota_plan_map->set_refactored(key, value, /*flag*/ 1)) {
+        } else if (OB_FAIL(quota_plan_map->set_refactored(key, value, /*flag*/ 1))) {
           LOG_WARN("fail to set quota_plan_map", K(ret));
         } else if (OB_FAIL(bucket_throt_map_.set_refactored(storage_key, quota_plan_map, /*flag*/ 1))) {
+          int tmp_ret = OB_SUCCESS;
+          if (OB_TMP_FAIL(quota_plan_map->erase_refactored(key))) {
+            LOG_WARN("erase key fail", K(storage_key));
+          }
           LOG_WARN("fail to set bucket_throt_map", K(ret));
         }
         if (ret != OB_SUCCESS) {
@@ -119,6 +123,7 @@ int ObSharedStorageNetThrotManager::register_endpoint(const ObSSNTEndpointArg &e
       }
     }
   }
+  LOG_INFO("register endpoint", K(ret), K(endpoint_storage_infos));
   return ret;
 }
 
@@ -140,12 +145,14 @@ int ObSharedStorageNetThrotManager::clear_expired_infos()
     obrpc::ObStorageKeyLimitMap::iterator it = storage_key_limit_map_.begin();
     for (; it != storage_key_limit_map_.end(); ++it) {
       if (it->second.expire_time_ < current_time) {
-        delete_storage_keys.push_back(it->first);
+        (void)delete_storage_keys.push_back(it->first);
       }
     }
     for (int i = 0; i < delete_storage_keys.count(); ++i) {
       if (OB_SUCCESS != storage_key_limit_map_.erase_refactored(delete_storage_keys.at(i))) {
         LOG_WARN("SSNT:failed to erase SSNT key", K(ret), K(delete_storage_keys.at(i)));
+      } else {
+        LOG_INFO("SSNT:erase SSNT key", K(delete_storage_keys.at(i)));
       }
     }
   }
@@ -179,12 +186,14 @@ int ObSharedStorageNetThrotManager::clear_expired_infos()
     for (; it != endpoint_infos_map_.end(); ++it) {
       ObEndpointInfos &endpoint_info = it->second;
       if (endpoint_info.expire_time_ < current_time) {
-        delete_addrs.push_back(it->first);
+        (void)delete_addrs.push_back(it->first);
       }
     }
     for (int i = 0; i < delete_addrs.count(); ++i) {
       if (OB_SUCCESS != endpoint_infos_map_.erase_refactored(delete_addrs.at(i))) {
         LOG_WARN("SSNT:failed to erase addr", K(ret), K(delete_addrs.at(i)));
+      } else {
+        LOG_INFO("SSNT:erase addr", K(delete_addrs.at(i)));
       }
     }
 
@@ -195,9 +204,9 @@ int ObSharedStorageNetThrotManager::clear_expired_infos()
         // badcase
         ret = OB_INVALID_CONFIG;
         LOG_WARN("value is nullptr", K(ret));
-        delete_storage_keys.push_back(iter->first);
+        (void)delete_storage_keys.push_back(iter->first);
       } else if (quota_plan_map->size() == 0) {
-        delete_storage_keys.push_back(iter->first);
+        (void)delete_storage_keys.push_back(iter->first);
       } else {
         ObQuotaPlanMap::iterator quota_it = quota_plan_map->begin();
         common::ObSEArray<ObSSNTKey, 10> delete_SSNT_keys;
@@ -205,20 +214,22 @@ int ObSharedStorageNetThrotManager::clear_expired_infos()
           ObSSNTKey &key = quota_it->first;
           ObSSNTValue *value = quota_it->second;
           if (OB_ISNULL(value)) {
-            delete_SSNT_keys.push_back(key);
+            (void)delete_SSNT_keys.push_back(key);
           } else if (value->expire_time_ < current_time) {
             ob_delete(value);
-            delete_SSNT_keys.push_back(key);
+            (void)delete_SSNT_keys.push_back(key);
           }
         }
         for (int i = 0; i < delete_SSNT_keys.count(); ++i) {
           if (OB_SUCCESS != quota_plan_map->erase_refactored(delete_SSNT_keys.at(i))) {
             LOG_WARN("SSNT:failed to erase SSNT key", K(ret), K(delete_SSNT_keys.at(i)));
+          } else {
+            LOG_INFO("SSNT:erase SSNT key", K(delete_SSNT_keys.at(i)));
           }
         }
       }
       if (OB_NOT_NULL(quota_plan_map) && quota_plan_map->size() == 0) {
-        delete_storage_keys.push_back(iter->first);
+        (void)delete_storage_keys.push_back(iter->first);
       }
     }
     if (OB_FAIL(clear_storage_key(delete_storage_keys))) {
@@ -247,6 +258,7 @@ int ObSharedStorageNetThrotManager::clear_storage_key(
       bucket_throt_map_.erase_refactored(delete_storage_keys.at(i));
     }
   }
+  LOG_INFO("SSNT:clear storage key", K(delete_storage_keys));
   return ret;
 }
 
@@ -286,7 +298,6 @@ int ObSharedStorageNetThrotManager::collect_predict_resource(const int64_t &expi
     LOG_WARN(
         "cnt not match", KR(ret), "return_cnt", return_code_array.count(), "server_cnt", endpoint_infos_map_.size());
   } else {
-    ObSpinLockGuard guard(lock_);
     for (int64_t i = 0; OB_SUCC(ret) && i < return_code_array.size(); ++i) {
       const ObAddr &addr = proxy_batch.get_dests().at(i);
       if (OB_SUCCESS != return_code_array.at(i)) {
@@ -309,6 +320,7 @@ int ObSharedStorageNetThrotManager::register_or_update_predict_resource(
     const ObAddr &addr, const obrpc::ObSharedDeviceResourceArray *predict_resources, const int64_t &expire_time)
 {
   int ret = OB_SUCCESS;
+  ObSpinLockGuard guard(lock_);
   if (OB_ISNULL(predict_resources)) {
     LOG_WARN_RET(OB_INVALID_CONFIG, "SSNT:predict_resources should not be NULL");  // ignore error
   } else {
@@ -349,6 +361,7 @@ int ObSharedStorageNetThrotManager::register_or_update_predict_resource(
         LOG_WARN("fail to register or update predict resource", K(tmp_ret), K(ret), K(storage_key));
       }
     }
+    LOG_INFO("SSNT:register or update predict resource", K(ret), K(addr), K(*predict_resources), K(expire_time));
   }
   return ret;
 }
@@ -395,12 +408,31 @@ int ObSharedStorageNetThrotManager::assign_type_value(
 int ObSharedStorageNetThrotManager::update_quota_plan()
 {
   int ret = OB_SUCCESS;
-  ObSpinLockGuard guard(lock_);
-  obrpc::ObBucketThrotMap::iterator it = bucket_throt_map_.begin();
   int tmp_ret = OB_SUCCESS;
-  for (; it != bucket_throt_map_.end(); ++it) {
-    if (OB_TMP_FAIL(update_one_storage_quota_plan(it->first, it->second))) {
-      LOG_WARN("SSNT:update quota plan failed", K(ret), K(tmp_ret), K(it->first));
+  ObSEArray<ObTrafficControl::ObStorageKey, 10> arr;
+  {
+    ObSpinLockGuard guard(lock_);
+    obrpc::ObBucketThrotMap::iterator it = bucket_throt_map_.begin();
+    for (; it != bucket_throt_map_.end(); ++it) {
+      if (OB_TMP_FAIL(arr.push_back(it->first))) {
+        LOG_WARN("push back failed", K(ret), K(tmp_ret), K(it->first));
+      }
+    }
+  }
+
+  for (int64_t i = 0; i < arr.count(); i++) {
+    if (OB_TMP_FAIL(register_or_update_storage_key_limit(arr[i]))) {
+      LOG_WARN("register or get storage limit failed", K(arr[i]), K(ret), K(tmp_ret));
+    }
+  }
+
+  {
+    ObSpinLockGuard guard(lock_);
+    obrpc::ObBucketThrotMap::iterator it = bucket_throt_map_.begin();
+    for (; it != bucket_throt_map_.end(); ++it) {
+      if (OB_TMP_FAIL(update_one_storage_quota_plan(it->first, it->second))) {
+        LOG_WARN("SSNT:update quota plan failed", K(ret), K(tmp_ret), K(it->first));
+      }
     }
   }
   return ret;
@@ -622,8 +654,8 @@ int ObSharedStorageNetThrotManager::commit_quota_plan()
   const int64_t timeout_ts = GCONF.rpc_timeout;
   ObArray<int> return_code_array;
   ObSEArray<std::pair<ObAddr, obrpc::ObSharedDeviceResourceArray>, 7> send_rpc_arr;
-  ObSpinLockGuard guard(lock_);
   {
+    ObSpinLockGuard guard(lock_);
     obrpc::ObEndpointRegMap::iterator iter = endpoint_infos_map_.begin();
     for (; iter != endpoint_infos_map_.end(); ++iter) {  // commit to each observer
       obrpc::ObSharedDeviceResourceArray arg;
@@ -735,6 +767,7 @@ int ObSharedStorageNetThrotManager::register_or_update_storage_key_limit(
     if (OB_TMP_FAIL(share::ObBackupStorageInfoOperator::get_restore_shared_storage_limit(
             storage_key, limit.max_iops_, limit.max_bw_))) {
       LOG_WARN("failed to get storage limit", K(storage_key), K(limit));
+    } else {
     }
   } else if (is_unlimited_category(storage_key.get_category())) {
     // ignore ret
@@ -748,6 +781,7 @@ int ObSharedStorageNetThrotManager::register_or_update_storage_key_limit(
   } else if (OB_FAIL(storage_key_limit_map_.set_refactored(storage_key, limit, /*flag*/ 1))) {  // update or insert
     LOG_WARN("failed to set storage key limit", K(ret), K(tmp_ret), K(storage_key), K(limit));
   }
+  LOG_INFO("SSNT:register_or_update_storage_key_limit", K(ret), K(storage_key));
   return ret;
 }
 
@@ -766,9 +800,6 @@ int ObSharedStorageNetThrotManager::get_storage_iops_and_bandwidth_limit(
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
   ObStorageKeyLimit limit;
-  if (OB_TMP_FAIL(register_or_update_storage_key_limit(storage_key))) {
-    LOG_WARN("register or get storage limit failed", K(storage_key), K(limit), K(ret), K(tmp_ret));
-  }
   if (OB_FAIL(storage_key_limit_map_.get_refactored(storage_key, limit))) {
     max_iops = 200;
     max_bandwidth = 25 * 1000L * 1000L; // 25MBtyes
@@ -781,6 +812,9 @@ int ObSharedStorageNetThrotManager::get_storage_iops_and_bandwidth_limit(
   } else {
     max_iops = limit.max_iops_;
     max_bandwidth = limit.max_bw_;
+  }
+  if (REACH_TIME_INTERVAL(10000000)) {
+    LOG_INFO("SSNT:get_storage_iops_and_bandwidth_limit", K(ret), K(storage_key), K(max_iops), K(max_bandwidth));
   }
   return ret;
 }
@@ -847,6 +881,8 @@ int ObSSNTAllocService::register_endpoint(const ObSSNTEndpointArg &endpoint_stor
     LOG_WARN("[SSNT_SERVICE] ObSSNTAllocService thread is stopped", KR(ret), KP(this));
   } else if (OB_FAIL(quota_manager_.register_endpoint(endpoint_storage_infos))) {
     LOG_WARN("[SSNT_SERVICE] ObSSNTAllocService register endpoint failed", KR(ret), KP(this));
+  } else {
+    LOG_INFO("SSNT:register endpoint", K(endpoint_storage_infos));
   }
   return ret;
 }
@@ -883,7 +919,7 @@ int ObSSNTAllocService::get_follower_register_arg(obrpc::ObSSNTEndpointArg &arg)
   for (common::hash::ObHashSet<ObTrafficControl::ObStorageKey>::iterator it = storage_set.begin();
        it != storage_set.end();
        ++it) {
-    arg.storage_keys_.push_back(it->first);
+    (void)arg.storage_keys_.push_back(it->first);
   }
   return ret;
 }

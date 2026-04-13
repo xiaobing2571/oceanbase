@@ -36,15 +36,22 @@ class ObConfigManager
   friend class UpdateTask;
   friend class oceanbase::omt::ObTenantConfigMgr;
 public:
+  // update the config of OB_LOGGER and OB_LOG_COMPRESSOR.
+  // notice: this function won't update the syslog_level, if you want to update it,
+  // please use OB_LOGGER.parse_set()
+  static int ob_logger_config_update(const ObServerConfig& config);
+public:
   static const int64_t DEFAULT_VERSION = 1;
 
   ObConfigManager(ObServerConfig &server_config, ObReloadConfig &reload_config);
   virtual ~ObConfigManager();
 
   // get newest version received
-  const int64_t &get_version() const;
+  int64_t get_version() const;
   // config version current used
   int64_t get_current_version() const;
+  // config version current can read
+  int64_t get_read_version() const;
 
   int base_init();
 
@@ -125,9 +132,19 @@ inline ObConfigManager::ObConfigManager(ObServerConfig &server_config,
   dump_path_[0] = '\0';
 }
 
+inline int64_t ObConfigManager::get_version() const
+{
+  return update_task_.version_;
+}
+
 inline int64_t ObConfigManager::get_current_version() const
 {
   return current_version_;
+}
+
+inline int64_t ObConfigManager::get_read_version() const
+{
+  return system_config_.get_version();
 }
 
 inline ObServerConfig &ObConfigManager::get_config(void)

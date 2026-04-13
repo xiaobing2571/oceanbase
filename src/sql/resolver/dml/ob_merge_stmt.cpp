@@ -21,9 +21,9 @@ using namespace common;
 namespace sql
 {
 
-ObMergeStmt::ObMergeStmt()
-    : ObDelUpdStmt(stmt::T_MERGE),
-      table_info_()
+ObMergeStmt::ObMergeStmt(ObIAllocator &allocator)
+    : ObDelUpdStmt(stmt::T_MERGE, allocator),
+      table_info_(allocator)
 {
 }
 
@@ -77,6 +77,9 @@ int64_t ObMergeStmt::to_string(char *buf, const int64_t buf_len) const
        N_TABLE, table_items_,
        N_PARTITION_EXPR, part_expr_items_,
        K_(table_info),
+       K_(condition_exprs),
+       K_(sharding_conditions),
+       K_(dml_source_from_join),
        N_QUERY_CTX, stmt_hint_);
   J_OBJ_END();
   return pos;

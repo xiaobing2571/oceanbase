@@ -23,6 +23,7 @@
 #include "sql/resolver/ob_stmt_type.h"
 #include "share/schema/ob_dependency_info.h"      // ObReferenceObjTable
 #include "lib/allocator/ob_pooled_allocator.h"
+#include "share/catalog/ob_catalog_properties.h"
 namespace oceanbase
 {
 namespace sql
@@ -76,9 +77,6 @@ typedef common::ObPooledAllocator<common::hash::HashMapTypes<uint64_t, int64_t>:
 class ObStmt
 {
 public:
-    typedef common::ObSEArray<uint64_t, 8, common::ModulePageAllocator, true> ObSynonymIds;
-
-public:
   ObStmt()
       : stmt_type_(stmt::T_NONE),
         query_ctx_(NULL),
@@ -100,6 +98,7 @@ public:
   }
   virtual ~ObStmt();
   int set_stmt_id();
+  inline void reset_stmt_id() { stmt_id_ = OB_INVALID_STMT_ID; }
   int64_t get_stmt_id() const { return stmt_id_; }
   virtual int get_first_stmt(common::ObString &first_stmt);
   void set_stmt_type(const stmt::StmtType stmt_type);
@@ -369,6 +368,7 @@ public:
             // user define type
             || stmt_type == stmt::T_CREATE_TYPE
             || stmt_type == stmt::T_DROP_TYPE
+            || stmt_type == stmt::T_ALTER_TYPE
 
             // trigger
             || stmt_type == stmt::T_CREATE_TRIGGER
@@ -394,10 +394,21 @@ public:
             // application context
             || stmt_type == stmt::T_CREATE_CONTEXT
             || stmt_type == stmt::T_DROP_CONTEXT
+            // location
+            || stmt_type == stmt::T_CREATE_LOCATION
+            || stmt_type == stmt::T_ALTER_LOCATION
+            || stmt_type == stmt::T_DROP_LOCATION
             // catalog
             || stmt_type == stmt::T_CREATE_CATALOG
             || stmt_type == stmt::T_ALTER_CATALOG
             || stmt_type == stmt::T_DROP_CATALOG
+            // ccl
+            || stmt_type == stmt::T_CREATE_CCL_RULE
+            || stmt_type == stmt::T_DROP_CCL_RULE
+            // sensitive rule
+            || stmt_type == stmt::T_CREATE_SENSITIVE_RULE
+            || stmt_type == stmt::T_DROP_SENSITIVE_RULE
+            || stmt_type == stmt::T_ALTER_SENSITIVE_RULE
             );
   }
 
@@ -538,10 +549,13 @@ public:
         || stmt_type == stmt::T_DROP_CATALOG);
   }
 
-  static inline bool is_catalog_supported_dml_stmt(stmt::StmtType stmt_type)
+  static inline bool is_catalog_supported_dml_stmt(stmt::StmtType stmt_type,
+                                                   share::ObCatalogProperties::CatalogType catalog_type)
   {
+    bool is_insert_supported = (catalog_type == share::ObCatalogProperties::CatalogType::HMS_TYPE
+                                || catalog_type == share::ObCatalogProperties::CatalogType::FILESYSTEM_TYPE);
     return stmt_type == stmt::T_SELECT
-           // || stmt_type == stmt::T_INSERT
+           || (stmt_type == stmt::T_INSERT && is_insert_supported)
            // || stmt_type == stmt::T_INSERT_ALL
            // || stmt_type == stmt::T_REPLACE
            // || stmt_type == stmt::T_MERGE
@@ -799,8 +813,20 @@ public:
   }
   ~ObStmtFactory() { destory(); }
 
-  template <typename StmtType>
+  template <typename StmtType, typename std::enable_if<std::is_default_constructible<StmtType>::value, bool>::type = true>
   inline int create_stmt(StmtType *&stmt)
+  {
+    return inner_create_stmt<StmtType>(stmt);
+  }
+
+  template <typename StmtType, typename std::enable_if<!std::is_default_constructible<StmtType>::value, bool>::type = true>
+  inline int create_stmt(StmtType *&stmt)
+  {
+    return inner_create_stmt<StmtType>(stmt, allocator_);
+  }
+
+  template <typename StmtType, typename ...Args>
+  inline int inner_create_stmt(StmtType *&stmt, Args &...args)
   {
     int ret = common::OB_SUCCESS;
     void *ptr = allocator_.alloc(sizeof(StmtType));
@@ -810,7 +836,7 @@ public:
       ret = common::OB_ALLOCATE_MEMORY_FAILED;
       SQL_RESV_LOG(ERROR, "no more memory to stmt");
     } else {
-      stmt = new(ptr) StmtType();
+      stmt = new(ptr) StmtType(args...);
       if (OB_FAIL(stmt_store_.store_obj(stmt))) {
         SQL_RESV_LOG(WARN, "store stmt failed", K(ret));
         stmt->~StmtType();

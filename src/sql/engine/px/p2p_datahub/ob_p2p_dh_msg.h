@@ -69,12 +69,30 @@ static int transform_vec_p2p_msg_type(const ObP2PDatahubMsgType &in_type, ObP2PD
   return ret;
 }
 
+static inline bool is_bloom_filter(ObP2PDatahubMsgType msg_type)
+{
+  return msg_type == ObP2PDatahubMsgBase::BLOOM_FILTER_MSG
+         || msg_type == ObP2PDatahubMsgBase::BLOOM_FILTER_VEC_MSG;
+}
+
+static inline bool is_range_filter(ObP2PDatahubMsgType msg_type)
+{
+  return msg_type == ObP2PDatahubMsgBase::RANGE_FILTER_MSG
+         || msg_type == ObP2PDatahubMsgBase::RANGE_FILTER_VEC_MSG;
+}
+
+static inline bool is_in_filter(ObP2PDatahubMsgType msg_type)
+{
+  return msg_type == ObP2PDatahubMsgBase::IN_FILTER_MSG
+         || msg_type == ObP2PDatahubMsgBase::IN_FILTER_VEC_MSG;
+}
+
 public:
   ObP2PDatahubMsgBase() : trace_id_(), p2p_datahub_id_(OB_INVALID_ID),
       px_sequence_id_(OB_INVALID_ID), task_id_(OB_INVALID_ID),
       tenant_id_(OB_INVALID_ID), timeout_ts_(0),
       start_time_(0), msg_type_(NOT_INIT),
-      lock_(), allocator_(), msg_receive_cur_cnt_(0),
+      lock_(common::ObLatchIds::OB_P2P_DH_MSG_LOCK), allocator_(), msg_receive_cur_cnt_(0),
       msg_receive_expect_cnt_(0), is_active_(true),
       is_ready_(false), is_empty_(true), ref_count_(0),
       register_dm_info_(), dm_cb_node_seq_id_(0) {}
@@ -169,7 +187,7 @@ public:
   int64_t get_msg_receive_cur_cnt() const { return msg_receive_cur_cnt_; }
   void set_msg_cur_cnt(int64_t cnt) { msg_receive_cur_cnt_ = cnt; }
   void set_msg_expect_cnt(int64_t cnt) { msg_receive_expect_cnt_ = cnt; }
-  bool is_valid_type() { return NOT_INIT < msg_type_ < MAX_TYPE; }
+  bool is_valid_type() { return NOT_INIT < msg_type_ && msg_type_ < MAX_TYPE; }
   common::ObCurTraceId::TraceId get_trace_id() const { return trace_id_; }
   int64_t get_start_time() const { return start_time_; }
   int64_t get_px_seq_id() const { return px_sequence_id_; }

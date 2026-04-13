@@ -103,7 +103,7 @@ int ObPredicateDeduce::deduce_simple_predicates(ObTransformerCtx &ctx,
       LOG_WARN("failed to choose equal predicates", K(ret));
     } else if (OB_FAIL(choose_unequal_preds(ctx, chosen, expr_equal_with_const))) {
       LOG_WARN("failed to choose unequal predicates", K(ret));
-    } else if (OB_FAIL(choose_input_preds(chosen, result))) {
+    } else if (OB_FAIL(choose_input_preds(chosen, result, expr_equal_with_const))) {
       LOG_WARN("failed to choose input preds", K(ret));
     } else if (OB_FAIL(create_simple_preds(ctx, chosen, result))) {
       LOG_WARN("failed to create simple predicates", K(ret));
@@ -288,17 +288,148 @@ int ObPredicateDeduce::check_index_part_cond(ObTransformerCtx &ctx,
   return ret;
 }
 
+int ObPredicateDeduce::get_basic_table_id(const int64_t node,
+                                          bool &is_basic_col,
+                                          uint64_t &table_id) const {
+  int ret = OB_SUCCESS;
+  ObRawExpr *expr = NULL;
+  if (OB_ISNULL(expr = input_exprs_.at(node))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("expr is null", K(ret), K(expr));
+  } else if (OB_FAIL(ObOptimizerUtil::get_expr_without_lossless_cast(expr, expr))) {
+    LOG_WARN("failed to get expr without lossless cast", K(ret));
+  } else if (!expr->is_column_ref_expr()) {
+    is_basic_col = false;
+  } else {
+    ObColumnRefRawExpr *col_expr = static_cast<ObColumnRefRawExpr *>(expr);
+    TableItem *table_item = stmt_.get_table_item_by_id(col_expr->get_table_id());
+    if (OB_ISNULL(table_item)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("table is null", K(ret), K(table_item));
+    } else if (!table_item->is_basic_table()) {
+      is_basic_col = false;
+    } else {
+      is_basic_col = true;
+      table_id = table_item->table_id_;
+    }
+  }
+  return ret;
+}
+
+/**
+ * check if the redundant predicate 'expr_left = expr_right' should be removed
+ *
+ * for redundant predicate like 't1.c1=t2.c1 and t1.c1=1 and t2.c1=1', we can
+ * remove 't1.c1=t2.c1' to convenient join order enumeration, but if there isn't
+ * another join condition between t1 and t2, it will become a cartesian product,
+ * and may cause bad join order, which we should avoid. Therefore, we need this
+ * function to check if the redundant predicate should be removed.
+ *
+ * conditions for removing redundant predicate:
+ *  1. expr_left and expr_right are both equal with a const
+ *  2. expr_left and expr_right are both basic table columns
+ *  3. exist other join conditions that connect tables of expr_left and
+ * expr_right
+ *
+ * for example:
+ *
+ * In sql 'select * from t1, t2 where t1.c1 = t2.c1 and t1.c1 = 1 and t2.c1 = 1
+ * and t1.c2 = t2.c2', we can remove 't1.c1 = t2.c1' because 't1.c1 = t2.c1' is
+ * redundant, and there is another join condition 't1.c2 = t2.c2' so that join
+ * won't become a cartesian product and cause bad join order.
+ *
+ * In sql 'select * from (select * from t1, t2 where t1.c1 = t2.c1) v, t3 where
+ * v.t1.c1 = t3.c1 and t3.c1 = 1 and v.t2.c2 = t3.c2', we can't remove
+ * 'v.t1.c1 = t3.c1', though 'v.t1.c1 = t3.c1' is redundant and v is connected
+ * to t3 by 'v.t2.c2 = t3.c2'. This is because v is a view and may be merged
+ * in the future, and then we need join condition 't1.c1 = t3.c1' to avoid a
+ * cartesian product.
+ */
+int ObPredicateDeduce::check_input_should_remove(const int64_t left,
+                                                 const int64_t right,
+                                                 const Type type,
+                                                 const ObIArray<uint8_t> &graph,
+                                                 ObSqlBitSet<> &expr_equal_with_const,
+                                                 bool &should_remove)
+{
+  int ret = OB_SUCCESS;
+  uint64_t l_table_id = 0;
+  uint64_t r_table_id = 0;
+  bool is_basic_col;
+  should_remove = false;
+  if (!expr_equal_with_const.has_member(left) ||
+      !expr_equal_with_const.has_member(right) ||
+      type != EQ) {
+    // do nothing
+  } else if (OB_FAIL(get_basic_table_id(left, is_basic_col, l_table_id))) {
+    LOG_WARN("failed to get basic table id", K(ret));
+  } else if (!is_basic_col) {
+    // do nothing
+  } else if (OB_FAIL(get_basic_table_id(right, is_basic_col, r_table_id))) {
+    LOG_WARN("failed to get basic table id", K(ret));
+  } else if (!is_basic_col) {
+    // do nothing
+  } else if (l_table_id == r_table_id) {
+    should_remove = true;
+  } else {
+    // Check if there are other join conditions that connect l_table and r_table
+    uint64_t i_table_id = 0;
+    uint64_t j_table_id = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && !should_remove && i < N; ++i) {
+      for (int64_t j = i + 1; OB_SUCC(ret) && !should_remove && j < N; ++j) {
+        if ((i == left && j == right) || (i == right && j == left)) {
+          // do nothing
+        } else if (!has(graph, i, j, EQ)) {
+          // do nothing
+        } else if (OB_FAIL(get_basic_table_id(i, is_basic_col, i_table_id))) {
+          LOG_WARN("failed to get basic table id", K(ret));
+        } else if (!is_basic_col) {
+          // do nothing
+        } else if (OB_FAIL(get_basic_table_id(j, is_basic_col, j_table_id))) {
+          LOG_WARN("failed to get basic table id", K(ret));
+        } else if (!is_basic_col) {
+          // do nothing
+        } else if ((i_table_id == l_table_id && j_table_id == r_table_id) ||
+                   (i_table_id == r_table_id && j_table_id == l_table_id)) {
+          // l_table and r_table is connected by 'expr_i = expr_j' in join graph
+          // should remove redundant predicate 'expr_left = expr_right'
+          should_remove = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObPredicateDeduce::choose_input_preds(ObIArray<uint8_t> &chosen,
-                                          ObIArray<ObRawExpr *> &output_exprs)
+                                          ObIArray<ObRawExpr *> &output_exprs,
+                                          ObSqlBitSet<> &expr_equal_with_const)
 {
   int ret = OB_SUCCESS;
   int64_t left = -1;
   int64_t right = -1;
   Type type = EQ;
+  bool use_new_version = false;
   ObArray<uint8_t> deduced;
-  ObArray<bool> keep;
-  if (OB_FAIL(deduced.assign(chosen))) {
+  ObSEArray<bool, 16> remove;
+  if (OB_ISNULL(stmt_.get_query_ctx())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("query ctx is null", K(ret));
+  } else if (OB_FAIL(deduced.assign(chosen))) {
     LOG_WARN("failed to assign array", K(ret));
+  } else {
+    uint64_t version = GET_MIN_CLUSTER_VERSION();
+    uint64_t opt_feature_version = stmt_.get_query_ctx()->optimizer_features_enable_version_;
+    use_new_version = ((MOCK_CLUSTER_VERSION_4_2_5_6 <= version &&
+                        version < CLUSTER_VERSION_4_3_0_0) ||
+                       (CLUSTER_VERSION_4_3_5_0 <= version &&
+                        version < CLUSTER_VERSION_4_4_0_0) ||
+                       (CLUSTER_VERSION_4_4_1_0 <= version)) &&
+                      ((COMPAT_VERSION_4_2_5_BP6 <= opt_feature_version &&
+                        opt_feature_version < COMPAT_VERSION_4_3_0) ||
+                       (COMPAT_VERSION_4_3_5_BP4 <= opt_feature_version &&
+                        opt_feature_version < COMPAT_VERSION_4_4_0) ||
+                       (COMPAT_VERSION_4_4_1 <= opt_feature_version));
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < N; ++i) {
     if (i * N + i >= chosen.count()) {
@@ -311,35 +442,74 @@ int ObPredicateDeduce::choose_input_preds(ObIArray<uint8_t> &chosen,
   if (OB_SUCC(ret)) {
     deduce(deduced);
   }
+
+  // Perform expand_graph based on equal predicates where both left and right
+  // params are not equal to const
+  for (int64_t i = 0; OB_SUCC(ret) && i < input_preds_.count(); ++i) {
+    bool should_remove = false;
+    ObRawExpr *pred = input_preds_.at(i);
+    if (OB_FAIL(remove.push_back(false)))  {
+      LOG_WARN("failed to init array", K(ret));
+    } else if (OB_FAIL(convert_pred(pred, left, right, type))) {
+      LOG_WARN("failed to convert predicate", K(ret));
+    } else if (EQ != type) {
+      // do nothing
+    } else if (expr_equal_with_const.has_member(left) ||
+               expr_equal_with_const.has_member(right)) {
+      // do nothing
+    } else if (has(chosen, left, right, type)) {
+      clear(chosen, left, right, type);
+    } else if (!has(deduced, left, right, type)) {
+      set(deduced, left, right, type);
+      expand_graph(deduced, left, right);
+      expand_graph(deduced, right, left);
+    } else if (use_new_version) {
+      // do nothing
+    } else {
+      remove.at(i) = true;
+    }
+  }
+
   const Type types[3] = {EQ, GT, GE};
   for (int64_t op_type = 0; OB_SUCC(ret) && op_type <= 2; ++op_type) {
     const Type check_type = types[op_type];
     for (int64_t i = 0; OB_SUCC(ret) && i < input_preds_.count(); ++i) {
       ObRawExpr *pred = input_preds_.at(i);
-      if (op_type == 0 && OB_FAIL(keep.push_back(false)))  {
-        LOG_WARN("failed to init array", K(ret));
-      } else if (OB_FAIL(convert_pred(pred, left, right, type))) {
+      if (OB_FAIL(convert_pred(pred, left, right, type))) {
         LOG_WARN("failed to convert predicate", K(ret));
       } else if (check_type == type) {
-        if (has(chosen, left, right, type)) {
-          keep.at(i) = true;
+        if (type == EQ && !(expr_equal_with_const.has_member(left) ||
+                            expr_equal_with_const.has_member(right))) {
+          // do nothing
+        } else if (has(chosen, left, right, type)) {
           clear(chosen, left, right, type);
         } else if (!has(deduced, left, right, type)) {
-          keep.at(i) = true;
           set(deduced, left, right, type);
           expand_graph(deduced, left, right);
           if (type == EQ) {
             expand_graph(deduced, right, left);
           }
+        } else if (use_new_version) {
+          bool should_remove = true;
+          if (EQ == type && OB_FAIL(check_input_should_remove(
+                                left, right, type, deduced,
+                                expr_equal_with_const, should_remove))) {
+            LOG_WARN("failed to check input should remove", K(ret));
+          } else {
+            remove.at(i) = should_remove;
+          }
+        } else {
+          remove.at(i) = true;
         }
       }
     }
   }
+
   // we do not want to change the order of input preds
   // hence, all selected input preds are added into output in the order.
   for (int64_t i = 0; OB_SUCC(ret) && i < input_preds_.count(); ++i) {
-    if (!keep.at(i)) {
-      // do nothing
+    if (remove.at(i)) {
+      LOG_TRACE("remove input predicate", K(ret), K(i), KPC(input_preds_.at(i)));
     } else if (OB_FAIL(output_exprs.push_back(input_preds_.at(i)))) {
       LOG_WARN("failed to push back input predicate", K(ret));
     }
@@ -571,6 +741,22 @@ int ObPredicateDeduce::deduce_general_predicates(ObTransformerCtx &ctx,
                                                   general_preds.at(i),
                                                   new_pred))) {
         LOG_WARN("failed to copy the predicate", K(ret));
+      } else if (OB_ISNULL(new_pred) ||
+                 OB_UNLIKELY(new_pred->get_param_count() == 0) ||
+                 OB_ISNULL(new_pred->get_param_expr(0))||
+                 OB_ISNULL(equal_exprs.at(j))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null", K(ret), KPC(new_pred), KPC(equal_exprs.at(j)));
+      } else if (is_oracle_mode() && T_OP_LIKE == new_pred->get_expr_type() &&
+                 new_pred->get_param_expr(0)->get_result_type().is_fixed_len_char_type() &&
+                 equal_exprs.at(j)->get_result_type().is_fixed_len_char_type() &&
+                 new_pred->get_param_expr(0)->get_result_type().get_length() !=
+                 equal_exprs.at(j)->get_result_type().get_length()) {
+        /* do nothing
+          In Oracle mode, if the column involved in the LIKE predicate is CHAR(LenA),
+          and another column in the equivalence class is also CHAR(LenB) but the lengths
+          are inconsistent (LenA != LenB), equivalent predicates cannot be derived.
+        */
       } else {
         new_pred->get_param_expr(0) = equal_exprs.at(j);
         if (OB_FAIL(new_pred->formalize(ctx.session_info_))) {
@@ -670,10 +856,17 @@ int ObPredicateDeduce::get_equal_exprs(ObRawExpr *pred,
   int64_t param_idx = -1;
   ObRawExpr *param_expr = NULL;
   const TableItem* table_item = NULL;
-  if (OB_ISNULL(pred) || OB_ISNULL(param_expr = pred->get_param_expr(0))) {
+  bool use_new_version = false;
+  if (OB_ISNULL(pred) || OB_ISNULL(param_expr = pred->get_param_expr(0)) || OB_ISNULL(stmt_.get_query_ctx())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("prediate is invalid", K(ret), K(pred), K(param_expr));
-  } else if (OB_FAIL(find_similar_expr(pred, general_preds, first_params))) {
+  } else if (OB_ISNULL(stmt_.get_query_ctx())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("query ctx is null", K(ret));
+  } else if (FALSE_IT(use_new_version = stmt_.get_query_ctx()->check_opt_compat_version(COMPAT_VERSION_4_4_2))) {
+  } else if (!use_new_version && OB_FAIL(find_similar_expr(pred, general_preds, first_params))) {
+    LOG_WARN("failed to find similar expr", K(ret));
+  } else if (use_new_version && OB_FAIL(find_exclusive_expr(pred, general_preds, first_params))) {
     LOG_WARN("failed to find general expr", K(ret));
   } else if (ObOptimizerUtil::find_item(input_exprs_, param_expr, &param_idx)) {
     for (int64_t i = 0; OB_SUCC(ret) && i < N; ++i) {
@@ -693,14 +886,18 @@ int ObPredicateDeduce::get_equal_exprs(ObRawExpr *pred,
         // do nothing
       } else if (ObOptimizerUtil::find_item(first_params, expr)) {
         // do nothing
-      } else if (OB_ISNULL(table_item = stmt_.get_table_item_by_id(
-                                              static_cast<const ObColumnRefRawExpr*>(real_expr)->get_table_id()))) {
+      } else if (!use_new_version
+                 && OB_ISNULL(table_item = stmt_.get_table_item_by_id(static_cast<const ObColumnRefRawExpr *>(real_expr)
+                                                                      ->get_table_id()))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("get unexpected null", K(ret));
-      } else if (T_OP_IN == pred->get_expr_type() &&
-                 (!table_item->is_basic_table() ||
-                  has_raw_const_equal_condition(i))) {
+      } else if (!use_new_version
+                 && (T_OP_IN == pred->get_expr_type()
+                     && (!table_item->is_basic_table() || has_raw_const_equal_condition(i)))) {
         // deduce IN predicates for column parameters that only have basic tables and do not contain const equal predicates and IN predicates
+      } else if (use_new_version && has_raw_const_equal_condition(i)) {
+        // if ther is already a raw const equal condition, we don't need to
+        // deduce a general predicate.
         // do nothing
       } else if (param_expr->get_result_type().get_type() != expr->get_result_type().get_type()) {
         need_check_type_safe = is_type_safe(param_idx, i);
@@ -823,6 +1020,110 @@ int ObPredicateDeduce::find_similar_expr(ObRawExpr *pred,
       }
     }
     if (OB_SUCC(ret) && is_similar) {
+      if (OB_FAIL(first_params.push_back(general_preds.at(i)->get_param_expr(0)))) {
+        LOG_WARN("failed to push back param expr", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObPredicateDeduce::is_similar_expr(ObRawExpr *pred,
+                                       ObRawExpr *general_pred,
+                                       bool &is_similar)
+{
+  int ret = OB_SUCCESS;
+  ObExprEqualCheckContext equal_ctx;
+  equal_ctx.override_const_compare_ = true;
+  if (OB_ISNULL(pred) || OB_ISNULL(general_pred)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid param expr", K(ret), K(pred), K(general_pred));
+  }
+  is_similar = false;
+  if (general_pred == pred) {
+    is_similar = true;
+  } else if (general_pred->get_expr_type() == pred->get_expr_type() &&
+             general_pred->get_param_count() == pred->get_param_count()) {
+    is_similar = true;
+    for (int64_t j = 1; OB_SUCC(ret) && is_similar && j < pred->get_param_count(); ++j) {
+      ObRawExpr *param1 = NULL;
+      ObRawExpr *param2 = NULL;
+      if (OB_ISNULL(param1 = pred->get_param_expr(j)) ||
+          OB_ISNULL(param2 = general_pred->get_param_expr(j))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("param expr is null", K(ret));
+      } else {
+        is_similar = param1->same_as(*param2, &equal_ctx);
+      }
+    }
+  } else {
+    is_similar = false;
+  }
+  return ret;
+}
+
+/**
+ * For columns that already have general predicates, decide whether to reject
+ * deducing new predicates. For example, if a column already has an 'in'
+ * predicate, we won't deduce new 'in' predicates or '!=' predicates.  This is
+ * to avoid consuming too many resources on unnecessary predicate deduction.
+ *
+ * This 'exclusion' relationship is summarized in the table below:
+ * Row headers represent existing predicate types, column headers represent
+ * predicate types to be deduced.
+ * × means reject new deduced predicate, √ means allow.
+ *
+ * |      | !=  | like | in  |
+ * |------|-----|------|-----|
+ * | !=   | √   | √    | √   |
+ * | like | ×   | √    | ×   |
+ * | in   | ×   | √    | ×   |
+ *
+ * In addition, we also need to avoid deducing duplicate predicates.
+ */
+int ObPredicateDeduce::find_exclusive_expr(ObRawExpr *pred,
+                                           ObIArray<ObRawExpr *> &general_preds,
+                                           ObIArray<ObRawExpr *> &first_params)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(pred)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid param expr", K(ret), K(pred));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < general_preds.count(); ++i) {
+    bool is_exclusive = true;
+    bool is_similar = false;
+    if (OB_ISNULL(general_preds.at(i))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("general predicate is null", K(ret));
+    } else if (general_preds.at(i) == pred) {
+      is_exclusive = true;
+    } else if (T_OP_NE == pred->get_expr_type()) {
+      if (T_OP_NE == general_preds.at(i)->get_expr_type()) {
+        is_exclusive = false;
+      } else {
+        is_exclusive = true;
+      }
+    } else if (T_OP_IN == pred->get_expr_type()) {
+      if (T_OP_NE == general_preds.at(i)->get_expr_type()) {
+        is_exclusive = false;
+      } else {
+        is_exclusive = true;
+      }
+    } else if (T_OP_LIKE == pred->get_expr_type()) {
+      is_exclusive = false;
+    }
+
+    // Exclude similar to avoid duplicate predicates
+    // for example, 'a.c1 = b.c1 and a.c1 like 'a%' and b.c1 like 'a%', we
+    // shouldn't deduce new 'like 'a%'' predicates. If we don't do this, the
+    // transformation might not converge.
+    if (OB_SUCC(ret) && !is_exclusive && OB_FAIL(is_similar_expr(pred, general_preds.at(i), is_similar))) {
+      LOG_WARN("failed to check is similar", K(ret));
+    } else if (is_similar) {
+      is_exclusive = true;
+    }
+    if (OB_SUCC(ret) && is_exclusive) {
       if (OB_FAIL(first_params.push_back(general_preds.at(i)->get_param_expr(0)))) {
         LOG_WARN("failed to push back param expr", K(ret));
       }

@@ -35,6 +35,7 @@ struct ObMacroBlocksWriteCtx;
 class ObStorageObjectHandle;
 struct ObDataStoreDesc;
 class ObBloomFilter;
+class ObIMacroBlockFlusher;
 
 class ObMicroBlockCompressor
 {
@@ -71,31 +72,36 @@ public:
       const bool is_leaf_index_block,
       int64_t &data_offset);
   int get_macro_block_meta(ObDataMacroBlockMeta &macro_meta);
-  int flush(ObStorageObjectHandle &macro_handle,
-            ObMacroBlocksWriteCtx &block_write_ctx,
-            ObIODevice *device_handle = nullptr);
+  int add_pre_warm_state(const bool micro_block_need_pre_warm);
+  int get_pre_warm_state(const int micro_block_idx, bool &need_pre_warm) const;
+  OB_INLINE bool need_pre_warm() const { return need_pre_warm_; }
+  OB_INLINE int64_t get_pre_warm_list_count() const { return micro_block_need_pre_warm_list_.count(); }
+  int flush(ObIMacroBlockFlusher &macro_block_flusher, const bool is_close_flush);
+  void print_flush_log(const ObStorageObjectHandle &macro_handle) const;
   void reset();
   void reuse();
   OB_INLINE bool is_dirty() const { return is_dirty_; }
   int64_t get_data_size() const;
   int64_t get_remain_size() const;
   int64_t get_current_macro_seq() const {return cur_macro_seq_; }
+  OB_INLINE int64_t get_data_capacity() const { return data_.capacity(); }
   OB_INLINE ObMacroBlockBloomFilter * get_macro_block_bloom_filter() { return &macro_block_bf_; }
   OB_INLINE int64_t get_macro_block_bloom_filter_serialize_size() const { return macro_block_bf_.get_serialize_size(); }
   OB_INLINE char *get_data_buf() { return data_.data(); }
+  OB_INLINE const char *get_data_buf() const { return data_.data(); }
   OB_INLINE int32_t get_row_count() const { return macro_header_.fixed_header_.row_count_; }
   OB_INLINE int32_t get_micro_block_count() const { return macro_header_.fixed_header_.micro_block_count_; }
   OB_INLINE int64_t get_data_checksum() const { return macro_header_.fixed_header_.data_checksum_; }
-
   int64_t get_compaction_scn() const; // for dump macro
   OB_INLINE ObRowStoreType get_row_store_type() const
   {
     return static_cast<ObRowStoreType>(macro_header_.fixed_header_.row_store_type_);
   }
-  void update_max_merged_trans_version(const int64_t max_merged_trans_version)
+
+  void update_max_merged_trans_version(const int64_t input_trans_version)
   {
-    if (max_merged_trans_version > max_merged_trans_version_) {
-      max_merged_trans_version_ = max_merged_trans_version;
+    if (input_trans_version > max_merged_trans_version_) {
+      max_merged_trans_version_ = input_trans_version;
     }
   }
   void set_contain_uncommitted_row()
@@ -120,6 +126,7 @@ private:
   OB_INLINE const char *get_micro_block_data_ptr() const { return data_.data() + data_base_offset_; }
   OB_INLINE int64_t get_micro_block_data_size() const { return data_.length() - data_base_offset_; }
 private:
+  static const int64_t DEFAULT_MICRO_BLOCK_COUNT = 128;
   const ObDataStoreDesc *spec_;
   compaction::ObMergeBlockInfo *merge_block_info_;
   storage::ObCompactionBufferWriter data_; //micro header + data blocks;
@@ -137,6 +144,8 @@ private:
   int64_t data_zsize_;
   int64_t cur_macro_seq_;
   bool is_inited_;
+  bool need_pre_warm_;
+  common::ObSEArray<bool, DEFAULT_MICRO_BLOCK_COUNT> micro_block_need_pre_warm_list_;
 };
 
 }

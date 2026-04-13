@@ -95,6 +95,8 @@ enum class ObTxLogType : int64_t
   TX_START_WORKING_LOG = 0x100000,
   // BigSegment log
   TX_BIG_SEGMENT_LOG = 0x200000,
+  // direct load inc major
+  TX_DIRECT_LOAD_INC_MAJOR_LOG = 0x400000,
   TX_LOG_TYPE_LIMIT
 };
 
@@ -150,7 +152,9 @@ static const ObTxLogType TX_LOG_TYPE_MASK = (ObTxLogType::TX_REDO_LOG |
                                              ObTxLogType::TX_COMMIT_LOG |
                                              ObTxLogType::TX_ABORT_LOG |
                                              ObTxLogType::TX_CLEAR_LOG |
-                                             ObTxLogType::TX_START_WORKING_LOG);
+                                             ObTxLogType::TX_START_WORKING_LOG |
+                                             ObTxLogType::TX_BIG_SEGMENT_LOG |
+                                             ObTxLogType::TX_DIRECT_LOAD_INC_MAJOR_LOG);
 
 class ObTxLogTypeChecker {
 public:
@@ -159,7 +163,8 @@ public:
     return ObTxLogType::TX_REDO_LOG == log_type || ObTxLogType::TX_RECORD_LOG == log_type
            || ObTxLogType::TX_ROLLBACK_TO_LOG == log_type
            || ObTxLogType::TX_MULTI_DATA_SOURCE_LOG == log_type
-           || ObTxLogType::TX_DIRECT_LOAD_INC_LOG == log_type;
+           || ObTxLogType::TX_DIRECT_LOAD_INC_LOG == log_type
+           || ObTxLogType::TX_DIRECT_LOAD_INC_MAJOR_LOG == log_type;
   }
   static bool is_state_log(const ObTxLogType log_type)
   {
@@ -621,6 +626,7 @@ public:
   const ObTxDLIncLogBuf &get_dli_buf() { return log_buf_; }
 
   int ob_admin_dump(share::ObAdminMutatorStringArg &arg);
+  int ob_admin_dump_macro_block(share::ObAdminMutatorStringArg &arg, int64_t scn_val);
 
   static const ObTxLogType LOG_TYPE;
   TO_STRING_KV(K(LOG_TYPE), K(ddl_log_type_), K(log_buf_));
@@ -637,7 +643,7 @@ public:
 
 #endif
 
-private:
+protected:
   ObTxSerCompatByte compat_bytes_;
 
   DirectLoadIncLogType ddl_log_type_;
@@ -645,6 +651,15 @@ private:
   ObTxDLIncLogBuf &log_buf_;
   // ObDDLRedoLog &ddl_redo_log_;
   ObDDLIncLogBasic batch_key_;
+};
+
+class ObTxDirectLoadIncMajorLog : public ObTxDirectLoadIncLog
+{
+public:
+  static const ObTxLogType LOG_TYPE;
+  ObTxDirectLoadIncMajorLog(const ObTxDirectLoadIncLog::ConstructArg &arg)
+      : ObTxDirectLoadIncLog(arg)
+  {}
 };
 
 class ObTxActiveInfoLogTempRef {

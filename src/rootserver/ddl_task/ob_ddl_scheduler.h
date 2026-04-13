@@ -274,6 +274,9 @@ public:
   virtual int switch_to_leader() override;
   virtual int switch_to_follower_gracefully() override;
   virtual int resume_leader() override;
+  // RS epoch for leader-change detection
+  inline int64_t get_rs_epoch() const { return rs_epoch_; }
+  inline void inc_rs_epoch() { ATOMIC_INC(&rs_epoch_); }
 
   // mtl_functions
   static int mtl_init(ObDDLScheduler *&ddl_scheduler);
@@ -344,6 +347,8 @@ public:
                             obrpc::ObAutoSplitTabletBatchRes &res);
   int schedule_auto_split_task();
   inline share::ObDDLReplicaBuilder &get_ddl_builder() { return ddl_builder_; }
+  int notify_refresh_related_mviews_task_end(const ObDDLTaskKey &task_key, const int ret_code);
+
 private:
   class DDLIdling : public ObThreadIdling
   {
@@ -355,7 +360,7 @@ private:
   class DDLScanTask : public common::ObTimerTask
   {
   public:
-    explicit DDLScanTask(ObDDLScheduler &ddl_scheduler): ddl_scheduler_(ddl_scheduler), tg_id_(-1) {}
+    explicit DDLScanTask(ObDDLScheduler &ddl_scheduler): ddl_scheduler_(ddl_scheduler), tg_id_(-1), last_schedule_time_(0) {}
     virtual ~DDLScanTask() {};
     int init();
     int schedule();
@@ -368,6 +373,7 @@ private:
   private:
     ObDDLScheduler &ddl_scheduler_;
     int tg_id_;
+    int64_t last_schedule_time_;
   };
 
   class HeartBeatCheckTask : public common::ObTimerTask
@@ -444,7 +450,8 @@ private:
       const obrpc::ObCreateIndexArg *create_index_arg,
       const uint64_t tenant_data_version,
       ObIAllocator &allocator,
-      ObDDLTaskRecord &task_record);
+      ObDDLTaskRecord &task_record,
+      const bool ddl_need_retry_at_executor = false);
   int create_build_vec_index_task(
       common::ObISQLClient &proxy,
       const share::schema::ObTableSchema *data_table_schema,
@@ -456,7 +463,8 @@ private:
       const uint64_t tenant_data_version,
       ObIAllocator &allocator,
       ObDDLTaskRecord &task_record,
-      const int64_t snapshot_version);
+      const int64_t snapshot_version,
+      const bool ddl_need_retry_at_executor = false);
   int create_constraint_task(
       common::ObISQLClient &proxy,
       const share::schema::ObTableSchema *table_schema,
@@ -598,7 +606,18 @@ private:
       const share::schema::ObTableSchema *domain_index_schema,
       const share::schema::ObTableSchema *delta_buffer_schema_,
       const share::schema::ObTableSchema *index_snapshot_data_schema_,
+      const share::schema::ObTableSchema *embedded_vec_schema_,
       const uint64_t tenant_data_version,
+      const obrpc::ObDropIndexArg *drop_index_arg,
+      ObIAllocator &allocator,
+      ObDDLTaskRecord &task_record);
+   int create_drop_search_index_task(
+      common::ObISQLClient &proxy,
+      const share::schema::ObTableSchema *index_schema,
+      const int64_t schema_version,
+      const int64_t consumer_group_id,
+      const share::schema::ObTableSchema *def_index_schema,
+      const share::schema::ObTableSchema *data_index_schema,
       const obrpc::ObDropIndexArg *drop_index_arg,
       ObIAllocator &allocator,
       ObDDLTaskRecord &task_record);
@@ -628,6 +647,7 @@ int create_partition_split_task(
     const int64_t parent_task_id,
     const int64_t task_id,
     const obrpc::ObPartitionSplitArg *partition_split_arg,
+    const uint64_t tenant_data_version,
     ObIAllocator &allocator,
     ObDDLTaskRecord &task_record);
 
@@ -665,6 +685,7 @@ int create_partition_split_task(
   int schedule_rebuild_index_task(const ObDDLTaskRecord &task_record);
   int schedule_drop_fts_index_task(const ObDDLTaskRecord &task_record);
   int schedule_drop_lob_task(const ObDDLTaskRecord &task_record);
+  int schedule_drop_search_index_task(const ObDDLTaskRecord &task_record);
   int schedule_ddl_retry_task(const ObDDLTaskRecord &task_record);
   int schedule_partition_split_task(const ObDDLTaskRecord &task_record);
   int schedule_recover_restore_table_task(const ObDDLTaskRecord &task_record);
@@ -674,8 +695,7 @@ int create_partition_split_task(
   int remove_task_from_longops_mgr(ObDDLTask *ddl_task);
   int remove_ddl_task(ObDDLTask *ddl_task);
   void add_event_info(const ObDDLTaskRecord &ddl_record, const ObString &ddl_event_stmt);
-  int check_conflict_with_upgrade(
-      const uint64_t tenant_id);
+  int check_conflict_with_upgrade();
 
 private:
   static const int64_t TOTAL_LIMIT = 1024L * 1024L * 1024L;
@@ -690,6 +710,7 @@ private:
   DDLScanTask scan_task_;
   HeartBeatCheckTask heart_beat_check_task_;
   share::ObDDLReplicaBuilder ddl_builder_;
+  int64_t rs_epoch_;
 };
 
 template<typename T>

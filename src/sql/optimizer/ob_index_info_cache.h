@@ -26,7 +26,7 @@ class ObShardingInfo;
 /* 缓存query range的信息 */
 class QueryRangeInfo {
 public:
-  QueryRangeInfo() : is_valid_(false),
+  QueryRangeInfo(common::ObIAllocator &allocator) : is_valid_(false),
       contain_always_false_(false),
       query_range_(NULL),
       pre_range_graph_(NULL),
@@ -35,9 +35,10 @@ public:
       equal_prefix_count_(0),
       equal_prefix_null_count_(0),
       range_prefix_count_(0),
+      ss_range_prefix_count_(0),
       index_column_count_(0),
-      range_columns_(),
-      expr_constraints_(),
+      range_columns_(allocator),
+      expr_constraints_(allocator),
       index_prefix_(-1),
       range_count_(-1),
       unique_range_rowcnt_(-1) {}
@@ -57,6 +58,7 @@ public:
   uint64_t get_equal_prefix_count() const { return equal_prefix_count_; };
   uint64_t get_equal_prefix_null_count() const { return equal_prefix_null_count_; };
   uint64_t get_range_prefix_count() const { return range_prefix_count_; };
+  uint64_t get_ss_range_prefix_count() const { return ss_range_prefix_count_; };
   uint64_t get_index_column_count() const { return index_column_count_; };
   bool get_contain_always_false() const { return contain_always_false_; }
   
@@ -95,6 +97,8 @@ public:
   { equal_prefix_null_count_ = equal_prefix_null_count; }
   void set_range_prefix_count(const int64_t range_prefix_count)
   { range_prefix_count_ = range_prefix_count; }
+  void set_ss_range_prefix_count(const int64_t ss_range_prefix_count)
+  { ss_range_prefix_count_ = ss_range_prefix_count; }
   void set_index_column_count(const int64_t index_column_count)
   { index_column_count_ = index_column_count; };
   void set_contain_always_false(const bool contain_always_false)
@@ -121,9 +125,10 @@ private:
   int64_t equal_prefix_count_;
   int64_t equal_prefix_null_count_;
   int64_t range_prefix_count_;
+  int64_t ss_range_prefix_count_;
   int64_t index_column_count_; // index column count without adding primary key
-  common::ObArray<ColumnItem> range_columns_;
-  common::ObArray<ObExprConstraint> expr_constraints_;
+  ObSqlArray<ColumnItem> range_columns_;
+  ObSqlArray<ObExprConstraint> expr_constraints_;
   int64_t index_prefix_;
   int64_t range_count_;
   int64_t unique_range_rowcnt_;
@@ -134,10 +139,10 @@ private:
 /* 索引的ordering 信息 */
 class OrderingInfo {
 public:
-  OrderingInfo() :
+  OrderingInfo(common::ObIAllocator &allocator) :
     scan_direction_(default_asc_direction()),
-    index_keys_(),
-    ordering_(){
+    index_keys_(allocator),
+    ordering_(allocator){
   }
   ObOrderDirection get_scan_direction() const { return scan_direction_; }
   const common::ObIArray<ObRawExpr *> &get_index_keys() const { return index_keys_; }
@@ -149,15 +154,15 @@ public:
   TO_STRING_KV(K_(scan_direction), K_(index_keys));
 private:
   ObOrderDirection scan_direction_;
-  common::ObArray<ObRawExpr*> index_keys_;
-  common::ObArray<ObRawExpr*> ordering_;
+  ObSqlArray<ObRawExpr*> index_keys_;
+  ObSqlArray<ObRawExpr*> ordering_;
   DISALLOW_COPY_AND_ASSIGN(OrderingInfo);
 };
 
 // 每个索引作为一个entry
 class IndexInfoEntry {
 public:
-  IndexInfoEntry() :
+  IndexInfoEntry(common::ObIAllocator &allocator) :
     index_id_(common::OB_INVALID_ID),
     is_unique_index_(false),
     is_index_back_(false),
@@ -166,9 +171,10 @@ public:
     is_fulltext_index_(false),
     is_multivalue_index_(false),
     is_vector_index_(false),
+    is_search_index_(false),
     force_direction_(false),
-    range_info_(),
-    ordering_info_(),
+    range_info_(allocator),
+    ordering_info_(allocator),
     interesting_order_info_(OrderingFlag::NOT_MATCH),
     interesting_order_prefix_count_(0),
     partition_info_(NULL),
@@ -203,6 +209,8 @@ public:
   void set_is_fulltext_index(const bool is_fulltext_index) { is_fulltext_index_ = is_fulltext_index; }
   bool is_vector_index() const { return is_vector_index_; }
   void set_is_vector_index(const bool is_vector_index) { is_vector_index_ = is_vector_index; }
+  bool is_search_index() const { return is_search_index_; }
+  void set_is_search_index(const bool is_search_index) { is_search_index_ = is_search_index; }
   void set_partition_info(ObTablePartitionInfo *partition_info) { partition_info_ = partition_info; }
   ObTablePartitionInfo *get_partition_info() const { return partition_info_; }
   void set_sharding_info(ObShardingInfo *sharding_info) { sharding_info_ = sharding_info; }
@@ -212,7 +220,7 @@ public:
   bool is_force_direction() const { return force_direction_; }
   void set_force_direction(bool force) { force_direction_ = force; }
   TO_STRING_KV(K_(index_id), K_(is_unique_index), K_(is_index_back), K_(is_index_global),
-               K_(is_fulltext_index), K_(is_multivalue_index), K_(range_info), K_(ordering_info), K_(interesting_order_info),
+               K_(is_fulltext_index), K_(is_multivalue_index), K_(is_search_index), K_(range_info), K_(ordering_info), K_(interesting_order_info),
                K_(interesting_order_prefix_count));
 private:
   uint64_t index_id_;
@@ -223,6 +231,7 @@ private:
   bool is_fulltext_index_;
   bool is_multivalue_index_;
   bool is_vector_index_;
+  bool is_search_index_;
   bool force_direction_;
   QueryRangeInfo range_info_;
   OrderingInfo ordering_info_;

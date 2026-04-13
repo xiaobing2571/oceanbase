@@ -16,6 +16,8 @@
 #include "ob_backup_base_service.h"
 #include "ob_backup_data_scheduler.h"
 #include "ob_backup_clean_scheduler.h"
+#include "ob_backup_validate_scheduler.h"
+#include "share/ob_rpc_struct.h"
 namespace oceanbase 
 {
 namespace rootserver 
@@ -35,8 +37,8 @@ public:
 public:
 
   virtual ObIBackupJobScheduler *get_scheduler(const BackupJobType &type) = 0;
-  virtual int get_need_reload_task(
-      common::ObIAllocator &allocator, common::ObIArray<ObBackupScheduleTask *> &tasks) = 0;
+  virtual int do_reload_task(
+      common::ObIAllocator &allocator, ObBackupTaskSchedulerQueue &queue) = 0;
 
   virtual int switch_to_leader() override { disable_backup(); return ObBackupBaseService::switch_to_leader(); }
   virtual int resume_leader() override { disable_backup(); return ObBackupBaseService::resume_leader(); }
@@ -47,12 +49,15 @@ public:
   void disable_backup();
   void enable_backup();
   bool can_schedule();
+  void wakeup_tenant_service(const uint64_t tenant_id);
   TO_STRING_KV(K_(tenant_id), K_(can_schedule))
 protected:
   virtual int sub_init(common::ObMySQLProxy &sql_proxy, obrpc::ObSrvRpcProxy &rpc_proxy,
            share::schema::ObMultiVersionSchemaService &schema_service,
            share::ObLocationService &loacation_service,
            ObBackupTaskScheduler &task_scheduler) = 0;
+private:
+  virtual obrpc::ObNotifyTenantThreadArg::TenantThreadType get_tenant_thread_type_() const = 0;
 protected:
   bool is_inited_;
   uint64_t tenant_id_;
@@ -72,8 +77,8 @@ public:
   int process(int64_t &last_schedule_ts) override;
 
   ObIBackupJobScheduler *get_scheduler(const BackupJobType &type);
-  int get_need_reload_task(
-      common::ObIAllocator &allocator, common::ObIArray<ObBackupScheduleTask *> &tasks) override;
+  int do_reload_task(
+      common::ObIAllocator &allocator, ObBackupTaskSchedulerQueue &queue) override;
 
   int handle_backup_database(const obrpc::ObBackupDatabaseArg &arg);
   int handle_backup_database_cancel(const uint64_t tenant_id, const ObIArray<uint64_t> &managed_tenant_ids);
@@ -81,28 +86,34 @@ private:
   int sub_init(common::ObMySQLProxy &sql_proxy, obrpc::ObSrvRpcProxy &rpc_proxy,
     share::schema::ObMultiVersionSchemaService &schema_service, share::ObLocationService &loacation_service,
     ObBackupTaskScheduler &task_scheduler) override;
+
+  obrpc::ObNotifyTenantThreadArg::TenantThreadType get_tenant_thread_type_() const override;
 private:
   ObBackupDataScheduler backup_data_scheduler_;
   DISALLOW_COPY_AND_ASSIGN(ObBackupDataService);
 };
 
-class ObBackupCleanService final : public ObBackupService
+class ObBackupMgrService final : public ObBackupService
 {
 public:
-  ObBackupCleanService() : ObBackupService(), backup_clean_scheduler_(), backup_auto_obsolete_delete_trigger_(),
-    jobs_(), triggers_() {}
-  virtual ~ObBackupCleanService() {}
-  DEFINE_MTL_FUNC(ObBackupCleanService);
+  ObBackupMgrService() : ObBackupService(), backup_clean_scheduler_(), backup_validate_scheduler_(),
+  backup_auto_obsolete_delete_trigger_(), jobs_(), triggers_() {}
+  virtual ~ObBackupMgrService() {}
+  DEFINE_MTL_FUNC(ObBackupMgrService);
   int process(int64_t &last_schedule_ts) override;
 
   ObIBackupJobScheduler *get_scheduler(const BackupJobType &type);
-  int get_need_reload_task(
-      common::ObIAllocator &allocator, common::ObIArray<ObBackupScheduleTask *> &tasks) override;
+  int do_reload_task(
+      common::ObIAllocator &allocator, ObBackupTaskSchedulerQueue &queue) override;
 
   int handle_backup_delete(const obrpc::ObBackupCleanArg &arg);
   int handle_delete_policy(const obrpc::ObDeletePolicyArg &arg);
-  int handle_backup_delete_obsolete(const obrpc::ObBackupCleanArg &arg);
+  int start_obsolete_backup_clean(const uint64_t tenant_id);
+  int handle_backup_validate(const obrpc::ObBackupValidateArg &arg);
+  int handle_backup_validate_cancel(const uint64_t tenant_id, const ObIArray<uint64_t> &managed_tenant_ids);
 private:
+  obrpc::ObNotifyTenantThreadArg::TenantThreadType get_tenant_thread_type_() const override;
+  int handle_backup_delete_(const obrpc::ObBackupCleanArg &arg);
   virtual int sub_init(common::ObMySQLProxy &sql_proxy, obrpc::ObSrvRpcProxy &rpc_proxy,
                   share::schema::ObMultiVersionSchemaService &schema_service,
                   share::ObLocationService &loacation_service,
@@ -116,12 +127,12 @@ private:
 
 private:
   ObBackupCleanScheduler backup_clean_scheduler_;
+  ObBackupValidateScheduler backup_validate_scheduler_;
   ObBackupAutoObsoleteDeleteTrigger backup_auto_obsolete_delete_trigger_;
   common::ObSEArray<ObIBackupJobScheduler *, 8> jobs_;
   common::ObSEArray<ObIBackupTrigger *, 2> triggers_;
-  DISALLOW_COPY_AND_ASSIGN(ObBackupCleanService);
+  DISALLOW_COPY_AND_ASSIGN(ObBackupMgrService);
 };
-
 
 }  // end namespace rootserver
 }  // namespace oceanbase

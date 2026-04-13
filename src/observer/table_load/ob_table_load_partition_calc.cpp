@@ -131,7 +131,10 @@ int ObTableLoadPartitionCalc::init_part_key_index(const ObTableSchema *table_sch
     }
   }
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(part_key_obj_index_.create(part_key_num, allocator))) {
+    if (OB_UNLIKELY(0 == part_key_num)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected zero part_key_num", KR(ret), K(part_key_num));
+    } else if (OB_FAIL(part_key_obj_index_.create(part_key_num, allocator))) {
       LOG_WARN("fail to create", KR(ret));
     }
   }
@@ -145,7 +148,7 @@ int ObTableLoadPartitionCalc::init_part_key_index(const ObTableSchema *table_sch
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected rowkey position", KR(ret), KPC(column_schema), K(pos));
       } else {
-        if (table_schema->is_table_with_hidden_pk_column()) {
+        if (table_schema->is_table_without_pk()) {
           abort_unless(i > 0);
           part_key_obj_index_[pos - 1].index_ = i - 1;
         } else {

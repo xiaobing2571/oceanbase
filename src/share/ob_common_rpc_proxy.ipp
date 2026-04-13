@@ -32,11 +32,13 @@
   RPC_S(PRD set_comment, obrpc::OB_PARALLEL_SET_COMMENT, (ObSetCommentArg), ObParallelDDLRes);
   RPC_S(PRD split_global_index_tablet, obrpc::OB_SPLIT_GLOBAL_INDEX_TABLET, (ObAlterTableArg));
   RPC_S(PRD create_hidden_table, obrpc::OB_CREATE_HIDDEN_TABLE, (obrpc::ObCreateHiddenTableArg), ObCreateHiddenTableRes);
+  RPC_S(PRD create_hidden_table_v2, obrpc::OB_CREATE_HIDDEN_TABLE_V2, (obrpc::ObCreateHiddenTableArgV2), ObCreateHiddenTableRes);
   RPC_S(PRD alter_database, obrpc::OB_ALTER_DATABASE, (ObAlterDatabaseArg));
   RPC_S(PRD drop_database, obrpc::OB_DROP_DATABASE, (ObDropDatabaseArg), ObDropDatabaseRes);
   RPC_S(PRD drop_tablegroup, obrpc::OB_DROP_TABLEGROUP, (ObDropTablegroupArg));
   RPC_S(PRD alter_tablegroup, obrpc::OB_ALTER_TABLEGROUP, (ObAlterTablegroupArg));
   RPC_S(PRD drop_table, obrpc::OB_DROP_TABLE, (ObDropTableArg), ObDDLRes);
+  RPC_S(PRD parallel_drop_table, obrpc::OB_PARALLEL_DROP_TABLE, (ObDropTableArg), ObDropTableRes);
   RPC_S(PRD rename_table, obrpc::OB_RENAME_TABLE, (ObRenameTableArg));
   RPC_S(PRD truncate_table, obrpc::OB_TRUNCATE_TABLE, (ObTruncateTableArg), ObDDLRes);
   RPC_S(PRD truncate_table_v2, obrpc::OB_TRUNCATE_TABLE_V2, (ObTruncateTableArg), ObDDLRes);
@@ -50,6 +52,7 @@
   RPC_S(PRD flashback_index, obrpc::OB_FLASHBACK_INDEX, (ObFlashBackIndexArg));
   RPC_S(PRD purge_index, obrpc::OB_PURGE_INDEX, (ObPurgeIndexArg));
   RPC_S(PRD create_table_like, obrpc::OB_CREATE_TABLE_LIKE, (ObCreateTableLikeArg));
+  RPC_S(PRD parallel_create_table_like, obrpc::OB_PARALLEL_CREATE_TABLE_LIKE, (ObCreateTableLikeArg), ObCreateTableRes);
   RPC_S(PRD flashback_table_from_recyclebin, obrpc::OB_FLASHBACK_TABLE_FROM_RECYCLEBIN, (ObFlashBackTableFromRecyclebinArg));
   RPC_S(PRD flashback_table_to_time_point, obrpc::OB_FLASHBACK_TABLE_TO_SCN, (ObFlashBackTableToScnArg));
   RPC_S(PRD purge_table, obrpc::OB_PURGE_TABLE, (ObPurgeTableArg));
@@ -80,6 +83,8 @@
   RPC_S(PRD revoke_table, obrpc::OB_REVOKE_TABLE, (ObRevokeTableArg));
   RPC_S(PRD revoke_routine, obrpc::OB_REVOKE_ROUTINE, (ObRevokeRoutineArg));
   RPC_S(PRD revoke_sys_priv, obrpc::OB_REVOKE_SYSPRIV, (ObRevokeSysPrivArg));
+  RPC_S(PRD revoke_object, obrpc::OB_REVOKE_OBJECT, (ObRevokeObjMysqlArg));
+  RPC_S(PRD revoke_sensitive_rule, obrpc::OB_REVOKE_SENSITIVE_RULE, (ObRevokeSensitiveRuleArg));
   RPC_S(PRD alter_user_profile, obrpc::OB_ALTER_USER_PROFILE, (ObAlterUserProfileArg));
   RPC_S(PRD handle_security_audit, obrpc::OB_SECURITY_AUDIT, (ObSecurityAuditArg));
   //----End of definitions for managing privileges----
@@ -99,6 +104,7 @@
   RPC_S(PRD create_udt, obrpc::OB_CREATE_UDT, (ObCreateUDTArg));
   RPC_S(PRD create_udt_with_res, obrpc::OB_CREATE_UDT_WITH_RES, (ObCreateUDTArg), ObRoutineDDLRes);
   RPC_S(PRD drop_udt, obrpc::OB_DROP_UDT, (ObDropUDTArg));
+  RPC_S(PRD alter_udt_with_res, obrpc::OB_ALTER_UDT_WITH_RES, (ObAlterUDTArg), ObRoutineDDLRes);
 
   //----Definitions for managing dblinks----
   RPC_S(PRD create_dblink, obrpc::OB_CREATE_DBLINK, (ObCreateDbLinkArg));
@@ -204,6 +210,7 @@
   RPC_S(PRD run_job, obrpc::OB_RUN_JOB, (ObRunJobArg));
   RPC_S(PRD run_upgrade_job, obrpc::OB_RUN_UPGRADE_JOB, (ObUpgradeJobArg));
   RPC_S(PRD upgrade_table_schema, obrpc::OB_UPGRADE_TABLE_SCHEMA, (ObUpgradeTableSchemaArg));
+  RPC_S(PRD batch_upgrade_table_schema, obrpc::OB_BATCH_UPGRADE_TABLE_SCHEMA, (ObBatchUpgradeTableSchemaArg));
   RPC_S(PR5 admin_flush_cache, obrpc::OB_ADMIN_FLUSH_CACHE, (ObAdminFlushCacheArg));
   RPC_S(PR5 admin_upgrade_cmd, obrpc::OB_ADMIN_UPGRADE_CMD, (Bool));
   RPC_S(PR5 admin_rolling_upgrade_cmd, obrpc::OB_ADMIN_ROLLING_UPGRADE_CMD, (ObAdminRollingUpgradeArg));
@@ -230,6 +237,7 @@
   RPC_S(PR5 calc_column_checksum_response, obrpc::OB_CALC_COLUMN_CHECKSUM_RESPONSE, (obrpc::ObCalcColumnChecksumResponseArg));
   RPC_S(PR5 build_ddl_single_replica_response, obrpc::OB_DDL_BUILD_SINGLE_REPLICA_RESPONSE, (obrpc::ObDDLBuildSingleReplicaResponseArg));
   RPC_S(PRD clean_splitted_tablet, obrpc::OB_CLEAN_SPLITTED_TABLET, (ObCleanSplittedTabletArg));
+  RPC_S(PRD clean_splitted_tablet_ddl, obrpc::OB_CLEAN_SPLITTED_TABLET_DDL, (ObCleanSplittedTabletDDLArg));
   RPC_S(PR5 send_auto_split_tablet_task_request, obrpc::OB_AUTO_SPLIT_TABLET_TASK_REQUEST, (obrpc::ObAutoSplitTabletBatchArg), obrpc::ObAutoSplitTabletBatchRes);
   RPC_S(PR5 cancel_ddl_task, obrpc::OB_CANCEL_DDL_TASK, (obrpc::ObCancelDDLTaskArg));
   RPC_S(PR5 start_redef_table, obrpc::OB_START_REDEF_TABLE, (ObStartRedefTableArg), ObStartRedefTableRes);
@@ -261,6 +269,7 @@
   RPC_S(PR5 backup_delete, obrpc::OB_BACKUP_CLEAN, (obrpc::ObBackupCleanArg));
   RPC_S(PR5 delete_policy, obrpc::OB_DELETE_POLICY, (obrpc::ObDeletePolicyArg));
   RPC_S(PR5 recover_table, obrpc::OB_RECOVER_TABLE, (obrpc::ObRecoverTableArg));
+  RPC_S(PR5 backup_validate, obrpc::OB_VALIDATE_BACKUP, (obrpc::ObBackupValidateArg));
   //RPC_S(PRD standby_upgrade_virtual_schema, obrpc::OB_UPGRADE_STANDBY_SCHEMA,
   //          (ObDDLNopOpreatorArg)); // use ddl thread
   RPC_S(PR5 check_backup_scheduler_working, obrpc::OB_CHECK_BACKUP_SCHEDULER_WORKING, Bool);
@@ -285,6 +294,11 @@
   //----Definitions for sync rewrite rules----
   RPC_S(PR5 admin_sync_rewrite_rules, obrpc::OB_ADMIN_SYNC_REWRITE_RULES, (ObSyncRewriteRuleArg));
   //----End of Definitions for sync rewrite rules----
+
+  //----Definitions for location object----
+  RPC_S(PRD create_location, obrpc::OB_CREATE_LOCATION, (ObCreateLocationArg));
+  RPC_S(PRD drop_location, obrpc::OB_DROP_LOCATION, (ObDropLocationArg));
+  //----End of definitions for location object----
 
 #ifdef OB_BUILD_ARBITRATION
   RPC_S(PR5 admin_add_arbitration_service, obrpc::OB_ADMIN_ADD_ARBITRATION_SERVICE, (ObAdminAddArbitrationServiceArg));
@@ -311,3 +325,30 @@
   //Rebuild Tablet
   RPC_S(PR5 root_rebuild_tablet, obrpc::OB_ROOT_REBUILD_TABLET, (ObRebuildTabletArg));
   RPC_S(PRD force_drop_lonely_lob_aux_table, OB_FORCE_DROP_LONELY_LOB_AUX_TABLE, (obrpc::ObForceDropLonelyLobAuxTableArg));
+
+  //----Functions for managing external resource----
+  RPC_S(PRD create_external_resource, obrpc::OB_CREATE_EXTERNAL_RESOURCE, (ObCreateExternalResourceArg), obrpc::ObCreateExternalResourceRes);
+  RPC_S(PRD drop_external_resource, obrpc::OB_DROP_EXTERNAL_RESOURCE, (ObDropExternalResourceArg), obrpc::ObDropExternalResourceRes);
+  //----End of functions for managing external resource----
+
+  //----Functions for managing ai model----
+  RPC_S(PRD create_ai_model, obrpc::OB_CREATE_AI_MODEL, (ObCreateAiModelArg));
+  RPC_S(PRD drop_ai_model, obrpc::OB_DROP_AI_MODEL, (ObDropAiModelArg));
+  //----End of functions for managing ai model----
+
+  // htable ddl
+  RPC_S(PRD parallel_htable_ddl, obrpc::OB_PARALLEL_HTABLE_DDL, (ObHTableDDLArg), ObHTableDDLRes);
+
+  //----Functions for managing CCL rules----
+  RPC_S(PRD create_ccl_rule, obrpc::OB_CREATE_CCL_RULE, (ObCreateCCLRuleArg));
+  RPC_S(PRD drop_ccl_rule, obrpc::OB_DROP_CCL_RULE, (ObDropCCLRuleArg));
+  //----End of functions for managing CCL rules----
+
+  //----Definitions for sensitive rule----
+  RPC_S(PRD handle_sensitive_rule_ddl, obrpc::OB_HANDLE_SENSITIVE_RULE_DDL, (ObSensitiveRuleDDLArg));
+  //----End of definitions for sensitive rule----
+  //----Functions for managing table non atomic in database----
+  RPC_AP(PRD non_atomic_drop_table_in_database, obrpc::OB_NON_ATOMIC_DROP_TABLE_IN_DATABASE, (ObDropTableArg), ObDropTableRes);
+  //----End of functions for managing table non atomic in database----
+
+  RPC_S(PR5 get_refreshed_schema_versions, obrpc::OB_GET_REFRESHED_SCHEMA_VERSIONS, obrpc::ObGetRefreshedSchemaVersionsRes);

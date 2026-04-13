@@ -20,6 +20,11 @@
 #ifdef OB_BUILD_SPM
 #include "sql/spm/ob_spm_controller.h"
 #endif
+#include "pl/external_routine/ob_external_resource.h"
+#ifdef OB_BUILD_ORACLE_PL
+#include "pl/ob_pl_profiler.h"
+#endif // OB_BUILD_ORACLE_PL
+#include "src/pl/external_routine/ob_py_utils.h"
 
 namespace oceanbase
 {
@@ -60,80 +65,6 @@ void ObOpKitStore::destroy()
   }
 }
 
-int ObDiagnosisManager::add_warning_info(int err_ret, int line_idx) {
-  int ret = OB_SUCCESS;
-  if (OB_FAIL(rets_.push_back(err_ret))) {
-    LOG_WARN("failed to push back error code into array", K(ret), K(err_ret));
-  } else if (OB_FAIL(idxs_.push_back(line_idx))) {
-    LOG_WARN("failed to push back line number into array", K(ret), K(line_idx));
-  }
-  return ret;
-}
-
-int ObDiagnosisManager::do_diagnosis(ObBitVector &skip, int64_t limit_num) {
-  int ret = OB_SUCCESS;
-
-  if (idxs_.count() != rets_.count()) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("idxs_ and rets_ count mismatch", K(ret), K(idxs_.count()), K(rets_.count()));
-  } else if (idxs_.count() > 0) {
-    if (cur_file_url_.empty()) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("missing cur_file_url", K(ret));
-    } else {
-      ObWarningBuffer *buffer = ob_get_tsi_warning_buffer();
-
-      bool has_col_info = idxs_.count() == col_names_.count();
-
-      for (int i = 0; OB_SUCC(ret) && i < idxs_.count(); i++) {
-        int64_t idx = idxs_.at(i);
-        int64_t err_ret = rets_.at(i);
-        ObSqlString err_msg;
-
-        if (skip.at(idx)) {
-          continue;
-        }
-
-        if (has_col_info) {
-          ObString cur_col_name = col_names_.at(i);
-          if (OB_FAIL(err_msg.append_fmt("fail to scan file %.*s at line %ld for column %.*s, error: %s",
-                                                        cur_file_url_.length(), cur_file_url_.ptr(),
-                                                        idx + cur_line_number_,
-                                                        cur_col_name.length(), cur_col_name.ptr(),
-                                                        common::ob_strerror(err_ret)))) {
-            LOG_WARN("failed to append error message", K(err_ret));
-          }
-        } else {
-          if (OB_FAIL(err_msg.append_fmt("fail to scan file %.*s at line %ld, error: %s",
-                                        cur_file_url_.length(), cur_file_url_.ptr(),
-                                        idx + cur_line_number_,
-                                        common::ob_strerror(err_ret)))) {
-            LOG_WARN("failed to append error message", K(err_ret));
-          }
-        }
-
-        if (OB_SUCC(ret)) {
-          skip.set(idx);
-          buffer->append_warning(err_msg.ptr(), err_ret);
-
-          if (limit_num >= 0 && buffer->get_total_warning_count() > limit_num) {
-            ret = OB_REACH_DIAGNOSIS_ERROR_LIMIT;
-          }
-        }
-      }
-
-      idxs_.reuse();
-      rets_.reuse();
-      col_names_.reuse();
-      allocator_.reuse();
-    }
-  } else {
-    // do nothing
-  }
-
-  return ret;
-}
-
 ObExecContext::ObExecContext(ObIAllocator &allocator)
   : allocator_(allocator),
     phy_op_size_(0),
@@ -153,8 +84,8 @@ ObExecContext::ObExecContext(ObIAllocator &allocator)
     sql_ctx_(NULL),
     pl_stack_ctx_(nullptr),
     need_disconnect_(true),
-    pl_ctx_(NULL),
     package_guard_(NULL),
+    pl_expr_allocator_(NULL),
     row_id_list_(nullptr),
     row_id_list_array_(),
     total_row_count_(0),
@@ -171,6 +102,9 @@ ObExecContext::ObExecContext(ObIAllocator &allocator)
     bloom_filter_ctx_array_(),
     frames_(NULL),
     frame_cnt_(0),
+    ori_frames_(nullptr),
+    ori_frame_cnt_(0),
+    ori_expr_op_size_(0),
     op_kit_store_(),
     convert_allocator_(nullptr),
     mem_context_(nullptr),
@@ -198,14 +132,22 @@ ObExecContext::ObExecContext(ObIAllocator &allocator)
     user_logging_ctx_(),
     is_online_stats_gathering_(false),
     is_ddl_idempotent_auto_inc_(false),
-    table_all_slice_count_(0),
-    table_level_slice_idx_(0),
+    slice_count_(0),
+    slice_idx_(0),
     slice_row_idx_(0),
     autoinc_range_interval_(0),
     lob_access_ctx_(nullptr),
     auto_dop_map_(),
     force_local_plan_(false),
-    diagnosis_manager_()
+    diagnosis_manager_(),
+    deterministic_udf_cache_allocator_("UDFCACHE", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
+    external_url_resource_cache_(nullptr),
+    external_py_url_resource_cache_(nullptr),
+    external_py_sch_resource_cache_(nullptr),
+    py_sub_inter_ctx_(nullptr),
+    lake_table_file_map_(nullptr),
+    need_try_serialize_package_var_(false),
+    current_granule_type_(OB_GRANULE_UNINITIALIZED)
 {
 }
 
@@ -234,14 +176,28 @@ ObExecContext::~ObExecContext()
     udf_ctx_mgr_->~ObUdfCtxMgr();
     udf_ctx_mgr_ = NULL;
   }
-  if (OB_NOT_NULL(pl_ctx_)) {
-    pl_ctx_->~ObPLCtx();
-    pl_ctx_ = NULL;
-  }
   if (OB_NOT_NULL(package_guard_)) {
     package_guard_->~ObPLPackageGuard();
     package_guard_ = NULL;
   }
+#ifdef OB_BUILD_ORACLE_PL
+  if (OB_NOT_NULL(my_session_)
+        && OB_NOT_NULL(my_session_->get_pl_profiler())
+        && OB_ISNULL(my_session_->get_pl_context())) {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(my_session_->get_pl_profiler()->flush_data())) {
+      LOG_WARN("[DBMS_PROFILER] failed to flush pl profiler data", K(ret), K(lbt()));
+    }
+  }
+  if (OB_NOT_NULL(my_session_)
+        && OB_NOT_NULL(my_session_->get_pl_code_coverage())
+        && OB_ISNULL(my_session_->get_pl_context())) {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(my_session_->get_pl_code_coverage()->flush_data())) {
+      LOG_WARN("[DBMS_PLSQL_CODE_COVERAGE] failed to flush pl code coverage data", K(ret), K(lbt()));
+    }
+  }
+#endif // OB_BUILD_ORACLE_PL
   if (OB_NOT_NULL(group_pwj_map_)) {
     group_pwj_map_->destroy();
     group_pwj_map_ = nullptr;
@@ -279,6 +235,41 @@ ObExecContext::~ObExecContext()
     lob_access_ctx_ = nullptr;
   }
   auto_dop_map_.destroy();
+
+  if (OB_NOT_NULL(external_url_resource_cache_)) {
+    using Cache = pl::ObExternalResourceCache<pl::ObExternalURLJar>;
+    Cache *cache = static_cast<Cache *>(external_url_resource_cache_);
+    cache->~Cache();
+    cache = nullptr;
+    external_url_resource_cache_ = nullptr;
+  }
+  if (OB_NOT_NULL(external_py_url_resource_cache_)) {
+    using Cache = pl::ObExternalResourceCache<pl::ObExternalURLPy>;
+    Cache *cache = static_cast<Cache *>(external_py_url_resource_cache_);
+    cache->~Cache();
+    cache = nullptr;
+    external_py_url_resource_cache_ = nullptr;
+  }
+  if (OB_NOT_NULL(external_py_sch_resource_cache_)) {
+    using Cache = pl::ObExternalResourceCache<pl::ObExternalSchemaPy>;
+    Cache *cache = static_cast<Cache *>(external_py_sch_resource_cache_);
+    cache->~Cache();
+    cache = nullptr;
+    external_py_sch_resource_cache_ = nullptr;
+  }
+  if (OB_NOT_NULL(py_sub_inter_ctx_)) {
+    pl::ObPyUtils::ob_py_end_sub_inter(py_sub_inter_ctx_);
+    py_sub_inter_ctx_ = nullptr;
+  }
+  if (OB_NOT_NULL(lake_table_file_map_)) {
+    lake_table_file_map_->destroy();
+    lake_table_file_map_ = NULL;
+  }
+  need_try_serialize_package_var_ = false;
+  if (odps_partition_str_to_file_size_.created()) {
+    odps_partition_str_to_file_size_.destroy();
+  }
+  pl_complex_type_lazy_mgr_.reset();
 }
 
 void ObExecContext::clean_resolve_ctx()
@@ -304,6 +295,8 @@ void ObExecContext::reset_op_ctx()
 {
   reset_expr_op();
   op_kit_store_.destroy();
+
+  deterministic_udf_cache_allocator_.reset();
 }
 
 void ObExecContext::reset_op_env()
@@ -365,9 +358,10 @@ int ObExecContext::init_expr_op(uint64_t expr_op_size, ObIAllocator *allocator)
   return ret;
 }
 
-void ObExecContext::reset_expr_op()
+void ObExecContext::reset_expr_op_ctx()
 {
   if (expr_op_ctx_store_ != NULL) {
+    int64_t ctx_store_size = expr_op_size_ * sizeof(ObExprOperatorCtx *);
     ObExprOperatorCtx **it = expr_op_ctx_store_;
     ObExprOperatorCtx **it_end = &expr_op_ctx_store_[expr_op_size_];
     for (; it != it_end; ++it) {
@@ -375,6 +369,14 @@ void ObExecContext::reset_expr_op()
         (*it)->~ObExprOperatorCtx();
       }
     }
+    MEMSET(expr_op_ctx_store_, 0, ctx_store_size);
+  }
+}
+
+void ObExecContext::reset_expr_op()
+{
+  if (expr_op_ctx_store_ != NULL) {
+    reset_expr_op_ctx();
     has_non_trivial_expr_op_ctx_ = false;
     expr_op_ctx_store_ = NULL;
     expr_op_size_ = 0;
@@ -386,6 +388,7 @@ void ObExecContext::destroy_eval_allocator()
   eval_res_allocator_.reset();
   eval_tmp_allocator_.reset();
   tmp_alloc_used_ = false;
+
 }
 
 int ObExecContext::get_temp_expr_eval_ctx(const ObTempExpr &temp_expr,
@@ -425,14 +428,15 @@ int ObExecContext::build_temp_expr_ctx(const ObTempExpr &temp_expr, ObTempExprCt
   int ret = OB_SUCCESS;
   uint64_t frame_cnt = 0;
   char **frames = NULL;
-  char *mem = static_cast<char*>(get_allocator().alloc(sizeof(ObTempExprCtx)));
+  ObIAllocator &allocator = get_allocator();
+  char *mem = static_cast<char*>(allocator.alloc(sizeof(ObTempExprCtx)));
   ObArray<char *> tmp_param_frame_ptrs;
   if (OB_ISNULL(mem)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("no more memory to create temp expr ctx", K(ret));
   }
   OX(temp_expr_ctx = new(mem)ObTempExprCtx(*this));
-  OZ(temp_expr.alloc_frame(get_allocator(), tmp_param_frame_ptrs, frame_cnt, frames));
+  OZ(temp_expr.alloc_frame(allocator, tmp_param_frame_ptrs, frame_cnt, frames));
   OX(temp_expr_ctx->frames_ = frames);
   OX(temp_expr_ctx->frame_cnt_ = frame_cnt);
   // init expr_op_size_ and expr_op_ctx_store_
@@ -441,7 +445,7 @@ int ObExecContext::build_temp_expr_ctx(const ObTempExpr &temp_expr, ObTempExprCt
       int64_t ctx_store_size = static_cast<int64_t>(
                                temp_expr.need_ctx_cnt_ * sizeof(ObExprOperatorCtx *));
       if (OB_ISNULL(temp_expr_ctx->expr_op_ctx_store_
-                    = static_cast<ObExprOperatorCtx **>(allocator_.alloc(ctx_store_size)))) {
+                    = static_cast<ObExprOperatorCtx **>(allocator.alloc(ctx_store_size)))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_ERROR("fail to alloc expr_op_ctx_store_ memory", K(ret), K(ctx_store_size));
       } else {
@@ -490,13 +494,14 @@ ObIAllocator &ObExecContext::get_allocator()
 int ObExecContext::create_expr_op_ctx(uint64_t op_id, int64_t op_ctx_size, void *&op_ctx)
 {
   int ret = OB_SUCCESS;
+  ObIAllocator &allocator = OB_NOT_NULL(pl_expr_allocator_) ? *pl_expr_allocator_ : allocator_;
   if (OB_UNLIKELY(op_id >= expr_op_size_ || op_ctx_size <= 0 || OB_ISNULL(expr_op_ctx_store_))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(op_id), K(op_ctx_size), K(expr_op_ctx_store_));
   } else if (OB_UNLIKELY(NULL != get_expr_op_ctx(op_id))) {
     ret = OB_INIT_TWICE;
     LOG_WARN("expr operator context has been created", K(op_id));
-  } else if (OB_ISNULL(op_ctx = allocator_.alloc(op_ctx_size))) {
+  } else if (OB_ISNULL(op_ctx = allocator.alloc(op_ctx_size))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_ERROR("allocate memory failed", K(ret), K(op_id), K(op_ctx_size));
   } else {
@@ -631,21 +636,6 @@ int ObExecContext::fast_check_status_ignore_interrupt(const int64_t n)
   return ret;
 }
 
-int ObExecContext::init_pl_ctx()
-{
-  int ret = OB_SUCCESS;
-  pl::ObPLCtx *pl_ctx = NULL;
-  if (OB_ISNULL(pl_ctx =
-    static_cast<pl::ObPLCtx*>(get_allocator().alloc(sizeof(pl::ObPLCtx))))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to allocator memory", K(ret), K(sizeof(pl::ObPLCtx)));
-  } else {
-    new(pl_ctx)pl::ObPLCtx();
-    set_pl_ctx(pl_ctx);
-  }
-  return ret;
-}
-
 uint64_t ObExecContext::get_min_cluster_version() const
 {
   return task_executor_ctx_.get_min_cluster_version();
@@ -678,7 +668,7 @@ int ObExecContext::get_gi_task_map(GIPrepareTaskMap *&gi_task_map)
   return ret;
 }
 
-int ObExecContext::get_convert_charset_allocator(ObArenaAllocator *&allocator)
+int ObExecContext::get_convert_charset_allocator(ObIAllocator *&allocator)
 {
   int ret = OB_SUCCESS;
   allocator = NULL;
@@ -881,7 +871,7 @@ int ObExecContext::init_physical_plan_ctx(const ObPhysicalPlan &plan)
       if (sql_ctx_ != NULL && sql_ctx_->spm_ctx_.need_spm_timeout_) {
         phy_plan_ctx_->set_spm_timeout_timestamp(
             ObSpmController::calc_spm_timeout_us(start_time + plan_timeout,
-                                                 sql_ctx_->spm_ctx_.baseline_exec_time_));
+                                                 sql_ctx_->spm_ctx_.spm_plan_timeout_));
       }
 #endif
     }
@@ -1020,7 +1010,7 @@ int ObExecContext::get_local_var_array(int64_t local_var_array_id, const ObSolid
 }
 
 int ObExecContext::fill_px_batch_info(ObBatchRescanParams &params,
-    int64_t batch_id, sql::ObExpr::ObExprIArray &array)
+    int64_t batch_id, const sql::ObExpr::ObExprIArray &array)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(phy_plan_ctx_)) {
@@ -1040,14 +1030,17 @@ int ObExecContext::fill_px_batch_info(ObBatchRescanParams &params,
       } else {
         phy_plan_ctx_->get_param_store_for_update().at(params.get_param_idx(i)) = one_params.at(i);
         if (params.param_expr_idxs_.count() == one_params.count()) {
-          sql::ObExpr *expr = NULL;
+          const sql::ObExpr *expr = NULL;
           int64_t idx = params.param_expr_idxs_.at(i);
           if (OB_FAIL(ret)) {
           } else if (OB_UNLIKELY(idx > array.count())) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("expr index out of expr array range", K(ret), K(array), K(idx), K(array.count()));
+            // do nothing.
+            LOG_TRACE("param idx out of array count", K(idx), K(array.count()));
+          } else if (FALSE_IT(expr = &array.at(idx - 1))) {
+          } else if (T_INVALID == expr->type_) {
+            // do nothing.
+            LOG_TRACE("empty expr", KPC(expr));
           } else {
-            expr = &array.at(idx - 1);
             expr->get_eval_info(eval_ctx).clear_evaluated_flag();
             ObDynamicParamSetter::clear_parent_evaluated_flag(eval_ctx, *expr);
             ObDatum &param_datum = expr->locate_datum_for_write(eval_ctx);
@@ -1059,7 +1052,7 @@ int ObExecContext::fill_px_batch_info(ObBatchRescanParams &params,
               LOG_WARN("adjust lob datum failed", K(ret), K(i),
                        K(one_params.at(i).get_meta()), K(expr->obj_meta_));
             } else {
-              expr->get_eval_info(eval_ctx).evaluated_ = true;
+              expr->get_eval_info(eval_ctx).set_evaluated(true);
             }
           }
         }
@@ -1117,10 +1110,22 @@ pl::ObPLPackageGuard* ObExecContext::get_package_guard()
 int ObExecContext::get_package_guard(pl::ObPLPackageGuard *&package_guard)
 {
   int ret = OB_SUCCESS;
-  package_guard = get_package_guard();
-  if (OB_ISNULL(package_guard)) {
+  ObExecContext *top_ctx = this;
+
+  if (OB_NOT_NULL(my_session_) &&
+      OB_NOT_NULL(my_session_->get_pl_context()) &&
+      !my_session_->get_pl_context()->get_disable_pl_exec_cache()) {
+    top_ctx = my_session_->get_pl_context()->get_my_exec_ctx();
+  }
+  if (OB_ISNULL(top_ctx)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get package guard failed", K(ret));
+    LOG_WARN("top context is null", K(ret));
+  } else {
+    package_guard = top_ctx->get_package_guard();
+    if (OB_ISNULL(package_guard)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get package guard failed", K(ret));
+    }
   }
   return ret;
 }
@@ -1134,11 +1139,11 @@ DEFINE_SERIALIZE(ObExecContext)
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("exec context is invalid", K_(phy_op_size), K_(phy_op_ctx_store),
              K_(phy_op_input_store), K_(phy_plan_ctx), K_(my_session), K(ret));
-  } else if (OB_FAIL(my_session_->add_changed_package_info(*const_cast<ObExecContext *>(this)))) {
+  } else if (OB_FAIL(my_session_->add_changed_package_info())) {
     LOG_WARN("add changed package info failed", K(ret));
   } else {
     my_session_->reset_all_package_changed_info();
-    phy_plan_ctx_->set_expr_op_size(expr_op_size_);
+    phy_plan_ctx_->set_expr_op_size(ori_expr_op_size_ > 0 ? ori_expr_op_size_ : expr_op_size_);
     if (ser_version == SER_VERSION_1) {
       OB_UNIS_ENCODE(my_session_->get_login_tenant_id());
     }
@@ -1168,9 +1173,9 @@ DEFINE_GET_SERIALIZE_SIZE(ObExecContext)
   int64_t len = 0;
   uint64_t ser_version = get_ser_version();
 
-  if (is_valid() && OB_SUCCESS == my_session_->add_changed_package_info(*const_cast<ObExecContext *>(this))) {
+  if (is_valid() && OB_SUCCESS == my_session_->add_changed_package_info()) {
     my_session_->reset_all_package_changed_info();
-    phy_plan_ctx_->set_expr_op_size(expr_op_size_);
+    phy_plan_ctx_->set_expr_op_size(ori_expr_op_size_ > 0 ? ori_expr_op_size_ : expr_op_size_);
     if (ser_version == SER_VERSION_1) {
       OB_UNIS_ADD_LEN(my_session_->get_login_tenant_id());
     }
@@ -1420,6 +1425,97 @@ int ObExecContext::get_lob_access_ctx(ObLobAccessCtx *&lob_access_ctx)
     LOG_WARN("alloc", K(ret), "size", sizeof(ObLobAccessCtx));
   } else {
     lob_access_ctx = lob_access_ctx_;
+  }
+  return ret;
+}
+
+int ObExecContext::get_lake_table_file_map(ObLakeTableFileMap *&lake_table_file_map)
+{
+  int ret = OB_SUCCESS;
+  lake_table_file_map = nullptr;
+  if (nullptr == lake_table_file_map_) {
+    void *buf = allocator_.alloc(sizeof(ObLakeTableFileMap));
+    if (nullptr == buf) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("Failed to allocate memories", K(ret));
+    } else if (FALSE_IT(lake_table_file_map_ = new(buf) ObLakeTableFileMap())) {
+    } else if (OB_FAIL(lake_table_file_map_->create(LAKE_TABLE_FILE_MAP_BUCKET_NUM, ObModIds::OB_SQL_PX))) {
+      LOG_WARN("Failed to create gi task map", K(ret));
+    } else {
+      lake_table_file_map = lake_table_file_map_;
+    }
+  } else {
+    lake_table_file_map = lake_table_file_map_;
+  }
+  return ret;
+}
+
+int ObExecContext::add_lake_table_files(const ObDASTableLocMeta &loc_meta,
+                                        const ObCandiTableLoc &candi_table_loc)
+{
+  int ret = OB_SUCCESS;
+  const ObCandiTabletLocIArray &candi_tablet_locs = candi_table_loc.get_phy_part_loc_info_list();
+  for (int64_t i = 0; OB_SUCC(ret) && i < candi_tablet_locs.count(); ++i) {
+    const ObCandiTabletLoc &candi_tablet_loc = candi_tablet_locs.at(i);
+    if (OB_FAIL(add_lake_table_file(loc_meta.table_loc_id_,
+                                    candi_tablet_loc.get_partition_location().get_tablet_id(),
+                                    candi_tablet_loc))) {
+      LOG_WARN("extended tablet loc failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObExecContext::add_lake_table_file(uint64_t table_loc_id,
+                                       ObTabletID tablet_id,
+                                       const ObCandiTabletLoc &candi_tablet_loc)
+{
+  int ret = OB_SUCCESS;
+  ObLakeTableFileMap *lake_table_file_map = nullptr;
+  ObLakeTableFileArray *files = nullptr;
+  if (OB_FAIL(get_lake_table_file_map(lake_table_file_map))) {
+    LOG_WARN("failed to get lake table file map");
+  } else if (OB_ISNULL(lake_table_file_map)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("lake table file map is null");
+  } else if (candi_tablet_loc.get_opt_lake_table_files().empty()) {
+    // do nothing
+  } else {
+    files = OB_NEWx(ObLakeTableFileArray, &allocator_, allocator_);
+    if (OB_ISNULL(files)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate memory for ObLakeTableFileArray");
+    } else if (OB_FAIL(files->init(candi_tablet_loc.get_opt_lake_table_files().count()))) {
+      LOG_WARN("failed to init lake table file array");
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < candi_tablet_loc.get_opt_lake_table_files().count(); ++i) {
+        ObFileScanTask *das_file = nullptr;
+        ObIOptLakeTableFile *opt_file = candi_tablet_loc.get_opt_lake_table_files().at(i);
+        if (OB_ISNULL(opt_file)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get null opt lake table file");
+        } else if (OB_FAIL(ObFileScanTask::create_lake_table_file_by_type(allocator_,
+                                                                          opt_file->get_file_type(),
+                                                                          das_file))) {
+          LOG_WARN("failed to create lake table file by type", K(opt_file->get_file_type()));
+        } else if (OB_ISNULL(das_file)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate memory for ObFileScanTask");
+        } else if (OB_FAIL(das_file->init_with_opt_lake_table_file(allocator_, *opt_file))) {
+          LOG_WARN("failed to deep copt file task");
+        } else if (OB_FAIL(files->push_back(das_file))) {
+          LOG_WARN("failed to push back lake table file");
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObLakeTableFileMapKey key;
+    key.table_loc_id_ = table_loc_id;
+    key.tablet_id_ = tablet_id;
+    if (OB_FAIL(lake_table_file_map->set_refactored(key, files))) {
+      LOG_WARN("failed to set refactored", K(key), K(files));
+    }
   }
   return ret;
 }

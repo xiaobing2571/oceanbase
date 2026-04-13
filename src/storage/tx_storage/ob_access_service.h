@@ -115,6 +115,7 @@ public:
   virtual int table_rescan(
       ObVTableScanParam &vparam,
       ObNewRowIterator *result) override;
+  virtual int table_advance_scan(ObVTableScanParam &vparam, ObNewRowIterator *result) override;
   virtual int reuse_scan_iter(const bool switch_param, common::ObNewRowIterator *iter) override;
   virtual int revert_scan_iter(common::ObNewRowIterator *iter) override;
   virtual int get_multi_ranges_cost(
@@ -248,6 +249,8 @@ public:
       ObTableScanParam &param,
       ObNewRowIterator *&result);
 
+  int scan_block_stat(ObBlockStatScanParam &scan_param, ObBlockStatIterator &iter);
+
 protected:
   int check_tenant_out_of_memstore_limit_(bool &is_out_of_mem);
   int check_data_disk_full_(
@@ -288,7 +291,8 @@ protected:
       const int64_t timeout,
       const share::SCN &snapshot,
       ObTabletHandle &tablet_handle,
-      ObStoreCtxGuard &ctx_guard);
+      ObStoreCtxGuard &ctx_guard,
+      ObTableType table_type);
   static int check_mlog_safe_(
       const ObTablet &tablet,
       const ObTableScanParam &scan_param);
@@ -304,6 +308,8 @@ protected:
       ObTableScanParam &param,
       ObNewRowIterator *&result);
 
+  int check_replica_type_accessible_(
+      const common::ObReplicaType &replica_type);
 private:
   bool is_inited_;
   ObLSService *ls_svr_;

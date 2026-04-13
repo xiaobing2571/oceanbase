@@ -51,7 +51,7 @@ ObTenantWeakReadService::ObTenantWeakReadService() :
     self_(),
     svr_version_mgr_(),
     cluster_service_(),
-    thread_cond_(),
+    thread_cond_(ObCond::SPIN_WAIT_NUM, common::ObWaitEventIds::WRS_THREAD_COND_WAIT),
     last_refresh_locaction_cache_tstamp_(0),
     last_post_cluster_heartbeat_tstamp_(0),
     post_cluster_heartbeat_count_(0),
@@ -631,6 +631,8 @@ int ObTenantWeakReadService::scan_all_ls_(storage::ObLSService *ls_svr)
       } else if (OB_ISNULL(ls)) {
         ret = OB_PARTITION_NOT_EXIST;
         LOG_WARN("iterate ls fail", KP(ls));
+      } else if (ObReplicaTypeCheck::is_log_replica(ls->get_replica_type())) {
+        LOG_TRACE("skip logonly replica", KPC(ls));
       } else if (OB_FAIL(handle_ls_(*ls))) {
         LOG_WARN("handle ls fail", "ls_id", ls->get_ls_id(), K(ret));
         ret = OB_SUCCESS;

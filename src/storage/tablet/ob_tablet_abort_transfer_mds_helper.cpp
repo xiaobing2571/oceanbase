@@ -131,11 +131,12 @@ int ObTabletAbortTransferHelper::check_transfer_in_tablet_aborted_(
       } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("tablet should not be NULL", K(ret), K(tablet_info));
-      } else if (tablet->is_empty_shell()) {
-        //do nothing
       } else if (for_replay && tablet->get_tablet_meta().transfer_info_.transfer_start_scn_ > scn) {
         LOG_INFO("tablet is new, skip wait transfer in abort tablet", KPC(tablet), K(scn));
       } else {
+        //TODO(muwei.ym) now cannot cover empty shell because cover empty shell will delete empty shell first
+        //It make restart cannot find right filter condition
+        //Now disable cover empty shell
         ret = OB_EAGAIN;
         LOG_WARN("tablet still exist, need retry", K(ret), K(tablet_info), KPC(tablet));
       }
@@ -254,8 +255,12 @@ bool ObTabletAbortTransferHelper::check_can_do_tx_end(
       LOG_WARN("tablet abort transfer mds ctx type is unexpected", K(ret), K(ctx), K(type_id));
     } else {
       mds::ObAbortTransferInMdsCtx &abort_transfer_in_ctx = static_cast<mds::ObAbortTransferInMdsCtx&>(ctx);
-      if (OB_FAIL(do_tx_end_before_commit_(transfer_in_aborted_info,
-          abort_transfer_in_ctx.get_redo_scn(), can_not_do_reason))) {
+      const share::SCN &redo_scn = abort_transfer_in_ctx.get_redo_scn();
+      if (!redo_scn.is_valid() || redo_scn.is_base_scn()) {
+        ret = OB_EAGAIN;
+        LOG_WARN("tablet abort transfer redo scn is invalid or base scn, need retry", K(ret), K(redo_scn),
+            K(abort_transfer_in_ctx), K(transfer_in_aborted_info));
+      } else if (OB_FAIL(do_tx_end_before_commit_(transfer_in_aborted_info, redo_scn, can_not_do_reason))) {
         LOG_WARN("failed to do tx end before commit", K(ret), K(transfer_in_aborted_info));
       }
     }

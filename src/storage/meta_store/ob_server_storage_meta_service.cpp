@@ -148,10 +148,8 @@ int ObServerStorageMetaService::get_server_slogger(ObStorageLogger *&slogger) co
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (!is_shared_storage_) {
-    slogger = server_slogger_;
   } else {
-    slogger = nullptr;
+    slogger = server_slogger_;
   }
   return ret;
 }
@@ -164,7 +162,7 @@ int ObServerStorageMetaService::prepare_create_tenant(const omt::ObTenantMeta &m
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
 #ifdef OB_BUILD_SHARED_STORAGE
-  } else if (is_shared_storage_ && OB_STORAGE_OBJECT_MGR.alloc_tenant_epoch(meta.unit_.tenant_id_, epoch))  {
+  } else if (is_shared_storage_ && OB_FAIL(OB_STORAGE_OBJECT_MGR.alloc_tenant_epoch(meta.unit_.tenant_id_, epoch)))  {
     LOG_WARN("fail to allocate tenant epoch", K(ret), K(meta.unit_.tenant_id_));
 #endif
   } else {
@@ -332,6 +330,12 @@ int ObServerStorageMetaService::clear_tenant_log_dir(const uint64_t tenant_id)
   char tenant_slog_dir[MAX_PATH_SIZE] = {0};
   bool exist = true;
 
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+  // in logservice mode, we don't need to clean tenant clog dir
+  // cause there is no clog dir in ob server`s disk
+  if (GCONF.enable_logservice) { // do nothing
+  } else
+#endif
   if (OB_FAIL(OB_FILE_SYSTEM_ROUTER.get_tenant_clog_dir(tenant_id, tenant_clog_dir))) {
     LOG_WARN("fail to get tenant clog dir", K(ret));
   } else if (OB_FAIL(FileDirectoryUtils::is_exists(tenant_clog_dir, exist))) {
@@ -454,7 +458,7 @@ int ObServerStorageMetaService::try_write_checkpoint_for_compat()
         // nothing to do.
       } else {
         MTL_SWITCH(super_block.tenant_id_) {
-          if (OB_FAIL(MTL(ObTenantStorageMetaService*)->write_checkpoint(true/*is_force*/))) {
+          if (OB_FAIL(MTL(ObTenantStorageMetaService*)->write_checkpoint(ObTenantSlogCheckpointWorkflow::COMPAT_UPGRADE))) {
             LOG_WARN("fail to write tenant slog checkpoint", K(ret));
           } else {
             // we don't write checkpoint or update super_block for hidden tenant
@@ -506,6 +510,8 @@ int ObServerStorageMetaService::start_complete_and_online_ls() const
           } else if (nullptr == ls) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("ls is null", K(ret));
+          } else if (ls->is_logonly_replica()) {
+            LOG_TRACE("should skip logonly replica", KPC(ls));
           } else if (OB_FAIL(ls->finish_storage_meta_replay())) {
             LOG_WARN("finish replay failed", K(ret), KPC(ls));
           }
@@ -514,6 +520,8 @@ int ObServerStorageMetaService::start_complete_and_online_ls() const
           ObTransferService *transfer_service = nullptr;
           if (OB_FAIL(MTL(ObLSService*)->gc_ls_after_replay_slog())) {
             LOG_WARN("fail to gc ls after replay slog", K(ret));
+          } else if (is_shared_storage_) {
+            //do nothing
           } else if (OB_FAIL(MTL(ObLSService*)->online_ls())) {
             LOG_WARN("fail enable replay clog", K(ret));
           } else if (OB_ISNULL(transfer_service = (MTL(ObTransferService *)))) {
@@ -526,7 +534,12 @@ int ObServerStorageMetaService::start_complete_and_online_ls() const
       }
     }
   }
-  FLOG_INFO("storage meta service start complete and enable replay clog", K(ret));
+
+  if (is_shared_storage_) {
+    FLOG_INFO("storage meta service complete", K(ret));
+  } else {
+    FLOG_INFO("storage meta service start complete and enable replay clog", K(ret));
+  }
   return ret;
 }
 

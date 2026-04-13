@@ -37,6 +37,10 @@ public:
       micro_data_scanner_(nullptr),
       mv_micro_data_scanner_(nullptr),
       mv_di_micro_data_scanner_(nullptr),
+      skip_scanner_(nullptr),
+      skip_state_(),
+      range_idx_(0),
+      mv_io_micro_data_scanner_(nullptr),
       is_di_base_iter_(false),
       cur_range_idx_(-1)
   {
@@ -46,17 +50,26 @@ public:
   virtual void reset() override;
   virtual void reuse() override;
   virtual void reclaim() override;
+  virtual int advance_scan(const blocksstable::ObDatumRange &range) override;
   virtual bool can_blockscan() const override;
   virtual bool can_batch_scan() const override;
   OB_INLINE bool is_di_base_iter() { return is_di_base_iter_; }
-  int get_next_rowkey(blocksstable::ObDatumRowkey& rowkey,
-                       int64_t &curr_scan_index,
-                       blocksstable::ObDatumRowkey &border_rowkey,
-                       common::ObIAllocator &allocator,
-                       bool need_set_border_rowkey);
-  TO_STRING_KV(K_(is_opened), K_(is_di_base_iter), K_(cur_range_idx),
+  virtual int get_next_rowkey(int64_t &curr_scan_index,
+                              blocksstable::ObDatumRowkey& rowkey,
+                              common::ObIAllocator &allocator) final;
+  virtual int get_next_border_rowkey(const blocksstable::ObDatumRowkey *&border_rowkey) const override final
+  {
+    border_rowkey = &prefetcher_.get_border_rowkey();
+    return OB_SUCCESS;
+  }
+  OB_INLINE bool is_end_of_scan() const
+  {
+    return prefetcher_.is_prefetch_end_ &&
+        prefetcher_.cur_range_fetch_idx_ >= prefetcher_.cur_range_prefetch_idx_;
+  }
+  TO_STRING_KV(K_(is_opened), K_(range_idx), K_(is_di_base_iter), K_(cur_range_idx),
                KP_(micro_scanner), KP_(micro_data_scanner), KP_(mv_micro_data_scanner), KP_(mv_di_micro_data_scanner),
-               KP_(sstable), KP_(iter_param), KP_(access_ctx), K_(prefetcher));
+               KP_(skip_scanner), K_(skip_state), KP_(sstable), KP_(iter_param), KP_(access_ctx), K_(prefetcher));
 protected:
   int inner_open(
       const ObTableIterParam &iter_param,
@@ -67,11 +80,18 @@ protected:
   virtual int inner_get_next_row(const ObDatumRow *&store_row) override;
   virtual int fetch_row(ObSSTableReadHandle &read_handle, const ObDatumRow *&store_row);
   virtual int refresh_blockscan_checker(const blocksstable::ObDatumRowkey &rowkey) override final;
+  virtual int get_blockscan_border_rowkey(blocksstable::ObDatumRowkey &border_rowkey) override final
+  {
+    int ret = OB_SUCCESS;
+    border_rowkey = prefetcher_.get_border_rowkey();
+    return ret;
+  }
   virtual int get_next_rows() override;
   // for column store
   int get_blockscan_start(ObCSRowId &start, int32_t &range_idx, BlockScanState &block_scan_state);
   int forward_blockscan(ObCSRowId &end, BlockScanState &block_scan_state, const ObCSRowId begin);
   int try_skip_deleted_row(ObCSRowId &co_current);
+  virtual bool is_multi_get() const { return false; }
 
 private:
   int init_micro_scanner();
@@ -85,6 +105,26 @@ private:
   int try_refreshing_blockscan_checker_for_column_store(
       const int64_t start_offset,
       const int64_t end_offset);
+  OB_INLINE bool has_skip_scanner() const
+  {
+    return nullptr != skip_scanner_ && skip_scanner_->should_skip();
+  }
+  OB_INLINE bool has_skip_scanner_and_not_skipped(const ObMicroIndexInfo &index_info, const bool ignore_disabled = false) const
+  {
+    return nullptr != skip_scanner_ &&
+           (ignore_disabled || !skip_scanner_->is_disabled()) &&
+           !index_info.skip_state_.is_skipped();
+  }
+  OB_INLINE void preprocess_skip_scanner(ObMicroIndexInfo &index_info)
+  {
+    if (nullptr != skip_scanner_ && skip_scanner_->is_disabled()) {
+      index_info.skip_state_.set_state(0, ObIndexSkipNodeState::PREFIX_SKIPPED_LEFT);
+    }
+  }
+  OB_INLINE bool has_skip_scanner_and_force_skip() const
+  {
+    return has_skip_scanner() && skip_scanner_->force_skip();
+  }
 
 protected:
   bool is_opened_;
@@ -97,6 +137,10 @@ protected:
   ObMicroBlockRowScanner *micro_data_scanner_;
   ObMultiVersionMicroBlockRowScanner *mv_micro_data_scanner_;
   ObMultiVersionDIMicroBlockRowScanner *mv_di_micro_data_scanner_;
+  ObISkipScanner *skip_scanner_;
+  ObIndexSkipState skip_state_;
+  int64_t range_idx_;
+  ObMultiVersionIOMicroBlockRowScanner *mv_io_micro_data_scanner_;
 private:
   bool is_di_base_iter_;
   int64_t cur_range_idx_;

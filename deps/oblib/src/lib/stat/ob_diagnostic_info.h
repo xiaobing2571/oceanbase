@@ -28,7 +28,8 @@ class ObSrvDeliver;
 namespace common
 {
 
-#define WAIT_EVENT_LIST_THRESHOLD 10
+// TODO(roland.qk) perf test to determine a best threshold.
+#define WAIT_EVENT_LIST_THRESHOLD 30
 
 class ObDiagnosticInfoSwitchGuard;
 
@@ -541,6 +542,10 @@ public:
   {
     return di_rpc_cache_;
   }
+  bool rpc_throttle() const
+  {
+    return rpc_throttle_;
+  }
 
 private:
   union {
@@ -549,6 +554,7 @@ private:
     {
       bool mysql_obrequest_ref_ : 1;
       bool di_rpc_cache_ : 1;
+      bool rpc_throttle_ : 1;
     };
   };
 };

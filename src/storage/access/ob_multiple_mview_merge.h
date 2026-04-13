@@ -15,6 +15,7 @@
 #include "ob_multiple_scan_merge.h"
 #include "ob_multiple_get_merge.h"
 #include "ob_multiple_multi_scan_merge.h"
+#include "ob_level_order_scan_merge.h"
 
 namespace oceanbase
 {
@@ -45,7 +46,7 @@ public:
   {
     return tables_.empty();
   }
-  virtual bool check_table_need_read(const ObITable &table, int64_t &major_version) const override;
+  virtual int check_table_need_read(const ObITable *table, bool &need_table) const override;
   virtual int alloc_row_store(ObTableAccessContext &context, const ObTableAccessParam &param) override;
 };
 
@@ -151,9 +152,16 @@ private:                                                                        
             access_ctx_->trans_version_range_.base_version_ :                                          \
             access_ctx_->store_ctx_->mvcc_acc_ctx_.get_snapshot_version().get_val_for_tx();            \
   }                                                                                                    \
-  virtual bool check_table_need_read(const ObITable &table, int64_t &major_version) const override     \
+  virtual int check_table_need_read(const ObITable *table, bool &need_table) const override            \
   {                                                                                                    \
-    return !table.is_major_sstable();                                                                  \
+    int ret = OB_SUCCESS;                                                                              \
+    need_table = true;                                                                                 \
+    if (OB_FAIL(ObMultipleMerge::check_table_need_read(table, need_table))) {                          \
+      STORAGE_LOG(WARN, "fail to check table need read", K(ret), KPC(table));                          \
+    } else {                                                                                           \
+      need_table = need_table && !table->is_major_sstable();                                           \
+    }                                                                                                  \
+    return ret;                                                                                        \
   }                                                                                                    \
 };
 
@@ -161,6 +169,8 @@ DEFINE_MERGE_WRAPPER(ObMviewSingleMerge, ObSingleMerge);
 DEFINE_MERGE_WRAPPER(ObMviewScanMerge, ObMultipleScanMerge);
 DEFINE_MERGE_WRAPPER(ObMviewGetMerge, ObMultipleGetMerge);
 DEFINE_MERGE_WRAPPER(ObMviewMultiScanMerge, ObMultipleMultiScanMerge);
+DEFINE_MERGE_WRAPPER(ObMviewLevelOrderScanMerge, ObLevelOrderScanMerge);
+DEFINE_MERGE_WRAPPER(ObMviewLevelOrderMultiScanMerge, ObLevelOrderMultiScanMerge);
 #undef DEFINE_MERGE_WRAPPER
 
 typedef ObMultipleMerge ObMviewMerge;
@@ -179,6 +189,7 @@ public:
       ObTableAccessContext &context,
       ObGetTableParam &get_table_param,
       ObTableScanRange &table_scan_range,
+      ObTableScanParam &scan_param,
       ObMviewMergeWrapper *&merge_wrapper,
       ObMviewMerge *&mview_merge);
 private:
@@ -187,6 +198,7 @@ private:
       ObTableAccessContext &context,
       ObGetTableParam &get_table_param,
       ObTableScanRange &table_scan_range,
+      ObTableScanParam &scan_param,
       ObMviewMerge *&version_merge);
   ObMviewMerge *merges_[T_MAX_ITER_TYPE];
 };

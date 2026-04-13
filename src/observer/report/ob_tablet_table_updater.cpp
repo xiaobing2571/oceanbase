@@ -383,13 +383,14 @@ int ObTabletTableUpdater::reput_to_queue_(
 int ObTabletTableUpdater::check_tenant_status_(
     const uint64_t tenant_id,
     bool &tenant_dropped,
-    bool &schema_not_ready)
+    bool &tenant_not_ready)
 {
   int ret = OB_SUCCESS;
   schema::ObMultiVersionSchemaService *schema_service = GCTX.schema_service_;
   schema::ObSchemaGetterGuard guard;
+  const share::schema::ObSimpleTenantSchema *tenant_info = nullptr;
   tenant_dropped = false;
-  schema_not_ready = false;
+  tenant_not_ready = true;
   if (OB_ISNULL(schema_service)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("schema_service is null", KR(ret));
@@ -397,9 +398,12 @@ int ObTabletTableUpdater::check_tenant_status_(
     LOG_WARN("fail to get schema guard", KR(ret), K(tenant_id));
   } else if (OB_FAIL(guard.check_if_tenant_has_been_dropped(tenant_id, tenant_dropped))) {
     LOG_WARN("fail to check if tenant has been dropped", KR(ret), K(tenant_id));
-  } else if (!schema_service->is_tenant_full_schema(tenant_id)) {
-    // need wait schema refresh
-    schema_not_ready = true;
+  } else if (!tenant_dropped) {
+    if (OB_FAIL(guard.get_tenant_info(tenant_id, tenant_info))) {
+      LOG_WARN("fail to get tenant info", K(ret), K(tenant_id));
+    } else if (OB_NOT_NULL(tenant_info) && tenant_info->is_normal()) {
+      tenant_not_ready = !schema_service->is_tenant_full_schema(tenant_id);
+    }
   }
   return ret;
 }
@@ -527,32 +531,7 @@ void ObTabletTableUpdater::check_remove_task_(
     bool &is_remove_task)
 {
   int ret = OB_SUCCESS;
-  is_remove_task = false;
-
-  if (!GCTX.is_shared_storage_mode()) {
-    is_remove_task = true;
-  } else {
-#ifdef OB_BUILD_SHARED_STORAGE
-    share::ObLSInfo ls_info;
-    const ObLSReplica *replica = nullptr;
-
-    if (!locality_is_valid) {
-      // locality cache not valid, ignore to check the remove task temporarily
-    } else if (OB_FAIL(locality_cache.get_ls_info(ls_id, ls_info))) {
-      if (OB_HASH_NOT_EXIST == ret) {
-        is_remove_task = true;
-      } else {
-        LOG_WARN("failed to get ls info", K(ret), K(ls_id));
-      }
-    } else if (is_ls_not_exist) {
-      // no need to check whether ls is leader
-    } else if (OB_FAIL(ls_info.find_leader(replica))) {
-      LOG_WARN("failed to find leader", K(ret), K(ls_id), K(ls_info));
-    } else if (replica->get_server() == GCTX.self_addr()) {
-      is_remove_task = true; // ls leader is on cur server
-    }
-#endif
-  }
+  is_remove_task = true;
 }
 
 int ObTabletTableUpdater::push_task_info_(
@@ -619,6 +598,7 @@ int ObTabletTableUpdater::generate_tasks_(
                                                                  checksum_item))) {
       bool is_remove_task = false;
       if (OB_EAGAIN == ret) {
+        (void) throttle_(ret, 0);
         if (OB_TMP_FAIL(add_task_(*task))) {
           LOG_WARN("fail to add task", KR(tmp_ret), KPC(task));
         } else {
@@ -646,7 +626,8 @@ int ObTabletTableUpdater::generate_tasks_(
                                       1/*data_size*/,
                                       1/*required_size*/,
                                       0/*report_scn*/,
-                                      ObTabletReplica::SCN_STATUS_IDLE))) {
+                                      ObTabletReplica::SCN_STATUS_IDLE,
+                                      0/*ddl_create_snapshot*/))) {
         LOG_WARN("fail to init ObTabletReplica", KR(ret), KPC(task), "server", GCONF.self_addr_);
       } else if (OB_FAIL(push_task_info_(*task, replica, remove_tablet_replicas, remove_tablet_tasks))) {
         LOG_WARN("failed to push remove task", K(ret), KPC(task));
@@ -667,8 +648,7 @@ int ObTabletTableUpdater::generate_tasks_(
   if (OB_FAIL(ret)) {
   } else if (update_tablet_tasks.count() != update_tablet_replicas.count()
           || update_tablet_tasks.count() != update_tablet_checksums.count()
-          || (!GCTX.is_shared_storage_mode() &&
-              (update_tablet_tasks.count() + remove_tablet_tasks.count() + retry_tablet_replica_count != batch_tasks.count()))) {
+          || (update_tablet_tasks.count() + remove_tablet_tasks.count() + retry_tablet_replica_count != batch_tasks.count())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet task count and replica count not match", KR(ret),
              "tablet_update_tasks count", update_tablet_tasks.count(),
@@ -689,7 +669,7 @@ int ObTabletTableUpdater::batch_process_tasks(
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
   bool tenant_dropped = false;
-  bool schema_not_ready = false;
+  bool tenant_not_ready = false;
   const uint64_t meta_tenant_id = gen_meta_tenant_id(tenant_id_);
   const int64_t start_time = ObTimeUtility::current_time();
   ObArray<ObTabletReplica> update_tablet_replicas;
@@ -714,7 +694,7 @@ int ObTabletTableUpdater::batch_process_tasks(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid batch_tasks", KR(ret), "task count", batch_tasks.count());
   } else {
-    (void)check_tenant_status_(meta_tenant_id, tenant_dropped, schema_not_ready);
+    (void)check_tenant_status_(meta_tenant_id, tenant_dropped, tenant_not_ready);
   }
   if (OB_FAIL(ret)) {
     // do nothing
@@ -723,10 +703,10 @@ int ObTabletTableUpdater::batch_process_tasks(
       FLOG_INFO("REPORT: tasks can't be processed because it's superior tenant has been dropped",
           KR(ret), K(meta_tenant_id), K(batch_tasks));
     }
-  } else if (schema_not_ready) { // need wait schema refresh
+  } else if (tenant_not_ready) { // need wait schema refresh
     ret = OB_NEED_WAIT;
     if (REACH_TIME_INTERVAL(1_s)) { // 1s
-      LOG_WARN("tenant schema is not ready, need wait", KR(ret), K(meta_tenant_id), K(batch_tasks));
+      LOG_WARN("tenant is not ready, need wait", KR(ret), K(meta_tenant_id), K(batch_tasks));
     }
     (void) throttle_(ret, ObTimeUtility::current_time() - start_time);
     if (OB_FAIL(reput_to_queue_(batch_tasks))) {
@@ -875,16 +855,6 @@ int ObTabletTableUpdater::do_batch_update_(
     common::ObMySQLTransaction trans;
     const uint64_t meta_tenant_id = gen_meta_tenant_id(tenant_id_);
     if (OB_FAIL(ret)) {
-    } else if (GCTX.is_shared_storage_mode()) {
-#ifdef OB_BUILD_SHARED_STORAGE
-      if (OB_FAIL(ObTabletReplicaChecksumOperator::batch_select_and_update_with_trans(tenant_id_, checksums))) {
-        LOG_WARN("do tablet table checksum update failed, try to reput to queue", KR(ret),
-             "escape time", ObTimeUtility::current_time() - start_time);
-      }
-#else
-      ret = OB_NOT_SUPPORTED;
-      LOG_WARN("not support shared storage mode", KR(ret));
-#endif
     } else {
       if (OB_FAIL(trans.start(GCTX.sql_proxy_, meta_tenant_id))) {
         LOG_WARN("fail to start transaction", KR(ret), K_(tenant_id), K(meta_tenant_id));

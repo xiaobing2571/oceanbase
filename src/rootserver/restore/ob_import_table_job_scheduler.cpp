@@ -714,6 +714,7 @@ int ObImportTableTaskScheduler::gen_import_ddl_task_()
   if (OB_FAIL(check_import_ddl_task_exist_(is_exist))) {
     LOG_WARN("failed to check import ddl task", K(ret));
   } else if (is_exist) {
+    import_task_->set_start_ts(ObTimeUtility::current_time());
     LOG_INFO("[IMPORT_TABLE]import ddl task exist, skip it", KPC_(import_task), K(arg));
   } else if (OB_FAIL(construct_import_table_arg_(arg))) {
     LOG_WARN("failed to construct import table arg", K(ret));
@@ -726,6 +727,7 @@ int ObImportTableTaskScheduler::gen_import_ddl_task_()
       LOG_WARN("fail to start import table", K(ret), K(arg));
     }
   } else {
+    import_task_->set_start_ts(ObTimeUtility::current_time());
     LOG_INFO("[IMPORT_TABLE]succeed execute_recover_restore_table", KPC_(import_task), K(arg));
   }
   return ret;
@@ -852,6 +854,7 @@ int ObImportTableTaskScheduler::construct_import_table_schema_(
     target_table_schema.clear_foreign_key_infos();
     target_table_schema.set_table_state_flag(ObTableStateFlag::TABLE_STATE_NORMAL);
     target_table_schema.set_mlog_tid(OB_INVALID_ID); // mlog (if exists) will be discarded
+    target_table_schema.set_tmp_mlog_tid(OB_INVALID_ID);
 
     uint64_t database_id = OB_INVALID_ID;
     if (OB_FAIL(target_tenant_guard.get_database_id(import_task_->get_tenant_id(),

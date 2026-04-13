@@ -102,7 +102,7 @@ class FixedTinyAllocator
 {
 public:
   FixedTinyAllocator() = delete;
-  FixedTinyAllocator(const ObMemAttr& attr) : attr_(attr), last_wash_time_us_(ObTimeUtility::current_time_us()) {}
+  FixedTinyAllocator(const ObMemAttr& attr) : attr_(attr), blocks_mu_(common::ObLatchIds::OB_FIXED_TINY_ALLOCATOR_BLOCK_MUTEX), last_wash_time_us_(ObTimeUtility::current_time_us()) {}
   ~FixedTinyAllocator();
   DISABLE_COPY_ASSIGN(FixedTinyAllocator);
   int alloc(SList<T>& list, int64_t num);
@@ -182,6 +182,7 @@ public:
   static HazardDomain& get_instance();
   void print_info() const;
   void wash();
+  int64_t get_retired_size() { return ATOMIC_LOAD_RLX(&retired_memory_size_); }
 
 private:
   friend class ObKVGlobalCache;

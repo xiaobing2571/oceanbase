@@ -14,6 +14,7 @@
 
 #include "ob_unit_resource.h"
 #include "share/ob_server_struct.h"
+#include "lib/utility/ob_tracepoint.h"
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/shared_storage/ob_disk_space_manager.h"
 #endif
@@ -23,6 +24,13 @@ namespace oceanbase
 using namespace common;
 namespace share
 {
+
+// Trace point for injecting meta tenant memory ratio
+// Usage: TP_SET_EVENT(EN_META_TENANT_MEMORY_RATIO, ratio, 1, 1, tenant_id)
+//   where ratio is the percentage (1-100), tenant_id is the condition
+//   Example: TP_SET_EVENT(EN_META_TENANT_MEMORY_RATIO, 15, 1, 1, 1001)
+//     means tenant 1001 will use 15% instead of default 10%
+ERRSIM_POINT_DEF(EN_META_TENANT_MEMORY_RATIO, "Inject meta tenant memory ratio for specific tenant")
 
 #define CALCULATE_CONFIG(l, op, r, result) \
   do { \
@@ -186,7 +194,7 @@ bool ObUnitResource::is_data_disk_size_valid_for_unit() const
 {
   bool b_ret = false;
   if (GCTX.is_shared_storage_mode()) {
-    b_ret = 0 == data_disk_size_ || data_disk_size_ >= UNIT_MIN_DATA_DISK_SIZE;
+    b_ret = data_disk_size_ >= UNIT_MIN_DATA_DISK_SIZE;
   } else {
     b_ret = DEFAULT_DATA_DISK_SIZE == data_disk_size_;
   }
@@ -197,9 +205,7 @@ bool ObUnitResource::is_data_disk_size_valid_for_meta_tenant() const
 {
   bool b_ret = false;
   if (GCTX.is_shared_storage_mode()) {
-    b_ret = 0 == data_disk_size_ ||
-            (data_disk_size_ >= META_TENANT_MIN_DATA_DISK_SIZE
-            && data_disk_size_ <= META_TENANT_MAX_DATA_DISK_SIZE);
+    b_ret = data_disk_size_ >= META_TENANT_MIN_DATA_DISK_SIZE;
   } else {
     b_ret = DEFAULT_DATA_DISK_SIZE == data_disk_size_;
   }
@@ -331,27 +337,23 @@ int ObUnitResource::init_update_and_check_data_disk_(const ObUnitResource &user_
 {
   int ret = OB_SUCCESS;
   if (0 == user_spec.data_disk_size()) {
-    if (! GCTX.is_shared_storage_mode()) {
+    if (!GCTX.is_shared_storage_mode()) {
       // for upgrade compatability in shared-nothing mode
       data_disk_size_ = DEFAULT_DATA_DISK_SIZE;
     } else {
-      uint64_t sys_data_version = 0;
-      // user specifying data_disk_size = 0 is supported in 4.3.5.2 and above
-      if (OB_FAIL(GET_MIN_DATA_VERSION(OB_SYS_TENANT_ID, sys_data_version))) {
-        LOG_WARN("failed to get sys tenant min data version", KR(ret));
-      } else if (sys_data_version < DATA_VERSION_4_3_5_2) {
-        ret = common::OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "SYS tenant data version is below 4.3.5.2, DATA_DISK_SIZE being 0");
-      } else {
-        data_disk_size_ = user_spec.data_disk_size();
-      }
+      // user specifying data_disk_size = 0 is supported in 4.3.5.2 and above, after 4.5.1, user can not specify data_disk_size = 0.
+      // in older versions, no users are using a data disk size of 0, so compatibility issues do not need to be considered.
+      // here will directly return that it is not supported.
+      ret = common::OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "DATA_DISK_SIZE being 0");
     }
   } else if (user_spec.data_disk_size() > 0) {
     // user specify data_disk_size
     if (OB_FAIL(check_data_disk_size_supported())) {
       LOG_WARN("failed to check data_disk_size supported", KR(ret), K(user_spec));
     } else {
-      const int64_t unit_min_data_disk_size = UNIT_MIN_DATA_DISK_SIZE;
+      const int64_t cpu_based_size = static_cast<int64_t>(min_cpu_) * (CPU_TO_DATA_DISK_FACTOR * 1LL * GB);
+      const int64_t unit_min_data_disk_size = max(cpu_based_size, UNIT_MIN_DATA_DISK_SIZE);
       if (user_spec.data_disk_size() < unit_min_data_disk_size) {
         ret = OB_RESOURCE_UNIT_VALUE_BELOW_LIMIT;
         LOG_WARN("data_disk_size is below limit", KR(ret), K(user_spec),
@@ -369,7 +371,7 @@ int ObUnitResource::init_update_and_check_data_disk_(const ObUnitResource &user_
     } else {
       // use the default value
       if (GCTX.is_shared_storage_mode()) {
-        data_disk_size_ = get_default_data_disk_size(memory_size_);
+        data_disk_size_ = get_default_data_disk_size(memory_size_, min_cpu_);
       } else {
         data_disk_size_ = DEFAULT_DATA_DISK_SIZE;
       }
@@ -1009,7 +1011,39 @@ bool ObUnitResource::has_shrunk_resource_than(const ObUnitResource &other) const
   return b_ret;
 }
 
-int ObUnitResource::divide_meta_tenant(ObUnitResource &meta_resource)
+int64_t ObUnitResource::gen_meta_tenant_memory(const int64_t unit_memory, const uint64_t tenant_id)
+{
+  int64_t meta_tenant_memory = 0;
+  int64_t memory_percentage = META_TENANT_MEMORY_PERCENTAGE;
+  const int64_t meta_tenant_id = gen_meta_tenant_id(tenant_id);
+
+  // Check if there's an injected ratio for this tenant via trace point
+  // Trace point usage: TP_SET_EVENT(EN_META_TENANT_MEMORY_RATIO, ratio, 1, 1, tenant_id)
+  //   where ratio is the percentage (1-100), stored in error_code_
+  //   tenant_id is the condition, stored in cond_
+  // Note: .test() returns error_code_ if cond_ matches tenant_id or if cond_ is 0 (unset)
+  //   So we need to check if the return value is valid (1-100) to ensure it's a real match
+  if (OB_INVALID_TENANT_ID != meta_tenant_id) {
+    int test_result = -EN_META_TENANT_MEMORY_RATIO.test(meta_tenant_id);
+    // Only use the value if it's a valid ratio (1-100), which indicates a real match
+    // If cond_ is 0 (unset), test() may return error_code_ but it's likely not a valid ratio
+    SHARE_LOG(INFO, "use injected meta memory ratio via trace point", K(meta_tenant_id), K(test_result));
+    if (test_result > 0 && test_result <= 100) {
+      memory_percentage = test_result;
+      SHARE_LOG(INFO, "use injected meta memory ratio via trace point", K(meta_tenant_id), K(memory_percentage));
+    }
+  }
+
+  if (unit_memory < UNIT_SAFE_MIN_MEMORY) {
+    meta_tenant_memory = META_TENANT_MIN_MEMORY;
+  } else {
+    const int64_t meta_memory_by_percent = unit_memory * memory_percentage / 100;
+    meta_tenant_memory = max(meta_memory_by_percent, META_TENANT_SAFE_MIN_MEMORY);
+  }
+  return meta_tenant_memory;
+}
+
+int ObUnitResource::divide_meta_tenant(ObUnitResource &meta_resource, const uint64_t tenant_id)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(! is_valid_for_unit())) {
@@ -1028,7 +1062,8 @@ int ObUnitResource::divide_meta_tenant(ObUnitResource &meta_resource)
     const double u_max_cpu = max_cpu_;
 
     ///////////////////// MEMORY ///////////////////
-    const int64_t m_memory_size = gen_meta_tenant_memory(memory_size_);
+    // Use injected ratio if available for this tenant
+    const int64_t m_memory_size = gen_meta_tenant_memory(memory_size_, tenant_id);
     const int64_t u_memory_size = memory_size_ - m_memory_size;
 
     ///////////////////// LOG_DISK ///////////////////
@@ -1120,17 +1155,14 @@ int ObUnitResource::gen_sys_tenant_default_unit_resource(const bool is_hidden_sy
   int64_t hidden_sys_data_disk_size = 0;
 #ifdef OB_BUILD_SHARED_STORAGE
   if (GCTX.is_shared_storage_mode()) {
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(OB_SERVER_DISK_SPACE_MGR.gen_hidden_sys_data_disk_size(hidden_sys_data_disk_size))) {
-      LOG_WARN("fail to generate hidden sys data_disk_size", KR(ret), K(hidden_sys_data_disk_size));
-    }
+    hidden_sys_data_disk_size = OB_SERVER_DISK_SPACE_MGR.get_hidden_sys_data_disk_config_size();
   }
 #endif
   if (OB_FAIL(ret)) {
   } else {
     data_disk_size_ = !GCTX.is_shared_storage_mode() ? DEFAULT_DATA_DISK_SIZE :
                         (is_hidden_sys ? hidden_sys_data_disk_size :
-                        max(get_default_data_disk_size(memory_size_), UNIT_MIN_DATA_DISK_SIZE));
+                        max(get_default_data_disk_size(memory_size_, min_cpu_), UNIT_MIN_DATA_DISK_SIZE));
   }
   if (OB_FAIL(ret)) {
   } else if (OB_UNLIKELY(! is_valid_for_unit())) {

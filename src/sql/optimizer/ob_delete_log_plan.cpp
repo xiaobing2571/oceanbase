@@ -147,6 +147,14 @@ int ObDeleteLogPlan::generate_normal_raw_plan()
       }
     }
 
+    if (OB_SUCC(ret) && delete_stmt->is_returning() && delete_stmt->get_returning_aggr_item_size() <= 0) {
+      if (OB_FAIL(candi_allocate_material_for_dml())) {
+        LOG_WARN("failed to allocate material operator", K(ret));
+      } else {
+        LOG_TRACE("succeed to allocate material op for dml returning", K(candidates_.candidate_plans_.count()));
+      }
+    }
+
     // allocate root exchange
     if (OB_SUCC(ret)) {
       if (OB_FAIL(candi_allocate_root_exchange())) {
@@ -337,7 +345,8 @@ int ObDeleteLogPlan::prepare_table_dml_info_special(const ObDmlTableInfo& table_
                                                     ObIArray<IndexDMLInfo*> &all_index_dml_infos)
 {
   int ret = OB_SUCCESS;
-  ObAssignments empty_assignments;
+  ObArenaAllocator allocator(ObModIds::OB_SQL_COMPILE);
+  ObAssignments empty_assignments(allocator);
   ObSchemaGetterGuard* schema_guard = optimizer_context_.get_schema_guard();
   ObSQLSessionInfo* session_info = optimizer_context_.get_session_info();
   const ObTableSchema* index_schema = NULL;

@@ -264,7 +264,7 @@ public:
     int init();
     void destroy();
     int set_storage_key(const ObTrafficControl::ObStorageKey &key);
-    int add_shared_device_limits();
+    int add_shared_device_limits(uint64_t storage_key);
     int fill_qsched_req_storage_key(ObIORequest& req);
     int add_group(const ObIOSSGrpKey &grp_key, const int qid);
     int is_group_key_exist(const ObIOSSGrpKey &grp_key);
@@ -349,7 +349,6 @@ public:
   int pwrite(ObIOInfo &info, int64_t &write_size);
 
   int detect_read(const ObIOInfo &info, ObIOHandle &handle);
-
   // config related, thread safe
   int set_io_config(const ObIOConfig &conf);
   const ObIOConfig &get_io_config() const;
@@ -389,6 +388,39 @@ public:
   void print_channel_status();
   void print_status();
   int64_t get_object_storage_io_timeout_ms(const uint64_t tenant_id) const;
+
+  // util request
+  int exist(const int64_t tenant_id, const ObIOFd &fd,
+      const ObString &uri, bool &exist);
+  int adaptive_exist(const int64_t tenant_id, const ObIOFd &fd,
+      const ObString &uri, bool &exist);
+  int stat(const int64_t tenant_id, const ObIOFd &fd,
+      const ObString &uri, ObIODFileStat &statbuf);
+  int adaptive_stat(const int64_t tenant_id, const ObIOFd &fd,
+      const ObString &uri, ObIODFileStat &statbuf);
+  int unlink(const int64_t tenant_id, const ObIOFd &fd,
+      const ObString &uri);
+  int adaptive_unlink(const int64_t tenant_id, const ObIOFd &fd,
+      const ObString &uri);
+  int mkdir(const int64_t tenant_id, const ObIOFd &fd,
+    const ObString &uri);
+  int rmdir(const int64_t tenant_id, const ObIOFd &fd,
+    const ObString &uri);
+  int is_tagging(const int64_t tenant_id, const ObIOFd &fd,
+    const ObString &uri, bool &is_tagging);
+  int complete(const int64_t tenant_id, const ObIOFd &fd,
+      const ObString &uri);
+  int abort(const int64_t tenant_id, const ObIOFd &fd,
+    const ObString &uri);
+  int seal_file(const int64_t tenant_id, const ObIOFd &fd,
+    const ObString &uri);
+
+  int scan_dir(const ObString &uri, ObIODevice *device_handle, ObBaseDirEntryOperator &op);
+  int adaptive_scan_dir(const ObString &uri, ObIODevice *device_handle, ObBaseDirEntryOperator &op);
+  int batch_del_files(ObIODevice *device_handle,
+    ObIArray<ObString> &files_to_delete,
+    ObIArray<int64_t> &failed_files_idx);
+
 
 private:
   friend class ObTenantIOManager;
@@ -497,12 +529,20 @@ public:
   void inc_ref();
   void dec_ref();
   int get_throttled_time(uint64_t group_id, int64_t &throttled_time);
+  int64_t get_local_iops_util() const {return local_iops_util_;};
   const ObIOFuncUsages& get_io_func_infos();
+  void inc_io_cancel_count() { ATOMIC_FAA(&io_cancel_count_, 1); }
+  int64_t get_and_reset_io_cancel_count()
+  {
+    const int64_t count = ATOMIC_LOAD(&io_cancel_count_);
+    ATOMIC_STORE(&io_cancel_count_, 0);
+    return count;
+  }
   OB_INLINE int64_t get_object_storage_io_timeout_ms() const { return io_config_.param_config_.object_storage_io_timeout_ms_; }
 
   TO_STRING_KV(K(is_inited_), K(tenant_id_), K(ref_cnt_), K(io_memory_limit_), K(request_count_), K(result_count_),
        K(io_config_), K(io_clock_), K(io_allocator_), KPC(io_scheduler_), K(callback_mgr_), K(io_memory_limit_),
-       K(request_count_), K(result_count_));
+       K(request_count_), K(result_count_), K(local_iops_util_), K(io_cancel_count_));
 private:
   friend class ObIORequest;
   friend class ObIOResult;
@@ -513,6 +553,7 @@ private:
   int64_t request_count_;
   int64_t result_count_;
   uint64_t tenant_id_;
+  int64_t io_cancel_count_;
   ObTenantIOConfig io_config_;
   ObTenantIOClock io_clock_;
   ObIOAllocator io_allocator_;
@@ -526,6 +567,7 @@ private:
   DRWLock io_config_lock_;                                      // for map and config
   hash::ObHashMap<ObIOGroupKey, uint64_t> group_id_index_map_;  // key:group_id, value:index
   ObTenantIOSchedulerV2 qsched_;
+  int64_t local_iops_util_;
 };
 
 #define OB_IO_MANAGER (oceanbase::common::ObIOManager::get_instance())

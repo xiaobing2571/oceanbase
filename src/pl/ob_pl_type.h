@@ -81,6 +81,7 @@ class ObPLUserTypeTable;
 class ObUserDefinedType;
 class ObPLStmt;
 class ObPLDbLinkGuard;
+class ObPLResolveCache;
 
 enum ObProcType
 {
@@ -535,7 +536,8 @@ public:
                             uint64_t location,
                             bool in_notfound,
                             bool in_warning,
-                            uint64_t package_id = OB_INVALID_ID) const;
+                            uint64_t package_id = OB_INVALID_ID,
+                            bool need_convert = true) const;
   virtual int generate_construct(ObPLCodeGenerator &generator,
                                  const ObPLINS &ns,
                                  jit::ObLLVMValue &value,
@@ -574,6 +576,17 @@ public:
                   const common::ObCollationType ncs_type, const common::ObTimeZoneInfo *tz_info,
                   const char *&src, char *dst, const int64_t dst_len, int64_t &dst_pos) const;
 
+  static int intervalym_element_cell_str(char *buf,
+                                        const int64_t len,
+                                        ObIntervalYMValue val,
+                                        int64_t &pos,
+                                        const ObScale scale);
+  static int intervalds_element_cell_str(char *buf,
+                                        const int64_t len,
+                                        ObIntervalDSValue val,
+                                        int64_t &pos,
+                                        const ObScale scale);
+
   int convert(ObPLResolveCtx &ctx, ObObj *&src, ObObj *&dst) const;
 
   static int get_udt_type_by_name(uint64_t tenant_id,
@@ -588,37 +601,38 @@ public:
                                   uint64_t owner_id,
                                   const common::ObString &pkg,
                                   const common::ObString &type,
-                                  common::ObIAllocator &allocator,
                                   sql::ObSQLSessionInfo &session_info,
                                   share::schema::ObSchemaGetterGuard &schema_guard,
                                   common::ObMySQLProxy &sql_proxy,
                                   bool is_pkg_var, // pkg var or pkg type
                                   ObPLDataType &pl_type,
-                                  ObIArray<share::schema::ObSchemaObjVersion> *deps);
+                                  ObIArray<share::schema::ObSchemaObjVersion> *deps,
+                                  pl::ObPLResolveCache *resolve_cache = nullptr);
 #endif
   static int get_table_type_by_name(uint64_t tenant_id,
                                   uint64_t owner_id,
                                   const ObString &table,
                                   const ObString &type,
-                                  common::ObIAllocator &allocator,
                                   sql::ObSQLSessionInfo &session_info,
                                   share::schema::ObSchemaGetterGuard &schema_guard,
                                   bool is_rowtype,
                                   ObPLDataType &pl_type,
-                                  ObIArray<share::schema::ObSchemaObjVersion> *deps);
+                                  ObIArray<share::schema::ObSchemaObjVersion> *deps,
+                                  pl::ObPLResolveCache *resolve_cache = nullptr);
   static int transform_from_iparam(const share::schema::ObRoutineParam *iparam,
                                   share::schema::ObSchemaGetterGuard &schema_guard,
                                   sql::ObSQLSessionInfo &session_info,
-                                  common::ObIAllocator &allocator,
                                   common::ObMySQLProxy &sql_proxy,
                                   pl::ObPLDataType &pl_type,
                                   ObIArray<share::schema::ObSchemaObjVersion> *deps = NULL,
-                                  pl::ObPLDbLinkGuard *dblink_guard = NULL);
+                                  pl::ObPLDbLinkGuard *dblink_guard = NULL,
+                                  pl::ObPLResolveCache *resolve_cache = nullptr);
   static int transform_and_add_routine_param(const pl::ObPLRoutineParam *param,
                                   int64_t position,
                                   int64_t level,
                                   int64_t &sequence,
                                   share::schema::ObRoutineInfo &routine_info);
+  static int adjust_routine_param_type(const share::schema::ObRoutineParam *iparam, pl::ObPLDataType &pl_type);
   static int deep_copy_pl_type(ObIAllocator &allocator, const ObPLDataType &src, ObPLDataType *&dst);
 
   static int obj_is_null(ObObj &obj, bool &is_null);
@@ -902,7 +916,7 @@ public:
     const ObPLBlockNS *label_ns_; //当AccessType是LABEL_NS时,这里记录的是Label对应的NameSpace
   };
   union {
-    share::schema::ObIRoutineInfo *routine_info_;
+    const share::schema::ObIRoutineInfo *routine_info_;
     const ObPLBlockNS *var_ns_; //当AccessType是SUBPROGRAM_VAR时,这里记录的是VAR对应的NS
   };
   common::ObSEArray<int64_t, 4> type_method_params_;
@@ -918,11 +932,15 @@ enum ObPLCursorFlag {
   INVALID_CURSOR = 16, // this cursor is convert to a dbms cursor, invalid for dynamic cursor op.
   DBMS_SQL_CURSOR = 32, // this is a dbms_sql cursor
 };
+
+#define CURSOR_MAGIC_NUM 0x13572468
+
 class ObPLCursorInfo
 {
 public:
   ObPLCursorInfo(bool is_explicit = true) :
     id_(OB_INVALID_ID),
+    magic_num_(CURSOR_MAGIC_NUM),
     entity_(nullptr),
     is_explicit_(is_explicit),
     current_position_(OB_INVALID_ID),
@@ -933,14 +951,20 @@ public:
     cursor_flag_(CURSOR_FLAG_UNDEF),
     ref_count_(0),
     is_scrollable_(false),
+    snapshot_(),
+    is_need_check_snapshot_(false),
+    streaming_cursor_read_uncommitted_(false),
     last_execute_time_(0),
     last_stream_cursor_(false),
-    sql_text_()
+    sql_text_(),
+    cursor_total_exec_time_(0),
+    cursor_total_elapsed_time_(0)
   {
     reset();
   }
   ObPLCursorInfo(ObIAllocator *allocator) :
     id_(OB_INVALID_ID),
+    magic_num_(CURSOR_MAGIC_NUM),
     entity_(nullptr),
     is_explicit_(true),
     current_position_(OB_INVALID_ID),
@@ -953,9 +977,12 @@ public:
     is_scrollable_(false),
     snapshot_(),
     is_need_check_snapshot_(false),
+    streaming_cursor_read_uncommitted_(false),
     last_execute_time_(0),
     last_stream_cursor_(false),
-    sql_text_()
+    sql_text_(),
+    cursor_total_exec_time_(0),
+    cursor_total_elapsed_time_(0)
   {
     reset();
   }
@@ -991,13 +1018,10 @@ public:
     in_forall_ = false;
     save_exception_ = false;
     forall_rollback_ = false;
-    if (is_session_cursor()) {
-      cursor_flag_ = SESSION_CURSOR;
-    } else if (is_dbms_sql_cursor()) {
-      cursor_flag_ = DBMS_SQL_CURSOR;
-    }else {
-      cursor_flag_ = CURSOR_FLAG_UNDEF;
-    }
+    // clear temporary cursor flags
+    clear_flag_bit(TRANSFERING_RESOURCE);
+    clear_flag_bit(SYNC_CURSOR);
+    clear_flag_bit(INVALID_CURSOR);
     // ref_count_ = 0; // 这个不要清零，因为oracle在close之后，它的ref count还是保留的
     is_scrollable_ = false;
     last_execute_time_ = 0;
@@ -1008,11 +1032,16 @@ public:
     first_row_.reset();
     last_row_.reset();
     is_need_check_snapshot_ = false;
+    streaming_cursor_read_uncommitted_ = false;
     sql_trace_id_.reset();
     is_packed_ = false;
     sql_text_.reset();
     sql_id_[0] = '\0';
     sql_id_[common::OB_MAX_SQL_ID_LENGTH] = '\0';
+    cursor_total_exec_time_ = 0;
+    cursor_total_elapsed_time_ = 0;
+    in_tx_cursor_ = false;
+    tx_cursor_idx_ = std::make_tuple(OB_INVALID_ID, OB_INVALID_ID, OB_INVALID_INDEX);
   }
 
   void reset()
@@ -1030,7 +1059,7 @@ public:
     spi_cursor_ = spi_cursor;
     is_explicit_ = spi_cursor != NULL;
   }
-  virtual int close(sql::ObSQLSessionInfo &session, bool is_reuse = false);
+  virtual int close(sql::ObSQLSessionInfo &session, bool is_reuse = false, bool close_by_open_thread = false);
 
   inline void set_id(int64_t id) { id_ = id; }
   inline void set_entity(lib::MemoryContext entity) { entity_ = entity; }
@@ -1059,6 +1088,7 @@ public:
     in_forall_ = false;
   }
   inline int64_t get_id() const { return id_; }
+  inline uint32_t get_magic_num() const { return magic_num_; }
   inline lib::MemoryContext &get_cursor_entity() { return entity_; }
   inline const lib::MemoryContext get_cursor_entity() const { return entity_; }
   inline bool get_in_forall() const { return in_forall_; }
@@ -1078,7 +1108,7 @@ public:
   inline const ObNewRow &get_last_row() const { return last_row_; }
   inline ObNewRow &get_last_row() { return last_row_; }
   inline sql::ObSPIResultSet* get_cursor_handler() const { return reinterpret_cast<sql::ObSPIResultSet*>(spi_cursor_); }
-  inline sql::ObSPICursor* get_spi_cursor() const { return reinterpret_cast<sql::ObSPICursor*>(spi_cursor_); }
+  virtual inline sql::ObSPICursor* get_spi_cursor() const { return reinterpret_cast<sql::ObSPICursor*>(spi_cursor_); }
 
   inline bool get_isopen() const { return is_explicit_ ? isopen_ : false; }
   inline bool get_save_exception() const { return save_exception_; }
@@ -1091,6 +1121,12 @@ public:
 
   void set_need_check_snapshot(bool is_need_check_snapshot) { is_need_check_snapshot_ = is_need_check_snapshot; }
   bool is_need_check_snapshot() { return is_need_check_snapshot_; }
+  void set_streaming_cursor_read_uncommitted(bool read_uncommitted) { streaming_cursor_read_uncommitted_ = read_uncommitted; }
+  bool is_streaming_cursor_read_uncommitted() { return streaming_cursor_read_uncommitted_; }
+  void set_is_in_tx_cursor(bool is_in_tx_cursor) { in_tx_cursor_ = is_in_tx_cursor; }
+  bool is_in_tx_cursor() { return in_tx_cursor_; }
+  void set_tx_cursor_idx(uint64_t package_id, uint64_t routine_id, int64_t cursor_index) { tx_cursor_idx_ = std::make_tuple(package_id, routine_id, cursor_index); }
+  std::tuple<uint64_t, uint64_t, int64_t> get_tx_cursor_idx() const { return tx_cursor_idx_; }
   int set_and_register_snapshot(const transaction::ObTxReadSnapshot &snapshot);
 
   int set_current_position(int64_t position);
@@ -1170,13 +1206,24 @@ public:
                           uint64_t mem_limit,
                           bool is_local_for_update = false,
                           sql::ObSQLSessionInfo* session_info = nullptr);
+  int convert_to_unstreaming(sql::ObSQLSessionInfo &session);
   ObCurTraceId::TraceId *get_sql_trace_id() { return &sql_trace_id_; }
-
+  virtual int get_field_count(int64_t &field_count)
+  {
+    return OB_NOT_SUPPORTED;
+  }
 
   inline void set_packed(bool is_packed) { is_packed_ = is_packed; }
   inline bool is_packed() { return is_packed_; }
+  virtual inline bool is_async() { return false; }
+
+  inline int64_t get_cursor_total_elapsed_time() const { return cursor_total_elapsed_time_; }
+  inline void add_cursor_elapsed_time(int64_t time) { cursor_total_elapsed_time_ += time; }
+  inline int64_t get_cursor_total_exec_time() const { return cursor_total_exec_time_; }
+  inline void add_cursor_exec_time(int64_t time) { cursor_total_exec_time_ += time; }
 
   TO_STRING_KV(K_(id),
+               K_(magic_num),
                K_(is_explicit),
                K_(for_update),
                K_(has_hidden_rowid),
@@ -1200,12 +1247,15 @@ public:
                K_(is_scrollable),
                K_(snapshot),
                K_(is_need_check_snapshot),
+               K_(streaming_cursor_read_uncommitted),
                K_(last_execute_time),
                K_(sql_trace_id),
-               K_(is_packed));
+               K_(is_packed),
+               K_(cursor_total_exec_time));
 
 protected:
   int64_t id_;            // Cursor ID
+  uint32 magic_num_;
   lib::MemoryContext entity_;
   bool is_explicit_;      // 是否是显式游标
   bool for_update_;    //是否可更新游标
@@ -1235,12 +1285,91 @@ protected:
   // and the snapshot were acquired in an active transaction
   // it is required to check snapshot state is valid before doing fetch
   bool is_need_check_snapshot_;
+  // If cursor is a streaming cursor and the snapshot were acquired in an active transaction
+  bool streaming_cursor_read_uncommitted_;
   int64_t last_execute_time_; // 记录上一次cursor操作的时间点
   bool last_stream_cursor_; // cursor复用场景下，记录上一次是否是流式cursor
   ObCurTraceId::TraceId sql_trace_id_; // trace id of cursor sql statement
   bool is_packed_;
   ObString sql_text_;     //non seesion的非流式游标保存sql text
   char sql_id_[common::OB_MAX_SQL_ID_LENGTH + 1]; //保存非流式游标的sql id
+  int64_t cursor_total_exec_time_;
+  int64_t cursor_total_elapsed_time_;
+  bool in_tx_cursor_; // 是否是流式游标，且读取未提交事务的数据
+  std::tuple<uint64_t, uint64_t, int64_t> tx_cursor_idx_; // 读取未提交事务的数据的流式游标的idx<package_id, routine_id, cursor_index>
+};
+
+class ObPsCursorInfo : public ObPLCursorInfo
+{
+public:
+  ObPsCursorInfo(ObIAllocator *allocator) :
+    ObPLCursorInfo(allocator),
+    cursor_store_(NULL),
+    spin_lock_(common::ObLatchIds::PS_CURSOR_LOCK),
+    fetch_size_(512),
+    store_ret_(OB_SUCCESS),
+    client_close_(false),
+    ora_max_ret_rows_(INT64_MAX)
+  {
+    is_async_ = can_open_async_cursor();
+  };
+
+  virtual ~ObPsCursorInfo()
+  {
+    cursor_store_ = NULL;
+    fetch_size_ = 0;
+    store_ret_ = false;
+    client_close_ = false;
+    ps_sql_.reset();
+  }
+
+  inline void set_cursor_store(sql::ObSPICursor *cursor_store) { cursor_store_ = cursor_store; }
+  inline sql::ObSPICursor *get_cursor_store() { return cursor_store_; }
+  virtual inline sql::ObSPICursor* get_spi_cursor() const { return cursor_store_; }
+  inline void set_spi_cursor(sql::ObSPICursor *v) { spi_cursor_ = v; }
+  inline ObSpinLock &get_spin_lock() { return spin_lock_; }
+  inline void set_fetch_size(uint64_t fetch_size) { fetch_size_ = fetch_size; }
+  inline uint64_t get_fetch_size() { return fetch_size_; }
+  inline void set_store_ret(int store_ret) { ATOMIC_STORE(&store_ret_, store_ret); }
+  inline int get_store_ret() { return ATOMIC_LOAD(&store_ret_); }
+  inline void set_client_close(bool client_close) { ATOMIC_STORE(&client_close_, client_close); }
+  inline bool is_client_close() { return ATOMIC_LOAD(&client_close_); }
+  inline void set_ps_sql(ObString &sql) { ps_sql_ = sql; }
+  inline ObString &get_ps_sql() { return ps_sql_; }
+  inline ParamStore &get_exec_params() { return exec_params_; }
+  virtual inline bool is_async() { return is_async_; }
+  inline void set_is_async(bool is_async) { is_async_ = is_async; }
+  inline void set_ora_max_ret_rows(int64_t max_ret_rows) { ora_max_ret_rows_ = max_ret_rows; }
+  inline int64_t get_ora_max_ret_rows() { return ora_max_ret_rows_; }
+  int init_params(ParamStore &exec_params);
+  int prepare_cursor_store(sql::ObSQLSessionInfo &session,
+                           sql::ObResultSet &result_set);
+  virtual int close(sql::ObSQLSessionInfo &session,
+                    bool is_reuse = false,
+                    bool close_by_open_thread = false);
+  virtual int get_field_columns(const common::ColumnsFieldArray *&fields);
+  virtual int get_field_count(int64_t &field_count);
+  ObPLExecCtx *get_exec_ctx() { return exec_ctx_; }
+  void set_exec_ctx(ObPLExecCtx *exec_ctx) { exec_ctx_ = exec_ctx;}
+  static void reduce_async_cursor_count();
+
+private:
+  // if return true, need to reduce async ps cursor count after detory cursor
+  // if return false, do nothing
+  static bool can_open_async_cursor();
+
+private:
+  ObPLExecCtx *exec_ctx_;
+  sql::ObSPICursor *cursor_store_; // store row data for cursor
+  ObSpinLock spin_lock_; // only use it in async mode
+  uint64_t fetch_size_; // the fetch size of cursor, only make sense in async mode
+  int store_ret_; // the store thread return value, only make sense in async mode
+  volatile bool client_close_; // whether the client has closed the cursor, only make sense in async mode
+  bool is_async_;  // whether the current cursor is asynchronous
+  common::ObString ps_sql_;
+  ParamStore exec_params_; // the params of ps stmt
+  int64_t ora_max_ret_rows_;
+  static int32_t ASYNC_PS_CURSOR_COUNT; // the number of asynchronous cursors on the current server
 };
 
 class ObPLGetCursorAttrInfo

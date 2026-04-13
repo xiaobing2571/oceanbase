@@ -21,17 +21,25 @@ namespace common
 ObPLogItem::ObPLogItem()
   : ObIBaseLogItem(), fd_type_(MAX_FD_FILE),
     log_level_(OB_LOG_LEVEL_NONE), tl_type_(common::OB_INVALID_INDEX), is_force_allow_(false),
-    is_size_overflow_(false), timestamp_(0), header_pos_(0), buf_size_(0), pos_(0)
+    is_size_overflow_(false), is_cached_item_(false), is_large_item_(false), timestamp_(0), header_pos_(0),
+    buf_size_(0), pos_(0), slot_(INT64_MAX)
 {
 }
 
 ObPLogFileStruct::ObPLogFileStruct()
   : fd_(STDERR_FILENO), wf_fd_(STDERR_FILENO), write_count_(0), write_size_(0),
-    file_size_(0)
+    file_size_(0), offset_(0), wf_offset_(0), unsynced_size_(0), wf_unsynced_size_(0)
 {
   filename_[0] = '\0';
   MEMSET(&stat_, 0, sizeof(stat_));
   MEMSET(&wf_stat_, 0, sizeof(wf_stat_));
+}
+
+uint64_t oceanbase::common::ObPLogFileStruct::sync_size_threshold = 0;
+
+void ObPLogFileStruct::set_sync_size_threshold(uint64_t threshold)
+{
+  sync_size_threshold = threshold;
 }
 
 int ObPLogFileStruct::open(const char *file_name, const bool open_wf_flag, const bool redirect_flag)
@@ -146,5 +154,51 @@ int ObPLogFileStruct::close_all()
   return ret;
 }
 
+void ObPLogFileStruct::fsync()
+{
+  if (sync_size_threshold != 0) {
+    int64_t unsynced_size = ATOMIC_SET(&unsynced_size_, 0);
+    int64_t offset = ATOMIC_FAA(&offset_, unsynced_size);
+    sync_file_range(fd_, offset, unsynced_size, SYNC_FILE_RANGE_WRITE);
+  }
+}
+void ObPLogFileStruct::wfsync()
+{
+  if (sync_size_threshold != 0) {
+    int64_t wf_unsynced_size = ATOMIC_SET(&wf_unsynced_size_, 0);
+      int64_t wf_offset = ATOMIC_FAA(&wf_offset_, wf_unsynced_size);
+      sync_file_range(wf_fd_, wf_offset, wf_unsynced_size, SYNC_FILE_RANGE_WRITE);
+  }
+}
+void ObPLogFileStruct::try_fsync(const int64_t size)
+{
+  if (sync_size_threshold != 0) {
+    int64_t new_unsynced = ATOMIC_AAF(&unsynced_size_, size);
+    if (new_unsynced >= sync_size_threshold) {
+      int64_t unsynced_size = ATOMIC_SET(&unsynced_size_, 0);
+      int64_t offset = ATOMIC_FAA(&offset_, unsynced_size);
+      sync_file_range(fd_, offset, unsynced_size, SYNC_FILE_RANGE_WRITE);
+    }
+  }
+}
+
+void ObPLogFileStruct::try_wfsync(const int64_t size)
+{
+  if (sync_size_threshold != 0) {
+    int64_t new_unsynced = ATOMIC_AAF(&wf_unsynced_size_, size);
+    if (new_unsynced >= sync_size_threshold) {
+      int64_t wf_unsynced_size = ATOMIC_SET(&wf_unsynced_size_, 0);
+      int64_t wf_offset = ATOMIC_FAA(&wf_offset_, wf_unsynced_size);
+      sync_file_range(wf_fd_, wf_offset, wf_unsynced_size, SYNC_FILE_RANGE_WRITE);
+    }
+  }
+}
+void ObPLogFileStruct::reset()
+{
+  fsync();
+  wfsync();
+  ATOMIC_SET(&offset_, 0);
+  ATOMIC_SET(&wf_offset_, 0);
+}
 } // end common
 } // end oceanbase

@@ -12,8 +12,7 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 
-#include "ob_external_file_writer.h"
-#include "ob_select_into_basic.h"
+#include "sql/engine/basic/ob_external_file_writer.h"
 
 namespace oceanbase
 {
@@ -24,9 +23,9 @@ namespace sql
 int ObExternalFileWriter::open_file()
 {
   int ret = OB_SUCCESS;
-  if (IntoFileLocation::SERVER_DISK != file_location_) {//OSS,COS,S3
+  if (IntoFileLocation::SERVER_DISK != file_location_) {//OSS,COS,S3,HDFS
     bool is_exist = false;
-    ObBackupIoAdapter adapter;
+    ObExternalIoAdapter adapter;
     ObStorageAccessType access_type = OB_STORAGE_ACCESS_APPENDER;
     // for S3, should use OB_STORAGE_ACCESS_BUFFERED_MULTIPART_WRITER
     // OSS,COS can also use multipart writer. need to check performance
@@ -34,13 +33,23 @@ int ObExternalFileWriter::open_file()
         || IntoFileLocation::REMOTE_COS == file_location_) {
       access_type = OB_STORAGE_ACCESS_BUFFERED_MULTIPART_WRITER;
     }
-    if (OB_FAIL(adapter.is_exist(url_, &access_info_, is_exist))) {
-      LOG_WARN("fail to check file exist", KR(ret), K(url_), K(access_info_));
+    if (OB_FAIL(adapter.is_exist(url_, access_info_, is_exist))) {
+      // When file object does not exist on hdfs then return OB_HDFS_PATH_NOT_FOUND.
+      if (IntoFileLocation::REMOTE_HDFS == file_location_ &&
+          OB_HDFS_PATH_NOT_FOUND == ret) {
+        ret = OB_SUCCESS;
+        is_exist = false;
+      } else {
+        LOG_WARN("fail to check file exist", KR(ret), K(url_), KPC(access_info_));
+      }
+    }
+
+    if (OB_FAIL(ret)) {
     } else if (is_exist) {
       ret = OB_FILE_ALREADY_EXIST;
       LOG_WARN("file already exist", KR(ret), K(url_), K(access_info_));
-    } else if (OB_FAIL(storage_appender_.open(&access_info_, url_, access_type))) {
-      LOG_WARN("fail to open file", KR(ret), K(url_), K(access_info_));
+    } else if (OB_FAIL(storage_appender_.open(access_info_, url_, access_type))) {
+      LOG_WARN("fail to open file", KR(ret), K(url_), KPC(access_info_));
     } else {
       is_file_opened_ = true;
     }
@@ -64,7 +73,7 @@ int ObExternalFileWriter::close_file()
       file_appender_.close();
     }
   } else if (OB_FAIL(storage_appender_.close())) {
-    LOG_WARN("fail to close storage appender", K(ret), K(url_), K(access_info_));
+    LOG_WARN("fail to close storage appender", K(ret), K(url_), KPC(access_info_));
   }
   if (OB_SUCC(ret)) {
     is_file_opened_ = false;
@@ -72,11 +81,27 @@ int ObExternalFileWriter::close_file()
   return ret;
 }
 
-int ObExternalFileWriter::close_data_writer()
+int ObExternalFileWriter::close_data_writer(bool need_retry)
 {
   int ret = OB_SUCCESS;
-  OZ(write_file());
-  OZ(close_file());
+  if (OB_FAIL(write_file())) {
+    LOG_WARN("failed to write file", K(ret));
+  }
+
+  bool is_delete = need_retry && is_file_opened_; // write_file可能会打开文件
+  if (OB_FAIL(ret)) {
+  } else if (is_delete && IntoFileLocation::SERVER_DISK != file_location_) {
+    OZ (storage_appender_.device_handle_->unlink(url_.ptr()));
+    LOG_TRACE("delete file for retry", K(ret), K(url_));
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(close_file())) {
+    LOG_WARN("failed to close file", K(ret));
+  } else if (is_delete && IntoFileLocation::SERVER_DISK == file_location_) {
+    OZ(common::FileDirectoryUtils::delete_file(url_.ptr()));
+    LOG_TRACE("delete file for retry", K(ret), K(url_));
+  }
   return ret;
 }
 
@@ -188,15 +213,30 @@ int ObCsvFileWriter::flush_to_storage(const char *data, int64_t data_len)
   } else if (!is_file_opened_ && OB_FAIL(open_file())) {
     LOG_WARN("failed to open file", K(ret), K(url_));
   } else {
+    int64_t begin_ts = ObTimeUtility::current_time();
     if (file_location_ == IntoFileLocation::SERVER_DISK) {
       if (OB_FAIL(file_appender_.append(data, data_len, false))) {
         LOG_WARN("failed to append file", K(ret), K(data_len));
+      } else {
+        write_offset_ += data_len;
+        int64_t end_ts = ObTimeUtility::current_time();
+        int64_t cost_time = end_ts - begin_ts;
+        long double speed = (cost_time <= 0) ? 0 :
+                        (long double) data_len * 1000.0 * 1000.0 / 1024.0 / 1024.0 / cost_time;
+        long double total_write = (long double) write_offset_ / 1024.0 / 1024.0;
+        _OB_LOG(TRACE, "write local stat, time:%ld write_size:%ld speed:%.2Lf MB/s total_write:%.2Lf MB",
+                cost_time, data_len, speed, total_write);
       }
     } else {
       int64_t write_size = 0;
-      int64_t begin_ts = ObTimeUtility::current_time();
-      if (OB_FAIL(storage_appender_.append(data, data_len, write_size))) {
-        LOG_WARN("fail to append data", KR(ret), KP(data), K(data_len), K(url_), K(access_info_));
+      const char *location = nullptr;
+      if (OB_FAIL(ObArrowUtil::get_location(file_location_, location))) {
+        LOG_WARN("fail to get locatiton", K(ret), K_(file_location));
+      } else if (OB_ISNULL(location)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid location string", K(ret));
+      } else if (OB_FAIL(storage_appender_.append(data, data_len, write_size))) {
+        LOG_WARN("fail to append data", KR(ret), KP(data), K(data_len), K(url_), KPC(access_info_));
       } else {
         write_offset_ += write_size;
         int64_t end_ts = ObTimeUtility::current_time();
@@ -204,7 +244,7 @@ int ObCsvFileWriter::flush_to_storage(const char *data, int64_t data_len)
         long double speed = (cost_time <= 0) ? 0 :
                         (long double) write_size * 1000.0 * 1000.0 / 1024.0 / 1024.0 / cost_time;
         long double total_write = (long double) write_offset_ / 1024.0 / 1024.0;
-        _OB_LOG(TRACE, "write oss stat, time:%ld write_size:%ld speed:%.2Lf MB/s total_write:%.2Lf MB",
+        _OB_LOG(TRACE, "write %s stat, time:%ld write_size:%ld speed:%.2Lf MB/s total_write:%.2Lf MB", location,
                 cost_time, write_size, speed, total_write);
       }
     }
@@ -261,6 +301,25 @@ int64_t ObCsvFileWriter::get_curr_bytes_exclude_curr_line()
   return curr_bytes_exclude_curr_line;
 }
 
+int64_t ObCsvFileWriter::get_curr_file_pos()
+{
+  int64_t curr_bytes = 0;
+  if (has_compress_) {
+    if (compress_stream_writer_ == NULL) {
+      // do nothing
+    } else {
+      curr_bytes = get_compress_stream_writer()->get_write_bytes();
+    }
+  } else {
+    if (IntoFileLocation::SERVER_DISK != file_location_) { //OSS,COS,S3
+      curr_bytes = storage_appender_.offset_;
+    } else { // local disk
+      curr_bytes = file_appender_.get_buffered_file_pos();
+    }
+  }
+  return curr_bytes;
+}
+
 int ObParquetFileWriter::open_parquet_file_writer(ObArrowMemPool &arrow_alloc,
                                                   const int64_t &row_group_size,
                                                   const int64_t &compress_type_index,
@@ -274,6 +333,7 @@ int ObParquetFileWriter::open_parquet_file_writer(ObArrowMemPool &arrow_alloc,
     builder.max_row_group_length(row_group_size);
     builder.compression(static_cast<parquet::Compression::type>(compress_type_index));
     builder.memory_pool(&arrow_alloc);
+    builder.enable_write_page_index();
     std::shared_ptr<ObParquetOutputStream> cur_file =
           std::make_shared<ObParquetOutputStream>(&file_appender_,
                                                   &storage_appender_,
@@ -450,7 +510,7 @@ int ObParquetFileWriter::write_file()
                                 parquet_row_def_levels_.at(col_idx),
                                 nullptr,
                                 reinterpret_cast<parquet::ByteArray*>(parquet_row_batch_.at(col_idx)));
-              estimated_bytes_ += writer->EstimatedBufferedValueBytes();
+              estimated_bytes_ += writer->estimated_buffered_value_bytes();
               break;
             }
             case parquet::Type::FIXED_LEN_BYTE_ARRAY:
@@ -460,7 +520,7 @@ int ObParquetFileWriter::write_file()
                                 parquet_row_def_levels_.at(col_idx),
                                 nullptr,
                                 reinterpret_cast<parquet::FixedLenByteArray*>(parquet_row_batch_.at(col_idx)));
-              estimated_bytes_ += writer->EstimatedBufferedValueBytes();
+              estimated_bytes_ += writer->estimated_buffered_value_bytes();
               break;
             }
             case parquet::Type::DOUBLE:
@@ -470,7 +530,7 @@ int ObParquetFileWriter::write_file()
                                 parquet_row_def_levels_.at(col_idx),
                                 nullptr,
                                 reinterpret_cast<double*>(parquet_row_batch_.at(col_idx)));
-              estimated_bytes_ += writer->EstimatedBufferedValueBytes();
+              estimated_bytes_ += writer->estimated_buffered_value_bytes();
               break;
             }
             case parquet::Type::FLOAT:
@@ -480,7 +540,7 @@ int ObParquetFileWriter::write_file()
                                 parquet_row_def_levels_.at(col_idx),
                                 nullptr,
                                 reinterpret_cast<float*>(parquet_row_batch_.at(col_idx)));
-              estimated_bytes_ += writer->EstimatedBufferedValueBytes();
+              estimated_bytes_ += writer->estimated_buffered_value_bytes();
               break;
             }
             case parquet::Type::INT32:
@@ -490,7 +550,7 @@ int ObParquetFileWriter::write_file()
                                 parquet_row_def_levels_.at(col_idx),
                                 nullptr,
                                 reinterpret_cast<int32_t*>(parquet_row_batch_.at(col_idx)));
-              estimated_bytes_ += writer->EstimatedBufferedValueBytes();
+              estimated_bytes_ += writer->estimated_buffered_value_bytes();
               break;
             }
             case parquet::Type::INT64:
@@ -500,7 +560,7 @@ int ObParquetFileWriter::write_file()
                                 parquet_row_def_levels_.at(col_idx),
                                 nullptr,
                                 reinterpret_cast<int64_t*>(parquet_row_batch_.at(col_idx)));
-              estimated_bytes_ += writer->EstimatedBufferedValueBytes();
+              estimated_bytes_ += writer->estimated_buffered_value_bytes();
               break;
             }
             case parquet::Type::INT96:
@@ -510,7 +570,7 @@ int ObParquetFileWriter::write_file()
                                 parquet_row_def_levels_.at(col_idx),
                                 nullptr,
                                 reinterpret_cast<parquet::Int96*>(parquet_row_batch_.at(col_idx)));
-              estimated_bytes_ += writer->EstimatedBufferedValueBytes();
+              estimated_bytes_ += writer->estimated_buffered_value_bytes();
               break;
             }
             default:
@@ -555,8 +615,34 @@ int ObParquetFileWriter::close_file()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("caught exception when close parquet file", K(ret), K(url_));
   }
-  if (OB_SUCC(ret) && OB_FAIL(ObExternalFileWriter::close_file())) {
-    LOG_WARN("failed to close file", K(ret));
+  if (OB_SUCC(ret) && share::ObLakeTableFormat::ICEBERG == lake_table_format_) {
+    OZ(get_datafile_generator().generate_datafile(storage_appender_,
+                                                  url_,
+                                                  record_count_,
+                                                  iceberg::DataFileFormat::PARQUET));
+  }
+  OX(reset_record_count());
+  OZ(ObExternalFileWriter::close_file());
+  return ret;
+}
+
+int ObIcebergDataGenerator::generate_datafile(const ObStorageAppender& storage_appender,
+                                              const ObString& url,
+                                              int record_count,
+                                              iceberg::DataFileFormat file_format)
+{
+  int ret = OB_SUCCESS;
+  iceberg::DataFile* data_file = OB_NEWx(iceberg::DataFile, &datafile_allocator_, datafile_allocator_);
+  if (OB_ISNULL(data_file)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate memory for data file", K(ret));
+  } else {
+    data_file->content = iceberg::DataFileContent::DATA;
+    data_file->file_format = file_format;
+    data_file->record_count = record_count;
+    data_file->file_size_in_bytes = storage_appender.offset_; // iceberg不写server disk
+    OZ(ob_write_string(datafile_allocator_, url, data_file->file_path, true));
+    OZ(data_files_.push_back(data_file));
   }
   return ret;
 }
@@ -658,9 +744,14 @@ int ObOrcFileWriter::close_file()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("caught exception when close parquet file", K(ret), K(url_));
   }
-  if (OB_SUCC(ret) && OB_FAIL(ObExternalFileWriter::close_file())) {
-    LOG_WARN("failed to close file", K(ret));
+  if (share::ObLakeTableFormat::ICEBERG == lake_table_format_) {
+    OZ(get_datafile_generator().generate_datafile(storage_appender_,
+                                                  url_,
+                                                  record_count_,
+                                                  iceberg::DataFileFormat::ORC));
   }
+  OX(reset_record_count());
+  OZ(ObExternalFileWriter::close_file());
   return ret;
 }
 

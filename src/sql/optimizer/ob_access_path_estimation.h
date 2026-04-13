@@ -97,6 +97,11 @@ public:
                                ObBaseTableEstMethod &method);
   static int inner_estimate_index_merge_rowcount(common::ObIArray<IndexMergePath *> &paths,
                                                  ObBaseTableEstMethod &method);
+  static int estimate_one_index_merge_node(const ObIndexMergeNode *node,
+                                           const OptSelectivityCtx *sel_ctx,
+                                           double &selectivity,
+                                           double &sum_child_sel,
+                                           double &sum_child_row);
   static int inner_estimate_rowcount(ObOptimizerContext &ctx,
                                       common::ObIArray<AccessPath *> &paths,
                                       const bool is_inner_path,
@@ -159,6 +164,7 @@ private:
                                     common::ObIArray<AccessPath*> &paths,
                                     const ObIArray<ObRawExpr*> &filter_exprs,
                                     const ObBaseTableEstMethod &valid_methods,
+                                    const ObBaseTableEstMethod &hint_specify_methods,
                                     ObBaseTableEstMethod& method);
 
   static int do_estimate_rowcount(ObOptimizerContext &ctx,
@@ -190,9 +196,11 @@ private:
   static int process_table_default_estimation(ObOptimizerContext &ctx, ObIArray<AccessPath *> &path);
 
   /// following functions are mainly uesd by statistics estimation
-  static int process_statistics_estimation(AccessPath *path);
+  static int process_statistics_estimation(ObOptimizerContext &ctx,
+                                           AccessPath *path);
 
-  static int process_statistics_estimation(ObIArray<AccessPath *> &paths);
+  static int process_statistics_estimation(ObOptimizerContext &ctx,
+                                           ObIArray<AccessPath *> &paths);
 
   /// following functions are mainly used by storage estimation
   static int process_storage_estimation(ObOptimizerContext &ctx,
@@ -230,7 +238,8 @@ private:
                                                    const ObCandiTabletLocIArray &index_partitions,
                                                    EstResultHelper &result_helper);
 
-  static int process_storage_estimation_result(ObIArray<ObBatchEstTasks *> &tasks,
+  static int process_storage_estimation_result(ObOptimizerContext &ctx,
+                                               ObIArray<ObBatchEstTasks *> &tasks,
                                                ObIArray<EstResultHelper> &result_helpers,
                                                bool &is_reliable);
 
@@ -239,6 +248,8 @@ private:
                                int64_t &idx);
 
   static int choose_storage_estimation_partitions(const int64_t partition_limit,
+                                                  share::schema::ObSchemaGetterGuard *schema_guard,
+                                                  const uint64_t table_id,
                                                   const ObCandiTabletLocIArray &partitions,
                                                   ObCandiTabletLocIArray &chosen_partitions);
   static int choose_storage_estimation_ranges(const int64_t range_limit,
@@ -268,13 +279,9 @@ private:
                                         int64_t skip_scan_offset,
                                         ObIArray<ObRawExpr*> &prefix_exprs);
 
-  static int update_use_skip_scan(ObCostTableScanInfo &est_cost_info,
-                                  ObIArray<ObExprSelPair> &all_predicate_sel,
-                                  OptSkipScanState &use_skip_scan);
+  static int update_use_skip_scan(AccessPath &path);
 
-  static int reset_skip_scan_info(ObCostTableScanInfo &est_cost_info,
-                                  ObIArray<ObExprSelPair> &all_predicate_sel,
-                                  OptSkipScanState &use_skip_scan);
+  static int reset_skip_scan_info(AccessPath &path);
 
   static int do_storage_estimation(ObOptimizerContext &ctx,
                                    ObBatchEstTasks &tasks);
@@ -312,7 +319,10 @@ private:
       bool new_range_with_exec_param,
       ObCostTableScanInfo &est_cost_info);
 
-  static int fill_cost_table_scan_info(ObCostTableScanInfo &est_cost_info);
+  static int fill_cost_table_scan_info(ObOptimizerContext &ctx,
+                                       ObCostTableScanInfo &est_cost_info);
+
+  static void fill_batch_type_info(ObCostTableScanInfo &est_cost_info);
 
   static int get_key_ranges(ObOptimizerContext &ctx,
                             ObIAllocator &allocator,
@@ -371,13 +381,25 @@ private:
                                                         bool &no_ds_data);
   static int update_table_stat_info_by_default(AccessPath *path);
 
-  static int estimate_path_rowcount_by_dynamic_sampling(const uint64_t table_id,
+  static int estimate_path_rowcount_by_dynamic_sampling(ObOptimizerContext &ctx,
+                                                        const uint64_t table_id,
                                                         ObIArray<AccessPath *> &paths,
                                                         ObIArray<ObDSResultItem> &ds_result_items);
+  static int process_ds_result(const OptTableMetas &table_metas,
+                               const OptSelectivityCtx &ctx,
+                               ObIArray<ObDSResultItem> &ds_result_items,
+                               uint64_t index_id,
+                               ObDSResultItemType type,
+                               ObIArray<ObExprSelPair> &all_predicate_sel,
+                               const double query_block_sample_ratio,
+                               const double total_rowcnt,
+                               double &filter_rowcnt,
+                               double &filter_sel);
   static int process_non_ds_filters(const OptTableMetas &table_metas,
                                     const OptSelectivityCtx &ctx,
                                     const ObDSResultItem &result_item,
-                                    double &selectivity,
+                                    double &total_sel,
+                                    double &non_ds_sel,
                                     ObIArray<ObExprSelPair> &all_predicate_sel);
   static int classify_paths(common::ObIArray<AccessPath *> &paths,
                             common::ObIArray<AccessPath *> &normal_paths,
@@ -448,6 +470,9 @@ public:
   ObSEArray<ObObjectID, 32> used_level_one_part_ids_;
   bool all_partition_is_valid_;
 };
+
+// Helper function to revise NDV (Number of Distinct Values)
+inline double revise_ndv(double ndv) { return ndv < 1.0 ? 1.0 : ndv; }
 
 }
 }

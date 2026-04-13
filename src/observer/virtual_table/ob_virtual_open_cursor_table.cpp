@@ -141,8 +141,7 @@ bool ObVirtualOpenCursorTable::FillScanner::operator()(sql::ObSQLSessionMgr::Key
     if (sess_info->is_shadow()) {
       //this session info is logical free, shouldn't be added to scanner
     } else if ((OB_SYS_TENANT_ID == my_session_->get_priv_tenant_id())
-        || (sess_info->get_priv_tenant_id() == my_session_->get_priv_tenant_id()
-            && my_session_->get_user_id() == sess_info->get_user_id())) {
+        || (sess_info->get_priv_tenant_id() == my_session_->get_priv_tenant_id())) {
       ObSQLSessionInfo::LockGuard lock_guard(sess_info->get_thread_data_lock());
       OZ (fill_cur_plan_cell(*sess_info));
       for (sql::ObSQLSessionInfo::CursorCache::CursorMap::iterator iter =
@@ -168,6 +167,8 @@ bool ObVirtualOpenCursorTable::FillScanner::operator()(sql::ObSQLSessionMgr::Key
           // ignore ret
           SERVER_LOG(WARN, "get a NULL cursor when record for v$open_cursor.");
         } else if (!cursor_info->isopen()) { //cursor does not open now, skip it
+        } else if (CURSOR_MAGIC_NUM != cursor_info->get_magic_num()) {
+          SERVER_LOG(WARN, "cursor magic num is not expected", K(cursor_info->get_magic_num()));
         } else {
           OZ (fill_cursor_cell(*sess_info, cursor_info, false));
         }

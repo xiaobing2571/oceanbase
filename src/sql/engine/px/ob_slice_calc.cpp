@@ -15,6 +15,8 @@
 #include "sql/engine/px/ob_px_util.h"
 #include "sql/engine/px/ob_slice_calc.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
+#include "observer/ob_server_struct.h"
+#include "share/schema/ob_schema_getter_guard.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -442,6 +444,68 @@ int ObRepartSliceIdxCalc::get_previous_row_tablet_id(ObObj &tablet_id)
   return ret;
 }
 
+int ObRepartSliceIdxCalc::check_partition_map_and_schema_match(bool &match)
+{
+  int ret = OB_SUCCESS;
+  match = true;
+  // Check if all tablet_ids in the map exist in the current table_schema.
+  // If all exist, it means the map is based on the current schema (or compatible),
+  // If some don't exist, it means schema has changed (e.g., concurrent truncate),
+  const ObPxPartChMapTMArray &part_ch_array = part_ch_info_.part_ch_array_;
+  if (OB_LIKELY(part_ch_array.size() > 0)) {
+    ObSEArray<ObTabletID, 64> schema_tablet_ids;
+    hash::ObHashSet<int64_t> schema_tablet_set;
+
+    if (OB_FAIL(table_schema_.get_tablet_ids(schema_tablet_ids))) {
+      LOG_WARN("fail to get tablet ids", K(ret));
+    } else if (OB_FAIL(schema_tablet_set.create(schema_tablet_ids.count()))) {
+      LOG_WARN("fail to create schema tablet set", K(ret));
+    } else {
+      for (int64_t i = 0; i < schema_tablet_ids.count() && OB_SUCC(ret); ++i) {
+        int64_t schema_tablet_id = schema_tablet_ids.at(i).id();
+        if (OB_FAIL(schema_tablet_set.set_refactored(schema_tablet_id))) {
+          LOG_WARN("fail to set refactored", K(ret));
+        }
+      }
+    }
+    // Check if all tablet_ids in map exist in current schema
+    if (OB_SUCC(ret)) {
+      for (int64_t i = 0; i < part_ch_array.size() && match && OB_SUCC(ret); ++i) {
+        int64_t map_tablet_id = part_ch_array.at(i).first_;
+        if (map_tablet_id > 0) {
+          ret = schema_tablet_set.exist_refactored(map_tablet_id);
+          if (OB_HASH_EXIST == ret) {
+            ret = OB_SUCCESS;
+          } else if (OB_HASH_NOT_EXIST == ret) {
+            match = false;
+            ret = OB_SUCCESS;
+            LOG_WARN("tablet id not exist in schema", K(ret), K(map_tablet_id));
+          } else {
+            LOG_WARN("fail to check exist", K(ret), K(map_tablet_id));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObRepartSliceIdxCalc::check_schema_not_match()
+{
+  int ret = OB_SUCCESS;
+  bool schema_match = true;
+  if (schema_consist_checked_) {
+    // do nothing
+  } else if (OB_FAIL(check_partition_map_and_schema_match(schema_match))) {
+    LOG_WARN("check partition map and schema match", K(ret));
+  } else if (!schema_match) {
+    ret = OB_ERR_WAIT_REMOTE_SCHEMA_REFRESH;
+  } else {
+    schema_consist_checked_ = true;
+  }
+  return ret;
+}
+
 int ObSlaveMapRepartIdxCalcBase::init(uint64_t tenant_id)
 {
   int ret = OB_SUCCESS;
@@ -543,19 +607,10 @@ int ObSlaveMapPkeyRandomIdxCalc::get_slice_indexes_inner(const ObIArray<ObExpr*>
     LOG_WARN("failed to get partition id", K(ret));
   } else if (OB_FAIL(get_task_idx_by_tablet_id(tablet_id, slice_idx_array.at(0)))) {
     if (OB_HASH_NOT_EXIST == ret) {
-      if (tablet_id <= 0) {
-        // tablet_id <= means this row matches no partition
-        ret = OB_NO_PARTITION_FOR_GIVEN_VALUE;
+      if (OB_FAIL(check_schema_not_match())) {
+        LOG_WARN("schema not match", K(ret));
       } else {
-        // there are two scenarios tablet_id > 0.
-        // 1. insert into t partition (p0) select * from t partition (p1).
-        //    tablet_id equals to tablet id of p1 but the map only contains tablet id of p0.
-        // 2. insert into t and truncate t concurrently. truncate t will make t maps to a new group of tablets.
-        // It's hard to distinct these two scenarios, so we report OB_NO_PARTITION_FOR_GIVEN_VALUE_SCHEMA_ERROR.
-        // The retry policy of OB_NO_PARTITION_FOR_GIVEN_VALUE_SCHEMA_ERROR is same as OB_SCHEMA_ERROR.
-        // As a result, if schema has changed, this query will be retried.
-        // Otherwise, an error will be reported to the client.
-        ret = OB_NO_PARTITION_FOR_GIVEN_VALUE_SCHEMA_ERROR;
+        ret = OB_NO_PARTITION_FOR_GIVEN_VALUE;
       }
       LOG_WARN("can't get the right partition", K(ret), K(tablet_id), K(slice_idx_array.at(0)), K(repart_type_));
     }
@@ -580,12 +635,20 @@ int ObSlaveMapPkeyRandomIdxCalc::get_slice_idx_batch_inner(const ObIArray<ObExpr
     LOG_WARN("get tablet ids failed", K(ret));
   } else {
     for (int64_t i = 0; i < batch_size && OB_SUCC(ret); i++) {
+      if (skip.at(i)) {
+        continue;
+      }
       if (OB_FAIL(get_task_idx_by_tablet_id(tablet_ids_[i], slice_indexes_[i]))) {
         if (OB_HASH_NOT_EXIST == ret) {
-          if (tablet_ids_[i] <= 0) {
-            ret = OB_NO_PARTITION_FOR_GIVEN_VALUE;
+          if (tablet_ids_[i] <= 0 && table_schema_.is_interval_part()) {
+            // interval partition is not supported to add partition by pdml, so change error code here
+            ret = OB_NOT_SUPPORTED;
+            LOG_WARN("add partition by pdml in interval partition table is not supported", K(ret));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "add partition by pdml in interval partition table is");
+          } else if (OB_FAIL(check_schema_not_match())) {
+            LOG_WARN("schema not match", K(ret));
           } else {
-            ret = OB_NO_PARTITION_FOR_GIVEN_VALUE_SCHEMA_ERROR;
+            ret = OB_NO_PARTITION_FOR_GIVEN_VALUE;
           }
           LOG_WARN("can't get the right partition", K(ret), K(tablet_ids_[i]), K(repart_type_));
         }
@@ -643,15 +706,21 @@ int ObAffinitizedRepartSliceIdxCalc::get_slice_indexes_inner(const ObIArray<ObEx
   } else if (OB_FAIL(ObRepartSliceIdxCalc::get_tablet_id<USE_VEC>(eval_ctx, tablet_id, skip))) {
     LOG_WARN("fail to get partition id", K(ret));
   } else if (OB_FAIL(px_repart_ch_map_.get_refactored(tablet_id, slice_idx_array.at(0)))) {
-    if (OB_HASH_NOT_EXIST == ret && unmatch_row_dist_method_ == ObPQDistributeMethod::DROP) {
+    int tmp_ret = ret;
+    if (OB_HASH_NOT_EXIST != ret) {
+      LOG_WARN("get refactored failed", K(ret));
+    } else if (OB_TMP_FAIL(check_schema_not_match())) {
+      ret = tmp_ret;
+      LOG_WARN("schema not match", K(ret));
+    } else if (unmatch_row_dist_method_ == ObPQDistributeMethod::DROP) {
       slice_idx_array.at(0) = ObSliceIdxCalc::DEFAULT_CHANNEL_IDX_TO_DROP_ROW;
       ret = OB_SUCCESS;
-    } else if (OB_HASH_NOT_EXIST == ret && unmatch_row_dist_method_ == ObPQDistributeMethod::RANDOM) {
+    } else if (unmatch_row_dist_method_ == ObPQDistributeMethod::RANDOM) {
       slice_idx_array.at(0) = round_robin_idx_;
       round_robin_idx_++;
       round_robin_idx_ = round_robin_idx_ % task_count_;
       ret = OB_SUCCESS;
-    } else if (OB_HASH_NOT_EXIST == ret && unmatch_row_dist_method_ == ObPQDistributeMethod::HASH) {
+    } else if (unmatch_row_dist_method_ == ObPQDistributeMethod::HASH) {
       ObHashSliceIdCalc slice_id_calc(exec_ctx_.get_allocator(), task_count_,
                                       ObNullDistributeMethod::NONE, hash_dist_exprs_, hash_funcs_,
                                       fast_calc_hash_slice_);
@@ -704,17 +773,21 @@ int ObAffinitizedRepartSliceIdxCalc::get_slice_idx_batch_inner(const ObIArray<Ob
       }
       batch_info_guard.set_batch_idx(i);
       if (OB_FAIL(px_repart_ch_map_.get_refactored(tablet_ids_[i], slice_indexes_[i]))) {
-        if (OB_HASH_NOT_EXIST == ret && unmatch_row_dist_method_ == ObPQDistributeMethod::DROP) {
+        int tmp_ret = ret;
+        if (OB_HASH_NOT_EXIST != ret) {
+          LOG_WARN("get refactored failed", K(ret));
+        } else if (OB_TMP_FAIL(check_schema_not_match())) {
+          ret = tmp_ret;
+          LOG_WARN("schema not match", K(ret));
+        } else if (unmatch_row_dist_method_ == ObPQDistributeMethod::DROP) {
           slice_indexes_[i] = ObSliceIdxCalc::DEFAULT_CHANNEL_IDX_TO_DROP_ROW;
           ret = OB_SUCCESS;
-        } else if (OB_HASH_NOT_EXIST == ret
-                   && unmatch_row_dist_method_ == ObPQDistributeMethod::RANDOM) {
+        } else if (unmatch_row_dist_method_ == ObPQDistributeMethod::RANDOM) {
           slice_indexes_[i] = round_robin_idx_;
           round_robin_idx_++;
           round_robin_idx_ = round_robin_idx_ % task_count_;
           ret = OB_SUCCESS;
-        } else if (OB_HASH_NOT_EXIST == ret
-                   && unmatch_row_dist_method_ == ObPQDistributeMethod::HASH) {
+        } else if (unmatch_row_dist_method_ == ObPQDistributeMethod::HASH) {
           ObHashSliceIdCalc slice_id_calc(exec_ctx_.get_allocator(), task_count_,
                                           null_row_dist_method_,
                                           hash_dist_exprs_, hash_funcs_,
@@ -1105,9 +1178,13 @@ int ObHashSliceIdCalc::calc_slice_idx<true>(ObEvalCtx &eval_ctx, int64_t slice_s
   int64_t batch_size = eval_ctx.get_batch_size();
   EvalBound eval_bound(batch_size, batch_idx, batch_idx + 1, all_rows_active);
   for (int64_t i = 0; OB_SUCC(ret) && i < n_keys_; ++i) {
+    bool skip_hash_calc = false;
     const ObExpr* dist_expr = hash_dist_exprs_->at(i);
     LOG_DEBUG("[VEC2.0 PX]calc hash slice idx", KPC(dist_expr));
-    if (OB_FAIL(dist_expr->eval_vector(eval_ctx, *skip, eval_bound))) {
+    if (OB_FAIL(check_skipping_dup_expr_hash_calc(eval_ctx, *skip, eval_bound, dist_expr, skip_hash_calc))) {
+      LOG_WARN("failed to check skipping dup expr hash calc", K(ret));
+    } else if (skip_hash_calc) {
+    } else if (OB_FAIL(dist_expr->eval_vector(eval_ctx, *skip, eval_bound))) {
       LOG_WARN("eval vector failed", K(ret));
     } else {
       ObIVector *vec = dist_expr->get_vector(eval_ctx);
@@ -1182,8 +1259,12 @@ int ObHashSliceIdCalc::calc_hash_value<true>(ObEvalCtx &eval_ctx, uint64_t &hash
     const int64_t batch_size = eval_ctx.get_batch_size();
     EvalBound bound(batch_size, batch_idx, batch_idx + 1, false);
     for (int64_t i = 0; OB_SUCC(ret) && i < n_keys_; ++i) {
+      bool skip_hash_calc = false;
       const ObExpr* dist_expr = hash_dist_exprs_->at(i);
-      if (OB_FAIL(dist_expr->eval_vector(eval_ctx, *skip, bound))) {
+      if (OB_FAIL(check_skipping_dup_expr_hash_calc(eval_ctx, *skip, bound, dist_expr, skip_hash_calc))) {
+        LOG_WARN("failed to check skipping dup expr hash calc", K(ret));
+      } else if (skip_hash_calc) {
+      } else if (OB_FAIL(dist_expr->eval_vector(eval_ctx, *skip, bound))) {
         LOG_WARN("eval vector failed", K(ret));
       } else {
         ObIVector *vec = dist_expr->get_vector(eval_ctx);
@@ -1337,9 +1418,12 @@ int ObHashSliceIdCalc::get_slice_idx_batch_inner<true>(const ObIArray<ObExpr*> &
       }
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < n_keys_; i++) {
+      bool skip_hash_calc = false;
       ObExpr *e = hash_dist_exprs_->at(i);
       const bool is_batch_seed = i > 0;
-      if (OB_FAIL(e->eval_vector(eval_ctx, skip, eval_bound))) {
+      if (OB_FAIL(check_skipping_dup_expr_hash_calc(eval_ctx, skip, eval_bound, e, skip_hash_calc))) {
+      } else if (skip_hash_calc) {
+      } else if (OB_FAIL(e->eval_vector(eval_ctx, skip, eval_bound))) {
         LOG_WARN("eval batch failed", K(ret));
       } else if (FALSE_IT(vec = e->get_vector(eval_ctx))) {
       } else if (OB_FAIL(vec->murmur_hash_v3(*e, hash_val, skip, eval_bound,
@@ -1400,6 +1484,42 @@ int ObHashSliceIdCalc::get_slice_idx_batch_inner<true>(const ObIArray<ObExpr*> &
       LOG_TRACE("[VEC2.0] hash slice calc", K(ObArrayWrap<int64_t>(indexes, batch_size)));
     }
   }
+  return ret;
+}
+
+int ObHashSliceIdCalc::check_skipping_dup_expr_hash_calc(ObEvalCtx &eval_ctx, const ObBitVector &skip,
+                                                        const EvalBound &bound, const ObExpr *calc_expr,
+                                                        bool &skip_hash_calc)
+{
+  int ret = OB_SUCCESS;
+  skip_hash_calc = false;
+  if (!should_skip_dup_expr_hash_by_aggr_code()) {
+  } else if (OB_UNLIKELY(bound.range_size() <= 0)) {
+    // do nothing
+  } else if (OB_FAIL(aggr_code_expr_->eval_vector(eval_ctx, skip, bound))) {
+    LOG_WARN("failed to eval aggr code expr", K(ret));
+  } else {// all  aggr code must be same
+    int64_t aggr_code = -1;
+    for (int i = bound.start(); i < bound.end(); i++) {
+      if (skip.at(i)) {
+      } else {
+        aggr_code = aggr_code_expr_->get_vector(eval_ctx)->get_int(i);
+        break;
+      }
+    }
+    if (OB_UNLIKELY(aggr_code == -1 || aggr_code >= dup_expr_list_->count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected status: aggr code is invalid", K(ret));
+    } else {
+      for (int i = 0; i < dup_expr_list_->count(); i++) {
+        if (calc_expr == dup_expr_list_->at(i)) {
+          skip_hash_calc = (i != aggr_code);
+          break;
+        }
+      }
+    }
+  }
+
   return ret;
 }
 
@@ -1720,9 +1840,13 @@ int ObSlaveMapPkeyHashIdxCalc::get_slice_indexes_inner(const ObIArray<ObExpr*> &
     LOG_WARN("the size of part task channel map is zero", K(ret));
   } else if (OB_FAIL(ObRepartSliceIdxCalc::get_tablet_id<USE_VEC>(eval_ctx, tablet_id, skip))) {
     LOG_WARN("failed to get partition id", K(ret));
-  } else if (OB_FAIL(get_task_idx_by_tablet_id(eval_ctx, tablet_id, slice_idx_array.at(0)))) {
+  } else if (OB_FAIL(get_task_idx_by_tablet_id<USE_VEC>(eval_ctx, tablet_id, slice_idx_array.at(0), skip))) {
     if (OB_HASH_NOT_EXIST == ret) {
-      if (unmatch_row_dist_method_ == ObPQDistributeMethod::DROP) {
+      int tmp_ret = ret;
+      if (OB_TMP_FAIL(check_schema_not_match())) {
+        ret = tmp_ret;
+        LOG_WARN("schema not match", K(ret));
+      } else if (unmatch_row_dist_method_ == ObPQDistributeMethod::DROP) {
         slice_idx_array.at(0) = ObSliceIdxCalc::DEFAULT_CHANNEL_IDX_TO_DROP_ROW;
         ret = OB_SUCCESS;
       } else if (unmatch_row_dist_method_ == ObPQDistributeMethod::RANDOM) {
@@ -1734,27 +1858,32 @@ int ObSlaveMapPkeyHashIdxCalc::get_slice_indexes_inner(const ObIArray<ObExpr*> &
       } else if (unmatch_row_dist_method_ == ObPQDistributeMethod::HASH) {
         const ObPxPartChMapTMArray &part_ch_array = part_ch_info_.part_ch_array_;
         int64_t hash_idx = 0;
-        if (OB_FAIL(hash_calc_.calc_slice_idx<false>(eval_ctx, part_ch_array.count(), hash_idx))) {
+        if (OB_FAIL(hash_calc_.calc_slice_idx<USE_VEC>(eval_ctx, part_ch_array.count(), hash_idx, skip))) {
           LOG_WARN("fail calc hash value", K(ret));
         } else if (ObSliceIdxCalc::DEFAULT_CHANNEL_IDX_TO_DROP_ROW == hash_idx) {
           slice_idx_array.at(0) = ObSliceIdxCalc::DEFAULT_CHANNEL_IDX_TO_DROP_ROW;
         } else {
           slice_idx_array.at(0) = part_ch_array.at(hash_idx).second_;
         }
+      } else if (tablet_id <= 0 && table_schema_.is_interval_part()) {
+        // interval partition is not supported to add partition by pdml, so change error code here
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("add partition by pdml in interval partition table is not supported", K(ret));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "add partition by pdml in interval partition table is");
       } else {
-        // 没有找到对应的分区，返回OB_NO_PARTITION_FOR_GIVEN_VALUE
         ret = OB_NO_PARTITION_FOR_GIVEN_VALUE;
-        LOG_WARN("can't get the right partition", K(ret), K(tablet_id),
-                 K(unmatch_row_dist_method_));
+        LOG_WARN("can't get the right partition", K(ret), K(tablet_id), K(unmatch_row_dist_method_));
       }
     }
   }
   return ret;
 }
 //TODO:shanting2.0 实现pkey hash的向量化1.0和2.0接口
+template <bool USE_VEC>
 int ObSlaveMapPkeyHashIdxCalc::get_task_idx_by_tablet_id(ObEvalCtx &eval_ctx,
                                                          int64_t tablet_id,
-                                                         int64_t &task_idx)
+                                                         int64_t &task_idx,
+                                                         ObBitVector *skip)
 {
   int ret = OB_SUCCESS;
   int64_t hash_idx = 0;
@@ -1769,7 +1898,10 @@ int ObSlaveMapPkeyHashIdxCalc::get_task_idx_by_tablet_id(ObEvalCtx &eval_ctx,
     } else if (task_idx_array->count() <= 0){
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("the size of task idx array is zero", K(ret));
-    } else if (OB_FAIL(hash_calc_.calc_slice_idx<false>(eval_ctx, task_idx_array->count(), hash_idx))) {
+    } else if (OB_FAIL(hash_calc_.calc_slice_idx<USE_VEC>(eval_ctx,
+                                                          task_idx_array->count(),
+                                                          hash_idx,
+                                                          skip))) {
       LOG_WARN("fail calc hash value", K(ret));
     } else if (ObSliceIdxCalc::DEFAULT_CHANNEL_IDX_TO_DROP_ROW == hash_idx) {
       task_idx = ObSliceIdxCalc::DEFAULT_CHANNEL_IDX_TO_DROP_ROW;

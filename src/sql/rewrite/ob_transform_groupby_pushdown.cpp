@@ -241,6 +241,7 @@ int ObTransformGroupByPushdown::check_push_down_into_union_validity(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("stmt is null", K(ret), K(stmt));
   } else if (stmt->has_rollup() ||
+             stmt->has_grouping_sets() ||
              stmt->get_aggr_item_size() <= 0 ||
              stmt->is_hierarchical_query()) {
     is_valid = false;
@@ -369,8 +370,7 @@ int ObTransformGroupByPushdown::check_aggr_exprs_valid(ObSelectStmt &stmt,
                  T_FUN_COUNT == aggr_expr->get_expr_type()) {
         only_min_max = false;
       } else {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("invalid param of aggr func", K(ret), K(aggr_expr));
+        is_valid = false;
       }
     }
   }
@@ -438,12 +438,26 @@ int ObTransformGroupByPushdown::is_basic_select_stmt(ObSelectStmt *stmt, bool &i
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null", K(ret));
   } else if (stmt->has_limit() || stmt->has_group_by() || stmt->has_order_by() ||
-      stmt->has_window_function() || stmt->has_distinct() || stmt->has_rollup() ||
+      stmt->has_window_function() || stmt->has_distinct() || stmt->has_rollup() || stmt->has_grouping_sets() ||
       stmt->is_set_stmt() || stmt->is_hierarchical_query()) {
     is_basic = false;
   } else if (0 != stmt->get_aggr_item_size()) {
     is_basic = false;
-  } else { /* do nothing */ }
+  } else if (1 == stmt->get_from_item_size()) {
+    TableItem *table_item = stmt->get_table_item(stmt->get_from_item(0));
+    if (OB_ISNULL(table_item)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null", K(ret));
+    } else if (TableItem::TEMP_TABLE == table_item->type_) {
+      ObSelectStmt *ref_query = table_item->ref_query_;
+      if (OB_ISNULL(ref_query)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null", K(ret));
+      } else if (ref_query->has_group_by()) {
+        is_basic = false;
+      }
+    }
+  }
   return ret;
 }
 
@@ -1165,7 +1179,7 @@ int ObTransformGroupByPushdown::adjust_transform_types(uint64_t &transform_types
 {
   int ret = OB_SUCCESS;
   if (cost_based_trans_tried_) {
-    transform_types &= (~(1 << transformer_type_));
+    transform_types &= (~(1ULL << transformer_type_));
   }
   return ret;
 }
@@ -1175,7 +1189,7 @@ int ObTransformGroupByPushdown::check_push_down_into_join_validity(ObSelectStmt 
   int ret = OB_SUCCESS;
   bool has_rownum = false;
   bool contain_inner_table = false;
-  bool contain_lateral_table = false;
+  bool contain_correlated_table = false;
   bool allow_distinct = false;
   ObSEArray<ObRawExpr *, 4> group_cols;
   bool is_enabled = ctx_->is_groupby_placement_enabled_;
@@ -1193,6 +1207,7 @@ int ObTransformGroupByPushdown::check_push_down_into_join_validity(ObSelectStmt 
     OPT_TRACE("do not rewrite inner table stmt with cost-based rule");
     // do not rewrite inner table stmt with cost-based rule
   } else if (stmt->has_rollup() ||
+             stmt->has_grouping_sets() ||
              stmt->get_semi_infos().count() > 0 ||
              stmt->get_subquery_exprs().count() > 0 ||
              stmt->get_aggr_item_size() <= 0 ||
@@ -1231,10 +1246,9 @@ int ObTransformGroupByPushdown::check_push_down_into_join_validity(ObSelectStmt 
     LOG_WARN("failed to check collation validity", K(ret));
   } else if (!is_valid) {
     // do nothing
-  } else if (OB_FAIL(ObTransformUtils::check_contain_correlated_lateral_table(stmt,
-                                                                              contain_lateral_table))) {
-    LOG_WARN("failed to check contain correlated lateral table", K(ret));
-  } else if (contain_lateral_table) {
+  } else if (OB_FAIL(ObTransformUtils::check_contain_correlated_table(stmt, contain_correlated_table))) {
+    LOG_WARN("failed to check contain correlated table", K(ret));
+  } else if (contain_correlated_table) {
     is_valid = false;
   } else if (OB_FAIL(is_push_through_cross_join_enabled(stmt, allow_distinct))) {
     LOG_WARN("failed to check support cross joins", K(ret));
@@ -2590,6 +2604,8 @@ int ObTransformGroupByPushdown::push_down_groupby_into_cross_join(
       if (OB_FAIL(ObRawExprUtils::create_double_op_expr(
           *ctx_->expr_factory_, ctx_->session_info_, T_OP_MUL,
           mul_expr, mul_expr, new_view_exprs.at(i)))) {
+      } else if (OB_FAIL(ObTransformUtils::add_cast_for_replace_if_need(*ctx_->expr_factory_, aggr_expr, mul_expr, ctx_->session_info_))) {
+        LOG_WARN("failed to add cast", K(ret));
       } else if (OB_FAIL(new_agg_exprs.push_back(mul_expr))) {
         LOG_WARN("failed to push_back to new_agg_exprs", K(ret));
       }
@@ -3280,15 +3296,14 @@ int ObTransformGroupByPushdown::construct_transform_hint(ObDMLStmt &stmt, void *
     LOG_WARN("failed to push back hint", K(ret));
   } else if (OB_FAIL(ctx_->add_used_trans_hint(get_hint(stmt.get_stmt_hint())))) {
     LOG_WARN("failed to add used trans hint", K(ret));
+  } else if (OB_FAIL(hint->get_tb_name_list().prepare_allocate(transed_tables->count()))) {
+    LOG_WARN("failed to prepare allocate", K(ret));
   } else {
     hint->set_qb_name(ctx_->src_qb_name_);
     for (int64_t i = 0; OB_SUCC(ret) && i < transed_tables->count(); ++i) {
-      ObHint::TablesInHint single_or_joined_hint_table;
       if (OB_FAIL(ObTransformUtils::get_sorted_table_hint(transed_tables->at(i),
-                                                          single_or_joined_hint_table))) {
+                                                          hint->get_tb_name_list().at(i)))) {
         LOG_WARN("failed to get table hint", K(ret));
-      } else if (OB_FAIL(hint->get_tb_name_list().push_back(single_or_joined_hint_table))) {
-        LOG_WARN("failed to push back table name list", K(ret));
       }
     }
   }

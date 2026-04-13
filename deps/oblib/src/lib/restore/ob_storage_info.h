@@ -22,6 +22,7 @@
 #include "lib/hash/ob_hashmap.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/string/ob_string.h"
+#include <type_traits>
 
 namespace oceanbase
 {
@@ -41,7 +42,7 @@ const int64_t OB_MAX_BACKUP_ENCRYPTKEY_LENGTH = OB_MAX_BACKUP_ACCESSKEY_LENGTH +
 const int64_t OB_MAX_BACKUP_SERIALIZEKEY_LENGTH = OB_MAX_BACKUP_ENCRYPTKEY_LENGTH * 2;
 // We have agreed with OCP that the maximum role_arn length shall not exceed 256
 static constexpr int64_t OB_MAX_ROLE_ARN_LENGTH = 256;
-// The limit on the maximum length of external_id in obs/cos/oss/s3 is 128
+// The limit on the maximum length of external_id in obs/oss/s3 is 128
 static constexpr int64_t OB_MAX_EXTERNAL_ID_LENGTH = 128;
 static constexpr int64_t OB_MAX_ASSUME_ROLE_JSON_DATA_LENGTH = 1024;
 // STS_AK and STS_SK are used to connect to STS service of OCP.
@@ -70,6 +71,7 @@ const char *const HOST = "host=";
 const char *const APPID = "appid=";
 const char *const DELETE_MODE = "delete_mode=";
 const char *const REGION = "s3_region=";
+const char* const SEPERATE_SYMBOL = "&";
 const char *const MAX_IOPS = "max_iops=";
 const char *const MAX_BANDWIDTH = "max_bandwidth=";
 const char *const ENABLE_WORM = "enable_worm=";
@@ -113,10 +115,10 @@ enum ObStorageChecksumType : uint8_t
 };
 
 bool is_oss_supported_checksum(const ObStorageChecksumType checksum_type);
-bool is_cos_supported_checksum(const ObStorageChecksumType checksum_type);
 bool is_s3_supported_checksum(const ObStorageChecksumType checksum_type);
-bool is_obdal_supported_checksum(const ObStorageChecksumType checksum_type);
+bool is_obdal_supported_checksum(const ObStorageType storage_type, const ObStorageChecksumType checksum_type);
 const char *get_storage_checksum_type_str(const ObStorageChecksumType &type);
+int get_storage_checksum_type(const char *checksum_type_str, ObStorageChecksumType &checksum_type);
 bool is_use_obdal();
 // [Extensions]
 //   load_data_* : sql/engine/cmd/ob_load_data_storage_info.h
@@ -172,11 +174,11 @@ struct ObObjectStorageCredential
   int64_t born_time_us_;
 };
 
-class ObClusterVersionBaseMgr
+class ObClusterStateBaseMgr
 {
 public:
-  ObClusterVersionBaseMgr() {}
-  virtual ~ObClusterVersionBaseMgr() {}
+  ObClusterStateBaseMgr(): enable_object_storage_async_io_(true), enable_obdal_(true), is_write_with_if_match_(false) {}
+  virtual ~ObClusterStateBaseMgr() {}
   virtual int is_supported_assume_version() const
   {
     return OB_SUCCESS;
@@ -185,11 +187,40 @@ public:
   {
     return OB_SUCCESS;
   };
-  static ObClusterVersionBaseMgr &get_instance()
+  virtual int is_supported_azblob_version() const
   {
-    static ObClusterVersionBaseMgr mgr;
+    return OB_SUCCESS;
+  }
+  virtual bool is_shared_storage_mode() const
+  {
+    return false;
+  }
+  virtual bool is_write_with_if_match() const { return is_write_with_if_match_; }
+  virtual bool is_enable_object_storage_async_io() const { return enable_object_storage_async_io_; }
+  virtual bool is_enable_obdal() const { return enable_obdal_; }
+  static ObClusterStateBaseMgr &get_instance()
+  {
+    static ObClusterStateBaseMgr mgr;
     return mgr;
   }
+public:
+  // for test
+  void set_enable_object_storage_async_io(const bool enable_object_storage_async_io)
+  {
+    enable_object_storage_async_io_ = enable_object_storage_async_io;
+  }
+
+  void set_enable_obdal(const bool enable_obdal)
+  {
+    enable_obdal_ = enable_obdal;
+  }
+
+  void set_is_write_with_if_match(const bool is_write_with_if_match) { is_write_with_if_match_ = is_write_with_if_match; }
+
+private:
+  bool enable_object_storage_async_io_;
+  bool enable_obdal_;
+  bool is_write_with_if_match_;
 };
 
 enum ObStorageDeleteMode: uint8_t
@@ -236,8 +267,9 @@ public:
   virtual int set(const common::ObStorageType device_type, const char *storage_info);
   virtual int set(const char *uri, const char *storage_info);
   virtual int assign(const ObObjectStorageInfo &storage_info);
+  virtual int clone(common::ObIAllocator &allocator, ObObjectStorageInfo *&storage_info) const;
   int reset_access_id_and_access_key(const char *access_id, const char *access_key);
-  static int register_cluster_version_mgr(ObClusterVersionBaseMgr *cluster_version_mgr);
+  static int register_cluster_state_mgr(ObClusterStateBaseMgr *cluster_version_mgr);
 
 public:
   int64_t hash() const;
@@ -250,8 +282,10 @@ public:
   const char *get_type_str() const;
   ObStorageChecksumType get_checksum_type() const;
   const char *get_checksum_type_str() const;
+  const char *get_extension() const { return extension_; }
 
   bool is_hdfs_storage() const { return OB_STORAGE_HDFS == device_type_; }
+  virtual bool is_backup_storage_info() const { return false; }
   bool is_enable_worm() const;
   bool is_assume_role_mode() const;
   virtual bool is_valid() const;
@@ -269,6 +303,7 @@ public:
 
   virtual int get_storage_info_str(char *storage_info, const int64_t info_len) const;
   virtual int to_account(ObStorageAccount &account) const;
+  bool is_write_with_if_match() const;
 
   TO_STRING_KV(K_(endpoint), K_(access_id), K_(extension), "type", get_type_str(),
       K_(checksum_type), K_(max_iops), K_(max_bandwidth), KP_(role_arn), KP_(external_id), K_(enable_worm));
@@ -283,6 +318,28 @@ protected:
   int set_addressing_model_(const char *addressing_model);
   int set_checksum_type_(const char *checksum_type_str);
 
+  template <typename T>
+  static int clone_impl_(ObIAllocator &allocator, const T &src, T *&dst)
+  {
+    static_assert(
+        std::is_base_of<ObObjectStorageInfo, T>::value,
+        "T must be ObObjectStorageInfo or its derived class");
+    int ret = OB_SUCCESS;
+    dst = nullptr;
+    if (OB_UNLIKELY(!src.is_valid())) {
+      ret = OB_INVALID_ARGUMENT;
+      OB_LOG(WARN, "src info is invalid", K(ret), K(src));
+    } else if (OB_ISNULL(dst = OB_NEWx(T, &allocator))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      OB_LOG(WARN, "fail to alloc dst", K(ret), K(src));
+    } else if (OB_FAIL(dst->assign(src))) {
+      OB_LOG(WARN, "fail to assign storage info", K(ret), K(src));
+      OB_DELETEx(T, &allocator, dst);
+      dst = nullptr;
+    }
+    return ret;
+  }
+
 public:
   // TODO: Rename device_type_ to storage_protocol_type_ for better clarity
   // Prefix in the storage_info string, such as 's3://', indicates the protocol used to access the
@@ -290,7 +347,7 @@ public:
   // to be an optional parameter
   common::ObStorageType device_type_;
   // Optional parameter. If not provided, the default value OB_MD5_ALGO will be used.
-  // For OSS/COS, OB_NO_CHECKSUM_ALGO indicates that no checksum algorithm will be used.
+  // For OSS, OB_NO_CHECKSUM_ALGO indicates that no checksum algorithm will be used.
   // For Object Storage Services accessed via the S3 protocol,
   // OB_NO_CHECKSUM_ALGO is not supported.
   ObStorageChecksumType checksum_type_;                                 // Repeated in extension_
@@ -307,7 +364,7 @@ public:
   char external_id_[OB_MAX_EXTERNAL_ID_LENGTH];                         // supported for assume role
   bool is_assume_role_mode_;
   bool enable_worm_;
-  static ObClusterVersionBaseMgr *cluster_version_mgr_;
+  static ObClusterStateBaseMgr *cluster_state_mgr_;
 };
 
 class ObTenantStsCredentialBaseMgr
@@ -456,20 +513,6 @@ public:
   bool update_access_time_us_;
   int64_t original_access_time_us_;
 };
-
-// @brief ObClusterEnableObdalConfigBase is used to check whether enable obdal or not.
-class ObClusterEnableObdalConfigBase
-{
-public:
-  ObClusterEnableObdalConfigBase() {};
-  virtual ~ObClusterEnableObdalConfigBase() {};
-  virtual bool is_enable_obdal() const { return true; }
-  static ObClusterEnableObdalConfigBase &get_instance() {
-    static ObClusterEnableObdalConfigBase instance;
-    return instance;
-  }
-};
-extern ObClusterEnableObdalConfigBase *cluster_enable_obdal_config;
 
 }
 }

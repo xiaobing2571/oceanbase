@@ -23,10 +23,10 @@ namespace oceanbase
 namespace sql
 {
 
-ObOptTabletLoc::ObOptTabletLoc()
+ObOptTabletLoc::ObOptTabletLoc(ObIAllocator &allocator)
     : partition_id_(OB_INVALID_INDEX),
       first_level_part_id_(OB_INVALID_INDEX),
-      replica_locations_("SqlOptimLocaCac", OB_MALLOC_NORMAL_BLOCK_SIZE)
+      replica_locations_(allocator)
 {
 }
 
@@ -83,8 +83,7 @@ int ObOptTabletLoc::assign_with_only_readable_replica(const ObObjectID &partitio
         LOG_WARN("check in black list failed", K(ret));
       } else if (!in_black_list) {
         if ((route_policy == COLUMN_STORE_ONLY && replica_loc.get_replica_type() != REPLICA_TYPE_COLUMNSTORE) ||
-            (route_policy != COLUMN_STORE_ONLY && replica_loc.get_replica_type() == REPLICA_TYPE_COLUMNSTORE) ||
-            (route_policy == FORCE_READONLY_ZONE && replica_loc.get_replica_type() != REPLICA_TYPE_READONLY)) {
+            (route_policy != COLUMN_STORE_ONLY && replica_loc.get_replica_type() == REPLICA_TYPE_COLUMNSTORE)) {
           // skip the tmp_replica_loc
           LOG_TRACE("skip the replica due to the replica policy.", K(ret), K(replica_loc));
         } else if (OB_FAIL(replica_locations_.push_back(replica_loc))) {
@@ -145,10 +144,11 @@ int ObOptTabletLoc::get_strong_leader(ObLSReplicaLocation &replica_location) con
   return get_strong_leader(replica_location, replica_idx);
 }
 
-ObCandiTabletLoc::ObCandiTabletLoc()
-  : opt_tablet_loc_(),
+ObCandiTabletLoc::ObCandiTabletLoc(ObIAllocator &allocator)
+  : opt_tablet_loc_(allocator),
     selected_replica_idx_(OB_INVALID_INDEX),
-    priority_replica_idxs_()
+    priority_replica_idxs_(allocator),
+    files_(allocator)
 {
 }
 
@@ -161,6 +161,7 @@ void ObCandiTabletLoc::reset()
   opt_tablet_loc_.reset();
   selected_replica_idx_ = OB_INVALID_INDEX;
   priority_replica_idxs_.reset();
+  files_.reset();
 }
 
 int ObCandiTabletLoc::assign(const ObCandiTabletLoc &other)
@@ -181,6 +182,8 @@ int ObCandiTabletLoc::assign(const ObCandiTabletLoc &other)
     LOG_WARN("fail to assign other opt_tablet_loc_", K(ret), K(other.opt_tablet_loc_));
   } else if (OB_FAIL(priority_replica_idxs_.assign(other.priority_replica_idxs_))) {
     LOG_WARN("fail to assign replica idxs", K(ret), K(other.priority_replica_idxs_));
+  } else if (OB_FAIL(files_.assign(other.files_))) {
+    LOG_WARN("failed to assign lake table files");
   } else {
     selected_replica_idx_ = other.selected_replica_idx_;
   }
@@ -368,11 +371,12 @@ int ObCandiTabletLoc::set_part_loc_with_only_readable_replica(const ObObjectID &
   return ret;
 }
 
-ObCandiTableLoc::ObCandiTableLoc()
+ObCandiTableLoc::ObCandiTableLoc(ObIAllocator &allocator)
   : table_location_key_(OB_INVALID_ID),
     ref_table_id_(OB_INVALID_ID),
-    candi_tablet_locs_(),
-    duplicate_type_(ObDuplicateType::NOT_DUPLICATE)
+    candi_tablet_locs_(allocator),
+    duplicate_type_(ObDuplicateType::NOT_DUPLICATE),
+    is_lake_table_(false)
 {
 }
 
@@ -386,6 +390,7 @@ void ObCandiTableLoc::reset()
   ref_table_id_ = OB_INVALID_ID;
   candi_tablet_locs_.reset();
   duplicate_type_ = ObDuplicateType::NOT_DUPLICATE;
+  is_lake_table_ = false;
 }
 
 int ObCandiTableLoc::assign(const ObCandiTableLoc &other)
@@ -394,6 +399,7 @@ int ObCandiTableLoc::assign(const ObCandiTableLoc &other)
   table_location_key_ = other.table_location_key_;
   ref_table_id_ = other.ref_table_id_;
   duplicate_type_ = other.duplicate_type_;
+  is_lake_table_ = other.is_lake_table_;
   if (OB_FAIL(candi_tablet_locs_.assign(other.candi_tablet_locs_))) {
     LOG_WARN("Failed to assign phy_part_loc_info_list", K(ret));
   }

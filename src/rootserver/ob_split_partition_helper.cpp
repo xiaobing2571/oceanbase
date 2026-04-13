@@ -22,6 +22,7 @@
 #include "storage/ddl/ob_ddl_lock.h"
 #include "src/rootserver/ob_root_service.h"
 #include "storage/tx_storage/ob_ls_service.h"
+#include "rootserver/ob_ls_service_helper.h"
 
 namespace oceanbase
 {
@@ -45,7 +46,7 @@ ObSplitPartitionHelper::~ObSplitPartitionHelper()
 int ObSplitPartitionHelper::execute(ObDDLTaskRecord &task_record)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(upd_table_schemas_.empty())) {
+  if (OB_UNLIKELY(upd_table_schemas_.empty() || new_table_schemas_.empty())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("empty upd table schemas", K(ret));
   } else if (OB_FAIL(check_allow_split(schema_guard_, *upd_table_schemas_.at(0)))) {
@@ -71,7 +72,7 @@ int ObSplitPartitionHelper::execute(ObDDLTaskRecord &task_record)
                                                  src_tablet_ids_,
                                                  dst_tablet_ids_,
                                                  inc_table_schemas_,
-                                                 *upd_table_schemas_.at(0),
+                                                 *new_table_schemas_.at(0),
                                                  split_type_,
                                                  allocator_,
                                                  tablet_creator_,
@@ -88,6 +89,8 @@ int ObSplitPartitionHelper::execute(ObDDLTaskRecord &task_record)
                                       split_type_,
                                       inc_table_schemas_,
                                       parallelism_,
+                                      ls_id_,
+                                      tenant_data_version_,
                                       allocator_,
                                       task_record,
                                       trans_))) {
@@ -118,6 +121,73 @@ int ObSplitPartitionHelper::execute(ObDDLTaskRecord &task_record)
   return ret;
 }
 
+int ObSplitPartitionHelper::check_split_supported_index(
+    const share::schema::ObTableSchema &data_table_schema,
+    const share::schema::ObTableSchema &index_table_schema)
+{
+  int ret = OB_SUCCESS;
+  if (data_table_schema.is_user_table()) {
+    bool is_local_index_column_store = false;
+    const share::schema::ObIndexType &index_type = index_table_schema.get_index_type();
+    if (index_table_schema.is_spatial_index()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("partition split and spatial index coexist on a table", KR(ret), K(index_type));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "partition split and spatial index coexist on a table is");
+    } else if (share::schema::is_fts_index(index_type)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("partition split and fulltext index coexist on a table", KR(ret), K(index_type));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "partition split and fulltext index coexist on a table is");
+    } else if (share::schema::is_multivalue_index(index_type)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("partition split and multivalue index coexist on a table", KR(ret), K(index_type));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "partition split and multivalue index coexist on a table is");
+    } else if (share::schema::is_vec_index(index_type)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("partition split and vector index coexist on a table", KR(ret), K(index_type));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "partition split and vector index coexist on a table is");
+    } else if (INDEX_TYPE_DOMAIN_CTXCAT_DEPRECATED == index_type) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("partition split and domain index coexist on a table", KR(ret));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "partition split and domain index coexist on a table is");
+    } else if (index_table_schema.is_index_local_storage() && OB_FAIL(index_table_schema.get_is_column_store(is_local_index_column_store))) {
+      LOG_WARN("failed to get is column store", KR(ret), K(index_type), "index_tid", index_table_schema.get_table_id());
+    } else if (is_local_index_column_store) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("partition split and column store local index coexist on a table", KR(ret), K(index_type), "index_tid", index_table_schema.get_table_id());
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "partition split and a column store local index coexist on a table is");
+    }
+  }
+  return ret;
+}
+
+int ObSplitPartitionHelper::check_split_supported_index(
+    share::schema::ObSchemaGetterGuard &schema_guard,
+    const share::schema::ObTableSchema &data_table_schema)
+{
+  int ret = OB_SUCCESS;
+  if (data_table_schema.is_user_table()) {
+    ObArray<ObAuxTableMetaInfo> simple_index_infos;
+    if (OB_FAIL(data_table_schema.get_simple_index_infos(simple_index_infos))) {
+      LOG_WARN("get_simple_index_infos failed", KR(ret));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < simple_index_infos.count(); i++) {
+        const ObTableSchema *index_table_schema = nullptr;
+        const ObAuxTableMetaInfo &index_info = simple_index_infos.at(i);
+        if (OB_FAIL(schema_guard.get_table_schema(data_table_schema.get_tenant_id(), index_info.table_id_, index_table_schema))) {
+          LOG_WARN("failed to get table schema", KR(ret), K(index_info.table_id_));
+        } else if (OB_ISNULL(index_table_schema)) {
+          ret = OB_TABLE_NOT_EXIST;
+          LOG_WARN("failed to get table schema", KR(ret), K(index_info.table_id_));
+        } else if (OB_FAIL(check_split_supported_index(data_table_schema, *index_table_schema))) {
+          LOG_WARN("failed to check split supported index", K(ret), K(data_table_schema));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+
 int ObSplitPartitionHelper::check_allow_split(
     share::schema::ObSchemaGetterGuard &schema_guard,
     const share::schema::ObTableSchema &table_schema)
@@ -130,7 +200,11 @@ int ObSplitPartitionHelper::check_allow_split(
   const uint64_t tablegroup_id = table_schema.get_tablegroup_id();
   ObArray<share::ObZoneReplicaAttrSet> zone_locality;
   ObArray<uint64_t> lob_col_idxs;
-  if (OB_UNLIKELY(table_schema.is_in_recyclebin())) {
+  if (OB_UNLIKELY(!GCONF._enable_schedule_tablet_split)) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_WARN("schedule tablet split is disabled", KR(ret));
+    LOG_USER_ERROR(OB_OP_NOT_ALLOW, "with disabled _enable_schedule_tablet_split, partition split is");
+  } else if (OB_UNLIKELY(table_schema.is_in_recyclebin())) {
     ret = OB_ERR_OPERATION_ON_RECYCLE_OBJECT;
     LOG_WARN("the table is in recyclebin.", KR(ret), K(table_schema));
   } else if (OB_FAIL(schema_guard.check_database_in_recyclebin(tenant_id,
@@ -148,9 +222,18 @@ int ObSplitPartitionHelper::check_allow_split(
   } else if (lob_col_idxs.empty() && table_schema.has_lob_aux_table()) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("can not support split table with lob aux table on gen column", K(ret), K(table_schema));
+  } else if (table_schema.is_interval_part()) {
+    // interval partition table is already defended in ObTableSchema::check_enable_split_partition
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("interval part table split partition is not supported", K(ret), K(table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "interval part table split partition is");
+  } else if (OB_FAIL(check_split_supported_index(schema_guard, table_schema))) {
+    LOG_WARN("failed to check split supported index", K(ret), K(table_schema));
   }
 
   if (OB_FAIL(ret)) {
+  } else if (table_schema.is_global_index_table()) {
+    // global index table doesn't have columnstore replica
   } else if (OB_FAIL(schema_guard.get_tenant_info(tenant_id, tenant_schema))) {
     LOG_WARN("failed to get tenant schema", K(ret));
   } else if (OB_FAIL(tenant_schema->get_zone_replica_attr_array(zone_locality))) {
@@ -176,13 +259,6 @@ int ObSplitPartitionHelper::check_allow_split(
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("not support spliting of a table in a group with multiple tables", K(ret));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "spliting of a table in a group with multiple tables");
-  }
-
-  if (OB_FAIL(ret)) {
-  } else if (OB_UNLIKELY(GCTX.is_shared_storage_mode())) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_WARN("split in shared storage mode not supported", K(ret));
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "split in shared storage mode");
   }
 
   return ret;
@@ -251,35 +327,96 @@ int ObSplitPartitionHelper::freeze_split_src_tablet(const ObFreezeSplitSrcTablet
 }
 
 // only used for create split dst tablet
-int ObSplitPartitionHelper::get_split_src_tablet_id_if_any(
+int ObSplitPartitionHelper::get_split_tablet_info_if_any(
     const share::schema::ObTableSchema &table_schema,
-    ObTabletID &split_src_tablet_id)
+    const share::schema::ObTableSchema &data_table_schema,
+    const uint64_t tenant_data_version,
+    ObTabletID &split_src_tablet_id,
+    bool &split_can_reuse_macro_block)
 {
   int ret = OB_SUCCESS;
-  const ObCheckPartitionMode mode = CHECK_PARTITION_MODE_NORMAL;
-  bool finish = false;
-  ObPartitionSchemaIter iter(table_schema, mode);
-  ObPartitionSchemaIter::Info info;
-  split_src_tablet_id.reset();
-  while (OB_SUCC(ret) && !finish) {
-    if (OB_FAIL(iter.next_partition_info(info))) {
-      if (OB_ITER_END == ret) {
-        ret = OB_SUCCESS;
-        finish = true;
-      } else {
-        LOG_WARN("iter partition failed", KR(ret));
-      }
-    } else if (nullptr != info.partition_) {
-      const ObTabletID &tablet_id = info.partition_->get_split_source_tablet_id();
-      if (tablet_id.is_valid()) {
-        if (split_src_tablet_id.is_valid() && OB_UNLIKELY(tablet_id != split_src_tablet_id)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("all split src tablet id must be same in schema", K(ret), K(split_src_tablet_id), KPC(info.partition_));
+  if (OB_SUCC(ret) && tenant_data_version >= DATA_VERSION_4_3_5_0) {
+    const ObCheckPartitionMode mode = CHECK_PARTITION_MODE_NORMAL;
+    bool finish = false;
+    ObPartitionSchemaIter iter(table_schema, mode);
+    ObPartitionSchemaIter::Info info;
+    split_src_tablet_id.reset();
+    split_can_reuse_macro_block = false;
+    while (OB_SUCC(ret) && !finish) {
+      if (OB_FAIL(iter.next_partition_info(info))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+          finish = true;
         } else {
-          split_src_tablet_id = tablet_id;
+          LOG_WARN("iter partition failed", KR(ret));
+        }
+      } else if (nullptr != info.partition_) {
+        const ObTabletID &tablet_id = info.partition_->get_split_source_tablet_id();
+        if (tablet_id.is_valid()) {
+          if (split_src_tablet_id.is_valid() && OB_UNLIKELY(tablet_id != split_src_tablet_id)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("all split src tablet id must be same in schema", K(ret), K(split_src_tablet_id), KPC(info.partition_));
+          } else {
+            split_src_tablet_id = tablet_id;
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && tenant_data_version >= DATA_VERSION_4_3_5_1) { // TODO(jyx441808): change to 4.4.1.0
+    if (split_src_tablet_id.is_valid()) { // is split dst tablet
+      if (OB_FAIL(check_can_reuse_macro_block(table_schema, &data_table_schema, split_can_reuse_macro_block))) {
+        LOG_WARN("failed to check can reuse macro block", K(ret), K(table_schema.get_table_id()), K(data_table_schema.get_table_id()));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSplitPartitionHelper::check_can_reuse_macro_block(
+    const share::schema::ObTableSchema &table_schema,
+    const share::schema::ObTableSchema *data_table_schema,
+    bool &split_can_reuse_macro_block)
+{
+  int ret = OB_SUCCESS;
+  split_can_reuse_macro_block = false;
+  if (is_aux_lob_table(table_schema.get_table_type())) {
+    split_can_reuse_macro_block = false;
+  } else if (OB_ISNULL(data_table_schema)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid data table schema", K(ret), K(table_schema.get_table_id()));
+  } else {
+    ObArray<uint64_t> rowkey_cols;
+    ObArray<uint64_t> part_key_cols;
+    const common::ObRowkeyInfo &rowkey_info = table_schema.get_rowkey_info();
+    const common::ObPartitionKeyInfo &part_key_info = data_table_schema->get_partition_key_info();
+    if (OB_FAIL(rowkey_info.get_column_ids(rowkey_cols))) {
+      LOG_WARN("get rowkey columns failed", K(ret), K(rowkey_info));
+    } else if (OB_FAIL(part_key_info.get_column_ids(part_key_cols))) {
+      LOG_WARN("get part key columns failed", K(ret), K(part_key_info));
+    } else if (OB_UNLIKELY(rowkey_cols.count() < part_key_cols.count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected err", K(ret), K(rowkey_cols), K(part_key_cols), KPC(data_table_schema));
+    } else {
+      bool can_reuse = true;
+      for (int64_t col_idx = 0; OB_SUCC(ret) && can_reuse && col_idx < rowkey_cols.count() && col_idx < part_key_cols.count(); col_idx++) {
+        const ObColumnSchemaV2 *part_col_chema = data_table_schema->get_column_schema(part_key_cols.at(col_idx));
+        const ObColumnSchemaV2 *rowkey_col_schema = table_schema.get_column_schema(rowkey_cols.at(col_idx));
+        if (OB_UNLIKELY(nullptr == part_col_chema || nullptr == rowkey_col_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected err", K(ret), K(col_idx), KPC(data_table_schema));
+        } else if (rowkey_col_schema->is_shadow_column()) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected error", K(ret), K(col_idx), K(rowkey_cols), K(part_key_cols), KPC(data_table_schema));
+        } else {
+          can_reuse &= rowkey_cols.at(col_idx) == part_key_cols.at(col_idx);
         }
       }
-      break;
+      if (OB_SUCC(ret)) {
+        split_can_reuse_macro_block = can_reuse;
+      }
     }
   }
   return ret;
@@ -293,34 +430,70 @@ int ObSplitPartitionHelper::check_enable_global_index_auto_split(
   int ret = OB_SUCCESS;
   enable_auto_split = false;
   auto_part_size = -1;
-  if (data_table_schema.is_mysql_tmp_table() || data_table_schema.is_sys_table() || GCTX.is_shared_storage_mode()) {
+  if (data_table_schema.is_mysql_tmp_table() || data_table_schema.is_sys_table()) {
     // not supported table type
-  } else if (data_table_schema.is_auto_partitioned_table()) {
-    enable_auto_split = true;
-    auto_part_size = data_table_schema.get_part_option().get_auto_part_size();
   } else {
     const uint64_t tenant_id = data_table_schema.get_tenant_id();
     omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
     if (tenant_config.is_valid()) {
       const ObString policy_str(tenant_config->global_index_auto_split_policy.str());
       if (0 == policy_str.case_compare("DISTRIBUTED")) {
-        int64_t primary_zone_num = 0;
-        int64_t unit_group_num = 0;
-        ObArray<share::ObSimpleUnitGroup> unit_group_array;
-        if (OB_FAIL(rootserver::ObTenantBalanceService::gather_stat_primary_zone_num_and_units(
-                tenant_id, primary_zone_num, unit_group_array))) {
-          LOG_WARN("failed to gather stat of primary zone and unit", KR(ret), K(tenant_id));
-        } else if (primary_zone_num > 1 || unit_group_array.count() > 1) {
-          enable_auto_split = true;
+        if (OB_FAIL(check_tenant_leader_distributed_(tenant_id, enable_auto_split))) {
+          LOG_WARN("failed to check tenant leader distributed", KR(ret), K(tenant_id));
         }
       } else if (0 == policy_str.case_compare("ALL")) {
         enable_auto_split = true;
       }
       if (OB_SUCC(ret) && enable_auto_split) {
         const int64_t data_auto_part_size = data_table_schema.get_part_option().get_auto_part_size();
-        auto_part_size = data_table_schema.get_part_option().is_valid_auto_part_size() ? data_auto_part_size : tenant_config->auto_split_tablet_size;
-        LOG_INFO("enable global index auto split by tenant config", K(auto_part_size), K(data_auto_part_size), K(policy_str));
+        int64_t tenant_auto_part_size = tenant_config->auto_split_tablet_size;
+        const int64_t errsim_auto_part_size = OB_E(common::EventTable::EN_AUTO_SPLIT_TABLET_SIZE) 0;
+        if (0 != errsim_auto_part_size) {
+          tenant_auto_part_size = std::abs(errsim_auto_part_size);
+        }
+        auto_part_size = data_table_schema.get_part_option().is_valid_auto_part_size() ? data_auto_part_size : tenant_auto_part_size;
+        LOG_INFO("enable global index auto split by tenant config", K(auto_part_size), K(data_auto_part_size), K(tenant_auto_part_size), K(errsim_auto_part_size), K(policy_str));
       }
+    }
+  }
+  return ret;
+}
+
+int ObSplitPartitionHelper::check_tenant_leader_distributed_(
+    const uint64_t tenant_id,
+    bool &is_leader_distributed)
+{
+  int ret = OB_SUCCESS;
+  is_leader_distributed = false;
+  share::schema::ObTenantSchema tenant_schema;
+  ObArray<ObZone> primary_zone_array;
+  ObArray<share::ObUnit> unit_array;
+  ObArray<ObZone> locality_zone_list; // unused
+  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid tenant id", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(ObTenantThreadHelper::get_tenant_schema(tenant_id, tenant_schema))) {
+    LOG_WARN("failed to get tenant schema", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(ObLSServiceHelper::get_primary_zone_unit_array(&tenant_schema,
+            primary_zone_array, unit_array, locality_zone_list))) {
+    LOG_WARN("failed to get primary zone unit array", KR(ret), K(tenant_id));
+  } else if (OB_UNLIKELY(primary_zone_array.count() <= 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("primary zone is empty", KR(ret), K(tenant_id));
+  } else if (primary_zone_array.count() > 1) {
+    // more than one primary zone, leader is distributed
+    is_leader_distributed = true;
+  } else {
+    // only has one primary zone, check if this zone has more than one unit
+    const ObZone &primary_zone = primary_zone_array.at(0);
+    int64_t zone_unit_num = 0;
+    ARRAY_FOREACH(unit_array, i) {
+      if (primary_zone == unit_array.at(i).zone_) {
+        zone_unit_num++;
+      }
+    }
+    if (zone_unit_num > 1) {
+      is_leader_distributed = true;
     }
   }
   return ret;
@@ -345,7 +518,9 @@ int ObSplitPartitionHelper::prepare_start_args_(
   bool is_oracle_mode = false;
   ObLocationService *location_service = nullptr;
   ObArray<ObLSID> ls_ids;
-  ObArray<ObRowkey> dst_high_bound_vals;
+  ObArray<blocksstable::ObDatumRowkey> dst_end_partkey_vals;
+  ObArenaAllocator dst_end_partkey_allocator;
+  dst_end_partkey_allocator.set_label("SplitMds");
   ls_id.reset();
   leader_addr.reset();
   src_tablet_ids.reset();
@@ -368,11 +543,13 @@ int ObSplitPartitionHelper::prepare_start_args_(
 
   // prepare tablet ids array for mapping between src and dst tablets later
   if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(ObTabletSplitMdsArg::prepare_basic_args(upd_table_schemas,
+  } else if (OB_FAIL(ObTabletSplitMdsArg::prepare_basic_args(new_table_schemas,
+                                                             upd_table_schemas,
                                                              inc_table_schemas,
                                                              src_tablet_ids,
                                                              dst_tablet_ids,
-                                                             dst_high_bound_vals))) {
+                                                             dst_end_partkey_vals,
+                                                             dst_end_partkey_allocator))) {
     LOG_WARN("failed to get all tablet ids", KR(ret));
   } else if (OB_FAIL(ObDDLUtil::batch_check_tablet_checksum(MTL_ID(), 0/*start index of tablet_arr*/, src_tablet_ids.count(), src_tablet_ids))) {
     LOG_WARN("verify tablet checksum error", K(ret), K(src_tablet_ids), K(tenant_id));
@@ -407,7 +584,7 @@ int ObSplitPartitionHelper::prepare_start_args_(
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(start_src_arg.init_split_start_src(tenant_id, is_oracle_mode, ls_id, new_table_schemas, upd_table_schemas, src_tablet_ids, dst_tablet_ids))) {
     LOG_WARN("failed to init split start src", KR(ret));
-  } else if (OB_FAIL(start_dst_arg.init_split_start_dst(tenant_id, ls_id, inc_table_schemas, src_tablet_ids, dst_tablet_ids, dst_high_bound_vals))) {
+  } else if (OB_FAIL(start_dst_arg.init_split_start_dst(tenant_id, ls_id, inc_table_schemas, src_tablet_ids, dst_tablet_ids, dst_end_partkey_vals))) {
     LOG_WARN("failed to init split start dst", KR(ret));
   }
 
@@ -476,7 +653,7 @@ int ObSplitPartitionHelper::prepare_dst_tablet_creator_(
       LOG_WARN("failed to freeze src tablet", KR(ret), K(leader_addr));
     } else if (OB_FAIL(create_commit_versions.assign(res.create_commit_versions_))) {
       LOG_WARN("failed to assign", K(ret));
-    } else if (OB_FALSE_IT(data_tablet_size = res.tablet_sizes_.at(0))) {
+    } else if (OB_FALSE_IT(data_tablet_size = std::max(static_cast<int64_t>(2), res.tablet_sizes_.at(0)))) {
     } else if (data_tablet_size < 0) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid data tablet size", K(ret), K(data_tablet_size));
@@ -503,7 +680,7 @@ int ObSplitPartitionHelper::prepare_dst_tablet_creator_(
   }
 
   if (OB_SUCC(ret)) {
-    const ObTableSchema &data_table_schema = *inc_table_schemas.at(0);
+    const ObTableSchema &data_table_schema = main_src_table_schema;
     const int64_t split_cnt = dst_tablet_ids.at(0).count();
     const int64_t table_cnt = inc_table_schemas.count();
     bool is_oracle_mode = false;
@@ -543,7 +720,8 @@ int ObSplitPartitionHelper::prepare_dst_tablet_creator_(
                                     tenant_data_version,
                                     need_create_empty_majors,
                                     create_commit_versions,
-                                    false/*has_cs_replica*/))) {
+                                    false/*has_cs_replica*/,
+                                    data_table_schema))) {
           LOG_WARN("failed to init", K(ret));
         } else if (OB_FAIL(tablet_creator->add_create_tablet_arg(arg))) {
           LOG_WARN("failed to add create tablet arg", K(ret));
@@ -621,6 +799,8 @@ int ObSplitPartitionHelper::create_ddl_task_(
     const ObDDLType split_type,
     const ObIArray<const ObTableSchema *> &inc_table_schemas,
     const int64_t parallelism,
+    const share::ObLSID &ls_id,
+    const uint64_t tenant_data_version,
     ObIAllocator &allocator,
     ObDDLTaskRecord &task_record,
     ObMySQLTransaction &trans)
@@ -629,6 +809,7 @@ int ObSplitPartitionHelper::create_ddl_task_(
   ObPartitionSplitArg split_arg;
   int64_t split_part_num = 0;
   const ObTableSchema *split_table = nullptr;
+  uint64_t tenant_data_format_version = 0;
   if (OB_UNLIKELY(OB_INVALID_ID == tenant_id || !share::is_tablet_split(split_type))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", K(ret), K(tenant_id), K(split_type), K(inc_table_schemas.count()));
@@ -646,6 +827,9 @@ int ObSplitPartitionHelper::create_ddl_task_(
     LOG_WARN("global index should not have aux tables", K(ret), KPC(split_table));
   } else {
     split_arg.task_type_ = split_type;
+    if (MOCK_DATA_VERSION_4_3_5_3 <= tenant_data_version) {
+      split_arg.src_ls_id_ = ls_id;
+    }
     ObPartition** table_parts = split_table->get_part_array();
     // for main table or global_index.
     for (int64_t i = 0; OB_SUCC(ret) && i < split_part_num; i++) {
@@ -663,6 +847,8 @@ int ObSplitPartitionHelper::create_ddl_task_(
       }
     }
     // for aux tables, containing local index table, lob table.
+    ObSArray<ObTableSchema> &local_index_table_schemas = split_arg.local_index_table_schemas_;
+    ObSArray<ObTableSchema> &lob_table_schemas = split_arg.lob_table_schemas_;
     for (int64_t i = 1/* 0 is main table*/; OB_SUCC(ret) && i < inc_table_schemas.count(); i++) {
       const ObTableSchema *aux_table_schema = inc_table_schemas.at(i);
       uint64_t table_id = aux_table_schema->get_table_id();
@@ -687,11 +873,23 @@ int ObSplitPartitionHelper::create_ddl_task_(
           table_schema_versions = &split_arg.local_index_schema_versions_;
           src_tablet_ids = &split_arg.src_local_index_tablet_ids_;
           dest_tablets_ids = &split_arg.dest_local_index_tablet_ids_;
+          if (OB_FAIL(local_index_table_schemas.push_back(*aux_table_schema))) {
+            LOG_WARN("failed to push back", K(ret), KPC(aux_table_schema));
+          } else {
+            int64_t tmp_len = local_index_table_schemas.count();
+            local_index_table_schemas.at(tmp_len - 1).reset_partition_schema();
+          }
         } else if (aux_table_schema->is_aux_lob_table()) {
           table_ids = &split_arg.lob_table_ids_;
           table_schema_versions = &split_arg.lob_schema_versions_;
           src_tablet_ids = &split_arg.src_lob_tablet_ids_;
           dest_tablets_ids = &split_arg.dest_lob_tablet_ids_;
+          if (OB_FAIL(split_arg.lob_table_schemas_.push_back(*aux_table_schema))) {
+            LOG_WARN("failed to push back", K(ret), KPC(aux_table_schema));
+          } else {
+            int64_t tmp_len = lob_table_schemas.count();
+            lob_table_schemas.at(tmp_len - 1).reset_partition_schema();
+          }
         } else {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("invalid type of aux table", K(ret), KPC(aux_table_schema));
@@ -744,6 +942,7 @@ int ObSplitPartitionHelper::create_ddl_task_(
                                &split_arg,
                                0/*parent_task_id*/,
                                task_id);
+    param.tenant_data_version_ = tenant_data_version;
     if (OB_FAIL(ObSysDDLSchedulerUtil::create_ddl_task(param, trans, task_record))) {
       LOG_WARN("submit ddl task failed", KR(ret));
     }
@@ -1023,7 +1222,8 @@ int ObSplitPartitionHelper::check_mem_usage_for_split_(
   common::ObSEArray<share::ObResourcePool, 2> pools;
   common::ObSEArray<uint64_t, 2> unit_config_ids;
   common::ObSEArray<ObUnitConfig, 2> unit_configs;
-
+  const int64_t skip_tablet_num_limit_check = std::abs(OB_E(EventTable::EN_SKIP_TABLET_NUM_LIMIT_CHECK) 0);
+  const bool skip_check = skip_tablet_num_limit_check > 0;
   if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id || dst_tablets_number < 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(tenant_id), K(dst_tablets_number));
@@ -1031,40 +1231,45 @@ int ObSplitPartitionHelper::check_mem_usage_for_split_(
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("the number of destined split tablets greater than 8192 is not supported", K(ret));
     LOG_USER_WARN(OB_NOT_SUPPORTED, "the number of destined split tablets greater than 8192 is");
-  } else if (OB_FAIL(unit_op.init(*GCTX.sql_proxy_))) {
-    LOG_WARN("failed to init proxy", K(ret));
-  } else if (OB_FAIL(unit_op.get_resource_pools(tenant_id, pools))) {
-    LOG_WARN("failed to get resource pool", K(ret), K(tenant_id));
-  } else if (pools.empty()) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected empty pool", K(ret), K(pools), K(tenant_id));
-  }
-  for (int64_t i = 0; OB_SUCC(ret) && i < pools.count(); ++i) {
-    const share::ObResourcePool &pool = pools.at(i);
-    if OB_FAIL(unit_config_ids.push_back(pool.unit_config_id_)) {
-      LOG_WARN("failed to push back into unit_config_ids");
+  } else if (skip_check) {
+    //skip check
+  } else {
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(unit_op.init(*GCTX.sql_proxy_))) {
+      LOG_WARN("failed to init proxy", K(ret));
+    } else if (OB_FAIL(unit_op.get_resource_pools(tenant_id, pools))) {
+      LOG_WARN("failed to get resource pool", K(ret), K(tenant_id));
+    } else if (pools.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected empty pool", K(ret), K(pools), K(tenant_id));
     }
-  }
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(unit_op.get_unit_configs(unit_config_ids, unit_configs))) {
-    LOG_WARN("failed to get unit configs");
-  } else if (unit_configs.empty()) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unit_configs should not be empty", K(ret));
-  }
-  for (int64_t i = 0; OB_SUCC(ret) && i < unit_configs.count(); ++i) {
-    ObUnitConfig & u_config = unit_configs.at(i);
-    const double percent_mem_for_split = 0.2;
-    /*
-       tenant memory | maximum num of dst tablets
-            2GB                    51
-            4GB                    102
-                     ......
-    */
-    if (u_config.memory_size() * percent_mem_for_split < (dst_tablets_number * MEMORY_USAGE_SPLIT_PER_DST)) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_WARN("the memory usage of split greater than the memory limit for split", K(ret));
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "the memory usage of split greater than memory limit for split is");
+    for (int64_t i = 0; OB_SUCC(ret) && i < pools.count(); ++i) {
+      const share::ObResourcePool &pool = pools.at(i);
+      if OB_FAIL(unit_config_ids.push_back(pool.unit_config_id_)) {
+        LOG_WARN("failed to push back into unit_config_ids");
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(unit_op.get_unit_configs(unit_config_ids, unit_configs))) {
+      LOG_WARN("failed to get unit configs");
+    } else if (unit_configs.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unit_configs should not be empty", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < unit_configs.count(); ++i) {
+      ObUnitConfig & u_config = unit_configs.at(i);
+      const double percent_mem_for_split = 0.2;
+      /*
+         tenant memory | maximum num of dst tablets
+              2GB                    51
+              4GB                    102
+                       ......
+      */
+      if (u_config.memory_size() * percent_mem_for_split < (dst_tablets_number * MEMORY_USAGE_SPLIT_PER_DST)) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("the memory usage of split greater than the memory limit for split", K(ret));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "the memory usage of split greater than memory limit for split is");
+      }
     }
   }
   return ret;

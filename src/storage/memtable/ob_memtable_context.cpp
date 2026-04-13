@@ -11,9 +11,11 @@
  */
 
 #include "ob_memtable_context.h"
+#include "meta_programming/ob_mover.h"
 #include "storage/tx/ob_trans_part_ctx.h"
 #include "storage/tablelock/ob_lock_memtable.h"
 #include "storage/tx/ob_trans_deadlock_adapter.h"
+#include "storage/lock_wait_mgr/ob_lock_wait_mgr.h"
 
 namespace oceanbase
 {
@@ -27,8 +29,8 @@ namespace memtable
 {
 ObMemtableCtx::ObMemtableCtx()
     : ObIMemtableCtx(),
-      rwlock_(),
-      lock_(),
+      rwlock_(common::ObLatchIds::OB_MEMTABLE_CTX_RW_LOCK),
+      lock_(common::ObLatchIds::OB_MEMTABLE_CTX_BYTE_LOCK),
       end_code_(OB_SUCCESS),
       tx_status_(ObTxStatus::NORMAL),
       elr_state_(ELR_STATE_INIT),
@@ -41,9 +43,8 @@ ObMemtableCtx::ObMemtableCtx()
       lock_for_read_elapse_(0),
       trans_mem_total_size_(0),
       unsubmitted_cnt_(0),
-      callback_mem_used_(0),
-      callback_alloc_count_(0),
-      callback_free_count_(0),
+      callback_alloc_count_(),
+      callback_free_count_(),
       is_read_only_(false),
       is_master_(true),
       has_row_updated_(false),
@@ -109,10 +110,7 @@ int ObMemtableCtx::enable_lock_table(ObLSTxCtxMgr *ls_tx_ctx_mgr)
 void ObMemtableCtx::reset()
 {
   if (IS_INIT) {
-    if ((ATOMIC_LOAD(&callback_mem_used_) > 8 * 1024 * 1024) && REACH_TIME_INTERVAL(200000)) {
-      TRANS_LOG(INFO, "memtable callback memory used > 8MB", K(callback_mem_used_), K(*this));
-    }
-    if (OB_UNLIKELY(callback_alloc_count_ != callback_free_count_)) {
+    if (OB_UNLIKELY(callback_alloc_count_.value() != callback_free_count_.value())) {
       TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "callback alloc and free count not match", K(*this));
       OB_SAFE_ABORT();
     }
@@ -134,9 +132,8 @@ void ObMemtableCtx::reset()
       }
     }
     is_inited_ = false;
-    callback_free_count_ = 0;
-    callback_alloc_count_ = 0;
-    callback_mem_used_ = 0;
+    callback_free_count_.reset();
+    callback_alloc_count_.reset();
     has_row_updated_ = false;
     trans_mem_total_size_ = 0;
     lock_for_read_retry_count_ = 0;
@@ -167,7 +164,7 @@ int64_t ObMemtableCtx::to_string(char *buf, const int64_t buf_len) const
 {
   int64_t pos = 0;
   common::databuff_printf(buf, buf_len, pos, "{");
-  pos += ObIMvccCtx::to_string(buf + pos, buf_len);
+  pos += ObIMvccCtx::to_string(buf + pos, buf_len - pos);
   common::databuff_printf(buf, buf_len, pos,
                           " end_code=%d tx_status=%ld is_readonly=%s "
                           "ref=%ld", end_code_, tx_status_, STR_BOOL(is_read_only_), ref_);
@@ -186,7 +183,7 @@ int64_t ObMemtableCtx::to_string(char *buf, const int64_t buf_len) const
   common::databuff_printf(buf, buf_len, pos, " row_callback[alloc:%ld, free:%ld, unsubmit:%ld] "
                           "redo[fill:%ld,sync_succ:%ld, sync_fail:%ld] "
                           "main_list_len=%ld pending_log_size=%ld ",
-                          callback_alloc_count_, callback_free_count_, unsubmitted_cnt_,
+                          callback_alloc_count_.value(), callback_free_count_.value(), unsubmitted_cnt_,
                           log_gen_.get_redo_filled_count(),
                           log_gen_.get_redo_sync_succ_count(),
                           log_gen_.get_redo_sync_fail_count(),
@@ -335,7 +332,6 @@ void *ObMemtableCtx::old_row_alloc(const int64_t size)
   if (OB_ISNULL(ret = ctx_cb_allocator_.alloc(size))) {
     TRANS_LOG_RET(ERROR, OB_ALLOCATE_MEMORY_FAILED, "old row alloc error, no memory", K(size), K(*this));
   } else {
-    ATOMIC_FAA(&callback_mem_used_, size);
     TRANS_LOG(DEBUG, "old row alloc succ", K(*this), KP(ret), K(lbt()));
   }
   return ret;
@@ -358,8 +354,7 @@ void *ObMemtableCtx::alloc_mvcc_row_callback()
   if (OB_ISNULL(ret = trans_mgr_.alloc_mvcc_row_callback())) {
     TRANS_LOG_RET(ERROR, OB_ALLOCATE_MEMORY_FAILED, "callback alloc error, no memory", K(*this));
   } else {
-    ATOMIC_FAA(&callback_mem_used_, sizeof(ObMvccRowCallback));
-    ATOMIC_INC(&callback_alloc_count_);
+    callback_alloc_count_.inc();
     TRANS_LOG(DEBUG, "callback alloc succ", K(*this), KP(ret), K(lbt()));
   }
   return ret;
@@ -374,7 +369,7 @@ void ObMemtableCtx::free_mvcc_row_callback(ObITransCallback *cb)
   } else if (MutatorType::MUTATOR_ROW_EXT_INFO == cb->get_mutator_type()) {
     TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "try to free ext info callback as mvcc row callback", KP(cb), K(*this));
   } else {
-    ATOMIC_INC(&callback_free_count_);
+    callback_free_count_.inc();
     TRANS_LOG(DEBUG, "callback release succ", KP(cb), K(*this), K(lbt()));
     trans_mgr_.free_mvcc_row_callback(cb);
     cb = NULL;
@@ -529,7 +524,7 @@ int ObMemtableCtx::do_trans_end(
     }
     // after a transaction finishes, callback memory should be released
     // and check memory leakage
-    if (OB_UNLIKELY(ATOMIC_LOAD(&callback_alloc_count_) != ATOMIC_LOAD(&callback_free_count_))) {
+    if (OB_UNLIKELY(callback_alloc_count_.value() != callback_free_count_.value())) {
       TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "callback alloc and free count not match", KPC(this));
       OB_SAFE_ABORT();
     }
@@ -586,8 +581,7 @@ int ObMemtableCtx::trans_replay_end(const bool commit,
   // merge may be triggered after clear state in which the callback has already
   if (commit
       && 0 != checksum // if leader's checksum is skipped, follow skip check
-      && log_cluster_version >= CLUSTER_VERSION_3100
-      && !ObServerConfig::get_instance().ignore_replay_checksum_error) {
+      && log_cluster_version >= CLUSTER_VERSION_3100) {
     ObSEArray<uint64_t, 1> replay_checksum;
     if (OB_FAIL(calc_checksum_all(replay_checksum))) {
       TRANS_LOG(WARN, "calc checksum fail", K(ret));
@@ -603,7 +597,11 @@ int ObMemtableCtx::trans_replay_end(const bool commit,
                   "checksum_replayed", checksum_collapsed,
                   "checksum_before_collapse", replay_checksum,
                   K(checksum_signature), KPC(this));
-        OB_SAFE_ABORT();
+        if (ObServerConfig::get_instance().ignore_replay_checksum_error) {
+          cs_ret = OB_SUCCESS;
+        } else {
+          OB_SAFE_ABORT();
+        }
       }
     }
   }
@@ -670,6 +668,11 @@ int ObMemtableCtx::log_submitted(const ObRedoLogSubmitHelper &helper)
   return log_gen_.log_submitted(helper.callbacks_, helper.log_scn_);
 }
 
+int ObMemtableCtx::prepare_log_submitted(const ObRedoLogSubmitHelper &helper)
+{
+  return trans_mgr_.prepare_log_submitted(helper.callbacks_);
+}
+
 int ObMemtableCtx::sync_log_succ(const SCN scn, const ObCallbackScopeArray &callbacks)
 {
   lock_mem_ctx_.sync_log_succ(scn);
@@ -720,71 +723,54 @@ int ObMemtableCtx::get_callback_list_stat(ObIArray<ObTxCallbackListStat> &stats)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-int ObMemtableCtx::get_conflict_trans_ids(common::ObIArray<ObTransIDAndAddr> &array)
+int ObMemtableCtx::fetch_conflict_info_array(common::ObIArray<ObRowConflictInfo> &array)
 {
   int ret = OB_SUCCESS;
-  common::ObArray<transaction::ObTransID> conflict_ids;
+  array.reset();
   {
     ObByteLockGuard guard(lock_, ObWaitEventIds::MEMTABLE_CTX_ACCESS_LOCK);
-    ret = conflict_ids.assign(conflict_trans_ids_);
-  }
-  if (OB_FAIL(ret)) {
-    DETECT_LOG(ERROR, "fail to copy conflict_trans_ids_", KR(ret), KPC(this));
-  } else if (OB_ISNULL(ctx_)) {
-    ret = OB_BAD_NULL_ERROR;
-    DETECT_LOG(ERROR, "trans part ctx on ObMemtableCtx is NULL", KR(ret), KPC(this));
-  } else {
-    for (int64_t idx = 0; idx < conflict_ids.count() && OB_SUCC(ret); ++idx) {
-      ObAddr scheduler_addr;
-      if (OB_FAIL(ObTransDeadlockDetectorAdapter::get_trans_scheduler_info_on_participant(conflict_ids.at(idx),
-                                                                                          ctx_->get_ls_id(),
-                                                                                          scheduler_addr))) {
-        if (ret == OB_TRANS_CTX_NOT_EXIST) {
-          DETECT_LOG(INFO, "tx ctx not exist anymore, give up blocking on this tx_id",
-                           KR(ret), KPC(this), K(conflict_ids), K(array), K(idx));
-          ret = OB_SUCCESS;
-        } else {
-          DETECT_LOG(WARN, "fail to get conflict trans scheduler addr",
-                           KR(ret), KPC(this), K(conflict_ids), K(array), K(idx));
-        }
-      } else if (OB_FAIL(array.push_back({conflict_ids[idx], scheduler_addr}))) {
-        DETECT_LOG(ERROR, "copy block trans id failed",
-                          KR(ret), KPC(this), K(conflict_ids), K(array), K(idx));
+    for (int64_t idx = 0; idx < row_conflict_info_array_.count() && OB_SUCC(ret); ++idx) {
+      if (OB_FAIL(array.push_back(ObRowConflictInfo()))) {
+        DETECT_LOG(WARN, "fail to push back", KR(ret), K(idx), KPC(this));
+      } else if (OB_FAIL(array.at(array.count() - 1).assign(meta::ObMover<ObRowConflictInfo>(row_conflict_info_array_[idx])))) {
+        DETECT_LOG(WARN, "move operation failed, should not happen", KR(ret), K(idx), KPC(this));
       }
+    }// MUST RELASE LOCK!!! THEN YOU CAN FIND TRANS SCHEDULER, OR DEADLOCK RISK!!!
+    row_conflict_info_array_.reset();
+  }
+  return ret;
+}
+
+bool ObMemtableCtx::check_if_contains_conflict_info_(meta::ObMover<ObRowConflictInfo> conflict_info)
+{
+  bool ret = false;
+  for (int64_t idx = 0; idx < this->row_conflict_info_array_.count(); ++idx) {
+    if (this->row_conflict_info_array_[idx].conflict_tx_id_ == conflict_info.get_object().conflict_tx_id_) {
+      ret = true;
     }
   }
   return ret;
 }
 
-void ObMemtableCtx::reset_conflict_trans_ids()
+int ObMemtableCtx::add_conflict_info(meta::ObMover<ObRowConflictInfo> conflict_info)// just receive rvalue, cause don't want do extra memory allocation
 {
-  ObByteLockGuard guard(lock_, ObWaitEventIds::MEMTABLE_CTX_ACCESS_LOCK);
-  conflict_trans_ids_.reset();
-}
-
-int ObMemtableCtx::add_conflict_trans_id(const ObTransID conflict_trans_id)
-{
-  auto if_contains = [this](const ObTransID trans_id) -> bool
-  {
-    for (int64_t idx = 0; idx < this->conflict_trans_ids_.count(); ++idx) {
-      if (this->conflict_trans_ids_[idx] == trans_id) {
-        return true;
-      }
-    }
-    return false;
-  };
   ObByteLockGuard guard(lock_, ObWaitEventIds::MEMTABLE_CTX_ACCESS_LOCK);
   int ret = OB_SUCCESS;
-
-  if (conflict_trans_ids_.count() >= MAX_RESERVED_CONFLICT_TX_NUM) {
-    ret = OB_SIZE_OVERFLOW;
-    DETECT_LOG(WARN, "too many conflict trans_id", K(*this), K(conflict_trans_id), K(conflict_trans_ids_));
-  } else if (if_contains(conflict_trans_id)) {
+  if (conflict_info.get_object().conflict_hash_ <= 0) {
     // do nothing
-  } else if (OB_FAIL(conflict_trans_ids_.push_back(conflict_trans_id))) {
-    DETECT_LOG(WARN, "push trans id to blocked trans ids failed", K(*this), K(conflict_trans_id), K(conflict_trans_ids_));
+  } else if (check_if_contains_conflict_info_(conflict_info)) {
+    // do nothing
+  } else if (row_conflict_info_array_.count() >= MAX_RESERVED_CONFLICT_TX_NUM) {
+    ret = OB_SIZE_OVERFLOW;
+    DETECT_LOG(WARN, "too many conflict tx", K(*this), K(conflict_info), K(row_conflict_info_array_));
+  } else {
+    if (OB_FAIL(row_conflict_info_array_.push_back(ObRowConflictInfo()))) {
+      DETECT_LOG(WARN, "push trans id to blocked trans ids failed", K(*this), K(conflict_info), K(row_conflict_info_array_));
+    } else if (OB_FAIL(row_conflict_info_array_[row_conflict_info_array_.count() - 1].assign(meta::ObMover<ObRowConflictInfo>(conflict_info)))) {
+      DETECT_LOG(ERROR, "fail to assign rvalue data, should not happen", K(*this), K(conflict_info), K(row_conflict_info_array_));
+      row_conflict_info_array_.pop_back();
+    }
   }
-
   return ret;
 }
 
@@ -868,11 +854,11 @@ int ObMemtableCtx::remove_callbacks_for_fast_commit(const int16_t callback_list_
   }
   return ret;
 }
-int ObMemtableCtx::remove_callbacks_for_fast_commit(const ObCallbackScopeArray &cb_scope_array)
+int ObMemtableCtx::remove_callbacks_for_fast_commit(const uint64_t callback_scope_host_bitmap)
 {
   int ret = OB_SUCCESS;
   common::ObTimeGuard timeguard("remove callbacks for fast commit", 10 * 1000);
-  if (OB_FAIL(trans_mgr_.remove_callbacks_for_fast_commit(cb_scope_array))) {
+  if (OB_FAIL(trans_mgr_.remove_callbacks_for_fast_commit(callback_scope_host_bitmap))) {
     TRANS_LOG(WARN, "fail to remove callback for fast commit", K(ret));
   }
   return ret;
@@ -962,19 +948,26 @@ int ObMemtableCtx::update_checksum(const ObIArray<uint64_t> &checksum,
 }
 
 ERRSIM_POINT_DEF(TX_FORCE_WRITE_CLOG)
-bool ObMemtableCtx::pending_log_size_too_large(const ObTxSEQ &write_seq_no)
+bool ObMemtableCtx::pending_log_size_too_large(const int16_t branch_id, int64_t limit)
 {
   bool ret = true;
-
-  if (0 == GCONF._private_buffer_size) {
-    ret = false;
-  } else if (TX_FORCE_WRITE_CLOG) {
-    ret = true;
-  } else {
-    ret = trans_mgr_.pending_log_size_too_large(write_seq_no, GCONF._private_buffer_size);
+  if (limit == 0) {
+    limit = GCONF._private_buffer_size;
   }
-
+  if (0 == limit) {
+    ret = false;
+  } else {
+    ret = trans_mgr_.pending_log_size_too_large(branch_id, limit);
+  }
   return ret;
+}
+
+int16_t ObMemtableCtx::get_pending_log_size_too_large_list(int64_t limit) const
+{
+  if (limit == 0) {
+    limit = GCONF._private_buffer_size;
+  }
+  return trans_mgr_.get_pending_log_size_too_large_list(limit);
 }
 
 int ObMemtableCtx::get_table_lock_store_info(ObTableLockInfo &table_lock_info)

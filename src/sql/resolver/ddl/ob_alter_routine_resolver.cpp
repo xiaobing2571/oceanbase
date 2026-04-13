@@ -76,6 +76,13 @@ int ObAlterRoutineResolver::resolve(const ParseNode &parse_tree)
                      db_name.length(), db_name.ptr(),
                      sp_name.length(), sp_name.ptr());
     }
+
+    if (OB_SUCC(ret) && ObExternalRoutineType::INTERNAL_ROUTINE != routine_info->get_external_routine_type()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("ALTER external routine is not supported", K(ret));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "ALTER external routine");
+    }
+
     // add schema check info
     OZ (ob_add_ddl_dependency(routine_info->get_routine_id(),
                               ROUTINE_SCHEMA,
@@ -96,6 +103,7 @@ int ObAlterRoutineResolver::resolve(const ParseNode &parse_tree)
       OX (alter_routine_stmt->get_routine_arg().is_need_alter_ = true);
     } else {
       CK (OB_NOT_NULL(parse_tree.children_[1]));
+      OX (alter_routine_stmt->get_routine_arg().db_name_ = db_name);
       OZ (resolve_impl(
         alter_routine_stmt->get_routine_arg(), *routine_info, *(parse_tree.children_[1])));
       OX (alter_routine_stmt->get_routine_arg()
@@ -480,7 +488,7 @@ int ObAlterRoutineResolver::register_debug_info(const share::schema::ObRoutineIn
     pl::ObPLDebuggerGuard guard(id);
     pl::debugger::ObPLDebugger *pl_debugger = nullptr;
     ObExecContext *exec_ctx = nullptr;
-
+    pl::ObPLPackageGuard *package_guard = nullptr;
     if (OB_FAIL(guard.get(pl_debugger))) {
       LOG_WARN("failed get pl debugger", K(ret));
     } else if (OB_ISNULL(pl_debugger) || !pl_debugger->is_debug_on()) {
@@ -488,7 +496,9 @@ int ObAlterRoutineResolver::register_debug_info(const share::schema::ObRoutineIn
     } else if (OB_ISNULL(exec_ctx = session_info_->get_cur_exec_ctx())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("failed to get cur exec context", K(session_info_));
-    } else if (OB_ISNULL(exec_ctx->get_package_guard())) {
+    } else if (OB_FAIL(exec_ctx->get_package_guard(package_guard))) {
+      LOG_WARN("failed to get top exec package guard", K(ret));
+    } else if (OB_ISNULL(package_guard)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("failed to get package guard", K(session_info_), K(exec_ctx));
     } else {
@@ -509,7 +519,7 @@ int ObAlterRoutineResolver::register_debug_info(const share::schema::ObRoutineIn
       if (OB_FAIL(session_info_
                     ->get_pl_engine()
                     ->get_pl_function(*exec_ctx,
-                                      *exec_ctx->get_package_guard(),
+                                      *package_guard,
                                       routine_info.get_package_id(),
                                       routine_info.get_routine_id(),
                                       subprogram_path,

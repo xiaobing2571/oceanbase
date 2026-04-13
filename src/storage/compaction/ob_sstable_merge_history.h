@@ -58,6 +58,7 @@ struct ObParalleMergeInfo
       sum_value_ += value;
       ++count_;
     }
+    bool is_empty() const { return 0 == count_; }
     void reset()
     {
       min_value_ = 0;
@@ -80,7 +81,10 @@ struct PartTableInfo {
   PartTableInfo()
   : is_major_merge_(false),
     table_cnt_(0),
+    inc_major_cnt_(0),
     snapshot_version_(0),
+    inc_major_start_scn_(0),
+    inc_major_end_scn_(0),
     start_scn_(0),
     end_scn_(0)
   {}
@@ -88,15 +92,24 @@ struct PartTableInfo {
   {
     is_major_merge_ = false;
     table_cnt_ = 0;
+    inc_major_cnt_ = 0;
     snapshot_version_ = 0;
+    inc_major_start_scn_ = 0;
+    inc_major_end_scn_ = 0;
     start_scn_ = 0;
     end_scn_ = 0;
   }
   void fill_info(char *buf, const int64_t buf_len) const;
-  TO_STRING_KV(K_(is_major_merge), K_(table_cnt), K_(snapshot_version), K_(start_scn), K_(end_scn));
+  TO_STRING_KV(K_(is_major_merge), K_(table_cnt), K_(inc_major_cnt), K_(snapshot_version),
+               K_(inc_major_start_scn), K_(inc_major_end_scn), K_(start_scn), K_(end_scn));
   bool is_major_merge_;
   int32_t table_cnt_;
+  int32_t inc_major_cnt_;
   int64_t snapshot_version_;
+  // for inc major sstables
+  int64_t inc_major_start_scn_;
+  int64_t inc_major_end_scn_;
+  // for mini/minor sstables
   int64_t start_scn_;
   int64_t end_scn_;
 };
@@ -108,16 +121,9 @@ struct ObMergeStaticInfo
   void reset();
   bool is_valid() const;
   void shallow_copy(const ObMergeStaticInfo &other);
-  TO_STRING_KV(K_(ls_id), K_(tablet_id), "merge_type", merge_type_to_str(merge_type_),
-    K_(compaction_scn), K_(is_full_merge), K_(concurrent_cnt),
-    "merge_level", merge_level_to_str(merge_level_),
-    "exec_mode", exec_mode_to_str(exec_mode_),
-    "merge_reason", ObAdaptiveMergePolicy::merge_reason_to_str(merge_reason_),
-    "base_major_status", co_major_sstable_status_to_str(base_major_status_),
-    "co_major_merge_type", ObCOMajorMergePolicy::co_major_merge_type_to_str(co_major_merge_type_),
-    K_(kept_snapshot_info), K_(participant_table_info), K_(mds_filter_info_str),
-    K_(progressive_merge_round), K_(progressive_merge_num), K_(is_fake));
+  int64_t to_string(char* buf, const int64_t buf_len) const;
   static const int64_t MDS_FILTER_INFO_LENGTH = 256;
+  static const int64_t WINDOW_DECISION_LOG_INFO_LENGTH = 256;
   share::ObLSID ls_id_;
   ObTabletID tablet_id_;
   ObMergeType merge_type_;
@@ -125,16 +131,18 @@ struct ObMergeStaticInfo
   int64_t concurrent_cnt_;
   int64_t progressive_merge_round_;
   int64_t progressive_merge_num_;
+  int64_t merge_sstable_count_; // equal to merge_sstable_status_array_.count()
   storage::ObStorageSnapshotInfo kept_snapshot_info_;
   PartTableInfo participant_table_info_;
   char mds_filter_info_str_[MDS_FILTER_INFO_LENGTH];
+  char window_decision_log_info_str_[WINDOW_DECISION_LOG_INFO_LENGTH];
   ObMergeLevel merge_level_;
   ObExecMode exec_mode_;
   ObAdaptiveMergePolicy::AdaptiveMergeReason merge_reason_;
-  ObCOMajorSSTableStatus base_major_status_;
-  ObCOMajorMergePolicy::ObCOMajorMergeType co_major_merge_type_;
+  ObMajorSSTableStatus base_major_status_;
+  ObCOMajorMergeStrategy co_major_merge_strategy_;
+  ObWindowCompactionDecisionLogInfo window_decision_log_info_;
   bool is_full_merge_;
-  bool is_fake_;
 };
 
 struct ObMergeRunningInfo
@@ -161,6 +169,40 @@ struct ObMergeRunningInfo
   char comment_[MERGE_INFO_COMMENT_LENGTH];
 };
 
+struct ObSSTableMergeBlockInfo final
+{
+  ObSSTableMergeBlockInfo()
+  : multiplexed_macro_block_count_(0),
+    multiplexed_micro_count_in_new_macro_(0)
+  {}
+  ObSSTableMergeBlockInfo(const int64_t multiplexed_macro_block_count, const int64_t multiplexed_micro_count_in_new_macro)
+  : multiplexed_macro_block_count_(multiplexed_macro_block_count),
+    multiplexed_micro_count_in_new_macro_(multiplexed_micro_count_in_new_macro)
+  {}
+  void reset()
+  {
+    multiplexed_macro_block_count_ = 0;
+    multiplexed_micro_count_in_new_macro_ = 0;
+  }
+  void add(const ObSSTableMergeBlockInfo &block_info)
+  {
+    multiplexed_macro_block_count_ += block_info.multiplexed_macro_block_count_;
+    multiplexed_micro_count_in_new_macro_ += block_info.multiplexed_micro_count_in_new_macro_;
+  }
+  void inc_multiplexed_macro_block_count()
+  {
+    multiplexed_macro_block_count_ += 1;
+  }
+  void inc_multiplexed_micro_count_in_new_macro()
+  {
+    multiplexed_micro_count_in_new_macro_ += 1;
+  }
+  bool is_empty() const { return 0 == multiplexed_macro_block_count_ && 0 == multiplexed_micro_count_in_new_macro_; }
+  TO_STRING_KV(K_(multiplexed_macro_block_count), K_(multiplexed_micro_count_in_new_macro));
+  int64_t multiplexed_macro_block_count_;
+  int64_t multiplexed_micro_count_in_new_macro_;
+};
+
 struct ObMergeBlockInfo
 {
 public:
@@ -168,13 +210,14 @@ public:
   ~ObMergeBlockInfo() {}
   void reset();
   bool is_valid() const;
+  bool is_empty() const { return 0 == macro_block_count_ && 0 == total_row_count_ && 0 == filter_row_count_; }
   void shallow_copy(const ObMergeBlockInfo &other);
   void add(const ObMergeBlockInfo &block_info);
   void add_without_row_cnt(const ObMergeBlockInfo &block_info);
   void add_index_block_info(const ObMergeBlockInfo &block_info);
-  TO_STRING_KV(K_(occupy_size), K_(original_size), K_(macro_block_count), K_(multiplexed_macro_block_count),
+  TO_STRING_KV(K_(occupy_size), K_(original_size), K_(compressed_size), K_(macro_block_count), K_(multiplexed_macro_block_count),
     K_(new_micro_count_in_new_macro), K_(multiplexed_micro_count_in_new_macro),
-    K_(total_row_count), K_(incremental_row_count), K_(new_micro_info), K_(block_io_us));
+    K_(total_row_count), K_(incremental_row_count), K_(filter_row_count), K_(new_micro_info), K_(block_io_us));
 
   int64_t occupy_size_; // including lob_macro
   int64_t original_size_;
@@ -185,6 +228,7 @@ public:
   int64_t multiplexed_micro_count_in_new_macro_;
   int64_t total_row_count_;
   int64_t incremental_row_count_;
+  int64_t filter_row_count_;
   int64_t new_flush_data_rate_; // KB per second
   ObNewMicroInfo new_micro_info_;
   int64_t block_io_us_;
@@ -197,7 +241,7 @@ struct ObMergeDiagnoseInfo
   ~ObMergeDiagnoseInfo() {}
   void reset();
   void shallow_copy(const ObMergeDiagnoseInfo &other);
-  bool is_empty() const { return 0 == dag_ret_; }
+  bool is_empty() const { return 0 == dag_ret_ && 0 == retry_cnt_ && 0 == suspect_add_time_ && 0 == early_create_time_; }
   TO_STRING_KV(K_(dag_ret), K_(retry_cnt), K_(suspect_add_time), K_(early_create_time), K_(error_location));
   int64_t dag_ret_;
   int64_t retry_cnt_;
@@ -216,20 +260,26 @@ struct ObSSTableMergeHistory : public ObIDiagnoseInfo
   bool is_valid() const;
   void reset();
   virtual void shallow_copy(ObIDiagnoseInfo *other) override;
-  int update_block_info(const ObMergeBlockInfo &block_info, const bool without_row_cnt);
+  void update_block_info(const ObMergeBlockInfo &block_info, const bool without_row_cnt);
+  void update_block_info_with_sstable_block_info(
+      const ObMergeBlockInfo &block_info,
+      const bool without_row_cnt,
+      ObIArray<ObSSTableMergeBlockInfo> &array);
   void update_execute_time(const int64_t cost_time) { running_info_.execute_time_ += cost_time; }
   int64_t get_macro_block_count() const { return block_info_.macro_block_count_; }
   int64_t get_multiplexed_macro_block_count() const { return block_info_.multiplexed_macro_block_count_; }
   bool is_major_merge_type() const { return compaction::is_major_merge_type(static_info_.merge_type_); }
+  bool is_minor_merge_type() const { return compaction::is_minor_merge_type(static_info_.merge_type_); }
+  bool is_mds_merge_type() const { return compaction::is_mds_merge(static_info_.merge_type_); }
   const ObNewMicroInfo &get_new_micro_info() const { return block_info_.new_micro_info_; }
   int fill_comment(char *buf, const int64_t buf_len, const char* other_info) const;
-  void update_start_time();
-  TO_STRING_KV(K_(static_info), K_(running_info), K_(block_info), K_(diagnose_info));
-
+  int64_t to_string(char* buf, const int64_t buf_len) const;
+  static int init_sstable_merge_block_info_array(const int64_t count, ObIArray<ObSSTableMergeBlockInfo> &array);
   ObMergeStaticInfo static_info_;
   ObMergeRunningInfo running_info_;
   ObMergeBlockInfo block_info_;
   ObMergeDiagnoseInfo diagnose_info_;
+  ObSEArray<ObSSTableMergeBlockInfo, 1> sstable_merge_block_info_array_;
   lib::ObMutex lock_;
 };
 

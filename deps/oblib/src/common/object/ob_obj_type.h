@@ -1114,6 +1114,8 @@ enum ObUDTType
   T_OBJ_SDO_GEOMETRY = 300028,
   T_OBJ_SDO_ELEMINFO_ARRAY = 300029,
   T_OBJ_SDO_ORDINATE_ARRAY = 300030,
+  T_OBJ_SDO_DIM_ELEMENT = 300031,
+  T_OBJ_SDO_DIM_ARRAY = 300032
 };
 
 // reserved sub schema id for system defined types
@@ -1209,6 +1211,31 @@ enum VecValueTypeClass: uint16_t {
   VEC_TC_MYSQL_DATETIME,
   MAX_VEC_TC
 };
+
+#define FIXED_VEC_TC_LIST \
+  VEC_TC_INTEGER,         \
+  VEC_TC_UINTEGER,        \
+  VEC_TC_FLOAT,           \
+  VEC_TC_DOUBLE,          \
+  VEC_TC_FIXED_DOUBLE,    \
+  VEC_TC_DATETIME,        \
+  VEC_TC_DATE,            \
+  VEC_TC_TIME,            \
+  VEC_TC_YEAR,            \
+  VEC_TC_UNKNOWN,         \
+  VEC_TC_BIT,             \
+  VEC_TC_ENUM_SET,        \
+  VEC_TC_TIMESTAMP_TZ,    \
+  VEC_TC_TIMESTAMP_TINY,  \
+  VEC_TC_INTERVAL_YM,     \
+  VEC_TC_INTERVAL_DS,     \
+  VEC_TC_DEC_INT32,       \
+  VEC_TC_DEC_INT64,       \
+  VEC_TC_DEC_INT128,      \
+  VEC_TC_DEC_INT256,      \
+  VEC_TC_DEC_INT512,      \
+  VEC_TC_MYSQL_DATETIME,  \
+  VEC_TC_MYSQL_DATE
 
 inline bool ob_is_double_type(ObObjType);
 inline bool ob_is_decimal_int(ObObjType);
@@ -1423,6 +1450,7 @@ inline bool ob_is_json_tc(ObObjType type) { return ObJsonTC == ob_obj_type_class
 inline bool ob_is_geometry_tc(ObObjType type) { return ObGeometryTC == ob_obj_type_class(type); }
 inline bool ob_is_decimal_int_tc(ObObjType type) { return ObDecimalIntTC == ob_obj_type_class(type); }
 inline bool ob_is_roaringbitmap_tc(ObObjType type) { return ObRoaringBitmapTC == ob_obj_type_class(type); }
+inline bool ob_is_extend_tc(ObObjType type) { return ObExtendTC == ob_obj_type_class(type); }
 
 inline bool is_lob(ObObjType type) { return ob_is_text_tc(type); }
 inline bool is_lob_locator(ObObjType type) { return ObLobType == type; }

@@ -20,6 +20,7 @@
 #include "close_modules/shared_storage/storage/incremental/sslog/ob_sslog_kv_proxy.h"
 #include "share/scn.h"
 #include "test_mock_palf_kv.h"
+#include "src/share/config/ob_server_config.h"
 
 namespace oceanbase
 {
@@ -40,6 +41,7 @@ public:
   virtual void SetUp()
   {
     PALF_KV.clear();
+    GCONF.cluster_id = 1;
   }
   virtual void TearDown()
   {
@@ -59,10 +61,10 @@ private:
   sslog::ObISSLogProxy *proxy_ptr = guard.get_sslog_proxy();            \
   MEMCPY(key_buf, meta_key1.ptr(), meta_key1.length());                 \
   const common::ObString meta_key_malloc(meta_key1.length(), key_buf);  \
-  ObSSLogIteratorGuard iter(false/*read_unfinish*/, true/*read_mark_delete*/);
+  ObSSLogIteratorGuard iter(false/*read_unfinish*/, true/*read_init_value*/, true/*read_mark_delete*/);
 
 #define SSLOG_TABLE_READ_INIT                                           \
-  ObSSLogIteratorGuard iter(true/*read_unfinish*/, true/*read_mark_delete*/);
+  ObSSLogIteratorGuard iter(true/*read_unfinish*/, true/*read_init_value*/, true/*read_mark_delete*/);
 
 TEST_F(TestSSLogKVProxy, basic_sslog_kv_basic)
 {
@@ -194,6 +196,7 @@ TEST_F(TestSSLogKVProxy, basic_sslog_kv_basic)
   // ========== Test 6: delete and read the prefix =========
   ASSERT_EQ(OB_SUCCESS, sslog_table_proxy->delete_row(meta_type2,
                                                       meta_key2,
+                                                      false,
                                                       affected_rows));
   ASSERT_EQ(1, affected_rows);
 

@@ -30,7 +30,6 @@ int ObTransformSimplifyGroupby::transform_one_stmt(common::ObIArray<ObParentDMLS
     OPT_TRACE("convert count aggr contain const:", is_happened);
     LOG_TRACE("succeed to convert count aggr contain const", K(is_happened));
   }
-
   if (OB_SUCC(ret)) {
     if (OB_FAIL(remove_stmt_group_by(stmt, is_happened))) {
       LOG_WARN("remove stmt group by failed", K(ret));
@@ -97,6 +96,15 @@ int ObTransformSimplifyGroupby::transform_one_stmt(common::ObIArray<ObParentDMLS
     }
   }
   if (OB_SUCC(ret)) {
+    if (OB_FAIL(prune_grouping_sets(parent_stmts, stmt, is_happened))) {
+      LOG_WARN("failed to prune grouping sets", K(ret));
+    } else {
+      trans_happened |= is_happened;
+      OPT_TRACE("prune grouping sets", is_happened);
+      LOG_TRACE("succeed to prune grouping sets", K(is_happened));
+    }
+  }
+  if (OB_SUCC(ret)) {
     if (OB_FAIL(convert_group_by_to_distinct(stmt, is_happened))) {
       LOG_WARN("failed to convert group by to distinct", K(ret));
     } else {
@@ -114,7 +122,15 @@ int ObTransformSimplifyGroupby::transform_one_stmt(common::ObIArray<ObParentDMLS
       LOG_TRACE("success to rewrite agg by associative rule", K(is_happened));
     }
   }
-
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(remove_const_group_by_exprs(stmt, is_happened))) {
+      LOG_WARN("failed to remove const group by exprs", K(ret));
+    } else {
+      trans_happened |= is_happened;
+      OPT_TRACE("remove const group by exprs:", is_happened);
+      LOG_TRACE("succeed to remove const group by exprs", K(is_happened));
+    }
+  }
   if (OB_SUCC(ret) && trans_happened) {
     if (OB_FAIL(add_transform_hint(*stmt))) {
       LOG_WARN("failed to add transform hint", K(ret));
@@ -176,7 +192,7 @@ int ObTransformSimplifyGroupby::check_upper_stmt_validity(ObSelectStmt *upper_st
   if (OB_ISNULL(upper_stmt) || OB_ISNULL(ctx_) || OB_ISNULL(ctx_->session_info_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null", K(ret));
-  } else if (!upper_stmt->has_group_by()) {
+  } else if (!upper_stmt->has_group_by() || upper_stmt->has_grouping_sets()) {// can't contain grouping sets
     is_valid = false;
   } else if (!ObTransformUtils::is_full_group_by(*upper_stmt,
                                                  ctx_->session_info_->get_sql_mode())) {
@@ -213,7 +229,7 @@ int ObTransformSimplifyGroupby::check_upper_stmt_validity(ObSelectStmt *upper_st
 }
 
 //获取可消除group by的child stmt, 对union all查找所有分支, 判断条件:
-//  1.child stmt 不存在 window function/having/distinct/rownum/limit/rollup
+//  1.child stmt 不存在 window function/having/distinct/rownum/limit/rollup/grouping sets
 //  2.upper stmt group by 不能包含 child stmt aggr
 //  3.upper stmt aggr 与 child aggr 满足消除匹配关系
 //  4.upper stmt condition 没有使用 child stmt aggr
@@ -235,6 +251,7 @@ int ObTransformSimplifyGroupby::get_valid_child_stmts(ObSelectStmt *upper_stmt,
     is_valid = false;
   } else if (!stmt->has_group_by()
              || stmt->has_rollup()
+             || stmt->has_grouping_sets()
              || stmt->has_window_function()//判断条件1
              || stmt->has_having()
              || stmt->has_distinct()
@@ -509,7 +526,9 @@ int ObTransformSimplifyGroupby::remove_stmt_group_by(ObDMLStmt *&stmt,
     //do nothing
   } else if (FALSE_IT(select_stmt = static_cast<ObSelectStmt *>(stmt))) {
     /*do nothing*/
-  } else if (select_stmt->get_group_expr_size() > 0 && !select_stmt->has_rollup()) {
+  } else if (select_stmt->get_group_expr_size() > 0
+             && !select_stmt->has_rollup()
+             && !select_stmt->has_grouping_sets()) {
     //check stmt group by can be removed
     bool can_be = false;
     if (OB_FAIL(check_stmt_group_by_can_be_removed(select_stmt, can_be))) {
@@ -626,7 +645,7 @@ int ObTransformSimplifyGroupby::remove_group_by_duplicates(ObDMLStmt *&stmt, boo
     //do nothing
   } else if (FALSE_IT(select_stmt = static_cast<ObSelectStmt *>(stmt))) {
     /* do nothing */
-  } else if (select_stmt->get_group_expr_size() > 0 && !select_stmt->has_rollup()) {
+  } else if (select_stmt->get_group_expr_size() > 0 && !select_stmt->has_rollup() && !select_stmt->has_grouping_sets()) {
     ObArray<ObRawExpr*> new_group_exprs;
     ObIArray<ObRawExpr*> &group_exprs = select_stmt->get_group_exprs();
     for (int64_t i = 0; OB_SUCC(ret) && i < group_exprs.count(); ++i) {
@@ -761,7 +780,8 @@ int ObTransformSimplifyGroupby::check_can_remove_redundant_aggr(
       break;
     }
     case T_FUN_GROUP_CONCAT:
-    case T_FUN_COUNT: {
+    case T_FUN_COUNT:
+    case T_FUN_CK_GROUPCONCAT: {
       // do not rewrite group_concat and count with multiple parameters for now
       can_remove = aggr_expr.is_param_distinct() && (1 == aggr_expr.get_real_param_count());
       break;
@@ -802,7 +822,8 @@ int ObTransformSimplifyGroupby::simplify_redundant_aggr(
       case T_FUN_MIN:
       case T_FUN_MEDIAN:
       case T_FUN_SUM:
-      case T_FUN_GROUP_CONCAT: {
+      case T_FUN_GROUP_CONCAT:
+      case T_FUN_CK_GROUPCONCAT: {
         // max/min/median -> expr
         // sum/group_concat(distinct expr) -> expr
         new_expr = param_expr;
@@ -902,11 +923,13 @@ int ObTransformSimplifyGroupby::remove_aggr_distinct(ObDMLStmt *stmt, bool &tran
                  T_FUN_MIN == aggr_expr->get_expr_type()) {
         // max/min(distinct) 可以直接消掉distinct
         aggr_expr->set_param_distinct(false);
+        aggr_expr->calc_hash();
         trans_happened = true;
       } else if (T_FUN_SUM == aggr_expr->get_expr_type() ||
                  T_FUN_COUNT == aggr_expr->get_expr_type() ||
                  T_FUN_GROUP_CONCAT == aggr_expr->get_expr_type() ||
-                 T_FUNC_SYS_ARRAY_AGG == aggr_expr->get_expr_type()) {
+                 T_FUNC_SYS_ARRAY_AGG == aggr_expr->get_expr_type() ||
+                 (T_FUN_CK_GROUPCONCAT == aggr_expr->get_expr_type() && aggr_expr->get_real_param_count() == 1)) {
         // sum/count/group_concat(distinct) 要求param在做group by之前是非严格unique的
         ObSEArray<ObRawExpr *, 4> aggr_param_exprs;
         bool is_unique = false;
@@ -939,6 +962,7 @@ int ObTransformSimplifyGroupby::remove_aggr_distinct(ObDMLStmt *stmt, bool &tran
           LOG_WARN("failed to check stmt unique", K(ret));
         } else if (is_unique) {
           aggr_expr->set_param_distinct(false);
+          aggr_expr->calc_hash();
           trans_happened = true;
         }
       } else {
@@ -965,6 +989,7 @@ int ObTransformSimplifyGroupby::remove_aggr_distinct(ObDMLStmt *stmt, bool &tran
                  T_FUN_MIN == aggr_expr->get_expr_type()) {
         // max/min(distinct) 可以直接消掉distinct
         aggr_expr->set_param_distinct(false);
+        win_expr->calc_hash();
         trans_happened = true;
         win_happened = true;
       } else if (T_FUN_SUM == aggr_expr->get_expr_type() ||
@@ -983,6 +1008,7 @@ int ObTransformSimplifyGroupby::remove_aggr_distinct(ObDMLStmt *stmt, bool &tran
           LOG_WARN("failed to check stmt unique", K(ret));
         } else if (is_unique) {
           aggr_expr->set_param_distinct(false);
+          win_expr->calc_hash();
           trans_happened = true;
           win_happened = true;
         }
@@ -1187,11 +1213,11 @@ int ObTransformSimplifyGroupby::convert_valid_count_aggr(ObSelectStmt *select_st
       if (OB_ISNULL(aggr = count_const.at(i))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpect null", K(ret), K(aggr));
-      } else if (OB_FAIL(ObTransformUtils::add_const_param_constraints(aggr->get_param_expr(0),
-                                                                       ctx_))) {
-        LOG_WARN("failed to add const param constraints", K(ret));
+      } else if (OB_FAIL(ObTransformUtils::add_param_not_null_constraint(*ctx_, aggr->get_param_expr(0)))) {
+        LOG_WARN("failed to add param not null constraint", K(ret));
       } else {
         aggr->get_real_param_exprs_for_update().reuse();
+        aggr->calc_hash();
       }
     }
     if (OB_FAIL(ret)) {
@@ -1321,7 +1347,8 @@ int ObTransformSimplifyGroupby::check_aggr_win_can_be_removed(const ObDMLStmt *s
       can_remove = true;
       break;
     }
-    case T_FUN_GROUP_CONCAT:{
+    case T_FUN_GROUP_CONCAT:
+    case T_FUN_CK_GROUPCONCAT: {
       if (OB_ISNULL(aggr)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("get unexpected func", K(ret));
@@ -1467,6 +1494,7 @@ int ObTransformSimplifyGroupby::transform_aggr_win_to_common_expr(ObSelectStmt *
     case T_FUN_AVG:
     case T_FUN_SUM:
     case T_FUN_GROUP_CONCAT:
+    case T_FUN_CK_GROUPCONCAT:
     case T_FUN_MEDIAN:
     case T_FUN_KEEP_MAX:
     case T_FUN_KEEP_MIN:
@@ -1976,7 +2004,8 @@ int ObTransformSimplifyGroupby::find_null_propagate_select_exprs(ObSelectStmt *s
   for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_select_item_size(); ++i) {
     bool is_null_propagate = false;
     ObRawExpr *select_expr = stmt->get_select_item(i).expr_;
-    if (OB_FAIL(ObTransformUtils::is_null_propagate_expr(select_expr,
+    if (select_expr->has_flag(CNT_AGG)) {// do nothing
+    } else if (OB_FAIL(ObTransformUtils::is_null_propagate_expr(select_expr,
                                                          dummy_exprs,
                                                          is_null_propagate))) {
       LOG_WARN("failed to check null propagate expr", K(ret));                                                    
@@ -2619,6 +2648,237 @@ int ObTransformSimplifyGroupby::transform_split_const(
     LOG_WARN("failed to formalize stmt", K(ret));
   } else {
     trans_happened = true;
+  }
+  return ret;
+}
+
+int ObTransformSimplifyGroupby::prune_grouping_sets(ObIArray<ObParentDMLStmt> &parent_stmts,
+                                                    ObDMLStmt *stmt, bool &trans_happened)
+{
+  int ret = OB_SUCCESS;
+  ObSelectStmt *select_stmt = nullptr;
+  trans_happened = false;
+  ObSEArray<int64_t, 4> prune_grouping_set_ids;
+  if (OB_ISNULL(stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid null stmt", K(ret));
+  } else if (!stmt->is_select_stmt()) {// do nothing
+  } else if (FALSE_IT(select_stmt = static_cast<ObSelectStmt *>(stmt))) {
+  } else if (!select_stmt->has_grouping_sets()) {// do nothing
+  } else if (OB_FAIL(
+               check_can_prune_grouping_sets(parent_stmts, *select_stmt, prune_grouping_set_ids))) {
+    LOG_WARN("check can prune grouping sets failed", K(ret));
+  } else if (prune_grouping_set_ids.empty()) {
+  } else if (OB_FAIL(do_prune_grouping_sets(*select_stmt, prune_grouping_set_ids))) {
+    LOG_WARN("prune grouping sets failed", K(ret));
+  } else {
+    trans_happened = true;
+  }
+  return ret;
+}
+
+int ObTransformSimplifyGroupby::check_can_prune_grouping_sets(
+  ObIArray<ObParentDMLStmt> &parent_stmts, ObSelectStmt &select_stmt, ObIArray<int64_t> &prune_ids)
+{
+  int ret = OB_SUCCESS;
+  if (!select_stmt.has_grouping_sets()) {
+  } else if (OB_FAIL(check_prune_grouping_sets_by_self(select_stmt, prune_ids))) {
+    LOG_WARN("check prune grouping sets by self failed", K(ret));
+  } else if (OB_FAIL(check_prune_grouping_sets_by_parent(parent_stmts, select_stmt, prune_ids))) {
+    LOG_WARN("check prune grouping sets by parent failed", K(ret));
+  } else {
+    // do nothing
+  }
+  return ret;
+}
+
+int ObTransformSimplifyGroupby::check_prune_grouping_sets_by_self(ObSelectStmt &select_stmt,
+                                                                  ObIArray<int64_t> &prune_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObRawExpr *, 4> valid_having_exprs;
+  ObSEArray<ObRawExpr *, 8> all_group_exprs;
+  if (OB_FAIL(get_valid_having_exprs_contain_aggr(select_stmt.get_having_exprs(), valid_having_exprs))) {
+    LOG_WARN("failed to get valid having exprs", K(ret));
+  } else if (valid_having_exprs.empty()) {
+    // do nothing
+  } else if (select_stmt.get_grouping_sets_items_size() != 1) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid grouping set items", K(select_stmt.get_grouping_sets_items()));
+  } else {
+    ObGroupingSetsItem &grouping_set_item = select_stmt.get_grouping_sets_items().at(0);
+    for(int64_t i = 0; OB_SUCC(ret) && i < grouping_set_item.grouping_sets_exprs_.count(); i++) {
+      if (OB_FAIL(append_array_no_dup(all_group_exprs, grouping_set_item.grouping_sets_exprs_.at(i).groupby_exprs_))) {
+        LOG_WARN("append array no dup failed", K(ret));
+      }
+    }
+    ObSqlBitSet<> has_null_reject_idx_list;
+    for(int64_t i = 0; OB_SUCC(ret) && i < all_group_exprs.count(); i++) {
+      bool has_null_reject = false;
+      if (OB_FAIL(ObTransformUtils::has_null_reject_condition(valid_having_exprs, all_group_exprs.at(i), has_null_reject))) {
+        LOG_WARN("check null reject condition failed", K(ret));
+      } else if(has_null_reject && OB_FAIL(has_null_reject_idx_list.add_member(i))) {
+        LOG_WARN("add member failed", K(ret));
+      }
+    }
+    ObSqlBitSet<> cur_nulls_idx;
+    for (int64_t i = 0; OB_SUCC(ret) && i < grouping_set_item.grouping_sets_exprs_.count(); i++) {
+      if (has_exist_in_array(grouping_set_item.pruned_grouping_set_ids_, i)) { continue; }
+      cur_nulls_idx.reset();
+      if (OB_FAIL(get_null_grouping_exprs(grouping_set_item, i, all_group_exprs, cur_nulls_idx))) {
+        LOG_WARN("failed to get null grouping exprs", K(ret));
+      } else if (cur_nulls_idx.overlap(has_null_reject_idx_list) && OB_FAIL(prune_ids.push_back(i))) {
+        LOG_WARN("push back failed", K(ret));
+      }
+    }// end for
+  }
+  return ret;
+}
+
+int ObTransformSimplifyGroupby::check_prune_grouping_sets_by_parent(
+  ObIArray<ObParentDMLStmt> &parent_stmts, ObSelectStmt &stmt, ObIArray<int64_t> &prune_ids)
+{
+  int ret = OB_SUCCESS;
+  ObDMLStmt *parent_stmt = nullptr;
+  TableItem *table_item = nullptr;
+  if (parent_stmts.empty()) {// do nothing
+  } else if (OB_ISNULL(parent_stmt = parent_stmts.at(parent_stmts.count() - 1).stmt_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null stmt", K(ret));
+  } else if (stmt.get_grouping_sets_items_size() != 1) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid grouping set items", K(stmt.get_grouping_sets_items()));
+  } else if (OB_FAIL(ObTransformUtils::get_generated_table_item(*parent_stmt, &stmt, table_item))) {
+    LOG_WARN("get table item failed", K(ret));
+  } else if (OB_NOT_NULL(table_item)) {
+    ObSEArray<ObRawExpr *, 16> conditions;
+    if (OB_FAIL(ObTransformUtils::get_table_related_condition(*parent_stmt, table_item, conditions))) {
+      LOG_WARN("get table relation conditions failed", K(ret));
+    } else {
+      ObSqlBitSet<> has_null_reject_idx_list;
+      ObSqlBitSet<> cur_nulls_idx;
+      ObGroupingSetsItem &grouping_set_item = stmt.get_grouping_sets_items().at(0);
+      ObSEArray<ObRawExpr *, 8>  all_group_exprs;
+      for(int64_t i = 0; OB_SUCC(ret) && i < grouping_set_item.grouping_sets_exprs_.count(); i++) {
+        if (OB_FAIL(append_array_no_dup(all_group_exprs, grouping_set_item.grouping_sets_exprs_.at(i).groupby_exprs_))) {
+          LOG_WARN("append array no dup failed", K(ret));
+        }
+      }
+
+      for (int64_t i = 0; OB_SUCC(ret) && i < all_group_exprs.count(); i++) {
+        ObSEArray<ObRawExpr *, 2> select_exprs;
+        ObSEArray<ObRawExpr *, 2> targets;
+        bool has_null_reject = false;
+        if (OB_FAIL(find_null_propagate_select_exprs(&stmt, all_group_exprs.at(i), select_exprs))) {
+          LOG_WARN("find null propegate select exprs failed", K(ret));
+        } else if (OB_FAIL(ObTransformUtils::convert_select_expr_to_column_expr(
+                     select_exprs, stmt, *parent_stmt, table_item->table_id_, targets))) {
+          LOG_WARN("convert select expr to column failed", K(ret));
+        } else if (OB_FAIL(ObTransformUtils::has_null_reject_condition(conditions, targets,
+                                                                       has_null_reject))) {
+          LOG_WARN("check null reject condition failed", K(ret));
+        } else if (has_null_reject && OB_FAIL(has_null_reject_idx_list.add_member(i))) {
+          LOG_WARN("add member failed", K(ret));
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < grouping_set_item.grouping_sets_exprs_.count(); i++) {
+        if (has_exist_in_array(grouping_set_item.pruned_grouping_set_ids_, i)) { continue; }
+        cur_nulls_idx.reuse();
+        if (OB_FAIL(get_null_grouping_exprs(grouping_set_item, i, all_group_exprs, cur_nulls_idx))) {
+          LOG_WARN("failed to get null grouping exprs", K(ret));
+        } else if (cur_nulls_idx.overlap(has_null_reject_idx_list) && OB_FAIL(prune_ids.push_back(i))) {
+          LOG_WARN("push back failed", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTransformSimplifyGroupby::get_null_grouping_exprs(ObGroupingSetsItem &grouping_set_item,
+                                                        const int64_t group_id,
+                                                        const ObIArray<ObRawExpr *> &all_group_exprs,
+                                                        ObSqlBitSet<> &nulls_idx)
+{
+  int ret = OB_SUCCESS;
+  ObIArray<ObRawExpr *> &not_null_group_exprs = grouping_set_item.grouping_sets_exprs_.at(group_id).groupby_exprs_;
+  for(int64_t i = 0; OB_SUCC(ret) && i < all_group_exprs.count(); i++) {
+    if (has_exist_in_array(not_null_group_exprs, all_group_exprs.at(i))) {
+      continue;
+    } else if (OB_FAIL(nulls_idx.add_member(i))) {
+      LOG_WARN("add bit member failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObTransformSimplifyGroupby::do_prune_grouping_sets(ObSelectStmt &stmt, ObIArray<int64_t> &prune_ids)
+{
+  int ret = OB_SUCCESS;
+  if (!stmt.has_grouping_sets() || prune_ids.empty()) { // do nothing
+  } else if (stmt.get_grouping_sets_items_size() != 1) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected grouping set items", K(ret));
+  } else {
+    ObGroupingSetsItem &grouping_set_item = stmt.get_grouping_sets_items().at(0);
+    if (OB_FAIL(append(grouping_set_item.pruned_grouping_set_ids_, prune_ids))) {
+      LOG_WARN("append failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObTransformSimplifyGroupby::remove_const_group_by_exprs(ObDMLStmt *stmt, bool &trans_happened)
+{
+  int ret = OB_SUCCESS;
+  trans_happened = false;
+  ObSelectStmt *select_stmt = NULL;
+  if (OB_ISNULL(stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("stmt is null", K(ret));
+  } else if (!stmt->is_select_stmt()) {
+  } else if (FALSE_IT(select_stmt = static_cast<ObSelectStmt*>(stmt))) {
+  } else if (select_stmt->is_scala_group_by()) {
+  } else if (select_stmt->has_rollup() || select_stmt->has_grouping_sets()) {
+  } else {
+    ObIArray<ObRawExpr*> &group_exprs = select_stmt->get_group_exprs();
+    ObArray<ObRawExpr*> new_group_exprs;
+    ObArray<ObRawExpr*> const_exprs;
+    ObArray<ObRawExpr*> non_const_exprs;
+    for (int64_t i = 0; OB_SUCC(ret) && i < group_exprs.count(); ++i) {
+      ObRawExpr *group_expr = group_exprs.at(i);
+      if (OB_ISNULL(group_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("group expr is null", K(ret));
+      } else if (group_expr->is_const_expr()) {
+        if (OB_FAIL(const_exprs.push_back(group_expr))) {
+          LOG_WARN("failed to push back const expr", K(ret));
+        }
+      } else {
+        if (OB_FAIL(non_const_exprs.push_back(group_expr))) {
+          LOG_WARN("failed to push back non const expr", K(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && const_exprs.count() > 0) {
+      if (non_const_exprs.count() == 0) {
+        if (OB_FAIL(new_group_exprs.push_back(const_exprs.at(0)))) {
+          LOG_WARN("failed to push back const expr", K(ret));
+        }
+      } else {
+        if (OB_FAIL(new_group_exprs.assign(non_const_exprs))) {
+          LOG_WARN("failed to assign non const exprs", K(ret));
+        }
+      }
+      if (OB_SUCC(ret) && new_group_exprs.count() != group_exprs.count()) {
+        group_exprs.reuse();
+        if (OB_FAIL(append(group_exprs, new_group_exprs))) {
+          LOG_WARN("failed to assign new group exprs", K(ret));
+        } else {
+          trans_happened = true;
+        }
+      }
+    }
   }
   return ret;
 }

@@ -45,7 +45,7 @@ struct ObSkippingFilterNode
 
   bool is_already_determinate_;
   blocksstable::ObSkipIndexType skip_index_type_;
-  sql::ObPhysicalFilterExecutor *filter_;
+  sql::ObPushdownFilterExecutor *filter_;
 };
 
 class ObSSTableIndexFilter
@@ -68,7 +68,8 @@ public:
       const bool is_cg,
       const ObITableReadInfo* read_info,
       sql::ObPushdownFilterExecutor &pushdown_filter,
-      common::ObIAllocator *allocator);
+      common::ObIAllocator *allocator,
+      const int64_t batch_size = 0);
   /// Check whether we can skip filtering.
   int check_range(
       const ObITableReadInfo *read_info,
@@ -102,11 +103,11 @@ private:
     sql::ObPushdownFilterExecutor &filter);
   int find_skipping_index(
       const ObITableReadInfo* read_info,
-      sql::ObPhysicalFilterExecutor &filter,
+      sql::ObPushdownFilterExecutor &filter,
       IndexList &index_list) const;
   int find_useful_skipping_filter(
       const IndexList &index_list,
-      sql::ObPhysicalFilterExecutor &filter);
+      sql::ObPushdownFilterExecutor &filter);
 private:
   bool is_inited_;
   bool is_cg_;
@@ -120,7 +121,7 @@ class ObSSTableIndexFilterFactory {
 public:
   static int build_sstable_index_filter(
       const bool is_cg,
-      const ObITableReadInfo* read_info,
+      const ObTableIterParam* iter_param,
       sql::ObPushdownFilterExecutor &pushdown_filter,
       common::ObIAllocator *allocator,
       ObSSTableIndexFilter *&index_filter);
@@ -132,7 +133,7 @@ struct ObSSTableIndexFilterExtracter
 {
 public:
   static int extract_skipping_filter(
-      const sql::ObPhysicalFilterExecutor &filter,
+      const sql::ObPushdownFilterExecutor &filter,
       const blocksstable::ObSkipIndexType skip_index_type,
       ObSkippingFilterNode &node);
 };

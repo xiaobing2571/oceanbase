@@ -14,6 +14,7 @@
 #include "ob_table_read_info.h"
 #include "storage/meta_mem/ob_tenant_meta_mem_mgr.h"
 #include "share/truncate_info/ob_truncate_info_util.h"
+#include "share/compaction_ttl/ob_compaction_ttl_util.h"
 namespace oceanbase
 {
 using namespace common;
@@ -221,9 +222,10 @@ void ObReadInfoStruct::reset()
   is_oracle_mode_ = false;
   allocator_ = nullptr;
   schema_column_count_ = 0;
-  compat_version_ = READ_INFO_VERSION_V4;
+  compat_version_ = READ_INFO_VERSION_LATEST;
   is_cs_replica_compat_ = false;
   is_delete_insert_table_ = false;
+  has_ttl_definition_ = false;
   reserved_ = 0;
   schema_rowkey_cnt_ = 0;
   rowkey_cnt_ = 0;
@@ -231,6 +233,7 @@ void ObReadInfoStruct::reset()
   cols_index_.reset();
   memtable_cols_index_.reset();
   datum_utils_.reset();
+  micro_block_format_version_ = ObMicroBlockFormatVersionHelper::DEFAULT_VERSION;
 }
 
 void ObReadInfoStruct::init_basic_info(const int64_t schema_column_count,
@@ -238,7 +241,11 @@ void ObReadInfoStruct::init_basic_info(const int64_t schema_column_count,
                      const bool is_oracle_mode,
                      const bool is_cg_sstable,
                      const bool is_cs_replica_compat,
-                     const bool is_delete_insert_table) {
+                     const bool is_delete_insert_table,
+                     const bool is_global_index_table,
+                     const int64_t micro_block_format_version,
+                     const bool is_mv_major_refresh_tablet,
+                     const bool has_ttl_definition) {
   const int64_t extra_rowkey_cnt = is_cg_sstable ? 0 : storage::ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt();
   schema_column_count_ = schema_column_count;
   schema_rowkey_cnt_ = schema_rowkey_cnt;
@@ -246,6 +253,10 @@ void ObReadInfoStruct::init_basic_info(const int64_t schema_column_count,
   is_oracle_mode_ = is_oracle_mode;
   is_cs_replica_compat_ = is_cs_replica_compat;
   is_delete_insert_table_ = is_delete_insert_table;
+  is_global_index_table_ = is_global_index_table;
+  micro_block_format_version_ = micro_block_format_version;
+  is_mv_major_refresh_tablet_ = is_mv_major_refresh_tablet;
+  has_ttl_definition_ = has_ttl_definition;
 }
 
 int ObReadInfoStruct::generate_for_column_store(ObIAllocator &allocator,
@@ -291,7 +302,8 @@ int64_t ObReadInfoStruct::to_string(char *buf, const int64_t buf_len) const
         K_(cols_index),
         K_(cols_desc),
         K_(datum_utils),
-        K_(memtable_cols_index));
+        K_(memtable_cols_index),
+        K_(micro_block_format_version));
     J_OBJ_END();
   }
   return pos;
@@ -309,8 +321,14 @@ int ObReadInfoStruct::init_compat_version()
     compat_version_ = READ_INFO_VERSION_V2;
   } else if (compat_version < share::ObTruncateInfoUtil::TRUNCATE_INFO_CMP_DATA_VERSION) {
     compat_version_ = READ_INFO_VERSION_V3;
-  } else {
+  } else if (compat_version <= DATA_VERSION_4_3_5_2) {
     compat_version_ = READ_INFO_VERSION_V4;
+  } else if (compat_version < ObMicroBlockFormatVersionHelper::MIN_SUPPORTED_VERSION) {
+    compat_version_ = READ_INFO_VERSION_V5;
+  } else if (compat_version < share::ObCompactionTTLUtil::COMPACTION_TTL_CMP_DATA_VERSION) {
+    compat_version_ = READ_INFO_VERSION_V6;
+  } else {
+    compat_version_ = READ_INFO_VERSION_V7;
   }
   return ret;
 }
@@ -355,7 +373,13 @@ int ObTableReadInfo::mock_for_sstable_query(
     LOG_WARN("failed to pre check", K(ret));
   } else if (OB_FAIL(init_compat_version())) { // init compat verion
     LOG_WARN("failed to init compat version", KR(ret));
-  } else if (FALSE_IT(init_basic_info(schema_column_count, schema_rowkey_cnt, is_oracle_mode, is_cg_sstable, false /*is_cs_replica_compat*/, false /*is_delete_insert_table*/))) { // init basic info
+  } else if (FALSE_IT(init_basic_info(schema_column_count, schema_rowkey_cnt, is_oracle_mode, is_cg_sstable,
+      false /*is_cs_replica_compat*/,
+      false /*is_delete_insert_table*/,
+      false/*is_global_index_table*/,
+      ObMicroBlockFormatVersionHelper::DEFAULT_VERSION,
+      false/*mv major refresh tablet*/,
+      false/*has_ttl_definition*/))) { // init basic info
   } else if (OB_FAIL(cols_desc_.init_and_assign(cols_desc, allocator))) {
     LOG_WARN("Fail to assign cols_desc", K(ret));
   } else if (OB_FAIL(cols_index_.init_and_assign(storage_cols_index, allocator))) {
@@ -421,7 +445,9 @@ int ObTableReadInfo::init(
     const bool has_all_column_group,
     const bool is_cg_sstable,
     const bool need_truncate_filter,
-    const bool is_delete_insert_table)
+    const bool is_delete_insert_table,
+    const int64_t micro_block_format_version,
+    const bool has_ttl_definition)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(init_pre_check(schema_column_count, schema_rowkey_cnt, cols_desc,
@@ -429,7 +455,13 @@ int ObTableReadInfo::init(
     LOG_WARN("failed to pre check", K(ret));
   } else if (OB_FAIL(init_compat_version())) { // init compat verion
     LOG_WARN("failed to init compat version", KR(ret));
-  } else if (FALSE_IT(init_basic_info(schema_column_count, schema_rowkey_cnt, is_oracle_mode, is_cg_sstable, false /*is_cs_replica_compat*/, is_delete_insert_table))) { // init basic info
+  } else if (FALSE_IT(init_basic_info(schema_column_count, schema_rowkey_cnt, is_oracle_mode, is_cg_sstable,
+      false /*is_cs_replica_compat*/,
+      is_delete_insert_table,
+      false/*is_global_index_table*/,
+      micro_block_format_version,
+      false/*mv major refresh tablet*/,
+      has_ttl_definition))) { // init basic info
   } else if (OB_FAIL(ObReadInfoStruct::prepare_arrays(allocator, cols_desc, cols_desc.count()))) {
     LOG_WARN("failed to prepare arrays", K(ret), K(cols_desc.count()));
   } else if (nullptr != cols_param && OB_FAIL(cols_param_.init_and_assign(*cols_param, allocator))) {
@@ -605,6 +637,11 @@ int ObTableReadInfo::serialize(
       LOG_WARN("Fail to encode need truncate filter", K(ret));
     }
   }
+  if (OB_SUCC(ret) && compat_version_ >= READ_INFO_VERSION_V6) {
+    if (OB_FAIL(serialization::encode_vi64(buf, buf_len, pos, micro_block_format_version_))) {
+      LOG_WARN("Fail to encode micro block format version", K(ret));
+    }
+  }
   return ret;
 }
 
@@ -700,6 +737,15 @@ int ObTableReadInfo::deserialize(
       need_truncate_filter_ = false;
     }
   }
+  if (OB_SUCC(ret)) {
+    if (compat_version_ >= READ_INFO_VERSION_V6) {
+      if (OB_FAIL(serialization::decode_vi64(buf, data_len, pos, &micro_block_format_version_))) {
+        LOG_WARN("Fail to decode micro block format version", K(ret));
+      }
+    } else {
+      micro_block_format_version_ = ObMicroBlockFormatVersionHelper::DEFAULT_VERSION;
+    }
+  }
 
   if (OB_SUCC(ret) && cols_desc_.count() > 0) {
     const bool is_cg_sstable = ObCGReadInfo::is_cg_sstable(schema_rowkey_cnt_, schema_column_count_);
@@ -763,6 +809,9 @@ int64_t ObTableReadInfo::get_serialize_size() const
   if (OB_SUCC(ret) && compat_version_ >= READ_INFO_VERSION_V4) {
     len += serialization::encoded_length_bool(need_truncate_filter_);
   }
+  if (OB_SUCC(ret) && compat_version_ >= READ_INFO_VERSION_V6) {
+    len += serialization::encoded_length_vi64(micro_block_format_version_);
+  }
   return len;
 }
 
@@ -787,7 +836,9 @@ int64_t ObTableReadInfo::to_string(char *buf, const int64_t buf_len) const
         K_(cg_idxs),
         K_(cols_extend),
         K_(has_all_column_group),
-        K_(need_truncate_filter));
+        K_(need_truncate_filter),
+        K_(micro_block_format_version),
+        K_(has_ttl_definition));
         //K_(datum_utils),
         //"cols_param",
         //ObArrayWrap<ObColumnParam *>(0 == cols_param_.count() ? NULL : &cols_param_.at(0),
@@ -817,7 +868,11 @@ int ObRowkeyReadInfo::init(
     const bool is_cg_sstable,
     const bool use_default_compat_version,
     const bool is_cs_replica_compat,
-    const bool is_delete_insert_table)
+    const bool is_delete_insert_table,
+    const bool is_global_index_table,
+    const int64_t micro_block_format_version,
+    const bool is_mv_major_refresh_tablet,
+    const bool has_ttl_definition)
 {
   int ret = OB_SUCCESS;
   const int64_t extra_rowkey_cnt = is_cg_sstable ? 0: storage::ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt();
@@ -836,10 +891,14 @@ int ObRowkeyReadInfo::init(
     LOG_WARN("failed to init compat version", KR(ret));
   }
   if (OB_SUCC(ret)) {
-    init_basic_info(schema_column_count, schema_rowkey_cnt, is_oracle_mode, is_cg_sstable, is_cs_replica_compat, is_delete_insert_table); // init basic info
+    init_basic_info(schema_column_count, schema_rowkey_cnt, is_oracle_mode,
+                    is_cg_sstable, is_cs_replica_compat, is_delete_insert_table,
+                    is_global_index_table, micro_block_format_version, is_mv_major_refresh_tablet, has_ttl_definition); // init basic info
     if (OB_FAIL(prepare_arrays(allocator, rowkey_col_descs, out_cols_cnt))) {
       LOG_WARN("failed to prepare arrays", K(ret), K(out_cols_cnt));
-    } else if (OB_FAIL(datum_utils_.init(cols_desc_, schema_rowkey_cnt_, is_oracle_mode_, allocator, is_cg_sstable))) {
+    } else if (OB_FAIL(datum_utils_.init(cols_desc_, schema_rowkey_cnt_,
+                                         is_oracle_mode_, allocator,
+                                         is_cg_sstable))) {
       STORAGE_LOG(WARN, "Failed to init datum utils", K(ret), K_(schema_rowkey_cnt), K_(is_oracle_mode));
     } else {
       is_inited_ = true;
@@ -879,6 +938,7 @@ int ObRowkeyReadInfo::deep_copy(char *buf, const int64_t buf_len, ObRowkeyReadIn
     dst_value->schema_rowkey_cnt_ = schema_rowkey_cnt_;
     dst_value->rowkey_cnt_ = rowkey_cnt_;
     dst_value->is_oracle_mode_ = is_oracle_mode_;
+    dst_value->micro_block_format_version_ = micro_block_format_version_;
     // can not deep copy cols param cuz ObColumnParam need an allocator on constructor for default value
     if (OB_FAIL(cols_desc_.deep_copy(buf, buf_len, pos, dst_value->cols_desc_))) {
       LOG_WARN("fail to deep copy cols_desc array", K(ret));
@@ -914,6 +974,11 @@ int ObRowkeyReadInfo::serialize(
               cols_desc_,
               cols_index_,
               memtable_cols_index_);
+
+  if (OB_SUCC(ret) && compat_version_ >= READ_INFO_VERSION_V6) {
+    OB_UNIS_ENCODE(micro_block_format_version_);
+  }
+
   return ret;
 }
 
@@ -937,6 +1002,8 @@ int ObRowkeyReadInfo::deserialize(
     LOG_WARN("Fail to deserialize cols_index", K(ret), K(data_len), K(pos));
   } else if (OB_FAIL(memtable_cols_index_.deserialize(buf, data_len, pos, allocator))) {
     LOG_WARN("Fail to deserialize memtable_cols_index", K(ret), K(data_len), K(pos));
+  } else if (compat_version_ >= READ_INFO_VERSION_V6) {
+    OB_UNIS_DECODE(micro_block_format_version_);
   }
 
   if (OB_SUCC(ret) && cols_desc_.count() > 0) {
@@ -966,6 +1033,11 @@ int64_t ObRowkeyReadInfo::get_serialize_size() const
               cols_desc_,
               cols_index_,
               memtable_cols_index_);
+
+  if (OB_SUCC(ret) && compat_version_ >= READ_INFO_VERSION_V6) {
+    OB_UNIS_ADD_LEN(micro_block_format_version_);
+  }
+
   return len;
 }
 
@@ -1007,7 +1079,7 @@ ObTenantCGReadInfoMgr::ObTenantCGReadInfoMgr()
   : allocator_(MTL_ID()),
     index_read_info_(),
     normal_cg_read_infos_(),
-    lock_(),
+    lock_(common::ObLatchIds::OB_TENANT_CG_READ_INFO_MGR_LOCK),
     hold_cg_read_info_cnt_(0),
     in_progress_cnt_(0),
     alloc_buf_(nullptr),
@@ -1051,7 +1123,7 @@ int ObTenantCGReadInfoMgr::init()
 
 #define WAIT_CNT(cnt_str, cnt) \
     while (ATOMIC_LOAD(&cnt) > 0) { \
-      usleep(1000L); \
+      ob_usleep(1000L); \
       if (REACH_THREAD_TIME_INTERVAL(PRINT_LOG_INVERVAL)) { \
         LOG_INFO("ObTenantCGReadInfoMgr wait release", cnt_str, ATOMIC_LOAD(&cnt)); \
       } \
@@ -1205,7 +1277,9 @@ int ObTenantCGReadInfoMgr::construct_index_read_info(ObIAllocator &allocator, Ob
                                           true, /* is_cg_sstable */
                                           true /* use_default_compat_version */,
                                           false /* is_cs_replica_compat */,
-                                          false /* is_delete_insert_table */))) {
+                                          false /* is_delete_insert_table */,
+                                          false /* is_global_index_table */,
+                                          ObMicroBlockFormatVersionHelper::DEFAULT_VERSION /* micro_block_format_version */))) {
     STORAGE_LOG(WARN, "Fail to init mtl index read info", K(ret));
   }
 

@@ -75,6 +75,58 @@ int ObTableLoadRedefTable::check_table_consistency(const uint64_t tenant_id,
   return ret;
 }
 
+int ObTableLoadRedefTable::create_hidden_table(const ObTableLoadRedefTableStartArg &arg,
+                                               ObTableLoadRedefTableStartRes &res,
+                                               ObSQLSessionInfo &session_info,
+                                               ObCreateHiddenTableRes &create_table_res)
+{
+  int ret = OB_SUCCESS;
+  uint64_t tenant_id = arg.tenant_id_;
+  uint64_t compat_version = GET_MIN_CLUSTER_VERSION();
+  const share::ObDDLType ddl_type = arg.is_load_data_ ? share::DDL_DIRECT_LOAD : share::DDL_DIRECT_LOAD_INSERT;
+  int64_t foreign_key_checks = 1;
+  session_info.get_foreign_key_checks(foreign_key_checks);
+  if (compat_version < MOCK_CLUSTER_VERSION_4_2_5_5
+      || (compat_version >= CLUSTER_VERSION_4_3_0_0 && compat_version < MOCK_CLUSTER_VERSION_4_3_5_4)) {
+    ObCreateHiddenTableArg create_table_arg;
+    if (OB_FAIL(create_table_arg.init(tenant_id, tenant_id, tenant_id, arg.table_id_,
+                                    THIS_WORKER.get_group_id(), session_info.get_sessid_for_table(),
+                                    arg.parallelism_, ddl_type, session_info.get_sql_mode(),
+                                    session_info.get_tz_info_wrap().get_tz_info_offset(),
+                                    session_info.get_local_nls_date_format(),
+                                    session_info.get_local_nls_timestamp_format(),
+                                    session_info.get_local_nls_timestamp_tz_format(),
+                                    session_info.get_tz_info_wrap(),
+                                    arg.tablet_ids_,
+                                    false,
+                                    foreign_key_checks))) {
+      LOG_WARN("fail to init create hidden table arg", KR(ret));
+    } else if (OB_FAIL(ObDDLServerClient::create_hidden_table(create_table_arg, create_table_res,
+        res.snapshot_version_, res.data_format_version_, session_info))) {
+      LOG_WARN("failed to create hidden table", KR(ret), K(create_table_arg));
+    }
+  } else {
+    ObCreateHiddenTableArgV2 create_table_argv2;
+    if (OB_FAIL(create_table_argv2.init(tenant_id, tenant_id, tenant_id, arg.table_id_,
+                                    THIS_WORKER.get_group_id(), session_info.get_sessid_for_table(),
+                                    arg.parallelism_, ddl_type, session_info.get_sql_mode(),
+                                    session_info.get_tz_info_wrap().get_tz_info_offset(),
+                                    session_info.get_local_nls_date_format(),
+                                    session_info.get_local_nls_timestamp_format(),
+                                    session_info.get_local_nls_timestamp_tz_format(),
+                                    session_info.get_tz_info_wrap(),
+                                    arg.tablet_ids_,
+                                    foreign_key_checks,
+                                    arg.enable_hidden_table_partition_pruning_))) {
+      LOG_WARN("fail to init create hidden table arg", KR(ret));
+    } else if (OB_FAIL(ObDDLServerClient::create_hidden_table(create_table_argv2, create_table_res,
+        res.snapshot_version_, res.data_format_version_, session_info))) {
+      LOG_WARN("failed to create hidden table", KR(ret), K(create_table_argv2));
+    }
+  }
+  return ret;
+}
+
 int ObTableLoadRedefTable::start(const ObTableLoadRedefTableStartArg &arg,
                                  ObTableLoadRedefTableStartRes &res, ObSQLSessionInfo &session_info)
 {
@@ -95,6 +147,7 @@ int ObTableLoadRedefTable::start(const ObTableLoadRedefTableStartArg &arg,
     } else {
       res.task_id_ = plan->get_ddl_task_id();
       share::ObDDLTaskStatus status = share::ObDDLTaskStatus::PREPARE;
+      bool unused_is_offline_index_rebuild = false;
       if (OB_FAIL(ObDDLUtil::get_data_information(arg.tenant_id_,
           res.task_id_,
           res.data_format_version_,
@@ -102,35 +155,17 @@ int ObTableLoadRedefTable::start(const ObTableLoadRedefTableStartArg &arg,
           status,
           res.dest_table_id_,
           res.schema_version_,
-          res.is_no_logging_))) {
+          res.is_no_logging_,
+          unused_is_offline_index_rebuild))) {
         LOG_WARN("fail to get ddl task info", KR(ret), K(arg));
       }
     }
   } else {
     const int64_t origin_timeout_ts = THIS_WORKER.get_timeout_ts();
-    ObCreateHiddenTableArg create_table_arg;
-    ObCreateHiddenTableRes create_table_res;
     DEBUG_SYNC(BEFORE_CREATE_HIDDEN_TABLE_IN_LOAD);
-    uint64_t tenant_id = arg.tenant_id_;
-    const bool need_reorder_column_id = false;
-    const share::ObDDLType ddl_type = arg.is_load_data_ ? share::DDL_DIRECT_LOAD : share::DDL_DIRECT_LOAD_INSERT;
-    int64_t foreign_key_checks = 1;
-    session_info.get_foreign_key_checks(foreign_key_checks);
-    if (OB_FAIL(create_table_arg.init(tenant_id, tenant_id, tenant_id, arg.table_id_,
-                                      THIS_WORKER.get_group_id(), session_info.get_sessid_for_table(),
-                                      arg.parallelism_, ddl_type, session_info.get_sql_mode(),
-                                      session_info.get_tz_info_wrap().get_tz_info_offset(),
-                                      session_info.get_local_nls_date_format(),
-                                      session_info.get_local_nls_timestamp_format(),
-                                      session_info.get_local_nls_timestamp_tz_format(),
-                                      session_info.get_tz_info_wrap(),
-                                      arg.tablet_ids_,
-                                      need_reorder_column_id,
-                                      foreign_key_checks))) {
-      LOG_WARN("fail to init create hidden table arg", KR(ret));
-    } else if (OB_FAIL(ObDDLServerClient::create_hidden_table(create_table_arg, create_table_res,
-        res.snapshot_version_, res.data_format_version_, session_info))) {
-      LOG_WARN("failed to create hidden table", KR(ret), K(create_table_arg));
+    ObCreateHiddenTableRes create_table_res;
+    if (OB_FAIL(create_hidden_table(arg, res, session_info, create_table_res))) {
+      LOG_WARN("fail to init create table arg", KR(ret), K(arg));
     } else {
       res.dest_table_id_ = create_table_res.dest_table_id_;
       res.task_id_ = create_table_res.task_id_;
@@ -232,6 +267,7 @@ int ObTableLoadRedefTable::abort(const ObTableLoadRedefTableAbortArg &arg,
     //pass
   } else {
     const int64_t origin_timeout_ts = THIS_WORKER.get_timeout_ts();
+    ObTableLoadErrorMessageGuard guard;
     ObAbortRedefTableArg abort_redef_table_arg;
     abort_redef_table_arg.task_id_ = arg.task_id_;
     abort_redef_table_arg.tenant_id_ = arg.tenant_id_;
@@ -243,6 +279,33 @@ int ObTableLoadRedefTable::abort(const ObTableLoadRedefTableAbortArg &arg,
     THIS_WORKER.set_timeout_ts(origin_timeout_ts);
   }
   return ret;
+}
+
+ObTableLoadErrorMessageGuard::ObTableLoadErrorMessageGuard()
+  : allocator_("TLD_ErrMessage"),
+    error_code_(OB_SUCCESS),
+    error_message_(nullptr),
+    need_reset_(false)
+{
+  int ret = OB_SUCCESS;
+  ObWarningBuffer *buf = ob_get_tsi_warning_buffer();
+  if (nullptr != buf && buf->get_err_code() != OB_MAX_ERROR_CODE) {
+    if (OB_ISNULL(error_message_ = static_cast<char *>(allocator_.alloc(ObWarningBuffer::WarningItem::STR_LEN)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("fail to allocate memory", K(ret));
+    } else {
+      error_code_ = buf->get_err_code();
+      MEMCPY(error_message_, buf->get_err_msg(), ObWarningBuffer::WarningItem::STR_LEN);
+      need_reset_ = true;
+    }
+  }
+}
+
+ObTableLoadErrorMessageGuard::~ObTableLoadErrorMessageGuard()
+{
+  if (need_reset_) {
+    FORWARD_USER_ERROR(error_code_, error_message_);
+  }
 }
 
 }  // namespace observer

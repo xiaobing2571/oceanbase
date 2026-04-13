@@ -15,12 +15,15 @@
 #include "ob_sql_session_info.h"
 #include "rpc/ob_rpc_define.h"
 #include "pl/ob_pl_package.h"
+#include "storage/lock_wait_mgr/ob_lock_wait_mgr.h"
 #include "observer/mysql/obmp_stmt_send_piece_data.h"
 #include "observer/ob_server.h"
+#include "observer/ob_temporary_table_cleaner.h"
 #ifdef OB_BUILD_ORACLE_PL
 #include "pl/debug/ob_pl_debugger_manager.h"
 #include "pl/sys_package/ob_pl_utl_file.h"
 #include "pl/ob_pl_profiler.h"
+#include "pl/ob_pl_code_coverage.h"
 #endif
 #include "sql/plan_cache/ob_ps_cache.h"
 #include "share/stat/ob_opt_stat_manager.h" // for ObOptStatManager
@@ -29,6 +32,8 @@
 #ifdef OB_BUILD_AUDIT_SECURITY
 #include "sql/audit/ob_audit_log_utils.h"
 #endif
+#include "pl/external_routine/ob_external_resource.h"
+#include "storage/tablet/ob_session_tablet_helper.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -129,6 +134,7 @@ ObSQLSessionInfo::ObSQLSessionInfo(const uint64_t tenant_id) :
 #ifdef OB_BUILD_ORACLE_PL
       pl_debugger_(NULL),
       pl_profiler_(NULL),
+      pl_code_coverage_(NULL),
 #endif
 #ifdef OB_BUILD_SPM
       select_plan_type_(ObSpmCacheCtx::INVALID_TYPE),
@@ -172,6 +178,7 @@ ObSQLSessionInfo::ObSQLSessionInfo(const uint64_t tenant_id) :
       group_id_not_expected_(false),
       gtt_session_scope_unique_id_(0),
       gtt_trans_scope_unique_id_(0),
+      gtt_tablet_info_map_(),
       vid_(OB_INVALID_ID),
       vport_(0),
       in_bytes_(0),
@@ -183,7 +190,13 @@ ObSQLSessionInfo::ObSQLSessionInfo(const uint64_t tenant_id) :
       failover_mode_(false),
       service_name_(),
       executing_sql_stat_record_(),
-      unit_gc_min_sup_proxy_version_(0)
+      unit_gc_min_sup_proxy_version_(0),
+      external_resource_schema_cache_(nullptr),
+      has_ccl_rule_(false),
+      last_update_ccl_cnt_time_(-1),
+      curr_request_id_(0),
+      trans_gtt_v2_sequence_(0),
+      min_data_version_of_init_sess_(0)
 {
   MEMSET(tenant_buff_, 0, sizeof(share::ObTenantSpaceFetcher));
   MEMSET(vip_buf_, 0, sizeof(vip_buf_));
@@ -249,6 +262,11 @@ int ObSQLSessionInfo::init(uint32_t sessid, uint64_t proxy_sessid,
     dblink_sequence_id_map_.clear();
     contexts_map_.clear();
     sock_fd_map_.clear();
+    #ifdef OB_BUILD_ORACLE_PL
+    if(ob_utl_http_info_ != NULL) {
+      ob_utl_http_info_->get_http_map().clear();
+    }
+    #endif
   }
   return ret;
 }
@@ -311,6 +329,12 @@ void ObSQLSessionInfo::reset(bool skip_sys_var)
     sequence_currval_map_.reuse();
     dblink_sequence_id_map_.reuse();
     sock_fd_map_.reuse();
+#ifdef OB_BUILD_ORACLE_PL
+    if(ob_utl_http_info_ != NULL) {
+      ob_utl_http_info_->~ObUtlHttp();
+      ob_utl_http_info_ = NULL;
+    }
+#endif
     curr_session_context_size_ = 0;
     pl_context_ = NULL;
     pl_can_retry_ = true;
@@ -319,6 +343,7 @@ void ObSQLSessionInfo::reset(bool skip_sys_var)
 #ifdef OB_BUILD_ORACLE_PL
     pl_debugger_ = NULL;
     pl_profiler_ = NULL;
+    pl_code_coverage_ = NULL;
 #endif
     pl_attach_session_id_ = 0;
     pl_query_sender_ = NULL;
@@ -379,6 +404,7 @@ void ObSQLSessionInfo::reset(bool skip_sys_var)
   }
   gtt_session_scope_unique_id_ = 0;
   gtt_trans_scope_unique_id_ = 0;
+  gtt_tablet_info_map_.reset();
   gtt_session_scope_ids_.reset();
   gtt_trans_scope_ids_.reset();
   vid_ = OB_INVALID_ID;
@@ -398,6 +424,9 @@ void ObSQLSessionInfo::reset(bool skip_sys_var)
   service_name_.reset();
   executing_sql_stat_record_.reset();
   unit_gc_min_sup_proxy_version_ = 0;
+  got_tenant_conn_res_ = false;
+  trans_gtt_v2_sequence_ = 0;
+  min_data_version_of_init_sess_ = 0;
 }
 
 void ObSQLSessionInfo::clean_status()
@@ -777,19 +806,35 @@ void ObSQLSessionInfo::destroy(bool skip_sys_var)
       if (is_user_session() && OB_FAIL(ObPLUtlTcp::close_all_conns(sock_fd_map_))) {
         LOG_WARN("failed to close all utl_tcp connections", K(ret), K(session_id));
       }
+
+      if(ob_utl_http_info_ != NULL) {
+        ob_utl_http_info_->~ObUtlHttp();
+        ob_utl_http_info_ = NULL;
+      }
     }
 #endif
 
 #ifdef OB_BUILD_ORACLE_PL
     // pl debug 功能, pl debug不支持分布式调试，但调用也不会有副作用
     reset_pl_debugger_resource();
+    cur_exec_ctx_ = nullptr;
     reset_pl_profiler_resource();
+    reset_pl_code_coverage_resource();
 #endif
     // 非分布式需要的话，分布式也需要，用于清理package的全局变量值
     reset_all_package_state();
     reset(skip_sys_var);
     is_inited_ = false;
     sql_req_level_ = 0;
+
+    if (OB_NOT_NULL(external_resource_schema_cache_)) {
+      using Cache = pl::ObExternalResourceCache<pl::ObExternalSchemaJar>;
+      Cache *cache = static_cast<Cache *>(external_resource_schema_cache_);
+      cache->~Cache();
+      get_session_allocator().free(cache);
+      cache = nullptr;
+      external_resource_schema_cache_ = nullptr;
+    }
   }
 }
 
@@ -882,11 +927,25 @@ int ObSQLSessionInfo::delete_from_oracle_temp_tables(const obrpc::ObDropTableArg
   } else if (OB_FAIL(oracle_sql_proxy.init(sql_proxy->get_pool()))) {
     LOG_WARN("init oracle sql proxy failed", K(ret));
   } else if (TMP_TABLE_ORA_SESS == table_type || TMP_TABLE_ORA_TRX == table_type) {
+    // atomic delete from oracle temporary table
+    common::ObMySQLTransaction trans;
     ObIArray<uint64_t> &table_ids = table_type == share::schema::TMP_TABLE_ORA_TRX ?
           get_gtt_trans_scope_ids() : get_gtt_session_scope_ids();
-    uint64_t unique_id = table_type == share::schema::TMP_TABLE_ORA_TRX ?
+    const int64_t unique_id = table_type == share::schema::TMP_TABLE_ORA_TRX ?
           get_gtt_trans_scope_unique_id() : get_gtt_session_scope_unique_id();
-    LOG_DEBUG("delete temp table", K(table_ids), K(unique_id));
+    if (!gtt_tablet_info_map_.is_empty()) {
+      const uint64_t session_id = get_sessid_for_table();
+      common::ObArray<uint64_t> tmp_table_ids;
+      if (OB_FAIL(gtt_tablet_info_map_.get_table_ids_by_session_id_and_sequence(session_id, unique_id, tmp_table_ids))) {
+        LOG_WARN("failed to get table ids by session id and sequence", K(ret), K(session_id), K(unique_id));
+      } else if (OB_FAIL(append_array_no_dup(table_ids, tmp_table_ids))) {
+        LOG_WARN("failed to append array", K(ret), K(tmp_table_ids), K(table_ids));
+      }
+    }
+    LOG_INFO("delete temp table", K(table_type), K(table_ids), K(unique_id));
+    if (FAILEDx(trans.start(sql_proxy, tenant_id))) {
+      LOG_WARN("failed to begin transaction", K(ret), K(tenant_id));
+    }
     for (int64_t i = 0; OB_SUCC(ret) && i < table_ids.count(); i++) {
       if (OB_FAIL(schema_guard.get_table_schema(tenant_id, table_ids.at(i), table_schema))) {
         LOG_WARN("fail to get table schema", K(ret));
@@ -895,6 +954,30 @@ int ObSQLSessionInfo::delete_from_oracle_temp_tables(const obrpc::ObDropTableArg
       } else if (tenant_id != table_schema->get_tenant_id()) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("tenant_id not match", K(ret), K(tenant_id), "table_id", table_schema->get_table_id());
+      } else if (table_schema->is_oracle_tmp_table_v2() || table_schema->is_oracle_tmp_table_v2_index_table()) {
+        const bool is_tmp_table_v2_index_table = table_schema->is_oracle_tmp_table_v2_index_table();
+        const share::schema::ObTableSchema *data_schema = nullptr;
+        if (is_tmp_table_v2_index_table) {
+          if (OB_FAIL(schema_guard.get_table_schema(tenant_id, table_schema->get_data_table_id(), data_schema))) {
+            LOG_WARN("fail to get data table schema", K(ret));
+          } else if (OB_ISNULL(data_schema)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("data table schema is null", K(ret));
+          }
+        } else {
+          data_schema = table_schema;
+        }
+        const bool is_trx_tmp_table_v2 = data_schema->is_oracle_trx_tmp_table_v2();
+        const int64_t sequence = is_trx_tmp_table_v2 ? get_gtt_trans_scope_unique_id()
+                                                     : get_gtt_session_scope_unique_id();
+        const bool need_skip = is_trx_tmp_table_v2 ^ (TMP_TABLE_ORA_TRX == table_type);
+        LOG_INFO("delete temp table", K(table_type), K(is_trx_tmp_table_v2), K(sequence), K(get_sessid_for_table()), K(need_skip), KPC(data_schema));
+        if (OB_FAIL(ret) || need_skip) {
+          // do nothing
+        } else if (OB_FAIL(delete_from_oracle_temp_table_v2(schema_guard, *table_schema, sequence, get_sessid_for_table(),
+                                                     is_tmp_table_v2_index_table, trans))) {
+          LOG_WARN("failed to delete from oracle temporary table", K(ret), K(*table_schema), K(sequence), K(get_sessid_for_table()));
+        }
       } else if (((TMP_TABLE_ORA_SESS == table_type && table_schema->is_oracle_tmp_table())
                   || (TMP_TABLE_ORA_TRX == table_type && table_schema->is_oracle_trx_tmp_table()))
                   && table_schema->is_normal_schema()) {
@@ -940,7 +1023,7 @@ int ObSQLSessionInfo::delete_from_oracle_temp_tables(const obrpc::ObDropTableArg
       }
     }
 
-    if (TMP_TABLE_ORA_TRX == table_type && !get_is_deserialized()) {
+    if ((TMP_TABLE_ORA_TRX == table_type || TMP_TABLE_ORA_TRX_V2 == table_type) && !get_is_deserialized()) {
       gtt_trans_scope_ids_.reuse();
       gen_gtt_trans_scope_unique_id();
       if (gtt_session_scope_ids_.count() == 0) {
@@ -949,9 +1032,96 @@ int ObSQLSessionInfo::delete_from_oracle_temp_tables(const obrpc::ObDropTableArg
         }
       }
     }
+
+    if (trans.is_started()) {
+      int tmp_ret = OB_SUCCESS;
+      bool is_commit = (OB_SUCCESS == ret);
+      if (OB_TMP_FAIL(trans.end(is_commit))) {
+        LOG_WARN("failed to end transaction", KR(ret), KR(tmp_ret));
+        ret = is_commit ? tmp_ret : ret;
+      }
+    }
   }
   return ret;
 }
+
+int ObSQLSessionInfo::delete_from_oracle_temp_table_v2(
+    share::schema::ObSchemaGetterGuard &schema_guard,
+    const share::schema::ObTableSchema &table_schema,
+    const int64_t sequence,
+    const uint64_t session_id,
+    const bool is_index_table,
+    common::ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = table_schema.get_tenant_id();
+  ObSessionTabletInfoKey info_key(table_schema.get_table_id(), sequence, session_id);
+  ObSessionTabletInfo session_tablet_info;
+  ObSEArray<storage::ObSessionTabletInfo *, 1> tablet_infos;
+  if (false == trans.is_started()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("transaction is not started", K(ret));
+  } else if (OB_FAIL(gtt_tablet_info_map_.get_session_tablet(info_key, session_tablet_info))) {
+    if (OB_ENTRY_NOT_EXIST != ret) {
+      LOG_WARN("failed to get session tablet", K(ret), K(info_key));
+    } else {
+      ret = OB_SUCCESS;
+      LOG_INFO("session tablet not exist, may be already removed", K(ret), K(info_key));
+    }
+  } else if (OB_FAIL(gtt_tablet_info_map_.remove_session_tablet(table_schema.get_table_id()))) {
+    LOG_WARN("failed to remove session tablet", K(ret));
+  } else if (OB_FAIL(tablet_infos.push_back(&session_tablet_info))) {
+    LOG_WARN("failed to push back tablet info", KR(ret), K(session_tablet_info));
+  } else {
+    storage::ObSessionTabletDeleteHelper tablet_delete_helper(tenant_id, tablet_infos, trans);
+    if (OB_FAIL(tablet_delete_helper.do_work())) {
+      LOG_WARN("failed to delete session tablet", K(ret));
+    } else {
+      LOG_INFO("succeed to remove session tablet", K(tenant_id), K(session_tablet_info));
+    }
+  }
+  if (OB_SUCC(ret) && !is_index_table) {
+    ObSEArray<ObAuxTableMetaInfo, 16> simple_index_infos;
+    if (OB_FAIL(table_schema.get_simple_index_infos(simple_index_infos))) {
+      LOG_WARN("fail to get simple index infos", K(ret), K(table_schema));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < simple_index_infos.count(); i++) {
+        const share::schema::ObTableSchema *index_schema = nullptr;
+        if (OB_FAIL(schema_guard.get_table_schema(tenant_id, simple_index_infos.at(i).table_id_, index_schema))) {
+          LOG_WARN("failed to get index table schema", K(ret), K(tenant_id), K(simple_index_infos.at(i).table_id_));
+        } else if (OB_ISNULL(index_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("index table schema is null", K(ret), K(simple_index_infos.at(i).table_id_));
+        } else if (OB_FAIL(delete_from_oracle_temp_table_v2(schema_guard, *index_schema, sequence, session_id, true, trans))) {
+          LOG_WARN("failed to delete from oracle temporary table", K(ret));
+        }
+      }
+      if (OB_SUCC(ret) && table_schema.has_lob_aux_table()) {
+        const uint64_t aux_lob_meta_tid = table_schema.get_aux_lob_meta_tid();
+        const uint64_t aux_lob_piece_tid = table_schema.get_aux_lob_piece_tid();
+        const share::schema::ObTableSchema *aux_lob_meta_schema = nullptr;
+        const share::schema::ObTableSchema *aux_lob_piece_schema = nullptr;
+        if (OB_FAIL(schema_guard.get_table_schema(tenant_id, aux_lob_meta_tid, aux_lob_meta_schema))) {
+          LOG_WARN("failed to get aux lob meta table schema", K(ret), K(tenant_id), K(aux_lob_meta_tid));
+        } else if (OB_ISNULL(aux_lob_meta_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("aux lob meta table schema is null", K(ret), K(aux_lob_meta_tid));
+        } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, aux_lob_piece_tid, aux_lob_piece_schema))) {
+          LOG_WARN("failed to get aux lob piece table schema", K(ret), K(tenant_id), K(aux_lob_piece_tid));
+        } else if (OB_ISNULL(aux_lob_piece_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("aux lob piece table schema is null", K(ret), K(aux_lob_piece_tid));
+        } else if (OB_FAIL(delete_from_oracle_temp_table_v2(schema_guard, *aux_lob_meta_schema, sequence, session_id, true, trans))) {
+          LOG_WARN("failed to delete from oracle temporary table", K(ret));
+        } else if (OB_FAIL(delete_from_oracle_temp_table_v2(schema_guard, *aux_lob_piece_schema, sequence, session_id, true, trans))) {
+          LOG_WARN("failed to delete from oracle temporary table", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 //mysql租户: 如果session创建过临时表, 直连模式: session断开时drop temp table;
 //oracle租户, commit时为了清空数据也会调用此接口, 但仅清除事务级别的临时表;
 //            session断开时则清理掉事务级和会话级的临时表;
@@ -977,16 +1147,20 @@ int ObSQLSessionInfo::drop_temp_tables(const bool is_disconn,
     //mysql: 1. 直连 & sess 断开时  2. reset connection
     //oracle: commit; 或者 直连时的断session;
     if (!is_oracle_mode()) {
-      if ((false == is_obproxy_mode() && is_sess_disconn) || is_reset_connection) {
-        need_drop_temp_table = true;
+      if ((is_sess_disconn) || is_reset_connection) {
+        // ignore ret
+        if (OB_ISNULL(MTL(ObSessionTmpTableCleaner*))) {
+          // do nothing
+        } else {
+          // ignore ret
+          MTL(ObSessionTmpTableCleaner*)->register_task(get_sessid_for_table());
+        }
       }
     } else {
-      if (false == is_sess_disconn || false == is_obproxy_mode() || is_reset_connection) {
-        need_drop_temp_table = true;
-        //ac=1, 反序列化session断开时只是任务结束, 并不是真的sess断开, 视作trx commit
-        if (is_sess_disconn && get_is_deserialized() && ac) {
-          is_sess_disconn = false;
-        }
+      need_drop_temp_table = true;
+      //ac=1, 反序列化session断开时只是任务结束, 并不是真的sess断开, 视作trx commit
+      if (is_sess_disconn && get_is_deserialized() && ac) {
+        is_sess_disconn = false;
       }
     }
     if (need_drop_temp_table) {
@@ -1016,10 +1190,7 @@ int ObSQLSessionInfo::drop_temp_tables(const bool is_disconn,
         LOG_WARN("rpc proxy is null", K(ret));
       } else if (OB_FAIL(delete_from_oracle_temp_tables(drop_table_arg))) {
         LOG_WARN("failed to delete from oracle temporary table", K(drop_table_arg), K(ret));
-      }/* else if (!is_oracle_mode() && OB_FALSE_IT(drop_table_arg.compat_mode_ = lib::Worker::CompatMode::MYSQL)) {
-      } else if (!is_oracle_mode() && OB_FAIL(common_rpc_proxy->drop_table(drop_table_arg, res))) {
-        LOG_WARN("failed to drop temporary table", K(drop_table_arg), K(ret));
-      }*/ else {
+      } else {
         LOG_INFO("temporary tables dropped due to connection disconnected", K(is_sess_disconn), K(drop_table_arg));
       }
     }
@@ -1040,7 +1211,7 @@ int ObSQLSessionInfo::drop_temp_tables(const bool is_disconn,
 //oracle临时表依赖附加的__sess_create_time判断重用并清理, 不需要更新
 void ObSQLSessionInfo::refresh_temp_tables_sess_active_time()
 {
-  int ret = OB_SUCCESS;
+  /*int ret = OB_SUCCESS;
   const int64_t REFRESH_INTERVAL = 60L * 60L * 1000L * 1000L; // 1hr
   obrpc::ObCommonRpcProxy *common_rpc_proxy = NULL;
   if (get_has_temp_table_flag() && is_obproxy_mode()
@@ -1071,7 +1242,7 @@ void ObSQLSessionInfo::refresh_temp_tables_sess_active_time()
     } else {
       LOG_DEBUG("no need to refresh session active time of temporary tables", "last refresh time", get_last_refresh_temp_table_time());
     }
-  }
+  }*/
 }
 
 
@@ -1589,7 +1760,7 @@ int ObSQLSessionInfo::add_cursor(pl::ObPLCursorInfo *cursor)
   }
   if (!add_cursor_success && OB_NOT_NULL(cursor)) {
     int64_t id = cursor->get_id();
-    int tmp_ret = close_cursor(cursor);
+    int tmp_ret = close_cursor(cursor, true);
     ret = OB_SUCCESS == ret ? tmp_ret : ret;
     if (OB_SUCCESS != tmp_ret) {
       LOG_WARN("close cursor fail when add cursor to sesssion.", K(ret), K(id), K(get_server_sid()));
@@ -1598,12 +1769,12 @@ int ObSQLSessionInfo::add_cursor(pl::ObPLCursorInfo *cursor)
   return ret;
 }
 
-int ObSQLSessionInfo::close_cursor(ObPLCursorInfo *&cursor)
+int ObSQLSessionInfo::close_cursor(ObPLCursorInfo *&cursor, bool close_by_open_thread)
 {
   int ret = OB_SUCCESS;
   if (OB_NOT_NULL(cursor)) {
     int64_t id = cursor->get_id();
-    OZ (cursor->close(*this));
+    OZ (cursor->close(*this, false, cursor->is_ps_cursor() ? close_by_open_thread : false));
     cursor->~ObPLCursorInfo();
     get_cursor_allocator().free(cursor);
     cursor = NULL;
@@ -1614,22 +1785,26 @@ int ObSQLSessionInfo::close_cursor(ObPLCursorInfo *&cursor)
   return ret;
 }
 
-int ObSQLSessionInfo::close_cursor(int64_t cursor_id)
+int ObSQLSessionInfo::close_cursor(int64_t cursor_id, bool close_by_open_thread)
 {
   int ret = OB_SUCCESS;
   ObPLCursorInfo *cursor = NULL;
   LOG_INFO("ps cursor : remove cursor", K(ret), K(cursor_id), K(get_server_sid()));
   // when select GV$OPEN_CURSOR, we will add get_thread_data_lock to fetch pl_cursor_map_
   // so we need get_thread_data_lock there
-  ObSQLSessionInfo::LockGuard lock_guard(get_thread_data_lock());
-  if (OB_FAIL(pl_cursor_cache_.pl_cursor_map_.erase_refactored(cursor_id, &cursor))) {
-    LOG_WARN("cursor info not exist", K(cursor_id));
+  {
+    ObSQLSessionInfo::LockGuard lock_guard(get_thread_data_lock());
+    if (OB_FAIL(pl_cursor_cache_.pl_cursor_map_.erase_refactored(cursor_id, &cursor))) {
+      LOG_WARN("cursor info not exist", K(cursor_id));
+    }
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_ISNULL(cursor)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("session_info is null", K(ret));
   } else {
     LOG_DEBUG("close cursor", K(ret), K(cursor_id), K(get_server_sid()));
-    OZ (cursor->close(*this));
+    OZ (cursor->close(*this, false, cursor->is_ps_cursor() ? close_by_open_thread : false));
     cursor->~ObPLCursorInfo();
     get_cursor_allocator().free(cursor);
     cursor = NULL;
@@ -1741,18 +1916,20 @@ int ObSQLSessionInfo::close_dbms_cursor(int64_t cursor_id)
 int ObSQLSessionInfo::make_cursor(pl::ObPLCursorInfo *&cursor)
 {
   int ret = OB_SUCCESS;
+  pl::ObPLCursorInfo* tmp_cursor = NULL;
 #ifndef OB_BUILD_ORACLE_PL
   UNUSED(cursor);
 #else
   const pl::ObRefCursorType pl_type;
   ObObj param;
-  param.set_ext(reinterpret_cast<int64_t>(cursor));
+  param.set_ext(reinterpret_cast<int64_t>(tmp_cursor));
   int64_t param_size = 0;
   ObSchemaGetterGuard dummy_schema_guard;
   OZ (init_cursor_cache());
   OZ (pl_type.init_obj(dummy_schema_guard, get_cursor_allocator(), param, param_size));
-  OX (cursor = reinterpret_cast<ObPLCursorInfo*>(param.get_ext()));
-  OZ (add_cursor(cursor));
+  OX (tmp_cursor = reinterpret_cast<ObPLCursorInfo*>(param.get_ext()));
+  OZ (add_cursor(tmp_cursor));
+  OX (cursor = tmp_cursor);
   LOG_DEBUG("cursor alloc, session cursor", K(cursor));
 #endif
   return ret;
@@ -1782,6 +1959,49 @@ int ObSQLSessionInfo::make_dbms_cursor(pl::ObDbmsCursorInfo *&cursor,
    *    创建entity。
    * 3. spi_result、spi_cursor也要在每次parse时重置。
    */
+  return ret;
+}
+
+int ObSQLSessionInfo::make_ps_cursor(pl::ObPsCursorInfo *&cursor,
+                                     ParamStore &exec_params,
+                                     ObString &sql,
+                                     uint64_t id)
+{
+  int ret = OB_SUCCESS;
+  void *buf = NULL;
+  int64_t ora_max_ret_rows = INT64_MAX;
+
+  if (OB_NOT_NULL(this->get_cursor(id))) {
+    OZ (this->close_cursor(id), id, this->get_server_sid());
+  }
+  if (OB_SUCC(ret)) {
+    if (!pl_cursor_cache_.is_inited()) {
+      OZ (pl_cursor_cache_.init(get_effective_tenant_id()),
+          get_effective_tenant_id(), get_proxy_sessid(), get_server_sid());
+    }
+    if (OB_SUCC(ret) && lib::is_oracle_mode()) {
+      OZ (get_oracle_sql_select_limit(ora_max_ret_rows));
+    }
+    OV (OB_NOT_NULL(buf = get_cursor_allocator().alloc(sizeof(ObPsCursorInfo))),
+        OB_ALLOCATE_MEMORY_FAILED, sizeof(ObPsCursorInfo));
+    OX (MEMSET(buf, 0, sizeof(ObPsCursorInfo)));
+    OV (OB_NOT_NULL(cursor = new (buf) ObPsCursorInfo(&get_cursor_allocator())));
+    OX (cursor->set_id(id));
+    OX (cursor->set_ps_sql(sql));
+    OX (cursor->set_ora_max_ret_rows(ora_max_ret_rows));
+    OZ (cursor->prepare_entity(*this, cursor->get_cursor_entity()));
+    OZ (cursor->init_params(exec_params));
+    if (OB_FAIL(ret) && NULL != cursor) {
+      cursor->~ObPsCursorInfo();
+      get_cursor_allocator().free(cursor);
+      cursor = NULL;
+    }
+    if (FAILEDx(add_cursor(cursor))) {
+      // cursor has been destoryed in `add_cursor`
+      cursor = NULL;
+      LOG_WARN("add cursor failed", K(ret));
+    }
+  }
   return ret;
 }
 
@@ -1858,7 +2078,34 @@ OB_DEF_SERIALIZE_SIZE(ObSQLSessionInfo::ApplicationInfo)
   return len;
 }
 
-OB_DEF_SERIALIZE(ObSQLSessionInfo)
+int ObSQLSessionInfo::serialize(char *buf, int64_t buf_len, int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+  if (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_3_0_0 &&
+      GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_4_1_0) {
+    const int64_t compat_version = 1;
+    OB_UNIS_ENCODE(compat_version);
+  } else {
+    OB_UNIS_ENCODE(UNIS_VERSION);
+  }
+  if (OB_SUCC(ret)) {
+    int64_t size_nbytes = common::serialization::OB_SERIALIZE_SIZE_NEED_BYTES;
+    int64_t pos_bak = (pos += size_nbytes);
+    if (OB_FAIL(serialize_(buf, buf_len, pos))) {
+      RPC_WARN("serialize fail", K(ret));
+    }
+    int64_t serial_size = pos - pos_bak;
+    int64_t tmp_pos = 0;
+    if (OB_SUCC(ret)) {
+      CHECK_SERIALIZE_SIZE(CLS, serial_size);
+      ret = common::serialization::encode_fixed_bytes_i64(buf + pos_bak - size_nbytes,
+        size_nbytes, tmp_pos, serial_size);
+    }
+  }
+  return ret;
+}
+
+int ObSQLSessionInfo::serialize_(char *buf, int64_t buf_len, int64_t &pos) const
 {
   int ret = OB_SUCCESS;
   BASE_SER((ObSQLSessionInfo, ObBasicSessionInfo));
@@ -1887,41 +2134,77 @@ OB_DEF_SERIALIZE(ObSQLSessionInfo)
       gtt_session_scope_ids_,
       gtt_trans_scope_ids_,
       affected_rows_,
-      unit_gc_min_sup_proxy_version_);
+      unit_gc_min_sup_proxy_version_,
+      gtt_tablet_info_map_,
+      trans_gtt_v2_sequence_,
+      min_data_version_of_init_sess_);
   return ret;
 }
 
-OB_DEF_DESERIALIZE(ObSQLSessionInfo)
+int ObSQLSessionInfo::deserialize(const char *buf, const int64_t data_len, int64_t &pos)
 {
   int ret = OB_SUCCESS;
-  BASE_DESER((ObSQLSessionInfo, ObBasicSessionInfo));
-  LST_DO_CODE(OB_UNIS_DECODE,
-      thread_data_.cur_query_start_time_,
-      user_priv_set_,
-      db_priv_set_,
-      trans_type_,
-      global_sessid_,
-      inner_flag_,
-      is_max_availability_mode_,
-      session_type_,
-      has_temp_table_flag_,
-      enable_early_lock_release_,
-      enable_role_array_,
-      in_definer_named_proc_,
-      priv_user_id_,
-      xa_end_timeout_seconds_,
-      prelock_,
-      proxy_version_,
-      min_proxy_version_ps_,
-      thread_data_.is_in_retry_,
-      ddl_info_,
-      gtt_session_scope_unique_id_,
-      gtt_trans_scope_unique_id_,
-      gtt_session_scope_ids_,
-      gtt_trans_scope_ids_,
-      affected_rows_,
-      unit_gc_min_sup_proxy_version_);
-  (void)ObSQLUtils::adjust_time_by_ntp_offset(thread_data_.cur_query_start_time_);
+  int64_t version = 0;
+  int64_t len = 0;
+
+  OB_UNIS_DECODE(version);
+  OB_UNIS_DECODE(len);
+  if (OB_SUCC(ret)) {
+    if (len < 0) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("can't decode object with negative length", K(len));
+    } else if (data_len < len + pos) {
+      ret = OB_DESERIALIZE_ERROR;
+      LOG_WARN("buf length not enough", K(len), K(pos), K(data_len));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    const_cast<int64_t&>(data_len) = len;
+    int64_t pos_orig = pos;
+    buf = buf + pos_orig;
+    pos = 0;
+
+    BASE_DESER((ObSQLSessionInfo, ObBasicSessionInfo));
+    LST_DO_CODE(OB_UNIS_DECODE,
+        thread_data_.cur_query_start_time_,
+        user_priv_set_,
+        db_priv_set_,
+        trans_type_,
+        global_sessid_,
+        inner_flag_,
+        is_max_availability_mode_,
+        session_type_,
+        has_temp_table_flag_,
+        enable_early_lock_release_,
+        enable_role_array_,
+        in_definer_named_proc_,
+        priv_user_id_,
+        xa_end_timeout_seconds_,
+        prelock_,
+        proxy_version_,
+        min_proxy_version_ps_,
+        thread_data_.is_in_retry_,
+        ddl_info_,
+        gtt_session_scope_unique_id_,
+        gtt_trans_scope_unique_id_,
+        gtt_session_scope_ids_,
+        gtt_trans_scope_ids_);
+
+    if (version == 2) {
+      affected_rows_ = 0;
+    } else {
+      OB_UNIS_DECODE(affected_rows_);
+    }
+
+    OB_UNIS_DECODE(unit_gc_min_sup_proxy_version_);
+    OB_UNIS_DECODE(gtt_tablet_info_map_);
+    OB_UNIS_DECODE(trans_gtt_v2_sequence_);
+    OB_UNIS_DECODE(min_data_version_of_init_sess_);
+    (void)ObSQLUtils::adjust_time_by_ntp_offset(thread_data_.cur_query_start_time_);
+
+    pos = pos_orig + len;
+  }
+
   return ret;
 }
 
@@ -1954,7 +2237,10 @@ OB_DEF_SERIALIZE_SIZE(ObSQLSessionInfo)
       gtt_session_scope_ids_,
       gtt_trans_scope_ids_,
       affected_rows_,
-      unit_gc_min_sup_proxy_version_);
+      unit_gc_min_sup_proxy_version_,
+      gtt_tablet_info_map_,
+      trans_gtt_v2_sequence_,
+      min_data_version_of_init_sess_);
   return len;
 }
 
@@ -2007,6 +2293,15 @@ int ObSQLSessionInfo::kill_query()
   ObSQLSessionInfo::LockGuard lock_guard(get_thread_data_lock());
   update_last_active_time();
   set_session_state(QUERY_KILLED);
+  {
+    lockwaitmgr::ObLockWaitMgr *mgr = nullptr;
+    if (OB_ISNULL(mgr = MTL(lockwaitmgr::ObLockWaitMgr *))) {
+      LOG_WARN_RET(OB_ERR_UNEXPECTED, "can't get lock wait mgr", K(get_server_sid()));
+    } else {
+      LOG_INFO("notify lockwaitmgr killed session", K(get_server_sid()));
+      mgr->notify_killed_session(get_server_sid());
+    }
+  }
   return OB_SUCCESS;
 }
 
@@ -2041,8 +2336,9 @@ const ObAuditRecordData &ObSQLSessionInfo::get_final_audit_record(
       || EXECUTE_PS_SEND_LONG_DATA == mode
       || EXECUTE_PS_FETCH == mode
       || EXECUTE_PL_EXECUTE == mode) {
-    audit_record_.tenant_name_ = const_cast<char *>(get_tenant_name().ptr());
-    audit_record_.tenant_name_len_ = min(get_tenant_name().length(),
+    // consistency between tenant_id_ and tenant_name_
+    audit_record_.tenant_name_ = const_cast<char *>(get_effective_tenant_name().ptr());
+    audit_record_.tenant_name_len_ = min(get_effective_tenant_name().length(),
                                          OB_MAX_TENANT_NAME_LENGTH);
     audit_record_.user_name_ = const_cast<char *>(get_user_name().ptr());
     audit_record_.user_name_len_ = min(get_user_name().length(),
@@ -2056,6 +2352,7 @@ const ObAuditRecordData &ObSQLSessionInfo::get_final_audit_record(
                                        OB_MAX_USER_NAME_LENGTH);
 
     if (EXECUTE_PS_EXECUTE == mode
+        || EXECUTE_LOCAL == mode
         || EXECUTE_PS_SEND_PIECE == mode
         || EXECUTE_PS_GET_PIECE == mode
         || EXECUTE_PS_SEND_LONG_DATA == mode
@@ -2100,6 +2397,10 @@ const ObAuditRecordData &ObSQLSessionInfo::get_final_audit_record(
   }
   audit_record_.flt_trace_id_[pos] = '\0';
   audit_record_.stmt_type_ = get_stmt_type();
+  bool ac = false;
+  get_autocommit(ac);
+  audit_record_.trans_status_ = is_in_transaction() == false ? TRANS_NOT_OPENED :
+                (ac == false ? IMPLICIT_TRANS : COMMIT_TRANS);
   return audit_record_;
 }
 
@@ -2281,6 +2582,36 @@ int ObSQLSessionInfo::alloc_pl_profiler(int32_t run_id)
 
   return ret;
 }
+
+int ObSQLSessionInfo::alloc_pl_code_coverage(int32_t run_id)
+{
+  int ret = OB_SUCCESS;
+
+  ObPLCodeCoverage *code_coverage = nullptr;
+
+  CK (OB_ISNULL(pl_code_coverage_));
+  CK (OB_LIKELY(run_id > 0));
+
+  if (OB_FAIL(ret)) {
+    // do nothing
+  } else if (OB_ISNULL(
+                 code_coverage = OB_NEW(
+                     ObPLCodeCoverage,
+                     ObMemAttr(MTL_ID(), GET_PL_MOD_STRING(OB_PL_CODE_COVERAGE)),
+                     *this))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("[DBMS_PLSQL_CODE_COVERAGE] failed to allocate memory for pl code coverage", K(ret));
+  } else if (OB_FAIL(code_coverage->init(run_id))) {
+    code_coverage->~ObPLCodeCoverage();
+    ob_free(code_coverage);
+    code_coverage = nullptr;
+    LOG_WARN("[DBMS_PLSQL_CODE_COVERAGE] failed to init pl profiler", K(ret));
+  } else {
+    pl_code_coverage_ = code_coverage;
+  }
+
+  return ret;
+}
 #endif // OB_BUILD_ORACLE_PL
 
 void ObSQLSessionInfo::reset_pl_profiler_resource()
@@ -2305,6 +2636,45 @@ void ObSQLSessionInfo::reset_pl_profiler_resource()
     pl_profiler_->~ObPLProfiler();
     ob_free(pl_profiler_);
     pl_profiler_ = nullptr;
+  }
+#endif // OB_BUILD_ORACLE_PL
+}
+
+int ObSQLSessionInfo::collect_pl_code_coverage_info()
+{
+  int ret = OB_SUCCESS;
+#ifdef OB_BUILD_ORACLE_PL
+  if (pl_code_coverage_ != nullptr && pl_code_coverage_->is_inited() && OB_NOT_NULL(pl_context_)) {
+    for (int64_t i = pl_context_->get_exec_stack().count() - 1; i >= 0 ; --i) {
+      if (OB_NOT_NULL(pl_context_->get_exec_stack().at(i))
+          && !pl_context_->get_exec_stack().at(i)->get_coverage_info().empty()) {
+        ObPLExecState &curr = *pl_context_->get_exec_stack().at(i);
+        hash::ObHashSet<std::pair<uint64_t, uint64_t>> & curr_coverage_info = curr.get_coverage_info();
+        hash::ObHashSet<std::pair<uint64_t, uint64_t>>::const_iterator iter;
+        for (iter = curr_coverage_info.begin(); OB_SUCC(ret) && iter != curr_coverage_info.end(); ++iter) {
+          if (OB_FAIL(pl_code_coverage_->set_coverage_info(curr.get_function().get_profiler_unit_info().first,
+            iter->first.first, iter->first.second))) {
+            LOG_WARN("[DBMS_PLSQL_CODE_COVERAGE] failed to set coverage info",
+                      K(ret), K(i), K(pl_context_->get_exec_stack().count()), K(lbt()));
+          }
+        }
+      }
+    }
+  }
+#endif // OB_BUILD_ORACLE_PL
+  return ret;
+}
+
+void ObSQLSessionInfo::reset_pl_code_coverage_resource()
+{
+#ifdef OB_BUILD_ORACLE_PL
+  if (pl_code_coverage_ != nullptr) {
+    // 先收集覆盖率信息
+    collect_pl_code_coverage_info();
+
+    pl_code_coverage_->~ObPLCodeCoverage();
+    ob_free(pl_code_coverage_);
+    pl_code_coverage_ = nullptr;
   }
 #endif // OB_BUILD_ORACLE_PL
 }
@@ -2349,6 +2719,10 @@ int ObSQLSessionInfo::reset_all_package_state_by_dbms_session(bool need_set_sync
     if (nullptr != pl_profiler_) {
       pl_profiler_->reset();
       reset_pl_profiler_resource();
+    }
+    if (nullptr != pl_code_coverage_) {
+      pl_code_coverage_->reset();
+      reset_pl_code_coverage_resource();
     }
 #endif // OB_BUILD_ORACLE_PL
 
@@ -2436,18 +2810,17 @@ bool ObSQLSessionInfo::get_changed_package_state_num() const
   return changed_num;
 }
 
-int ObSQLSessionInfo::add_changed_package_info(ObExecContext &exec_ctx)
+int ObSQLSessionInfo::add_changed_package_info()
 {
   int ret = OB_SUCCESS;
   ObArenaAllocator allocator;
-  ObPLExecCtx pl_ctx(&allocator, &exec_ctx, NULL, NULL, NULL, NULL);
   if (0 != package_state_map_.size()) {
-    FOREACH(it, package_state_map_) {
+    FOREACH_X(it, package_state_map_, OB_SUCC(ret)) {
       ObPLPackageState *package_state = it->second;
       if (package_state->is_package_info_changed()) {
         ObSEArray<ObString, 4> key;
         ObSEArray<ObObj, 4> value;
-        if (OB_FAIL(package_state->convert_changed_info_to_string_kvs(pl_ctx, key, value))) {
+        if (OB_FAIL(package_state->convert_changed_info_to_string_kvs(*this, allocator, key, value))) {
           LOG_WARN("convert package state to string kv failed", K(ret));
         } else {
           ObSessionVariable sess_var;
@@ -2576,6 +2949,7 @@ int ObSQLSessionInfo::set_package_variable(
                                 NULL, /*param_list*/
                                 NULL, /*extern_param_info*/
                                 TgTimingEvent::TG_TIMING_EVENT_INVALID,
+                                nullptr,
                                 true /*is_sync_pacakge_var*/);
     OZ (package_guard.init());
     if (OB_SUCC(ret)) {
@@ -3035,7 +3409,6 @@ int ObSQLSessionInfo::save_sql_session(StmtSavedValue &saved_value)
 int ObSQLSessionInfo::restore_sql_session(StmtSavedValue &saved_value)
 {
   int ret = OB_SUCCESS;
-  ObObj obj;
   OX (session_type_ = saved_value.session_type_);
   OX (inner_flag_ = saved_value.inner_flag_);
   OX (read_uncommited_ = saved_value.read_uncommited_);
@@ -3044,8 +3417,11 @@ int ObSQLSessionInfo::restore_sql_session(StmtSavedValue &saved_value)
 #ifdef OB_BUILD_SPM
   OX (select_plan_type_ = saved_value.select_plan_type_);
 #endif
-  OX (obj.set_uint64(saved_value.catalog_id_));
-  OZ (update_sys_variable(share::SYS_VAR__CURRENT_DEFAULT_CATALOG, obj));
+  if (get_current_default_catalog() != saved_value.catalog_id_) {
+    ObObj obj;
+    OX (obj.set_uint64(saved_value.catalog_id_));
+    OZ (update_sys_variable(share::SYS_VAR__CURRENT_DEFAULT_CATALOG, obj));
+  }
   OX (set_database_id(saved_value.db_id_));
   OZ (set_default_database(saved_value.db_name_.string()));
   return ret;
@@ -3092,11 +3468,17 @@ void ObSQLSessionInfo::ObCachedTenantConfigInfo::refresh()
 {
   int tmp_ret = OB_SUCCESS;
   int64_t cur_ts = ObClockGenerator::getClock();
+  bool disable_cache = false;
+  int ret = OB_E(EventTable::EN_ENABLE_TENANT_CONFIG_CACHED) OB_SUCCESS;
+  if (ret == OB_ERR_UNEXPECTED) {
+    disable_cache = true;
+  }
   if (OB_ISNULL(session_)) {
     tmp_ret = OB_ERR_UNEXPECTED;
     LOG_WARN_RET(tmp_ret, "session_ is null");
   } else if ((saved_tenant_info_ != session_->get_effective_tenant_id())
-             || cur_ts - last_check_ec_ts_ > 5000000) {
+             || cur_ts - last_check_ec_ts_ > 5000000
+             || disable_cache) {
     const uint64_t effective_tenant_id = session_->get_effective_tenant_id();
     const bool change_tenant = (saved_tenant_info_ != effective_tenant_id);
     if (change_tenant) {
@@ -3160,6 +3542,7 @@ void ObSQLSessionInfo::ObCachedTenantConfigInfo::refresh()
         tenant_config->sql_plan_management_mode.get_value_string());
       enable_mysql_compatible_dates_ = tenant_config->_enable_mysql_compatible_dates;
       enable_enum_set_subschema_ = tenant_config->_enable_enum_set_subschema;
+      enable_seq_wrap_around_flush_cache_ = tenant_config->_enable_seq_wrap_around_flush_cache;
       // 7. print_sample_ppm_ for flt
       ATOMIC_STORE(&print_sample_ppm_, tenant_config->_print_sample_ppm);
       // 8. _enable_enhanced_cursor_validation
@@ -3170,7 +3553,15 @@ void ObSQLSessionInfo::ObCachedTenantConfigInfo::refresh()
       ATOMIC_STORE(&pc_adaptive_effectiveness_ratio_threshold_,
                    tenant_config->_pc_adaptive_effectiveness_ratio_threshold);
       ATOMIC_STORE(&enable_adaptive_plan_cache_, tenant_config->enable_adaptive_plan_cache);
+      // 13. enable_ps_parameterize
+      ATOMIC_STORE(&enable_ps_parameterize_, tenant_config->enable_ps_parameterize);
+      ATOMIC_STORE(&enable_sql_ccl_rule_, tenant_config->_enable_sql_ccl_rule);
+      ATOMIC_STORE(&enable_streaming_cursor_prefetch_, tenant_config->_enable_streaming_cursor_prefetch);
+      ATOMIC_STORE(&force_unstreaming_cursor_, tenant_config->_force_unstreaming_cursor);
+      extend_sql_plan_monitor_metrics_ = tenant_config->_extend_sql_plan_monitor_metrics;
+      ATOMIC_STORE(&enable_pl_sql_parameterize_, tenant_config->_enable_pl_sql_parameterize);
     }
+    conf_enable_sql_audit_ = GCONF.enable_sql_audit;
     ATOMIC_STORE(&last_check_ec_ts_, cur_ts);
     session_->update_tenant_config_version(
         (::oceanbase::omt::ObTenantConfigMgr::get_instance()).get_tenant_config_version(effective_tenant_id));
@@ -3257,6 +3648,7 @@ int ObSQLSessionInfo::set_login_info(const share::schema::ObUserLoginInfo &login
   OZ (write_str_reuse_buf(get_session_allocator(), login_info.passwd_, login_info_.passwd_));
   OZ (write_str_reuse_buf(get_session_allocator(), login_info.db_, login_info_.db_));
   OZ (write_str_reuse_buf(get_session_allocator(), login_info.scramble_str_, login_info_.scramble_str_));
+  OX (login_info_.is_passwd_plaintext_ = login_info.is_passwd_plaintext_);
   return ret;
 }
 
@@ -3326,15 +3718,18 @@ int ObSQLSessionInfo::on_user_disconnect()
 // prepare baseline for the following `calc_txn_free_route` to get the diff
 void ObSQLSessionInfo::prep_txn_free_route_baseline(bool reset_audit)
 {
+
 #define RESET_TXN_STATE_ENCODER_CHANGED_(x) txn_##x##_info_encoder_.is_changed_ = false
 #define RESET_TXN_STATE_ENCODER_CHANGED(x) RESET_TXN_STATE_ENCODER_CHANGED_(x)
-  LST_DO(RESET_TXN_STATE_ENCODER_CHANGED, (;), static, dynamic, participants, extra);
+  if (txn_free_route_ctx_.has_calculated()) {
+    LST_DO(RESET_TXN_STATE_ENCODER_CHANGED, (;), static, dynamic, participants, extra);
+    if (reset_audit) {
+      txn_free_route_ctx_.reset_audit_record();
+    }
+    txn_free_route_ctx_.init_before_handle_request(tx_desc_);
+  }
 #undef RESET_TXN_STATE_ENCODER_CHANGED
 #undef RESET_TXN_STATE_ENCODER_CHANGED_
-  if (reset_audit) {
-    txn_free_route_ctx_.reset_audit_record();
-  }
-  txn_free_route_ctx_.init_before_handle_request(tx_desc_);
 }
 
 void ObSQLSessionInfo::post_sync_session_info()
@@ -3405,6 +3800,12 @@ inline int ObSQLSessionInfo::init_mem_context(uint64_t tenant_id)
   return ret;
 }
 
+inline int64_t ObSQLSessionInfo::get_truncated_sql_len(const ObString &stmt)
+{
+  return enable_audit_log() ? static_cast<int64_t>(stmt.length()) :
+                              std::min(MAX_QUERY_STRING_LEN - 1, static_cast<int64_t>(stmt.length()));
+}
+
 void ObSQLSessionInfo::destory_mem_context()
 {
   if (OB_NOT_NULL(mem_context_)) {
@@ -3463,8 +3864,9 @@ int ObSQLSessionInfo::set_client_info(const common::ObString &client_info) {
   client_app_info_.client_info_.assign(&client_info_buf_[0], size);
   ObDiagnosticInfo *di = ObLocalDiagnosticInfo::get();
   if (OB_NOT_NULL(di)) {
-    MEMCPY(di->get_ash_stat().client_id_, client_info.ptr(),
-        min(static_cast<int64_t>(sizeof(di->get_ash_stat().client_id_)), size));
+    int64_t length = min(static_cast<int64_t>(sizeof(di->get_ash_stat().client_id_)), size);
+    MEMCPY(di->get_ash_stat().client_id_, client_info.ptr(), length);
+    di->get_ash_stat().client_id_[length > 0 ? length - 1 : 0] = '\0';
   }
   return ret;
 }
@@ -3572,9 +3974,10 @@ int ObErrorSyncSysVarEncoder::fetch_sess_info(ObSQLSessionInfo &sess, char *buf,
   return ret;
 }
 
-int64_t ObErrorSyncSysVarEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess)
+int ObErrorSyncSysVarEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size)
 {
-  int64_t size = 0;
+  int ret = OB_SUCCESS;
+  size = 0;
   for (int64_t j = 0; j< share::ObSysVarFactory::ALL_SYS_VARS_COUNT; ++j) {
     if (ObSysVariables::get_sys_var_id(j) == SYS_VAR_OB_LAST_SCHEMA_VERSION) {
       // need sync sys var
@@ -3583,7 +3986,7 @@ int64_t ObErrorSyncSysVarEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& ses
       // do nothing.
     }
   }
-  return size;
+  return ret;
 }
 
 int ObErrorSyncSysVarEncoder::compare_sess_info(ObSQLSessionInfo &sess,
@@ -3707,9 +4110,12 @@ int ObSysVarEncoder::get_serialize_size(ObSQLSessionInfo& sess, int64_t &len) co
 int ObSysVarEncoder::fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const int64_t length, int64_t &pos)
 {
   int ret = OB_SUCCESS;
+  ObString sys_var_in_pc_str;
   if (OB_FAIL(sess.get_sys_var_cache_inc_data().serialize(buf, length, pos))) {
     LOG_WARN("failed to serialize", K(length), K(ret));
-  } else if (OB_FAIL(sess.get_sys_var_in_pc_str().serialize(buf, length, pos))) {
+  } else if (OB_FAIL(sess.get_sys_var_in_pc_str(sys_var_in_pc_str))) {
+    LOG_WARN("fail to get sys var in pc str", K(ret));
+  } else if (OB_FAIL(sys_var_in_pc_str.serialize(buf, length, pos))) {
     LOG_WARN("failed to serialize", K(ret), K(length), K(pos));
   } else {
     for (int64_t j = 0; OB_SUCC(ret) && j< share::ObSysVarFactory::ALL_SYS_VARS_COUNT; ++j) {
@@ -3733,27 +4139,33 @@ int ObSysVarEncoder::fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const in
   return ret;
 }
 
-int64_t ObSysVarEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess)
+int ObSysVarEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size)
 {
-  int64_t size = 0;
+  int ret = OB_SUCCESS;
+  size = 0;
+  ObString sys_var_in_pc_str;
   size = sess.get_sys_var_cache_inc_data().get_serialize_size();
-  size += sess.get_sys_var_in_pc_str().get_serialize_size();
-  for (int64_t j = 0; j< share::ObSysVarFactory::ALL_SYS_VARS_COUNT; ++j) {
-      if (ObSysVariables::get_sys_var_id(j) == SYS_VAR_SERVER_UUID ||
-          ObSysVariables::get_sys_var_id(j) == SYS_VAR_OB_PROXY_PARTITION_HIT ||
-          ObSysVariables::get_sys_var_id(j) == SYS_VAR_OB_STATEMENT_TRACE_ID ||
-          ObSysVariables::get_sys_var_id(j) == SYS_VAR_VERSION_COMMENT ||
-          ObSysVariables::get_sys_var_id(j) == SYS_VAR__OB_PROXY_WEAKREAD_FEEDBACK ||
-          ObSysVariables::get_sys_var_id(j) ==  SYS_VAR_SYSTEM_TIME_ZONE ||
-          ObSysVariables::get_sys_var_id(j) ==  SYS_VAR_PID_FILE ||
-          ObSysVariables::get_sys_var_id(j) ==  SYS_VAR_PORT ||
-          ObSysVariables::get_sys_var_id(j) ==  SYS_VAR_SOCKET) {
-      // no need sync sys var
-      continue;
+  if (OB_FAIL(sess.get_sys_var_in_pc_str(sys_var_in_pc_str))) {
+    LOG_WARN("fail to get sys var in pc str", K(ret));
+  } else {
+    size += sys_var_in_pc_str.get_serialize_size();
+    for (int64_t j = 0; j< share::ObSysVarFactory::ALL_SYS_VARS_COUNT; ++j) {
+        if (ObSysVariables::get_sys_var_id(j) == SYS_VAR_SERVER_UUID ||
+            ObSysVariables::get_sys_var_id(j) == SYS_VAR_OB_PROXY_PARTITION_HIT ||
+            ObSysVariables::get_sys_var_id(j) == SYS_VAR_OB_STATEMENT_TRACE_ID ||
+            ObSysVariables::get_sys_var_id(j) == SYS_VAR_VERSION_COMMENT ||
+            ObSysVariables::get_sys_var_id(j) == SYS_VAR__OB_PROXY_WEAKREAD_FEEDBACK ||
+            ObSysVariables::get_sys_var_id(j) ==  SYS_VAR_SYSTEM_TIME_ZONE ||
+            ObSysVariables::get_sys_var_id(j) ==  SYS_VAR_PID_FILE ||
+            ObSysVariables::get_sys_var_id(j) ==  SYS_VAR_PORT ||
+            ObSysVariables::get_sys_var_id(j) ==  SYS_VAR_SOCKET) {
+        // no need sync sys var
+        continue;
+      }
+      size += sess.get_sys_var(j)->get_serialize_size();
     }
-    size += sess.get_sys_var(j)->get_serialize_size();
   }
-  return size;
+  return ret;
 }
 
 int ObSysVarEncoder::compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
@@ -3832,12 +4244,15 @@ int ObSysVarEncoder::display_sess_info(ObSQLSessionInfo &sess, const char* curre
         // do nothing
       }
     }
+    ObString current_sys_var_in_pc_str;
     if (OB_FAIL(ret)) {
 
-    } else if (sess.get_sys_var_in_pc_str() != last_sess_sys_var_in_pc_str) {
+    } else if (OB_FAIL(sess.get_sys_var_in_pc_str(current_sys_var_in_pc_str))) {
+      LOG_WARN("fail to get sys var in pc str", K(ret));
+    } else if (current_sys_var_in_pc_str != last_sess_sys_var_in_pc_str) {
       share::ObTaskController::get().allow_next_syslog();
       LOG_WARN("failed to verify sys var in pc str", K(ret), "current_sess_sys_var_in_pc_str",
-            sess.get_sys_var_in_pc_str(),
+            current_sys_var_in_pc_str,
             "last_sess_sys_var_in_pc_str", last_sess_sys_var_in_pc_str);
     } else if (!is_error) {
       share::ObTaskController::get().allow_next_syslog();
@@ -3915,11 +4330,14 @@ int ObAppInfoEncoder::fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const i
   return ret;
 }
 
-int64_t ObAppInfoEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess)
+int ObAppInfoEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size)
 {
-  int64_t len = 0;
-  get_serialize_size(sess, len);
-  return len;
+  int ret = OB_SUCCESS;
+  size = 0;
+  if (OB_FAIL(get_serialize_size(sess, size))) {
+    LOG_WARN("fail to get serialize size", K(ret));
+  }
+  return ret;
 }
 
 int ObAppInfoEncoder::compare_sess_info(ObSQLSessionInfo &sess, const char* current_sess_buf, int64_t current_sess_length,
@@ -4053,11 +4471,14 @@ int ObClientIdInfoEncoder::fetch_sess_info(ObSQLSessionInfo &sess, char *buf, co
   return ret;
 }
 
-int64_t ObClientIdInfoEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess)
+int ObClientIdInfoEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size)
 {
-  int64_t len = 0;
-  get_serialize_size(sess, len);
-  return len;
+  int ret = OB_SUCCESS;
+  size = 0;
+  if (OB_FAIL(get_serialize_size(sess, size))) {
+    LOG_WARN("fail to get serialize size", K(ret));
+  }
+  return ret;
 }
 
 int ObClientIdInfoEncoder::compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
@@ -4160,11 +4581,14 @@ int ObAppCtxInfoEncoder::fetch_sess_info(ObSQLSessionInfo &sess, char *buf, cons
   return ret;
 }
 
-int64_t ObAppCtxInfoEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess)
+int ObAppCtxInfoEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size)
 {
-  int64_t len = 0;
-  get_serialize_size(sess, len);
-  return len;
+  int ret = OB_SUCCESS;
+  size = 0;
+  if (OB_FAIL(get_serialize_size(sess, size))) {
+    LOG_WARN("fail to get serialize size", K(ret));
+  }
+  return ret;
 }
 
 int ObAppCtxInfoEncoder::compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
@@ -4324,11 +4748,14 @@ int ObSequenceCurrvalEncoder::fetch_sess_info(ObSQLSessionInfo &sess, char *buf,
   return ret;
 }
 
-int64_t ObSequenceCurrvalEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess)
+int ObSequenceCurrvalEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size)
 {
-  int64_t len = 0;
-  get_serialize_size(sess, len);
-  return len;
+  int ret = OB_SUCCESS;
+  size = 0;
+  if (OB_FAIL(get_serialize_size(sess, size))) {
+    LOG_WARN("fail to get serialize size", K(ret));
+  }
+  return ret;
 }
 
 int ObSequenceCurrvalEncoder::compare_sess_info(ObSQLSessionInfo &sess,
@@ -4513,11 +4940,14 @@ int ObQueryInfoEncoder::fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const
   return ret;
 }
 
-int64_t ObQueryInfoEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess)
+int ObQueryInfoEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size)
 {
-  int64_t len = 0;
-  get_serialize_size(sess, len);
-  return len;
+  int ret = OB_SUCCESS;
+  size = 0;
+  if (OB_FAIL(get_serialize_size(sess, size))) {
+    LOG_WARN("fail to get serialize size", K(ret));
+  }
+  return ret;
 }
 
 int ObQueryInfoEncoder::compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
@@ -4560,6 +4990,83 @@ int ObQueryInfoEncoder::display_sess_info(ObSQLSessionInfo &sess, const char* cu
   } else {
     share::ObTaskController::get().allow_next_syslog();
     LOG_INFO("success to verify VariousInfo", K(ret));
+  }
+  return ret;
+}
+
+int ObTransGttV2SequenceEncoder::serialize(ObSQLSessionInfo &sess, char *buf, const int64_t buf_len, int64_t &pos)
+{
+  int ret = OB_SUCCESS;
+  OB_UNIS_ENCODE(sess.get_trans_gtt_v2_sequence());
+  return ret;
+}
+
+int ObTransGttV2SequenceEncoder::deserialize(ObSQLSessionInfo &sess, const char *buf, const int64_t data_len, int64_t &pos)
+{
+  int ret = OB_SUCCESS;
+  int64_t trans_gtt_v2_sequence = 0;
+  OB_UNIS_DECODE(trans_gtt_v2_sequence);
+  sess.set_trans_gtt_v2_sequence(trans_gtt_v2_sequence);
+  return ret;
+}
+
+int ObTransGttV2SequenceEncoder::get_serialize_size(ObSQLSessionInfo &sess, int64_t &len) const
+{
+  int ret = OB_SUCCESS;
+  len = serialization::encoded_length(sess.get_trans_gtt_v2_sequence());
+  return ret;
+}
+
+int ObTransGttV2SequenceEncoder::fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const int64_t buf_len, int64_t &pos)
+{
+  int ret = OB_SUCCESS;
+  OB_UNIS_ENCODE(sess.get_trans_gtt_v2_sequence());
+  return ret;
+}
+
+int ObTransGttV2SequenceEncoder::get_fetch_sess_info_size(ObSQLSessionInfo &sess, int64_t &size)
+{
+  int ret = OB_SUCCESS;
+  size = serialization::encoded_length(sess.get_trans_gtt_v2_sequence());
+  return ret;
+}
+
+int ObTransGttV2SequenceEncoder::compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
+                                                    int64_t current_sess_length, const char *last_sess_buf,
+                                                    int64_t last_sess_length)
+{
+  int ret = OB_SUCCESS;
+  if (current_sess_length != last_sess_length) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sess info length not equal", K(ret), K(current_sess_length), K(last_sess_length));
+  } else if (0 != MEMCMP(current_sess_buf, last_sess_buf, current_sess_length)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sess info is different", K(ret));
+  }
+  return ret;
+}
+
+int ObTransGttV2SequenceEncoder::display_sess_info(ObSQLSessionInfo &sess, const char* current_sess_buf,
+                                                    int64_t current_sess_length, const char* last_sess_buf,
+                                                    int64_t last_sess_length)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(current_sess_buf);
+  UNUSED(current_sess_length);
+  int64_t pos = 0;
+  const char *buf = last_sess_buf;
+  int64_t data_len = last_sess_length;
+  int64_t trans_gtt_v2_sequence = 0;
+
+  LST_DO_CODE(OB_UNIS_DECODE, trans_gtt_v2_sequence);
+  if (sess.get_trans_gtt_v2_sequence() != trans_gtt_v2_sequence) {
+    share::ObTaskController::get().allow_next_syslog();
+    LOG_WARN("failed to verify trans_gtt_v2_sequence", K(ret),
+      "current_trans_gtt_v2_sequence", sess.get_trans_gtt_v2_sequence(),
+      "last_trans_gtt_v2_sequence", trans_gtt_v2_sequence);
+  } else {
+    share::ObTaskController::get().allow_next_syslog();
+    LOG_INFO("success to verify trans_gtt_v2_sequence", K(ret));
   }
   return ret;
 }
@@ -4697,11 +5204,14 @@ int ObControlInfoEncoder::fetch_sess_info(ObSQLSessionInfo &sess, char *buf, con
   return ret;
 }
 
-int64_t ObControlInfoEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess)
+int ObControlInfoEncoder::get_fetch_sess_info_size(ObSQLSessionInfo& sess, int64_t &size)
 {
-  int64_t len = 0;
-  get_serialize_size(sess, len);
-  return len;
+  int ret = OB_SUCCESS;
+  size = 0;
+  if (OB_FAIL(get_serialize_size(sess, size))) {
+    LOG_WARN("fail to get serialize size", K(ret));
+  }
+  return ret;
 }
 
 int ObControlInfoEncoder::compare_sess_info(ObSQLSessionInfo &sess, const char *current_sess_buf,
@@ -4779,9 +5289,11 @@ int CLS::fetch_sess_info(ObSQLSessionInfo &sess, char *buf, const int64_t data_l
 {                                                                       \
   return ObSqlTransControl::fetch_txn_##func##_state(sess, buf, data_len, pos); \
 }                                                                       \
-int64_t CLS::get_fetch_sess_info_size(ObSQLSessionInfo &sess)         \
+int CLS::get_fetch_sess_info_size(ObSQLSessionInfo &sess, int64_t &size)         \
 {                                                                       \
-  return ObSqlTransControl::get_fetch_txn_##func##_state_size(sess); \
+  int ret = OB_SUCCESS;                                                 \
+  size = ObSqlTransControl::get_fetch_txn_##func##_state_size(sess); \
+  return ret;                                                           \
 }                                                                       \
 int CLS::compare_sess_info(ObSQLSessionInfo &sess, const char* current_sess_buf, int64_t current_sess_length, const char* last_sess_buf, int64_t last_sess_length) \
 {                                                                       \
@@ -4920,13 +5432,16 @@ int ObSQLSessionInfo::sql_sess_record_sql_stat_start_value(ObExecutingSqlStatRec
   int ret = OB_SUCCESS;
   if (OB_FAIL(executing_sql_stat_record_.assign(executing_sqlstat))) {
     LOG_WARN("failed to assign executing sql stat record");
-  } else {
-    ObDiagnosticInfo *di = ObLocalDiagnosticInfo::get();
-    if (OB_NOT_NULL(di)) {
-      di->get_ash_stat().record_cur_query_start_ts(get_is_in_retry());
-    }
   }
   return ret;
+}
+
+void ObSQLSessionInfo::set_retry_wait_event_begin_time()
+{
+  ObDiagnosticInfo *di = ObLocalDiagnosticInfo::get();
+  if (OB_NOT_NULL(di)) {
+    di->get_ash_stat().record_cur_query_start_ts(get_is_in_retry());
+  }
 }
 
 int ObSQLSessionInfo::set_service_name(const ObString& service_name)
@@ -4992,8 +5507,8 @@ void ObSQLSessionInfo::set_ash_stat_value(ObActiveSessionStat &ash_stat)
 {
   ObBasicSessionInfo::set_ash_stat_value(ash_stat);
   if (!get_module_name().empty()) {
-    int64_t size = get_module_name().length() > ASH_MODULE_STR_LEN
-                      ? ASH_MODULE_STR_LEN
+    int64_t size = get_module_name().length() >= ASH_MODULE_STR_LEN
+                      ? ASH_MODULE_STR_LEN - 1
                       : get_module_name().length();
     MEMCPY(ash_stat.module_, get_module_name().ptr(), size);
     ash_stat.module_[size] = '\0';
@@ -5001,8 +5516,8 @@ void ObSQLSessionInfo::set_ash_stat_value(ObActiveSessionStat &ash_stat)
 
   // fill action for user session
   if (!get_action_name().empty()) {
-    int64_t size = get_action_name().length() > ASH_ACTION_STR_LEN
-                      ? ASH_ACTION_STR_LEN
+    int64_t size = get_action_name().length() >= ASH_ACTION_STR_LEN
+                      ? ASH_ACTION_STR_LEN - 1
                       : get_action_name().length();
     MEMCPY(ash_stat.action_, get_action_name().ptr(), size);
     ash_stat.action_[size] = '\0';
@@ -5010,8 +5525,8 @@ void ObSQLSessionInfo::set_ash_stat_value(ObActiveSessionStat &ash_stat)
 
   // fill client id for user session
   if (!get_client_identifier().empty()) {
-    int64_t size = get_client_identifier().length() > ASH_CLIENT_ID_STR_LEN
-                      ? ASH_CLIENT_ID_STR_LEN
+    int64_t size = get_client_identifier().length() >= ASH_CLIENT_ID_STR_LEN
+                      ? ASH_CLIENT_ID_STR_LEN - 1
                       : get_client_identifier().length();
     MEMCPY(ash_stat.client_id_, get_client_identifier().ptr(), size);
     ash_stat.client_id_[size] = '\0';

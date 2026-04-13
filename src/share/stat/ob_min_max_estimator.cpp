@@ -35,8 +35,8 @@ int ObStatMinMaxSubquery::gen_expr(char *buf, const int64_t buf_len, int64_t &po
     LOG_WARN("failed to print  buf", K(ret));
   } else if (OB_FAIL(databuff_printf(buf, buf_len, pos,
                                      lib::is_oracle_mode() ?
-                                     " (SELECT /*+ %.*s */ %.*s FROM \"%.*s\".\"%.*s\" %.*s T WHERE %.*s IS NOT NULL ORDER BY 1 %s FETCH FIRST 1 ROWS ONLY)" :
-                                     " (SELECT /*+ %.*s */ %.*s FROM `%.*s`.`%.*s` %.*s T WHERE %.*s IS NOT NULL ORDER BY 1 %s LIMIT 1)",
+                                     " (SELECT /*+ %.*s */ \"%.*s\" FROM \"%.*s\".\"%.*s\" %.*s T WHERE \"%.*s\" IS NOT NULL ORDER BY 1 %s FETCH FIRST 1 ROWS ONLY)" :
+                                     " (SELECT /*+ %.*s */ `%.*s` FROM `%.*s`.`%.*s` %.*s T WHERE `%.*s` IS NOT NULL ORDER BY 1 %s LIMIT 1)",
                                      (int)hint_pos,
                                      hint,
                                      col_param_->column_name_.length(),
@@ -136,13 +136,15 @@ int ObMinMaxEstimator::estimate(const ObOptStatGatherParam &param,
   ObSqlString raw_sql;
   int64_t duration_time = -1;
   ObSEArray<ObOptStat, 1> tmp_opt_stats;
-  if (OB_FAIL(add_from_table(allocator, param.db_name_, param.tab_name_))) {
-    LOG_WARN("failed to add from table", K(ret));
+  if (OB_FAIL(init_escape_char_names(allocator, param))) {
+    LOG_WARN("failed to add init escape char names", K(ret));
+  } else if (OB_FALSE_IT(set_from_table(tab_name_))) {
   } else if (OB_UNLIKELY(param.partition_infos_.count() > 1)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected error", K(ret), K(param));
   } else if (!param.partition_infos_.empty() &&
-             OB_FAIL(fill_partition_info(allocator, param, param.partition_infos_.at(0)))) {
+             OB_FAIL(ObStatsEstimator::fill_partition_info(allocator,
+                                                           param.partition_infos_.at(0).part_name_))) {
     LOG_WARN("failed to add partition info", K(ret));
   } else if (OB_FAIL(add_min_max_stat_items(allocator,
                                             param,

@@ -20,6 +20,7 @@
 #include "storage/tx_storage/ob_tenant_freezer.h"
 #include "storage/meta_store/ob_server_storage_meta_service.h"
 #include "storage/compaction/ob_compaction_schedule_util.h"
+#include "storage/compaction/ob_tenant_tablet_scheduler.h"
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/incremental/garbage_collector/ob_ss_garbage_collector_service.h"
 #endif
@@ -53,15 +54,15 @@ ObStorageSnapshotInfo::ObStorageSnapshotInfo()
   STATIC_ASSERT(SNAPSHOT_MAX - share::ObSnapShotType::MAX_SNAPSHOT_TYPE == ARRAYSIZEOF(ObSnapShotTypeStr), "snapshot type len is mismatch");
 }
 
-const char * ObStorageSnapshotInfo::get_snapshot_type_str() const
+const char * ObStorageSnapshotInfo::get_snapshot_type_str(const uint64_t snapshot_type)
 {
   const char * str = nullptr;
-  if (OB_UNLIKELY(snapshot_type_ >= SNAPSHOT_MAX)) {
+  if (OB_UNLIKELY(snapshot_type >= SNAPSHOT_MAX)) {
     str = "invalid_snapshot_type";
-  } else if (snapshot_type_ < ObSnapShotType::MAX_SNAPSHOT_TYPE) {
-    str = ObSnapshotInfo::get_snapshot_type_str((ObSnapShotType)snapshot_type_);
+  } else if (snapshot_type < ObSnapShotType::MAX_SNAPSHOT_TYPE) {
+    str = ObSnapshotInfo::get_snapshot_type_str((ObSnapShotType)snapshot_type);
   } else {
-    str = ObSnapShotTypeStr[snapshot_type_ - ObSnapShotType::MAX_SNAPSHOT_TYPE];
+    str = ObSnapShotTypeStr[snapshot_type - ObSnapShotType::MAX_SNAPSHOT_TYPE];
   }
   return str;
 }
@@ -83,7 +84,7 @@ ObTenantFreezeInfoMgr::ObTenantFreezeInfoMgr()
     update_reserved_snapshot_task_(*this),
     freeze_info_mgr_(),
     snapshots_(),
-    lock_(),
+    lock_(common::ObLatchIds::OB_TENANT_FREEZE_INFO_MGR_LOCK),
     cur_idx_(0),
     last_change_ts_(0),
     tenant_id_(OB_INVALID_ID),
@@ -441,7 +442,8 @@ void ObTenantFreezeInfoMgr::check_tenant_in_restore_with_mv_(
 int ObTenantFreezeInfoMgr::get_min_reserved_snapshot(
     const ObTabletID &tablet_id,
     const int64_t merged_version,
-    ObStorageSnapshotInfo &snapshot_info)
+    ObStorageSnapshotInfo &snapshot_info,
+    const bool skip_undo_retention)
 {
   int ret = OB_SUCCESS;
   ObFreezeInfo freeze_info;
@@ -468,24 +470,35 @@ int ObTenantFreezeInfoMgr::get_min_reserved_snapshot(
     if (OB_ISNULL(ss_gc_srv = MTL(ObSSGarbageCollectorService *))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("ObSSGarbageCollectorService should not be null", KR(ret));
+    } else if (OB_FAIL(ss_gc_srv->get_min_ss_gc_last_succ_scn(false /*is_for_sslog_table */, last_succ_scn))) {
+      LOG_WARN("get last_succ_scns from ObSSGarbageCollectorService failed", KR(ret));
     } else {
-      last_succ_scn = ss_gc_srv->get_last_succ_gc_scn();
-    }
-    // get last_succ_scn from user_tenant
-    uint64_t user_tenant_id = gen_user_tenant_id(MTL_ID());
-    ss_gc_srv = nullptr;
-    MTL_SWITCH(user_tenant_id) {
-      if (OB_ISNULL(ss_gc_srv = MTL(ObSSGarbageCollectorService *))) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("ObSSGarbageCollectorService should not be null", KR(ret));
+      // get last_succ_scn from user_tenant
+      uint64_t user_tenant_id = gen_user_tenant_id(MTL_ID());
+      SCN user_last_succ_scn = SCN::min_scn();
+      // Use the new interface with tenant_id parameter, which will handle the case
+      // where the tenant is not in the current server by forwarding the request to sswriter
+      if (OB_FAIL(ss_gc_srv->get_min_ss_gc_last_succ_scn(
+            user_tenant_id, false /*is_for_sslog_table */, user_last_succ_scn))) {
+        LOG_WARN("get last_succ_scns from ObSSGarbageCollectorService failed", KR(ret), K(user_tenant_id));
       } else {
-        last_succ_scn = SCN::min(last_succ_scn, ss_gc_srv->get_last_succ_gc_scn());
+        last_succ_scn = SCN::min(last_succ_scn, user_last_succ_scn);
       }
     }
+    if (OB_FAIL(ret)) {
+      LOG_WARN(
+        "meet fail during get_min_ss_gc_last_succ_scn, reset multi_version_start to min", KR(ret), K(last_succ_scn));
+      last_succ_scn.set_min();
+    }
     snapshot_info.update_by_smaller_snapshot(ObStorageSnapshotInfo::SNAPSHOT_FOR_SS_GC, last_succ_scn.get_val_for_tx());
-    LOG_TRACE("set multi_start_version for sslog_table", KR(ret), K(user_tenant_id), K(snapshot_info));
+    LOG_TRACE("set multi_start_version for sslog_table", KR(ret), K(snapshot_info));
 #endif
-  } else if (OB_FAIL(get_multi_version_duration(duration))) {
+  }
+  if (OB_FAIL(ret)) {
+  } else if (skip_undo_retention && !GCTX.is_shared_storage_mode()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("get unexpected argument skip_undo_retention", K(ret));
+  } else if (!skip_undo_retention && OB_FAIL(get_multi_version_duration(duration))) {
     STORAGE_LOG(WARN, "fail to get multi version duration", K(ret), K(tablet_id));
   } else {
     if (merged_version < 1) {
@@ -586,6 +599,7 @@ int ObTenantFreezeInfoMgr::ReloadTask::init()
 int ObTenantFreezeInfoMgr::ReloadTask::refresh_merge_info()
 {
   int ret = OB_SUCCESS;
+  int tmp_ret = OB_SUCCESS;
 
   const uint64_t tenant_id = MTL_ID();
 
@@ -594,15 +608,24 @@ int ObTenantFreezeInfoMgr::ReloadTask::refresh_merge_info()
   global_merge_info.tenant_id_ = tenant_id;
   int64_t cur_broadcast_version = 0;
   int64_t global_broadcast_version = 0;
+  int64_t current_window_start_time = 0;
+  ObZoneMergeInfo::MergeStatus merge_status = ObZoneMergeInfo::MERGE_STATUS_MAX;
+  ObGlobalMergeInfo::MergeMode merge_mode = ObGlobalMergeInfo::MERGE_MODE_MAX;
 
   if (OB_FAIL(ObGlobalMergeTableOperator::load_global_merge_info(*GCTX.sql_proxy_, tenant_id, global_merge_info))) {
     LOG_WARN("failed to load global merge info", KR(ret), K(global_merge_info));
   } else {
+    merge_status = static_cast<ObZoneMergeInfo::MergeStatus>(global_merge_info.merge_status_.get_value());
+    merge_mode = static_cast<ObGlobalMergeInfo::MergeMode>(global_merge_info.merge_mode_.get_value());
+    current_window_start_time = global_merge_info.merge_start_time();
     // set merged version
     MERGE_SCHEDULER_PTR->set_inner_table_merged_scn(global_merge_info.last_merged_scn_.get_scn().get_val_for_tx());
+    if (is_user_tenant(tenant_id) && OB_TMP_FAIL(MERGE_SCHEDULER_PTR->update_merge_info(merge_mode, merge_status, current_window_start_time))) {
+      LOG_WARN("fail to update merge info", K(tmp_ret), "zone", GCTX.config_->zone.str(), K(merge_mode), K(merge_status), K(current_window_start_time));
+    }
     if (global_merge_info.suspend_merging_.get_value()) { // suspend_merge
       MERGE_SCHEDULER_PTR->stop_major_merge();
-      LOG_INFO("schedule zone to stop major merge", K(tenant_id), K(global_merge_info));
+      LOG_INFO("schedule zone to stop major merge", K(ret), K(tenant_id), K(global_merge_info));
     } else {
       if (check_tenant_status_) {
         if (is_sys_tenant(tenant_id) || is_meta_tenant(tenant_id)) {
@@ -612,11 +635,9 @@ int ObTenantFreezeInfoMgr::ReloadTask::refresh_merge_info()
           LOG_WARN("tenant is unexpected virtual tenant", KR(ret), K(tenant_id));
         } else {
           const ObTenantRole::Role &role = MTL_GET_TENANT_ROLE_CACHE();
-          if (is_primary_tenant(role) || is_standby_tenant(role)) {
+          if (is_primary_tenant(role) || is_standby_tenant(role) || is_restore_tenant(role)) {
             check_tenant_status_ = false;
             LOG_INFO("finish check tenant restore", K(tenant_id), K(role));
-          } else if (REACH_THREAD_TIME_INTERVAL(10L * 1000L * 1000L)) {
-            LOG_INFO("skip restoring tenant to schedule major merge", K(tenant_id), K(role));
           }
         }
       }
@@ -625,7 +646,7 @@ int ObTenantFreezeInfoMgr::ReloadTask::refresh_merge_info()
         cur_broadcast_version = MERGE_SCHEDULER_PTR->get_frozen_version();
         global_broadcast_version = global_merge_info.global_broadcast_scn_.get_scn().get_val_for_tx();
         if (global_broadcast_version > cur_broadcast_version) {
-          FLOG_INFO("try to schedule merge", K(tenant_id), "zone", GCTX.config_->zone.str(), K(global_broadcast_version), K(cur_broadcast_version));
+          FLOG_INFO("try to schedule tenant major merge", K(tenant_id), "zone", GCTX.config_->zone.str(), K(global_broadcast_version), K(cur_broadcast_version));
           if (OB_FAIL(MERGE_SCHEDULER_PTR->schedule_merge(global_broadcast_version))) {
             LOG_WARN("fail to schedule merge", K(ret), "zone", GCTX.config_->zone.str(), K(global_broadcast_version));
           } else if (OB_FAIL(MTL(ObTenantFreezer*)->update_frozen_scn(global_broadcast_version))) {

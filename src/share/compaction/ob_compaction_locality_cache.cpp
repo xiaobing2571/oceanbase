@@ -8,6 +8,7 @@
 // MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 // See the Mulan PubL v2 for more details.
 #define USING_LOG_PREFIX COMMON
+#include "storage/compaction/ob_compaction_diagnose.h"
 #include "ob_compaction_locality_cache.h"
 #include "src/storage/compaction/ob_medium_compaction_func.h"
 
@@ -76,6 +77,7 @@ int ObCompactionLocalityCache::refresh_ls_locality(const bool force_refresh)
 int ObCompactionLocalityCache::inner_refresh_ls_locality()
 {
   int ret = OB_SUCCESS;
+  int tmp_ret = OB_SUCCESS;
   int64_t cost_ts = ObTimeUtility::fast_current_time();
   ObSEArray<ObZone, 10> zone_list;
   if (IS_NOT_INIT) {
@@ -102,19 +104,34 @@ int ObCompactionLocalityCache::inner_refresh_ls_locality()
     if (OB_ISNULL(GCTX.lst_operator_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("lst_operator is null", KR(ret), K_(tenant_id));
-    } else if (OB_FAIL(GCTX.lst_operator_->get_by_tenant(tenant_id_, false/*inner_table_only*/, ls_infos))) {
-      LOG_WARN("fail to get ls infos", KR(ret), K_(tenant_id));
+    } else if (OB_TMP_FAIL(GCTX.lst_operator_->get_by_tenant(tenant_id_, false/*inner_table_only*/, ls_infos))) {
+      LOG_WARN("fail to get ls infos", KR(tmp_ret), K_(tenant_id));
+    } else if (OB_UNLIKELY(ls_infos.empty())) {
+      LOG_INFO("ls_infos is empty, skip refresh ls locality", K_(tenant_id));
+      MTL(compaction::ObDiagnoseTabletMgr *)->add_diagnose_tablet(UNKNOW_LS_ID, UNKNOW_TABLET_ID, ObDiagnoseTabletType::TYPE_MEDIUM_MERGE);
     } else {
       // 3. update ls_infos cached in memory
-      for (int64_t i = 0; OB_SUCC(ret) && i < ls_infos.count(); ++i) {
+      for (int64_t i = 0; i < ls_infos.count(); ++i) {
         const ObLSInfo &ls_info = ls_infos.at(i);
         if (OB_FAIL(refresh_by_zone(ls_info, zone_list))) {
           LOG_WARN("fail to refresh by zone", K(ret), K(ls_info), K_(tenant_id), K(zone_list));
+          if (OB_TMP_FAIL(compaction::ADD_SUSPECT_LS_INFO(
+            compaction::ObMergeType::MEDIUM_MERGE,
+            ObDiagnoseTabletType::TYPE_MEDIUM_MERGE,
+            ls_info.get_ls_id(),
+            ObSuspectInfoType::SUSPECT_FAILED_TO_REFRESH_LS_LOCALITY,
+            ret))) {
+            LOG_WARN("fail to add suspect info", KR(tmp_ret), K(ls_info));
+          }
+          ret = OB_SUCCESS;
         }
       }
-    }
-    if (OB_SUCC(ret)) {
-      MTL(compaction::ObDiagnoseTabletMgr *)->delete_diagnose_tablet(UNKNOW_LS_ID, UNKNOW_TABLET_ID, ObDiagnoseTabletType::TYPE_MEDIUM_MERGE);
+      if (ls_infos_map_.empty()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("all ls failed to refresh locality", KR(ret), K_(tenant_id));
+      } else if (ls_infos_map_.size() == ls_infos.count()) {
+        MTL(compaction::ObDiagnoseTabletMgr *)->delete_diagnose_tablet(UNKNOW_LS_ID, UNKNOW_TABLET_ID, ObDiagnoseTabletType::TYPE_MEDIUM_MERGE);
+      }
     }
     cost_ts = ObTimeUtility::fast_current_time() - cost_ts;
     LOG_INFO("finish to refresh ls locality cache", KR(ret), K_(tenant_id), K(cost_ts), K(zone_list));
@@ -187,11 +204,21 @@ bool ObMemberListInfo::check_exist(const common::ObAddr &addr)
   return found;
 }
 
+ERRSIM_POINT_DEF(ERRSIM_REFRESH_LOCALITY_CACHE_FAILED);
 int ObCompactionLocalityCache::refresh_by_zone(
     const share::ObLSInfo &ls_info,
     const ObIArray<common::ObZone> &zone_list)
 {
   int ret = OB_SUCCESS;
+
+#ifdef ERRSIM
+  if (OB_UNLIKELY(ERRSIM_REFRESH_LOCALITY_CACHE_FAILED)) {
+    ret = ERRSIM_REFRESH_LOCALITY_CACHE_FAILED;
+    LOG_WARN("[ERRSIM] refresh_by_zone failed", K(ret), K(ls_info.get_ls_id()), K(zone_list));
+    return ret;
+  }
+#endif
+
   if (OB_UNLIKELY(!ls_info.is_valid() || zone_list.empty())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid ls_info", K(ret), K(ls_info), K(zone_list));
@@ -229,8 +256,9 @@ int ObCompactionLocalityCache::refresh_by_zone(
     }
     if (FAILEDx(ls_infos_map_.set_refactored(ls_id, tmp_ls_info, 1/*overwrite*/))) {
       LOG_WARN("fail to set refactored", KR(ret), K(ls_id), K(tmp_ls_info));
-    } else {
-      FLOG_INFO("success to refresh cached ls_info", K(ret), K(tmp_ls_info), K(zone_list));
+    }
+    if (OB_FAIL(ret)) {
+      LOG_WARN("failed to refresh cached ls_info", K(ret), K(tmp_ls_info), K(zone_list));
     }
   }
   return ret;

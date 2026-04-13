@@ -20,10 +20,12 @@
 #include "share/resource_manager/ob_resource_manager_proxy.h"
 #include "sql/engine/expr/ob_expr_uuid.h"
 #include "lib/locale/ob_locale_type.h"
+#include "lib/encrypt/ob_encrypted_helper.h"
 #ifdef OB_BUILD_ORACLE_PL
 #include "pl/ob_pl_warning.h"
 #endif
-
+#include "lib/charset/ob_charset.h"
+#include "rootserver/freeze/window/ob_window_compaction_helper.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::share;
@@ -92,7 +94,7 @@ ObSpecialSysVarValues::ObSpecialSysVarValues()
       tmp_tm.tm_gmtoff = 0 - tmp_tm.tm_gmtoff;
     }
     const int64_t tz_hour = tmp_tm.tm_gmtoff / 3600;
-    const int64_t tz_minuts = (tmp_tm.tm_gmtoff % 3600) % 60;
+    const int64_t tz_minuts = (tmp_tm.tm_gmtoff % 3600) / 60;
     if (OB_FAIL(databuff_printf(ObSpecialSysVarValues::system_time_zone_str_,
                                 ObSpecialSysVarValues::SYSTEM_TIME_ZONE_MAX_LEN,
                                 pos,
@@ -2219,8 +2221,6 @@ int ObSysVarOnCheckFuncs::check_update_resource_manager_plan(ObExecContext &ctx,
       // maybe NULL, do nothing
     } else if (OB_FAIL(val.get_string(plan))) {
       LOG_WARN("fail to get sql mode str", K(ret), K(val), K(sys_var));
-    } else if (0 == plan.length()) {
-      // do nothing.
     } else {
       // check if plan exists
       ObResourceManagerProxy proxy;
@@ -2230,13 +2230,23 @@ int ObSysVarOnCheckFuncs::check_update_resource_manager_plan(ObExecContext &ctx,
         LOG_WARN("fail to get session info", K(ret));
       } else {
         uint64_t tenant_id = session->get_effective_tenant_id();
-        bool exists = false;
-        if (OB_FAIL(proxy.check_if_plan_exist(tenant_id, plan, exists))) {
+        bool exists = (0 == plan.length());
+        bool is_window_compaction_active = false;
+        if (!exists && OB_FAIL(proxy.check_if_plan_exist(tenant_id, plan, exists))) {
           LOG_WARN("fail check plan exists", K(tenant_id), K(plan), K(val), K(ret));
         } else if (!exists) {
           ret = OB_ERR_RES_MGR_PLAN_NOT_EXIST;
           LOG_USER_ERROR(OB_ERR_RES_MGR_PLAN_NOT_EXIST);
           LOG_WARN("plan not exist", K(plan), K(ret));
+        } else if (session->is_inner()) {
+          // allow inner sql to alter resource manager plan
+        } else if (OB_FAIL(rootserver::ObWindowCompactionHelper::check_window_compaction_global_active(tenant_id, is_window_compaction_active))) {
+          LOG_WARN("fail to check window compaction global active", KR(ret), K(tenant_id));
+        } else if (is_window_compaction_active) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "Tenant is during window compaction now, "
+                                           "please stop window compaction by CALL DBMS_SCHEDULER.DISABLE('DAILY_MAINTENANCE_WINDOW');"
+                                           "directly alter resource manager plan");
         }
       }
     }
@@ -2966,7 +2976,8 @@ int ObSysVarOnUpdateFuncs::start_trans_by_set_trans_char_(
                 ->get_read_snapshot(*session.get_tx_desc(),
                                     isolation,
                                     stmt_expire_ts,
-                                    snapshot))) {
+                                    snapshot,
+                                    false))) {
       LOG_WARN("fail to get snapshot for serializable / repeatable read", K(ret),
                KPC(session.get_tx_desc()), K(isolation), K(stmt_expire_ts));
       // rollback tx because of prepare snapshot fail
@@ -3608,6 +3619,71 @@ int ObSysVarUtils::log_bounds_error_or_warning(ObExecContext &ctx,
     } else {
       LOG_USER_WARN(OB_ERR_TRUNCATED_WRONG_VALUE, set_var.var_name_.length(),
                     set_var.var_name_.ptr(), static_cast<int32_t>(strlen(val_str)), val_str);
+    }
+  }
+  return ret;
+}
+
+int ObSysVarOnCheckFuncs::check_and_convert_caching_sha2_password_digest_rounds(ObExecContext &ctx,
+                                                                               const ObSetVar &set_var,
+                                                                               const ObBasicSysVar &sys_var,
+                                                                               const ObObj &in_val,
+                                                                               ObObj &out_val)
+{
+  int ret = OB_SUCCESS;
+  if (set_var.is_set_default_ || in_val.is_null()) {
+    // do nothing
+  } else if (!in_val.is_int()) {
+    ret = OB_ERR_WRONG_TYPE_FOR_VAR;
+    LOG_WARN("wrong type for caching_sha2_password_digest_rounds", K(ret), K(in_val));
+  } else {
+    int64_t digest_rounds = 0;
+    if (OB_FAIL(in_val.get_int(digest_rounds))) {
+      LOG_WARN("fail to get digest_rounds int64", K(ret), K(set_var), K(sys_var), K(in_val));
+    } else if (digest_rounds % 1000 != 0) {
+      const int64_t VALUE_STR_LENGTH = 32;
+      char val_str[VALUE_STR_LENGTH];
+      int64_t pos = 0;
+      if (OB_FAIL(in_val.print_plain_str_literal(val_str, VALUE_STR_LENGTH, pos))) {
+        LOG_WARN("fail to print varchar literal", K(ret));
+      } else {
+        LOG_USER_ERROR(OB_ERR_WRONG_VALUE_FOR_VAR, set_var.var_name_.length(),
+                       set_var.var_name_.ptr(), static_cast<int32_t>(pos), val_str);
+        ret = OB_ERR_WRONG_VALUE_FOR_VAR;
+      }
+    } else {
+      out_val = in_val;
+    }
+  }
+  return ret;
+}
+
+int ObSysVarOnCheckFuncs::check_and_convert_default_authentication_plugin(ObExecContext &ctx,
+                                                                          const ObSetVar &set_var,
+                                                                          const ObBasicSysVar &sys_var,
+                                                                          const ObObj &in_val,
+                                                                          ObObj &out_val)
+{
+  UNUSED(ctx);
+  UNUSED(sys_var);
+  int ret = OB_SUCCESS;
+  if (in_val.is_null()) {
+    // do nothing
+  } else if (!ob_is_string_type(in_val.get_type())) {
+    ret = OB_ERR_WRONG_TYPE_FOR_VAR;
+    LOG_WARN("wrong type for default_authentication_plugin", K(ret), K(in_val));
+  } else {
+    ObString plugin_name;
+    if (OB_FAIL(get_string(in_val, plugin_name))) {
+      LOG_WARN("fail to get string from ObObj", K(ret), K(in_val));
+    } else if (!ObEncryptedHelper::is_valid_auth_plugin(plugin_name)) {
+      ret = OB_ERR_WRONG_VALUE_FOR_VAR;
+      LOG_USER_ERROR(OB_ERR_WRONG_VALUE_FOR_VAR, set_var.var_name_.length(),
+                     set_var.var_name_.ptr(), plugin_name.length(), plugin_name.ptr());
+      LOG_WARN("invalid authentication plugin name", K(ret), K(plugin_name));
+    } else {
+      ObString tmp_out_val = in_val.get_string();
+      out_val.set_varchar(ObEncryptedHelper::format_plugin_name(tmp_out_val));
     }
   }
   return ret;

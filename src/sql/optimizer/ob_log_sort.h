@@ -13,6 +13,7 @@
 #ifndef OCEANBASE_SQL_OB_LOG_SORT_H
 #define OCEANBASE_SQL_OB_LOG_SORT_H
 #include "lib/container/ob_array.h"
+#include "sql/optimizer/ob_log_plan.h"
 #include "sql/optimizer/ob_logical_operator.h"
 
 namespace oceanbase
@@ -21,26 +22,21 @@ namespace sql
 {
 class ObRawExpr;
 class ObLogSort;
+template<typename R, typename C>
+class PlanVisitor;
 
 struct ObTopNFilterInfo
 {
 public:
   ObTopNFilterInfo()
       : enabled_(false), p2p_sequence_id_(OB_INVALID_ID), pushdown_topn_filter_expr_(nullptr),
-        effective_sk_cnt_(0), is_shuffle_(false), topn_filter_node_(NULL)
+        effective_sk_cnt_(0), is_shuffle_(false), topn_filter_node_(NULL),
+        enable_runtime_filter_adaptive_apply_(true)
   {}
-  inline void init(int64_t p2p_sequence_id, ObRawExpr *pushdown_topn_filter_expr,
-                   int64_t effective_sk_cnt, bool is_shuffle, ObLogicalOperator* node)
-  {
-    p2p_sequence_id_ = p2p_sequence_id;
-    pushdown_topn_filter_expr_ = pushdown_topn_filter_expr;
-    effective_sk_cnt_ = effective_sk_cnt;
-    is_shuffle_ = is_shuffle;
-    enabled_ = true;
-    topn_filter_node_ = node;
-  }
+  void init(int64_t p2p_sequence_id, ObRawExpr *pushdown_topn_filter_expr, int64_t effective_sk_cnt,
+            bool is_shuffle, ObLogicalOperator *node, bool enable_runtime_filter_adaptive_apply);
   TO_STRING_KV(K_(enabled), K_(p2p_sequence_id), KP_(pushdown_topn_filter_expr),
-               K_(effective_sk_cnt), K_(is_shuffle));
+               K_(effective_sk_cnt), K_(is_shuffle), K_(enable_runtime_filter_adaptive_apply));
 
 public:
   bool enabled_;
@@ -51,6 +47,7 @@ public:
   // the topn sort op and the tsc op not in same dfo, need shuffle
   bool is_shuffle_;
   ObLogicalOperator *topn_filter_node_;
+  bool enable_runtime_filter_adaptive_apply_;
 };
 
 class ObLogSort : public ObLogicalOperator
@@ -59,8 +56,8 @@ public:
   ObLogSort(ObLogPlan &plan)
       : ObLogicalOperator(plan),
         hash_sortkey_(),
-        sort_keys_(),
-        encode_sortkeys_(),
+        sort_keys_(plan.get_allocator()),
+        encode_sortkeys_(plan.get_allocator()),
         topn_expr_(NULL),
         minimum_row_count_(0),
         topk_precision_(0),
@@ -88,7 +85,10 @@ public:
   int get_sort_output_exprs(ObIArray<ObRawExpr *> &output_exprs);
   int create_encode_sortkey_expr(const common::ObIArray<OrderItem> &order_keys);
   int get_sort_exprs(common::ObIArray<ObRawExpr*> &sort_exprs);
-
+  inline bool is_topn_op()
+  {
+    return topn_expr_ != NULL;
+  }
   inline void set_topn_expr(ObRawExpr *expr) { topn_expr_ = expr; }
   inline void set_prefix_pos(int64_t prefix_pos) { prefix_pos_ = prefix_pos; }
   inline void set_local_merge_sort(bool is_local_merge_sort) { is_local_merge_sort_ = is_local_merge_sort; }
@@ -148,19 +148,20 @@ public:
   int try_allocate_pushdown_topn_runtime_filter();
   int check_use_child_ordering(bool &used, int64_t &inherit_child_ordering_index);
   ObLogicalOperator *get_topn_filter_node() const { return topn_filter_info_.topn_filter_node_; }
+  bool enable_runtime_filter_adaptive_apply() const { return topn_filter_info_.enable_runtime_filter_adaptive_apply_; }
 protected:
   virtual int inner_replace_op_exprs(ObRawExprReplacer &replacer);
   int est_sort_key_width();
 private:
   int get_candidate_pushdown_sort_keys(
       uint64_t &table_id,
-      common::ObSEArray<ObRawExpr *, 8, common::ModulePageAllocator, true> &candidate_sk_exprs);
+      common::ObIArray<ObRawExpr *> &candidate_sk_exprs);
   int check_expr_can_pushdown(ObRawExpr *expr, uint64_t &table_id, bool &can_push_down);
   int is_expr_in_pushdown_whitelist(ObRawExpr *expr, bool &in_pushdown_whitelist);
 private:
   OrderItem hash_sortkey_;
-  common::ObSEArray<OrderItem, 8, common::ModulePageAllocator, true> sort_keys_;
-  common::ObSEArray<OrderItem, 1, common::ModulePageAllocator, true> encode_sortkeys_;
+  ObSqlArray<OrderItem> sort_keys_;
+  ObSqlArray<OrderItem> encode_sortkeys_;
   ObRawExpr *topn_expr_;
   int64_t minimum_row_count_;
   int64_t topk_precision_;

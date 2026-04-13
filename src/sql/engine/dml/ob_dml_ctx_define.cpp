@@ -28,7 +28,9 @@ OB_SERIALIZE_MEMBER(ObTrigDMLCtDef,
                     old_row_exprs_,
                     new_row_exprs_,
                     rowid_old_expr_,
-                    rowid_new_expr_);
+                    rowid_new_expr_,
+                    ref_types_,
+                    trig_flags_);
 
 OB_SERIALIZE_MEMBER(ObErrLogCtDef,
                     is_error_logging_,
@@ -125,7 +127,10 @@ OB_SERIALIZE_MEMBER(ObForeignKeyCheckerCtdef,
                     rowkey_count_,
                     rowkey_ids_);
 
-OB_SERIALIZE_MEMBER(ObTriggerArg, trigger_id_, trigger_events_.bit_value_, timing_points_.bit_value_);
+OB_SERIALIZE_MEMBER(ObTriggerRowRefType, old_type_, new_type_);
+
+OB_SERIALIZE_MEMBER(ObTriggerArg, trigger_id_, trigger_events_.bit_value_, timing_points_.bit_value_,
+                    analyze_flag_, trigger_type_, ref_types_);
 
 OB_SERIALIZE_MEMBER(ObForeignKeyColumn, name_, idx_, name_idx_, obj_meta_);
 
@@ -152,6 +157,8 @@ OB_DEF_SERIALIZE(ObForeignKeyArg)
   if (OB_NOT_NULL(fk_ctdef_)) {
     OB_UNIS_ENCODE(*fk_ctdef_);
   }
+  OB_UNIS_ENCODE(foreign_key_database_name_);
+  OB_UNIS_ENCODE(foreign_key_name_);
   return ret;
 }
 
@@ -169,6 +176,8 @@ OB_DEF_DESERIALIZE(ObForeignKeyArg)
   if (OB_NOT_NULL(fk_ctdef_)) {
     OB_UNIS_DECODE(*fk_ctdef_);
   }
+  OB_UNIS_DECODE(foreign_key_database_name_);
+  OB_UNIS_DECODE(foreign_key_name_);
   return ret;
 }
 
@@ -186,6 +195,8 @@ OB_DEF_SERIALIZE_SIZE(ObForeignKeyArg)
   if (OB_NOT_NULL(fk_ctdef_)) {
     OB_UNIS_ADD_LEN(*fk_ctdef_);
   }
+  OB_UNIS_ADD_LEN(foreign_key_database_name_);
+  OB_UNIS_ADD_LEN(foreign_key_name_);
   return len;
 }
 
@@ -280,7 +291,9 @@ OB_SERIALIZE_MEMBER(ObDMLBaseCtDef,
                     is_primary_index_,
                     is_table_without_pk_, // FARM COMPAT WHITELIST, renamed
                     has_instead_of_trigger_,
-                    trans_info_expr_);
+                    trans_info_expr_,
+                    is_table_with_clustering_key_,
+                    is_vec_hnsw_index_vid_opt_);
 
 OB_SERIALIZE_MEMBER(ObMultiInsCtDef,
                     calc_part_id_expr_,
@@ -730,6 +743,17 @@ OB_DEF_SERIALIZE(ObInsertUpCtDef)
   int ret = OB_SUCCESS;
   OB_UNIS_ENCODE(*ins_ctdef_);
   OB_UNIS_ENCODE(*upd_ctdef_);
+  OB_UNIS_ENCODE(do_opt_path_);
+  OB_UNIS_ENCODE(do_index_lookup_);
+  OB_UNIS_ENCODE(unique_key_conv_exprs_);
+  OB_UNIS_ENCODE(unique_index_rowkey_exprs_);
+  if (do_index_lookup_ && das_index_scan_ctdef_ != nullptr) {
+    OB_UNIS_ENCODE(*das_index_scan_ctdef_);
+  }
+  if (do_opt_path_ && lookup_ctdef_for_batch_ != nullptr) {
+    OB_UNIS_ENCODE(*lookup_ctdef_for_batch_);
+  }
+  OB_UNIS_ENCODE(enable_do_update_directly_);
   return ret;
 }
 
@@ -749,6 +773,29 @@ OB_DEF_DESERIALIZE(ObInsertUpCtDef)
   }
   OB_UNIS_DECODE(*ins_ctdef_);
   OB_UNIS_DECODE(*upd_ctdef_);
+  OB_UNIS_DECODE(do_opt_path_);
+  OB_UNIS_DECODE(do_index_lookup_);
+  OB_UNIS_DECODE(unique_key_conv_exprs_);
+  OB_UNIS_DECODE(unique_index_rowkey_exprs_);
+
+  ObDMLCtDefAllocator<ObDASScanCtDef> das_scan_ctdef_allocator(alloc_);
+  if (do_index_lookup_) {
+    das_index_scan_ctdef_ = das_scan_ctdef_allocator.alloc();
+    if (OB_ISNULL(das_index_scan_ctdef_)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("alloc das index scan ctdef failed", K(ret));
+    }
+    OB_UNIS_DECODE(*das_index_scan_ctdef_);
+  }
+  if (do_opt_path_) {
+    lookup_ctdef_for_batch_ = das_scan_ctdef_allocator.alloc();
+    if (OB_ISNULL(lookup_ctdef_for_batch_)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("alloc lookup ctdef for batch failed", K(ret));
+    }
+    OB_UNIS_DECODE(*lookup_ctdef_for_batch_);
+  }
+  OB_UNIS_DECODE(enable_do_update_directly_);
   return ret;
 }
 
@@ -757,6 +804,17 @@ OB_DEF_SERIALIZE_SIZE(ObInsertUpCtDef)
   int64_t len = 0;
   OB_UNIS_ADD_LEN(*ins_ctdef_);
   OB_UNIS_ADD_LEN(*upd_ctdef_);
+  OB_UNIS_ADD_LEN(do_opt_path_);
+  OB_UNIS_ADD_LEN(do_index_lookup_);
+  OB_UNIS_ADD_LEN(unique_key_conv_exprs_);
+  OB_UNIS_ADD_LEN(unique_index_rowkey_exprs_);
+  if (do_index_lookup_ && das_index_scan_ctdef_ != nullptr) {
+    OB_UNIS_ADD_LEN(*das_index_scan_ctdef_);
+  }
+  if (do_opt_path_ && lookup_ctdef_for_batch_ != nullptr) {
+    OB_UNIS_ADD_LEN(*lookup_ctdef_for_batch_);
+  }
+  OB_UNIS_ADD_LEN(enable_do_update_directly_);
   return len;
 }
 

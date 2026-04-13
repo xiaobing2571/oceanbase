@@ -193,7 +193,8 @@ public:
                                    char *dst,
                                    const int64_t dst_len,
                                    int64_t &dst_pos,
-                                   bool &has_serialized) const;
+                                   bool &has_serialized,
+                                   const sql::ObSQLSessionInfo &session) const;
 
   VIRTUAL_TO_STRING_KV(K_(type), K_(user_type_id), K_(type_name));
 protected:
@@ -416,7 +417,7 @@ public:
 
   int add_record_member(
     const common::ObString &record_name, const ObPLDataType &record_type,
-    int64_t default_idx = OB_INVALID_INDEX, sql::ObRawExpr *default_raw_expr = NULL);
+    int64_t default_idx = OB_INVALID_INDEX, sql::ObRawExpr *default_raw_expr = NULL, bool need_check_dup = false);
   int add_record_member(
     ObPLEnumSetCtx &enum_set_ctx, const common::ObString &record_name, const ObPLDataType &record_type,
     int64_t default_idx = OB_INVALID_INDEX, sql::ObRawExpr *default_raw_expr = NULL);
@@ -438,6 +439,7 @@ public:
   const ObRecordMember *get_record_member(int64_t index) const;
 
   int is_compatble(const ObRecordType &other, bool &is_comp) const;
+  int check_record_cursor_member() const;
   int record_members_init(common::ObIAllocator *alloc, int64_t size);
   void reset_record_member() { record_members_.reset(); }
 
@@ -586,6 +588,7 @@ public:
                                         const ObPLINS &ns,
                                         jit::ObLLVMValue &allocator,
                                         jit::ObLLVMValue &dest) const;
+  virtual int convert(ObPLResolveCtx &ctx, ObObj *&src, ObObj *&dst) const;
 };
 #endif
 //---------- for ObCollectionType ----------
@@ -622,6 +625,9 @@ public:
   int deep_copy(common::ObIAllocator &alloc, const ObCollectionType &other);
 
   int get_init_size(int64_t &size) const;
+  int convert_anonymous_array(ObPLResolveCtx &ctx,
+                              ObObj *&src,
+                              ObObj *&dest) const;
 
 public:
   virtual int generate_construct(ObPLCodeGenerator &generator,
@@ -914,6 +920,7 @@ public:
   static int copy_element(const ObObj &src,
                           ObObj &dest,
                           ObIAllocator &allocator,
+                          bool need_convert_basic_type,
                           const ObPLINS *ns = NULL,
                           sql::ObSQLSessionInfo *session = NULL,
                           const ObDataType *dest_type = NULL,
@@ -977,6 +984,7 @@ public:
 
   int assign(ObPLRecord *src, ObIAllocator *allocator);
   int deep_copy(ObPLRecord &src, ObIAllocator &allocator,
+                bool need_convert_basic_type,
                 const ObPLINS *ns = NULL, sql::ObSQLSessionInfo *session = NULL,
                 bool ignore_del_element = false);
 
@@ -1122,7 +1130,10 @@ public:
   static uint32_t last_offset_bits() { return offsetof(ObPLCollection, last_) * 8; }
   static uint32_t data_offset_bits() { return offsetof(ObPLCollection, data_) * 8; }
   void print() const;
-  int deep_copy(ObPLCollection *src, common::ObIAllocator *allocator, bool ignore_del_element = false);
+  int deep_copy(ObPLCollection *src,
+                common::ObIAllocator *allocator,
+                bool need_convert_basic_type,
+                bool ignore_del_element = false);
   int assign(ObPLCollection *src, ObIAllocator *allocator);
   int64_t get_init_size() const
   {
@@ -1213,7 +1224,7 @@ public:
     return ret;
   }
 
-  int deep_copy(ObPLCollection *src, ObIAllocator *allocator, bool ignore_del_element = false);
+  int deep_copy(ObPLCollection *src, ObIAllocator *allocator, bool need_convert_basic_type, bool ignore_del_element = false);
   int64_t get_init_size() const
   {
     return sizeof(ObPLAssocArray);
@@ -1267,7 +1278,7 @@ public:
 
   static uint32_t key_offset_bits() { return offsetof(ObPLVArray, capacity_) * 8; }
 
-  int deep_copy(ObPLCollection *src, ObIAllocator *allocator, bool ignore_del_element = false);
+  int deep_copy(ObPLCollection *src, ObIAllocator *allocator, bool need_convert_basic_type, bool ignore_del_element = false);
   int64_t get_init_size() const
   {
     return sizeof(ObPLVArray);

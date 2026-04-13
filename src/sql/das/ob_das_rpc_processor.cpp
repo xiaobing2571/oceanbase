@@ -28,7 +28,8 @@ int ObDASBaseAccessP<pcode>::init()
   ObDASTaskArg &task = RpcProcessor::arg_;
   ObDASBaseAccessP<pcode>::get_das_factory() = &das_factory_;
   memset(monitor_val_, 0, sizeof(monitor_val_));
-  tsc_monitor_info_.init(&monitor_val_[0], &monitor_val_[1], &monitor_val_[2], &monitor_val_[3], nullptr);
+  tsc_monitor_info_.init(nullptr, &monitor_val_[0], &monitor_val_[1], &monitor_val_[2], &monitor_val_[3], &monitor_val_[4],
+                        &monitor_val_[5], &monitor_val_[6], &monitor_val_[7]);
   das_remote_info_.tsc_monitor_info_ = &tsc_monitor_info_;
   das_remote_info_.exec_ctx_ = &exec_ctx_;
   das_remote_info_.frame_info_ = &frame_info_;
@@ -52,7 +53,6 @@ int ObDASBaseAccessP<pcode>::before_process()
   if (OB_NOT_NULL(di)) {
     di->get_ash_stat().in_sql_execution_ = true;
     di->get_ash_stat().in_das_remote_exec_ = true;
-    di->get_ash_stat().tenant_id_ = task.get_task_op()->get_tenant_id();
     di->get_ash_stat().trace_id_ = *ObCurTraceId::get_trace_id();
     di->get_ash_stat().user_id_ = das_remote_info_.user_id_;
     di->get_ash_stat().plan_id_ = das_remote_info_.plan_id_;
@@ -272,7 +272,12 @@ int ObDASBaseAccessP<pcode>::after_process(int error_code)
   } else {
     if (is_enable_sqlstat_) {
       sqlstat_record_.record_sqlstat_end_value();
-      sqlstat_record_.move_to_sqlstat_cache(sqlstat_key_);
+      int64_t error_sim_code = -EVENT_CALL(EventTable::EN_DAS_RECORD_SQLSTAT);
+      if (error_sim_code > 0) {
+        //do nothing
+      } else {
+        sqlstat_record_.move_to_sqlstat_cache(sqlstat_key_);
+      }
     }
   }
   //执行相关的错误信息不用传递给RPC框架，RPC框架不处理具体的RPC执行错误信息，始终返回OB_SUCCESS
@@ -417,8 +422,8 @@ int ObDASSyncFetchP::process()
   } else if (OB_FAIL(das->get_task_res_mgr().iterator_task_result(res,
                                                                   res.io_read_bytes_,
                                                                   res.ssstore_read_bytes_,
-                                                                  res.ssstore_read_row_cnt_,
-                                                                  res.memstore_read_row_cnt_))) {
+                                                                  res.base_read_row_cnt_,
+                                                                  res.delta_read_row_cnt_))) {
     if (OB_UNLIKELY(OB_ENTRY_NOT_EXIST == ret)) {
       // After server reboot, the hash map containing task results was gone.
       // We need to retry for such cases.

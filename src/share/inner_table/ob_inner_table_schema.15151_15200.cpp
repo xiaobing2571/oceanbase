@@ -390,6 +390,21 @@ int ObInnerTableSchema::all_virtual_tenant_profile_real_agent_ora_schema(ObTable
   }
 
   if (OB_SUCC(ret)) {
+    ADD_COLUMN_SCHEMA("PASSWORD_ROLLOVER_TIME", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObNumberType, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      38, //column_length
+      38, //column_precision
+      0, //column_scale
+      false, //is_nullable
+      false); //is_autoincrement
+  }
+
+  if (OB_SUCC(ret)) {
     ADD_COLUMN_SCHEMA("GMT_CREATE", //column_name
       ++column_id, //column_id
       0, //rowkey_id
@@ -7475,6 +7490,21 @@ int ObInnerTableSchema::all_virtual_table_stat_real_agent_ora_schema(ObTableSche
   }
 
   if (OB_SUCC(ret)) {
+    ADD_COLUMN_SCHEMA("INTERNAL_STAT", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObNumberType, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      38, //column_length
+      38, //column_precision
+      0, //column_scale
+      true, //is_nullable
+      false); //is_autoincrement
+  }
+
+  if (OB_SUCC(ret)) {
     ADD_COLUMN_SCHEMA("GMT_CREATE", //column_name
       ++column_id, //column_id
       0, //rowkey_id
@@ -7986,6 +8016,21 @@ int ObInnerTableSchema::all_virtual_column_stat_real_agent_ora_schema(ObTableSch
 
   if (OB_SUCC(ret)) {
     ADD_COLUMN_SCHEMA("CG_SKIP_RATE", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObNumberType, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      38, //column_length
+      38, //column_precision
+      0, //column_scale
+      true, //is_nullable
+      false); //is_autoincrement
+  }
+
+  if (OB_SUCC(ret)) {
+    ADD_COLUMN_SCHEMA("INTERNAL_STAT", //column_name
       ++column_id, //column_id
       0, //rowkey_id
       0, //index_id

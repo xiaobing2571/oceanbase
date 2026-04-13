@@ -84,6 +84,8 @@ struct VectorCasterHelper
     } else if (OB_SUCCESS != ret && CM_IS_WARN_ON_FAIL(cast_mode)) {
       warning = ret;
       ret = OB_SUCCESS;
+    } else if (ret == OB_INVALID_ZERO_DATE) {
+      ret = OB_INVALID_DATE_VALUE;
     }
     return ret;
   }
@@ -254,6 +256,7 @@ struct VectorCasterUtil
           || OB_DATA_OUT_OF_RANGE == warning                      \
           || OB_ERR_DATA_TRUNCATED == warning                     \
           || OB_ERR_DOUBLE_TRUNCATED == warning                   \
+          || OB_INVALID_ZERO_DATE == warning                      \
           || OB_ERR_TRUNCATED_WRONG_VALUE_FOR_FIELD == warning) { \
         res_vec_->set_##func_val(idx, value);                      \
       } else if (CM_IS_ZERO_ON_WARN(cast_mode)) {                 \
@@ -273,6 +276,9 @@ struct VectorCasterUtil
   SET_RES_OBJ(expr.extra_, date, ObTimeConverter::ZERO_DATE, value, idx)
 #define SET_RES_DATETIME(idx, value)    \
   SET_RES_OBJ(expr.extra_, datetime,ObTimeConverter::ZERO_DATETIME, value, idx)
+
+#define SET_RES_TIME(idx, value)    \
+  SET_RES_OBJ(expr.extra_, time,ObTimeConverter::ZERO_TIME, value, idx)
 
 #define EVAL_COMMON_ARG()                                                                   \
   int ret = OB_SUCCESS;                                                                     \
@@ -302,6 +308,7 @@ struct VectorCasterUtil
 #include "sql/engine/expr/vector_cast/cast_to_number.ipp"
 #include "sql/engine/expr/vector_cast/cast_to_datetime.ipp"
 #include "sql/engine/expr/vector_cast/cast_to_string.ipp"
+#include "sql/engine/expr/vector_cast/cast_to_time.ipp"
 
 #undef DEF_VECTOR_IMPLICIT_CAST_FUNC
 #undef CAST_FAIL

@@ -28,7 +28,7 @@
 #include "sql/engine/expr/ob_expr_column_conv.h"
 #include "sql/engine/expr/ob_expr_dll_udf.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
-#include "sql/engine/expr/ob_expr_udf.h"
+#include "sql/engine/expr/ob_expr_udf/ob_expr_udf.h"
 #include "sql/engine/expr/ob_expr_pl_integer_checker.h"
 #include "sql/engine/expr/ob_expr_pl_get_cursor_attr.h"
 #include "sql/engine/expr/ob_expr_pl_sqlcode_sqlerrm.h"
@@ -1338,6 +1338,7 @@ int ObExprGeneratorImpl::visit_udf_expr(ObOpRawExpr &expr, ObExprUDF *udf)
     OZ (udf->set_params_type(udf_expr.get_params_type()));
     OZ (udf->set_params_desc(udf_expr.get_params_desc()));
     OZ (udf->set_nocopy_params(udf_expr.get_nocopy_params()));
+    OZ (udf->set_out_params_type(udf_expr.get_out_params_type()));
   }
   return ret;
 }
@@ -1677,7 +1678,9 @@ int ObExprGeneratorImpl::visit(ObAggFunRawExpr &expr)
     //其他聚集函数的参数只有一列
     int64_t col_count = (T_FUN_JSON_OBJECTAGG == expr.get_expr_type()
                         || T_FUN_ORA_JSON_OBJECTAGG == expr.get_expr_type()
-                        || T_FUN_ORA_XMLAGG == expr.get_expr_type()) ?  2 : 1;
+                        || T_FUN_ORA_XMLAGG == expr.get_expr_type()
+                        || T_FUN_ARG_MIN == expr.get_expr_type()
+                        || T_FUN_ARG_MAX == expr.get_expr_type()) ? 2 : 1;
     aggr_expr->set_real_param_col_count(col_count);
     aggr_expr->set_all_param_col_count(col_count);
     const ObIArray<ObRawExpr*> &real_param_exprs = expr.get_real_param_exprs();
@@ -1726,6 +1729,7 @@ int ObExprGeneratorImpl::visit(ObAggFunRawExpr &expr)
         || (T_FUN_APPROX_COUNT_DISTINCT == expr.get_expr_type() && expr.get_real_param_count() > 1)
         || (T_FUN_APPROX_COUNT_DISTINCT_SYNOPSIS == expr.get_expr_type() && expr.get_real_param_count() > 1)
         || T_FUN_GROUP_CONCAT == expr.get_expr_type()
+        || T_FUN_CK_GROUPCONCAT == expr.get_expr_type()
         || T_FUN_AGG_UDF == expr.get_expr_type()
         || T_FUN_GROUP_RANK == expr.get_expr_type()
         || T_FUN_GROUP_DENSE_RANK == expr.get_expr_type()
@@ -1744,7 +1748,9 @@ int ObExprGeneratorImpl::visit(ObAggFunRawExpr &expr)
         || T_FUN_ORA_XMLAGG == expr.get_expr_type()
         || T_FUNC_SYS_ARRAY_AGG == expr.get_expr_type()
         || (T_FUN_JSON_OBJECTAGG == expr.get_expr_type() && expr.get_real_param_count() > 1)
-        || (T_FUN_ORA_JSON_OBJECTAGG == expr.get_expr_type() && expr.get_real_param_count() > 1)) {
+        || (T_FUN_ORA_JSON_OBJECTAGG == expr.get_expr_type() && expr.get_real_param_count() > 1)
+        || (T_FUN_ARG_MAX == expr.get_expr_type() && expr.get_real_param_count() == 2)
+        || (T_FUN_ARG_MIN == expr.get_expr_type() && expr.get_real_param_count() == 2)) {
       ObExprOperator *op = NULL;
       if (OB_FAIL(factory_.alloc(T_OP_AGG_PARAM_LIST, op))) {
         LOG_WARN("fail to alloc expr_op", K(ret));
@@ -1766,6 +1772,7 @@ int ObExprGeneratorImpl::visit(ObAggFunRawExpr &expr)
           aggr_expr->set_all_param_col_count(expr.get_param_count());
           if (OB_SUCC(ret) &&
               (T_FUN_GROUP_CONCAT == expr.get_expr_type() ||
+               T_FUN_CK_GROUPCONCAT == expr.get_expr_type() ||
                T_FUN_GROUP_RANK == expr.get_expr_type() ||
                T_FUN_GROUP_DENSE_RANK == expr.get_expr_type() ||
                T_FUN_GROUP_PERCENT_RANK == expr.get_expr_type() ||

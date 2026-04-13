@@ -99,7 +99,7 @@ int ObTableLoginP::process()
           LOG_WARN("failed to record login client info", K(ret), K(login));
         } else {
           // sync server capacity to client
-          sync_capacity(login.client_type_);
+          sync_capacity(login.client_type_, login.allow_distribute_capability_);
         }
       }
       result_.reserved1_ = can_use_redis_v2() ? ObTableLoginFlag::REDIS_PROTOCOL_V2 : ObTableLoginFlag::LOGIN_FLAG_NONE;
@@ -133,11 +133,12 @@ int ObTableLoginP::process()
   return ret;
 }
 
-void ObTableLoginP::sync_capacity(uint8_t client_type)
+void ObTableLoginP::sync_capacity(uint8_t client_type, bool allow_distribute_capability)
 {
   ObTableClientType type = static_cast<ObTableClientType>(client_type);
   uint32_t server_capabilities = ObTableServerCapacity::CAPACITY_NONE;
   if (type == ObTableClientType::JAVA_HTABLE_CLIENT &&
+      allow_distribute_capability &&
       TABLEAPI_OBJECT_POOL_MGR->is_support_distributed_execute()) {
     server_capabilities |= ObTableServerCapacity::DISTRIBUTED_EXECUTE;
   }
@@ -169,9 +170,15 @@ int ObTableLoginP::get_ids()
                                              result_.database_id_))) {
       LOG_WARN("failed to get database id", K(ret), "database", arg_.database_name_);
     } else if (OB_INVALID_ID == result_.database_id_) {
-      ret = OB_ERR_BAD_DATABASE;
-      LOG_USER_ERROR(OB_ERR_BAD_DATABASE, arg_.database_name_.length(), arg_.database_name_.ptr());
-      LOG_WARN("failed to get database id", K(ret), "database", arg_.database_name_);
+      if (arg_.client_type_ ==  3) {
+        ret = OB_KV_HBASE_NAMESPACE_NOT_FOUND;
+        LOG_USER_ERROR(OB_KV_HBASE_NAMESPACE_NOT_FOUND, arg_.database_name_.length(), arg_.database_name_.ptr());
+        LOG_WARN("failed to get database id for hbase namespace", K(ret), "namespace", arg_.database_name_);
+      } else {
+        ret = OB_ERR_BAD_DATABASE;
+        LOG_USER_ERROR(OB_ERR_BAD_DATABASE, arg_.database_name_.length(), arg_.database_name_.ptr());
+        LOG_WARN("failed to get database id", K(ret), "database", arg_.database_name_);
+      }
     } else if (OB_FAIL(guard.get_user_id(result_.tenant_id_, arg_.user_name_,
                                          ObString::make_string("%")/*assume there is no specific host*/,
                                          result_.user_id_))) {
@@ -267,6 +274,7 @@ ObTableApiProcessorBase::ObTableApiProcessorBase(const ObGlobalContext &gctx)
       sess_guard_(),
       schema_guard_(),
       simple_table_schema_(nullptr),
+      table_schema_(nullptr),
       req_timeinfo_guard_(),
       schema_cache_guard_(),
       stat_process_type_(-1),
@@ -274,6 +282,8 @@ ObTableApiProcessorBase::ObTableApiProcessorBase(const ObGlobalContext &gctx)
       stat_row_count_(0),
       need_retry_in_queue_(false),
       is_tablegroup_req_(false),
+      require_rerouting_(false),
+      kv_route_meta_error_(false),
       retry_count_(0),
       user_client_addr_(),
       audit_ctx_(retry_count_, user_client_addr_),
@@ -338,6 +348,56 @@ int ObTableApiProcessorBase::init_schema_info(uint64_t table_id,
   return ret;
 }
 
+// init member table_schema_ (ObTableSchema)
+int ObTableApiProcessorBase::init_table_schema_info(const ObString &arg_table_name, uint64_t arg_table_id)
+{
+  return ObHTableUtils::init_schema_info(arg_table_name, arg_table_id, credential_, is_tablegroup_req_,
+                                         schema_guard_, table_schema_, schema_cache_guard_);
+}
+
+int ObTableApiProcessorBase::init_table_schema_info(const ObString &arg_table_name)
+{
+  return ObHTableUtils::init_schema_info(arg_table_name, credential_, is_tablegroup_req_, schema_guard_,
+                                         table_schema_, schema_cache_guard_);
+}
+
+
+int ObTableApiProcessorBase::init_table_schema_info(uint64_t table_id,
+                                                    const ObString &arg_table_name,
+                                                    bool check_match/*=true*/)
+{
+  int ret = OB_SUCCESS;
+  if (schema_cache_guard_.is_inited()) {
+    // skip and do nothing
+  } else if (OB_ISNULL(gctx_.schema_service_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid schema service", K(ret));
+  } else if (OB_FAIL(gctx_.schema_service_->get_tenant_schema_guard(credential_.tenant_id_, schema_guard_))) {
+    LOG_WARN("fail to get schema guard", K(ret), K(credential_.tenant_id_));
+  } else if (OB_FAIL(schema_guard_.get_table_schema(credential_.tenant_id_, table_id, table_schema_))) {
+    LOG_WARN("fail to get table schema", K(ret), K(credential_.tenant_id_), K(table_id));
+  } else if (OB_ISNULL(table_schema_) || !table_schema_->is_valid()) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("table not exist", K(ret), K(credential_), K(table_id));
+  } else if (check_match && !arg_table_name.empty()
+      && arg_table_name.case_compare(table_schema_->get_table_name()) != 0) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("arg table name is not match with schema table name", K(ret), K(arg_table_name),
+            K(table_schema_->get_table_name()));
+  } else if (table_schema_->is_in_recyclebin()) {
+    ret = OB_ERR_OPERATION_ON_RECYCLE_OBJECT;
+    LOG_USER_ERROR(OB_ERR_OPERATION_ON_RECYCLE_OBJECT);
+    LOG_WARN("table is in recycle bin, not allow to do operation", K(ret), K(credential_.tenant_id_),
+                K(credential_.database_id_), K(table_id));
+  } else if (OB_FAIL(schema_cache_guard_.init(credential_.tenant_id_,
+                                              table_schema_->get_table_id(),
+                                              table_schema_->get_schema_version(),
+                                              schema_guard_))) {
+    LOG_WARN("fail to init schema cache guard", K(ret));
+  }
+  return ret;
+}
+
 int ObTableApiProcessorBase::get_ls_id(const ObTabletID &tablet_id, ObLSID &ls_id)
 {
   int ret = OB_SUCCESS;
@@ -374,8 +434,22 @@ int ObTableApiProcessorBase::check_user_access(const ObString &credential_str)
   } else if (OB_FAIL(check_mode())) {
     LOG_WARN("fail to check mode", K(ret));
   } else {
-    enable_query_response_time_stats_ = TABLEAPI_OBJECT_POOL_MGR->is_enable_query_response_time_stats();
-    LOG_DEBUG("user can access", K_(credential));
+    // 使用session中缓存的用户锁定状态，避免每次都访问schema
+    ObTableApiSessNodeVal* sess_node_val = sess_guard_.get_sess_node_val();
+    if (OB_ISNULL(sess_node_val)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("session node val is null", K(ret));
+    } else if (OB_ISNULL(sess_node_val->get_owner_node())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("session owner node is null", K(ret));
+    } else if (sess_node_val->get_owner_node()->is_user_locked()) {
+      ret = OB_ERR_USER_IS_LOCKED;
+      LOG_WARN("user is locked", K(ret), K(credential_.tenant_id_));
+      LOG_USER_ERROR(OB_ERR_USER_IS_LOCKED);
+    } else {
+      enable_query_response_time_stats_ = TABLEAPI_OBJECT_POOL_MGR->is_enable_query_response_time_stats();
+      LOG_DEBUG("user can access", K_(credential));
+    }
   }
   return ret;
 }
@@ -532,6 +606,8 @@ int ObTableApiProcessorBase::end_trans(bool is_rollback,
   trans_param_.req_ = req;
   trans_param_.use_sync_ = use_sync;
   trans_param_.create_cb_functor_ = functor;
+  trans_param_.require_rerouting_ = require_rerouting_;
+  trans_param_.require_refresh_kv_meta_ = kv_route_meta_error_;
   if (OB_FAIL(ObTableTransUtils::end_trans(trans_param_))) {
     LOG_WARN("fail to end trans", K(ret), K_(trans_param));
   }
@@ -566,20 +642,53 @@ static int set_audit_name(const char *info_name, char *&audit_name, int64_t &aud
   return ret;
 }
 
-bool ObTableApiProcessorBase::can_retry(int retcode)
+bool ObTableApiProcessorBase::can_retry(const int retcode, bool &did_local_retry)
 {
   bool can_retry = false;
-
-  if (OB_TRY_LOCK_ROW_CONFLICT == retcode ||
+  bool tmp_can_retry = false;
+  bool tmp_local_retry = false;
+  bool is_max_local_retry_count = retry_count_ >= retry_policy_.max_local_retry_count_;
+  if ((OB_TRY_LOCK_ROW_CONFLICT == retcode ||
       OB_TRANSACTION_SET_VIOLATION == retcode ||
-      OB_SCHEMA_EAGAIN == retcode) {
-    can_retry = true;
-  } else if (ObTableRpcProcessorUtil::is_require_rerouting_err(retcode) &&
-             is_new_try_process()) {
-    can_retry = true;
+      OB_SCHEMA_EAGAIN == retcode) && !is_max_local_retry_count) {
+    tmp_can_retry = true;
+    // retry in current thread
+    tmp_local_retry = true;
+    if (OB_TRANSACTION_SET_VIOLATION == retcode) {
+      EVENT_INC(TABLEAPI_TSC_VIOLATE_COUNT);
+    }
+    // retry these error codes based on allow_retry_
+    can_retry = tmp_can_retry && retry_policy_.allow_retry();
+  } else {
+    bool require_rerouting = ObTableRpcProcessorUtil::is_require_rerouting_err(retcode);
+    bool kv_route_meta_error = ObTableRpcProcessorUtil::is_need_refresh_route_meta_error(retcode);
+    bool can_did_local_retry = ObTableRpcProcessorUtil::can_did_local_retry(retcode);
+    if (can_did_local_retry && is_new_try_process()) {
+      // only if some specific errors + new distributed server can did_local_retry
+      tmp_can_retry = true;
+      tmp_local_retry = true;
+    }
+    if (require_rerouting) {
+      // require_rerouting_ will keep true once it has been set as true
+      // to trigger ODP and client to refresh location
+      require_rerouting_ = require_rerouting;
+      LOG_DEBUG("meet error needed rerouting", K(retcode), K(require_rerouting_));
+    }
+    if (kv_route_meta_error) {
+      // kv_route_meta_error_ will keep true once it has been set as true
+      // to trigger ODP and client to refresh table meta information
+      kv_route_meta_error_ = kv_route_meta_error;
+      LOG_DEBUG("meet error needed refreshing table meta information", K(retcode), K(kv_route_meta_error_));
+    }
+    // retry based on error code and allow_route_retry_
+    can_retry = tmp_can_retry && retry_policy_.allow_route_retry();
+  }
+  if (can_retry) {
+    // only if in the situation of can_try and policy allowed that can do local retry
+    did_local_retry = tmp_local_retry;
   }
 
-  return can_retry && retry_policy_.allow_retry();
+  return can_retry;
 }
 
 int ObTableApiProcessorBase::process_with_retry(const ObString &credential, const int64_t timeout_ts)
@@ -601,39 +710,18 @@ int ObTableApiProcessorBase::process_with_retry(const ObString &credential, cons
     do {
       ret = try_process();
       did_local_retry = false;
-      if (can_retry(ret)) {
+      if (can_retry(ret, did_local_retry)) {
         int64_t now = ObTimeUtility::fast_current_time();
         if (now > timeout_ts) {
           LOG_WARN("process timeout", K(ret), K(now), K(timeout_ts));
           did_local_retry = false;
-        } else {
-          if (OB_TRY_LOCK_ROW_CONFLICT == ret) {
-            // throw to queue and retry
-            if (retry_policy_.allow_rpc_retry() && THIS_WORKER.can_retry()) {
-              THIS_WORKER.set_need_retry();
-              LOG_DEBUG("set retry flag and retry later when lock available");
-              need_retry_in_queue_ = true;
-            } else {
-              // retry in current thread
-              did_local_retry = true;
-            }
-          } else if (OB_TRANSACTION_SET_VIOLATION == ret) {
-            EVENT_INC(TABLEAPI_TSC_VIOLATE_COUNT);
-            did_local_retry = true;
-            // @todo sleep for is_master_changed_error(ret) etc. ?
-          } else if (OB_SCHEMA_EAGAIN == ret) {
-            // retry in current thread
-            did_local_retry = true;
-          }
         }
       }
       if (did_local_retry) {
-        if (retry_count_ < retry_policy_.max_local_retry_count_) {
-          ++retry_count_;
-          reset_ctx();
-        } else {
-          did_local_retry = false;
-        }
+        // retry to timeout, do not use retry count limit
+        ob_usleep(retry_policy_.local_retry_interval_us_);
+        ++retry_count_;
+        reset_ctx();
       }
     } while (did_local_retry);
   }
@@ -650,6 +738,8 @@ template class oceanbase::observer::ObTableRpcProcessor<ObTableRpcProxy::ObRpc<O
 template class oceanbase::observer::ObTableRpcProcessor<ObTableRpcProxy::ObRpc<OB_TABLE_API_LS_EXECUTE> >;
 template class oceanbase::observer::ObTableRpcProcessor<ObTableRpcProxy::ObRpc<OB_REDIS_EXECUTE> >;
 template class oceanbase::observer::ObTableRpcProcessor<ObTableRpcProxy::ObRpc<OB_REDIS_EXECUTE_V2> >;
+template class oceanbase::observer::ObTableRpcProcessor<ObTableRpcProxy::ObRpc<OB_HBASE_EXECUTE> >;
+template class oceanbase::observer::ObTableRpcProcessor<ObTableRpcProxy::ObRpc<OB_TABLE_API_META_INFO_EXECUTE> >;
 
 
 template<class T>
@@ -695,10 +785,17 @@ int ObTableRpcProcessor<T>::process()
       LOG_INFO("fail to process table_api request", K(ret), K_(stat_process_type), "request", RpcProcessor::arg_, K(audit_ctx_.exec_timestamp_));
     }
     // whether the client should refresh location cache and retry
-    if (ObTableRpcProcessorUtil::is_require_rerouting_err(ret)) {
+    if (ObTableApiProcessorBase::require_rerouting_) {
       ObRpcProcessor<T>::require_rerouting_ = true;
       LOG_WARN("table_api request require rerouting", K(ret), "require_rerouting", ObRpcProcessor<T>::require_rerouting_);
     }
+    if (ObTableApiProcessorBase::kv_route_meta_error_) {
+      ObRpcProcessor<T>::kv_route_meta_error_ = true;
+      LOG_WARN("table_api request refresh table meta", K(ret), "kv_route_meta_error", ObRpcProcessor<T>::kv_route_meta_error_);
+    }
+  } else {
+    ObRpcProcessor<T>::require_rerouting_ = ObTableApiProcessorBase::require_rerouting_;
+    ObRpcProcessor<T>::kv_route_meta_error_ = ObTableApiProcessorBase::kv_route_meta_error_;
   }
   return ret;
 }
@@ -707,6 +804,9 @@ template<class T>
 int ObTableRpcProcessor<T>::before_response(int error_code)
 {
   const int64_t elapsed_us = ObTimeUtility::fast_current_time() - RpcProcessor::get_receive_timestamp();
+  if (OB_SUCCESS != error_code) {
+    stat_process_type_ = ObTableProccessType::TABLE_API_FAILED_OP;
+  }
   ObTableRpcProcessorUtil::record_stat(stat_process_type_, elapsed_us, stat_row_count_, enable_query_response_time_stats_);
   request_finish_callback(); // clear thread local variables used to wait in queue
   return RpcProcessor::before_response(error_code);
@@ -790,18 +890,63 @@ int ObTableApiProcessorBase::get_tablet_id(const share::schema::ObSimpleTableSch
   return ret;
 }
 
+int ObTableApiProcessorBase::check_local_execute(const ObTabletID &tablet_id)
+{
+  int ret = OB_SUCCESS;
+  bool is_cache_hit = false;
+  ObLSID ls_id(ObLSID::INVALID_LS_ID);
+  ObAddr leader;
+  ObLocationService *location_service = nullptr;
+  if (OB_ISNULL(location_service = GCTX.location_service_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("GCTX.location_service_ is NULL", K(ret));
+  } else if (OB_FAIL(location_service->get(MTL_ID(),
+                                          tablet_id,
+                                          0, /* expire_renew_time */
+                                          is_cache_hit,
+                                          ls_id))) {
+    LOG_WARN("fail to get ls id", K(ret), K(MTL_ID()), K(tablet_id));
+  } else if (OB_FAIL(location_service->get_leader(GCONF.cluster_id,
+                                                  MTL_ID(),
+                                                  ls_id,
+                                                  false,/* force_renew */
+                                                  leader))) {
+    LOG_WARN("get leader failed", K(ret), K(ls_id));
+  } else if (leader != GCTX.self_addr()) {
+    // inform client and odp to refresh tabelt location
+    if (retry_policy_.allow_route_retry()) {
+      // if allow route retry, continue executing, odp and client will only refresh location cahce by require_rerouting_
+      require_rerouting_ = true;
+    } else {
+      // if not allow route retry, do not cotinue executing and return OB_NOT_MASTER to trigger cache refreshing
+      ret = OB_NOT_MASTER;
+      LOG_WARN("route to wrong server", K(ret), K(leader), K(GCTX.self_addr()));
+    }
+  }
+  return ret;
+}
+
 ObTableProccessType ObTableApiProcessorBase::get_stat_process_type(bool is_readonly,
                                                                    bool is_same_type,
                                                                    bool is_same_properties_names,
                                                                    ObTableOperationType::Type op_type)
 {
   ObTableEntityType entity_type = get_entity_type();
+  bool is_hkv = ObTableEntityType::ET_HKV == entity_type;
   ObTableProccessType process_type = ObTableProccessType::TABLE_API_PROCESS_TYPE_INVALID;
   if (is_readonly) {
-    if (is_same_properties_names) {
-      process_type = ObTableProccessType::TABLE_API_MULTI_GET;
+    if (is_hkv) {
+      if (is_same_type) { // for batch get
+        process_type = ObTableProccessType::TABLE_API_HBASE_QUERY;
+      } else { // hybrid batch of get and other operations
+        process_type = ObTableProccessType::TABLE_API_HBASE_HYBRID;
+      }
     } else {
-      process_type = ObTableProccessType::TABLE_API_BATCH_RETRIVE;
+      if (is_same_properties_names) {
+        process_type = ObTableProccessType::TABLE_API_MULTI_GET;
+      } else {
+        process_type = ObTableProccessType::TABLE_API_BATCH_RETRIVE;
+      }
     }
   } else if (is_same_type) {
     switch(op_type) {
@@ -809,7 +954,7 @@ ObTableProccessType ObTableApiProcessorBase::get_stat_process_type(bool is_reado
         process_type = ObTableProccessType::TABLE_API_MULTI_INSERT;
         break;
       case ObTableOperationType::DEL:
-        if (ObTableEntityType::ET_HKV == entity_type) {
+        if (is_hkv) {
           process_type = ObTableProccessType::TABLE_API_HBASE_DELETE;
         } else {
           process_type = ObTableProccessType::TABLE_API_MULTI_DELETE;
@@ -819,7 +964,7 @@ ObTableProccessType ObTableApiProcessorBase::get_stat_process_type(bool is_reado
         process_type = ObTableProccessType::TABLE_API_MULTI_UPDATE;
         break;
       case ObTableOperationType::INSERT_OR_UPDATE:
-        if (ObTableEntityType::ET_HKV == entity_type) {
+        if (is_hkv) {
           process_type = ObTableProccessType::TABLE_API_HBASE_PUT;
         } else {
           process_type = ObTableProccessType::TABLE_API_MULTI_INSERT_OR_UPDATE;
@@ -852,11 +997,60 @@ ObTableProccessType ObTableApiProcessorBase::get_stat_process_type(bool is_reado
         break;
     }
   } else {
-    if (ObTableEntityType::ET_HKV == entity_type) {
+    if (is_hkv) {
       process_type = ObTableProccessType::TABLE_API_HBASE_HYBRID;
     } else {
       process_type = ObTableProccessType::TABLE_API_BATCH_HYBRID;
     }
+  }
+  return process_type;
+}
+
+// only use for lsop batch hbase operations
+ObTableProccessType ObTableApiProcessorBase::get_hbase_process_type(OHOperationType hbase_op_type,
+                                                                    bool is_same_type, /* for all lsop operations, not tablet operations */
+                                                                    ObTableOperationType::Type table_op_type) {
+  ObTableProccessType process_type = ObTableProccessType::TABLE_API_PROCESS_TYPE_INVALID;
+  switch(hbase_op_type) {
+    case OHOperationType::PUT:
+      process_type = ObTableProccessType::TABLE_API_HBASE_PUT;
+      break;
+    case OHOperationType::DELETE:
+      process_type = ObTableProccessType::TABLE_API_HBASE_DELETE;
+      break;
+    case OHOperationType::GET_LIST:
+    case OHOperationType::EXISTS_LIST:
+      process_type = ObTableProccessType::TABLE_API_HBASE_BATCH_GET;
+      break;
+    case OHOperationType::PUT_LIST:
+      process_type = ObTableProccessType::TABLE_API_HBASE_BATCH_PUT;
+      break;
+    case OHOperationType::DELETE_LIST:
+      process_type = ObTableProccessType::TABLE_API_HBASE_BATCH_DELETE;
+      break;
+    case OHOperationType::BATCH:
+    case OHOperationType::BATCH_CALLBACK:
+      if (is_same_type) {
+        switch (table_op_type) {
+          case ObTableOperationType::DEL:
+          case ObTableOperationType::QUERY_AND_MUTATE:
+            process_type = ObTableProccessType::TABLE_API_HBASE_BATCH_DELETE;
+            break;
+          case ObTableOperationType::INSERT_OR_UPDATE:
+            process_type = ObTableProccessType::TABLE_API_HBASE_BATCH_PUT;
+            break;
+          case ObTableOperationType::SCAN:
+            process_type = ObTableProccessType::TABLE_API_HBASE_BATCH_GET;
+            break;
+          default:
+            break;
+        }
+      } else {
+        process_type = ObTableProccessType::TABLE_API_HBASE_HYBRID;
+        break;
+      }
+    default:
+      break;
   }
   return process_type;
 }

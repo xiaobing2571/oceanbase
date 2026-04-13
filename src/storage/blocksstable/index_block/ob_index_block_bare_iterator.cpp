@@ -68,7 +68,7 @@ int ObIndexBlockBareIterator::open(
   } else if (OB_ISNULL(index_micro_block_header = index_micro_block.get_micro_header())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("fail to get index micro block header", KR(ret), K(index_micro_block), KPC(this));
-  } else if (OB_FAIL(set_reader(get_row_type()))) {
+  } else if (OB_FAIL(set_reader(*index_micro_block.get_micro_header()))) {
     LOG_WARN("fail to init reader for index block", KR(ret), KPC(this));
   } else if (OB_FAIL(reader_->init(index_micro_block, nullptr/*datum_utils*/))) {
     LOG_WARN("fail to init reader for index block", KR(ret), K(index_micro_block), KPC(this));
@@ -114,7 +114,7 @@ int ObIndexBlockBareIterator::get_next_logic_micro_id(
   } else if (OB_ISNULL(idx_row_header)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("idx_row_header is NULL", KR(ret), K(idx_row_parser), K(row_), KPC(this));
-  } else if (OB_UNLIKELY(!idx_row_header->has_logic_micro_id())) {
+  } else if (OB_UNLIKELY(!idx_row_header->has_valid_logic_micro_id())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("logic micro id is invalid", KR(ret),
         K(idx_row_header), K(idx_row_parser), K(row_), KPC(this));

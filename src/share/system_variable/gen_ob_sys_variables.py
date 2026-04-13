@@ -104,6 +104,20 @@ def parse_json(json_file_name):
   json_file.close()
   return (json_Dict, list_sorted_by_name, list_sorted_by_id)
 
+def get_default_value_changed_serialized_var_indices(list_sorted_by_id):
+  """Find indices (offsets in ObSysVars) of vars where default_value != base_value and flags has SESSION or NEED_SERIALIZE or QUERY_SENSITIVE."""
+  default_value_changed_serialized_var_indices = []
+  var_num = 0
+  for (name, attributes) in list_sorted_by_id:
+    default_value = attributes.get('default_value', '')
+    base_value = attributes.get('base_value', '')
+    flags = attributes.get('flags', '')
+    has_required_flag = ('SESSION' in flags or 'NEED_SERIALIZE' in flags or 'QUERY_SENSITIVE' in flags)
+    if default_value != base_value and has_required_flag:
+      default_value_changed_serialized_var_indices.append(var_num)
+    var_num += 1
+  return default_value_changed_serialized_var_indices
+
 def make_alias_file(pdir, alias_file_name, sorted_list):
   alias_file =open(alias_file_name,'w')
   alias_file.write(file_head_annotation);
@@ -216,6 +230,8 @@ def make_head_file(pdir, head_file_name, sorted_list):
   head_file.write("  static int set_base_value(const char *name, const char * new_value);\n");
   head_file.write("  static int set_base_value(const common::ObString &name, const common::ObString &new_value);\n");
   head_file.write("  static int init_default_values();\n");
+  head_file.write("  static int64_t get_default_value_changed_serialized_var_count();\n");
+  head_file.write("  static int64_t get_default_value_changed_serialized_var_idx(int64_t i);\n");
   head_file.write("};\n");
   head_file.write("\n");
   head_file.write("class ObSysVarsToIdxMap\n");
@@ -224,6 +240,13 @@ def make_head_file(pdir, head_file_name, sorted_list):
   head_file.write("  static int64_t get_store_idx(int64_t var_id);\n");
   head_file.write("  static bool has_invalid_sys_var_id();\n");
   head_file.write("};\n");
+  head_file.write("\n");
+
+  # Add ESSENTIAL_SYS_VARS declaration
+  head_file.write("// Auto-generated ESSENTIAL_SYS_VARS array for inner session initialization\n");
+  head_file.write("// These variables are frequently used in session initialization, tenant processing, schema setting and other critical processes\n");
+  head_file.write("extern const ObSysVarClassType ESSENTIAL_SYS_VARS[];\n");
+  head_file.write("extern const int64_t ESSENTIAL_SYS_VARS_COUNT;\n");
 
   head_file.write("\n");
   head_file.write("} // end namespace share\n");
@@ -247,7 +270,7 @@ def make_flags_value(flags):
 def make_type_value(type):
   return type_dict[type.strip()]
 
-def make_cpp_file(pdir, cpp_file_name, sorted_list):
+def make_cpp_file(pdir, cpp_file_name, sorted_list, default_value_changed_serialized_var_indices):
   cpp_file =  open(cpp_file_name,'w')
   cpp_file.write(file_head_annotation)
   cpp_file.write("#define USING_LOG_PREFIX SHARE\n")
@@ -266,6 +289,11 @@ def make_cpp_file(pdir, cpp_file_name, sorted_list):
   cpp_file.write("static ObObj ObSysVarBaseValues[ObSysVarFactory::ALL_SYS_VARS_COUNT];\n")
   cpp_file.write("static ObArenaAllocator ObBaseSysVarAllocator(ObModIds::OB_COMMON_SYS_VAR_DEFAULT_VALUE);\n")
   cpp_file.write("static int64_t ObSysVarsIdToArrayIdx[ObSysVarFactory::OB_MAX_SYS_VAR_ID];\n")
+  cpp_file.write("// default_value != base_value and variable flags has SESSION or NEED_SERIALIZE or QUERY_SENSITIVE\n")
+  cpp_file.write("static int64_t ObDefaultValueChangedSerializedVarIndices[ObSysVarFactory::OB_SYS_DEFAULT_VALUE_CHANGED_SERIALIZED_VAR_COUNT] = {\n")
+  if default_value_changed_serialized_var_indices:
+    cpp_file.write("  " + ", ".join(str(i) for i in default_value_changed_serialized_var_indices) + "\n")
+  cpp_file.write("};\n")
   cpp_file.write("// VarsInit中需要判断当前最大的SysVars对应的id，是否大于OB_MAX_SYS_VAR_ID\n")
   cpp_file.write("// 如果大于OB_MAX_SYS_VAR_ID表示存在无效的SysVarsId\n")
   cpp_file.write("static bool HasInvalidSysVar = false;\n")
@@ -338,6 +366,8 @@ def make_cpp_file(pdir, cpp_file_name, sorted_list):
   cpp_file.write("const ObObj &ObSysVariables::get_default_value(int64_t i){ return ObSysVarDefaultValues[i];}\n")
   cpp_file.write("const ObObj &ObSysVariables::get_base_value(int64_t i){ return ObSysVarBaseValues[i];}\n")
   cpp_file.write("int64_t ObSysVariables::get_amount(){ return var_amount;}\n")
+  cpp_file.write("int64_t ObSysVariables::get_default_value_changed_serialized_var_count(){ return ObSysVarFactory::OB_SYS_DEFAULT_VALUE_CHANGED_SERIALIZED_VAR_COUNT;}\n")
+  cpp_file.write("int64_t ObSysVariables::get_default_value_changed_serialized_var_idx(int64_t i){ return ObDefaultValueChangedSerializedVarIndices[i];}\n")
   cpp_file.write("ObCollationType ObSysVariables::get_default_sysvar_collation() { return CS_TYPE_UTF8MB4_GENERAL_CI;}\n")
   cpp_file.write("\n")
   cpp_file.write("int ObSysVariables::set_value(const char *name, const char * new_value)\n")
@@ -478,7 +508,7 @@ def write_sys_var_classes(wfile, sorted_list):
         attributes["session_special_update_func"] if "session_special_update_func" in attributes.keys() else None)
     idx += 1
 
-def write_sys_var_fac_class(wfile, sorted_list):
+def write_sys_var_fac_class(wfile, sorted_list, default_value_changed_serialized_var_indices):
   mysql_sys_var_names_count = 0
   ob_sys_var_names_count = 0
   for (name, attributes) in sorted_list:
@@ -486,6 +516,7 @@ def write_sys_var_fac_class(wfile, sorted_list):
       mysql_sys_var_names_count += 1
     else:
       ob_sys_var_names_count += 1
+  ob_sys_default_value_changed_serialized_var_count = len(default_value_changed_serialized_var_indices)
   wfile.write("""
 class ObSysVarFactory
 {
@@ -512,6 +543,9 @@ public:
   wfile.write("""
   const static int64_t OB_SYS_VARS_COUNT = """)
   wfile.write(str(ob_sys_var_names_count) + ";")
+  wfile.write("""
+  const static int64_t OB_SYS_DEFAULT_VALUE_CHANGED_SERIALIZED_VAR_COUNT = """)
+  wfile.write(str(ob_sys_default_value_changed_serialized_var_count) + ";")
   wfile.write("""
   const static int64_t ALL_SYS_VARS_COUNT = MYSQL_SYS_VARS_COUNT + OB_SYS_VARS_COUNT;
   const static int64_t INVALID_MAX_READ_STALE_TIME = -1;
@@ -612,6 +646,14 @@ def write_sys_var_class(wfile, idx, sys_var_name, data_type, base_class, \
         + ") {}\n")
   wfile.write("  inline virtual ObSysVarClassType get_type() const { return SYS_VAR_" + sys_var_name.upper() + "; }\n")
   wfile.write("  inline virtual const common::ObObj &get_global_default_value() const { return ObSysVariables::get_default_value(" + str(idx) + "); }\n")
+  # Special handling for parallel_servers_target: add override method declarations
+  if sys_var_name == "parallel_servers_target":
+    wfile.write("  virtual int inner_to_select_obj(common::ObIAllocator &allocator,\n")
+    wfile.write("                                  const sql::ObBasicSessionInfo &session,\n")
+    wfile.write("                                  common::ObObj &select_obj) const override;\n")
+    wfile.write("  virtual int inner_to_show_str(common::ObIAllocator &allocator,\n")
+    wfile.write("                                const sql::ObBasicSessionInfo &session,\n")
+    wfile.write("                                common::ObString &show_str) const override;\n")
   wfile.write("};\n");
 
 def make_sys_var_class_type_h(pdir, filename, sorted_list):
@@ -636,7 +678,7 @@ namespace share
   wfile.write("#endif //" + file_def_str)
   print("Generate " + str(filename) + " successfully!\n");
 
-def make_sys_var_h(pdir, filename, sorted_list):
+def make_sys_var_h(pdir, filename, sorted_list, default_value_changed_serialized_var_indices):
   wfile = open(filename, 'w')
   wfile.write(file_head_annotation);
   suffix_idx = filename.find(".h")
@@ -657,7 +699,7 @@ namespace share
 """)
   write_sys_var_classes(wfile, sorted_list)
   wfile.write("\n")
-  write_sys_var_fac_class(wfile, sorted_list)
+  write_sys_var_fac_class(wfile, sorted_list, default_value_changed_serialized_var_indices)
   wfile.write("""
 }
 }
@@ -670,6 +712,14 @@ def make_sys_var_cpp(pdir, filename, list_sorted_by_name, list_sorted_by_id):
   wfile.write(file_head_annotation);
   wfile.write("#define USING_LOG_PREFIX SQL_SESSION\n");
   wfile.write("#include \"" + pdir + "/" + filename.replace(".cpp", ".h") + "\"\n")
+  # Special handling for parallel_servers_target: add extra includes
+  has_parallel_servers_target = any(name == "parallel_servers_target" for (name, attributes) in list_sorted_by_id)
+  if has_parallel_servers_target:
+    wfile.write("#include \"src/observer/omt/ob_tenant_config_mgr.h\"\n")
+    wfile.write("#include \"share/ob_server_struct.h\"\n")
+    wfile.write("#include \"src/sql/engine/expr/ob_expr_operator.h\"\n")
+    wfile.write("#include \"src/sql/session/ob_basic_session_info.h\"\n")
+    wfile.write("\n")
   # wfile.write("#include \"share/system_variable/ob_system_variable_init.cpp\"\n")
   wfile.write("using namespace oceanbase::common;\n");
   wfile.write("""
@@ -1043,6 +1093,60 @@ int ObSysVarFactory::create_sys_var(ObSysVarClassType sys_var_id, ObBasicSysVar 
   return ret;
 }
 """)
+
+  # Special handling for parallel_servers_target: add custom method implementations
+  has_parallel_servers_target = any(name == "parallel_servers_target" for (name, attributes) in list_sorted_by_id)
+  if has_parallel_servers_target:
+    wfile.write("""
+int ObSysVarParallelServersTarget::inner_to_select_obj(common::ObIAllocator &allocator,
+                                                       const sql::ObBasicSessionInfo &session,
+                                                       common::ObObj &select_obj) const
+{
+  int ret = OB_SUCCESS;
+  uint64_t tenant_id = MTL_ID();
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
+  double min_cpu = 0.0;
+  double max_cpu = 0.0;
+  if (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_5_1_0 &&
+      tenant_config.is_valid() &&
+      NULL != GCTX.omt_ &&
+      OB_SUCC(GCTX.omt_->get_tenant_cpu(tenant_id, min_cpu, max_cpu))) {
+    int64_t val = static_cast<int64_t>(min_cpu * tenant_config->px_target_workers_per_cpu + 0.5);
+    select_obj.set_int(val);
+  } else {
+    ret = ObIntSysVar::inner_to_select_obj(allocator, session, select_obj);
+  }
+  return ret;
+}
+
+int ObSysVarParallelServersTarget::inner_to_show_str(common::ObIAllocator &allocator,
+                                const sql::ObBasicSessionInfo &session,
+                                common::ObString &show_str) const
+{
+  int ret = OB_SUCCESS;
+  ObObj value;
+  if (OB_FAIL(inner_to_select_obj(allocator, session, value))) {
+    LOG_WARN("inner to select obj failed", K(ret));
+  } else {
+    const ObObj *res_obj = NULL;
+    const ObDataTypeCastParams dtc_params = sql::ObBasicSessionInfo::create_dtc_params(&session);
+    ObCastCtx cast_ctx(&allocator, &dtc_params, CM_NONE, ObCharset::get_system_collation());
+    EXPR_CAST_OBJ_V2(ObVarcharType, value, res_obj);
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(res_obj)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("sys var casted obj ptr is NULL", K(ret), K(value), K(get_name()));
+    } else if (OB_UNLIKELY(ObVarcharType != res_obj->get_type())) {
+      LOG_WARN("sys var casted obj is not ObVarcharType",
+              K(ret), K(value), K(*res_obj), K(get_name()));
+    } else {
+      show_str = res_obj->get_varchar();
+    }
+  }
+  return ret;
+}
+""")
+
   wfile.write("""
 }
 }
@@ -1078,6 +1182,108 @@ def gen_upgrade_script():
   print(info.read())
   print('\n=========run gen_upgrade_scripts.py, end=========\n')
 
+def generate_essential_sys_vars_in_init_cpp(cpp_filename, list_sorted_by_id):
+  """
+  Generate ESSENTIAL_SYS_VARS array in ob_system_variable_init.cpp which is used for inner session initialization,
+  including:
+  1. some essential vars (such as ob_compatibility_mode, sql_mode, ob_read_consistency)
+  2. all system vars with INFLUENCE_PLAN flag
+  """
+  # some essential vars
+  essential_core_vars = [
+    "ob_compatibility_mode",
+    "sql_mode",
+    "ob_read_consistency",
+    "lower_case_table_names",      # needed for table name resolution in SQL parsing
+    "collation_connection",        # needed for expression resolution in SQL parsing
+    "character_set_connection",     # needed for expression resolution in SQL parsing
+    "ob_check_sys_variable",
+    "ob_compatibility_version",
+    "ob_log_level",                # needed for process_session_variable_fast
+    "debug_sync",                   # needed for process_session_variable_fast
+    "ob_global_debug_sync",         # needed for process_session_variable_fast
+    "wait_timeout",                 # needed for process_session_variable_fast
+    "autocommit"
+  ]
+
+  essential_vars = []
+  influence_plan_vars = []
+
+  # iterate all system vars
+  for (name, attributes) in list_sorted_by_id:
+    var_name_upper = "SYS_VAR_" + name.upper()
+
+    # check if it is an essential var
+    if name in essential_core_vars:
+      essential_vars.append((var_name_upper, name, "core"))
+    # check if it has INFLUENCE_PLAN flag
+    elif "INFLUENCE_PLAN" in attributes["flags"]:
+      influence_plan_vars.append((var_name_upper, name, "influence_plan"))
+
+  # sort the vars by the order of the original array: first core vars, then influence_plan vars
+  essential_vars.extend(influence_plan_vars)
+
+  # read the existing cpp file
+  import codecs
+  with codecs.open(cpp_filename, 'r', encoding='utf-8') as rfile:
+    content = rfile.read()
+
+  # generate ESSENTIAL_SYS_VARS array content
+  essential_array_content = []
+  essential_array_content.append('// Auto-generated ESSENTIAL_SYS_VARS array for inner session initialization')
+  essential_array_content.append('// These variables are frequently used in session initialization, tenant processing, schema setting and other critical processes')
+  essential_array_content.append('const ObSysVarClassType ESSENTIAL_SYS_VARS[] = {')
+
+  # write core vars comment
+  core_vars_written = False
+  influence_plan_vars_written = False
+
+  for var_name_upper, name, var_type in essential_vars:
+    if var_type == "core" and not core_vars_written:
+      essential_array_content.append('  // compatibility mode related vars - affect SQL parsing and execution behavior')
+      core_vars_written = True
+    elif var_type == "influence_plan" and not influence_plan_vars_written:
+      essential_array_content.append('  ')
+      essential_array_content.append('  // all system vars with INFLUENCE_PLAN flag - affect execution plan generation')
+      influence_plan_vars_written = True
+
+    # add variable comment
+    comment = "  " + var_name_upper + ","
+    if var_type == "influence_plan":
+      comment += "        // " + name
+    essential_array_content.append(comment)
+
+  essential_array_content.append('};')
+  essential_array_content.append('')
+  essential_array_content.append('const int64_t ESSENTIAL_SYS_VARS_COUNT = sizeof(ESSENTIAL_SYS_VARS) / sizeof(ESSENTIAL_SYS_VARS[0]);')
+  essential_array_content.append('')
+
+  # find the position to insert the array (after static variables but before VarsInit)
+  lines = content.split('\n')
+  insert_pos = -1
+
+  for i, line in enumerate(lines):
+    if 'static bool HasInvalidSysVar = false;' in line:
+      insert_pos = i + 1
+      break
+
+  if insert_pos == -1:
+    raise Exception("Could not find insertion point in ob_system_variable_init.cpp")
+
+  # insert the essential vars array
+  lines[insert_pos:insert_pos] = [''] + essential_array_content
+
+  # write back to file
+  os.chmod(cpp_filename, stat.S_IRUSR + stat.S_IWUSR + stat.S_IRGRP + stat.S_IROTH)
+  with codecs.open(cpp_filename, 'w', encoding='utf-8') as wfile:
+    wfile.write('\n'.join(lines))
+  os.chmod(cpp_filename, stat.S_IRUSR + stat.S_IRGRP + stat.S_IROTH)
+
+  print("Generate ESSENTIAL_SYS_VARS array in " + str(cpp_filename) + " successfully!")
+  print("Generated " + str(len(essential_vars)) + " essential system variables:")
+  print("  - " + str(len([v for v in essential_vars if v[2] == 'core'])) + " core variables")
+  print("  - " + str(len([v for v in essential_vars if v[2] == 'influence_plan'])) + " INFLUENCE_PLAN variables")
+
 pdir = "share/system_variable"
 json_file_name = "ob_system_variable_init.json"
 head_file_name = "ob_system_variable_init.h"
@@ -1089,14 +1295,18 @@ sys_var_fac_cpp_file_name = "ob_system_variable_factory.cpp"
 #sys_vars_dict_script_file_name = "../../../tools/upgrade/sys_vars_dict.py"
 
 (json_Dict, list_sorted_by_name, list_sorted_by_id) = parse_json(json_file_name)
+default_value_changed_serialized_var_indices = get_default_value_changed_serialized_var_indices(list_sorted_by_id)
 
 make_head_file(pdir, head_file_name, list_sorted_by_id)
-make_cpp_file(pdir, cpp_file_name, list_sorted_by_id)
+make_cpp_file(pdir, cpp_file_name, list_sorted_by_id, default_value_changed_serialized_var_indices)
 make_alias_file(pdir, alias_file_name, list_sorted_by_id)
 
 make_sys_var_class_type_h(pdir, sys_var_class_type_head_file_name, list_sorted_by_id)
-make_sys_var_h(pdir, sys_var_fac_head_file_name, list_sorted_by_id)
+make_sys_var_h(pdir, sys_var_fac_head_file_name, list_sorted_by_id, default_value_changed_serialized_var_indices)
 make_sys_var_cpp(pdir, sys_var_fac_cpp_file_name, list_sorted_by_name, list_sorted_by_id)
+
+# generate ESSENTIAL_SYS_VARS array in ob_system_variable_init.cpp
+generate_essential_sys_vars_in_init_cpp(cpp_file_name, list_sorted_by_id)
 
 #gen_sys_vars_dict_script_for_upgrade(sys_vars_dict_script_file_name, list_sorted_by_id)
 #gen_upgrade_script()

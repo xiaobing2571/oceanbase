@@ -188,6 +188,9 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
   ObSqlCtx *sql_ctx = result.get_exec_context().get_sql_ctx();
   bool is_packed = result.get_physical_plan() ? result.get_physical_plan()->is_packed() : false;
   MYSQL_PROTOCOL_TYPE protocol_type = is_ps_protocol ? MYSQL_PROTOCOL_TYPE::BINARY : MYSQL_PROTOCOL_TYPE::TEXT;
+  // for external consistency
+  transaction::ObTxReadSnapshot &tx_read_snapshot = DAS_CTX(result.get_exec_context()).get_snapshot();
+  tx_read_snapshot.wait_consistency();
 
   int64_t limit_count = INT64_MAX;
   if (OB_FAIL(ret)) {
@@ -282,7 +285,7 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
         if (OB_FAIL(ret)){
         } else if ((value.is_lob() || value.is_lob_locator() || value.is_json() || value.is_geometry() || value.is_roaringbitmap())
                   && OB_FAIL(process_lob_locator_results(value, result))) {
-          LOG_WARN("convert lob locator to longtext failed", K(ret));
+          LOG_WARN("convert lob locator to longtext failed", K(ret), KPC(row), K(i));
         } else if ((value.is_user_defined_sql_type() || value.is_collection_sql_type() || value.is_geometry()) &&
                    OB_FAIL(ObXMLExprHelper::process_sql_udt_results(value, result))) {
           LOG_WARN("convert udt to client format failed", K(ret), K(value.get_udt_subschema_id()));
@@ -338,6 +341,50 @@ int ObQueryDriver::response_query_result(ObResultSet &result,
   return ret;
 }
 
+int ObQueryDriver::send_eof_packet(bool has_more_result)
+{
+  int ret = OB_SUCCESS;
+  OMPKEOF eofp;
+  if (OB_FAIL(seal_eof_packet(has_more_result, eofp))) {
+    LOG_WARN("failed to seal eof packet", K(ret), K(has_more_result));
+  } else if (OB_FAIL(sender_.response_packet(eofp, &session_))) {
+    LOG_WARN("response packet fail", K(ret), K(has_more_result));
+  }
+  return ret;
+}
+
+int ObQueryDriver::seal_eof_packet(bool has_more_result, obmysql::OMPKEOF& eofp)
+{
+  int ret = OB_SUCCESS;
+  const ObWarningBuffer *warnings_buf = common::ob_get_tsi_warning_buffer();
+  uint16_t warning_count = 0;
+  if (OB_ISNULL(warnings_buf)) {
+    // ignore ret
+    LOG_WARN("can not get thread warnings buffer", K(warnings_buf));
+  } else {
+    warning_count = static_cast<uint16_t>(warnings_buf->get_readable_warning_count());
+  }
+  eofp.set_warning_count(warning_count);
+  ObServerStatusFlags flags = eofp.get_server_status();
+  flags.status_flags_.OB_SERVER_STATUS_IN_TRANS
+    = (session_.is_server_status_in_transaction() ? 1 : 0);
+  flags.status_flags_.OB_SERVER_STATUS_AUTOCOMMIT = (session_.get_local_autocommit() ? 1 : 0);
+  flags.status_flags_.OB_SERVER_MORE_RESULTS_EXISTS = has_more_result;
+  eofp.set_server_status(flags);
+  if (!session_.is_obproxy_mode()) {
+    // in java client or others, use slow query bit to indicate partition hit or not
+    flags.status_flags_.OB_SERVER_QUERY_WAS_SLOW = !session_.partition_hit().get_bool();
+  }
+  eofp.set_server_status(flags);
+  // for proxy
+  // in multi-stmt, send extra ok packet in the last stmt(has no more result)
+  if (!is_prexecute_ && !has_more_result
+      && OB_FAIL(sender_.update_last_pkt_pos())) {
+    LOG_WARN("failed to update last packet pos", K(ret));
+  }
+  return ret;
+}
+
 int ObQueryDriver::convert_field_charset(ObIAllocator& allocator,
                                          const ObCollationType& from_collation,
                                          const ObCollationType& dest_collation,
@@ -369,7 +416,8 @@ int ObQueryDriver::convert_field_charset(ObIAllocator& allocator,
 }
 
 int ObQueryDriver::convert_string_value_charset(ObObj& value, ObResultSet &result,
-                                                ObCharsetType charset_type, ObCharsetType nchar)
+                                                ObCharsetType charset_type, ObCharsetType nchar,
+                                                common::ObIAllocator *alloc)
 {
   int ret = OB_SUCCESS;
   if (lib::is_oracle_mode()
@@ -379,7 +427,7 @@ int ObQueryDriver::convert_string_value_charset(ObObj& value, ObResultSet &resul
     charset_type = nchar;
   }
   ObCollationType to_collation_type = ObCharset::get_default_collation(charset_type);
-  ObArenaAllocator *allocator = NULL;
+  ObIAllocator *allocator = alloc;
   ObCollationType from_collation_type = value.get_collation_type();
   if (OB_FAIL(ret)) {
   } else if (from_collation_type == to_collation_type) {
@@ -391,7 +439,7 @@ int ObQueryDriver::convert_string_value_charset(ObObj& value, ObResultSet &resul
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid collation", K(ret), K(from_collation_type), K(to_collation_type), K(value));
     }
-  } else if (OB_FAIL(result.get_exec_context().get_convert_charset_allocator(allocator))) {
+  } else if (OB_ISNULL(allocator) && OB_FAIL(result.get_exec_context().get_convert_charset_allocator(allocator))) {
     LOG_WARN("fail to get lob fake allocator", K(ret));
   } else if (OB_ISNULL(allocator)) {
     ret = OB_ERR_UNEXPECTED;
@@ -403,7 +451,8 @@ int ObQueryDriver::convert_string_value_charset(ObObj& value, ObResultSet &resul
 }
 
 int ObQueryDriver::convert_lob_value_charset(common::ObObj& value, sql::ObResultSet &result,
-                                            ObCharsetType charset_type, ObCharsetType nchar)
+                                            ObCharsetType charset_type, ObCharsetType nchar,
+                                            common::ObIAllocator *alloc)
 {
   int ret = OB_SUCCESS;
 
@@ -414,8 +463,8 @@ int ObQueryDriver::convert_lob_value_charset(common::ObObj& value, sql::ObResult
     charset_type = nchar;
   }
 
-  ObArenaAllocator *allocator = NULL;
-  if (OB_FAIL(result.get_exec_context().get_convert_charset_allocator(allocator))) {
+  ObIAllocator *allocator = alloc;
+  if (OB_ISNULL(allocator) && OB_FAIL(result.get_exec_context().get_convert_charset_allocator(allocator))) {
     LOG_WARN("fail to get lob fake allocator", K(ret));
   } else if (OB_ISNULL(allocator)) {
     ret = OB_ERR_UNEXPECTED;
@@ -429,7 +478,8 @@ int ObQueryDriver::convert_lob_value_charset(common::ObObj& value, sql::ObResult
 }
 
 int ObQueryDriver::convert_text_value_charset(common::ObObj& value, sql::ObResultSet &result,
-                                              ObCharsetType charset_type, ObCharsetType nchar)
+                                              ObCharsetType charset_type, ObCharsetType nchar,
+                                              common::ObIAllocator *alloc)
 {
   int ret = OB_SUCCESS;
 
@@ -441,8 +491,8 @@ int ObQueryDriver::convert_text_value_charset(common::ObObj& value, sql::ObResul
     charset_type = nchar;
   }
 
-  ObArenaAllocator *allocator = NULL;
-  if (OB_FAIL(result.get_exec_context().get_convert_charset_allocator(allocator))) {
+  ObIAllocator *allocator = alloc;
+  if (OB_ISNULL(allocator) && OB_FAIL(result.get_exec_context().get_convert_charset_allocator(allocator))) {
     LOG_WARN("fail to get lob fake allocator", K(ret));
   } else if (OB_ISNULL(allocator)) {
     ret = OB_ERR_UNEXPECTED;
@@ -451,6 +501,114 @@ int ObQueryDriver::convert_text_value_charset(common::ObObj& value, sql::ObResul
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(convert_text_value_charset(value, charset_type, *allocator, &my_session, &result.get_exec_context()))) {
     LOG_WARN("convert lob value fail.", K(ret), K(value));
+  }
+  return ret;
+}
+
+int ObQueryDriver::convert_extend_value_charset(common::ObObj& value, sql::ObResultSet &result,
+                                                ObCharsetType charset_type, ObCharsetType nchar)
+{
+  int ret = OB_SUCCESS;
+#ifdef OB_BUILD_ORACLE_PL
+  ObIAllocator *allocator = NULL;
+  if (pl::ObPLType::PL_NESTED_TABLE_TYPE == value.get_meta().get_extend_type()) {
+    pl::ObPLNestedTable *coll = NULL;
+    if (OB_ISNULL(coll = reinterpret_cast<pl::ObPLNestedTable *>(value.get_ext()))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null", K(ret), K(coll));
+    } else if (OB_ISNULL(allocator = coll->get_allocator())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null", K(ret));
+    } else {
+      ObArenaAllocator temp_allocator("PlTemp", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+      ObObj tmp_obj;
+      ObObj element_obj;
+      for (int64_t i = 0; OB_SUCC(ret) && i < coll->get_count(); ++i) {
+        tmp_obj = coll->get_data()[i];
+        element_obj = coll->get_data()[i];
+        if (OB_FAIL(SMART_CALL(convert_value_charset(tmp_obj, result, charset_type, nchar, &temp_allocator)))) {
+          LOG_WARN("failed to convert charset", K(ret), K(i));
+        } else {
+          if (!tmp_obj.is_pl_extend()) {
+            if (OB_FAIL(SMART_CALL(common::deep_copy_obj(*allocator, tmp_obj, coll->get_data()[i])))) { // deep copy to dst element
+              LOG_WARN("failed to deep copy obj", K(ret), K(i));
+            } else if (OB_FAIL(SMART_CALL(pl::ObUserDefinedType::destruct_objparam(*allocator, element_obj)))) { // destruct src element
+              LOG_WARN("failed to destruct objparam", K(ret), K(i));
+            }
+          }
+        }
+      }
+    }
+  } else if (pl::ObPLType::PL_RECORD_TYPE == value.get_meta().get_extend_type()) {
+    pl::ObPLRecord *record = NULL;
+    if (OB_ISNULL(record = reinterpret_cast<pl::ObPLRecord*>(value.get_ext()))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null", K(ret), K(record));
+    } else if (OB_ISNULL(allocator = record->get_allocator())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null", K(ret));
+    } else {
+      ObArenaAllocator temp_allocator("PlTemp", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+      for (int64_t i = 0; OB_SUCC(ret) && i < record->get_count(); ++i) {
+        ObObj* obj;
+        ObObj tmp_obj;
+        ObObj element_obj;
+        if (OB_FAIL(record->get_element(i, tmp_obj))) {
+          LOG_WARN("failed to get element", K(ret), K(i));
+        } else if (OB_FAIL(record->get_element(i, obj))) {
+          LOG_WARN("failed to get element", K(ret), K(i));
+        } else if (OB_FAIL(SMART_CALL(convert_value_charset(tmp_obj, result, charset_type, nchar, &temp_allocator)))) {
+          LOG_WARN("failed to convert charset", K(ret), K(i));
+        } else {
+          if (!tmp_obj.is_pl_extend()) {
+            element_obj = *obj;
+            if (OB_FAIL(SMART_CALL(common::deep_copy_obj(*allocator, tmp_obj, *obj)))) { // deep copy to dst element
+              LOG_WARN("failed to deep copy obj", K(ret), K(i));
+            } else if (OB_FAIL(SMART_CALL(pl::ObUserDefinedType::destruct_objparam(*allocator, element_obj)))) { // destruct src element
+              LOG_WARN("failed to destruct objparam", K(ret), K(i));
+            }
+          }
+        }
+      }
+    }
+  }
+#endif
+  return ret;
+}
+
+int ObQueryDriver::convert_value_charset(common::ObObj& value, sql::ObResultSet &result,
+                                         ObCharsetType charset_type, ObCharsetType nchar,
+                                         ObIAllocator *alloc)
+{
+  int ret = OB_SUCCESS;
+  ObIAllocator *allocator = alloc;
+  if (OB_ISNULL(allocator)) {
+    if (OB_FAIL(result.get_exec_context().get_convert_charset_allocator(allocator))) {
+      LOG_WARN("fail to get lob fake allocator", K(ret));
+    } else if (OB_ISNULL(allocator)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("text fake allocator is null.", K(ret), K(value));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (ob_is_string_tc(value.get_type()) && CS_TYPE_INVALID != value.get_collation_type()) {
+    OZ(convert_string_value_charset(value, result, charset_type, nchar, allocator));
+  } else if (value.is_clob_locator()
+            && OB_FAIL(convert_lob_value_charset(value, result, charset_type, nchar, allocator))) {
+    LOG_WARN("convert lob value charset failed", K(ret));
+  } else if (ob_is_text_tc(value.get_type())
+            && OB_FAIL(convert_text_value_charset(value, result, charset_type, nchar, allocator))) {
+    LOG_WARN("convert text value charset failed", K(ret));
+  } else if (ob_is_extend_tc(value.get_type())) {
+    OZ (SMART_CALL(convert_extend_value_charset(value, result, charset_type, nchar)));
+  }
+  if (OB_FAIL(ret)) {
+  } else if ((value.is_lob() || value.is_lob_locator() || value.is_json() || value.is_geometry() || value.is_roaringbitmap())
+              && OB_FAIL(process_lob_locator_results(value, result, allocator))) {
+    LOG_WARN("convert lob locator to longtext failed", K(ret));
+  } else if ((value.is_user_defined_sql_type() || value.is_collection_sql_type() || value.is_geometry()) &&
+              OB_FAIL(ObXMLExprHelper::process_sql_udt_results(value, result, allocator))) {
+    LOG_WARN("convert udt to client format failed", K(ret), K(value.get_udt_subschema_id()));
   }
   return ret;
 }
@@ -515,7 +673,7 @@ int ObQueryDriver::like_match(const char* str, int64_t length_str, int64_t i,
 int ObQueryDriver::convert_lob_locator_to_longtext(ObObj& value, sql::ObResultSet &result)
 {
   int ret = OB_SUCCESS;
-  ObArenaAllocator *allocator = NULL;
+  ObIAllocator *allocator = NULL;
   if (OB_FAIL(result.get_exec_context().get_convert_charset_allocator(allocator))) {
     LOG_WARN("fail to get lob fake allocator", K(ret));
   } else if (OB_ISNULL(allocator)) {
@@ -572,11 +730,11 @@ int ObQueryDriver::convert_lob_locator_to_longtext(ObObj& value,
   return ret;
 }
 
-int ObQueryDriver::process_lob_locator_results(ObObj& value, sql::ObResultSet &result)
+int ObQueryDriver::process_lob_locator_results(ObObj& value, sql::ObResultSet &result, ObIAllocator *alloc)
 {
   int ret = OB_SUCCESS;
-  ObArenaAllocator *allocator = NULL;
-  if (OB_FAIL(result.get_exec_context().get_convert_charset_allocator(allocator))) {
+  ObIAllocator *allocator = alloc;
+  if (OB_ISNULL(allocator) && OB_FAIL(result.get_exec_context().get_convert_charset_allocator(allocator))) {
     LOG_WARN("fail to get lob fake allocator", K(ret));
   } else if (OB_ISNULL(allocator)) {
     ret = OB_ERR_UNEXPECTED;

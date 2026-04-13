@@ -335,6 +335,20 @@ public:
   double get_cg_skip_rate() const { return cg_skip_rate_; }
   void set_cg_skip_rate(double cg_skip_rate) { cg_skip_rate_ = cg_skip_rate; }
 
+  bool is_internal() const { return is_internal_; }
+
+  void set_is_interal() { is_internal_ = true; }
+
+  int64_t get_lob_inrow_count() const { return lob_inrow_count_; }
+  void set_lob_inrow_count(int64_t lob_inrow_count) { lob_inrow_count_ = lob_inrow_count; }
+  void add_lob_inrow_count(int64_t lob_inrow_count)
+  {
+    if (lob_inrow_count_ < 0) {
+      lob_inrow_count_ = lob_inrow_count;
+    } else {
+      lob_inrow_count_ += lob_inrow_count;
+    }
+  }
   TO_STRING_KV(K_(table_id),
                K_(partition_id),
                K_(column_id),
@@ -353,7 +367,9 @@ public:
                K_(histogram),
                K_(cg_macro_blk_cnt),
                K_(cg_micro_blk_cnt),
-               K_(cg_skip_rate));
+               K_(cg_skip_rate),
+               K_(is_internal),
+               K_(lob_inrow_count));
 private:
   DISALLOW_COPY_AND_ASSIGN(ObOptColumnStat);
   int merge_min_max(ObObj &cur, const ObObj &other, bool is_cmp_min);
@@ -382,6 +398,9 @@ protected:
   int64_t cg_macro_blk_cnt_;
   int64_t cg_micro_blk_cnt_;
   double cg_skip_rate_;
+
+  bool is_internal_;// mark the stat is internal stat used by statstics
+  int64_t lob_inrow_count_;
 };
 
 }

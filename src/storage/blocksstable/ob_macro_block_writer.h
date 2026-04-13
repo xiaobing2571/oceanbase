@@ -40,21 +40,16 @@
 #include "storage/compaction/ob_compaction_util.h"
 #include "storage/compaction/ob_sstable_merge_history.h"
 #include "storage/blocksstable/ob_batch_datum_rows.h"
+#include "storage/blocksstable/ob_macro_block_flusher.h"
 
 namespace oceanbase
 {
-namespace compaction
-{
-#ifdef OB_BUILD_SHARED_STORAGE
-  enum class ObSSMajorPrewarmLevel : uint8_t;
-#endif
-}
 namespace blocksstable
 {
 class ObDataIndexBlockBuilder;
 class ObSSTableIndexBuilder;
 class ObSSTableSecMetaIterator;
-class ObSSTablePrivateObjectCleaner;
+class ObISSTableObjectCleaner;
 struct ObIndexBlockRowDesc;
 struct ObMacroBlockDesc;
 class ObIMacroBlockFlushCallback;
@@ -80,6 +75,7 @@ public:
   int compress_encrypt_micro_block(ObMicroBlockDesc &micro_block_desc, const int64_t macro_seq, const int64_t micro_offset);
   int dump_micro_block_writer_buffer(const char *buf, const int64_t size);
   void reset();
+  int64_t get_micro_block_merge_verify_level() const { return micro_block_merge_verify_level_; }
 private:
   int prepare_micro_block_reader(
       const char *buf,
@@ -123,13 +119,14 @@ struct ObMicroCompressionInfo{
 public:
   ObMicroBlockAdaptiveSplitter();
   ~ObMicroBlockAdaptiveSplitter();
-  int init(const int64_t macro_store_size, const int64_t min_micro_row_count, const bool is_use_adaptive);
+  int init(const ObDataStoreDesc &store_desc, const int64_t min_micro_row_count);
   void reset();
   int check_need_split(const int64_t micro_size,
                        const int64_t micro_row_count,
                        const int64_t split_size,
                        const int64_t current_macro_size,
                        const bool is_keep_space,
+                       const bool is_last_row_last_flag,
                        bool &check_need_split) const;
 int update_compression_info(const int64_t micro_row_count, const int64_t original_size, const int64_t compressed_size);
 private:
@@ -140,6 +137,7 @@ private:
   int64_t macro_store_size_;
   int64_t min_micro_row_count_;
   bool is_use_adaptive_;
+  bool need_reduce_cross_mb_multi_version_rows_;
   ObMicroCompressionInfo compression_infos_[DEFAULT_MICRO_ROW_COUNT + 1]; //compression_infos_[0] for total compression info
 };
 
@@ -154,7 +152,7 @@ public:
       const int64_t parallel_idx,
       const blocksstable::ObMacroSeqParam &macro_seq_param,
       const share::ObPreWarmerParam &pre_warm_param,
-      ObSSTablePrivateObjectCleaner &object_cleaner,
+      ObISSTableObjectCleaner &object_cleaner,
       ObIMacroBlockFlushCallback *callback = nullptr,
       ObIMacroBlockValidator *validator = nullptr,
       ObIODevice *device_handle = nullptr);
@@ -163,12 +161,12 @@ public:
       const int64_t parallel_idx,
       const blocksstable::ObMacroSeqParam &macro_seq_param,
       const share::ObPreWarmerParam &pre_warm_param,
-      ObSSTablePrivateObjectCleaner &object_cleaner,
+      ObISSTableObjectCleaner &object_cleaner,
       ObIMacroBlockFlushCallback *callback);
   virtual int append_macro_block(const ObMacroBlockDesc &macro_desc,
                                  const ObMicroBlockData *micro_block_data);
   virtual int append_micro_block(const ObMicroBlock &micro_block, const ObMacroBlockDesc *curr_macro_desc = nullptr);
-  int append_micro_block(ObMicroBlockDesc &micro_block_desc, const ObMicroIndexInfo &micro_index_info);
+  int append_micro_block(ObMicroBlockDesc &micro_block_desc, const ObMicroIndexData &micro_index_data);
   int append_index_micro_block(ObMicroBlockDesc &micro_block_desc);
   virtual int append_row(const ObDatumRow &row, const ObMacroBlockDesc *curr_macro_desc = nullptr);
   virtual int append_batch(const ObBatchDatumRows &datum_rows,
@@ -183,22 +181,54 @@ public:
   inline ObMacroBlocksWriteCtx &get_macro_block_write_ctx() { return block_write_ctx_; }
   inline int64_t get_last_macro_seq() const { return OB_ISNULL(macro_seq_generator_) ? -1 : macro_seq_generator_->get_current(); } /* save our seq num */
   TO_STRING_KV(K_(block_write_ctx));
+
   static int build_micro_writer(const ObDataStoreDesc *data_store_desc,
                                 ObIAllocator &allocator,
                                 ObIMicroBlockWriter *&micro_writer,
                                 const int64_t verify_level = MICRO_BLOCK_MERGE_VERIFY_LEVEL::ENCODING_AND_COMPRESSION);
   inline int64_t get_macro_data_size() const { return macro_blocks_[current_index_].get_data_size() + micro_writer_->get_block_size(); }
   const compaction::ObMergeBlockInfo& get_merge_block_info() const { return merge_block_info_; }
-  ObIMacroBlockFlushCallback *get_flush_callback() { return callback_; }
   void inc_incremental_row_count() { ++merge_block_info_.incremental_row_count_; }
 protected:
+  void reset_for_open();
   virtual int build_micro_block();
   virtual int try_switch_macro_block();
+  virtual bool is_alloc_block_needed() const;
+  virtual bool need_write_macro_meta() const { return true; }
   virtual bool is_keep_freespace() const {return false; }
+  virtual int on_buffer_not_enough() { return OB_SUCCESS; }
+  virtual bool allow_use_external_flusher() const { return false; }
   inline bool is_dirty() const { return macro_blocks_[current_index_].is_dirty() || 0 != micro_writer_->get_row_count(); }
   inline int64_t get_curr_micro_writer_row_count() const { return micro_writer_->get_row_count(); }
-
+  int inner_init(
+      const ObDataStoreDesc &data_store_desc,
+      const int64_t parallel_idx,
+      const blocksstable::ObMacroSeqParam &macro_seq_param,
+      const share::ObPreWarmerParam &pre_warm_param,
+      const bool cluster_micro_index_on_flush,
+      ObISSTableObjectCleaner &object_cleaner,
+      ObIMacroBlockFlushCallback *callback,
+      ObIMacroBlockValidator *validator,
+      ObIODevice *device_handle);
 private:
+  template <typename MicroBlockWriterType, typename... Args>
+  static int inner_build_micro_writer(ObIAllocator &allocator,
+                                      ObIMicroBlockWriter *&micro_writer,
+                                      const int64_t verify_level = MICRO_BLOCK_MERGE_VERIFY_LEVEL::ENCODING_AND_COMPRESSION,
+                                      Args &&... args);
+  void inner_reset();
+  int post_flush(ObMacroBlock &macro_block);
+  bool check_can_flush_small_sstable(const bool is_flush_for_last_block) const;
+  bool is_definitely_not_small_sstable() const;
+  int write_micro_block_and_prewarm(const bool dump_diag_info,
+                                    const bool need_pre_warm,
+                                    ObMicroBlockDesc &micro_block_desc);
+  int prewarm_micro_blocks(const ObMacroBlock &macro_block,
+                           const MacroBlockId &macro_block_id,
+                           const bool need_fill_logic_id);
+  int cluster_micro_blocks(const ObMacroBlock &macro_block,
+                           const MacroBlockId &macro_block_id,
+                           const bool need_fill_logic_id);
   int init_pre_warmer(const share::ObPreWarmerParam &pre_warm_param);
   int data_aggregator_eval(const ObBatchDatumRows &datum_rows, const int64_t start, const int64_t write_row_count);
   int append_row_inner(const ObDatumRow &row, const ObMacroBlockDesc *curr_macro_desc);
@@ -212,20 +242,11 @@ private:
   int check_order(const ObDatumRow &row);
   int init_macro_seq_generator(const blocksstable::ObMacroSeqParam &macro_seq_param);
   int init_hash_index_builder();
-  int inner_init(
-      const ObDataStoreDesc &data_store_desc,
-      const int64_t parallel_idx,
-      const blocksstable::ObMacroSeqParam &macro_seq_param,
-      const share::ObPreWarmerParam &pre_warm_param,
-      const bool cluster_micro_index_on_flush,
-      ObSSTablePrivateObjectCleaner &object_cleaner,
-      ObIMacroBlockFlushCallback *callback,
-      ObIMacroBlockValidator *validator,
-      ObIODevice *device_handle);
   int append_row_and_hash_index(const ObDatumRow &row);
   int append_batch_to_micro_block(const ObBatchDatumRows &datum_rows, const int64_t start, const int64_t write_row_count);
   int init_pre_agg_util(const ObDataStoreDesc &data_store_desc);
   void release_pre_agg_util();
+  int agg_micro_block(const ObMicroIndexData &micro_index_data);
   int agg_micro_block(const ObMicroIndexInfo &micro_index_info);
   int build_micro_block_desc(
       const ObMicroBlock &micro_block,
@@ -236,12 +257,19 @@ private:
       ObMicroBlockDesc &micro_block_desc,
       ObMicroBlockHeader &header);
   int build_micro_block_desc_with_reuse(const ObMicroBlock &micro_block, ObMicroBlockDesc &micro_block_desc);
-  int write_micro_block(ObMicroBlockDesc &micro_block_desc);
+  int index_builder_append_row(const ObMicroBlockDesc &micro_block_desc, const ObMacroBlock &macro_block);
+  int write_micro_block(ObMicroBlockDesc &micro_block_desc, const bool need_pre_warm);
   int check_micro_block_need_merge(const ObMicroBlock &micro_block, bool &need_merge);
   int merge_micro_block(const ObMicroBlock &micro_block);
-  int flush_macro_block(ObMacroBlock &macro_block);
+  int flush_macro_block(ObMacroBlock &macro_block, const bool is_close_flush);
+  int choose_macro_block_flusher(const bool is_close_flush, ObIMacroBlockFlusher *&final_flusher);
+  int prepare_default_macro_block_flusher(const bool is_close_flush);
+  int post_flush_normal_macro_block(const ObMacroBlock &macro_block,
+                                    const MacroBlockId &macro_block_id);
+  int post_flush_small_sstable_data_macro_block(const ObBlockInfo &block_info);
   int try_active_flush_macro_block();
   int wait_io_finish(ObStorageObjectHandle &macro_handle, ObMacroBlock *macro_block);
+  int wait_io_and_alloc_block();
   int alloc_block();
   int alloc_block_from_device(ObStorageObjectHandle &macro_handle);
   int check_write_complete(const MacroBlockId &macro_block_id);
@@ -254,6 +282,7 @@ private:
   int flush_reuse_macro_block(const ObDataMacroBlockMeta &macro_meta);
   int update_micro_commit_info(const ObDatumRow &row);
   int update_micro_commit_info(const ObBatchDatumRows &datum_rows, const int64_t start, const int64_t write_row_count);
+  int update_cs_row_sql_sequence_info(const ObBatchDatumRows *&datum_rows);
   void dump_micro_block(ObIMicroBlockWriter &micro_writer);
   void dump_macro_block(ObMacroBlock &macro_block);
   int exec_callback(const ObStorageObjectHandle &macro_handle, ObMacroBlock *macro_block);
@@ -262,6 +291,7 @@ private:
   int create_pre_warmer(const share::ObPreWarmerType pre_warmer_type,
                         const share::ObPreWarmerParam &pre_warm_param);
   bool is_for_index() const;
+  bool is_pre_alloc() const;
 public:
   static const int64_t DEFAULT_MACRO_BLOCK_REWRTIE_THRESHOLD = 30;
 private:
@@ -269,13 +299,58 @@ private:
 protected:
   const ObDataStoreDesc *data_store_desc_;
   compaction::ObMergeBlockInfo merge_block_info_;
-private:
   ObIMicroBlockWriter *micro_writer_;
+  ObMacroBlock macro_blocks_[2];
+  int64_t current_index_;
+  volatile bool concurrent_lock_;
+  ObIMacroBlockFlusher *custom_macro_flusher_;
+private:
+  /**
+  * -----------------------------------------------------------------ObDefaultMacroBlockFlusher---------------------------------------------------------------
+  */
+  class ObDefaultMacroBlockFlusher : public ObIMacroBlockFlusher
+  {
+  public:
+    ObDefaultMacroBlockFlusher();
+    virtual ~ObDefaultMacroBlockFlusher();
+    virtual void reset();
+    virtual int write_disk(ObMacroBlock& macro_block, const bool is_close_flush) override;
+    OB_INLINE void set_writer_and_handles(ObMacroBlockWriter &macro_block_writer,
+                                          ObStorageObjectHandle *macro_handle,
+                                          ObIODevice *device_handle)
+    {
+      macro_block_writer_ = &macro_block_writer;
+      macro_handle_ = macro_handle;
+      device_handle_ = device_handle;
+    }
+  protected:
+    ObMacroBlockWriter *macro_block_writer_;
+  private:
+    ObStorageObjectHandle *macro_handle_;
+    ObIODevice *device_handle_;
+  };
+  /**
+  * --------------------------------------------------------------ObSmallSStableMacroBlockFlusher------------------------------------------------------------
+  */
+  class ObSmallSStableMacroBlockFlusher : public ObDefaultMacroBlockFlusher
+  {
+  public:
+    ObSmallSStableMacroBlockFlusher();
+    virtual ~ObSmallSStableMacroBlockFlusher();
+    virtual void reset() override;
+    virtual int write_disk(ObMacroBlock& macro_block, const bool is_close_flush) override;
+    int init(ObMacroBlockWriter &macro_block_writer,
+             ObMacroBlocksWriteCtx &block_write_ctx);
+  private:
+    ObBlockInfo block_info_;
+    ObMacroBlocksWriteCtx *block_write_ctx_;
+    bool is_inited_;
+  };
+private:
+  bool is_curr_block_pre_allocated_;
   ObMicroBlockBloomFilter micro_block_bf_;
   ObMicroBlockReaderHelper reader_helper_;
   ObMicroBlockBufferHelper micro_helper_;
-  ObMacroBlock macro_blocks_[2];
-  int64_t current_index_;
   blocksstable::ObMacroSeqGenerator *macro_seq_generator_; // set by sstable layer;
   int64_t last_micro_size_;
   int64_t last_micro_expand_pct_;
@@ -288,21 +363,24 @@ private:
   bool is_try_full_fill_macro_block_;
   int64_t *curr_micro_column_checksum_;
   compaction::ObLocalArena allocator_;
+  compaction::ObLocalArena index_builder_allocator_;
   compaction::ObLocalArena rowkey_allocator_;
   blocksstable::ObMacroBlockReader macro_reader_;
   common::ObArray<uint32_t> micro_rowkey_hashs_;
   blocksstable::ObDatumRow datum_row_;
+  ObBatchDatumRows datum_rows_;
   ObSkipIndexDataAggregator *data_aggregator_;
   ObIMacroBlockFlushCallback *callback_;
   ObIODevice *device_handle_;
   ObDataIndexBlockBuilder *builder_;
   ObMicroBlockAdaptiveSplitter micro_block_adaptive_splitter_;
   share::ObIPreWarmer *pre_warmer_;
-  ObSSTablePrivateObjectCleaner *object_cleaner_;
+  ObISSTableObjectCleaner *object_cleaner_;
   char *io_buf_;
   ObIMacroBlockValidator *validator_;
-  bool is_cs_encoding_writer_;
-  volatile bool concurrent_lock_;
+  bool can_append_batch_;
+  ObDefaultMacroBlockFlusher default_macro_flusher_;
+  ObSmallSStableMacroBlockFlusher small_sstable_macro_flusher_;
 };
 
 struct ObIMacroBlockValidator

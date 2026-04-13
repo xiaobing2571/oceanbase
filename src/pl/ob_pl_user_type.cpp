@@ -249,7 +249,7 @@ int ObUserDefinedType::deep_copy_obj(
     case PL_VARRAY_TYPE: //fallthrough
 #endif
     case PL_RECORD_TYPE: {
-      OZ (ObPLComposite::copy_element(src, dst, allocator, NULL, NULL, NULL,  need_new_allocator, ignore_del_element));
+      OZ (ObPLComposite::copy_element(src, dst, allocator, true, NULL, NULL, NULL,  need_new_allocator, ignore_del_element));
     }
       break;
 
@@ -790,7 +790,6 @@ int ObUserDefinedType::text_protocol_prefix_info_for_each_item(share::schema::Ob
   if (type.is_collection_type() || type.is_record_type()) {
     const ObUserDefinedType *user_type = NULL;
     const ObUDTTypeInfo *udt_info = NULL;
-    ObArenaAllocator local_allocator;
     const uint64_t tenant_id = get_tenant_id_by_object_id(type.get_user_type_id());
     const_cast<ObPLDataType&>(type).set_charset(get_charset());
 
@@ -895,26 +894,31 @@ int ObUserDefinedType::text_protocol_base_type_convert(const ObPLDataType &type,
   if (OB_FAIL(ObMySQLUtil::get_length(start, orign_str_length, inc_len))) {
     LOG_WARN("get length fail.", K(ret));
   } else {
-    ObArenaAllocator alloc;
-    char* tmp_buf = static_cast<char*>(alloc.alloc(orign_str_length));
-    MEMCPY(tmp_buf, buf + pos + inc_len, orign_str_length);
-    if (type.is_obj_type() && (OB_NOT_NULL(type.get_data_type()))
-          && (type.get_data_type()->get_meta_type().is_string_or_lob_locator_type())) {
-      // need do convert first
-      if (OB_FAIL(observer::ObQueryDriver::convert_string_charset(ObString(orign_str_length, tmp_buf),
-                                                        type.get_data_type()->get_collation_type(),
-                                                        get_charset(),
-                                                        buf + pos,
-                                                        len - pos,
-                                                        convert_length))) {
-        LOG_WARN("convert string charset failed", K(ret));
-      } else {
-        pos += convert_length;
-      }
+    ObArenaAllocator alloc(GET_PL_MOD_STRING(PL_MOD_IDX::OB_PL_TEXT_PROTOCOL_CONVERT), OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    char* tmp_buf = NULL;
+    if (OB_ISNULL(tmp_buf = static_cast<char*>(alloc.alloc(orign_str_length)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("memory allocate failed", K(ret));
     } else {
-      // only remove length info in buf when type is not nchar/nvarchar
-      MEMCPY(buf + pos, tmp_buf, orign_str_length);
-      pos += orign_str_length;
+      MEMCPY(tmp_buf, buf + pos + inc_len, orign_str_length);
+      if (type.is_obj_type() && (OB_NOT_NULL(type.get_data_type()))
+            && (type.get_data_type()->get_meta_type().is_string_or_lob_locator_type())) {
+        // need do convert first
+        if (OB_FAIL(observer::ObQueryDriver::convert_string_charset(ObString(orign_str_length, tmp_buf),
+                                                          type.get_data_type()->get_collation_type(),
+                                                          get_charset(),
+                                                          buf + pos,
+                                                          len - pos,
+                                                          convert_length))) {
+          LOG_WARN("convert string charset failed", K(ret));
+        } else {
+          pos += convert_length;
+        }
+      } else {
+        // only remove length info in buf when type is not nchar/nvarchar
+        MEMCPY(buf + pos, tmp_buf, orign_str_length);
+        pos += orign_str_length;
+      }
     }
   }
   return ret;
@@ -925,7 +929,8 @@ int ObUserDefinedType::base_type_serialize_for_text(ObObj* obj,
                                                     char *dst,
                                                     const int64_t dst_len,
                                                     int64_t &dst_pos,
-                                                    bool &has_serialized) const
+                                                    bool &has_serialized,
+                                                    const sql::ObSQLSessionInfo &session) const
 {
   int ret = OB_SUCCESS;
   has_serialized = true;
@@ -941,13 +946,28 @@ int ObUserDefinedType::base_type_serialize_for_text(ObObj* obj,
     OX (dst_pos += obj->get_string_len() * 2 + 1);
   } else if (obj->is_lob() && NULL != obj->get_string_ptr()) {
     ObString lob_string;
-    OZ (obj->get_string(lob_string));
+    ObObj tmp_obj;
+    OX (tmp_obj = *obj);
+    ObArenaAllocator local_allocator(GET_PL_MOD_STRING(PL_MOD_IDX::OB_PL_ARENA), OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    OZ (observer::ObQueryDriver::process_lob_locator_results(tmp_obj,
+                                                  session.is_client_use_lob_locator(),
+                                                  session.is_client_support_lob_locatorv2(),
+                                                  &local_allocator,
+                                                  &session,
+                                                  NULL));
+    OZ (tmp_obj.get_string(lob_string));
     if (obj->is_blob()) {
       OZ (ObMySQLUtil::store_length(dst, dst_len, lob_string.length() * 2 + 1, dst_pos));
       OZ (to_hex_cstr(lob_string.ptr(), lob_string.length(), dst + dst_pos, dst_len - dst_pos));
       OX (dst_pos += (lob_string.length() * 2 + 1));
     } else {
       CK (obj->is_clob());
+      if (OB_SUCC(ret)) {
+        if (lob_string.length() > dst_len) {
+          ret = OB_SIZE_OVERFLOW;
+          LOG_WARN("buffer length is not enough. ", K(ret), K(lob_string.length()), K(dst_len));
+        }
+      }
       OZ (ObMySQLUtil::store_length(dst, dst_len, lob_string.length(), dst_pos));
       OX (MEMCPY(dst + dst_pos, lob_string.ptr(), lob_string.length()));
       OX (dst_pos += lob_string.length());
@@ -1311,7 +1331,8 @@ int ObRecordType::add_record_member(const ObRecordMember &record)
 int ObRecordType::add_record_member(const ObString &record_name,
                                     const ObPLDataType &record_type,
                                     int64_t default_idx,
-                                    sql::ObRawExpr *default_raw_expr)
+                                    sql::ObRawExpr *default_raw_expr,
+                                    bool need_check_dup)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(record_members_.count() >= MAX_RECORD_COUNT)) {
@@ -1321,7 +1342,7 @@ int ObRecordType::add_record_member(const ObString &record_name,
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("record member with not null modifier must hava default value", K(ret));
   } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < record_members_.count(); ++i) {
+    for (int64_t i = 0; OB_SUCC(ret) && need_check_dup && i < record_members_.count(); ++i) {
       if (common::ObCharset::case_compat_mode_equal(
         record_members_.at(i).member_name_, record_name)) {
         ret = OB_ENTRY_EXIST;
@@ -1350,14 +1371,6 @@ int ObRecordType::add_record_member(ObPLEnumSetCtx &enum_set_ctx,
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("record member with not null modifier must hava default value", K(ret));
   } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < record_members_.count(); ++i) {
-      if (common::ObCharset::case_compat_mode_equal(
-        record_members_.at(i).member_name_, record_name)) {
-        ret = OB_ENTRY_EXIST;
-        LOG_WARN("dup record member found", K(ret), K(record_name), K(i));
-        break;
-      }
-    }
     ObPLDataType member_type;
     OZ (member_type.deep_copy(enum_set_ctx, record_type));
     OZ (record_members_.push_back(ObRecordMember(
@@ -1427,18 +1440,33 @@ const ObRecordMember *ObRecordType::get_record_member(int64_t index) const
   return record_member;
 }
 
+int ObRecordType::check_record_cursor_member() const
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < get_record_member_count(); ++i) {
+    if (get_record_member_type(i)->is_cursor_type()) {
+      ret = OB_ERR_INVALID_NESTED_CURSOR;
+      LOG_WARN("Cursor Variable in record, object, or collection is not supported by this release ", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObRecordType::is_compatble(const ObRecordType &other, bool &is_comp) const
 {
   int ret = OB_SUCCESS;
   is_comp = true;
   if (get_record_member_count() != other.get_record_member_count()) {
     is_comp = false;
+    LOG_TRACE("record type is not compatible",
+              K(get_record_member_count()), K(other.get_record_member_count()));
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && is_comp && i < get_record_member_count(); ++i) {
       const ObPLDataType *left = get_record_member_type(i);
       const ObPLDataType *right = other.get_record_member_type(i);
       CK (OB_NOT_NULL(left));
       CK (OB_NOT_NULL(right));
+      LOG_TRACE("check record member type", K(i), KPC(left), KPC(right));
       if (OB_SUCC(ret)) {
         if (left->is_obj_type() && right->is_obj_type()) {
           CK (OB_NOT_NULL(left->get_data_type()));
@@ -1447,6 +1475,8 @@ int ObRecordType::is_compatble(const ObRecordType &other, bool &is_comp) const
                                       left->get_data_type()->get_collation_type(),
                                       right->get_data_type()->get_obj_type(),
                                       right->get_data_type()->get_collation_type()));
+          LOG_TRACE("check obj type cast support",
+                    K(i), K(is_comp), KPC(left->get_data_type()), KPC(right->get_data_type()));
         } else if ((!left->is_obj_type() ||
                     (left->get_data_type() != NULL && left->get_data_type()->get_meta_type().is_ext()))
                       &&
@@ -1458,6 +1488,7 @@ int ObRecordType::is_compatble(const ObRecordType &other, bool &is_comp) const
                                                                     : right->get_data_type()->get_udt_id();
           if (left_udt_id != right_udt_id) {
             is_comp = false;
+            LOG_TRACE("record type is not compatible", K(i), K(left_udt_id), K(right_udt_id));
           }
         } else {
           is_comp = false;
@@ -1767,15 +1798,13 @@ int ObRecordType::generate_default_value(ObPLCodeGenerator &generator,
       OZ (generator.get_helper().get_int8(false, notnull_value));
       OZ (generator.extract_notnull_ptr_from_record(value, i, notnull_ptr));
       OZ (generator.get_helper().create_store(notnull_value, notnull_ptr));
-      OZ (generator.extract_meta_ptr_from_record(value, get_record_member_count(), i, meta_ptr));
-      OZ (generator.store_data_type(meta, meta_ptr));
+      OZ (generator.store_datatype_of_record(meta, get_record_member_count() + RECORD_META_OFFSET + i, value));
     }
-
-    OZ (buffer_guard.get_objparam_buffer(result));
 
     //设置数据
     if (OB_SUCC(ret)) {
       if (OB_INVALID_INDEX != member->get_default()) {
+        OZ (buffer_guard.get_objparam_buffer(result));
         if (OB_NOT_NULL(member->get_default_expr())) {
           OZ (generator.generate_expr(member->get_default(), *stmt, result_idx, result));
         } else {
@@ -2202,7 +2231,7 @@ int ObRecordType::serialize(share::schema::ObSchemaGetterGuard &schema_guard,
       } else {
         int64_t offset_dst_pos = dst_pos;
         bool has_serialized = false;
-        if (TEXT == protocl_type && OB_FAIL(base_type_serialize_for_text(obj, tz_info, dst, dst_len, dst_pos, has_serialized))) {
+        if (TEXT == protocl_type && OB_FAIL(base_type_serialize_for_text(obj, tz_info, dst, dst_len, dst_pos, has_serialized, session))) {
           LOG_WARN("serialize for text fail.", K(ret), K(has_serialized));
         } else if (false == has_serialized) {
           OZ (type->serialize(schema_guard, session, tz_info, protocl_type, new_src, dst, dst_len, dst_pos),
@@ -2471,6 +2500,30 @@ int ObOpaqueType::generate_assign_with_null(ObPLCodeGenerator &generator,
                                          args,
                                          ret_err));
   OZ (generator.check_success(ret_err));
+  return ret;
+}
+
+int ObOpaqueType::convert(ObPLResolveCtx &ctx, ObObj *&src, ObObj *&dst) const
+{
+  int ret = OB_SUCCESS;
+  CK (OB_NOT_NULL(src));
+  CK (OB_NOT_NULL(dst));
+  if (OB_FAIL(ret)) {
+  } else if (src->is_null() || src->get_ext() == 0) {
+    dst->set_null();
+  } else {
+    ObPLOpaque *src_opaque = NULL;
+    CK (src->is_ext());
+    OX (src_opaque = reinterpret_cast<ObPLOpaque *>(src->get_ext()));
+    if (OB_FAIL(ret)) {
+    } else if (src_opaque->get_type() == ObPLOpaque::get_type(get_user_type_id())) {
+      OZ (ObUserDefinedType::deep_copy_obj(ctx.allocator_, *src, *dst));
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN_RET(OB_NOT_SUPPORTED, "failed to convert to different opaque type");
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "convert to different opaque type");
+    }
+  }
   return ret;
 }
 
@@ -3032,7 +3085,8 @@ int ObCollectionType::init_obj(ObSchemaGetterGuard &schema_guard,
   } else {
     MEMSET(data, 0, init_size);
     if (is_varray_type()) {
-      new (data) ObPLVArray(get_user_type_id());
+      ObPLVArray *varray = new (data) ObPLVArray(get_user_type_id());
+      OX (varray->set_capacity(static_cast<const ObVArrayType *>(this)->get_capacity()));
     } else if (is_associative_array_type()) {
       new (data) ObPLAssocArray(get_user_type_id());
     } else {
@@ -3134,7 +3188,7 @@ int ObCollectionType::serialize(share::schema::ObSchemaGetterGuard &schema_guard
       } else {
         int64_t offset_dst_pos = dst_pos;
         bool has_serialized = false;
-        if (TEXT == type && OB_FAIL(base_type_serialize_for_text(obj, tz_info, dst, dst_len, dst_pos, has_serialized))) {
+        if (TEXT == type && OB_FAIL(base_type_serialize_for_text(obj, tz_info, dst, dst_len, dst_pos, has_serialized, session))) {
           LOG_WARN("serialize for text fail.", K(ret), K(has_serialized));
         } else if (false == has_serialized) {
           OZ (element_type_.serialize(schema_guard, session, tz_info, type, data, dst, dst_len, dst_pos), KPC(this), K(i));
@@ -3158,6 +3212,20 @@ int ObCollectionType::serialize(share::schema::ObSchemaGetterGuard &schema_guard
       src += sizeof(ObObj);
     }
   }
+  return ret;
+}
+
+int ObCollectionType::convert_anonymous_array(ObPLResolveCtx &ctx,
+                                              ObObj *&src,
+                                              ObObj *&dest) const
+{
+  int ret = OB_SUCCESS;
+  ObPLCollection *dest_collection = NULL;
+  ObPLCollection *src_collection = NULL;
+  CK (src->is_ext() && dest->is_ext());
+  CK (OB_NOT_NULL(src_collection = reinterpret_cast<ObPLCollection *>(src->get_ext())));
+  CK (OB_NOT_NULL(dest_collection = reinterpret_cast<ObPLCollection *>(dest->get_ext())));
+  OZ (ObCollectionType::convert(ctx, src, dest));
   return ret;
 }
 
@@ -3321,6 +3389,10 @@ int ObCollectionType::convert(ObPLResolveCtx &ctx, ObObj *&src, ObObj *&dst) con
   int64_t element_init_size = 0;
   ObPLAllocator1 *collection_allocator = NULL;
   char *table_data = NULL;
+  int64_t processed_count = 0;
+  bool is_assoc_array = PL_ASSOCIATIVE_ARRAY_TYPE == this->get_type();
+  ObArray<int64_t> valid_index_array;
+  int64_t valid_element_count = 0;
 
   CK (OB_NOT_NULL(src));
   CK (OB_NOT_NULL(dst));
@@ -3343,11 +3415,23 @@ int ObCollectionType::convert(ObPLResolveCtx &ctx, ObObj *&src, ObObj *&dst) con
     OZ (element_type_.get_size(PL_TYPE_INIT_SIZE, element_init_size));
     OX (collection_allocator = dynamic_cast<ObPLAllocator1 *>(dst_table->get_allocator()));
     CK (OB_NOT_NULL(collection_allocator));
+    OX (valid_element_count = src_table->get_count());
+
+    if (is_assoc_array) {
+      OX (valid_index_array.reserve(src_table->get_count()));
+      for (int64_t i = 0; i < src_table->get_count(); i++) {
+        ObObj *src_table_pos = reinterpret_cast<ObObj*>(src_table->get_data()) + i;
+        if (!src_table_pos->is_invalid_type()) {
+          valid_index_array.push_back(i);
+        }
+      }
+      OX (valid_element_count = valid_index_array.count());
+    }
 
     if (OB_SUCC(ret) && src_table->get_count() > 0
       && OB_ISNULL(table_data
         = static_cast<char *>(
-            collection_allocator->alloc(element_init_size * src_table->get_count())))) {
+            collection_allocator->alloc(element_init_size * valid_element_count)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to alloc table data", K(ret));
     }
@@ -3358,29 +3442,41 @@ int ObCollectionType::convert(ObPLResolveCtx &ctx, ObObj *&src, ObObj *&dst) con
                                   ctx.package_guard_,
                                   ctx.sql_proxy_,
                                   false);
-      for (int64_t i = 0; OB_SUCC(ret) && i < src_table->get_count(); i++) {
-        ObObj *src_table_pos = reinterpret_cast<ObObj*>(src_table->get_data()) + i;
-        ObObj *dst_table_pos = reinterpret_cast<ObObj*>(table_data) + i;
-        if (src_table_pos->is_invalid_type()) {
-          OX (dst_table_pos->set_type(ObMaxType));
-        } else {
+      if (is_assoc_array) {
+        for (int64_t i = 0; OB_SUCC(ret) && i < valid_index_array.count(); i++) {
+          int64_t index = valid_index_array.at(i);
+          ObObj *src_table_pos = reinterpret_cast<ObObj*>(src_table->get_data()) + index;
+          ObObj *dst_table_pos = reinterpret_cast<ObObj*>(table_data) + i;
           OX (new (dst_table_pos)ObObj());
           OZ (element_type_.convert(resolve_ctx, src_table_pos, dst_table_pos));
+          OX (processed_count++);
+        }
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < src_table->get_count(); i++) {
+          ObObj *src_table_pos = reinterpret_cast<ObObj*>(src_table->get_data()) + i;
+          ObObj *dst_table_pos = reinterpret_cast<ObObj*>(table_data) + i;
+          if (src_table_pos->is_invalid_type()) {
+            OX (dst_table_pos->set_type(ObMaxType));
+          } else {
+            OX (new (dst_table_pos)ObObj());
+            OZ (element_type_.convert(resolve_ctx, src_table_pos, dst_table_pos));
+          }
+          OX (processed_count++);
         }
       }
     }
     if (OB_SUCC(ret)) {
-      dst_table->set_type(src_table->get_type());
+      dst_table->set_type(this->get_type());
       dst_table->set_allocator(collection_allocator);
-      dst_table->set_count(src_table->get_count());
-      if (src_table->get_count() > 0) {
+      dst_table->set_count(valid_element_count);
+      if (valid_element_count > 0) {
         dst_table->set_first(1);
-        dst_table->set_last(src_table->get_count());
+        dst_table->set_last(valid_element_count);
       } else {
         dst_table->set_first(OB_INVALID_INDEX);
         dst_table->set_last(OB_INVALID_INDEX);
       }
-      dst_table->set_data(reinterpret_cast<ObObj*>(table_data), src_table->get_count());
+      dst_table->set_data(reinterpret_cast<ObObj*>(table_data), valid_element_count);
 
       ObElemDesc elem_desc;
       elem_desc.set_pl_type(element_type_.get_type());
@@ -3396,6 +3492,16 @@ int ObCollectionType::convert(ObPLResolveCtx &ctx, ObObj *&src, ObObj *&dst) con
         elem_desc.set_field_count(1);
       }
       OX (dst_table->set_element_desc(elem_desc));
+    } else if (OB_NOT_NULL(collection_allocator) && OB_NOT_NULL(table_data)) { // Memory cleanup in case of error
+      for (int64_t i = 0; i < processed_count; i++) {
+        ObObj *dst_table_pos = reinterpret_cast<ObObj*>(table_data) + i;
+        int tmp_ret = ObUserDefinedType::destruct_objparam(*collection_allocator, *dst_table_pos, NULL, true);
+        if (OB_SUCCESS != tmp_ret) {
+          LOG_WARN("failed to destruct objparam", K(tmp_ret));
+        }
+      }
+      collection_allocator->free(table_data);
+      table_data = NULL;
     }
   }
   return ret;
@@ -3608,10 +3714,36 @@ int ObVArrayType::init_session_var(const ObPLResolveCtx &resolve_ctx,
 
 int ObVArrayType::convert(ObPLResolveCtx &ctx, ObObj *&src, ObObj *&dst) const
 {
-  UNUSEDx(ctx, src, dst);
-  LOG_WARN_RET(OB_NOT_SUPPORTED, "failed to convert to varray type");
-  LOG_USER_ERROR(OB_NOT_SUPPORTED, "convert to varray");
-  return OB_NOT_SUPPORTED;
+  int ret = OB_SUCCESS;
+  CK (OB_NOT_NULL(src));
+  CK (OB_NOT_NULL(dst));
+  if (OB_FAIL(ret)) {
+  } else if (src->is_null() || src->get_ext() == 0) {
+    dst->set_null();
+  } else {
+    ObPLComposite *src_composite = NULL;
+    CK (src->is_ext());
+    OX (src_composite = reinterpret_cast<ObPLComposite *>(src->get_ext()));
+    if (OB_FAIL(ret)) {
+    } else if (src_composite->get_id() == get_user_type_id()) {
+      OZ (ObUserDefinedType::deep_copy_obj(ctx.allocator_, *src, *dst));
+    } else if (is_mocked_anonymous_array_id(src_composite->get_id())) {
+      ObPLNestedTable *src_table = NULL;
+      CK (OB_NOT_NULL(src_table = reinterpret_cast<ObPLNestedTable *>(src->get_ext())));
+      if (OB_SUCC(ret) && src_table->get_count() <= this->get_capacity()) {
+        OZ (convert_anonymous_array(ctx, src, dst));
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN_RET(OB_NOT_SUPPORTED, "failed to convert to different varray type");
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "convert to different varray");
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN_RET(OB_NOT_SUPPORTED, "failed to convert to different varray type");
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "convert to different varray");
+    }
+  }
+  return ret;
 }
 
 //---------- for ObAssocArrayType ----------
@@ -3759,10 +3891,31 @@ int ObAssocArrayType::deserialize(
 
 int ObAssocArrayType::convert(ObPLResolveCtx &ctx, ObObj *&src, ObObj *&dst) const
 {
-  UNUSEDx(ctx, src, dst);
-  LOG_WARN_RET(OB_NOT_SUPPORTED, "failed to convert to assoc array type");
-  LOG_USER_ERROR(OB_NOT_SUPPORTED, "convert to associtive array");
-  return OB_NOT_SUPPORTED;
+  int ret = OB_SUCCESS;
+  CK (OB_NOT_NULL(src));
+  CK (OB_NOT_NULL(dst));
+  if (OB_FAIL(ret)) {
+  } else if (src->is_null() || src->get_ext() == 0) {
+    dst->set_null();
+  } else {
+    ObPLComposite *src_composite = NULL;
+    const ObPLDataType &index_type = get_index_type();
+    CK (src->is_ext());
+    OX (src_composite = reinterpret_cast<ObPLComposite *>(src->get_ext()));
+    if (OB_FAIL(ret)) {
+    } else if (src_composite->get_id() == get_user_type_id()) {
+      OZ (ObUserDefinedType::deep_copy_obj(ctx.allocator_, *src, *dst));
+    } else if (is_mocked_anonymous_array_id(src_composite->get_id())
+               && OB_NOT_NULL(index_type.get_meta_type())
+               && !index_type.get_meta_type()->is_character_type()) {
+      OZ (convert_anonymous_array(ctx, src, dst));
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN_RET(OB_NOT_SUPPORTED, "failed to convert to different varray type");
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "convert to different varray");
+    }
+  }
+  return ret;
 }
 #endif
 
@@ -3777,6 +3930,7 @@ int ObPLComposite::deep_copy(ObPLComposite &src,
                              bool ignore_del_element)
 {
   int ret = OB_SUCCESS;
+  bool need_convert_basic_type = true;
 
 #ifdef OB_BUILD_ORACLE_PL
 #define COPY_COLLECTION(TYPE) \
@@ -3791,16 +3945,19 @@ int ObPLComposite::deep_copy(ObPLComposite &src,
         } else {                                                          \
           TYPE *collection = static_cast<TYPE*>(dest);                    \
           CK (OB_NOT_NULL(collection));                                   \
-          LOG_INFO("src is: ", KP(&src), K(src), KP(dest), K(src.get_init_size()));                                   \
           OX (new(collection)TYPE(src.get_id()));                         \
           OZ (collection->init_allocator(allocator, need_new_allocator));  \
           OX (keep_collectin_attr = false);  \
+          OX (need_convert_basic_type = false); \
           if (OB_FAIL(ret) && OB_NOT_NULL(dest)) {  \
             allocator.free(dest);   \
           }   \
         }                   \
       } else { \
         CK (OB_NOT_NULL(dest->get_allocator())); \
+        if (OB_SUCC(ret) && src.get_id() == dest->get_id()) { \
+          OX (need_convert_basic_type = false); \
+        } \
       } \
       OX (collection = static_cast<TYPE*>(dest)); \
       if (OB_SUCC(ret)) { \
@@ -3809,7 +3966,7 @@ int ObPLComposite::deep_copy(ObPLComposite &src,
         OZ (ObUserDefinedType::destruct_obj(destruct_obj, session, true)); \
       } \
       if (OB_FAIL(ret)) {    \
-      } else if (OB_FAIL(collection->deep_copy(static_cast<TYPE*>(&src), NULL, ignore_del_element))) { \
+      } else if (OB_FAIL(collection->deep_copy(static_cast<TYPE*>(&src), NULL, need_convert_basic_type, ignore_del_element))) { \
         ObObj destruct_obj; \
         int tmp = OB_SUCCESS; \
         destruct_obj.set_extend(reinterpret_cast<int64_t>(collection), collection->get_type()); \
@@ -3838,14 +3995,18 @@ int ObPLComposite::deep_copy(ObPLComposite &src,
       OX (new(composite)ObPLRecord(src.get_id(), static_cast<ObPLRecord&>(src).get_count()));
       OZ (composite->init_data(allocator, need_new_allocator));
       OX (need_free = true);
+      OX (need_convert_basic_type = false);
       if (OB_FAIL(ret) && OB_NOT_NULL(composite)) {
         allocator.free(composite);
       }
     } else {
       OX (composite = static_cast<ObPLRecord*>(dest));
+      if (OB_SUCC(ret) && src.get_id() == dest->get_id()) {
+        OX (need_convert_basic_type = false);
+      }
     }
     if (OB_SUCC(ret)) {
-      OZ (composite->deep_copy(static_cast<ObPLRecord&>(src), allocator, ns, session, ignore_del_element));
+      OZ (composite->deep_copy(static_cast<ObPLRecord&>(src), allocator, need_convert_basic_type, ns, session, ignore_del_element));
       if (OB_FAIL(ret) && need_free) {
         ObObj destruct_obj;
         int tmp = OB_SUCCESS;
@@ -3868,16 +4029,19 @@ int ObPLComposite::deep_copy(ObPLComposite &src,
       } else {
         ObPLNestedTable *collection = static_cast<ObPLNestedTable*>(dest);
         CK (OB_NOT_NULL(collection));
-        LOG_INFO("src is: ", KP(&src), K(src), KP(dest), K(src.get_init_size()));
         OX (new(collection)ObPLNestedTable(src.get_id()));
         OZ (collection->init_allocator(allocator, need_new_allocator));
         OX (keep_collectin_attr = false);
+        OX (need_convert_basic_type = false);
         if (OB_FAIL(ret) && OB_NOT_NULL(dest)) {
           allocator.free(dest);
         }
       }
     } else {
       CK (OB_NOT_NULL(dest->get_allocator()));
+      if (OB_SUCC(ret) && src.get_id() == dest->get_id()) {
+        OX (need_convert_basic_type = false);
+      }
     }
     OX (collection = static_cast<ObPLNestedTable*>(dest));
     if (OB_SUCC(ret)) {
@@ -3886,7 +4050,7 @@ int ObPLComposite::deep_copy(ObPLComposite &src,
       OZ (ObUserDefinedType::destruct_obj(destruct_obj, session, true));
     }
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(collection->deep_copy(static_cast<ObPLNestedTable*>(&src), NULL, ignore_del_element))) {
+    } else if (OB_FAIL(collection->deep_copy(static_cast<ObPLNestedTable*>(&src), NULL, need_convert_basic_type, ignore_del_element))) {
       ObObj destruct_obj;
       int tmp = OB_SUCCESS;
       destruct_obj.set_extend(reinterpret_cast<int64_t>(collection), collection->get_type());
@@ -3939,6 +4103,7 @@ int ObPLComposite::assign_element(ObObj &src, ObObj &dest, ObIAllocator &allocat
 int ObPLComposite::copy_element(const ObObj &src,
                                 ObObj &dest,
                                 ObIAllocator &allocator,
+                                bool need_convert_basic_type,
                                 const ObPLINS *ns,
                                 sql::ObSQLSessionInfo *session,
                                 const ObDataType *dest_type,
@@ -3993,12 +4158,15 @@ int ObPLComposite::copy_element(const ObObj &src,
     OX (result_type.set_meta(dest_type->get_meta_type()));
     OX (result_type.set_accuracy(dest_type->get_accuracy()));
     OX (src_tmp = src);
-    OZ (ObSPIService::spi_convert(*session, tmp_allocator, src_tmp, result_type, result));
+    if (need_convert_basic_type) {
+      OZ (ObSPIService::spi_convert(*session, tmp_allocator, src_tmp, result_type, result));
+    } else {
+      OX (result = src_tmp);
+    }
     OZ (ObUserDefinedType::destruct_objparam(allocator, dest));
     OZ (deep_copy_obj(allocator, result, dest));
   } else {
     if (src.is_null() && 0 != src.get_unknown()) {
-      LOG_INFO("here maybe a bug", K(src), K(&src), K(src.get_unknown()));
     }
     OZ (ObUserDefinedType::destruct_objparam(allocator, dest));
     OZ (deep_copy_obj(allocator, src, dest));
@@ -4242,6 +4410,7 @@ int ObPLRecord::assign(ObPLRecord *src, ObIAllocator *allocator)
 
 int ObPLRecord::deep_copy(ObPLRecord &src,
                           ObIAllocator &allocator,
+                          bool need_convert_basic_type,
                           const ObPLINS *ns,
                           sql::ObSQLSessionInfo *session,
                           bool ignore_del_element)
@@ -4281,6 +4450,7 @@ int ObPLRecord::deep_copy(ObPLRecord &src,
       OZ (ObPLComposite::copy_element(src_element,
                                       *dest_element,
                                       *get_allocator(),
+                                      need_convert_basic_type,
                                       ns,
                                       session,
                                       NULL == elem_type ? NULL : elem_type->get_data_type(),
@@ -4396,7 +4566,10 @@ int ObPLCollection::init_allocator(common::ObIAllocator &allocator, bool need_ne
  * 3、如果data域是record，那么该record本身的内存同样由Collection自己的allocator分配；record里的基础数据类型的内存同样由Collection自己的allocator分配；
  * 4、如果data域里是子Collection，那么该子Collection数据结构本身由父Collection的allocator分配，子Collection的内存管理递归遵循此约定。
  * */
-int ObPLCollection::deep_copy(ObPLCollection *src, ObIAllocator *allocator, bool ignore_del_element)
+int ObPLCollection::deep_copy(ObPLCollection *src,
+                              ObIAllocator *allocator,
+                              bool need_convert_basic_type,
+                              bool ignore_del_element)
 {
   int ret = OB_SUCCESS;
   /*
@@ -4439,6 +4612,7 @@ int ObPLCollection::deep_copy(ObPLCollection *src, ObIAllocator *allocator, bool
             OZ (ObPLComposite::copy_element(old_obj,
                                             new_objs[k],
                                             *coll_allocator,
+                                            need_convert_basic_type,
                                             NULL, /*ns*/
                                             NULL, /*session*/
                                             NULL, /*dest_type*/
@@ -5292,14 +5466,14 @@ int ObPLAssocArray::exist(int64_t idx, ObObj &result)
   return ret;
 }
 
-int ObPLAssocArray::deep_copy(ObPLCollection *src, ObIAllocator *allocator, bool ignore_del_element)
+int ObPLAssocArray::deep_copy(ObPLCollection *src, ObIAllocator *allocator, bool need_convert_basic_type, bool ignore_del_element)
 {
   int ret = OB_SUCCESS;
   ObObj *key = NULL;
   int64_t *sort = NULL;
   CK (OB_NOT_NULL(src));
   CK (src->is_associative_array());
-  OZ (ObPLCollection::deep_copy(src, allocator, ignore_del_element));
+  OZ (ObPLCollection::deep_copy(src, allocator, need_convert_basic_type, ignore_del_element));
   if (OB_SUCC(ret) && src->get_inner_capacity() > 0) {
     ObPLAssocArray *src_aa = static_cast<ObPLAssocArray*>(src);
     CK (OB_NOT_NULL(src_aa));
@@ -5739,13 +5913,13 @@ int ObPLAssocArray::reserve_assoc_key()
 
 //---------- for ObPLVarray ----------
 
-int ObPLVArray::deep_copy(ObPLCollection *src, ObIAllocator *allocator, bool ignore_del_element)
+int ObPLVArray::deep_copy(ObPLCollection *src, ObIAllocator *allocator, bool need_convert_basic_type, bool ignore_del_element)
 {
   int ret = OB_SUCCESS;
   ObPLVArray *src_va = NULL;
   CK (OB_NOT_NULL(src));
   CK (src->is_varray());
-  OZ (ObPLCollection::deep_copy(src, allocator, ignore_del_element));
+  OZ (ObPLCollection::deep_copy(src, allocator, need_convert_basic_type, ignore_del_element));
   CK (OB_NOT_NULL(src_va = static_cast<ObPLVArray*>(src)));
   OX (set_capacity(src_va->get_capacity()));
   return ret;

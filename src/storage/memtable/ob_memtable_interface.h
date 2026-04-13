@@ -66,7 +66,6 @@ public:
   virtual void set_trans_ctx(transaction::ObPartTransCtx *ctx) = 0;
   virtual void inc_truncate_cnt() = 0;
   virtual uint64_t get_tenant_id() const = 0;
-  virtual int get_conflict_trans_ids(common::ObIArray<transaction::ObTransIDAndAddr> &array) = 0;
   VIRTUAL_TO_STRING_KV("", "");
 public:
   // return OB_AGAIN/OB_SUCCESS
@@ -85,6 +84,7 @@ struct CreateMemtableArg {
   bool for_replay_;
   bool for_inc_direct_load_;
   bool is_delete_insert_;
+  int64_t micro_block_format_version_;
 
   CreateMemtableArg() { reset(); }
 
@@ -95,6 +95,7 @@ struct CreateMemtableArg {
     for_replay_ = false;
     for_inc_direct_load_ = false;
     is_delete_insert_ = false;
+    micro_block_format_version_ = ObMicroBlockFormatVersionHelper::DEFAULT_VERSION;
   }
 
   TO_STRING_KV(K(schema_version_),
@@ -102,7 +103,8 @@ struct CreateMemtableArg {
                K(new_clog_checkpoint_scn_),
                K(for_replay_),
                K(for_inc_direct_load_),
-               K(is_delete_insert_));
+               K(is_delete_insert_),
+               K(micro_block_format_version_));
 };
 
 class ObIMemtable : public storage::ObITable {

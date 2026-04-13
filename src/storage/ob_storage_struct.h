@@ -48,6 +48,7 @@ namespace storage
 {
 class ObStorageSchema;
 struct ObMigrationTabletParam;
+class ObSSTransferSrcTabletBlockInfo;
 
 typedef common::ObSEArray<common::ObStoreRowkey, common::OB_DEFAULT_MULTI_GET_ROWKEY_NUM> GetRowkeyArray;
 typedef common::ObSEArray<common::ObStoreRange, common::OB_DEFAULT_MULTI_GET_ROWKEY_NUM> ScanRangeArray;
@@ -303,6 +304,36 @@ struct ObGetMergeTablesParam
 
 struct ObGetMergeTablesResult
 {
+  struct FillTxInfo {
+  public:
+    FillTxInfo() : type_(compaction::FILL_TX_TYPE_NORMAL), fill_tx_scn_() {}
+
+    void reset()
+    {
+      type_ = compaction::FILL_TX_TYPE_NORMAL;
+      fill_tx_scn_.reset();
+    }
+    bool is_valid() const {
+      return is_normal() || (!is_normal() && fill_tx_scn_.is_valid_and_not_min());
+    }
+    void set_special_fill_tx_type(const compaction::ObFillTxType type, const share::SCN &fill_tx_scn)
+    {
+      type_ = type;
+      fill_tx_scn_ = fill_tx_scn;
+    }
+    bool is_normal() const { return type_ == compaction::FILL_TX_TYPE_NORMAL; }
+    bool is_data_mini() const { return type_ == compaction::FILL_TX_TYPE_DATA_MINI; }
+    bool is_data_minor() const { return type_ == compaction::FILL_TX_TYPE_DATA_MINOR; }
+    bool is_gc_tx_data() const { return type_ == compaction::FILL_TX_TYPE_GC_TX_DATA; }
+    bool is_backfill() const { return type_ == compaction::FILL_TX_TYPE_BACKFILL; }
+
+    TO_STRING_KV("type", compaction::FillTxTypeToStr(type_), K(fill_tx_scn_));
+
+  public:
+    compaction::ObFillTxType type_;
+    share::SCN fill_tx_scn_;
+  } fill_tx_info_;
+
   common::ObVersionRange version_range_;
   ObTablesHandleArray handle_;
   int64_t merge_version_;
@@ -312,10 +343,7 @@ struct ObGetMergeTablesResult
   share::ObScnRange scn_range_;
   share::ObDiagnoseLocation *error_location_;
   ObStorageSnapshotInfo snapshot_info_;
-  //for backfill
-  bool is_backfill_;
-  share::SCN backfill_scn_;
-  int64_t transfer_seq_; // is_used for write_macro_block in ss, used for all compaction.
+  int32_t private_transfer_epoch_; // is_used for write_macro_block in ss, used for all compaction.
 
   // for sstorage
   share::SCN rec_scn_;
@@ -328,8 +356,20 @@ struct ObGetMergeTablesResult
   int assign(const ObGetMergeTablesResult &src);
   int copy_basic_info(const ObGetMergeTablesResult &src);
   share::SCN get_merge_scn() const;
-  TO_STRING_KV(K_(version_range), K_(scn_range), K_(merge_version), K_(is_simplified),
-      K_(handle), K_(update_tablet_directly), K_(schedule_major), K_(is_backfill), K_(backfill_scn), K_(transfer_seq));
+  bool is_data_mini() const { return fill_tx_info_.is_data_mini(); }
+  bool is_data_minor() const { return fill_tx_info_.is_data_minor(); }
+  bool is_gc_tx_data() const { return fill_tx_info_.is_gc_tx_data(); }
+  bool is_backfill() const { return fill_tx_info_.is_backfill(); }
+
+  TO_STRING_KV(K_(fill_tx_info),
+               K_(version_range),
+               K_(scn_range),
+               K_(merge_version),
+               K_(is_simplified),
+               K_(handle),
+               K_(update_tablet_directly),
+               K_(schedule_major),
+               K_(private_transfer_epoch));
 };
 
 OB_INLINE bool is_valid_migrate_status(const ObMigrateStatus &status)
@@ -371,20 +411,18 @@ public:
   ObHATableStoreParam();
   ObHATableStoreParam(
     const int64_t transfer_seq,
-    const bool need_check_sstable,
-    const bool need_check_transfer_seq);
-  ObHATableStoreParam(
-    const int64_t transfer_seq,
-    const bool need_check_sstable,
     const bool need_check_transfer_seq,
-    const bool need_replace_remote_sstable,
-    const bool is_only_replace_major);
+    const bool need_replace_remote_sstable = false,
+    const bool is_only_replace_major = false);
   ~ObHATableStoreParam() = default;
   bool is_valid() const;
-  TO_STRING_KV(K_(transfer_seq), K_(need_check_sstable), K_(need_check_transfer_seq), K_(need_replace_remote_sstable), K_(is_only_replace_major));
+  TO_STRING_KV(K_(transfer_seq), K_(need_check_transfer_seq), K_(need_replace_remote_sstable), K_(is_only_replace_major));
 public:
+  /// NOTE: transfer_seq_ here to be used for
+  /// validation only and doesn't affect the private data's storage path.
+  /// DON'T USE IT to generate private data's storage path in SS mode.
+  /// For more detail please see:
   int64_t transfer_seq_;
-  bool need_check_sstable_;
   bool need_check_transfer_seq_;
   bool need_replace_remote_sstable_; // only true for restore replace sstable.
   bool is_only_replace_major_;
@@ -398,20 +436,20 @@ public:
     const compaction::ObMergeType merge_type,
     const share::SCN clog_checkpoint_scn,
     const bool need_report,
-    const bool has_truncate_info);
+    const bool has_merged_with_mds_info);
   ~ObCompactionTableStoreParam() = default;
   bool is_valid() const;
   bool is_valid_with_sstable(const bool have_sstable) const;
   int assign(const ObCompactionTableStoreParam &other, ObArenaAllocator *allocator = nullptr);
   int64_t get_report_scn() const;
   TO_STRING_KV(K_(clog_checkpoint_scn), K_(need_report),
-    "merge_type", merge_type_to_str(merge_type_),  K_(major_ckm_info), K_(has_truncate_info));
+    "merge_type", merge_type_to_str(merge_type_),  K_(major_ckm_info), K_(has_merged_with_mds_info));
 public:
   compaction::ObMergeType merge_type_;
   share::SCN clog_checkpoint_scn_;
   blocksstable::ObMajorChecksumInfo major_ckm_info_;
   bool need_report_;
-  bool has_truncate_info_;
+  bool has_merged_with_mds_info_;
 };
 
 struct UpdateUpperTransParam final
@@ -428,11 +466,12 @@ public:
   UpdateUpperTransParam();
   ~UpdateUpperTransParam();
   void reset();
-  TO_STRING_KV(K_(new_upper_trans), K_(last_minor_end_scn), KPC_(ss_new_upper_trans));
+  TO_STRING_KV(K_(new_upper_trans), K_(last_minor_end_scn), KPC_(ss_new_upper_trans), K_(gc_inc_major_ddl_scns));
 public:
   ObIArray<int64_t> *new_upper_trans_;
   share::SCN last_minor_end_scn_;
   ObIArray<SCNAndVersion> *ss_new_upper_trans_;
+  ObIArray<int64_t> *gc_inc_major_ddl_scns_; // record the end scn of inc major ddl sstables which should be recycled
 };
 
 struct ObUpdateTableStoreParam
@@ -444,7 +483,8 @@ struct ObUpdateTableStoreParam
     const ObStorageSchema *storage_schema,
     const int64_t rebuild_seq,
     const blocksstable::ObSSTable *sstable = NULL,
-    const bool allow_duplicate_sstable = false);
+    const bool allow_duplicate_sstable = false,
+    const bool need_wait_check_flag = true);
   ObUpdateTableStoreParam(
     const int64_t snapshot_version,
     const int64_t multi_version_start,
@@ -455,16 +495,18 @@ struct ObUpdateTableStoreParam
     const ObCompactionTableStoreParam &comp_param,
     ObArenaAllocator *allocator = NULL);
   int init_with_ha_info(const ObHATableStoreParam &ha_param);
+  void set_upper_trans_param(const UpdateUpperTransParam upper_trans_param) { upper_trans_param_ = upper_trans_param; }
   bool is_valid() const;
   bool need_report_major() const;
   int64_t get_report_scn() const;
+  bool is_ha_replace_table() const { return ha_info_.is_only_replace_major_ || ha_info_.need_replace_remote_sstable_; }
+  bool get_need_check_sstable() const { return is_minor_merge_type(compaction_info_.merge_type_) && !is_ss_upload_minor_sstable_; }
   #define PARAM_DEFINE_FUNC(var_type, param, var_name) \
     OB_INLINE var_type get_##var_name() const { return param. var_name##_; }
   #define HA_PARAM_FUNC(var_type, var_name) \
     PARAM_DEFINE_FUNC(var_type, ha_info_, var_name)
   #define COMP_PARAM_FUNC(var_type, var_name) \
     PARAM_DEFINE_FUNC(var_type, compaction_info_, var_name)
-  HA_PARAM_FUNC(bool, need_check_sstable);
   HA_PARAM_FUNC(bool, need_check_transfer_seq);
   HA_PARAM_FUNC(int64_t, transfer_seq);
   COMP_PARAM_FUNC(compaction::ObMergeType, merge_type);
@@ -477,7 +519,14 @@ struct ObUpdateTableStoreParam
   TO_STRING_KV(KP_(sstable), K_(snapshot_version), K_(multi_version_start),
                KPC_(storage_schema), K_(rebuild_seq),
                K_(compaction_info), K_(ha_info),
-               K_(ddl_info), K_(allow_duplicate_sstable), K_(upper_trans_param));
+               K_(ddl_info), K_(allow_duplicate_sstable),
+               K_(allow_adjust_next_start_scn),
+               K_(is_ss_upload_minor_sstable),
+               K_(update_tablet_ss_change_version),
+               K_(tablet_ss_change_fully_applied),
+               K_(upper_trans_param),
+               K_(need_wait_check_flag),
+               KP_(input_tables_handle));
   ObCompactionTableStoreParam compaction_info_;
   ObDDLTableStoreParam ddl_info_;
   ObHATableStoreParam ha_info_;
@@ -488,7 +537,14 @@ struct ObUpdateTableStoreParam
   int64_t rebuild_seq_;
   const blocksstable::ObSSTable *sstable_;
   bool allow_duplicate_sstable_;
-  UpdateUpperTransParam upper_trans_param_; // set upper_trans_param_ only when update upper_trans_version
+  bool allow_adjust_next_start_scn_;           // wheter can adjust start_scn of next sibling sstable
+  bool is_ss_upload_minor_sstable_;            // for shared storage upload minor sstable
+  share::SCN update_tablet_ss_change_version_; // for shared storage tablet change sync
+  bool tablet_ss_change_fully_applied_;        // wheter the specified version is fully applied
+  UpdateUpperTransParam upper_trans_param_;    // set upper_trans_param_ only when update upper_trans_version
+  bool need_wait_check_flag_;                  // A flag used to skip the checksum verification between replicas
+  // for shared storage minor merge: verify all input sstables still exist in table-store
+  const ObTablesHandleArray *input_tables_handle_;
 };
 
 struct ObSplitTableStoreParam final
@@ -498,7 +554,8 @@ public:
   ~ObSplitTableStoreParam();
   bool is_valid() const;
   void reset();
-  TO_STRING_KV(K_(snapshot_version), K_(multi_version_start), K_(merge_type), K_(skip_split_keys));
+  TO_STRING_KV(K_(snapshot_version), K_(multi_version_start), K_(merge_type),
+    K_(skip_split_keys));
 
 public:
   int64_t snapshot_version_;
@@ -518,7 +575,7 @@ struct ObBatchUpdateTableStoreParam final
 
   TO_STRING_KV(K_(tables_handle), K_(rebuild_seq), K_(is_transfer_replace),
       K_(start_scn), KP_(tablet_meta), K_(restore_status), K_(tablet_split_param),
-      K_(need_replace_remote_sstable), K_(release_mds_scn));
+      K_(need_replace_remote_sstable), K_(release_mds_scn), K_(reorg_scn));
 
   ObTablesHandleArray tables_handle_;
 #ifdef ERRSIM
@@ -532,6 +589,8 @@ struct ObBatchUpdateTableStoreParam final
   ObSplitTableStoreParam tablet_split_param_;
   bool need_replace_remote_sstable_;
   share::SCN release_mds_scn_;
+  share::SCN reorg_scn_;
+  const ObSSTransferSrcTabletBlockInfo *src_tablet_block_info_;
 
   DISALLOW_COPY_AND_ASSIGN(ObBatchUpdateTableStoreParam);
 };

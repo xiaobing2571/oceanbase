@@ -31,10 +31,12 @@ public:
                  const uint8_t char_len,
                  const ObFTCharUtil::CharType type) override;
 
+  void reuse() override { reset(); }
+
 private:
   void reset()
   {
-    low_offset = -1;
+    low_offset_ = -1;
     high_offset_ = -1;
   }
 
@@ -42,7 +44,7 @@ private:
 
 private:
   int64_t high_offset_ = -1;
-  int64_t low_offset = -1;
+  int64_t low_offset_ = -1;
 };
 
 } //  namespace storage

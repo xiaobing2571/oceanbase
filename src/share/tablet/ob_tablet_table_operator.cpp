@@ -14,6 +14,7 @@
 
 #include "share/tablet/ob_tablet_table_operator.h"
 #include "share/resource_manager/ob_cgroup_ctrl.h"
+#include "share/compaction_ttl/ob_compaction_ttl_util.h"
 namespace oceanbase
 {
 using namespace common;
@@ -392,6 +393,7 @@ int ObTabletTableOperator::construct_tablet_replica_(
   ObTabletReplica::ScnStatus status = ObTabletReplica::SCN_STATUS_IDLE;
   bool skip_null_error = false;
   bool skip_column_error = true;
+  int64_t ddl_create_snapshot = 0;
 
   (void) GET_COL_IGNORE_NULL(res.get_int, "tenant_id", tenant_id);
   (void) GET_COL_IGNORE_NULL(res.get_int, "tablet_id", tablet_id);
@@ -404,6 +406,7 @@ int ObTabletTableOperator::construct_tablet_replica_(
 
   EXTRACT_UINT_FIELD_MYSQL_WITH_DEFAULT_VALUE(res, "report_scn", uint_report_scn, uint64_t, skip_null_error, skip_column_error, 0);
   EXTRACT_INT_FIELD_MYSQL_WITH_DEFAULT_VALUE(res, "status", status_in_table, int64_t, skip_null_error, skip_column_error, ObTabletReplica::SCN_STATUS_IDLE);
+  EXTRACT_INT_FIELD_MYSQL_WITH_DEFAULT_VALUE(res, "ddl_create_snapshot", ddl_create_snapshot, int64_t, skip_null_error, skip_column_error, 0);
 
   status = (ObTabletReplica::ScnStatus)status_in_table;
   compaction_scn = static_cast<int64_t>(uint_compaction_scn);
@@ -424,7 +427,8 @@ int ObTabletTableOperator::construct_tablet_replica_(
           data_size,
           required_size,
           (int64_t)uint_report_scn,
-          status))) {
+          status,
+          ddl_create_snapshot))) {
     LOG_WARN("fail to init replica", KR(ret),
         K(tenant_id), K(tablet_id), K(server), K(ls_id), K(data_size), K(required_size));
   }
@@ -532,7 +536,7 @@ int ObTabletTableOperator::inner_batch_update_by_sql_(
       if (OB_UNLIKELY(!replica.is_valid() || tenant_id != replica.get_tenant_id())) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("invalid replica", KR(ret), K(tenant_id), K(replica));
-      } else if (OB_FAIL(fill_dml_splicer_(replica, dml))) {
+      } else if (OB_FAIL(fill_dml_splicer_(sql_tenant_id, replica, dml))) {
         LOG_WARN("fail to fill dml splicer", KR(ret), K(replica));
       } else if (OB_FAIL(dml.finish_row())) {
         LOG_WARN("fail to finish row", KR(ret), K(replica));
@@ -548,11 +552,13 @@ int ObTabletTableOperator::inner_batch_update_by_sql_(
 }
 
 int ObTabletTableOperator::fill_dml_splicer_(
+    const int64_t sql_tenant_id,
     const ObTabletReplica &replica,
     ObDMLSqlSplicer &dml_splicer)
 {
   int ret = OB_SUCCESS;
   const uint64_t snapshot_version = replica.get_snapshot_version() < 0 ? 0 : replica.get_snapshot_version();
+  uint64_t compat_version = 0;
   char ip[OB_MAX_SERVER_ADDR_SIZE] = "";
   if (OB_UNLIKELY(!replica.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
@@ -560,6 +566,8 @@ int ObTabletTableOperator::fill_dml_splicer_(
   } else if (OB_UNLIKELY(!replica.get_server().ip_to_string(ip, sizeof(ip)))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("convert server ip to string failed", KR(ret), "server", replica.get_server());
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(sql_tenant_id, compat_version))) {
+    LOG_WARN("fail to get min data version", KR(ret), K(sql_tenant_id), K(replica));
   } else if (OB_FAIL(dml_splicer.add_pk_column("tenant_id", replica.get_tenant_id()))
       || OB_FAIL(dml_splicer.add_pk_column("tablet_id", replica.get_tablet_id().id()))
       || OB_FAIL(dml_splicer.add_pk_column("svr_ip", ip))
@@ -567,7 +575,9 @@ int ObTabletTableOperator::fill_dml_splicer_(
       || OB_FAIL(dml_splicer.add_pk_column("ls_id", replica.get_ls_id().id()))
       || OB_FAIL(dml_splicer.add_uint64_column("compaction_scn", snapshot_version))
       || OB_FAIL(dml_splicer.add_column("data_size", replica.get_data_size()))
-      || OB_FAIL(dml_splicer.add_column("required_size", replica.get_required_size()))) {
+      || OB_FAIL(dml_splicer.add_column("required_size", replica.get_required_size()))
+      || (compat_version >= ObCompactionTTLUtil::COMPACTION_TTL_CMP_DATA_VERSION
+        && OB_FAIL(dml_splicer.add_column("ddl_create_snapshot", replica.get_ddl_create_snapshot())))) {
     LOG_WARN("add column failed", KR(ret), K(replica));
   }
   return ret;
@@ -739,8 +749,10 @@ int ObTabletTableOperator::fill_remove_dml_splicer_(
 int ObTabletTableOperator::remove_residual_tablet(
     ObISQLClient &sql_client,
     const uint64_t tenant_id,
+    const ObLSID &ls_id,
     const ObAddr &server,
     const int64_t limit,
+    const char *const table_name,
     int64_t &affected_rows)
 {
   int ret = OB_SUCCESS;
@@ -760,18 +772,34 @@ int ObTabletTableOperator::remove_residual_tablet(
   } else if (OB_UNLIKELY(!server.ip_to_string(ip, sizeof(ip)))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("convert server ip to string failed", KR(ret), K(server));
+  } else if (OB_ISNULL(table_name)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("table name is null", KR(ret));
+  } else if (!ls_id.is_valid()) { // ls_id is invalid, means delete all ls in server here
+    if (OB_FAIL(sql.assign_fmt(
+        "DELETE FROM %s WHERE tenant_id = %lu AND svr_ip = '%s' AND svr_port = %d limit %ld",
+        table_name,
+        tenant_id,
+        ip,
+        server.get_port(),
+        limit))) {
+      LOG_WARN("assign sql string failed", KR(ret), K(sql), K(tenant_id), K(server), K(table_name));
+    }
   } else if (OB_FAIL(sql.assign_fmt(
-      "DELETE FROM %s WHERE tenant_id = %lu AND svr_ip = '%s' AND svr_port = %d limit %ld",
-      OB_ALL_TABLET_META_TABLE_TNAME,
+      "DELETE FROM %s WHERE tenant_id = %lu AND ls_id = %lu AND svr_ip = '%s' AND svr_port = %d LIMIT %ld",
+      table_name,
       tenant_id,
+      ls_id.id(),
       ip,
       server.get_port(),
       limit))) {
-    LOG_WARN("assign sql string failed", KR(ret), K(sql));
+    LOG_WARN("assign sql string failed", KR(ret), K(sql), K(tenant_id), K(ls_id), K(server), K(table_name));
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(sql_client.write(sql_tenant_id, sql.ptr(), group_id_, affected_rows))) {
     LOG_WARN("execute sql failed", KR(ret), K(sql), K(sql_tenant_id));
   } else if (affected_rows > 0) {
-    LOG_INFO("finish to remove residual tablet", KR(ret), K(tenant_id), K(affected_rows));
+    LOG_INFO("finish to remove residual tablet", KR(ret), K(tenant_id), K(ls_id), K(server), K(affected_rows), K(table_name), K(sql));
   }
   return ret;
 }

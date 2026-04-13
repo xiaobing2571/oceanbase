@@ -152,6 +152,7 @@ TG_DEF(HeartBeatCheckTask, HeartBeatCheckTask, TIMER)
 TG_DEF(RedefHeartBeatTask, RedefHeartBeatTask, TIMER)
 TG_DEF(SSTableDefragment, SSTableDefragment, TIMER)
 TG_DEF(TenantMetaMemMgr, TenantMetaMemMgr, TIMER)
+TG_DEF(OracleTempTableGCTask, OracleTempTableGCTask, TIMER)
 TG_DEF(IngressService, IngressService, TIMER)
 TG_DEF(HeartbeatService, HeartbeatService, REENTRANT_THREAD_POOL, 2)
 TG_DEF(DetectManager, DetectManager, THREAD_POOL, 1)
@@ -176,37 +177,50 @@ TG_DEF(TieredStorageTimer, TieredStorageTimer, TIMER)
 TG_DEF(TenantTTLManager, TTLManager, TIMER)
 TG_DEF(TenantTabletTTLMgr, TTLTabletMgr, TIMER)
 TG_DEF(TntSharedTimer, TntSharedTimer, TIMER)
+TG_DEF(PCachedExtServiceScheduler, PCachedExtServiceScheduler, TIMER)
 TG_DEF(VectorAsyncTaskPool, VectorAsyncTask, QUEUE_THREAD, 1, 8)   // for tmp
+TG_DEF(DRCreateSSLOGTimer, DRCreateSSLOGTimer, TIMER)
+TG_DEF(VectorTaskPool, VectorTaskPool, QUEUE_THREAD, 1, 1024)
 
 #ifdef OB_BUILD_SHARED_STORAGE
 TG_DEF(ReplicaPrewarmHdlr, RepPrewarmHdlr, QUEUE_THREAD, 1, storage::ObReplicaPrewarmHandler::MAX_TASK_NUM)
+TG_DEF(LoCacheMTimer, LoCacheMTimer, TIMER)
+TG_DEF(LoCacheHTimer, LoCacheHTimer, TIMER)
 TG_DEF(MicCacheLTimer, MicCacheLTimer, TIMER)
 TG_DEF(MicCacheMTimer, MicCacheMTimer, TIMER)
 TG_DEF(MicCacheHTimer, MicCacheHTimer, TIMER)
+TG_DEF(MemMacroCacheTimer, MemMacroCacheTimer, TIMER)
+TG_DEF(MacroCacheLTimer, MacroCacheLTimer, TIMER)
+TG_DEF(MacroCacheHTimer, MacroCacheHTimer, TIMER)
 TG_DEF(SSTmpFileAFlush, TmpFileAFlush, TIMER)
 TG_DEF(SSTmpFileARemove, TmpFileARemove, TIMER)
 TG_DEF(SSTmpFileShrinkWBP, TmpFileShrink, TIMER)
 TG_DEF(TmpFileFlushTimer, TmpFileFlushTimer, TIMER)
+TG_DEF(SSDiskSpaceMgrTimer, SSDiskSpaceMgrTimer, TIMER)
 TG_DEF(TmpFilePrereadTimer, TmpFilePrereadTimer, TIMER)
 TG_DEF(ReplicaPrewarmTimer, ReplicaPrewarmTimer, TIMER)
 TG_DEF(StorageCachePolicyMgr, StorageCachePolicyMgr, TIMER)
 TG_DEF(StorageCacheTabletScheduler, StorageCacheTabletScheduler, QUEUE_THREAD, 1, storage::ObStorageCacheTabletScheduler::MAX_TASK_NUM)
 TG_DEF(TenantDirGCTimer, TntGCTimer, TIMER)
-TG_DEF(ObPublicBlockGCThread, PubGCThread, QUEUE_THREAD,
-       ThreadCountPair(storage::ObPublicBlockGCThread::THREAD_NUM,
-       storage::ObPublicBlockGCThread::MINI_MODE_THREAD_NUM),
-       storage::ObPublicBlockGCThread::MAX_BLOCK_GC_TASK_NUM)
+TG_DEF(ServerSlogFlushTimer, SvrSlogFlushTimer, TIMER)
 TG_DEF(ObPrivateBlockGCThread, PrivGCThread, QUEUE_THREAD,
        ThreadCountPair(storage::ObPrivateBlockGCThread::THREAD_NUM,
        storage::ObPrivateBlockGCThread::MINI_MODE_THREAD_NUM),
        storage::ObPrivateBlockGCThread::MAX_BLOCK_GC_TASK_NUM)
 TG_DEF(SSWriterWorker, SSWSrv, THREAD_POOL, 1)
+TG_DEF(SS_SSTableGCTimer, SS_TableGCTimer, TIMER)
+TG_DEF(SSScheduleUpload, ScheUpload, QUEUE_THREAD, ThreadCountPair(8, 4), 100)
 #endif
 
+TG_DEF(ExtDiskCacheServerTimer, ExtDiskCacheServerTimer, TIMER)
 
 TG_DEF(TmpFileSwap, TFSwap, THREAD_POOL, 1)
 TG_DEF(TableGroupCommitMgr, TableGroupCommitMgr, TIMER)
 TG_DEF(TmpFileFlush, TFFlush, TIMER)
 TG_DEF(LogFetcherBGWorker, LogFetcherBGW, TIMER)
 TG_DEF(MaBlkBFLoader, MBFLoad, THREAD_POOL, 1)
+TG_DEF(TLD_HTimer, TLD_HTimer, TIMER)
+TG_DEF(ShrBlkChk, ShrBlkChk, TIMER)
+TG_DEF(WindowLoop, WindowLoop, TIMER)
+TG_DEF(OMTProcCpuSampler, OmtProcCpuSampler, THREAD_POOL, 1)
 #endif

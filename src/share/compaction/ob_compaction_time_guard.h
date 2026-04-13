@@ -36,6 +36,8 @@ public:
     RS_COMPACT_TIME_GUARD = 1,
     SCHEDULE_COMPACT_TIME_GUARD = 2,
     STORAGE_COMPACT_TIME_GUARD = 3,
+    CO_MERGE_TIME_GUARD = 4,
+    WINDOW_COMPACT_TIME_GUARD = 5,
     MAX_COMPACT_TIME_GUARD
   };
 public:
@@ -166,6 +168,8 @@ public:
     SCHEDULE_OTHER_COMPACTION,
     DAG_FINISH,
     PRE_WARM,
+    UPDATE_SHARED_TABLET,
+    UPDATE_LOCAL_TABLET,
     COMPACTION_EVENT_MAX
   };
   virtual int64_t to_string(char *buf, const int64_t buf_len) const override;
@@ -203,6 +207,49 @@ private:
   static const int64_t COMPACTION_WARN_THRESHOLD_RATIO = 60 * 1000L * 1000L; // 1 min
   static constexpr float COMPACTION_SHOW_PERCENT_THRESHOLD = 0.1;
   static const int64_t COMPACTION_SHOW_TIME_THRESHOLD = 1 * 1000L * 1000L; // 1s
+};
+
+struct ObCOMergeTimeGuard : public ObCompactionTimeGuard
+{
+public:
+  ObCOMergeTimeGuard()
+    : ObCompactionTimeGuard(CO_MERGE_TIME_GUARD, UINT64_MAX, "[CO_Merge] ")
+  {}
+  virtual ~ObCOMergeTimeGuard() {}
+  enum CompactionEvent : uint16_t {
+    MOVE_NEXT = 0,
+    COMPARE,
+    BUILD_LOG,
+    REPLAY_BASE_CG,
+    PERSIST_LOG,
+    REPLAY_LOG,
+    COMPACTION_EVENT_MAX
+  };
+  virtual int64_t to_string(char *buf, const int64_t buf_len) const override;
+private:
+  const static char *CompactionEventStr[];
+  static const char *get_comp_event_str(const enum CompactionEvent event);
+};
+
+struct ObWindowCompactionTimeGuard : public ObCompactionTimeGuard
+{
+public:
+  ObWindowCompactionTimeGuard()
+    : ObCompactionTimeGuard(WINDOW_COMPACT_TIME_GUARD, UINT64_MAX, "[STORAGE] ")
+  {}
+  virtual ~ObWindowCompactionTimeGuard() {}
+  enum CompactionEvent : uint16_t {
+    UPDATE_ADAPTIVE_THREAD_CNT = 0,
+    LOOP_TABLET_STATS,
+    LOOP_PRIORITY_QUEUE,
+    LOOP_READY_LIST,
+    COMPACTION_EVENT_MAX
+  };
+  virtual int64_t to_string(char *buf, const int64_t buf_len) const override;
+  virtual bool need_print() const override { return false; } // 不在析构时自动打印
+private:
+  const static char *CompactionEventStr[];
+  static const char *get_comp_event_str(const enum CompactionEvent event);
 };
 
 } // namespace compaction

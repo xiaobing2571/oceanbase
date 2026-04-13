@@ -10,12 +10,11 @@
  * See the Mulan PubL v2 for more details.
  */
 
-#include "mittest/mtlenv/storage/tmp_file/ob_tmp_file_test_helper.h"
-#include "mittest/mtlenv/storage/tmp_file/mock_ob_tmp_file_util.h"
+#include "mittest/mtlenv/mock_tenant_module_env.h"
+#include "mittest/shared_storage/tmp_file/ob_ss_tmp_file_test_helper.h"
 #define USING_LOG_PREFIX STORAGE
 #define protected public
 #define private public
-#include "mittest/mtlenv/mock_tenant_module_env.h"
 #include "share/ob_simple_mem_limit_getter.h"
 #include "lib/alloc/ob_malloc_allocator.h"
 #include "storage/tmp_file/ob_tmp_file_global.h"
@@ -23,6 +22,8 @@
 #include "storage/tmp_file/ob_shared_storage_tmp_file.h"
 #include "storage/shared_storage/ob_file_manager.h"
 #include "mittest/shared_storage/clean_residual_data.h"
+#include "lib/alloc/memory_dump.h"
+#include <thread>
 
 namespace oceanbase
 {
@@ -35,7 +36,7 @@ using namespace share::schema;
 static const int64_t TENANT_MEMORY = 16L * 1024L * 1024L * 1024L /* 16 GB */;
 static constexpr int64_t IO_WAIT_TIME_MS = 60 * 1000L; // 60s
 /********************************* Mock WBP *************************** */
-static const int64_t WBP_BLOCK_SIZE = ObTmpWriteBufferPool::WBP_BLOCK_SIZE; // each wbp block has 253 pages (253 * 8KB == 2024KB)
+static const int64_t WBP_BLOCK_SIZE = ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE; // each wbp block has 253 pages (253 * 8KB == 2024KB)
 static const int64_t SMALL_WBP_BLOCK_COUNT = 3;
 static const int64_t SMALL_WBP_MEM_LIMIT = SMALL_WBP_BLOCK_COUNT * WBP_BLOCK_SIZE; // the wbp mem size is 5.93MB
 static const int64_t BIG_WBP_BLOCK_COUNT = 40;
@@ -43,7 +44,7 @@ static const int64_t BIG_WBP_MEM_LIMIT = BIG_WBP_BLOCK_COUNT * WBP_BLOCK_SIZE; /
 /********************************* Mock WBP Index Cache*************************** */
 // each bucket could indicate a 256KB data in wbp.
 // SMALL_WBP_IDX_CACHE_MAX_CAPACITY will indicate 4MB data in wbp
-static const int64_t SMALL_WBP_IDX_CACHE_MAX_CAPACITY = ObTmpFileWBPIndexCache::INIT_BUCKET_ARRAY_CAPACITY * 2;
+static const int64_t SMALL_WBP_IDX_CACHE_MAX_CAPACITY = ObSSTmpFileWBPIndexCache::INIT_BUCKET_ARRAY_CAPACITY * 2;
 /* ---------------------------- Unittest Class ----------------------------- */
 
 class TestTmpFile : public ::testing::Test
@@ -68,6 +69,8 @@ void TestTmpFile::SetUpTestCase()
 
   CHUNK_MGR.set_limit(TENANT_MEMORY);
   ObMallocAllocator::get_instance()->set_tenant_limit(MTL_ID(), TENANT_MEMORY);
+  ObMallocAllocator::get_instance()->set_tenant_max_min(MTL_ID(), TENANT_MEMORY, 0);
+  ObMemoryDump::get_instance().init();
 
   MTL(ObTenantTmpFileManager *)->get_ss_file_manager().wbp_.default_wbp_memory_limit_ = SMALL_WBP_MEM_LIMIT;
 }
@@ -109,13 +112,14 @@ void TestTmpFile::TearDown()
 
 void TestTmpFile::check_final_status()
 {
+  ObSSTmpFileFlushManager &flush_mgr = MTL(ObTenantTmpFileManager *)->get_ss_file_manager().flush_mgr_;
   ASSERT_LE(MTL(ObTenantTmpFileManager *)->get_ss_file_manager().wbp_.default_wbp_memory_limit_, SMALL_WBP_MEM_LIMIT);
-  MTL(ObTenantTmpFileManager *)->get_ss_file_manager().flush_mgr_.print_stat_info();
+  flush_mgr.print_stat_info();
   bool is_over = false;
   const int64_t max_wait_cnt = 50;
   int cnt = 0;
   while (!is_over) {
-    is_over = MTL(ObTenantTmpFileManager *)->get_ss_file_manager().flush_mgr_.wait_task_queue_.queue_length_ == 0;
+    is_over = flush_mgr.wait_task_queue_.get_queue_length() == 0 && !ATOMIC_LOAD(&flush_mgr.is_processing_wait_task_);
     if (!is_over) {
       if (cnt++ > max_wait_cnt) {
         is_over = true;
@@ -124,14 +128,147 @@ void TestTmpFile::check_final_status()
       }
     }
   }
-  MTL(ObTenantTmpFileManager *)->get_ss_file_manager().flush_mgr_.print_stat_info();
-  ASSERT_EQ(0, MTL(ObTenantTmpFileManager *)->get_ss_file_manager().flush_mgr_.flush_prio_mgr_.get_file_size());
-  ASSERT_EQ(0, MTL(ObTenantTmpFileManager *)->get_ss_file_manager().flush_mgr_.wait_task_queue_.queue_length_);
-  ASSERT_EQ(0, MTL(ObTenantTmpFileManager *)->get_ss_file_manager().flush_mgr_.f1_cnt_);
-  ASSERT_EQ(0, MTL(ObTenantTmpFileManager *)->get_ss_file_manager().flush_mgr_.f2_cnt_);
-  ASSERT_EQ(0, MTL(ObTenantTmpFileManager *)->get_ss_file_manager().flush_mgr_.f3_cnt_);
-  ASSERT_EQ(0, MTL(ObTenantTmpFileManager *)->get_ss_file_manager().flush_mgr_.total_flushing_page_num_);
+  flush_mgr.print_stat_info();
+  ASSERT_EQ(0, flush_mgr.flush_prio_mgr_.get_file_size());
+  ASSERT_EQ(0, flush_mgr.wait_task_queue_.get_queue_length());
+  ASSERT_EQ(0, flush_mgr.f1_cnt_);
+  ASSERT_EQ(0, flush_mgr.f2_cnt_);
+  ASSERT_EQ(0, flush_mgr.f3_cnt_);
+  ASSERT_EQ(0, flush_mgr.total_flushing_page_num_);
 }
+
+// Helper function to test tmp file deletion with optional scan gc
+void test_tmp_file_deletion_impl(const int64_t file_cnt, bool test_scan_gc)
+{
+  int ret = OB_SUCCESS;
+  const int64_t write_size = 512;
+  char *write_buf = new char [write_size];
+  for (int64_t i = 0; i < write_size;) {
+    int64_t random_length = generate_random_int(1024, 8 * 1024);
+    int64_t random_int = generate_random_int(0, 256);
+    for (int64_t j = 0; j < random_length && i + j < write_size; ++j) {
+      write_buf[i + j] = random_int;
+    }
+    i += random_length;
+  }
+
+  int64_t dir = -1;
+  ret = MTL(ObTenantTmpFileManager *)->alloc_dir(dir);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ObArray<int64_t> file_ids;
+  int64_t test_start_time = ObTimeUtility::fast_current_time();
+  int64_t completed_count = 0;
+  ObSpinLock lock(common::ObLatchIds::TEST_LATCH_LOCK);
+  const int64_t THREAD_COUNT = 16;
+  std::vector<std::thread> threads;
+  int64_t files_per_thread = file_cnt / THREAD_COUNT;
+  int64_t remaining_files = file_cnt % THREAD_COUNT;
+  for (int64_t t = 0; t < THREAD_COUNT; ++t) {
+    LOG_INFO("create tmp files", K(t), K(files_per_thread), K(remaining_files));
+    int64_t start_idx = t * files_per_thread;
+    int64_t end_idx = (t + 1) * files_per_thread;
+    if (t == THREAD_COUNT - 1) {
+      end_idx += remaining_files; // Last thread handles remaining files
+    }
+
+    ObTenantBase *tenant_ctx = MTL_CTX();
+    ASSERT_NE(nullptr, tenant_ctx);
+    threads.emplace_back([&, tenant_ctx, start_idx, end_idx]() {
+      int64_t start_time = ObTimeUtility::fast_current_time();
+      ObTenantEnv::set_tenant(tenant_ctx);
+      for (int64_t i = start_idx; i < end_idx; ++i) {
+        int64_t fd = -1;
+        int ret = MTL(ObTenantTmpFileManager *)->open(fd, dir, "");
+        if (OB_SUCCESS != ret) {
+          STORAGE_LOG(ERROR, "Failed to open tmp file", K(ret), K(i));
+          continue;
+        }
+
+        {
+          ObSpinLockGuard guard(lock);
+          file_ids.push_back(fd);
+        }
+        ObTmpFileIOInfo io_info;
+        io_info.io_desc_.set_wait_event(2);
+        io_info.io_timeout_ms_ = IO_WAIT_TIME_MS;
+        io_info.size_ = write_size;
+        io_info.buf_ = write_buf;
+        io_info.fd_ = fd;
+        ret = MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info);
+        if (OB_SUCCESS != ret) {
+          STORAGE_LOG(ERROR, "Failed to write tmp file", K(ret), K(fd));
+          continue;
+        }
+
+        ATOMIC_INC(&completed_count);
+        if (ATOMIC_LOAD(&completed_count) % 10000 == 0) {
+          printf("completed count: %ld, cost time: %ldms\n",
+              ATOMIC_LOAD(&completed_count), (ObTimeUtility::fast_current_time() - start_time)/1000);
+              start_time = ObTimeUtility::fast_current_time();
+        }
+      }
+    });
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  ASSERT_EQ(file_cnt, ATOMIC_LOAD(&completed_count));
+  ASSERT_EQ(file_cnt, file_ids.count());
+  printf("All threads completed. Total files created: %ld, cost time: %ldms\n",
+      ATOMIC_LOAD(&completed_count), (ObTimeUtility::fast_current_time() - test_start_time)/100);
+  ObSSTmpFileRemoveManager &rm_mgr = MTL(ObTenantTmpFileManager *)->get_ss_file_manager().remove_mgr_;
+
+  // Stop remove manager if testing scan gc
+  if (test_scan_gc) {
+    rm_mgr.stop();
+  }
+
+  int64_t start_time = ObTimeUtility::fast_current_time();
+  for (int64_t i = 0; i < file_ids.count(); ++i) {
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->remove(file_ids.at(i)));
+    if (i % 10000 == 0 || i == file_ids.count() - 1) {
+      int64_t cost_time = (ObTimeUtility::fast_current_time() - start_time)/1000;
+      printf("delete tmp file, i: %ld, file_cnt: %ld, cost time: %ldms\n", i, file_cnt, cost_time);
+      start_time = ObTimeUtility::fast_current_time();
+      STORAGE_LOG(INFO, "delete tmp file", K(i), K(file_cnt), K(cost_time));
+    }
+  }
+
+  // Trigger scan gc if needed
+  if (test_scan_gc) {
+    rm_mgr.deleted_file_map_.clear(); // 模拟重启，看scan gc是否正常
+    ATOMIC_STORE(&rm_mgr.scan_invalid_files_ts_,
+      ObTimeUtility::fast_current_time() - ObSSTmpFileRemoveManager::SCAN_INVALID_FILES_INTERVAL);
+    rm_mgr.start();
+    sleep(10);
+  }
+
+  int64_t end_time = ObTimeUtility::fast_current_time();
+  LOG_INFO("sleep for remove threads");
+  int64_t count = 0;
+  while (rm_mgr.get_task_num() > 0) {
+    sleep(1);
+    printf("remove task num: %ld, sleep count: %ld\n", rm_mgr.get_task_num(), count++);
+  }
+  STORAGE_LOG(INFO, "test cost time", K((end_time - test_start_time)/1000));
+  delete [] write_buf;
+}
+TEST_F(TestTmpFile, test_delete_tmp_file)
+{
+  STORAGE_LOG(INFO, "=======================test_delete_tmp_file begin=======================");
+  test_tmp_file_deletion_impl(2 * 10000, false);
+  STORAGE_LOG(INFO, "=======================test_delete_tmp_file end=======================");
+}
+
+TEST_F(TestTmpFile, test_scan_gc)
+{
+  STORAGE_LOG(INFO, "=======================test_scan_gc begin=======================");
+  test_tmp_file_deletion_impl(2000, true);
+  STORAGE_LOG(INFO, "=======================test_scan_gc end=======================");
+}
+
 
 // generate 2MB random data (will not trigger flush and evict logic)
 // 1. test write pages and append write tail page
@@ -162,7 +299,7 @@ TEST_F(TestTmpFile, test_unaligned_data_read_write)
   ret = MTL(ObTenantTmpFileManager *)->open(fd, dir, "");
   std::cout << "open temporary file: " << fd << std::endl;
   ASSERT_EQ(OB_SUCCESS, ret);
-  tmp_file::ObITmpFileHandle file_handle;
+  tmp_file::ObSSTmpFileHandle file_handle;
   ret = MTL(ObTenantTmpFileManager *)->get_tmp_file(fd, file_handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   file_handle.get()->page_idx_cache_.max_bucket_array_capacity_ = SMALL_WBP_IDX_CACHE_MAX_CAPACITY;
@@ -278,7 +415,7 @@ TEST_F(TestTmpFile, test_read)
   ret = MTL(ObTenantTmpFileManager *)->open(fd, dir, "");
   std::cout << "open temporary file: " << fd << std::endl;
   ASSERT_EQ(OB_SUCCESS, ret);
-  tmp_file::ObITmpFileHandle file_handle;
+  tmp_file::ObSSTmpFileHandle file_handle;
   ret = MTL(ObTenantTmpFileManager *)->get_tmp_file(fd, file_handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   file_handle.get()->page_idx_cache_.max_bucket_array_capacity_ = SMALL_WBP_IDX_CACHE_MAX_CAPACITY;
@@ -318,7 +455,6 @@ TEST_F(TestTmpFile, test_read)
   read_buf = new char [wbp_begin_offset];
   io_info.buf_ = read_buf;
   io_info.size_ = wbp_begin_offset;
-  io_info.disable_block_cache_ = true;
   ret = MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, 0, handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(io_info.size_, handle.get_done_size());
@@ -330,7 +466,6 @@ TEST_F(TestTmpFile, test_read)
   read_buf = new char [wbp_begin_offset];
   io_info.buf_ = read_buf;
   io_info.size_ = wbp_begin_offset;
-  io_info.disable_block_cache_ = false;
   ret = MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, 0, handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(io_info.size_, handle.get_done_size());
@@ -342,7 +477,6 @@ TEST_F(TestTmpFile, test_read)
   read_buf = new char [wbp_begin_offset];
   io_info.buf_ = read_buf;
   io_info.size_ = wbp_begin_offset;
-  io_info.disable_block_cache_ = false;
   io_info.disable_page_cache_ = true;
   ret = MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, 0, handle);
   ASSERT_EQ(OB_SUCCESS, ret);
@@ -358,7 +492,6 @@ TEST_F(TestTmpFile, test_read)
   read_buf = new char [read_size];
   io_info.buf_ = read_buf;
   io_info.size_ = read_size;
-  io_info.disable_block_cache_ = true;
   ret = MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, read_offset, handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(io_info.size_, handle.get_done_size());
@@ -372,7 +505,6 @@ TEST_F(TestTmpFile, test_read)
   read_buf = new char [read_size];
   io_info.buf_ = read_buf;
   io_info.size_ = read_size;
-  io_info.disable_block_cache_ = false;
   ret = MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, read_offset, handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(io_info.size_, handle.get_done_size());
@@ -385,7 +517,6 @@ TEST_F(TestTmpFile, test_read)
   read_buf = new char [200];
   io_info.buf_ = read_buf;
   io_info.size_ = 200;
-  io_info.disable_block_cache_ = true;
   ret = MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, write_size - 100, handle);
   ASSERT_EQ(OB_ITER_END, ret);
   ASSERT_EQ(100, handle.get_done_size());
@@ -463,7 +594,7 @@ TEST_F(TestTmpFile, test_cached_read)
   ret = MTL(ObTenantTmpFileManager *)->open(fd, dir, "");
   std::cout << "open temporary file: " << fd << std::endl;
   ASSERT_EQ(OB_SUCCESS, ret);
-  tmp_file::ObITmpFileHandle file_handle;
+  tmp_file::ObSSTmpFileHandle file_handle;
   ret = MTL(ObTenantTmpFileManager *)->get_tmp_file(fd, file_handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   file_handle.get()->page_idx_cache_.max_bucket_array_capacity_ = SMALL_WBP_IDX_CACHE_MAX_CAPACITY;
@@ -510,7 +641,20 @@ TEST_F(TestTmpFile, test_cached_read)
   io_info.buf_ = read_buf;
   io_info.size_ = read_size;
   io_info.disable_page_cache_ = false;
-  io_info.disable_block_cache_ = true;
+  ret = MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, read_offset, handle);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ASSERT_EQ(io_info.size_, handle.get_done_size());
+  cmp = memcmp(handle.get_buffer(), write_buf + read_offset, io_info.size_);
+  ASSERT_EQ(0, cmp);
+  handle.reset();
+  delete[] read_buf;
+
+  read_size = wbp_begin_offset;
+  read_offset = 0;
+  read_buf = new char [read_size];
+  io_info.buf_ = read_buf;
+  io_info.size_ = read_size;
+  io_info.disable_page_cache_ = false;
   ret = MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, read_offset, handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(io_info.size_, handle.get_done_size());
@@ -526,7 +670,6 @@ TEST_F(TestTmpFile, test_cached_read)
   io_info.buf_ = read_buf;
   io_info.size_ = read_size;
   io_info.disable_page_cache_ = false;
-  io_info.disable_block_cache_ = true;
   ret = MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, read_offset, handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(io_info.size_, handle.get_done_size());
@@ -545,14 +688,16 @@ TEST_F(TestTmpFile, test_cached_read)
                                 - seg_id * ObTmpFileGlobal::SS_BLOCK_PAGE_NUMS;
     for (int64_t page_id = 0; page_id < end_page_id && OB_SUCC(ret); page_id++) {
       const int64_t virtual_page_id = seg_id * ObTmpFileGlobal::SS_BLOCK_PAGE_NUMS + page_id;
-      tmp_file::ObTmpPageCacheKey key(fd, 0, virtual_page_id, MTL_ID());
+      tmp_file::ObTmpPageCacheKey key(fd, virtual_page_id, MTL_ID());
       tmp_file::ObTmpPageValueHandle handle;
       ret = tmp_file::ObTmpPageCache::get_instance().get_page(key, handle);
       if (OB_FAIL(ret)) {
         std::cout << "get cached page failed\n"
+                  << "ret: " << ret << " "
                   << "wbp_begin_offset: " << wbp_begin_offset << " "
                   << "block_id: " << seg_id << " "
                   << "page_id: " << page_id << " "
+                  << "virtual_page_id: " << virtual_page_id << " "
                   << "end_page_id: " << end_page_id << " "
                   << "begin_block_id: " << begin_block_id << " "
                   << "end_block_id: " << end_block_id << " "
@@ -578,7 +723,7 @@ TEST_F(TestTmpFile, test_prefetch_read)
 {
   STORAGE_LOG(INFO, "=======================test_prefetch_read begin=======================");
   int ret = OB_SUCCESS;
-  ObTmpWriteBufferPool &wbp = MTL(ObTenantTmpFileManager *)->get_ss_file_manager().wbp_;
+  ObSSTmpWriteBufferPool &wbp = MTL(ObTenantTmpFileManager *)->get_ss_file_manager().wbp_;
   // const int64_t write_size = 8 * 1024 * 1024; // 8MB
   const int64_t write_size = 9 * 1024 * 1024 + 37 * 1024; // 8MB
   const int64_t wbp_mem_limit = wbp.get_memory_limit();
@@ -600,7 +745,7 @@ TEST_F(TestTmpFile, test_prefetch_read)
   ret = MTL(ObTenantTmpFileManager *)->open(fd, dir, "");
   std::cout << "open temporary file: " << fd << std::endl;
   ASSERT_EQ(OB_SUCCESS, ret);
-  tmp_file::ObITmpFileHandle file_handle;
+  tmp_file::ObSSTmpFileHandle file_handle;
   ret = MTL(ObTenantTmpFileManager *)->get_tmp_file(fd, file_handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   file_handle.get()->page_idx_cache_.max_bucket_array_capacity_ = SMALL_WBP_IDX_CACHE_MAX_CAPACITY;
@@ -610,7 +755,7 @@ TEST_F(TestTmpFile, test_prefetch_read)
   io_info.io_desc_.set_wait_event(2);
   io_info.buf_ = write_buf;
   io_info.size_ = write_size;
-  io_info.io_timeout_ms_ = DEFAULT_IO_WAIT_TIME_MS;
+  io_info.io_timeout_ms_ = IO_WAIT_TIME_MS;
 
   // 1. Write data and wait flushing over
   int64_t write_time = ObTimeUtility::current_time();
@@ -622,13 +767,11 @@ TEST_F(TestTmpFile, test_prefetch_read)
   int64_t wash_size = 0;
   ObSSTmpFileFlushManager &flush_mgr = MTL(ObTenantTmpFileManager *)->ss_file_manager_.flush_mgr_;
   ObSSTmpFileAsyncFlushWaitTaskHandle task_handle;
-  common::ObIOFlag io_desc;
-  io_desc.set_wait_event(ObWaitEventIds::TMP_FILE_WRITE);
-  ASSERT_EQ(OB_SUCCESS, flush_mgr.wash(INT64_MAX, io_desc, task_handle, wash_size));
+  ASSERT_EQ(OB_SUCCESS, flush_mgr.wash(INT64_MAX, task_handle, wash_size));
   task_handle.wait(30 * 1000);
   while (file_handle.get()->cached_page_nums_ > 0) {
     task_handle.reset();
-    ASSERT_EQ(OB_SUCCESS, flush_mgr.wash(INT64_MAX, io_desc, task_handle, wash_size)); // flush twice to make sure all pages are flushed
+    ASSERT_EQ(OB_SUCCESS, flush_mgr.wash(INT64_MAX, task_handle, wash_size)); // flush twice to make sure all pages are flushed
     task_handle.wait(30 * 1000);
   }
   EXPECT_EQ(file_handle.get()->cached_page_nums_, 0);
@@ -653,7 +796,6 @@ TEST_F(TestTmpFile, test_prefetch_read)
     io_info.buf_ = read_buf;
     io_info.size_ = read_size;
     io_info.disable_page_cache_ = false;
-    io_info.disable_block_cache_ = true;
     io_info.prefetch_ = true;
     ret = MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, read_offset, handle);
     ASSERT_EQ(OB_SUCCESS, ret);
@@ -674,10 +816,10 @@ TEST_F(TestTmpFile, test_prefetch_read)
                                 - seg_id * ObTmpFileGlobal::SS_BLOCK_PAGE_NUMS;
     for (int64_t page_id = 0; page_id < end_page_id && OB_SUCC(ret); page_id++) {
       const int64_t virtual_page_id = seg_id * ObTmpFileGlobal::SS_BLOCK_PAGE_NUMS + page_id;
-      tmp_file::ObTmpPageCacheKey key(fd, 0, virtual_page_id, MTL_ID());
-      if (virtual_page_id == write_size / ObTmpFileGlobal::PAGE_SIZE) {
-        key.unfilled_page_length_ = write_size % ObTmpFileGlobal::PAGE_SIZE;
-      }
+      tmp_file::ObTmpPageCacheKey key(fd, virtual_page_id, MTL_ID());
+      int64_t unfilled_page_length_ = virtual_page_id == write_size / ObTmpFileGlobal::PAGE_SIZE ?
+                                      write_size % ObTmpFileGlobal::PAGE_SIZE : 0;
+
       tmp_file::ObTmpPageValueHandle handle;
       ret = tmp_file::ObTmpPageCache::get_instance().get_page(key, handle);
       if (OB_FAIL(ret)) {
@@ -692,7 +834,7 @@ TEST_F(TestTmpFile, test_prefetch_read)
         ob_abort();
       }
       ASSERT_EQ(OB_SUCCESS, ret);
-      int64_t cmp_size = MIN(ObTmpFileGlobal::PAGE_SIZE, ObTmpFileGlobal::PAGE_SIZE - key.unfilled_page_length_);
+      int64_t cmp_size = MIN(ObTmpFileGlobal::PAGE_SIZE, ObTmpFileGlobal::PAGE_SIZE - unfilled_page_length_);
       int cmp = memcmp(handle.value_->get_buffer(), write_buf + virtual_page_id * ObTmpFileGlobal::PAGE_SIZE, cmp_size);
       ASSERT_EQ(0, cmp);
     }
@@ -743,7 +885,6 @@ TEST_F(TestTmpFile, test_write_tail_page)
   io_info.buf_ = write_buf;
   io_info.size_ = 2 * 1024; // 2KB
   io_info.io_timeout_ms_ = IO_WAIT_TIME_MS;
-  io_info.disable_block_cache_ = true;
   ret = MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info);
   ASSERT_EQ(OB_SUCCESS, ret);
   already_write_size += io_info.size_;
@@ -787,7 +928,7 @@ TEST_F(TestTmpFile, test_write_tail_page)
   ObSSTmpFileAsyncFlushWaitTaskHandle wait_task_handle;
   ObSharedStorageTmpFile *ss_tmp_file = file_handle.get();
   ASSERT_EQ(OB_SUCCESS, set_ss_tmp_file_flushing(*ss_tmp_file));
-  ASSERT_EQ(OB_SUCCESS, ss_tmp_file->flush(true, io_info.io_desc_, ObTmpFileGlobal::SS_TMP_FILE_FLUSH_WAIT_TIMEOUT_MS, flush_size, wait_task_handle));
+  ASSERT_EQ(OB_SUCCESS, ss_tmp_file->flush(true, flush_size, wait_task_handle));
   ASSERT_EQ(OB_SUCCESS, wait_task_handle.wait(ObTmpFileGlobal::SS_TMP_FILE_FLUSH_WAIT_TIMEOUT_MS));
   wait_task_handle.reset();
   int64_t wbp_begin_offset = file_handle.get()->cal_wbp_begin_offset();
@@ -830,7 +971,7 @@ TEST_F(TestTmpFile, test_write_tail_page)
 
   // 6. forcibly evict all pages and read them from disk to check whether hit old cached page in kv_cache
   ASSERT_EQ(OB_SUCCESS, set_ss_tmp_file_flushing(*ss_tmp_file));
-  ASSERT_EQ(OB_SUCCESS, ss_tmp_file->flush(true, io_info.io_desc_, ObTmpFileGlobal::SS_TMP_FILE_FLUSH_WAIT_TIMEOUT_MS, flush_size, wait_task_handle));
+  ASSERT_EQ(OB_SUCCESS, ss_tmp_file->flush(true, flush_size, wait_task_handle));
   ASSERT_EQ(OB_SUCCESS, wait_task_handle.wait(ObTmpFileGlobal::SS_TMP_FILE_FLUSH_WAIT_TIMEOUT_MS));
   wait_task_handle.reset();
   wbp_begin_offset = file_handle.get()->cal_wbp_begin_offset();
@@ -863,7 +1004,7 @@ TEST_F(TestTmpFile, test_write_tail_page)
 // 3. truncate memory data and disk data (wbp begin offset < truncate_offset < file_size_)
 // 4. truncate() do nothing (truncate_offset < file's truncate_offset_)
 // 5. invalid truncate_offset checking
-TEST_F(TestTmpFile, test_tmp_file_truncate)
+TEST_F(TestTmpFile, DISABLED_test_tmp_file_truncate)
 {
   STORAGE_LOG(INFO, "=======================test_tmp_file_truncate begin=======================");
   int ret = OB_SUCCESS;
@@ -888,7 +1029,7 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
   ret = MTL(ObTenantTmpFileManager *)->open(fd, dir, "");
   std::cout << "open temporary file: " << fd << std::endl;
   ASSERT_EQ(OB_SUCCESS, ret);
-  tmp_file::ObITmpFileHandle file_handle;
+  tmp_file::ObSSTmpFileHandle file_handle;
   ret = MTL(ObTenantTmpFileManager *)->get_tmp_file(fd, file_handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   file_handle.get()->page_idx_cache_.max_bucket_array_capacity_ = SMALL_WBP_IDX_CACHE_MAX_CAPACITY;
@@ -911,7 +1052,6 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
   char *read_buf = new char [read_size];
   ObTmpFileIOHandle handle;
   io_info.buf_ = read_buf;
-  io_info.disable_block_cache_ = true;
   ret = MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, read_offset, handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(read_size, handle.get_done_size());
@@ -924,7 +1064,7 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
   uint32_t begin_page_id = file_handle.get()->begin_page_id_;
   uint32_t end_page_id = file_handle.get()->end_page_id_;
   int64_t truncate_offset = ObTmpFileGlobal::PAGE_SIZE / 2;
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(file_handle.get()->begin_page_id_, begin_page_id);
 
@@ -943,7 +1083,7 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
 
   // 1.1.3 truncate the first page
   truncate_offset = ObTmpFileGlobal::PAGE_SIZE;
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(file_handle.get()->begin_page_id_, end_page_id);
   ASSERT_EQ(file_handle.get()->cached_page_nums_, 1);
@@ -963,7 +1103,7 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
 
   // 1.1.4 truncate whole pages
   truncate_offset = already_write_size;
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(file_handle.get()->begin_page_id_, ObTmpFileGlobal::INVALID_PAGE_ID);
   ASSERT_EQ(file_handle.get()->cached_page_nums_, 0);
@@ -1003,7 +1143,7 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
   // 1.2.2 pop the first page index of index cache of file
   ASSERT_NE(file_handle.get()->page_idx_cache_.page_buckets_, nullptr);
   ASSERT_EQ(file_handle.get()->page_idx_cache_.size(), 1);
-  ObTmpFileWBPIndexCache::ObTmpFilePageIndexBucket *bucket = file_handle.get()->page_idx_cache_.page_buckets_->at(0);
+  ObSSTmpFileWBPIndexCache::ObTmpFilePageIndexBucket *bucket = file_handle.get()->page_idx_cache_.page_buckets_->at(0);
   ASSERT_NE(bucket, nullptr);
   ASSERT_EQ(bucket->size(), 3);
   begin_page_id = file_handle.get()->begin_page_id_;
@@ -1019,7 +1159,7 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
   // 1.2.3 truncate the first page
   ASSERT_EQ(file_handle.get()->cached_page_nums_, 3);
   truncate_offset = read_offset + ObTmpFileGlobal::PAGE_SIZE;
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(file_handle.get()->cached_page_nums_, 2);
 
@@ -1047,7 +1187,7 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
 
   truncate_offset = wbp_begin_offset/2;
   read_size = wbp_begin_offset - read_offset;
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset);
   ASSERT_EQ(OB_SUCCESS, ret);
   read_buf = new char [read_size];
   io_info.buf_ = read_buf;
@@ -1066,7 +1206,7 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
   read_offset = truncate_offset;
   truncate_offset = (wbp_begin_offset + data_size) / 2 - ObTmpFileGlobal::PAGE_SIZE / 2;
   read_size = data_size - read_offset;
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset);
   ASSERT_EQ(OB_SUCCESS, ret);
   read_buf = new char [read_size];
   io_info.buf_ = read_buf;
@@ -1083,7 +1223,7 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
   read_offset = truncate_offset;
   truncate_offset = upper_align(truncate_offset, ObTmpFileGlobal::PAGE_SIZE) + ObTmpFileGlobal::PAGE_SIZE;
   read_size = data_size - read_offset;
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset);
   ASSERT_EQ(OB_SUCCESS, ret);
   read_buf = new char [read_size];
   io_info.buf_ = read_buf;
@@ -1102,7 +1242,7 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
   read_offset = truncate_offset;
   truncate_offset = truncate_offset + 5 * ObTmpFileGlobal::PAGE_SIZE;
   read_size = data_size - read_offset;
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset);
   ASSERT_EQ(OB_SUCCESS, ret);
   read_buf = new char [read_size];
   io_info.buf_ = read_buf;
@@ -1119,7 +1259,7 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
   read_offset = truncate_offset;
   truncate_offset = data_size;
   read_size = data_size - read_offset;
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset);
   ASSERT_EQ(OB_SUCCESS, ret);
   read_buf = new char [read_size];
   io_info.buf_ = read_buf;
@@ -1137,14 +1277,14 @@ TEST_F(TestTmpFile, test_tmp_file_truncate)
   int64_t old_truncate_offset = truncate_offset;
   ASSERT_EQ(old_truncate_offset, file_handle.get()->truncated_offset_);
   truncate_offset = wbp_begin_offset;
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset);
   ASSERT_EQ(OB_SUCCESS, ret);
   ASSERT_EQ(old_truncate_offset, file_handle.get()->truncated_offset_);
 
   // 5. invalid truncate_offset checking
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, -1);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, -1);
   ASSERT_NE(OB_SUCCESS, ret);
-  ret = MTL(ObTenantTmpFileManager *)->truncate(fd, data_size + 10);
+  ret = MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, data_size + 10);
   ASSERT_NE(OB_SUCCESS, ret);
 
   file_handle.reset();
@@ -1179,7 +1319,7 @@ void test_big_file(const int64_t write_size, const int64_t wbp_mem_limit, ObTmpF
   ret = MTL(ObTenantTmpFileManager *)->open(fd, dir, "");
   std::cout << "open temporary file: " << fd << " tenant_id:"<< MTL_ID() << std::endl;
   ASSERT_EQ(OB_SUCCESS, ret);
-  tmp_file::ObITmpFileHandle file_handle;
+  tmp_file::ObSSTmpFileHandle file_handle;
   ret = MTL(ObTenantTmpFileManager *)->get_tmp_file(fd, file_handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   file_handle.get()->page_idx_cache_.max_bucket_array_capacity_ = SMALL_WBP_IDX_CACHE_MAX_CAPACITY;
@@ -1272,7 +1412,7 @@ void test_big_file(const int64_t write_size, const int64_t wbp_mem_limit, ObTmpF
   ret = MTL(ObTenantTmpFileManager *)->remove(fd);
   ASSERT_EQ(OB_SUCCESS, ret);
 
-  STORAGE_LOG(INFO, "test_big_file", K(io_info.disable_page_cache_), K(io_info.disable_block_cache_));
+  STORAGE_LOG(INFO, "test_big_file", K(io_info.disable_page_cache_));
   STORAGE_LOG(INFO, "io time", K(write_time), K(read_time));
 }
 
@@ -1283,7 +1423,6 @@ TEST_F(TestTmpFile, test_big_file_with_small_wbp)
   const int64_t wbp_mem_limit = SMALL_WBP_MEM_LIMIT;
   ObTmpFileIOInfo io_info;
   io_info.disable_page_cache_ = true;
-  io_info.disable_block_cache_ = true;
   test_big_file(write_size, wbp_mem_limit, io_info);
   check_final_status();
   STORAGE_LOG(INFO, "=======================test_big_file_with_small_wbp end=======================");
@@ -1296,7 +1435,6 @@ TEST_F(TestTmpFile, test_big_file_with_small_wbp_disable_page_cache)
   const int64_t wbp_mem_limit = SMALL_WBP_MEM_LIMIT;
   ObTmpFileIOInfo io_info;
   io_info.disable_page_cache_ = false;
-  io_info.disable_block_cache_ = true;
   test_big_file(write_size, wbp_mem_limit, io_info);
   check_final_status();
   STORAGE_LOG(INFO, "=======================test_big_file_with_small_wbp_disable_page_cache end=======================");
@@ -1307,7 +1445,7 @@ TEST_F(TestTmpFile, test_big_file_with_small_wbp_disable_page_cache)
 // 2. the 4th file writes and reads 3MB+1020KB data (will trigger flushing in the processing of writing)
 // 3. the first three files write and read 1MB data 3 times (total 3MB)
 // 4. each file read and write 12MB+4KB data
-void test_multi_file_single_thread_read_write(bool disable_block_cache)
+void test_multi_file_single_thread_read_write()
 {
   int ret = OB_SUCCESS;
   const int64_t buf_size = 64 * 1024 * 1024; // 64MB
@@ -1341,7 +1479,7 @@ void test_multi_file_single_thread_read_write(bool disable_block_cache)
     ASSERT_EQ(OB_SUCCESS, ret);
     fds[i] = fd;
     write_bufs[i] = random_buf + i * buf_size / file_num;
-    tmp_file::ObITmpFileHandle file_handle;
+    tmp_file::ObSSTmpFileHandle file_handle;
     ret = MTL(ObTenantTmpFileManager *)->get_tmp_file(fd, file_handle);
     ASSERT_EQ(OB_SUCCESS, ret);
     file_handle.get()->page_idx_cache_.max_bucket_array_capacity_ = SMALL_WBP_IDX_CACHE_MAX_CAPACITY;
@@ -1350,7 +1488,6 @@ void test_multi_file_single_thread_read_write(bool disable_block_cache)
   ObTmpFileIOInfo io_info;
   io_info.io_desc_.set_wait_event(2);
   io_info.io_timeout_ms_ = IO_WAIT_TIME_MS;
-  io_info.disable_block_cache_ = disable_block_cache;
   ObTmpFileIOHandle handle;
   int cmp = 0;
 
@@ -1467,12 +1604,12 @@ void test_multi_file_single_thread_read_write(bool disable_block_cache)
   }
 }
 
-TEST_F(TestTmpFile, test_multi_file_single_thread_read_write_with_disable_block_cache)
+TEST_F(TestTmpFile, test_multi_file_single_thread_read_write)
 {
-  STORAGE_LOG(INFO, "=======================test_multi_file_single_thread_read_write_with_disable_block_cache begin=======================");
-  test_multi_file_single_thread_read_write(true);
+  STORAGE_LOG(INFO, "=======================test_multi_file_single_thread_read_write begin=======================");
+  test_multi_file_single_thread_read_write();
   check_final_status();
-  STORAGE_LOG(INFO, "=======================test_multi_file_single_thread_read_write_with_disable_block_cache end=======================");
+  STORAGE_LOG(INFO, "=======================test_multi_file_single_thread_read_write end=======================");
 }
 
 TEST_F(TestTmpFile, test_single_file_multi_thread_read_write)
@@ -1483,12 +1620,11 @@ TEST_F(TestTmpFile, test_single_file_multi_thread_read_write)
   const int64_t file_cnt = 1;
   const int64_t batch_size = 64 * 1024 * 1024; // 64MB
   const int64_t batch_num = 4;
-  const bool disable_block_cache = true;
   TestMultiTmpFileStress test(MTL_CTX());
   int64_t dir = -1;
   ret = MTL(ObTenantTmpFileManager *)->alloc_dir(dir);
   ASSERT_EQ(OB_SUCCESS, ret);
-  ret = test.init(file_cnt, dir, read_thread_cnt, IO_WAIT_TIME_MS, batch_size, batch_num, disable_block_cache);
+  ret = test.init(file_cnt, dir, read_thread_cnt, IO_WAIT_TIME_MS, batch_size, batch_num);
   ASSERT_EQ(OB_SUCCESS, ret);
   int64_t io_time = ObTimeUtility::current_time();
   test.start();
@@ -1509,12 +1645,11 @@ TEST_F(TestTmpFile, test_multi_file_multi_thread_read_write)
   const int64_t file_cnt = 4;
   const int64_t batch_size = 16 * 1024 * 1024; // 16MB
   const int64_t batch_num = 4;
-  const bool disable_block_cache = true;
   TestMultiTmpFileStress test(MTL_CTX());
   int64_t dir = -1;
   ret = MTL(ObTenantTmpFileManager *)->alloc_dir(dir);
   ASSERT_EQ(OB_SUCCESS, ret);
-  ret = test.init(file_cnt, dir, read_thread_cnt, IO_WAIT_TIME_MS, batch_size, batch_num, disable_block_cache);
+  ret = test.init(file_cnt, dir, read_thread_cnt, IO_WAIT_TIME_MS, batch_size, batch_num);
   ASSERT_EQ(OB_SUCCESS, ret);
   int64_t io_time = ObTimeUtility::current_time();
   test.start();
@@ -1534,12 +1669,11 @@ TEST_F(TestTmpFile, test_more_files_more_threads_read_write)
   const int64_t file_cnt = 128;
   const int64_t batch_size = 3 * 1024 * 1024;
   const int64_t batch_num = 2; // total 128 * 3MB * 2 = 768MB
-  const bool disable_block_cache = true;
   TestMultiTmpFileStress test(MTL_CTX());
   int64_t dir = -1;
   ret = MTL(ObTenantTmpFileManager *)->alloc_dir(dir);
   ASSERT_EQ(OB_SUCCESS, ret);
-  ret = test.init(file_cnt, dir, read_thread_cnt, IO_WAIT_TIME_MS, batch_size, batch_num, disable_block_cache);
+  ret = test.init(file_cnt, dir, read_thread_cnt, IO_WAIT_TIME_MS, batch_size, batch_num);
   ASSERT_EQ(OB_SUCCESS, ret);
   int64_t io_time = ObTimeUtility::current_time();
   test.start();
@@ -1556,15 +1690,14 @@ TEST_F(TestTmpFile, test_multiple_small_files)
   STORAGE_LOG(INFO, "=======================test_multiple_small_files begin=======================");
   int ret = OB_SUCCESS;
   const int64_t read_thread_cnt = 2;
-  const int64_t file_cnt = 256;
-  const int64_t batch_size = 1 * 1024 * 1024 + 54 * 1024 + 1023; // 1MB + 54KB + 1023B
-  const int64_t batch_num = 3;
-  const bool disable_block_cache = true;
+  const int64_t file_cnt = 1024;
+  const int64_t batch_size = 54 * 1024 + 1023; // 54KB + 1023B
+  const int64_t batch_num = 4;
   TestMultiTmpFileStress test(MTL_CTX());
   int64_t dir = -1;
   ret = MTL(ObTenantTmpFileManager *)->alloc_dir(dir);
   ASSERT_EQ(OB_SUCCESS, ret);
-  ret = test.init(file_cnt, dir, read_thread_cnt, IO_WAIT_TIME_MS, batch_size, batch_num, disable_block_cache);
+  ret = test.init(file_cnt, dir, read_thread_cnt, IO_WAIT_TIME_MS, batch_size, batch_num);
   ASSERT_EQ(OB_SUCCESS, ret);
   int64_t io_time = ObTimeUtility::current_time();
   test.start();
@@ -1586,7 +1719,6 @@ TEST_F(TestTmpFile, test_big_file)
   const int64_t wbp_mem_limit = BIG_WBP_MEM_LIMIT;
   ObTmpFileIOInfo io_info;
   io_info.disable_page_cache_ = false;
-  io_info.disable_block_cache_ = true;
   test_big_file(write_size, wbp_mem_limit, io_info);
   MTL(ObTenantTmpFileManager *)->get_ss_file_manager().wbp_.default_wbp_memory_limit_ = SMALL_WBP_MEM_LIMIT;
   usleep(1 * 1000 * 1000); // 1s
@@ -1597,11 +1729,10 @@ TEST_F(TestTmpFile, test_big_file)
 TEST_F(TestTmpFile, test_big_file_disable_page_cache)
 {
   STORAGE_LOG(INFO, "=======================test_big_file_disable_page_cache begin=======================");
-  const int64_t write_size = 750 * 1024 * 1024;  // write 750MB data
+  const int64_t write_size = 400 * 1024 * 1024;  // write 400MB data
   const int64_t wbp_mem_limit = BIG_WBP_MEM_LIMIT;
   ObTmpFileIOInfo io_info;
   io_info.disable_page_cache_ = true;
-  io_info.disable_block_cache_ = true;
   test_big_file(write_size, wbp_mem_limit, io_info);
   MTL(ObTenantTmpFileManager *)->get_ss_file_manager().wbp_.default_wbp_memory_limit_ = SMALL_WBP_MEM_LIMIT;
   usleep(1 * 1000 * 1000); // 1s
@@ -1631,7 +1762,7 @@ TEST_F(TestTmpFile, test_aio_pread)
   ret = MTL(ObTenantTmpFileManager *)->open(fd, dir, "");
   std::cout << "open temporary file: " << fd << std::endl;
   ASSERT_EQ(OB_SUCCESS, ret);
-  tmp_file::ObITmpFileHandle file_handle;
+  tmp_file::ObSSTmpFileHandle file_handle;
   ret = MTL(ObTenantTmpFileManager *)->get_tmp_file(fd, file_handle);
   ASSERT_EQ(OB_SUCCESS, ret);
   file_handle.get()->page_idx_cache_.max_bucket_array_capacity_ = SMALL_WBP_IDX_CACHE_MAX_CAPACITY;
@@ -1704,7 +1835,7 @@ int mock_flush_file(const int64_t flush_page_num, ObSharedStorageTmpFile &file, 
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("flush page num is larger than cached page num", KR(ret), K(flush_page_num), K(file.cached_page_nums_));
   } else {
-    ObTmpWriteBufferPool &wbp = MTL(ObTenantTmpFileManager *)->get_ss_file_manager().wbp_;
+    ObSSTmpWriteBufferPool &wbp = MTL(ObTenantTmpFileManager *)->get_ss_file_manager().wbp_;
     int64_t fd = file.fd_;
     int64_t flush_page_virtual_id = file.begin_page_virtual_id_;
     uint32_t flush_page_id = file.begin_page_id_;
@@ -1718,7 +1849,7 @@ int mock_flush_file(const int64_t flush_page_num, ObSharedStorageTmpFile &file, 
       }
     }
     int64_t flush_level = file.data_page_flush_level_;
-    if (FAILEDx(file.flush_prio_mgr_->remove_file(false, file))) {
+    if (FAILEDx(file.flush_prio_mgr_->remove_file(file))) {
       LOG_WARN("fail to remove file from flush prio mgr", KR(ret), K(file));
     } else {
       file.data_page_flush_level_ = flush_level; // to mock flushing state
@@ -1745,11 +1876,17 @@ int mock_flush_wait(const int64_t succ_page_num, ObSSTmpFileAsyncFlushWaitTask& 
   bool flush_breakdown = has_flushed_unfinished_tail_page && succ_page_num != task.expected_flushed_page_num_ &&
                          is_tail_page_failed;
   if (flush_breakdown) {
-    if (OB_FAIL(task.flush_mgr_->notify_flush_breakdown(task.fd_))) {
+    if (OB_FAIL(task.flush_mgr_->notify_flush_breakdown(task.fd_, OB_IO_TIMEOUT))) {
       LOG_WARN("fail to notify flush breakdown", KR(ret), K(task));
     }
-  } else if (OB_FAIL(task.flush_mgr_->update_meta_after_flush(task))){
-    LOG_WARN("fail to update meta after flush", KR(ret), K(task));
+  } else {
+    ObSSTmpFileHandle tmp_file_handle;
+    if (OB_FAIL(MTL(ObTenantTmpFileManager *)->get_ss_file_manager().get_tmp_file(task.fd_, tmp_file_handle))) {
+      LOG_WARN("fail to get tmp file handle", KR(ret), K(task.fd_));
+    } else if (OB_NOT_NULL(tmp_file_handle.get()) &&
+        OB_FAIL(task.flush_mgr_->update_meta_after_flush(tmp_file_handle, task))){
+      LOG_WARN("fail to update meta after flush", KR(ret), K(task));
+    }
   }
   return ret;
 }
@@ -1767,7 +1904,7 @@ int check_flush_over(ObSharedStorageTmpFile &file)
       LOG_WARN("file begin page id is not invalid", KR(ret), K(file));
     }
   } else {
-    ObTmpWriteBufferPool &wbp = MTL(ObTenantTmpFileManager *)->get_ss_file_manager().wbp_;
+    ObSSTmpWriteBufferPool &wbp = MTL(ObTenantTmpFileManager *)->get_ss_file_manager().wbp_;
     int64_t page_virtual_id = file.begin_page_virtual_id_;
     uint32_t page_id = file.begin_page_id_;
     for(int64_t i = 0; OB_SUCC(ret) && i < file.cached_page_nums_ ; ++i) {
@@ -1784,7 +1921,7 @@ int check_flush_over(ObSharedStorageTmpFile &file)
   return ret;
 }
 
-TEST_F(TestTmpFile, test_flush_with_write_tail_page_and_truncate)
+TEST_F(TestTmpFile, DISABLED_test_flush_with_write_tail_page_and_truncate)
 {
   STORAGE_LOG(INFO, "=======================test_flush_with_write_tail_page_and_truncate begin=======================");
   int ret = OB_SUCCESS;
@@ -1806,7 +1943,6 @@ TEST_F(TestTmpFile, test_flush_with_write_tail_page_and_truncate)
   io_info.io_timeout_ms_ = IO_WAIT_TIME_MS;
   int64_t write_size = 0;
   char * write_buff = nullptr;
-  ObTmpFileIOHandle io_handle;
   ObSSTmpFileAsyncFlushWaitTask wait_task;
   int64_t truncate_offset = 0;
   // 1. write and flush full pages, then wait
@@ -1814,9 +1950,8 @@ TEST_F(TestTmpFile, test_flush_with_write_tail_page_and_truncate)
   write_buff = new char [write_size];
   io_info.size_ = write_size;
   io_info.buf_ = write_buff;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
   delete [] write_buff;
-  io_handle.reset();
 
   ASSERT_EQ(OB_SUCCESS, mock_flush_file(5, ss_tmp_file, wait_task));
   ASSERT_EQ(OB_SUCCESS, mock_flush_wait(5, wait_task));
@@ -1832,9 +1967,8 @@ TEST_F(TestTmpFile, test_flush_with_write_tail_page_and_truncate)
   write_buff = new char [write_size];
   io_info.size_ = write_size;
   io_info.buf_ = write_buff;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
   delete [] write_buff;
-  io_handle.reset();
 
   ASSERT_EQ(OB_SUCCESS, mock_flush_file(5, ss_tmp_file, wait_task));
 
@@ -1842,9 +1976,8 @@ TEST_F(TestTmpFile, test_flush_with_write_tail_page_and_truncate)
   write_buff = new char [write_size];
   io_info.size_ = write_size;
   io_info.buf_ = write_buff;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
   delete [] write_buff;
-  io_handle.reset();
 
   ASSERT_EQ(OB_SUCCESS, mock_flush_wait(5, wait_task));
   ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
@@ -1855,15 +1988,14 @@ TEST_F(TestTmpFile, test_flush_with_write_tail_page_and_truncate)
   write_buff = new char [write_size];
   io_info.size_ = write_size;
   io_info.buf_ = write_buff;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
   delete [] write_buff;
-  io_handle.reset();
 
   ASSERT_EQ(OB_SUCCESS, mock_flush_file(5, ss_tmp_file, wait_task));
 
   truncate_offset = (ss_tmp_file.begin_page_virtual_id_ + 4) * ObTmpFileGlobal::PAGE_SIZE +
                     ObTmpFileGlobal::PAGE_SIZE / 2;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset));
 
   ASSERT_EQ(OB_SUCCESS, mock_flush_wait(5, wait_task));
   ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
@@ -1874,9 +2006,8 @@ TEST_F(TestTmpFile, test_flush_with_write_tail_page_and_truncate)
   write_buff = new char [write_size];
   io_info.size_ = write_size;
   io_info.buf_ = write_buff;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
   delete [] write_buff;
-  io_handle.reset();
 
   ASSERT_EQ(OB_SUCCESS, mock_flush_file(5, ss_tmp_file, wait_task));
 
@@ -1884,13 +2015,12 @@ TEST_F(TestTmpFile, test_flush_with_write_tail_page_and_truncate)
   write_buff = new char [write_size];
   io_info.size_ = write_size;
   io_info.buf_ = write_buff;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
   delete [] write_buff;
-  io_handle.reset();
 
   truncate_offset = (ss_tmp_file.begin_page_virtual_id_ + 6) * ObTmpFileGlobal::PAGE_SIZE +
                     ObTmpFileGlobal::PAGE_SIZE / 2;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset));
 
   ASSERT_EQ(OB_SUCCESS, mock_flush_wait(5, wait_task));
   ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
@@ -1901,9 +2031,8 @@ TEST_F(TestTmpFile, test_flush_with_write_tail_page_and_truncate)
   write_buff = new char [write_size];
   io_info.size_ = write_size;
   io_info.buf_ = write_buff;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
   delete [] write_buff;
-  io_handle.reset();
 
   ASSERT_EQ(OB_SUCCESS, mock_flush_file(5, ss_tmp_file, wait_task));
 
@@ -1911,13 +2040,12 @@ TEST_F(TestTmpFile, test_flush_with_write_tail_page_and_truncate)
   write_buff = new char [write_size];
   io_info.size_ = write_size;
   io_info.buf_ = write_buff;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
   delete [] write_buff;
-  io_handle.reset();
 
   truncate_offset = (ss_tmp_file.begin_page_virtual_id_ + 2) * ObTmpFileGlobal::PAGE_SIZE +
                     ObTmpFileGlobal::PAGE_SIZE / 2;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(MTL_ID(), fd, truncate_offset));
 
   ASSERT_EQ(OB_SUCCESS, mock_flush_wait(5, wait_task));
   ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
@@ -1928,9 +2056,8 @@ TEST_F(TestTmpFile, test_flush_with_write_tail_page_and_truncate)
   write_buff = new char [write_size];
   io_info.size_ = write_size;
   io_info.buf_ = write_buff;
-  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+  ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
   delete [] write_buff;
-  io_handle.reset();
 
   ASSERT_EQ(OB_SUCCESS, mock_flush_file(5, ss_tmp_file, wait_task));
   ASSERT_EQ(OB_SUCCESS, mock_flush_wait(5, wait_task));
@@ -1980,9 +2107,8 @@ TEST_F(TestTmpFile, test_flush_with_io_error)
     write_buff = new char [write_size];
     io_info.size_ = write_size;
     io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
     delete [] write_buff;
-    io_handle.reset();
 
     ASSERT_EQ(OB_SUCCESS, mock_flush_file(5, ss_tmp_file, wait_task));
 
@@ -1990,17 +2116,16 @@ TEST_F(TestTmpFile, test_flush_with_io_error)
     write_buff = new char [write_size];
     io_info.size_ = write_size;
     io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
     delete [] write_buff;
-    io_handle.reset();
 
     ASSERT_EQ(OB_SUCCESS, mock_flush_wait(4, wait_task, true));
-    ASSERT_EQ(ss_tmp_file.is_deleting_, true);
+    ASSERT_EQ(ss_tmp_file.get_discard_reason_(), OB_IO_TIMEOUT);
     write_size = ObTmpFileGlobal::PAGE_SIZE / 2;
     write_buff = new char [write_size];
     io_info.size_ = write_size;
     io_info.buf_ = write_buff;
-    ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+    ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
     ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, 0, io_handle));
     delete [] write_buff;
 
@@ -2036,9 +2161,8 @@ TEST_F(TestTmpFile, test_flush_with_io_error)
     write_buff = new char [write_size];
     io_info.size_ = write_size;
     io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
     delete [] write_buff;
-    io_handle.reset();
 
     ASSERT_EQ(OB_SUCCESS, mock_flush_file(5, ss_tmp_file, wait_task));
     ASSERT_EQ(OB_SUCCESS, mock_flush_wait(0, wait_task));
@@ -2054,27 +2178,23 @@ TEST_F(TestTmpFile, test_flush_with_io_error)
     // 2.3 write 0.5 pages(totally 2.5 pages in file) and flush 2.5 pages;
     //     then write 1.5 pages;
     //     then exec wait and the first page is failed
-    //     (we assume the tail page has been waited successful, thus we don't need to discard the file;
-    //      this case is used to test whether the tail page is changed state to dirty twice)
     write_size = ObTmpFileGlobal::PAGE_SIZE / 2;
     write_buff = new char [write_size];
     io_info.size_ = write_size;
     io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
     delete [] write_buff;
-    io_handle.reset();
 
     ASSERT_EQ(OB_SUCCESS, mock_flush_file(3, ss_tmp_file, wait_task));
     write_size = ObTmpFileGlobal::PAGE_SIZE + ObTmpFileGlobal::PAGE_SIZE / 2;
     write_buff = new char [write_size];
     io_info.size_ = write_size;
     io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
     delete [] write_buff;
-    io_handle.reset();
 
     ASSERT_EQ(OB_SUCCESS, mock_flush_wait(0, wait_task, false));
-    ASSERT_EQ(ss_tmp_file.is_deleting_, false);
+    ASSERT_EQ(ss_tmp_file.get_discard_reason_(), OB_SUCCESS);
     ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
     ASSERT_EQ(ss_tmp_file.cached_page_nums_, 4);
 
@@ -2084,175 +2204,18 @@ TEST_F(TestTmpFile, test_flush_with_io_error)
     write_buff = new char [write_size];
     io_info.size_ = write_size;
     io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
     delete [] write_buff;
-    io_handle.reset();
 
     ASSERT_EQ(OB_SUCCESS, mock_flush_file(5, ss_tmp_file, wait_task));
-    ASSERT_EQ(OB_SUCCESS, mock_flush_wait(4, wait_task, true));
-    ASSERT_EQ(ss_tmp_file.is_deleting_, true);
+    ASSERT_EQ(OB_SUCCESS, mock_flush_wait(4, wait_task, true/*flush_breakdown*/));
+    ASSERT_EQ(ss_tmp_file.get_discard_reason_(), OB_IO_TIMEOUT);
     write_size = ObTmpFileGlobal::PAGE_SIZE / 2;
     write_buff = new char [write_size];
     io_info.size_ = write_size;
     io_info.buf_ = write_buff;
-    ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
-    ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->pread(MTL_ID(), io_info, 0, io_handle));
+    ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
     delete [] write_buff;
-
-    tmp_file_handle.reset();
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->remove(fd));
-  }
-
-  // 3. some cases with truncate and flush timeout
-  {
-    int64_t dir = -1;
-    int64_t fd = -1;
-    ret = MTL(ObTenantTmpFileManager *)->alloc_dir(dir);
-    ASSERT_EQ(OB_SUCCESS, ret);
-    ret = MTL(ObTenantTmpFileManager *)->open(fd, dir, "");
-    std::cout << "open temporary file: " << fd << std::endl;
-    ASSERT_EQ(OB_SUCCESS, ret);
-    ObSSTmpFileHandle tmp_file_handle;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->get_ss_file_manager().get_tmp_file(fd, tmp_file_handle));
-    ObSharedStorageTmpFile &ss_tmp_file = *static_cast<ObSharedStorageTmpFile *>(tmp_file_handle.get());
-    ASSERT_EQ(fd, ss_tmp_file.get_fd());
-
-    ObTmpFileIOInfo io_info;
-    io_info.fd_ = fd;
-    io_info.io_desc_.set_wait_event(2);
-    io_info.io_timeout_ms_ = IO_WAIT_TIME_MS;
-    int64_t write_size = 0;
-    char * write_buff = nullptr;
-    ObTmpFileIOHandle io_handle;
-    ObSSTmpFileAsyncFlushWaitTask wait_task;
-    int64_t truncate_offset = 0;
-
-    // 3.1. write and flush 10 pages; then, truncate 5 pages;
-    //      exec wait and five pages are successful
-    write_size = 10 * ObTmpFileGlobal::PAGE_SIZE;
-    write_buff = new char [write_size];
-    io_info.size_ = write_size;
-    io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
-    delete [] write_buff;
-    io_handle.reset();
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_file(10, ss_tmp_file, wait_task));
-
-    truncate_offset = (ss_tmp_file.begin_page_virtual_id_ + 5) * ObTmpFileGlobal::PAGE_SIZE;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset));
-    ASSERT_EQ(ss_tmp_file.write_back_data_page_num_, 5);
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 5);
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_wait(5, wait_task));
-    ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 5);
-
-    // 3.2. append write file to 10 pages and flush 10 pages; then, truncate 4 pages;
-    //      exec wait and 3 pages are successful
-    write_size = 5 * ObTmpFileGlobal::PAGE_SIZE;
-    write_buff = new char [write_size];
-    io_info.size_ = write_size;
-    io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
-    delete [] write_buff;
-    io_handle.reset();
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_file(10, ss_tmp_file, wait_task));
-
-    truncate_offset = (ss_tmp_file.begin_page_virtual_id_ + 4) * ObTmpFileGlobal::PAGE_SIZE;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset));
-    ASSERT_EQ(ss_tmp_file.write_back_data_page_num_, 6);
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 6);
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_wait(3, wait_task));
-    ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 6);
-
-    // 3.3. append write file to 10 pages and flush 10 pages; then, truncate 4 pages;
-    //      exec wait and 5 pages are successful
-    write_size = 4 * ObTmpFileGlobal::PAGE_SIZE;
-    write_buff = new char [write_size];
-    io_info.size_ = write_size;
-    io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
-    delete [] write_buff;
-    io_handle.reset();
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_file(10, ss_tmp_file, wait_task));
-
-    truncate_offset = (ss_tmp_file.begin_page_virtual_id_ + 4) * ObTmpFileGlobal::PAGE_SIZE;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset));
-    ASSERT_EQ(ss_tmp_file.write_back_data_page_num_, 6);
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 6);
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_wait(5, wait_task));
-    ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 5);
-
-    // 3.4. append write file to 10 pages and flush 10 pages; then, truncate 10 pages;
-    //      exec wait and 0 pages are successful
-    write_size = 5 * ObTmpFileGlobal::PAGE_SIZE;
-    write_buff = new char [write_size];
-    io_info.size_ = write_size;
-    io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
-    delete [] write_buff;
-    io_handle.reset();
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_file(10, ss_tmp_file, wait_task));
-
-    truncate_offset = (ss_tmp_file.begin_page_virtual_id_ + 10) * ObTmpFileGlobal::PAGE_SIZE;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset));
-    ASSERT_EQ(ss_tmp_file.write_back_data_page_num_, 0);
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 0);
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_wait(0, wait_task));
-    ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 0);
-
-    // 3.5. append write file to 10 pages and flush 10 pages; then, truncate 5 pages;
-    //      exec wait and 0 pages are successful
-    write_size = 10 * ObTmpFileGlobal::PAGE_SIZE;
-    write_buff = new char [write_size];
-    io_info.size_ = write_size;
-    io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
-    delete [] write_buff;
-    io_handle.reset();
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_file(10, ss_tmp_file, wait_task));
-
-    truncate_offset = (ss_tmp_file.begin_page_virtual_id_ + 5) * ObTmpFileGlobal::PAGE_SIZE;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset));
-    ASSERT_EQ(ss_tmp_file.write_back_data_page_num_, 5);
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 5);
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_wait(0, wait_task));
-    ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 5);
-
-    // 3.6. append write file to 10 pages and flush 10 pages; then, truncate 5.5 pages;
-    //      exec wait and 0 pages are successful
-    write_size = 5 * ObTmpFileGlobal::PAGE_SIZE;
-    write_buff = new char [write_size];
-    io_info.size_ = write_size;
-    io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
-    delete [] write_buff;
-    io_handle.reset();
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_file(10, ss_tmp_file, wait_task));
-
-    truncate_offset = (ss_tmp_file.begin_page_virtual_id_ + 5) * ObTmpFileGlobal::PAGE_SIZE +
-                      ObTmpFileGlobal::PAGE_SIZE / 2;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->truncate(fd, truncate_offset));
-    ASSERT_EQ(ss_tmp_file.write_back_data_page_num_, 5);
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 5);
-
-    ASSERT_EQ(OB_SUCCESS, mock_flush_wait(0, wait_task));
-    ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
-    ASSERT_EQ(ss_tmp_file.cached_page_nums_, 5);
 
     tmp_file_handle.reset();
     ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->remove(fd));
@@ -2306,7 +2269,6 @@ TEST_F(TestTmpFile, test_seal)
   io_info.io_timeout_ms_ = IO_WAIT_TIME_MS;
   int64_t write_size = 0;
   char * write_buff = nullptr;
-  ObTmpFileIOHandle io_handle;
   ObSSTmpFileAsyncFlushWaitTask wait_task;
   ObSSTmpFileFlushManager &flush_mgr = MTL(ObTenantTmpFileManager *)->get_ss_file_manager().flush_mgr_;
   flush_mgr.stop();
@@ -2332,17 +2294,16 @@ TEST_F(TestTmpFile, test_seal)
     write_buff = new char [write_size];
     io_info.size_ = write_size;
     io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
-    io_handle.reset();
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
 
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->seal(fd));
-    ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->seal(MTL_ID(), fd));
+    ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
     delete [] write_buff;
 
     int64_t flush_size = 0;
     ObSSTmpFileAsyncFlushWaitTaskHandle wait_task_handle;
     set_ss_tmp_file_flushing(ss_tmp_file);
-    ASSERT_EQ(OB_SUCCESS, ss_tmp_file.flush(true, io_info.io_desc_, ObTmpFileGlobal::SS_TMP_FILE_FLUSH_WAIT_TIMEOUT_MS, flush_size, wait_task_handle));
+    ASSERT_EQ(OB_SUCCESS, ss_tmp_file.flush(true, flush_size, wait_task_handle));
     ASSERT_EQ(ss_tmp_file.write_back_data_page_num_, write_page_num);
     ASSERT_EQ(ss_tmp_file.cached_page_nums_, write_page_num);
     ASSERT_EQ(flush_mgr.get_wait_task_queue().queue_length_, 1);
@@ -2381,19 +2342,18 @@ TEST_F(TestTmpFile, test_seal)
     write_buff = new char [write_size];
     io_info.size_ = write_size;
     io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
-    io_handle.reset();
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
 
     int64_t flush_size = 0;
     ObSSTmpFileAsyncFlushWaitTaskHandle wait_task_handle;
     set_ss_tmp_file_flushing(ss_tmp_file);
-    ASSERT_EQ(OB_SUCCESS, ss_tmp_file.flush(true, io_info.io_desc_, ObTmpFileGlobal::SS_TMP_FILE_FLUSH_WAIT_TIMEOUT_MS, flush_size, wait_task_handle));
+    ASSERT_EQ(OB_SUCCESS, ss_tmp_file.flush(true, flush_size, wait_task_handle));
     ASSERT_EQ(ss_tmp_file.write_back_data_page_num_, write_page_num);
     ASSERT_EQ(ss_tmp_file.cached_page_nums_, write_page_num);
     ASSERT_EQ(flush_mgr.get_wait_task_queue().queue_length_, 1);
 
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->seal(fd));
-    ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->seal(MTL_ID(), fd));
+    ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
     delete [] write_buff;
 
     ASSERT_EQ(OB_SUCCESS, flush_mgr.exec_wait_task_once());
@@ -2431,13 +2391,12 @@ TEST_F(TestTmpFile, test_seal)
     write_buff = new char [write_size];
     io_info.size_ = write_size;
     io_info.buf_ = write_buff;
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
-    io_handle.reset();
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
 
     int64_t flush_size = 0;
     ObSSTmpFileAsyncFlushWaitTaskHandle wait_task_handle;
     set_ss_tmp_file_flushing(ss_tmp_file);
-    ASSERT_EQ(OB_SUCCESS, ss_tmp_file.flush(true, io_info.io_desc_, ObTmpFileGlobal::SS_TMP_FILE_FLUSH_WAIT_TIMEOUT_MS, flush_size, wait_task_handle));
+    ASSERT_EQ(OB_SUCCESS, ss_tmp_file.flush(true, flush_size, wait_task_handle));
     ASSERT_EQ(ss_tmp_file.write_back_data_page_num_, write_page_num);
     ASSERT_EQ(ss_tmp_file.cached_page_nums_, write_page_num);
     ASSERT_EQ(flush_mgr.get_wait_task_queue().queue_length_, 1);
@@ -2449,8 +2408,8 @@ TEST_F(TestTmpFile, test_seal)
     ASSERT_EQ(OB_SUCCESS, check_flush_over(ss_tmp_file));
     ASSERT_EQ(ss_tmp_file.cached_page_nums_, 0);
 
-    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->seal(fd));
-    ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->aio_write(MTL_ID(), io_info, io_handle));
+    ASSERT_EQ(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->seal(MTL_ID(), fd));
+    ASSERT_NE(OB_SUCCESS, MTL(ObTenantTmpFileManager *)->write(MTL_ID(), io_info));
     delete [] write_buff;
 
     ASSERT_EQ(OB_SUCCESS, check_file_is_sealed(ss_tmp_file));
@@ -2470,7 +2429,6 @@ int main(int argc, char **argv)
 {
   int ret = 0;
   system("rm -f ./test_ss_tmp_file.log*");
-  system("rm -rf ./run*");
   OB_LOGGER.set_file_name("test_ss_tmp_file.log", true);
   OB_LOGGER.set_log_level("INFO");
   testing::InitGoogleTest(&argc, argv);

@@ -52,6 +52,8 @@ public:
   bool is_valid() const;
   int init(compaction::ObBasicTabletMergeCtx &merge_ctx);
   int init(const compaction::ObMediumCompactionInfo &medium_info);
+  int init_parallel_merge(const compaction::ObParallelMergeInfo &paral_info);
+  int init_serial_merge();
   OB_INLINE int64_t get_concurrent_cnt() const { return concurrent_cnt_; }
   int get_merge_range(const int64_t parallel_idx, blocksstable::ObDatumRange &merge_range);
   static int get_concurrent_cnt(
@@ -65,11 +67,11 @@ private:
   static const int64_t PARALLEL_MERGE_TARGET_TASK_CNT = 20;
 
   //TODO @hanhui parallel in ai
-  int init_serial_merge();
   int init_parallel_mini_merge(compaction::ObBasicTabletMergeCtx &merge_ctx);
   int init_parallel_mini_minor_merge(compaction::ObBasicTabletMergeCtx &merge_ctx);
   int init_parallel_major_merge(compaction::ObBasicTabletMergeCtx &merge_ctx);
   void calc_adaptive_parallel_degree(
+      const compaction::ObMergeType merge_type,
       const int64_t prio,
       const int64_t mem_per_thread,
       const int64_t origin_degree,

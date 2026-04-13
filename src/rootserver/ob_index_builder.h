@@ -80,6 +80,7 @@ public:
                       share::schema::ObTableSchema &index_schema);
   bool is_drop_dense_vec_index_task(const obrpc::ObDropIndexArg &arg, const share::schema::ObTableSchema &index_schema);
   bool is_drop_with_docid_index_task(const obrpc::ObDropIndexArg &arg, const share::schema::ObTableSchema &index_schema);
+  bool is_drop_search_index_task(const obrpc::ObDropIndexArg &arg, const share::schema::ObTableSchema &index_schema);
   int check_drop_with_docid_indexs_ith_valid(
       const obrpc::ObDropIndexArg &arg,
       const share::schema::ObTableSchema &index_schema,
@@ -130,6 +131,9 @@ public:
                                 ObDDLTaskRecord &task_record);
   int drop_index_on_failed(const obrpc::ObDropIndexArg &arg, obrpc::ObDropIndexRes &res);
 private:
+  int get_index_row_store_type(const share::schema::ObIndexType index_type,
+                               const share::schema::ObTableSchema &data_schema,
+                               share::schema::ObTableSchema &index_schema);
   int recognize_vec_hnsw_index_schemas(
       const common::ObIArray<share::schema::ObTableSchema> &index_schemas,
       const bool is_vec_inner_drop,
@@ -138,7 +142,8 @@ private:
       int64_t &vid_rowkey_ith,
       int64_t &domain_index_ith,
       int64_t &index_id_ith,
-      int64_t &snapshot_data_ith);
+      int64_t &snapshot_data_ith,
+      int64_t &embedded_vec_ith);
   int recognize_vec_ivf_index_schemas(
       const common::ObIArray<share::schema::ObTableSchema> &index_schemas,
       const bool is_vec_inner_drop,
@@ -153,11 +158,18 @@ private:
       const common::ObIArray<share::schema::ObTableSchema> &index_schemas,
       const bool is_parent_task_dropping_fts,
       const bool is_parent_task_dropping_multivalue,
+      const bool is_parent_task_dropping_spiv,
       int64_t &index_ith,
       int64_t &aux_doc_word_ith,
       int64_t &aux_rowkey_doc_ith,
       int64_t &domain_index_ith,
       int64_t &aux_doc_rowkey_ith);
+    int recognize_search_index_schemas(
+      const common::ObIArray<share::schema::ObTableSchema> &index_schemas,
+      const bool is_parent_task_dropping_search_index,
+      int64_t &index_ith,
+      int64_t &def_index_ith,
+      int64_t &data_index_ith);
   int set_basic_infos(const obrpc::ObCreateIndexArg &arg,
                       const share::schema::ObTableSchema &data_schema,
                       share::schema::ObTableSchema &schema);
@@ -191,6 +203,19 @@ private:
   int set_index_table_column_store_if_need(share::schema::ObTableSchema &table_schema);
   int create_index_column_group(const obrpc::ObCreateIndexArg &arg,
                                 share::schema::ObTableSchema &index_table_schema);
+
+  bool rowkey_doc_index_valid(const bool has_docid_col,
+                              const int64_t aux_rowkey_doc_ith,
+                              const int64_t aux_doc_rowkey_ith,
+                              const int64_t schema_count);
+
+  int check_index_for_if_not_exist_(const uint64_t tenant_id,
+                                    const ObString database_name,
+                                    const ObString index_name,
+                                    share::schema::ObSchemaGetterGuard &schema_guard,
+                                    obrpc::ObAlterTableRes &res);
+  static int get_rebuild_drop_index_id_and_name(share::schema::ObSchemaGetterGuard &schema_guard,
+                                                obrpc::ObDropIndexArg &arg);
 
 private:
   ObDDLService &ddl_service_;

@@ -27,6 +27,7 @@ int ObSkipIndexColMeta::append_skip_index_meta(
 {
   int ret = OB_SUCCESS;
   bool has_null_count_column = false;
+  bool has_min_max_column = false;
   if (OB_UNLIKELY(!skip_idx_attr.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "invalid skip index attribute", K(ret), K(skip_idx_attr));
@@ -39,6 +40,17 @@ int ObSkipIndexColMeta::append_skip_index_meta(
       STORAGE_LOG(WARN, "failed to push null count skip index meta", K(ret));
     } else {
       has_null_count_column = true;
+      has_min_max_column = true;
+    }
+  }
+
+  if (OB_SUCC(ret) && skip_idx_attr.has_loose_min_max() && !has_min_max_column) {
+    if (OB_FAIL(skip_idx_metas.push_back(ObSkipIndexColMeta(col_idx, ObSkipIndexColType::SK_IDX_MIN)))) {
+      STORAGE_LOG(WARN, "failed to push min skip idx meta for loose min", K(ret));
+    } else if (OB_FAIL(skip_idx_metas.push_back(ObSkipIndexColMeta(col_idx, ObSkipIndexColType::SK_IDX_MAX)))) {
+      STORAGE_LOG(WARN, "failed to push max skip idx meta for loose max", K(ret));
+    } else {
+      has_min_max_column = true;
     }
   }
 
@@ -50,6 +62,19 @@ int ObSkipIndexColMeta::append_skip_index_meta(
       STORAGE_LOG(WARN, "failed to push sum skip index meta", K(ret));
     }
   }
+
+  if (OB_SUCC(ret) && skip_idx_attr.has_bm25_token_freq_param()) {
+    if (OB_FAIL(skip_idx_metas.push_back(ObSkipIndexColMeta(col_idx, ObSkipIndexColType::SK_IDX_BM25_MAX_SCORE_TOKEN_FREQ)))) {
+      STORAGE_LOG(WARN, "failed to push bm25 token freq skip index meta", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && skip_idx_attr.has_bm25_doc_len_param()) {
+    if (OB_FAIL(skip_idx_metas.push_back(ObSkipIndexColMeta(col_idx, ObSkipIndexColType::SK_IDX_BM25_MAX_SCORE_DOC_LEN)))) {
+      STORAGE_LOG(WARN, "failed to push bm25 doc len skip index meta", K(ret));
+    }
+  }
+
   return ret;
 }
 
@@ -69,9 +94,12 @@ int ObSkipIndexColMeta::calc_skip_index_maximum_size(
     int64_t normal_agg_column_cnt = 0;
     int64_t sum_column_cnt = 0;
     bool has_null_count_column = false;
-    if (skip_idx_attr.has_min_max()) {
+    if (skip_idx_attr.has_min_max() || skip_idx_attr.has_loose_min_max()) {
       normal_agg_column_cnt += 2;
-      has_null_count_column = true;
+      has_null_count_column = skip_idx_attr.has_min_max();
+    }
+    if (skip_idx_attr.has_bm25_token_freq_param() || skip_idx_attr.has_bm25_doc_len_param()) {
+      normal_agg_column_cnt += 1;
     }
     if (skip_idx_attr.has_sum()) {
       sum_column_cnt += 1;

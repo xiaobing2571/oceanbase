@@ -39,23 +39,23 @@ struct ObFTTrieNode
 public:
   ObFTTrieNode(ObIAllocator &alloc) : alloc_(alloc), children_(nullptr) {}
 
-  ObFTSingleWord word_;
+  ObFTSingleToken token_;
   bool is_leaf_ = false;
 
   struct DATBuildInfo
   {
     int32_t level_ = 0;
     uint32_t state_index_ = 0;
-    ObFTWordCode code_ = 0;
-    ObFTWordCode min_child_ = 0;
-    ObFTWordCode max_child_ = 0;
+    ObFTTokenCode code_ = 0;
+    ObFTTokenCode min_child_ = 0;
+    ObFTTokenCode max_child_ = 0;
   } dat_build_info_;
 
   ObFTTrieNodeData<DATA_TYPE> data_;
 
   struct NodeIndex
   {
-    ObFTSingleWord word_;
+    ObFTSingleToken token_;
     ObFTTrieNode<DATA_TYPE> *child_;
   };
 
@@ -65,18 +65,17 @@ public:
   {
     int ret = OB_SUCCESS;
     if (OB_ISNULL(children_)) {
-      if (OB_ISNULL(children_ = static_cast<ListType *>(
-                        alloc_.alloc(sizeof(ObList<NodeIndex, ObIAllocator>))))) {
+      if (OB_ISNULL(children_ = OB_NEWx(ListType, &alloc_, alloc_))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         STORAGE_FTS_LOG(WARN, "Failed to alloc children vector", K(ret));
       } else {
-        new (children_) ObList<NodeIndex, ObIAllocator>(alloc_);
       }
     } else {
     }
 
     if (OB_SUCC(ret) && OB_FAIL(children_->push_back(node))) {
       STORAGE_FTS_LOG(WARN, "Failed to push back child", K(ret));
+      OB_DELETEx(ListType, &alloc_, children_);
     }
     return ret;
   }
@@ -105,24 +104,24 @@ public:
 
   size_t node_num() const { return node_num_; }
 
-  int get_start_word(ObFTSingleWord &start_word) const
+  int get_start_token(ObFTSingleToken &start_token) const
   {
     int ret = OB_SUCCESS;
     if (OB_ISNULL(root_.children_) || root_.children_->empty()) {
       return OB_NOT_INIT;
     } else {
-      start_word = root_.children_->get_first().word_;
+      start_token = root_.children_->get_first().token_;
     }
     return ret;
   }
 
-  int get_end_word(ObFTSingleWord &end_word) const
+  int get_end_token(ObFTSingleToken &end_token) const
   {
     int ret = OB_SUCCESS;
     if (OB_ISNULL(root_.children_) || root_.children_->empty()) {
       return OB_NOT_INIT;
     } else {
-      end_word = root_.children_->get_last().word_;
+      end_token = root_.children_->get_last().token_;
     }
     return ret;
   }

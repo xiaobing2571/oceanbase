@@ -26,7 +26,9 @@ using sql::ObSqlExpression;
 namespace pl {
 
 class ObPLCGBufferGuard;
-
+#ifdef OB_BUILD_ORACLE_PL
+struct CoverageData;
+#endif
 class ObPLCodeGenerator
 {
 friend class ObPLCGBufferGuard;
@@ -83,6 +85,8 @@ public:
     jit::ObLLVMFunction spi_cast_enum_set_to_string_;
     jit::ObLLVMFunction spi_destruct_obj_;
     jit::ObLLVMFunction spi_sub_nestedtable_;
+    jit::ObLLVMFunction spi_sub_nestedtable_indices_of_collection_;
+    jit::ObLLVMFunction spi_sub_nestedtable_values_of_index_collection_;
     jit::ObLLVMFunction spi_alloc_complex_var_;
     jit::ObLLVMFunction spi_construct_collection_;
     jit::ObLLVMFunction spi_clear_diagnostic_area_;
@@ -112,6 +116,11 @@ public:
     jit::ObLLVMFunction spi_get_current_expr_allocator_;
     jit::ObLLVMFunction spi_adjust_error_trace_;
     jit::ObLLVMFunction spi_convert_anonymous_array_;
+    jit::ObLLVMFunction spi_internal_error_;
+    jit::ObLLVMFunction spi_reset_allocator_;
+    jit::ObLLVMFunction spi_restore_sqlcode_;
+    jit::ObLLVMFunction spi_save_sqlcode_;
+    jit::ObLLVMFunction spi_set_rowcount_;
   };
 
   struct EHStack
@@ -123,6 +132,7 @@ public:
       jit::ObLLVMBasicBlock exit_;
       int64_t level_;
       jit::ObLLVMBasicBlock raising_block_;
+      bool has_continue_hander_;
     };
 
     EHStack() : exceptions_(), cur_(0) {}
@@ -208,9 +218,11 @@ public:
     oracle_mode_(oracle_mode),
     out_params_(allocator),
     profile_mode_(session_info_.get_pl_profiler() != nullptr),
+    code_coverage_mode_(session_info_.get_pl_code_coverage() != nullptr),
     global_strings_(),
     int_buffer_(allocator),
-    objparam_buffer_(allocator)
+    objparam_buffer_(allocator),
+    dispatch_map_()
     { }
 
   virtual ~ObPLCodeGenerator() {}
@@ -342,6 +354,8 @@ public:
 
   int generate_sql(const ObPLSqlStmt &s, jit::ObLLVMValue &ret_err);
   int generate_after_sql(const ObPLSqlStmt &s, jit::ObLLVMValue &ret_err);
+  int generate_dynamic_sql(const ObPLExecuteStmt &s, ObPLCGBufferGuard &out_param_guard, jit::ObLLVMValue &params, jit::ObLLVMValue &ret_err);
+  int generate_after_dynamic_sql(const ObPLExecuteStmt &s, jit::ObLLVMValue &params, jit::ObLLVMValue &ret_err);
   int generate_reset_objparam(jit::ObLLVMValue &result, int64_t udt_id = OB_INVALID_ID, int8_t actual_type = 0, int8_t extend_type = -1);
   int check_success(jit::ObLLVMValue &ret_err,
                     int64_t stmt_id = OB_INVALID_ID,
@@ -401,7 +415,8 @@ public:
   inline EHStack::EHInfo *get_exception(int64_t idx) { return exception_stack_.cur_ - 1 < idx ? NULL : &exception_stack_.exceptions_[idx]; }
   inline int set_exception(jit::ObLLVMBasicBlock &block,
                            jit::ObLLVMBasicBlock &exit,
-                           int64_t level)
+                           int64_t level,
+                           bool has_continue_hander)
   {
     int ret = common::OB_SUCCESS;
     if (exception_stack_.cur_ < EH_STACK_DEPTH - 1) {
@@ -409,6 +424,7 @@ public:
       exception_stack_.exceptions_[exception_stack_.cur_].exit_ = exit;
       exception_stack_.exceptions_[exception_stack_.cur_].level_ = level;
       exception_stack_.exceptions_[exception_stack_.cur_].raising_block_.reset();
+      exception_stack_.exceptions_[exception_stack_.cur_].has_continue_hander_ = has_continue_hander;
       ++exception_stack_.cur_;
     } else {
       ret = OB_NOT_SUPPORTED;
@@ -417,7 +433,6 @@ public:
     }
     return ret;
   }
-
   inline int reset_exception()
   {
     int ret = common::OB_SUCCESS;
@@ -428,11 +443,20 @@ public:
     }
     return ret;
   }
+  inline bool could_be_catched_by_continue_handler() const
+  {
+    bool ret = false;
+    for (int64_t i = exception_stack_.cur_ - 1; !ret && i >= 0; --i) {
+      ret = ret || exception_stack_.exceptions_[i].has_continue_hander_;
+    }
+    return ret;
+  }
+
   inline const LabelStack::LabelInfo *get_label(const common::ObString &name) const
   {
     const LabelStack::LabelInfo *label = NULL;
     for (int64_t i = label_stack_.cur_; NULL == label && i > 0; --i) {
-      if (0 == label_stack_.labels_[i - 1].name_.case_compare(name)) {
+      if (label_stack_.labels_[i - 1].name_.case_compare_equal(name)) {
         label = &label_stack_.labels_[i - 1];
       }
     }
@@ -603,6 +627,8 @@ public:
   int extract_status_from_context(jit::ObLLVMValue &p_pl_exex_ctx, jit::ObLLVMValue &result);
   int extract_pl_ctx_from_context(jit::ObLLVMValue &p_pl_exex_ctx, jit::ObLLVMValue &result);
   int extract_pl_function_from_context(jit::ObLLVMValue &p_pl_exex_ctx, jit::ObLLVMValue &result);
+  int extract_tmp_allocator_from_context(jit::ObLLVMValue &p_pl_exex_ctx, jit::ObLLVMValue &result);
+  int extract_result_allocator_from_context(jit::ObLLVMValue &p_pl_exex_ctx, jit::ObLLVMValue &result);
   int extract_arg_from_argv(jit::ObLLVMValue &p_argv, int64_t idx, jit::ObLLVMValue &result);
   int extract_objparam_from_argv(jit::ObLLVMValue &p_argv, const int64_t idx, jit::ObLLVMValue &result);
   int extract_datum_from_argv(jit::ObLLVMValue &p_argv, const int64_t idx, common::ObObjType type, jit::ObLLVMValue &result);
@@ -613,12 +639,14 @@ public:
   int extract_len_ptr_from_condition_value(jit::ObLLVMValue &p_condition_value, jit::ObLLVMValue &result);
   int extract_stmt_ptr_from_condition_value(jit::ObLLVMValue &p_condition_value, jit::ObLLVMValue &result);
   int extract_signal_ptr_from_condition_value(jit::ObLLVMValue &p_condition_value, jit::ObLLVMValue &result);
+  int extract_ob_error_code_ptr_from_condition_value(jit::ObLLVMValue &p_condition_value, jit::ObLLVMValue &result);
   int extract_type_from_condition_value(jit::ObLLVMValue &p_condition_value, jit::ObLLVMValue &result);
   int extract_code_from_condition_value(jit::ObLLVMValue &p_condition_value, jit::ObLLVMValue &result);
   int extract_name_from_condition_value(jit::ObLLVMValue &p_condition_value, jit::ObLLVMValue &result);
   int extract_len_from_condition_value(jit::ObLLVMValue &p_condition_value, jit::ObLLVMValue &result);
   int extract_stmt_from_condition_value(jit::ObLLVMValue &p_condition_value, jit::ObLLVMValue &result);
   int extract_signal_from_condition_value(jit::ObLLVMValue &p_condition_value, jit::ObLLVMValue &result);
+  int extract_ob_error_code_from_condition_value(jit::ObLLVMValue &p_condition_value, jit::ObLLVMValue &result);
   int extract_type_ptr_from_collection(jit::ObLLVMValue &p_collection, jit::ObLLVMValue &result);
   int extract_id_ptr_from_collection(jit::ObLLVMValue &p_collection, jit::ObLLVMValue &result);
   int extract_isnull_ptr_from_collection(jit::ObLLVMValue &p_collection, jit::ObLLVMValue &result);
@@ -679,6 +707,9 @@ public:
 
 public:
   int store_obj(const ObObj &object, jit::ObLLVMValue &p_obj);
+  int store_datatype_of_record(const ObDataType &object,
+                                int64_t idx,
+                                jit::ObLLVMValue &record);
   int store_data_type(const ObDataType &object, jit::ObLLVMValue &result);
   int store_elem_desc(const ObElemDesc &object, jit::ObLLVMValue &result);
   int generate_debug(const ObString &name, int64_t value);
@@ -701,6 +732,7 @@ public:
                                 jit::ObLLVMValue &p_result_obj);
   int prepare_expression(ObPLCompileUnit &pl_func);
   int final_expression(ObPLCompileUnit &pl_func);
+  int codegen_expression(ObPLCompileUnit &pl_func);
   ObSQLSessionInfo& get_session_info() const { return session_info_; }
 
 private:
@@ -774,6 +806,84 @@ private:
                           bool in_notfound,
                           bool in_warning,
                           jit::ObLLVMValue &p_result_obj);
+public:
+  int get_unreachable_block(jit::ObLLVMBasicBlock &unreachable);
+  inline goto_label_map &get_goto_label_map() { return goto_label_map_; }
+  // debug.
+public:
+//  inline jit::ObLLVMDIHelper &get_di_helper() { return di_helper_; }
+//  inline ObPLDIADTService &get_di_adt_service() { return di_adt_service_; }
+  int set_debug_location(const ObPLStmt &s);
+  int unset_debug_location();
+  int get_di_llvm_type(const ObPLDataType &pl_type, jit::ObLLVMDIType &di_type);
+  int get_di_datum_type(const ObPLDataType &pl_type, jit::ObLLVMDIType &di_type);
+  int generate_di_user_type(const ObUserDefinedType &type, uint32_t line);
+#ifdef OB_BUILD_ORACLE_PL
+  int generate_di_table_type(const ObNestedTableType &table_type, uint32_t line);
+#endif
+  int generate_di_record_type(const ObRecordType &record_type, uint32_t line);
+  int generate_di_argument();
+  // generate debug info for variables which have a llvm::Value,
+  // for parameters of function, arg_no should be start from 1.
+  // for common variables, arg_no should be 0.
+  int generate_di_local_variable(const ObPLVar &var,
+                                 uint32_t arg_no, uint32_t line, jit::ObLLVMValue &value);
+  int generate_di_local_variable(const ObString &name, jit::ObLLVMDIType &di_type,
+                                 uint32_t arg_no, uint32_t line, jit::ObLLVMValue &value);
+  bool get_debug_mode() { return debug_mode_; }
+
+  inline ObPLSEArray<jit::ObLLVMValue> &get_out_params() { return out_params_; }
+  inline void reset_out_params() { out_params_.reset(); }
+  inline int add_out_params(jit::ObLLVMValue &value) { return out_params_.push_back(value); }
+  int generate_entry_alloca(const common::ObString &name, const common::ObObjType &type, jit::ObLLVMValue &result);
+  int generate_entry_alloca(const common::ObString &name, const jit::ObLLVMType &ir_type, jit::ObLLVMValue &result);
+  bool get_profile_mode() { return profile_mode_; }
+  bool get_code_coverage_mode() { return code_coverage_mode_; }
+  int reset_code_coverage_mode(const ObPLFunction &pl_func);
+  int generate_spi_pl_profiler_before_record(const ObPLStmt &s);
+  int generate_spi_pl_profiler_after_record(const ObPLStmt &s);
+
+  int generate_spi_adjust_error_trace(const ObPLStmt &s, int level);
+
+  int generate_get_parent_allocator(jit::ObLLVMValue &allocator,
+                                    jit::ObLLVMValue &parent_allocator,
+                                    jit::ObLLVMValue &ret_value_ptr,
+                                    jit::ObLLVMBasicBlock &exit);
+  int extract_allocator_and_restore_obobjparam(jit::ObLLVMValue &into_address, jit::ObLLVMValue &allocator);
+  int generate_get_current_expr_allocator(const ObPLStmt &s, jit::ObLLVMValue &expr_allocator);
+  static int set_profiler_unit_info_recursive(const ObPLCompileUnit &unit);
+
+private:
+  int init_di_adt_service();
+  int generate_di_prototype();
+
+  int get_int_buffer(jit::ObLLVMValue &result);
+  int get_char_buffer(jit::ObLLVMValue &result);
+  int get_condition_buffer(jit::ObLLVMValue &result);
+  int get_data_type_buffer(jit::ObLLVMValue &result);
+  int get_objparam_buffer(jit::ObLLVMValue &result);
+
+  int64_t get_objparam_buffer_idx() { return objparam_buffer_idx_; };
+  void set_objparam_buffer_idx(int64_t idx) { objparam_buffer_idx_ = idx; }
+
+  int64_t get_int_buffer_idx() { return int_buffer_idx_; };
+  void set_int_buffer_idx(int64_t idx) { int_buffer_idx_ = idx; }
+
+  int get_into_type_array_buffer(int64_t size, jit::ObLLVMValue &result);
+  int get_return_type_array_buffer(int64_t size, jit::ObLLVMValue &result);
+  int get_argv_array_buffer(int64_t size, jit::ObLLVMValue &result);
+
+// continue handler
+public:
+  jit::ObLLVMBasicBlock &get_continue_handler_dispatcher() { return continue_handler_dispatcher_; }
+  jit::ObLLVMValue &get_dispatch_stmt_id() { return dispatch_stmt_id_; }
+  int generate_istore_stmt_id(int64_t stmt_id);
+  int generate_load_stmt_id(jit::ObLLVMValue &stmt_id);
+  int register_dispatch_map(const uint64_t stmt_id, const jit::ObLLVMBasicBlock &continue_block);
+  int generate_init_continue_handler_dispatcher();
+private:
+  int generate_dispatch_dest();
+
 private:
   common::ObIAllocator &allocator_;
   sql::ObSQLSessionInfo &session_info_;
@@ -812,57 +922,6 @@ private:
   // if there is no current_exception, use this block to throw an exception to PL engine
   jit::ObLLVMBasicBlock default_raise_block_;
 
-public:
-  int get_unreachable_block(jit::ObLLVMBasicBlock &unreachable);
-  inline goto_label_map &get_goto_label_map() { return goto_label_map_; }
-  // debug.
-public:
-//  inline jit::ObLLVMDIHelper &get_di_helper() { return di_helper_; }
-//  inline ObPLDIADTService &get_di_adt_service() { return di_adt_service_; }
-  int set_debug_location(const ObPLStmt &s);
-  int unset_debug_location();
-  int get_di_llvm_type(const ObPLDataType &pl_type, jit::ObLLVMDIType &di_type);
-  int get_di_datum_type(const ObPLDataType &pl_type, jit::ObLLVMDIType &di_type);
-  int generate_di_user_type(const ObUserDefinedType &type, uint32_t line);
-#ifdef OB_BUILD_ORACLE_PL
-  int generate_di_table_type(const ObNestedTableType &table_type, uint32_t line);
-#endif
-  int generate_di_record_type(const ObRecordType &record_type, uint32_t line);
-  int generate_di_argument();
-  // generate debug info for variables which have a llvm::Value,
-  // for parameters of function, arg_no should be start from 1.
-  // for common variables, arg_no should be 0.
-  int generate_di_local_variable(const ObPLVar &var,
-                                 uint32_t arg_no, uint32_t line, jit::ObLLVMValue &value);
-  int generate_di_local_variable(const ObString &name, jit::ObLLVMDIType &di_type,
-                                 uint32_t arg_no, uint32_t line, jit::ObLLVMValue &value);
-  bool get_debug_mode() { return debug_mode_; }
-
-  inline ObPLSEArray<jit::ObLLVMValue> &get_out_params() { return out_params_; }
-  inline void reset_out_params() { out_params_.reset(); }
-  inline int add_out_params(jit::ObLLVMValue &value) { return out_params_.push_back(value); }
-  int generate_entry_alloca(const common::ObString &name, const common::ObObjType &type, jit::ObLLVMValue &result);
-  int generate_entry_alloca(const common::ObString &name, const jit::ObLLVMType &ir_type, jit::ObLLVMValue &result);
-  bool get_profile_mode() { return profile_mode_; }
-
-  int generate_spi_pl_profiler_before_record(const ObPLStmt &s);
-  int generate_spi_pl_profiler_after_record(const ObPLStmt &s);
-
-  int generate_spi_adjust_error_trace(const ObPLStmt &s, int level);
-
-  int generate_get_parent_allocator(jit::ObLLVMValue &allocator,
-                                    jit::ObLLVMValue &parent_allocator,
-                                    jit::ObLLVMValue &ret_value_ptr,
-                                    jit::ObLLVMBasicBlock &exit);
-  int extract_allocator_and_restore_obobjparam(jit::ObLLVMValue &into_address, jit::ObLLVMValue &allocator);
-  int generate_get_current_expr_allocator(const ObPLStmt &s, jit::ObLLVMValue &expr_allocator);
-  static int set_profiler_unit_info_recursive(const ObPLCompileUnit &unit);
-
-private:
-  int init_di_adt_service();
-  int generate_di_prototype();
-
-private:
   jit::ObLLVMDIHelper &di_helper_;
   ObPLDIADTService di_adt_service_;
   ObLLVMDITypeMap di_user_type_map_;
@@ -870,6 +929,7 @@ private:
   bool oracle_mode_;
   ObPLSEArray<jit::ObLLVMValue> out_params_;
   bool profile_mode_;
+  bool code_coverage_mode_;
 
   using GlobalStringMap = common::hash::ObHashMap<
                             common::ObString,
@@ -907,21 +967,13 @@ private:
   jit::ObLLVMValue argv_array_ptr_;
   int64_t argv_array_size_ = 0;
 
-  int get_int_buffer(jit::ObLLVMValue &result);
-  int get_char_buffer(jit::ObLLVMValue &result);
-  int get_condition_buffer(jit::ObLLVMValue &result);
-  int get_data_type_buffer(jit::ObLLVMValue &result);
-  int get_objparam_buffer(jit::ObLLVMValue &result);
-
-  int64_t get_objparam_buffer_idx() { return objparam_buffer_idx_; };
-  void set_objparam_buffer_idx(int64_t idx) { objparam_buffer_idx_ = idx; }
-
-  int64_t get_int_buffer_idx() { return int_buffer_idx_; };
-  void set_int_buffer_idx(int64_t idx) { int_buffer_idx_ = idx; }
-
-  int get_into_type_array_buffer(int64_t size, jit::ObLLVMValue &result);
-  int get_return_type_array_buffer(int64_t size, jit::ObLLVMValue &result);
-  int get_argv_array_buffer(int64_t size, jit::ObLLVMValue &result);
+  // continue handler
+  using DispatchMap =
+      common::hash::ObHashMap<uint64_t, jit::ObLLVMBasicBlock, common::hash::NoPthreadDefendMode>;
+  DispatchMap dispatch_map_;
+  jit::ObLLVMBasicBlock continue_handler_dispatcher_;
+  jit::ObLLVMSwitch dispatch_switch_inst_;
+  jit::ObLLVMValue dispatch_stmt_id_;
 };
 
 class ObPLCodeGenerateVisitor : public ObPLStmtVisitor
@@ -934,6 +986,7 @@ public:
 
   virtual int visit(const ObPLStmtBlock &s);
   virtual int visit(const ObPLDeclareVarStmt &s);
+  virtual int visit(const ObPLTransformedAssignStmt &s);
   virtual int visit(const ObPLAssignStmt &s);
   virtual int visit(const ObPLIfStmt &s);
   virtual int visit(const ObPLLeaveStmt &s);
@@ -985,6 +1038,7 @@ struct ObPLCGBufferGuard
 public:
   ObPLCGBufferGuard(ObPLCodeGenerator &generator)
     : generator_(generator),
+      int_buffer_idx_(generator.get_int_buffer_idx()),
       objparam_buffer_idx_(generator.get_objparam_buffer_idx()),
       old_guard_(generator.top_buffer_guard_)
   {
@@ -1049,6 +1103,7 @@ private:
 
 private:
   ObPLCodeGenerator &generator_;
+  int64_t int_buffer_idx_;
   int64_t objparam_buffer_idx_;
   int64_t objparam_count_ = 0;
   ObPLCGBufferGuard *old_guard_ = nullptr;

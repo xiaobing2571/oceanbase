@@ -21,7 +21,7 @@
 #include "sql/engine/expr/ob_expr_subquery_ref.h"
 #include "sql/engine/expr/ob_expr_pl_get_cursor_attr.h"
 #include "sql/engine/expr/ob_expr_pl_integer_checker.h"
-#include "sql/engine/expr/ob_expr_udf.h"
+#include "sql/engine/expr/ob_expr_udf/ob_expr_udf.h"
 #include "sql/engine/expr/ob_expr_object_construct.h"
 #include "sql/engine/expr/ob_expr_coll_pred.h"
 #include "sql/engine/expr/ob_expr_output_pack.h"
@@ -36,6 +36,8 @@
 #include "sql/engine/expr/ob_expr_json_utils.h"
 #include "sql/engine/expr/ob_expr_get_path.h"
 #include "sql/engine/expr/ob_expr_array_map.h"
+#include "sql/engine/expr/ob_expr_ai/ob_ai_func.h"
+#include "sql/engine/expr/ob_expr_get_package_var.h"
 
 namespace oceanbase
 {
@@ -118,6 +120,10 @@ void ObExprExtraInfoFactory::register_expr_extra_infos()
   REG_EXTRA_INFO(T_FUNC_SYS_ARRAY_FIRST, ObExprArrayMapInfo);
   REG_EXTRA_INFO(T_FUNC_SYS_ARRAY_SORTBY, ObExprArrayMapInfo);
   REG_EXTRA_INFO(T_FUNC_SYS_ARRAY_FILTER, ObExprArrayMapInfo);
+  REG_EXTRA_INFO(T_FUN_SYS_AI_COMPLETE, ObAIFuncExprInfo);
+  REG_EXTRA_INFO(T_FUN_SYS_AI_EMBED, ObAIFuncExprInfo);
+  REG_EXTRA_INFO(T_FUN_SYS_AI_RERANK, ObAIFuncExprInfo);
+  REG_EXTRA_INFO(T_OP_GET_PACKAGE_VAR, ObExprGetPackageVar::ExtraInfo);
 }
 
 } // end namespace sql

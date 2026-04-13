@@ -71,7 +71,10 @@ int ObRpcProcessorBase::run()
 {
   int ret = OB_SUCCESS;
   bool deseri_succ = true;
-
+  if (ObQueryRetryAshGuard::get_info_ptr() != nullptr) {
+    LOG_ERROR_RET(OB_ERR_UNEXPECTED, "retry info ptr is not null, maybe crash", K(ObLocalDiagnosticInfo::get()->get_ash_stat()));
+    ObQueryRetryAshGuard::reset_info();
+  }
   run_timestamp_ = ObTimeUtility::current_time();
   if (OB_FAIL(check_timeout())) {
     LOG_WARN("req timeout", K(ret));
@@ -214,7 +217,11 @@ int ObRpcProcessorBase::deserialize()
     if (OB_SUCC(ret) && need_compressed) {
       common::ObCompressor *compressor = NULL;
       int64_t dst_data_size = 0;
-      if (OB_FAIL(common::ObCompressorPool::get_instance().get_compressor(compressor_type,
+      if (original_len <= 0 || original_len > get_max_rpc_packet_size()) {
+        ret = OB_RPC_PACKET_TOO_LONG;
+        RPC_OBRPC_LOG(ERROR, "original len should not be less than 0 or greater than max rpc packet size",
+                            K(ret), K(original_len), "limit", get_max_rpc_packet_size());
+      } else if (OB_FAIL(common::ObCompressorPool::get_instance().get_compressor(compressor_type,
               compressor))) {
         RPC_OBRPC_LOG(WARN, "get_compressor failed", K(ret), K(compressor_type));
       } else if (NULL == (uncompressed_buf_ =
@@ -359,8 +366,11 @@ int ObRpcProcessorBase::do_response(const Response &rsp)
             packet->set_stream_last();
           }
         }
-        if (rsp.require_rerouting_) {
+        if (require_rerouting_) {
           packet->set_require_rerouting();
+        }
+        if (kv_route_meta_error_) {
+          packet->set_kv_route_meta_error(); // reuse IS_KV_REQUEST_FALG flag as KV_ROUTE_META_ERROR_FLAG
         }
         packet->set_unis_version(0);
         packet->calc_checksum();
@@ -529,7 +539,7 @@ int ObRpcProcessorBase::part_response(const int retcode, bool is_last)
     if (OB_SUCC(ret)) {
       const int64_t sessid = sc_ ? sc_->sessid() : 0;
       ObRpcPacket *pkt = new (pkt_buf) ObRpcPacket();
-      Response rsp(sessid, is_stream_, is_last, require_rerouting_, pkt);
+      Response rsp(sessid, is_stream_, is_last, pkt);
       if ((need_compressed) && NULL != tmp_buf) {
         // compress the serialized result buffer
         char *dst_buf = pkt_buf + sizeof(ObRpcPacket) + ez_rpc_header_size;
@@ -577,7 +587,7 @@ int ObRpcProcessorBase::part_response_error(rpc::ObRequest* req, const int retco
   } else {
     ObRpcPacket pkt;
     pkt.set_content(tbuf, pos);
-    Response err_rsp(sessid, is_stream_, is_last, require_rerouting_, &pkt);
+    Response err_rsp(sessid, is_stream_, is_last, &pkt);
     if (OB_FAIL(do_response(err_rsp))) {
       RPC_OBRPC_LOG(WARN, "response data fail", K(ret));
     }

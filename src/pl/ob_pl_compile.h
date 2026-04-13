@@ -44,8 +44,9 @@ public:
   ObPLCGMallocCallback(int64_t &mem_used)
     : mem_used_(mem_used) {}
   virtual ~ObPLCGMallocCallback() {}
-  virtual void operator()(const ObMemAttr &attr, int64_t add_size) override
+  virtual void operator()(const ObMemAttr &attr, int64_t add_size, const lib::AObject &obj) override
   {
+    UNUSED(obj);
     if ((ObLabel(GET_PL_MOD_STRING(pl::OB_PL_JIT)) == attr.label_
         || ObLabel(GET_PL_MOD_STRING(pl::OB_PL_CODE_GEN)) == attr.label_)
         && attr.ctx_id_ == ObCtxIds::GLIBC) {
@@ -69,6 +70,8 @@ public:
     schema_guard_(schema_guard),
     package_guard_(package_guard),
     sql_proxy_(sql_proxy) {}
+
+  static ObMutex package_dep_info_lock_;
   virtual ~ObPLCompiler() {}
 
   int compile(const ObStmtNodeTree *block,
@@ -81,7 +84,7 @@ public:
   int compile(const uint64_t id, ObPLFunction &func); //Procedure/Function接口
 
   int analyze_package(const ObString &source, const ObPLBlockNS *parent_ns,
-                      ObPLPackageAST &package_ast, bool is_for_trigger);
+                      ObPLPackageAST &package_ast, bool is_for_trigger, bool &is_wrap);
   int generate_package(const ObString &exec_env, ObPLPackageAST &package_ast, ObPLPackage &package, bool &is_from_disk);
   int compile_package(const share::schema::ObPackageInfo &package_info, const ObPLBlockNS *parent_ns,
                       ObPLPackageAST &package_ast, ObPLPackage &package); //package
@@ -151,8 +154,6 @@ private:
   share::schema::ObSchemaGetterGuard &schema_guard_;
   ObPLPackageGuard &package_guard_;
   common::ObMySQLProxy &sql_proxy_;
-
-  static ObMutex package_dep_info_lock_;
 };
 
 class ObPLCompilerEnvGuard

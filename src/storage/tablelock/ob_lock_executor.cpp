@@ -73,19 +73,27 @@ int ObLockContext::init(ObExecContext &ctx,
       session_info->set_has_exec_inner_dml(false);
 
       ObTransID parent_tx_id;
+      int64_t parent_tx_start_ts = 0;
       parent_tx_id = session_info->get_tx_id();
+      transaction::ObTxDesc *desc = session_info->get_tx_desc();
+      if (OB_NOT_NULL(desc)) {
+        parent_tx_start_ts = desc->get_active_ts();
+      }
       OZ (session_info->begin_autonomous_session(saved_session_));
+
       OX (have_saved_session_ = true);
       OZ (ObSqlTransControl::explicit_start_trans(ctx, false));
       if (OB_SUCC(ret)) {
         has_autonomous_tx_ = true;
       }
       if (OB_SUCC(ret) && parent_tx_id.is_valid()) {
-        (void) register_for_deadlock_(*session_info, parent_tx_id);
+        (void) register_for_deadlock_(*session_info, parent_tx_id, parent_tx_start_ts);
       }
     }
     OX (my_exec_ctx_ = &ctx);
     OZ (open_inner_conn_());
+    OX (is_inner_session_ = session_info->is_inner());
+    OX (session_info->set_inner_session());
   }
   return ret;
 }
@@ -143,6 +151,9 @@ int ObLockContext::destroy(ObExecContext &ctx,
         LOG_ERROR("restore autocommit value failed", K(tmp_ret), K(ret));
       }
     }
+    if (!is_inner_session_) {
+      session_info->set_user_session();
+    }
   }
   return ret;
 }
@@ -183,12 +194,12 @@ int ObLockContext::valid_execute_context(ObExecContext &ctx)
   CK (OB_NOT_NULL(ctx.get_my_session()));
   CK (OB_NOT_NULL(ctx.get_sql_proxy()));
   CK (OB_NOT_NULL(ctx.get_sql_ctx()->schema_guard_));
-  CK (OB_NOT_NULL(ctx.get_package_guard()));
   return ret;
 }
 
 void ObLockContext::register_for_deadlock_(ObSQLSessionInfo &session_info,
-                                           const ObTransID &parent_tx_id)
+                                           const ObTransID &parent_tx_id,
+                                           const int64_t parent_tx_start_ts)
 {
   int ret = OB_SUCCESS;
   int64_t query_timeout = 0;
@@ -203,6 +214,7 @@ void ObLockContext::register_for_deadlock_(ObSQLSessionInfo &session_info,
       if (OB_FAIL(ObTransDeadlockDetectorAdapter::
                   autonomous_register_to_deadlock(parent_tx_id,
                                                   child_tx_id,
+                                                  parent_tx_start_ts,
                                                   query_timeout))) {
         LOG_WARN("autonomous register to deadlock failed", K(parent_tx_id),
                  K(child_tx_id), KR(ret));
@@ -471,7 +483,7 @@ int ObLockExecutor::query_lock_id_(const ObString &lock_name,
   lock_id = OB_INVALID_OBJECT_ID;
 
   OZ (databuff_printf(where_cond, WHERE_CONDITION_BUFFER_SIZE,
-                      "WHERE name = '%s'", to_cstring(lock_name)));
+                      "WHERE name = '%.*s'", lock_name.length(), lock_name.ptr()));
   OZ (databuff_printf(table_name, MAX_FULL_TABLE_NAME_LENGTH,
                       "%s.%s", OB_SYS_DATABASE_NAME, OB_ALL_DBMS_LOCK_ALLOCATED_TNAME));
   OZ (ObTableAccessHelper::read_single_row(tenant_id,
@@ -504,7 +516,7 @@ int ObLockExecutor::query_lock_id_and_lock_handle_(const ObString &lock_name,
   lock_id = OB_INVALID_OBJECT_ID;
 
   OZ (databuff_printf(where_cond, WHERE_CONDITION_BUFFER_SIZE,
-                      "WHERE name = '%s'", to_cstring(lock_name)));
+                      "WHERE name = '%.*s'", lock_name.length(), lock_name.ptr()));
   OZ (databuff_printf(table_name, MAX_FULL_TABLE_NAME_LENGTH,
                       "%s.%s", OB_SYS_DATABASE_NAME, OB_ALL_DBMS_LOCK_ALLOCATED_TNAME));
   OZ (ObTableAccessHelper::read_single_row(tenant_id,
@@ -598,7 +610,7 @@ int ObLockExecutor::get_first_session_info_(common::sqlclient::ObMySQLResult &re
   OX (GET_COL_IGNORE_NULL(res.get_uint, "server_session_id", tmp_session_id));
   OX (server_session_id = static_cast<uint32_t>(tmp_session_id));
   OX (session_addr.reset());
-  OV (session_addr.set_ip_addr(to_cstring(svr_ip), svr_port), OB_ERR_UNEXPECTED, svr_ip, svr_port);
+  OV (session_addr.set_ip_addr(svr_ip, svr_port), OB_ERR_UNEXPECTED, svr_ip, svr_port);
 
   return ret;
 }
@@ -811,7 +823,7 @@ int ObUnLockExecutor::execute_(ObExecContext &ctx,
       is_rollback = (OB_SUCCESS != ret);
       if (OB_TMP_FAIL(stack_ctx.destroy(ctx, is_rollback))) {
         LOG_WARN("stack ctx destroy failed", K(tmp_ret));
-        COVER_SUCC(tmp_ret);
+        ret = COVER_SUCC(tmp_ret);
       }
     }
   }
@@ -853,7 +865,7 @@ int ObUnLockExecutor::execute_(ObExecContext &ctx,
       is_rollback = (OB_SUCCESS != ret);
       if (OB_TMP_FAIL(stack_ctx.destroy(ctx, is_rollback))) {
         LOG_WARN("stack ctx destroy failed", K(tmp_ret));
-        COVER_SUCC(tmp_ret);
+        ret = COVER_SUCC(tmp_ret);
       }
     }
   }
@@ -877,7 +889,7 @@ int ObUnLockExecutor::release_all_locks_(ObLockContext &ctx,
 
   OZ (get_task_type_by_release_type_(release_type, task_type));
   OZ (ObTableLockDetector::get_unlock_request_list(session, owner_id, task_type, allocator, arg_list));
-  OX (release_all_locks_(ctx, arg_list, session, tx_param, release_cnt));
+  OZ (release_all_locks_(ctx, arg_list, session, tx_param, release_cnt));
   // clean the unlock request list
   for (int64_t i = 0; i < arg_list.count(); i++) {
     ObLockRequest *arg = arg_list.at(i);

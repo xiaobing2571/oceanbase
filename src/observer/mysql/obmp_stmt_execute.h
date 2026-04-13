@@ -83,14 +83,6 @@ public:
     LOG_WARN("memory access out of bounds", K(ret));       \
   } else
 
-struct ObPsSessionInfoParamsCleaner
-{
-public:
-  ObPsSessionInfoParamsCleaner(): ret_(OB_SUCCESS) {}
-  void operator() (common::hash::HashMapPair<uint64_t, ObPsSessionInfo *> &entry);
-  int ret_;
-};
-
 struct ObPsSessionInfoParamsAssignment
 {
 public:
@@ -108,7 +100,12 @@ public:
   const uint32_t DEFAULT_ITERATION_COUNT = 1;
 
   explicit ObMPStmtExecute(const ObGlobalContext &gctx);
-  virtual ~ObMPStmtExecute() {}
+  virtual ~ObMPStmtExecute()
+  {
+    if (inited_) {
+      DESTROY_CONTEXT(retry_mem_context_);
+    }
+  }
 
   // Parse basic param value, no MYSQL_TYPE_COMPLEX or MYSQL_TYPE_CURSOR.
   // see parse_param_value()
@@ -153,13 +150,8 @@ public:
   }
   int init_for_arraybinding(ObIAllocator &alloc);
   int init_arraybinding_paramstore(ObIAllocator &alloc);
-  int init_arraybinding_fields_and_row(ObMySQLResultSet &result);
   int set_session_active(sql::ObSQLSessionInfo &session) const;
   int after_do_process_for_arraybinding(ObMySQLResultSet &result);
-  inline void set_arraybounding(bool is_arraybinding) { is_arraybinding_ = is_arraybinding; }
-  inline bool get_arraybounding() { return is_arraybinding_; }
-  inline void set_save_exception(bool is_save_exception) { is_save_exception_ = is_save_exception; }
-  inline bool get_save_exception() { return is_save_exception_; }
   // response need send long data
   virtual bool is_send_long_data() { return false;}
   inline bool support_send_long_data(const uint32_t type) {
@@ -192,13 +184,12 @@ public:
     }
     return is_support;
   }
-  inline int32_t get_param_num() { return params_num_; }
-  inline void set_param_num(int32_t num) { params_num_ = num; }
   static int store_params_value_to_str(ObIAllocator &alloc,
                                        sql::ObSQLSessionInfo &session,
                                        ParamStore *params,
                                        char *&params_value,
-                                       int64_t &params_value_len);
+                                       int64_t &params_value_len,
+                                       bool print_sql_audit = false);
 
 protected:
   virtual int deserialize()  { return common::OB_SUCCESS; }
@@ -212,18 +203,19 @@ protected:
     single_process_timestamp_ = single_process_timestamp;
   }
   inline void set_exec_start_timestamp(int64_t time) { exec_start_timestamp_ = time; }
-  ParamStore *get_params() { return params_; }
-  inline void set_param(ParamStore *params) { params_ = params; }
-  sql::ObSqlCtx &get_ctx() { return ctx_; }
-  ObQueryRetryCtrl &get_retry_ctrl() { return retry_ctrl_; }
   void record_stat(const sql::stmt::StmtType type, const int64_t end_time,
                    const sql::ObSQLSessionInfo& session, const int64_t ret,
                    const ObMySQLResultSet &result) const;
+  int verify_ps_stmt_checksum(sql::ObSQLSessionInfo &session,
+                              ObPsSessionInfo &ps_session_info,
+                              uint32_t ps_stmt_checksum);
+  void configure_by_stmt_type(const sql::stmt::StmtType stmt_type);
   int request_params(sql::ObSQLSessionInfo *session,
-                     const char* &pos,
-                     uint32_t ps_stmt_checksum,
                      ObIAllocator &alloc,
-                     int32_t all_param_num);
+                     const char *&pos,
+                     const int64_t all_param_num,
+                     const int64_t input_param_num,
+                     ParamTypeArray &param_types);
   int parse_request_type(const char* &pos,
                          int64_t num_of_params,
                          int8_t new_param_bound_flag,
@@ -261,16 +253,27 @@ protected:
   }
   void set_curr_sql_idx(int64_t curr_sql_idx) { curr_sql_idx_ = curr_sql_idx; }
   int64_t get_curr_sql_idx() { return curr_sql_idx_; }
+  int ps_cursor_open(ObSQLSessionInfo &session,
+                     sql::ObSqlCtx &ctx,
+                     ObMySQLResultSet &result,
+                     ParamStore &params,
+                     pl::ObPsCursorInfo *&cursor,
+                     int64_t stmt_id,
+                     bool &need_response_error,
+                     bool enable_perf_event);
+  int ps_cursor_store_data(ObSQLSessionInfo &session,
+                           int64_t pre_store_size);
+
+
+protected:
+  int init_arraybinding_field(int64_t column_field_cnt, const ColumnsFieldIArray *column_fields);
+  int init_row_for_arraybinding(ObIAllocator &alloc, int64_t array_binding_row_num);
+  int construct_execute_param_for_arraybinding(int64_t pos);
 
 private:
-  // for arraybinding
-  int init_arraybinding_field(int64_t column_field_cnt, const ColumnsFieldIArray *column_fields);
-
-  int init_row_for_arraybinding(ObIAllocator &alloc, int64_t array_binding_row_num);
   int check_precondition_for_arraybinding(const ObSQLSessionInfo &session_info);
   int check_param_type_for_arraybinding(sql::ParamTypeInfoArray &param_type_infos);
   int check_param_value_for_arraybinding(ObObjParam &param);
-  int construct_execute_param_for_arraybinding(int64_t pos);
   int param_assign_after_convert_int2number(ObObj& dst, const ObObj& src);
   void reset_complex_param_memory(ParamStore *params, sql::ObSQLSessionInfo *session_info = nullptr);
   int save_exception_for_arraybinding(
@@ -354,7 +357,7 @@ private:
 
   virtual int before_process();
   virtual int after_process(int error_code);
-  int response_query_header(sql::ObSQLSessionInfo &session, pl::ObDbmsCursorInfo &cursor);
+  int response_query_header(sql::ObSQLSessionInfo &session, pl::ObPsCursorInfo &cursor);
   //重载response，在response中不去调用flush_buffer(true)；flush_buffer(true)在需要回包时显示调用
 
 
@@ -365,10 +368,14 @@ private:
                                  const common::ObString &src,
                                  common::ObString &out,
                                  int64_t extra_buf_len = 0);
+  int is_async_cursor(ObSQLSessionInfo &session, bool &is_async);
+  virtual int32_t get_iteration_count() const { return OB_INVALID_COUNT; }
+
 protected:
   ObQueryRetryCtrl retry_ctrl_;
   sql::ObSqlCtx ctx_;
   int64_t stmt_id_;
+  int8_t new_param_bound_flag_;
   sql::stmt::StmtType stmt_type_;
   ParamStore *params_;
 
@@ -392,6 +399,9 @@ protected:
   char *params_value_;
   int64_t curr_sql_idx_; // only for arraybinding
   ObPSAnalysisChecker analysis_checker_;
+  bool ps_cursor_has_destroy_;
+  lib::MemoryContext retry_mem_context_; // for retry sql
+  bool inited_; // indicates whether `retry_mem_context_` is initialized
 private:
   DISALLOW_COPY_AND_ASSIGN(ObMPStmtExecute);
 

@@ -190,6 +190,56 @@ int ObTableExprCgService::generate_count_expr(ObTableCtx &ctx, ObAggFunRawExpr *
   return ret;
 }
 
+int ObTableExprCgService::generate_heap_table_hidden_pk_increment_expr(ObTableCtx &ctx,
+                                                                       const ObTableColumnItem &item,
+                                                                       ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  ObPseudoColumnRawExpr *func_expr = nullptr;
+  ObSQLSessionInfo &sess_info = ctx.get_session_info();
+  ObRawExprFactory &expr_factory = ctx.get_expr_factory();
+  const ObColumnRefRawExpr *ref_expr = item.expr_;
+  const ObTableColumnInfo *column_info = nullptr;
+  if (OB_ISNULL(column_info = item.column_info_) || OB_ISNULL(ref_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("column info or ref expr is NULL", KR(ret));
+  } else if (ref_expr->is_hidden_clustering_key_column()) {
+    // 隐藏排序键列：使用 T_PSEUDO_HIDDEN_CLUSTERING_KEY
+    if (OB_FAIL(expr_factory.create_raw_expr(T_PSEUDO_HIDDEN_CLUSTERING_KEY, func_expr))) {
+      LOG_WARN("create hidden clustering key expr failed", KR(ret));
+    } else {
+      func_expr->set_expr_name(ObString::make_string("hidden_clustering_key"));
+      func_expr->set_accuracy(ref_expr->get_accuracy());
+      func_expr->set_result_flag(ref_expr->get_result_flag());
+      func_expr->set_data_type(ref_expr->get_data_type());
+      if (OB_FAIL(func_expr->formalize(&sess_info))) {
+        LOG_WARN("failed to formalize hidden clustering key expr", K(ret));
+      } else {
+        expr = func_expr;
+      }
+    }
+  } else if (column_info->column_id_ == OB_HIDDEN_PK_INCREMENT_COLUMN_ID) {
+    // 无主键表的隐藏列：使用 T_TABLET_AUTOINC_NEXTVAL
+    if (OB_FAIL(expr_factory.create_raw_expr(T_TABLET_AUTOINC_NEXTVAL, func_expr))) {
+      LOG_WARN("create nextval failed", K(ret));
+    } else {
+      func_expr->set_expr_name(ObString::make_string("pk_tablet_seq"));
+      func_expr->set_accuracy(ref_expr->get_accuracy());
+      func_expr->set_result_flag(ref_expr->get_result_flag());
+      func_expr->set_data_type(ref_expr->get_data_type());
+      if (OB_FAIL(func_expr->formalize(&sess_info))) {
+        LOG_WARN("failed to extract info", K(ret));
+      } else {
+        expr = func_expr;
+      }
+    }
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("error unexpected", KR(ret), K(item));
+  }
+  return ret;
+}
+
 /*
   expr tree:
       autoinc_nextval expr
@@ -448,6 +498,10 @@ int ObTableExprCgService::resolve_exprs(ObTableCtx &ctx)
                 LOG_WARN("fail to fill doc_id expr param", K(ret));
               }
             }
+          } else if (column_info->column_id_ == OB_HIDDEN_PK_INCREMENT_COLUMN_ID || item.expr_->is_hidden_clustering_key_column()) {
+            if (OB_FAIL(generate_heap_table_hidden_pk_increment_expr(ctx, item, expr))) {
+              LOG_WARN("fail to generate hidden pk increment expr", K(ret), K(item));
+            }
           } else {
             expr = item.expr_;
           }
@@ -655,7 +709,7 @@ int ObTableExprCgService::build_partition_expr(ObTableCtx &ctx,
   } else {
     ObResolverParams resolver_ctx;
     ObStmtFactory stmt_factory(ctx.get_allocator());
-    TableItem table_item;
+    TableItem table_item(ctx.get_allocator());
     resolver_ctx.allocator_ = &ctx.get_allocator();
     resolver_ctx.schema_checker_ = &schema_checker;
     resolver_ctx.session_info_ = &ctx.get_session_info();
@@ -1116,21 +1170,24 @@ int ObTableLocCgService::generate_table_loc_meta(const ObTableCtx &ctx,
   loc_meta.ref_table_id_ = simple_table_schema.get_table_id();
   loc_meta.table_loc_id_ = ctx.get_ref_table_id();
   loc_meta.is_dup_table_ = simple_table_schema.is_duplicate_table();
-  if (ctx.is_weak_read()) {
-    loc_meta.is_weak_read_ = 1;
-    loc_meta.select_leader_ = 0;
-  } else if (loc_meta.is_dup_table_) {
-    loc_meta.select_leader_ = 0;
-    loc_meta.is_weak_read_ = 0;
-  } else {
-    //strong consistency read policy is used by default
-    loc_meta.select_leader_ = 1;
-    loc_meta.is_weak_read_ = 0;
-  }
-  if (OB_FAIL(ctx.get_session_info().get_sys_variable(SYS_VAR_OB_ROUTE_POLICY, route_policy))) {
+  if (OB_FAIL(ctx.get_session_info().get_ob_route_policy(route_policy))) {
     LOG_WARN("fail to get route policy from session", K(ret));
   } else {
     loc_meta.route_policy_ = route_policy;
+    if (ctx.is_weak_read()) {
+      loc_meta.is_weak_read_ = 1;
+      loc_meta.select_leader_ = 0;
+    } else if (loc_meta.is_dup_table_) {
+      loc_meta.select_leader_ = 0;
+      loc_meta.is_weak_read_ = 0;
+    } else if (COLUMN_STORE_ONLY == static_cast<ObRoutePolicyType>(route_policy) && !ctx.is_dml()) {
+      loc_meta.select_leader_ = 0;
+      loc_meta.is_weak_read_ = 0;
+    } else {
+      //strong consistency read policy is used by default
+      loc_meta.select_leader_ = 1;
+      loc_meta.is_weak_read_ = 0;
+    }
   }
   if (OB_FAIL(ret)) {
   } else if (simple_table_schema.is_user_table()) {
@@ -1162,39 +1219,121 @@ int ObTableExprCgService::refresh_update_exprs_frame(ObTableCtx &ctx,
 
 int ObTableExprCgService::refresh_ttl_exprs_frame(ObTableCtx &ctx,
                                                   const ObIArray<ObExpr *> &ins_new_row,
-                                                  const ObTableEntity &entity)
+                                                  const ObITableEntity &entity)
 {
   return refresh_insert_up_exprs_frame(ctx, ins_new_row, entity);
 }
 
 int ObTableExprCgService::refresh_insert_up_exprs_frame(ObTableCtx &ctx,
                                                         const ObIArray<ObExpr *> &ins_new_row,
-                                                        const ObTableEntity &entity)
+                                                        const ObITableEntity &entity)
 {
   int ret = OB_SUCCESS;
-  const ObIArray<ObObj> &rowkey = entity.get_rowkey_objs();
-
-  if (OB_FAIL(refresh_rowkey_exprs_frame(ctx, ins_new_row, rowkey))) {
-    LOG_WARN("fail to init rowkey exprs frame", K(ret), K(ctx), K(rowkey));
-  } else if (OB_FAIL(refresh_properties_exprs_frame(ctx, ins_new_row, entity))) {
-    LOG_WARN("fail to init properties exprs frame", K(ret), K(ctx), K(ins_new_row), K(entity));
+  if (ObTableEntityType::ET_HKV_V2 == ctx.get_entity_type()) {
+    const ObHCell &hcell = static_cast<const ObHCell &>(entity);
+    return refresh_hbase_exprs_frame(ctx, ins_new_row, hcell);
+  } else {
+    const ObTableEntity &table_entity = static_cast<const ObTableEntity &>(entity);
+    ObRowkey rowkey = table_entity.get_rowkey();
+    if (OB_FAIL(refresh_rowkey_exprs_frame(ctx, ins_new_row, rowkey))) {
+      LOG_WARN("fail to init rowkey exprs frame", K(ret), K(ctx), K(rowkey));
+    } else if (OB_FAIL(refresh_properties_exprs_frame(ctx, ins_new_row, table_entity))) {
+      LOG_WARN("fail to init properties exprs frame", K(ret), K(ctx), K(ins_new_row), K(table_entity));
+    }
   }
 
   return ret;
 }
 
+int ObTableExprCgService::refresh_hbase_exprs_frame(ObTableCtx &ctx,
+                                                    const ObIArray<ObExpr *> &exprs,
+                                                    const ObHCell &hcell)
+{
+  int ret = OB_SUCCESS;
+  ObEvalCtx eval_ctx(ctx.get_exec_ctx());
+  const ObIArray<ObTableColumnInfo *> &col_info_array = ctx.get_column_info_array();
+  if (col_info_array.count() != exprs.count()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("col info array count is not equal to exprs count", K(ret), K(col_info_array.count()), K(exprs.count()));
+  }
+  for (int64_t i = 0; i < col_info_array.count() && OB_SUCC(ret); i++) {
+    const ObTableColumnInfo *col_info = col_info_array.at(i);
+    ObExpr *expr = exprs.at(i);
+    if (OB_ISNULL(col_info)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("col info is NULL", K(ret), K(i));
+    } else if (OB_ISNULL(expr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("expr is NULL", K(ret), K(i));
+    } else if (col_info->rowkey_position_ > 0) {
+      ObObj obj;
+      if (OB_FAIL(hcell.get_rowkey_value(col_info->rowkey_position_ - 1, obj))) {
+        LOG_WARN("fail to get rowkey value", K(ret), K(i));
+      } else if (OB_FAIL(write_datum(ctx, ctx.get_allocator(), *col_info, *expr, eval_ctx, obj))) {
+        LOG_WARN("fail to write datum", K(ret), K(i), K(obj));
+      }
+    } else if (col_info->is_generated_column()) {
+      ObDatum *tmp_datum = nullptr;
+      if (OB_FAIL(expr->eval(eval_ctx, tmp_datum))) {
+        LOG_WARN("fail to eval generate expr", K(ret));
+      }
+    } else {
+      ObObj obj;
+      if (col_info->column_name_.case_compare(ObHTableConstants::VALUE_CNAME) == 0) {
+        if (OB_FAIL(hcell.get_cell_obj(ObHTableConstants::COL_IDX_V, obj))) {
+          LOG_WARN("fail to get cell obj", K(ret), K(i));
+        } else if (OB_FAIL(write_datum(ctx, ctx.get_allocator(), *col_info, *expr, eval_ctx, obj))) {
+          LOG_WARN("fail to write datum", K(ret), K(i), K(obj));
+        }
+      } else if (col_info->column_name_.case_compare(ObHTableConstants::TTL_CNAME) == 0) {
+        if (hcell.count() <= ObHTableConstants::COL_IDX_TTL) {
+          obj = col_info->default_value_;
+          if (!col_info->is_nullable_ && obj.is_null()) {
+            ret = OB_ERR_NO_DEFAULT_FOR_FIELD;
+            ObCStringHelper helper;
+            LOG_USER_ERROR(OB_ERR_NO_DEFAULT_FOR_FIELD, helper.convert(col_info->column_name_));
+            LOG_WARN("column can not be null", K(ret), KPC(col_info));
+          }
+        } else if (OB_FAIL(hcell.get_cell_obj(ObHTableConstants::COL_IDX_TTL, obj))) {
+          LOG_WARN("fail to get cell obj", K(ret), K(i));
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(write_datum(ctx, ctx.get_allocator(), *col_info, *expr, eval_ctx, obj))) {
+          LOG_WARN("fail to write datum", K(ret), K(i), K(obj));
+        }
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected column name", K(ret), K(col_info->column_name_));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTableExprCgService::refresh_insert_exprs_frame(ObTableCtx &ctx,
                                                      const ObIArray<ObExpr *> &exprs,
-                                                     const ObTableEntity &entity)
+                                                     const ObITableEntity &entity)
 {
-  return refresh_exprs_frame(ctx, exprs, entity);
+  if (ObTableEntityType::ET_HKV_V2 == ctx.get_entity_type()) {
+    const ObHCell &hcell = static_cast<const ObHCell &>(entity);
+    return refresh_hbase_exprs_frame(ctx, exprs, hcell);
+  } else {
+    const ObTableEntity &table_entity = static_cast<const ObTableEntity &>(entity);
+    return refresh_exprs_frame(ctx, exprs, table_entity);
+  }
 }
 
 int ObTableExprCgService::refresh_replace_exprs_frame(ObTableCtx &ctx,
                                                       const ObIArray<ObExpr *> &exprs,
-                                                      const ObTableEntity &entity)
+                                                      const ObITableEntity &entity)
 {
-  return refresh_exprs_frame(ctx, exprs, entity);
+  if (ObTableEntityType::ET_HKV_V2 == ctx.get_entity_type()) {
+    const ObHCell &hcell = static_cast<const ObHCell &>(entity);
+    return refresh_hbase_exprs_frame(ctx, exprs, hcell);
+  } else {
+    const ObTableEntity &table_entity = static_cast<const ObTableEntity &>(entity);
+    return refresh_exprs_frame(ctx, exprs, table_entity);
+  }
 }
 
 // only for htable
@@ -1203,7 +1342,8 @@ int ObTableExprCgService::refresh_delete_exprs_frame(ObTableCtx &ctx,
                                                      const ObTableEntity &entity)
 {
   int ret = OB_SUCCESS;
-  ObSEArray<ObObj, 3> rowkey;
+  ObObj tmp_objs[3];
+  ObRowkey rowkey(const_cast<ObObj*>(tmp_objs), 3);
   if (ObTableEntityType::ET_HKV == ctx.get_entity_type()) {
     ObObj k_obj;
     ObObj q_obj;
@@ -1217,21 +1357,15 @@ int ObTableExprCgService::refresh_delete_exprs_frame(ObTableCtx &ctx,
       LOG_WARN("fail to get Q", K(ret));
     } else if (OB_FAIL(entity.get_property(ObHTableConstants::VERSION_CNAME_STR, t_obj))) {
       LOG_WARN("fail to get T", K(ret));
-    } else if (OB_FAIL(rowkey.push_back(k_obj))) {
-      LOG_WARN("fail to push back k_obj", K(ret), K(k_obj));
-    } else if (OB_FAIL(rowkey.push_back(q_obj))) {
-      LOG_WARN("fail to push back q_obj", K(ret), K(q_obj));
-    } else if (FALSE_IT(time = t_obj.get_int())) {
-      // do nothing
-    } else if (FALSE_IT(t_obj.set_int(-1 * time))) {
-      // do nothing
-    } else if (OB_FAIL(rowkey.push_back(t_obj))) {
-      LOG_WARN("fail to push back t_obj", K(ret), K(t_obj));
+    }  else {
+      tmp_objs[0] = k_obj;
+      tmp_objs[1] = q_obj;
+      time = t_obj.get_int();
+      t_obj.set_int(-1 * time);
+      tmp_objs[2] = t_obj;
     }
   } else {
-    if (OB_FAIL(rowkey.assign(entity.get_rowkey_objs()))) {
-      LOG_WARN("fail to assign", K(ret), K(entity.get_rowkey_objs()));
-    }
+    rowkey = entity.get_rowkey();
   }
 
   if (OB_SUCC(ret)) {
@@ -1266,7 +1400,7 @@ int ObTableExprCgService::write_autoinc_datum(ObTableCtx &ctx,
   } else if (expr.arg_cnt_ != 1) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid arg count for auto inc expr", K(ret), K(expr));
-  } else if (expr.get_eval_info(eval_ctx).evaluated_ == true) {
+  } else if (expr.get_eval_info(eval_ctx).is_evaluated(eval_ctx) == true) {
     // do nothing
   } else {
     const ObExpr *conlumn_conv_expr = expr.args_[0];
@@ -1278,8 +1412,8 @@ int ObTableExprCgService::write_autoinc_datum(ObTableCtx &ctx,
       if (OB_FAIL(datum.from_obj(obj))) {
         LOG_WARN("fail to convert object from datum", K(ret), K(obj));
       } else {
-        conlumn_conv_expr->get_eval_info(eval_ctx).evaluated_ = true;
-        conlumn_conv_expr->get_eval_info(eval_ctx).projected_ = true;
+        conlumn_conv_expr->get_eval_info(eval_ctx).set_evaluated(true);
+        conlumn_conv_expr->get_eval_info(eval_ctx).set_projected(true);
       }
     }
   }
@@ -1309,8 +1443,8 @@ int ObTableExprCgService::write_datum(ObTableCtx &ctx,
     // `ob_adjust_lob_datum()` will try to adjust datum form in_meta into out_meta
     LOG_WARN("fail to adjust lob datum", K(ret), K(datum), K(obj));
   } else {
-    expr.get_eval_info(eval_ctx).evaluated_ = true;
-    expr.get_eval_info(eval_ctx).projected_ = true;
+    expr.get_eval_info(eval_ctx).set_evaluated(true);
+    expr.get_eval_info(eval_ctx).set_projected(true);
   }
 
   return ret;
@@ -1342,7 +1476,7 @@ int ObTableExprCgService::refresh_exprs_frame(ObTableCtx &ctx,
                                               const ObTableEntity &entity)
 {
   int ret = OB_SUCCESS;
-  const ObIArray<ObObj> &rowkey = entity.get_rowkey_objs();
+  ObRowkey rowkey = entity.get_rowkey();
 
   if (OB_FAIL(refresh_rowkey_exprs_frame(ctx, exprs, rowkey))) {
     LOG_WARN("fail to init rowkey exprs frame", K(ret), K(ctx), K(rowkey));
@@ -1364,7 +1498,7 @@ int ObTableExprCgService::refresh_exprs_frame(ObTableCtx &ctx,
 */
 int ObTableExprCgService::refresh_rowkey_exprs_frame(ObTableCtx &ctx,
                                                      const ObIArray<ObExpr *> &exprs,
-                                                     const ObIArray<ObObj> &rowkey)
+                                                     ObRowkey &rowkey)
 {
   int ret = OB_SUCCESS;
   const ObIArray<ObTableColumnInfo *> &col_info_array = ctx.get_column_info_array();
@@ -1377,7 +1511,7 @@ int ObTableExprCgService::refresh_rowkey_exprs_frame(ObTableCtx &ctx,
   } else if (OB_FAIL(schema_cache_guard->get_rowkey_column_num(schema_rowkey_cnt))) {
     LOG_WARN("get rowkey column num failed", K(ret));
   } else {
-    const int64_t entity_rowkey_cnt = rowkey.count();
+    const int64_t entity_rowkey_cnt = rowkey.get_obj_cnt();
     bool is_full_filled = (schema_rowkey_cnt == entity_rowkey_cnt); // did user fill all rowkey columns or not
     ObEvalCtx eval_ctx(ctx.get_exec_ctx());
     int64_t skip_pos = 0; // skip columns that do not need to be filled
@@ -1414,13 +1548,14 @@ int ObTableExprCgService::refresh_rowkey_exprs_frame(ObTableCtx &ctx,
               tmp_obj = &null_obj;
               skip_pos++;
             } else {
-              tmp_obj = &rowkey.at(rowkey_position-1);
+              tmp_obj = &rowkey.get_obj_ptr()[rowkey_position-1];
             }
             if (OB_FAIL(write_autoinc_datum(ctx, *expr, eval_ctx, *tmp_obj))) {
               LOG_WARN("fail to write auto increment datum", K(ret), K(is_full_filled), K(*expr), K(*tmp_obj));
             }
           }
-        } else if (!is_full_filled && IS_DEFAULT_NOW_OBJ(col_info->default_value_)) {
+        } else if ((!is_full_filled && IS_DEFAULT_NOW_OBJ(col_info->default_value_))
+            || (col_info->column_id_ == OB_HIDDEN_PK_INCREMENT_COLUMN_ID && !ctx.is_ttl_delete())) { // ttl delete need refresh datum with entity
           ObDatum *tmp_datum = nullptr;
           expr->get_eval_info(eval_ctx).clear_evaluated_flag();
           if (OB_FAIL(expr->eval(eval_ctx, tmp_datum))) {
@@ -1430,14 +1565,15 @@ int ObTableExprCgService::refresh_rowkey_exprs_frame(ObTableCtx &ctx,
           }
         } else {
           int64_t pos = rowkey_position - 1 - skip_pos;
+          ObObj tmp_obj = rowkey.get_obj_ptr()[pos];
           if (pos >= entity_rowkey_cnt) {
             ret = OB_INDEX_OUT_OF_RANGE;
             LOG_WARN("idx out of range", K(ret), K(i), K(entity_rowkey_cnt), K(rowkey_position), K(skip_pos));
           } else if (OB_ISNULL(expr)) {
             ret = OB_ERR_UNDEFINED;
             LOG_WARN("expr is null", K(ret));
-          } else if (OB_FAIL(write_datum(ctx, ctx.get_allocator(), *col_info, *expr, eval_ctx, rowkey.at(pos)))) {
-            LOG_WARN("fail to write datum", K(ret), K(rowkey_position), K(rowkey.at(pos)), K(*expr), K(pos));
+          } else if (OB_FAIL(write_datum(ctx, ctx.get_allocator(), *col_info, *expr, eval_ctx, tmp_obj))) {
+            LOG_WARN("fail to write datum", K(ret), K(rowkey_position), K(tmp_obj), K(*expr), K(pos));
           }
         }
       }
@@ -2406,23 +2542,28 @@ int ObTableDmlCgService::generate_single_constraint_info(ObTableCtx &ctx,
 }
 
 int ObTableDmlCgService::generate_constraint_infos(ObTableCtx &ctx,
-                                                   ObIArray<ObUniqueConstraintInfo> &cst_infos)
+                                                   ObIAllocator &allocator,
+                                                   ObIArray<ObUniqueConstraintInfo*> &cst_infos)
 {
   int ret = OB_SUCCESS;
   ObSchemaGetterGuard *schema_guard = ctx.get_schema_guard();
   const ObTableSchema *table_schema = ctx.get_table_schema();
   const uint64_t ref_table_id = ctx.get_ref_table_id();
-  ObUniqueConstraintInfo constraint_info;
+  ObUniqueConstraintInfo *constraint_info = NULL;
   ObSEArray<ObAuxTableMetaInfo, 16> index_infos;
 
   // 1. primary key
   if (OB_ISNULL(table_schema) || OB_ISNULL(schema_guard)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("table schema is null", K(ret), KP(table_schema), KP(schema_guard));
+  } else if (OB_ISNULL(constraint_info = OB_NEWx(ObUniqueConstraintInfo,
+                                                 &allocator, allocator))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate memory");
   } else if (OB_FAIL(generate_single_constraint_info(ctx,
                                                      *table_schema,
                                                      ref_table_id,
-                                                     constraint_info))) {
+                                                     *constraint_info))) {
     LOG_WARN("fail to generate primary key constraint info", K(ret), K(ref_table_id));
   } else if (OB_FAIL(cst_infos.push_back(constraint_info))) {
     LOG_WARN("fail to push back constraint info", K(ret));
@@ -2434,7 +2575,7 @@ int ObTableDmlCgService::generate_constraint_infos(ObTableCtx &ctx,
   } else {
     const ObTableSchema *index_schema = NULL;
     for (int64_t i = 0; OB_SUCC(ret) && i < index_infos.count(); i++) {
-      constraint_info.reset();
+      constraint_info = NULL;
       if (OB_FAIL(schema_guard->get_table_schema(ctx.get_session_info().get_effective_tenant_id(),
                                                 index_infos.at(i).table_id_,
                                                 index_schema))) {
@@ -2443,10 +2584,14 @@ int ObTableDmlCgService::generate_constraint_infos(ObTableCtx &ctx,
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("index schema null", K(ret));
       } else if (!index_schema->is_final_invalid_index() && index_schema->is_unique_index()) {
-        if (OB_FAIL(generate_single_constraint_info(ctx,
-                                                    *index_schema,
-                                                    ref_table_id,
-                                                    constraint_info))) {
+        if (OB_ISNULL(constraint_info = OB_NEWx(ObUniqueConstraintInfo,
+                                                &allocator, allocator))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate memory");
+        } else if (OB_FAIL(generate_single_constraint_info(ctx,
+                                                           *index_schema,
+                                                           ref_table_id,
+                                                           *constraint_info))) {
           LOG_WARN("fail to generate unique key constraint info", K(ret));
         } else if (OB_FAIL(cst_infos.push_back(constraint_info))) {
           LOG_WARN("fail to push back constraint info", K(ret));
@@ -2464,32 +2609,35 @@ int ObTableDmlCgService::generate_constraint_ctdefs(ObTableCtx &ctx,
 {
   int ret = OB_SUCCESS;
   ObDMLCtDefAllocator<ObRowkeyCstCtdef> cst_ctdef_allocator(allocator);
-  ObSEArray<ObUniqueConstraintInfo, 2> cst_infos;
+  ObSEArray<ObUniqueConstraintInfo*, 2> cst_infos;
   ObRowkeyCstCtdef *rowkey_cst_ctdef = nullptr;
   ObStaticEngineCG cg(ctx.get_cur_cluster_version());
 
-  if (OB_FAIL(generate_constraint_infos(ctx, cst_infos))) {
+  if (OB_FAIL(generate_constraint_infos(ctx, allocator, cst_infos))) {
     LOG_WARN("fail to generate constraint infos", K(ret), K(ctx));
   } else if (OB_FAIL(cst_ctdefs.init(cst_infos.count()))) {
     LOG_WARN("fail to allocate conflict checker spec array", K(ret), K(cst_infos.count()));
   }
 
   for (int64_t i = 0; OB_SUCC(ret) && i < cst_infos.count(); i++) {
-    const ObIArray<ObColumnRefRawExpr*> &cst_columns = cst_infos.at(i).constraint_columns_;
-    if (OB_ISNULL(rowkey_cst_ctdef = cst_ctdef_allocator.alloc())) {
+    ObUniqueConstraintInfo *info = cst_infos.at(i);
+    if (OB_ISNULL(info)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("info is null", K(ret));
+    } else if (OB_ISNULL(rowkey_cst_ctdef = cst_ctdef_allocator.alloc())) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("fail to alloc cst ctdef memory", K(ret));
     } else if (OB_FAIL(ob_write_string(allocator,
-                                       cst_infos.at(i).constraint_name_,
+                                       info->constraint_name_,
                                        rowkey_cst_ctdef->constraint_name_))) {
-      LOG_WARN("fail to write string", K(ret), K(cst_infos.at(i).constraint_name_));
-    } else if (OB_FAIL(rowkey_cst_ctdef->rowkey_expr_.init(cst_columns.count()))) {
-      LOG_WARN("fail to init rowkey", K(ret), K(cst_columns.count()));
+      LOG_WARN("fail to write string", K(ret), K(info->constraint_name_));
+    } else if (OB_FAIL(rowkey_cst_ctdef->rowkey_expr_.init(info->constraint_columns_.count()))) {
+      LOG_WARN("fail to init rowkey", K(ret), K(info->constraint_columns_.count()));
     } else {
-      for (int64_t j = 0; OB_SUCC(ret) && j < cst_columns.count(); ++j) {
+      for (int64_t j = 0; OB_SUCC(ret) && j < info->constraint_columns_.count(); ++j) {
         const ObTableColumnItem *item = nullptr;
         const ObTableColumnInfo *col_info = nullptr;
-        ObColumnRefRawExpr *ref_expr = cst_columns.at(j);
+        ObColumnRefRawExpr *ref_expr = info->constraint_columns_.at(j);
         ObRawExpr *raw_expr = nullptr;
         ObExpr *expr = nullptr;
         if (OB_FAIL(ctx.get_column_item_by_expr(ref_expr, item))) {
@@ -3221,7 +3369,7 @@ int ObTableTscCgService::generate_pushdown_aggr_ctdef(const ObTableCtx &ctx,
 
 
 // 非索引扫描: access exprs = select exprs
-// 普通索引表: access exprs = [index column exprs][rowkey expr]
+// 普通索引表: access exprs = [index column exprs, including storing column exprs][rowkey expr]
 // 索引回表: access expr = [rowkey expr][select without rowkey exprs]
 // 全文索引表：access exprs = extract_text_ir_access_columns
 int ObTableTscCgService::generate_access_ctdef(const ObTableCtx &ctx,
@@ -3482,6 +3630,7 @@ int ObTableTscCgService::generate_table_param(const ObTableCtx &ctx,
                                                                  das_tsc_ctdef.access_column_ids_,
                                                                  das_tsc_ctdef.aggregate_column_ids_,
                                                                  das_tsc_ctdef.group_by_column_ids_,
+                                                                 das_tsc_ctdef.aggregate_param_props_,
                                                                  das_tsc_ctdef.pd_expr_spec_.pd_storage_flag_))) {
     LOG_WARN("convert group by failed", K(ret), KP(index_schema),
              K(das_tsc_ctdef.aggregate_column_ids_), K(das_tsc_ctdef.group_by_column_ids_));
@@ -3508,6 +3657,9 @@ int ObTableTscCgService::generate_das_tsc_ctdef(const ObTableCtx &ctx,
     LOG_WARN("failed to generate text ir pushdown aggregate ctdef", K(ret));
   } else if (OB_FAIL(generate_table_param(ctx, das_tsc_ctdef, query_cs_replica))) { // init table_param_, result_output_
     LOG_WARN("fail to generate table param", K(ret));
+  } else {
+    das_tsc_ctdef.table_scan_opt_.io_read_batch_size_ = ctx.get_io_read_batch_size();
+    das_tsc_ctdef.table_scan_opt_.io_read_gap_size_ = ctx.get_io_read_gap_size();
   }
 
   return ret;

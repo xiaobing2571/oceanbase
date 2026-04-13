@@ -18,6 +18,7 @@
 #include "lib/signal/ob_signal_struct.h"
 #include "lib/thread/thread_mgr.h"
 #include "lib/container/ob_vector.h"
+#include "lib/utility/ob_hang_fatal_error.h"
 
 namespace oceanbase
 {
@@ -224,7 +225,7 @@ int ObMemoryDump::check_sql_memory_leak()
   int ret = OB_SUCCESS;
   ObMemoryCheckContext memory_check_ctx;
   ObThreadCond &cond = memory_check_ctx.cond_;
-  if (OB_FAIL(cond.init(ObWaitEventIds::DEFAULT_COND_WAIT))) {
+  if (OB_FAIL(cond.init(ObWaitEventIds::MEMORY_DUMP_COND_WAIT))) {
     LOG_WARN("thread cond init failed", K(ret));
   } else if (OB_FAIL(generate_mod_stat_task(&memory_check_ctx))) {
     LOG_WARN("generate mod stat task", K(ret));
@@ -430,7 +431,7 @@ int print_block_meta(AChunk *chunk, ABlock *block, char *buf, int64_t buf_len, i
   int ret = OB_SUCCESS;
   ret = databuff_printf(buf, buf_len, pos,
                         "    block: %p, offset: %03d, in_use: %d, is_large: %d, is_washed: %d, nblocks: %03d," \
-                        " alloc_bytes: %lu, aobject_size: %d, obj_set: %p\n",
+                        " alloc_bytes: %u, aobject_size: %d, obj_set: %p\n",
                         chunk->blk_data(block), chunk->blk_offset(block), block->in_use_, block->is_large_,
                         block->is_washed_, chunk->blk_nblocks(block),
                         block->alloc_bytes_, AOBJECT_CELL_BYTES, block->obj_set_);
@@ -614,9 +615,7 @@ void ObMemoryDump::handle(void *task)
                                  object->version_ < max_check_version) {
                         has_memory_leak = true;
                         char bt[MAX_BACKTRACE_LENGTH] = {'\0'};
-                        if (object->on_malloc_sample_) {
-                          parray(bt, sizeof(bt), (int64_t*)object->bt(), AOBJECT_BACKTRACE_COUNT);
-                        }
+                        PARRAY_MALLOC_BACKTRACE(object, bt, MAX_BACKTRACE_LENGTH);
                         allow_next_syslog();
                         LOG_WARN("SQL_MEMORY_LEAK", KP(object), K(tenant_id), K(ctx_id), K(object->version_), K(object->label_), K(bt));
                       }
@@ -692,6 +691,7 @@ void ObMemoryDump::handle(void *task)
       ma->print_tenant_memory_usage(tenant_id);
       ma->print_tenant_ctx_memory_usage(tenant_id, m_task->min_print_size_);
     }
+    print_capture_memory_info();
 
 #ifdef FATAL_ERROR_HANG
     print_malloc_sample_info();

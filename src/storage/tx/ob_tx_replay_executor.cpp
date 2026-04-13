@@ -119,7 +119,7 @@ int ObTxReplayExecutor::do_replay_(const char *buf, const int64_t size, const in
           ret = replay_tx_log_(log_type);
         }
       }
-      TRANS_LOG(DEBUG, "[Replay Tx] Replay One Tx Log", K(log_type), K(ret), K_(log_ts_ns));
+      TRANS_LOG(TRACE, "[Replay Tx] Replay One Tx Log", K(log_type), K(ret), K_(log_ts_ns));
     }
     finish_replay_(ret);
     rewrite_replay_retry_code_(ret);
@@ -127,20 +127,35 @@ int ObTxReplayExecutor::do_replay_(const char *buf, const int64_t size, const in
   return ret;
 }
 
-#ifdef ERRSIM
-ERRSIM_POINT_DEF(EN_TX_REPLAY)
-#endif
+ERRSIM_POINT_DEF(EN_TX_REPLAY_TASK_DELAY_TENANT_ID)
+ERRSIM_POINT_DEF(EN_TX_REPLAY_TASK_DELAY_LS_ID)
+ERRSIM_POINT_DEF(EN_TX_REPLAY_TASK_DELAY_TIME)
+ERRSIM_POINT_DEF(EN_TX_REPLAY_TASK_DELAY_RETRY)
 
 OB_NOINLINE int ObTxReplayExecutor::errsim_tx_replay_()
 {
   int ret = OB_SUCCESS;
 
-#ifdef ERRSIM
-  ret = EN_TX_REPLAY;
-#endif
+  int errsim_tenant_id = abs(EN_TX_REPLAY_TASK_DELAY_TENANT_ID);
+  int errsim_ls_id = abs(EN_TX_REPLAY_TASK_DELAY_LS_ID);
+  int sleep_time = abs(EN_TX_REPLAY_TASK_DELAY_TIME);
+  int retry_delay = abs(EN_TX_REPLAY_TASK_DELAY_RETRY);
+  bool sleep_succ = false;
 
-  if (OB_FAIL(ret)) {
-    TRANS_LOG(INFO, "errsim tx replay in observer", K(ret));
+  if ((errsim_tenant_id > 0 || errsim_ls_id > 0) &&
+      (errsim_tenant_id == tenant_id_ || errsim_tenant_id <= 0) &&
+      (errsim_ls_id == ls_id_.id() || errsim_ls_id <= 0)) {
+    usleep(sleep_time);
+    sleep_succ = true;
+  }
+
+  if (retry_delay > 0) {
+    ret = OB_EAGAIN;
+  }
+
+  if (sleep_succ || retry_delay > 0) {
+    TRANS_LOG(INFO, "errsim tx replay in observer", K(ret), K(sleep_time), K(errsim_tenant_id),
+              K(errsim_ls_id), K(sleep_time), K(retry_delay), K(sleep_succ));
   }
   return ret;
 }
@@ -211,6 +226,18 @@ int ObTxReplayExecutor::replay_tx_log_(const ObTxLogType log_type)
   case ObTxLogType::TX_MULTI_DATA_SOURCE_LOG: {
     if (OB_FAIL(replay_multi_source_data_())) {
       TRANS_LOG(WARN, "[Replay Tx] replay multi source data log error", KR(ret));
+    }
+    break;
+  }
+  case ObTxLogType::TX_DIRECT_LOAD_INC_MAJOR_LOG:{
+    ObTxDirectLoadIncLog::ReplayArg replay_arg;
+    replay_arg.part_log_no_ = tx_part_log_no_;
+    replay_arg.ddl_log_handler_ptr_ = ls_->get_ddl_log_handler();
+    ObTxDirectLoadIncLog::TempRef temp_ref;
+    ObTxDirectLoadIncLog::ConstructArg  construct_arg(temp_ref);
+    ObTxCtxLogOperator<ObTxDirectLoadIncMajorLog> dli_log_op(ctx_, &log_block_, &construct_arg, replay_arg, log_ts_ns_, lsn_);
+    if (OB_FAIL(dli_log_op(ObTxLogOpType::REPLAY))) {
+      TRANS_LOG(WARN, "[Replay Tx] replay direct load inc log error", KR(ret));
     }
     break;
   }
@@ -380,16 +407,17 @@ int ObTxReplayExecutor::replay_redo_()
   if (is_tx_log_replay_queue()) {
     tx_part_log_no_ += 1; // redo is compound with tx log, mark part_log_no is required
   }
-
+  TIMEGUARD_INIT("replay_redo_", 20_ms, 100_ms);
+  int64_t start_us = ObTimeUtility::current_time();
   if (OB_ISNULL(ls_)) {
     ret = OB_ERR_UNEXPECTED;
     TRANS_LOG(WARN, "[Replay Tx] ls should not be null", K(ret), K(ls_));
   } else if (OB_FAIL(log_block_.deserialize_log_body(redo_log))) {
     TRANS_LOG(WARN, "[Replay Tx] deserialize log body error", K(ret), K(redo_log), K(lsn_),
               K(log_ts_ns_));
-  } else if (OB_FAIL(replay_redo_in_memtable_(redo_log, serial_final, max_seq_no))) {
+  } else if (CLICK_FAIL(replay_redo_in_memtable_(redo_log, serial_final, max_seq_no))) {
     TRANS_LOG(WARN, "[Replay Tx] replay redo in memtable error", K(ret), K(lsn_), K(log_ts_ns_));
-  } else if (OB_FAIL(ctx_->replay_redo_in_ctx(redo_log,
+  } else if (CLICK_FAIL(ctx_->replay_redo_in_ctx(redo_log,
                                               lsn_,
                                               log_ts_ns_,
                                               tx_part_log_no_,
@@ -398,7 +426,7 @@ int ObTxReplayExecutor::replay_redo_()
                                               max_seq_no))) {
     TRANS_LOG(WARN, "[Replay Tx] replay redo in tx_ctx error", K(ret), K(lsn_), K(log_ts_ns_));
   }
-  if (OB_SUCC(ret) && OB_TMP_FAIL(mt_ctx_->remove_callbacks_for_fast_commit(replay_queue_, share::SCN::minus(log_ts_ns_, 1)))) {
+  if (OB_SUCC(ret) && CLICK_TMP_FAIL(mt_ctx_->remove_callbacks_for_fast_commit(replay_queue_, share::SCN::minus(log_ts_ns_, 1)))) {
     TRANS_LOG(WARN, "[Replay Tx] remove callbacks for fast commit", K(ret), K(tmp_ret),
               K(replay_queue_), K(lsn_), K(log_ts_ns_), K(*mt_ctx_));
   }
@@ -579,10 +607,9 @@ int ObTxReplayExecutor::replay_redo_in_memtable_(ObTxRedoLog &redo, const bool s
 {
   int ret = OB_SUCCESS;
   // ObMemtable *cur_mem = nullptr;
-  common::ObTimeGuard timeguard("replay_redo_in_memtable", 10 * 1000);
+  TIMEGUARD_INIT("replay_redo_in_memtable", 20_ms, 100_ms);
   int64_t pos = 0;
 
-  const int64_t start_us = ObTimeUtility::current_time();
   const bool for_replay = true;
 
   ObMutatorRowHeader row_head;
@@ -608,7 +635,7 @@ int ObTxReplayExecutor::replay_redo_in_memtable_(ObTxRedoLog &redo, const bool s
 
   if (OB_FAIL(ret)) {
 
-  } else if (OB_FAIL(mmi_ptr_->deserialize(redo.get_replay_mutator_buf(), redo.get_mutator_size(),
+  } else if (CLICK_FAIL(mmi_ptr_->deserialize(redo.get_replay_mutator_buf(), redo.get_mutator_size(),
                                            pos, encrypt_info))
              || redo.get_mutator_size() != pos) {
     TRANS_LOG(WARN, "[Replay Tx] deserialize fail or pos does not match data_len", K(ret));
@@ -617,6 +644,7 @@ int ObTxReplayExecutor::replay_redo_in_memtable_(ObTxRedoLog &redo, const bool s
     TRANS_LOG(WARN, "[Replay Tx] failed to decrypt table key", K(ret));
 #endif
   } else {
+    CLICK();
     meta_flag = mmi_ptr_->get_meta().get_flags();
     ObEncryptRowBuf row_buf;
     while (OB_SUCC(ret)) {
@@ -666,19 +694,14 @@ int ObTxReplayExecutor::replay_redo_in_memtable_(ObTxRedoLog &redo, const bool s
 
   ret = (OB_ITER_END == ret) ? OB_SUCCESS : ret;
   // free ObRowKey's objs's memory
+  CLICK();
   THIS_WORKER.get_sql_arena_allocator().reset();
-
-  if(timeguard.get_diff()> 10*1000)
-  {
+  if (__time_guard__.is_timeout()) {
     TRANS_LOG(INFO,
               "[Replay Tx] Replay redo in MemTable cost too much time",
               K(ret),
-              K(timeguard.get_diff()),
-              K(log_ts_ns_),
-              K(ctx_->get_trans_id()),
-              K(ctx_->get_ls_id()),
-              K(mvcc_row_count_),
-              K(table_lock_row_count_));
+              K(__time_guard__),
+              KPC(this));
   }
   return ret;
 }
@@ -733,7 +756,6 @@ int ObTxReplayExecutor::replay_one_row_in_memtable_(ObMutatorRowHeader &row_head
     storeCtx.tablet_id_ = row_head.tablet_id_;
     storeCtx.ls_ = ls_;
 
-    ObRelativeTable relative_table;
     lib::CompatModeGuard compat_guard(mode);
     switch (row_head.mutator_type_) {
     case MutatorType::MUTATOR_ROW: {

@@ -41,11 +41,11 @@ int ObRootQueue::init(const char *label, uint64_t size, uint64_t tenant_id)
   mem_attr.tenant_id_ = tenant_id;
   if (OB_FAIL(ObRaQueue::init(label, size, tenant_id))) {
     LOG_WARN("fail to init ObRaQueue", K(ret));
-  } else if (OB_ISNULL(SlotLock_ = (ObRWLock *)ob_malloc(sizeof(ObRWLock) * size, mem_attr))) {
+  } else if (OB_ISNULL(SlotLock_ = (obsys::ObRWLock<obsys::WRITE_PRIORITY> *)ob_malloc(sizeof(obsys::ObRWLock<obsys::WRITE_PRIORITY>) * size, mem_attr))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
     for (int64_t i = 0; i < size; i++) {
-      new (&SlotLock_[i]) ObRWLock(obsys::WRITE_PRIORITY);
+      new (&SlotLock_[i]) obsys::ObRWLock<obsys::WRITE_PRIORITY>(ObWaitEventIds::DL_ROOT_QUEUE_LOCK);
     }
   }
   return ret;
@@ -128,7 +128,7 @@ int ObDlQueue::construct_leaf_queue() {
   return ret;
 }
 
-int ObDlQueue::push(void* p, int64_t& seq) {
+int ObDlQueue::push(void* p, int64_t& seq, int64_t& assigned_seq_id) {
   int ret = OB_SUCCESS;
   bool need_retry = false;
   uint64_t retry_times = 0;
@@ -154,7 +154,7 @@ int ObDlQueue::push(void* p, int64_t& seq) {
       }
     } else if (leaf_rec == NULL) {
     } else if (OB_FAIL(leaf_rec->push(p, leaf_queue_cur_idx,
-                      root_queue_cur_idx, seq, leaf_queue_size_))) {
+                      root_queue_cur_idx, seq, leaf_queue_size_, assigned_seq_id))) {
       //When the sql audit secondary slot is full
       // the push will fail and needs to be retried.
       if (root_queue_cur_idx < (rq_.get_push_idx() - 1)) {
@@ -231,7 +231,7 @@ void* ObDlQueue::get(uint64_t seq, DlRef* ref) {
 }
 
 
-int ObLeafQueue::push(void* p, int64_t& leaf_idx, int64_t root_idx, int64_t& seq, int64_t leaf_queue_size) {
+int ObLeafQueue::push(void* p, int64_t& leaf_idx, int64_t root_idx, int64_t& seq, int64_t leaf_queue_size, int64_t &assigned_seq_id) {
   int ret = OB_SUCCESS;
   if (NULL == array_) {
     ret = OB_NOT_INIT;
@@ -245,6 +245,7 @@ int ObLeafQueue::push(void* p, int64_t& leaf_idx, int64_t root_idx, int64_t& seq
       leaf_idx = push_idx;
       // request_id
       seq = root_idx * leaf_queue_size + leaf_idx;
+      assigned_seq_id = seq;
       while(!ATOMIC_BCAS(addr, NULL, p))
         ;
     } else {

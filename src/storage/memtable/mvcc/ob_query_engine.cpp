@@ -43,7 +43,7 @@ void ObQueryEngine::check_cleanout(bool &is_all_cleanout,
                                              true  /*end_exclusive*/))) {
     TRANS_LOG(ERROR, "set key range to btree scan handle fail", KR(ret));
   } else {
-    blocksstable::ObRowReader row_reader;
+    blocksstable::ObCompatRowReader row_reader;
     blocksstable::ObDatumRow datum_row;
     is_all_cleanout = true;
     is_all_delay_cleanout = true;
@@ -80,7 +80,7 @@ void ObQueryEngine::dump2text(FILE* fd)
                                              true  /*end_exclusive*/))) {
     TRANS_LOG(ERROR, "set key range to btree scan handle fail", KR(ret));
   } else {
-    blocksstable::ObRowReader row_reader;
+    blocksstable::ObCompatRowReader row_reader;
     blocksstable::ObDatumRow datum_row;
     SMART_VAR(ObCStringHelper, helper) {
       for (int64_t row_idx = 0; OB_SUCC(ret) && OB_SUCC(iter.next_internal()); row_idx++) {
@@ -255,6 +255,61 @@ int ObQueryEngine::get(const ObMemtableKey *parameter_key,
   return ret;
 }
 
+int ObQueryEngine::get_from_btree(const ObMemtableKey *parameter_key,
+                                  ObMvccRow *&row,
+                                  ObMemtableKey *returned_key)
+{
+  int ret = OB_SUCCESS;
+  row = nullptr;
+
+  if (IS_NOT_INIT) {
+    TRANS_LOG(WARN, "not init", K(this));
+    ret = OB_NOT_INIT;
+  } else if (OB_ISNULL(parameter_key)) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "invalid param", KP(parameter_key));
+  } else {
+    const ObStoreRowkeyWrapper parameter_key_wrapper(parameter_key->get_rowkey());
+
+    if (OB_FAIL(keybtree_.get(parameter_key_wrapper, row))) {
+      if (OB_ENTRY_NOT_EXIST != ret) {
+        TRANS_LOG(WARN, "get from keyhash fail", KR(ret), KPC(parameter_key));
+      }
+      row = nullptr;
+    } else if (OB_ISNULL(row)) {
+      ret = OB_ERR_UNEXPECTED;
+      TRANS_LOG(ERROR, "get NULL value from keyhash", KR(ret), KPC(parameter_key));
+    }
+  }
+  return ret;
+}
+
+int ObQueryEngine::create_btree_kv(const ObMemtableKey *parameter_key,
+                                  const ObMvccRowCreator &row_creator,
+                                  ObMvccRow *&row)
+{
+  int ret = OB_SUCCESS;
+
+  if (IS_NOT_INIT) {
+    TRANS_LOG(WARN, "not init", K(this));
+    ret = OB_NOT_INIT;
+  } else if (OB_ISNULL(parameter_key)) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "invalid param", KP(parameter_key));
+  } else if (OB_UNLIKELY(!row_creator.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "invalid row creator", K(row_creator));
+  } else {
+    const ObStoreRowkeyWrapper parameter_key_wrapper(parameter_key->get_rowkey());
+    if (OB_FAIL(keybtree_.insert_or_get(parameter_key_wrapper, row_creator, row))) {
+      TRANS_LOG(WARN, "fail to insert or get", KR(ret), KPC(parameter_key));
+    }
+  }
+
+  return ret;
+}
+
+
 // The caller need to guarantee the mutual exclusive enforced here, otherwise
 // the concurrent modification will violate the rules of the btree(the ERROR
 // will be reported if two same key is inserted into keybtree successively)
@@ -401,7 +456,9 @@ int ObQueryEngine::sample_rows(Iterator<BtreeRawIterator> *iter,
           // Case5: existent row, not change estimation total row count
         }
 
-        if (sample_row_count >= MAX_SAMPLE_ROW_COUNT) {
+        // In full scan mode, don't limit sample count for accurate estimation
+        int64_t event_ret = (OB_E(EventTable::EN_EXPLAIN_GENERATE_PLAN_WITH_OUTLINE) OB_SUCCESS);
+        if (OB_SUCCESS == event_ret && sample_row_count >= MAX_SAMPLE_ROW_COUNT) {
           break;
         }
       }

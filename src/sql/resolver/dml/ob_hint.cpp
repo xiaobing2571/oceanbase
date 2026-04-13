@@ -12,7 +12,11 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "ob_hint.h"
+
+#include "share/catalog/ob_catalog_utils.h"
+#include "sql/code_generator/ob_enable_rich_format_flags.h"
 #include "sql/optimizer/ob_log_plan.h"
+#include "sql/resolver/expr/ob_raw_expr.h"
 
 namespace oceanbase
 {
@@ -29,6 +33,7 @@ void ObPhyPlanHint::reset()
   log_level_.reset();
   parallel_ = -1;
   monitor_ = false;
+  table_lock_mode_ = 0;
 }
 
 OB_SERIALIZE_MEMBER(ObPhyPlanHint,
@@ -38,7 +43,9 @@ OB_SERIALIZE_MEMBER(ObPhyPlanHint,
                     force_trace_log_,
                     log_level_,
                     parallel_,
-                    monitor_);
+                    monitor_,
+                    table_lock_mode_,
+		    max_execution_time_);
 
 int ObPhyPlanHint::deep_copy(const ObPhyPlanHint &other, ObIAllocator &allocator)
 {
@@ -49,6 +56,7 @@ int ObPhyPlanHint::deep_copy(const ObPhyPlanHint &other, ObIAllocator &allocator
   force_trace_log_ = other.force_trace_log_;
   parallel_ = other.parallel_;
   monitor_ = other.monitor_;
+  table_lock_mode_ = other.table_lock_mode_;
   if (OB_FAIL(ob_write_string(allocator, other.log_level_, log_level_))) {
     LOG_WARN("Failed to deep copy log level", K(ret));
   }
@@ -73,6 +81,17 @@ int ObDBLinkHit::print(char *buf, int64_t &buf_len, int64_t &pos, const char* ou
     }
   }
   return 0;
+}
+
+ObGlobalHint::ObGlobalHint(common::ObIAllocator &allocator)
+  : dops_(allocator),
+    opt_params_(allocator),
+    ob_ddl_schema_versions_(allocator),
+    alloc_op_hints_(allocator),
+    disable_op_rich_format_hint_(allocator),
+    trigger_hint_(allocator)
+{
+  reset();
 }
 
 int ObGlobalHint::merge_alloc_op_hints(const ObIArray<ObAllocOpHint> &alloc_op_hints)
@@ -322,6 +341,25 @@ void ObGlobalHint::merge_read_consistency_hint(ObConsistencyLevel read_consisten
   }
 }
 
+void ObGlobalHint::merge_table_lock_mode_hint(int64_t table_lock_mode)
+{
+  const ObTableLockMode input_table_lock_mode = static_cast<ObTableLockMode>(table_lock_mode);
+  const ObTableLockMode curr_table_lock_mode = static_cast<ObTableLockMode>(table_lock_mode_);
+
+  if (NO_LOCK != table_lock_mode) {
+    if (NO_LOCK == table_lock_mode_) {
+      table_lock_mode_ = table_lock_mode;
+    } else if (is_equal_or_greater_lock_mode(curr_table_lock_mode, input_table_lock_mode)) {
+      // do nothing
+      LOG_INFO("current table_lock_mode is equal or greater than the merge table_lock_mode, ignore it",
+               K(table_lock_mode_),
+               K(table_lock_mode));
+    } else {
+      table_lock_mode_ = table_lock_mode;
+    }
+  }
+}
+
 void ObGlobalHint::merge_opt_features_version_hint(uint64_t opt_features_version)
 {
   if (is_valid_opt_features_version(opt_features_version)) {
@@ -345,43 +383,6 @@ void ObGlobalHint::merge_resource_group_hint(const ObString &resource_group)
   }
 }
 
-// zhanyue todo: try remove this later
-bool ObGlobalHint::has_hint_exclude_concurrent() const
-{
-  bool bret = false;
-  return -1 != frozen_version_
-         || -1 != topk_precision_
-         || 0 != sharding_minimum_row_count_
-         || UNSET_QUERY_TIMEOUT != query_timeout_
-         || dblink_hints_.has_valid_hint()
-         || common::INVALID_CONSISTENCY != read_consistency_
-         || OB_USE_PLAN_CACHE_INVALID != plan_cache_policy_
-         || false != force_trace_log_
-         || false != enable_lock_early_release_
-         || false != force_refresh_lc_
-         || !log_level_.empty()
-         || has_parallel_hint()
-         || has_dml_parallel_hint()
-         || false != monitor_
-         || ObPDMLOption::NOT_SPECIFIED != pdml_option_
-         || ObParamOption::NOT_SPECIFIED != param_option_
-         || !alloc_op_hints_.empty()
-         || !dops_.empty()
-         || false != disable_transform_
-         || false != disable_cost_based_transform_
-         || false != has_append()
-         || !opt_params_.empty()
-         || !ob_ddl_schema_versions_.empty()
-         || has_gather_opt_stat_hint()
-         || false != has_dbms_stats_hint_
-         || -1 != dynamic_sampling_
-         || flashback_read_tx_uncommitted_
-         || has_direct_load()
-         || !resource_group_.empty()
-         || ObParallelDASOption::NOT_SPECIFIED != parallel_das_dml_option_
-         || !px_node_hint_.empty();
-}
-
 void ObGlobalHint::reset()
 {
   frozen_version_ = -1;
@@ -394,6 +395,7 @@ void ObGlobalHint::reset()
   max_concurrent_ = UNSET_MAX_CONCURRENT;
   enable_lock_early_release_ = false;
   force_refresh_lc_ = false;
+  table_lock_mode_ = 0;
   log_level_.reset();
   parallel_ = UNSET_PARALLEL;
   dml_parallel_ = UNSET_PARALLEL;
@@ -416,11 +418,15 @@ void ObGlobalHint::reset()
   resource_group_.reset();
   parallel_das_dml_option_ = ObParallelDASOption::NOT_SPECIFIED;
   px_node_hint_.reset();
+  disable_op_rich_format_hint_.reset();
+  trigger_hint_.reset();
+  has_hint_exclude_concurrent_ = false;
 }
 
 int ObGlobalHint::merge_global_hint(const ObGlobalHint &other)
 {
   int ret = OB_SUCCESS;
+  has_hint_exclude_concurrent_ |= other.has_hint_exclude_concurrent_;
   merge_read_consistency_hint(other.read_consistency_, other.frozen_version_);
   merge_topk_hint(other.topk_precision_, other.sharding_minimum_row_count_);
   merge_query_timeout_hint(other.query_timeout_);
@@ -447,6 +453,7 @@ int ObGlobalHint::merge_global_hint(const ObGlobalHint &other)
   merge_dynamic_sampling_hint(other.dynamic_sampling_);
   merge_direct_load_hint(other.direct_load_hint_);
   merge_resource_group_hint(other.resource_group_);
+  merge_table_lock_mode_hint(other.table_lock_mode_);
   if (OB_FAIL(merge_alloc_op_hints(other.alloc_op_hints_))) {
     LOG_WARN("failed to merge alloc op hints", K(ret));
   } else if (OB_FAIL(merge_dop_hint(other.dops_))) {
@@ -457,6 +464,10 @@ int ObGlobalHint::merge_global_hint(const ObGlobalHint &other)
     LOG_WARN("failed to append ddl_schema_version", K(ret));
   } else if (OB_FAIL(px_node_hint_.merge_px_node_hint(other.px_node_hint_))) {
     LOG_WARN("failed to merge px_node_addrs", K(ret));
+  } else if (OB_FAIL(disable_op_rich_format_hint_.merge_hint(other.disable_op_rich_format_hint_))) {
+    LOG_WARN("merge disable op rich format hint failed", K(ret));
+  } else if (OB_FAIL(trigger_hint_.merge_trigger_hint(other.trigger_hint_))) {
+    LOG_WARN("merge trigger hint failed", K(ret));
   }
   return ret;
 }
@@ -468,7 +479,6 @@ int ObGlobalHint::assign(const ObGlobalHint &other)
 }
 
 // hints below not print
-// MAX_CONCURRENT
 // ObDDLSchemaVersionHint
 int ObGlobalHint::print_global_hint(PlanText &plan_text) const
 {
@@ -656,6 +666,27 @@ int ObGlobalHint::print_global_hint(PlanText &plan_text) const
   if (OB_SUCC(ret) && OB_FAIL(px_node_hint_.print_px_node_hint(plan_text))) {
     LOG_WARN("failed to print px node hint", K(ret));
   }
+
+  if (OB_SUCC(ret) && OB_FAIL(disable_op_rich_format_hint_.print(plan_text))) {
+    LOG_WARN("print disable op rich format hint failed", K(ret));
+  }
+
+if (OB_SUCC(ret) && OB_FAIL(trigger_hint_.print_trigger_hint(plan_text))) {
+    LOG_WARN("print trigger hint failed", K(ret));
+  }
+
+  if (OB_SUCC(ret) && UNSET_MAX_CONCURRENT != max_concurrent_ && plan_text.is_used_hint_) { // MAX_CONCURRENT
+    PRINT_GLOBAL_HINT_NUM("MAX_CONCURRENT", max_concurrent_);
+  }
+
+  if (OB_SUCC(ret) && 0 != table_lock_mode_) {  // TABLE_LOCK_MODE
+    char lock_mode_str[32];
+    if (OB_FAIL(lock_mode_to_string(table_lock_mode_, lock_mode_str, sizeof(lock_mode_str), false /*in_short*/))) {
+      LOG_WARN("get lock mode string failed", K(ret), K(table_lock_mode_));
+    } else if (OB_FAIL(BUF_PRINTF("%s%s(%s)", outline_indent, "TABLE_LOCK_MODE", lock_mode_str))) {
+      LOG_WARN("failed to print hint", K(ret), K(table_lock_mode_));
+    }
+  }
   return ret;
 }
 
@@ -829,19 +860,48 @@ int ObOptParamHint::merge_opt_param_hint(const ObOptParamHint &other)
   return ret;
 }
 
-int ObOptParamHint::add_opt_param_hint(const OptParamType param_type, const ObObj &val)
+int ObOptParamHint::add_opt_param_hint(const OptParamType param_type, const ObObj &val, bool overwrite)
 {
   int ret = OB_SUCCESS;
   ObObj cur_value;
+  int64_t idx = OB_INVALID_INDEX;
   if (!is_param_val_valid(param_type, val)) {
     /* do nothing */
-  } else if (OB_FAIL(get_opt_param(param_type, cur_value))) {
+  } else if (OB_FAIL(get_opt_param(param_type, cur_value, &idx))) {
     LOG_WARN("failed to get opt param", K(ret), K(param_type));
   } else if (!cur_value.is_nop_value()) {
-    /* exists opt param hint for this type, use the first opt param hint */
+    if (overwrite) {
+      param_vals_.at(idx) = val;
+    } else {
+      /* exists opt param hint for this type, use the first opt param hint */
+    }
   } else if (OB_FAIL(param_types_.push_back(param_type))
              || OB_FAIL(param_vals_.push_back(val))) {
     LOG_WARN("failed to push back", K(ret), K(param_type), K(val));
+  }
+  return ret;
+}
+
+int ObOptParamHint::remove_opt_param(const OptParamType param_type)
+{
+  int ret = OB_SUCCESS;
+  int64_t idx = OB_INVALID_INDEX;
+  if (OB_UNLIKELY(param_types_.count() != param_vals_.count())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected opt param hint", K(ret), K(param_types_.count()), K(param_vals_.count()));
+  } else {
+    for (int64_t i = 0; OB_INVALID_INDEX == idx && i < param_types_.count(); ++i) {
+      if (param_type == param_types_.at(i)) {
+        idx = i;
+      }
+    }
+    if (OB_INVALID_INDEX == idx) {
+      // param not found, do nothing
+    } else if (OB_FAIL(param_types_.remove(idx))) {
+      LOG_WARN("failed to remove opt param type", K(ret), K(param_type), K(idx));
+    } else if (OB_FAIL(param_vals_.remove(idx))) {
+      LOG_WARN("failed to remove opt param value", K(ret), K(param_type), K(idx));
+    }
   }
   return ret;
 }
@@ -871,8 +931,19 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
     case ENABLE_SPF_BATCH_RESCAN:
     case NLJ_BATCHING_ENABLED:
     case ENABLE_PX_ORDERED_COORD:
+    case ENABLE_WINDOW_FUNCTION_STREAMING_PROCESS:
     case ENABLE_TOPN_RUNTIME_FILTER:
     case DISABLE_GTT_SESSION_ISOLATION:
+    case ENABLE_PARTIAL_GROUP_BY_PUSHDOWN:
+    case ENABLE_PARTIAL_LIMIT_PUSHDOWN:
+    case ENABLE_PARTIAL_DISTINCT_PUSHDOWN:
+    case ENABLE_RUNTIME_FILTER_ADAPTIVE_APPLY:
+    case ENABLE_GROUPING_SETS_EXPANSION:
+    case EXTENDED_SQL_PLAN_MONITOR_METRICS:
+    case ENABLE_DELETE_INSERT_SCAN:
+    case ENABLE_FAST_REFRESH_WITH_CUR_TIME:
+    case DISABLE_SHARED_EXPR_EXTRACTION:
+    case ENABLE_MERGE_INTO:
     case PRESERVE_ORDER_FOR_GROUPBY: {
       is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("true")
                                       || 0 == val.get_varchar().case_compare("false"));
@@ -900,8 +971,12 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
       is_valid = val.is_int() && (0 < val.get_int());
       break;
     }
+    case INDEX_MERGE_THRESHOLD_FOR_MULTIVALUE: {
+      is_valid = val.is_int() && (0 <= val.get_int());
+      break;
+    }
     case WORKAREA_SIZE_POLICY: {
-      is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("MANULE"));
+      is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("MANUAL"));
       break;
     }
     case SPILL_COMPRESSION_CODEC: {
@@ -1025,14 +1100,61 @@ bool ObOptParamHint::is_param_val_valid(const OptParamType param_type, const ObO
                                       || 0 == val.get_varchar().case_compare("range"));
       break;
     }
-    default:
+    case PARQUET_FILTER_PUSHDOWN_LEVEL:
+    case ORC_FILTER_PUSHDOWN_LEVEL: {
+      is_valid = val.is_int() && val.get_int() >= 0 && val.get_int() <= 4;
+      break;
+    }
+    case ENABLE_INDEX_MERGE: {
+      is_valid = val.is_varchar() && (0 == val.get_varchar().case_compare("true")
+                                      || 0 == val.get_varchar().case_compare("false"));
+      break;
+    }
+    case APPROX_COUNT_DISTINCT_PRECISION: {
+      is_valid = val.is_int()
+                 && val.get_int() >= 4
+                 && val.get_int() <= 16;
+      break;
+    }
+    case AP_QUERY_ROUTE_POLICY: {
+      if (val.is_int()) {
+        is_valid = 0 <= val.get_int() && val.get_int() < static_cast<int64_t>(APQueryRoutePolicy::MAX);
+      } else if (val.is_varchar()) {
+        int64_t type = OB_INVALID_ID;
+        ObSysVarApQueryRoutePolicy sv;
+        is_valid = (OB_SUCCESS == sv.find_type(val.get_varchar(), type));
+      }
+      break;
+    }
+    case PARTITION_ORDERED: {
+      is_valid = val.is_varchar()
+                 && (0 == val.get_varchar().case_compare("asc")
+                     || 0 == val.get_varchar().case_compare("desc"));
+      break;
+    }
+    case USE_DISTINCT_WITH_EXPANSION: {
+      is_valid = val.is_varchar()
+                 && (0 == val.get_varchar().case_compare("disabled")
+                     || 0 == val.get_varchar().case_compare("normal")
+                     || 0 == val.get_varchar().case_compare("ordered")
+                     || 0 == val.get_varchar().case_compare("auto"));
+      break;
+    }
+    case JOIN_ORDER_ENUM_THRESHOLD:
+    case OPTIMIZER_MAX_PERMUTATIONS:
+    case IDP_STEP_REDUCTION_THRESHOLD: {
+      is_valid = val.is_int() && (0 <= val.get_int());
+      break;
+    }
+    default: {
       LOG_TRACE("invalid opt param val", K(param_type), K(val));
       break;
+    }
   }
   return is_valid;
 }
 
-int ObOptParamHint::get_opt_param(const OptParamType param_type, ObObj &val) const
+int ObOptParamHint::get_opt_param(const OptParamType param_type, ObObj &val, int64_t *idx_ptr) const
 {
   int ret = OB_SUCCESS;
   int64_t idx = OB_INVALID_INDEX;
@@ -1041,6 +1163,9 @@ int ObOptParamHint::get_opt_param(const OptParamType param_type, ObObj &val) con
     if (param_type == param_types_.at(i)) {
       idx = i;
     }
+  }
+  if (nullptr != idx_ptr) {
+    *idx_ptr = idx;
   }
   if (OB_INVALID_INDEX == idx) {
     /* do nothing */
@@ -1117,6 +1242,15 @@ int ObOptParamHint::get_integer_opt_param(const OptParamType param_type, int64_t
   return get_integer_opt_param(param_type, val, is_exists);
 }
 
+int ObOptParamHint::get_integer_opt_param(const OptParamType param_type, uint64_t &val) const
+{
+  bool is_exists = false;
+  int64_t int_val = 0;
+  int ret = get_integer_opt_param(param_type, int_val, is_exists);
+  val = static_cast<uint64_t>(int_val);
+  return ret;
+}
+
 int ObOptParamHint::get_opt_param_runtime_filter_type(int64_t &rf_type) const
 {
   int ret = OB_SUCCESS;
@@ -1151,6 +1285,31 @@ int ObOptParamHint::get_hash_rollup_param(ObObj &val, bool &has_param) const
   return ret;
 }
 
+
+int ObOptParamHint::get_distinct_with_expansion_param(ObString &policy, bool &has_param) const
+{
+  int ret = OB_SUCCESS;
+  ObObj obj;
+  has_param = false;
+  if (OB_FAIL(has_opt_param(USE_DISTINCT_WITH_EXPANSION, has_param))) {
+    LOG_WARN("failed to check param", K(ret));
+  } else if (has_param) {
+    if (OB_FAIL(get_opt_param(OptParamType::USE_DISTINCT_WITH_EXPANSION, obj))) {
+      LOG_WARN("failed to get opt param", K(ret));
+    } else if (FALSE_IT(has_param = is_param_val_valid(USE_DISTINCT_WITH_EXPANSION, obj))) {
+    } else if (has_param) {
+      policy = obj.get_string();
+    }
+  }
+  return ret;
+}
+
+int ObOptParamHint::enable_window_function_streaming_process_param(bool &enabled, bool &has_param) const
+{
+  int ret = OB_SUCCESS;
+  return get_bool_opt_param(ENABLE_WINDOW_FUNCTION_STREAMING_PROCESS, enabled, has_param);
+}
+
 int ObOptParamHint::get_enum_opt_param(const OptParamType param_type, int64_t &val) const
 {
   int ret = OB_SUCCESS;
@@ -1180,6 +1339,13 @@ int ObOptParamHint::get_enum_opt_param(const OptParamType param_type, int64_t &v
       }
       case ENABLE_OPTIMIZER_ROWGOAL: {
         ObSysVarEnableOptimizerRowgoal sv;
+        if (OB_FAIL(sv.find_type(obj.get_varchar(), val))) {
+          LOG_WARN("param obj is invalid", K(ret), K(obj));
+        }
+        break;
+      }
+      case AP_QUERY_ROUTE_POLICY: {
+        ObSysVarApQueryRoutePolicy sv;
         if (OB_FAIL(sv.find_type(obj.get_varchar(), val))) {
           LOG_WARN("param obj is invalid", K(ret), K(obj));
         }
@@ -1243,6 +1409,15 @@ int ObOptParamHint::inner_get_sys_var(const OptParamType param_type,
     LOG_WARN("failed to get sys variable", K(ret));
   }
   return ret;
+}
+
+int ObOptParamHint::get_sys_var(const OptParamType param_type,
+                                const ObSQLSessionInfo *session,
+                                const share::ObSysVarClassType sys_var_id,
+                                uint64_t &val) const
+{
+  return inner_get_sys_var<uint64_t, &ObOptParamHint::get_integer_opt_param>
+            (param_type, session, sys_var_id, val);
 }
 
 int ObOptParamHint::get_sys_var(const OptParamType param_type,
@@ -1334,6 +1509,7 @@ ObItemType ObHint::get_hint_type(ObItemType type)
     case T_NO_USE_HASH_SET: return T_USE_HASH_SET;
     case T_NO_USE_DISTRIBUTED_DML:    return T_USE_DISTRIBUTED_DML;
     case T_NO_PUSH_SUBQ:         return T_PUSH_SUBQ;
+    case T_NO_INDEX_MERGE_HINT: return T_INDEX_MERGE_HINT;
     default:                    return type;
   }
 }
@@ -1385,6 +1561,7 @@ const char* ObHint::get_hint_name(ObItemType type, bool is_enable_hint /* defaul
     case T_NO_INDEX_HINT:       return "NO_INDEX";
     case T_USE_DAS_HINT:        return is_enable_hint ? "USE_DAS" : "NO_USE_DAS";
     case T_UNION_MERGE_HINT:    return "UNION_MERGE";
+    case T_INDEX_MERGE_HINT:    return is_enable_hint ? "INDEX_MERGE" : "NO_INDEX_MERGE";
     case T_USE_COLUMN_STORE_HINT: return is_enable_hint ? "USE_COLUMN_TABLE" : "NO_USE_COLUMN_TABLE";
     case T_INDEX_SS_HINT:       return "INDEX_SS";
     case T_INDEX_SS_ASC_HINT:   return "INDEX_SS_ASC";
@@ -1416,6 +1593,9 @@ const char* ObHint::get_hint_name(ObItemType type, bool is_enable_hint /* defaul
     case T_INDEX_ASC_HINT:    return "INDEX_ASC";
     case T_INDEX_DESC_HINT:   return "INDEX_DESC";
     case T_PUSH_SUBQ:         return is_enable_hint ? "PUSH_SUBQ" : "NO_PUSH_SUBQ";
+    case T_DISABLE_TRIGGER_HINT: return "DISABLE_TRIGGER";
+    case T_TABLE_LOCK_MODE_HINT: return "TABLE_LOCK_MODE";
+    case T_VECTOR_INDEX_HINT: return "VECTOR_INDEX";
     default:                    return NULL;
   }
 }
@@ -1491,7 +1671,7 @@ int ObHint::deep_copy_hint_contain_table(ObIAllocator *allocator, ObHint *&hint)
     case HINT_JOIN_FILTER:  DEEP_COPY_NORMAL_HINT(ObJoinFilterHint); break;
     case HINT_WIN_MAGIC: DEEP_COPY_NORMAL_HINT(ObWinMagicHint); break;
     case HINT_COALESCE_AGGR: DEEP_COPY_NORMAL_HINT(ObCoalesceAggrHint); break;
-    case HINT_UNION_MERGE: DEEP_COPY_NORMAL_HINT(ObUnionMergeHint); break;
+    case HINT_INDEX_MERGE: DEEP_COPY_NORMAL_HINT(ObIndexMergeHint); break;
     default:  {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected hint type to deep copy", K(ret), K(hint_class_));
@@ -2419,6 +2599,16 @@ int ObIndexHint::print_hint_desc(PlanText &plan_text) const
     /* do nothing */
   } else if (OB_FAIL(BUF_PRINTF(" \"%.*s\"", index_name_.length(), index_name_.ptr()))) {
     LOG_WARN("fail to print index name", K(ret));
+  } else if (T_VECTOR_INDEX_HINT == hint_type_) {
+    if (filter_type_ == VecFilterType::PRE_FILTER) {
+      if (OB_FAIL(BUF_PRINTF(" PRE_FILTER"))) {
+        LOG_WARN("fail to print index filter type", K(ret));
+      }
+    } else if (filter_type_ == VecFilterType::POST_FILTER) {
+      if (OB_FAIL(BUF_PRINTF(" POST_FILTER"))) {
+        LOG_WARN("fail to print index filter type", K(ret));
+      }
+    }
   } else if ((T_INDEX_HINT != hint_type_ && T_INDEX_ASC_HINT != hint_type_ && T_INDEX_DESC_HINT != hint_type_)
              || index_prefix_ < 0) {
     //do nothing
@@ -2428,7 +2618,7 @@ int ObIndexHint::print_hint_desc(PlanText &plan_text) const
   return ret;
 }
 
-int ObUnionMergeHint::assign(const ObUnionMergeHint &other)
+int ObIndexMergeHint::assign(const ObIndexMergeHint &other)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(table_.assign(other.table_))) {
@@ -2441,7 +2631,7 @@ int ObUnionMergeHint::assign(const ObUnionMergeHint &other)
   return ret;
 }
 
-int ObUnionMergeHint::print_hint_desc(PlanText &plan_text) const
+int ObIndexMergeHint::print_hint_desc(PlanText &plan_text) const
 {
   int ret = OB_SUCCESS;
   char *buf = plan_text.buf_;
@@ -2467,6 +2657,8 @@ int ObJoinHint::assign(const ObJoinHint &other)
     LOG_WARN("fail to assign table", K(ret));
   } else if (OB_FAIL(ObOptHint::assign(other))) {
     LOG_WARN("fail to assign hint", K(ret));
+  } else {
+    parallel_ = other.parallel_;
   }
   return ret;
 }
@@ -2490,6 +2682,9 @@ int ObJoinHint::print_hint_desc(PlanText &plan_text) const
   } else if (T_PQ_DISTRIBUTE == hint_type_ && NULL != algo_str
              && OB_FAIL(BUF_PRINTF(" %s", algo_str))) {
     LOG_WARN("failed to print dist algo", K(ret));
+  } else if (ObGlobalHint::UNSET_PARALLEL < parallel_ &&
+             OB_FAIL(BUF_PRINTF(" %ld", parallel_))) {
+    LOG_WARN("fail to print parallel", K(ret));
   }
   return ret;
 }
@@ -2527,6 +2722,7 @@ const char *ObJoinHint::get_dist_algo_str(DistAlgo dist_algo)
     case DistAlgo::DIST_NONE_ALL:           return  "NONE ALL";
     case DistAlgo::DIST_ALL_NONE:           return  "ALL NONE";
     case DistAlgo::DIST_RANDOM_ALL:         return  "RANDOM ALL";
+    case DistAlgo::DIST_RANDOM_BROADCAST:     return  "RANDOM BROADCAST";
     case DistAlgo::DIST_HASH_ALL:           return  "HASH ALL";
     case DistAlgo::DIST_HASH_HASH_LOCAL:    return "HASH_LOCAL HASH_LOCAL";
     case DistAlgo::DIST_PARTITION_HASH_LOCAL:    return "PARTITION HASH_LOCAL";
@@ -3077,6 +3273,7 @@ int ObTableInHint::assign(const ObTableInHint &other)
 {
   int ret = OB_SUCCESS;
   qb_name_ = other.qb_name_;
+  catalog_name_ = other.catalog_name_;
   db_name_ = other.db_name_;
   table_name_ = other.table_name_;
   return ret;
@@ -3085,6 +3282,7 @@ int ObTableInHint::assign(const ObTableInHint &other)
 bool ObTableInHint::equal(const ObTableInHint& other) const
 {
   return qb_name_.case_compare(other.qb_name_) == 0 &&
+         catalog_name_.case_compare(other.catalog_name_) == 0 &&
          db_name_.case_compare(other.db_name_) == 0 &&
          table_name_.case_compare(other.table_name_) == 0;
 }
@@ -3095,6 +3293,10 @@ DEF_TO_STRING(ObTableInHint)
   J_OBJ_START();
   if (!qb_name_.empty()) {
     J_KV(K_(qb_name));
+  }
+  if (!catalog_name_.empty()) {
+    J_KV(K_(catalog_name));
+    J_COMMA();
   }
   if (!db_name_.empty()) {
     J_KV(K_(db_name));
@@ -3132,6 +3334,9 @@ int ObTableInHint::print_table_in_hint(PlanText &plan_text,
   if (OB_UNLIKELY(table_name_.empty())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get empty table name for table in hint", K(ret), K(table_name_));
+  } else if (!catalog_name_.empty()
+             && OB_FAIL(BUF_PRINTF("\"%.*s\".", catalog_name_.length(), catalog_name_.ptr()))) {
+    LOG_WARN("fail to print catalog_name", K(ret), K(catalog_name_), K(buf), K(buf_len), K(pos));
   } else if (!db_name_.empty() &&
              OB_FAIL(BUF_PRINTF("\"%.*s\".", db_name_.length(), db_name_.ptr()))) {
     LOG_WARN("fail to print db_name", K(ret), K(db_name_), K(buf), K(buf_len), K(pos));
@@ -3148,13 +3353,15 @@ int ObTableInHint::print_table_in_hint(PlanText &plan_text,
 bool ObTableInHint::is_match_table_item(ObCollationType cs_type, const TableItem &table_item) const
 {
   return 0 == ObCharset::strcmp(cs_type, table_name_, table_item.get_object_name()) &&
-         (db_name_.empty() || 0 == ObCharset::strcmp(cs_type, db_name_, table_item.get_object_db_name()));
+         (db_name_.empty() || 0 == ObCharset::strcmp(cs_type, db_name_, table_item.get_object_db_name())) &&
+         (catalog_name_.empty() || 0 == ObCharset::strcmp(cs_type, catalog_name_, table_item.get_catalog_name()));
 }
 
 bool ObTableInHint::is_match_physical_table_item(ObCollationType cs_type, const TableItem &table_item) const
 {
   return 0 == ObCharset::strcmp(cs_type, table_name_, table_item.table_name_) &&
-         (db_name_.empty() || 0 == ObCharset::strcmp(cs_type, db_name_, table_item.database_name_));
+         (db_name_.empty() || 0 == ObCharset::strcmp(cs_type, db_name_, table_item.database_name_)) &&
+         (catalog_name_.empty() || 0 == ObCharset::strcmp(cs_type, catalog_name_, table_item.get_catalog_name()));
 }
 
 bool ObTableInHint::is_match_table_item(ObCollationType cs_type,
@@ -3274,6 +3481,7 @@ bool ObTableInHint::is_match_table_items(ObCollationType cs_type,
 void ObTableInHint::set_table(const TableItem& table)
 {
   qb_name_.assign_ptr(table.qb_name_.ptr(), table.qb_name_.length());
+  catalog_name_.reset();
   db_name_.reset(); // for alias table or generated table, db_name_ should be empty
   if (!table.alias_name_.empty()) {
     table_name_.assign_ptr(table.alias_name_.ptr(), table.alias_name_.length());
@@ -3283,6 +3491,10 @@ void ObTableInHint::set_table(const TableItem& table)
   } else {
     table_name_.assign_ptr(table.table_name_.ptr(), table.table_name_.length());
     if (table.is_basic_table()) {
+      if (!ObCatalogUtils::is_internal_catalog_name(table.catalog_name_)) {
+        // 只有当外表的 catalog_name 才会拷贝，INTERNAL catalog_name 不拷贝，保持以往的兼容性
+        catalog_name_.assign_ptr(table.catalog_name_.ptr(), table.catalog_name_.length());
+      }
       db_name_.assign_ptr(table.database_name_.ptr(), table.database_name_.length());
     }
   }
@@ -3405,8 +3617,15 @@ bool ObWindowDistHint::WinDistOption::is_valid() const
     bret = false;
   } else if (WinDistAlgo::WIN_DIST_HASH != algo_ &&
              WinDistAlgo::WIN_DIST_NONE != algo_ &&
-             WinDistAlgo::WIN_DIST_HASH_LOCAL != algo_
-            && (use_hash_sort_ || use_topn_sort_)) {
+             WinDistAlgo::WIN_DIST_HASH_LOCAL != algo_ &&
+             use_hash_sort_) {
+    bret = false;
+  } else if (WinDistAlgo::WIN_DIST_HASH != algo_ &&
+             WinDistAlgo::WIN_DIST_NONE != algo_ &&
+             WinDistAlgo::WIN_DIST_HASH_LOCAL != algo_ &&
+             WinDistAlgo::WIN_DIST_RANGE != algo_ &&
+             WinDistAlgo::WIN_DIST_LIST != algo_ &&
+            use_topn_sort_) {
     bret = false;
   } else {
     for (int64_t i = 0; bret && i < win_func_idxs_.count(); ++i) {
@@ -3710,6 +3929,91 @@ int ObPxNodeHint::print_px_node_hint(PlanText &plan_text) const {
   }
   return ret;
 }
+
+int DisableOpRichFormatHint::merge_op_list(const common::ObIArray<common::ObString> &op_list)
+{
+  int ret = OB_SUCCESS;
+  for (int op_idx = 0; OB_SUCC(ret) && op_idx < op_list.count(); op_idx++) {
+    bool found_op = false;
+    const ObString &op_name = op_list.at(op_idx).trim();
+    for (int i = 0; OB_SUCC(ret) && !found_op && i < PHY_END; i++) {
+      const EnableOpRichFormat::PhyOpInfo &phy_op = EnableOpRichFormat::PHY_OPS_[i];
+      if (op_name.case_compare(ObString(phy_op.name_)) == 0) {
+        if (OB_FAIL(op_list_.push_back(phy_op.name_))) {
+          LOG_WARN("push back element failed", K(ret));
+        } else {
+          op_flags_ |= phy_op.disable_flag_;
+          found_op = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int DisableOpRichFormatHint::print(PlanText &plan_text) const
+{
+  int ret = OB_SUCCESS;
+  if (!op_list_.empty()) {
+    char *buf = plan_text.buf_;
+    int64_t &buf_len = plan_text.buf_len_;
+    int64_t &pos = plan_text.pos_;
+    const char *outline_indent = ObQueryHint::get_outline_indent(plan_text.is_oneline_);
+    if (OB_FAIL(BUF_PRINTF("%sDISABLE_OP_RICH_FORMAT(", outline_indent))) {
+      LOG_WARN("buf_printf failed", K(ret));
+    }
+    for (int i = 0; OB_SUCC(ret) && i < op_list_.count(); i++) {
+      if (OB_FAIL(BUF_PRINTF("'%s'", op_list_.at(i).ptr()))) {
+        LOG_WARN("buf printf failed", K(ret));
+      } else if (i == op_list_.count() - 1 && OB_FAIL(BUF_PRINTF(")"))) {
+        LOG_WARN("buf printf failed", K(ret));
+      } else if (i < op_list_.count() - 1 && OB_FAIL(BUF_PRINTF(", "))) {
+        LOG_WARN("BUF_PRINTF failed", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int TriggerHint::print_trigger_hint(PlanText &plan_text) const
+{
+  int ret = OB_SUCCESS;
+  char *buf = plan_text.buf_;
+  int64_t &buf_len = plan_text.buf_len_;
+  int64_t &pos = plan_text.pos_;
+  const char* outline_indent = ObQueryHint::get_outline_indent(plan_text.is_oneline_);
+  if (OB_SUCC(ret)) {
+    if (disable_all_) {
+      PRINT_GLOBAL_HINT_STR("DISABLE_TRIGGER")
+    } else if (!trigger_hints_.empty()) {
+      if (OB_FAIL(BUF_PRINTF("%sDISABLE_TRIGGER(", outline_indent))) {
+        LOG_WARN("buf_printf failed", K(ret));
+      }
+      for (int i = 0; OB_SUCC(ret) && i < trigger_hints_.count(); i++) {
+        if (OB_FAIL(BUF_PRINTF("%.*s", static_cast<int>(trigger_hints_.at(i).length()), trigger_hints_.at(i).ptr()))) {
+          LOG_WARN("buf printf failed", K(ret));
+        } else if (i == trigger_hints_.count() - 1 && OB_FAIL(BUF_PRINTF(")"))) {
+          LOG_WARN("buf printf failed", K(ret));
+        } else if (i < trigger_hints_.count() - 1 && OB_FAIL(BUF_PRINTF(", "))) {
+          LOG_WARN("BUF_PRINTF failed", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int TriggerHint::merge_trigger_hint(const TriggerHint &other)
+{
+    disable_all_ = disable_all_ || other.disable_all_;
+    int ret = OB_SUCCESS;
+    for (int64 i = 0; OB_SUCC(ret) && i < other.trigger_hints_.count(); i++) {
+      if (OB_FAIL(trigger_hints_.push_back(other.trigger_hints_.at(i)))) {
+        LOG_WARN("failed to push back trigger hint", K(ret));
+      }
+    }
+    return ret;
+  }
 
 }//end of namespace sql
 }//end of namespace oceanbase

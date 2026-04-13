@@ -16,15 +16,17 @@
 #include "sql/rewrite/ob_transform_utils.h"
 #include "share/stat/ob_opt_stat_manager.h"
 #include "share/stat/ob_dbms_stats_utils.h"
+#include "share/stat/ob_lake_table_stat.h"
 #include "sql/optimizer/ob_access_path_estimation.h"
 #include "sql/optimizer/ob_sel_estimator.h"
+
 using namespace oceanbase::common;
 using namespace oceanbase::share::schema;
+
 namespace oceanbase
 {
 namespace sql
 {
-inline double revise_ndv(double ndv) { return ndv < 1.0 ? 1.0 : ndv; }
 
 void OptSelectivityCtx::init_op_ctx(ObLogicalOperator *child_op)
 {
@@ -92,7 +94,7 @@ int OptSelectivityCtx::init_deduce_infos(AccessPath *path)
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null", K(ret));
   } else {
-    const ObIArray<ObJoinOrder::DeducedExprInfo> &prefix_deduce_info = path->parent_->get_deduce_info();
+    const ObIArray<DeducedExprInfo> &prefix_deduce_info = path->parent_->get_deduce_info();
     ExprDeduceInfo *deduce_info = NULL;
     /**
      * all range filters => real range filters => precise range filters
@@ -391,7 +393,7 @@ int OptTableMeta::init(const uint64_t table_id,
   // init pkey ids
   if (OB_SUCC(ret)) {
     if (table_schema->is_heap_organized_table()) {
-      if (OB_FAIL(table_schema->get_heap_table_pk(pk_ids_))) {
+      if (OB_FAIL(table_schema->get_heap_table_pk(schema_guard.get_schema_guard(), pk_ids_))) {
         LOG_WARN("failed to get heap table pk", K(ret));
       }
     } else {
@@ -415,8 +417,98 @@ int OptTableMeta::init(const uint64_t table_id,
   //init column ndv
   if (OB_SUCC(ret) && OB_FAIL(init_column_meta(ctx, column_ids, column_metas_))) {
     LOG_WARN("init column meta failed", K(ret));
-    }
+  }
 
+  return ret;
+}
+
+int OptTableMeta::init_lake_table(const uint64_t table_id,
+                                  const uint64_t ref_table_id,
+                                  const int64_t rows,
+                                  const int64_t last_analyzed,
+                                  const OptTableStatType stat_type,
+                                  ObIArray<uint64_t> &column_ids,
+                                  const ObIArray<ObLakeColumnStat*> &column_stats,
+                                  const OptSelectivityCtx &ctx,
+                                  const ObTableMetaInfo *base_meta_info)
+{
+  int ret = OB_SUCCESS;
+  //init common member variable
+  table_id_ = table_id;
+  ref_table_id_ = ref_table_id;
+  rows_ = rows;
+  stat_type_ = stat_type;
+  base_meta_info_ = base_meta_info;
+  real_rows_ = rows;
+  base_rows_ = rows;
+  last_analyzed_ = last_analyzed;
+  if (OB_FAIL(column_metas_.prepare_allocate(column_ids.count()))) {
+    LOG_WARN("failed to init column metas", K(ret));
+  } else if (OB_FAIL(init_lake_column_meta(ctx, column_ids, column_stats, column_metas_))) {
+    LOG_WARN("init column meta failed", K(ret));
+  }
+  return ret;
+}
+
+int OptTableMeta::init_lake_column_meta(const OptSelectivityCtx &ctx,
+                                        const ObIArray<uint64_t> &column_ids,
+                                        const ObIArray<ObLakeColumnStat*> &column_stats,
+                                        ObIArray<OptColumnMeta> &column_metas)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObGlobalColumnStat, 4> col_stats;
+  if (use_default_stat()) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < column_ids.count(); ++i) {
+      ObGlobalColumnStat s;
+      column_metas.at(i).set_default_meta(rows_);
+      if (OB_FAIL(col_stats.push_back(s))) {
+        LOG_WARN("failed to push back column id", K(ret));
+      }
+    }
+  } else if (!column_ids.empty()) {
+    // batch get column stats
+    if (OB_UNLIKELY(column_ids.count() != column_stats.count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected column size", K(column_ids.count()), K(column_stats.count()));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < column_ids.count(); ++i) {
+        ObGlobalColumnStat s;
+        ObLakeColumnStat* column_stat = column_stats.at(i);
+        if (OB_ISNULL(column_stat)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get null column stat");
+        } else {
+          if (!column_stat->min_val_.is_null() &&
+              !column_stat->max_val_.is_null()) {
+            column_metas.at(i).set_max_value(column_stat->max_val_);
+            column_metas.at(i).set_min_value(column_stat->min_val_);
+            column_metas.at(i).set_min_max_inited(true);
+          }
+          column_metas.at(i).set_num_null(column_stat->null_count_);
+          if (column_stat->record_count_ > 0) {
+            s.avglen_val_ = column_stat->size_ / column_stat->record_count_;
+          } else {
+            // magic number
+            s.avglen_val_ = 4;
+          }
+          s.ndv_val_ = column_stat->num_distinct_;
+        }
+        if (OB_SUCC(ret)) {
+          if (OB_FAIL(refine_column_stat(s, rows_, column_metas.at(i)))) {
+            LOG_WARN("failed to refine column stat", K(ret));
+          } else if (OB_FAIL(col_stats.push_back(s))) {
+            LOG_WARN("failed to push back column id", K(ret));
+          }
+        }
+      }
+    }
+  }
+
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_ids.count(); ++i) {
+    if (OB_FAIL(refine_column_meta(ctx, column_ids.at(i), col_stats.at(i), column_metas.at(i)))) {
+      LOG_WARN("failed to init column ", K(ret));
+    }
+  }
   return ret;
 }
 
@@ -482,10 +574,14 @@ int OptTableMeta::refine_column_meta(const OptSelectivityCtx &ctx,
   int ret = OB_SUCCESS;
   bool is_single_pkey = (1 == pk_ids_.count() && pk_ids_.at(0) == column_id) ||
                          column_id == OB_HIDDEN_PK_INCREMENT_COLUMN_ID;
+  bool is_tmp_table_hidden_col = (OB_HIDDEN_SESSION_ID_COLUMN_ID == column_id);
   int64_t global_ndv = 0;
   int64_t num_null = 0;
   if (is_single_pkey) {
     col_meta.set_ndv(rows_);
+    col_meta.set_num_null(0);
+  } else if (is_tmp_table_hidden_col) {
+    col_meta.set_ndv(1);
     col_meta.set_num_null(0);
   }
   if (OB_SUCC(ret)) {
@@ -614,10 +710,16 @@ int OptTableMeta::refine_column_stat(const ObGlobalColumnStat &stat,
 int OptTableMetas::copy_table_meta_info(const OptTableMeta &src_meta, OptTableMeta *&dst_meta)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(table_metas_.push_back(src_meta))) {
+  OptTableMeta *new_meta = NULL;
+  if (OB_ISNULL(new_meta = OB_NEWx(OptTableMeta, &allocator_, allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate table meta", K(ret));
+  } else if (OB_FAIL(new_meta->assign(src_meta))) {
+    LOG_WARN("failed to assign table meta", K(ret));
+  } else if (OB_FAIL(table_metas_.push_back(new_meta))) {
     LOG_WARN("failed to push back table meta");
   } else {
-    dst_meta = &table_metas_.at(table_metas_.count() - 1);
+    dst_meta = new_meta;
   }
   return ret;
 }
@@ -660,9 +762,11 @@ int OptTableMetas::add_base_table_meta_info(OptSelectivityCtx &ctx,
   if (OB_ISNULL(schema_guard)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null sql schema guard", K(schema_guard));
-  } else if (OB_ISNULL(table_meta = table_metas_.alloc_place_holder())) {
+  } else if (OB_ISNULL(table_meta = OB_NEWx(OptTableMeta, &allocator_, allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to allocate place holder for table meta", K(ret));
+    LOG_WARN("failed to allocate table meta", K(ret));
+  } else if (OB_FAIL(table_metas_.push_back(table_meta))) {
+    LOG_WARN("failed to push back table meta", K(ret));
   } else if (OB_FAIL(table_meta->init(table_id, ref_table_id, rows, stat_type, micro_block_count,
                                       *schema_guard, all_used_part_id, all_used_tablets,
                                       column_ids, stat_part_id, hist_part_id, scale_ratio, ctx,
@@ -696,9 +800,11 @@ int OptTableMetas::add_set_child_stmt_meta_info(const ObSelectStmt *parent_stmt,
   if (OB_ISNULL(parent_stmt) || OB_ISNULL(child_stmt)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null stmt", K(ret), K(parent_stmt), K(child_stmt));
-  } else if (OB_ISNULL(table_meta = table_metas_.alloc_place_holder())) {
+  } else if (OB_ISNULL(table_meta = OB_NEWx(OptTableMeta, &allocator_, allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to allocate place holder for table meta", K(ret));
+    LOG_WARN("failed to allocate table meta", K(ret));
+  } else if (OB_FAIL(table_metas_.push_back(table_meta))) {
+    LOG_WARN("failed to push back table meta", K(ret));
   } else {
     const double table_rows = child_rows;
     table_meta->set_table_id(table_id);
@@ -737,7 +843,7 @@ int OptTableMetas::add_set_child_stmt_meta_info(const ObSelectStmt *parent_stmt,
           ret = OB_ALLOCATE_MEMORY_FAILED;
           LOG_WARN("failed to allocate place holder for column meta", K(ret));
         } else {
-          column_meta->init(OB_APP_MIN_COLUMN_ID + i, revise_ndv(ndv), num_null, avg_len);
+          column_meta->init(OB_APP_MIN_COLUMN_ID + i, ObOptSelectivity::revise_ndv(ndv), num_null, avg_len);
           column_meta->set_min_max_inited(true);
         }
       }
@@ -783,9 +889,11 @@ int OptTableMetas::add_generate_table_meta_info(const ObDMLStmt *parent_stmt,
   if (OB_ISNULL(parent_stmt) || OB_ISNULL(child_stmt) || OB_ISNULL(child_ctx.get_plan())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null stmt", K(ret), K(parent_stmt), K(child_stmt));
-  } else if (OB_ISNULL(table_meta = table_metas_.alloc_place_holder())) {
+  } else if (OB_ISNULL(table_meta = OB_NEWx(OptTableMeta, &allocator_, allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to allocate place holder for table meta", K(ret));
+    LOG_WARN("failed to allocate table meta", K(ret));
+  } else if (OB_FAIL(table_metas_.push_back(table_meta))) {
+    LOG_WARN("failed to push back table meta", K(ret));
   } else if (OB_FAIL(parent_stmt->get_column_items(table_id, column_items))) {
     LOG_WARN("failed to get column items", K(ret));
   } else {
@@ -840,7 +948,7 @@ int OptTableMetas::add_generate_table_meta_info(const ObDMLStmt *parent_stmt,
           ret = OB_ALLOCATE_MEMORY_FAILED;
           LOG_WARN("failed to allocate place holder for column meta", K(ret));
         } else {
-          column_meta->init(column_item.column_id_, revise_ndv(ndv), num_null, avg_len);
+          column_meta->init(column_item.column_id_, ObOptSelectivity::revise_ndv(ndv), num_null, avg_len);
           column_meta->set_min_max_inited(true);
           ObObj maxobj;
           ObObj minobj;
@@ -870,7 +978,7 @@ int OptTableMetas::add_generate_table_meta_info(const ObDMLStmt *parent_stmt,
               LOG_WARN("failed to calculate distinct", K(ret));
             } else {
               nns = ObOptSelectivity::revise_between_0_1(nns);
-              base_ndv = revise_ndv(base_ndv);
+              base_ndv = ObOptSelectivity::revise_ndv(base_ndv);
               column_meta->set_num_null(table_rows * (1 - nns));
               column_meta->set_base_ndv(base_ndv);
             }
@@ -897,9 +1005,11 @@ int OptTableMetas::add_values_table_meta_info(const ObDMLStmt *stmt,
   if (OB_ISNULL(stmt) || OB_ISNULL(table_def)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null stmt", K(ret), KP(stmt), KP(table_def));
-  } else if (OB_ISNULL(table_meta = table_metas_.alloc_place_holder())) {
+  } else if (OB_ISNULL(table_meta = OB_NEWx(OptTableMeta, &allocator_, allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to allocate place holder for table meta", K(ret));
+    LOG_WARN("failed to allocate table meta", K(ret));
+  } else if (OB_FAIL(table_metas_.push_back(table_meta))) {
+    LOG_WARN("failed to push back table meta", K(ret));
   } else if (OB_FAIL(stmt->get_column_items(table_id, column_items))) {
     LOG_WARN("failed to get column items", K(ret));
   } else {
@@ -918,7 +1028,7 @@ int OptTableMetas::add_values_table_meta_info(const ObDMLStmt *stmt,
       } else {
         double avg_len = ObOptEstCost::get_estimate_width_from_type(column_item.expr_->get_result_type());
         column_meta->init(column_item.column_id_,
-                          revise_ndv(table_def->column_ndvs_.at(idx)),
+                          ObOptSelectivity::revise_ndv(table_def->column_ndvs_.at(idx)),
                           table_def->column_nnvs_.at(idx),
                           avg_len);
       }
@@ -1007,8 +1117,8 @@ const OptTableMeta* OptTableMetas::get_table_meta_by_table_id(const uint64_t tab
 {
   const OptTableMeta *table_meta = NULL;
   for (int64_t i = 0; NULL == table_meta && i < table_metas_.count(); ++i) {
-    if (table_id == table_metas_.at(i).get_table_id()) {
-      table_meta = &table_metas_.at(i);
+    if (NULL != table_metas_.at(i) && table_id == table_metas_.at(i)->get_table_id()) {
+      table_meta = table_metas_.at(i);
     }
   }
   return table_meta;
@@ -1018,8 +1128,8 @@ OptTableMeta* OptTableMetas::get_table_meta_by_table_id(const uint64_t table_id)
 {
   OptTableMeta *table_meta = NULL;
   for (int64_t i = 0; NULL == table_meta && i < table_metas_.count(); ++i) {
-    if (table_id == table_metas_.at(i).get_table_id()) {
-      table_meta = &table_metas_.at(i);
+    if (NULL != table_metas_.at(i) && table_id == table_metas_.at(i)->get_table_id()) {
+      table_meta = table_metas_.at(i);
     }
   }
   return table_meta;
@@ -1065,6 +1175,37 @@ double OptTableMetas::get_base_rows(const uint64_t table_id) const
     rows = table_meta->get_base_rows();
   }
   return rows;
+}
+
+int OptTableMetas::add_lake_table_meta_info(OptSelectivityCtx &ctx,
+                                            const uint64_t table_id,
+                                            const uint64_t ref_table_id,
+                                            const int64_t rows,
+                                            const int64_t last_analyzed,
+                                            ObIArray<uint64_t> &column_ids,
+                                            const ObIArray<ObLakeColumnStat*> &column_stats,
+                                            const OptTableStatType stat_type,
+                                            const ObTableMetaInfo *base_meta_info)
+{
+  int ret = OB_SUCCESS;
+  OptTableMeta *table_meta = NULL;
+  void *ptr = NULL;
+  if (OB_ISNULL(ptr = allocator_.alloc(sizeof(OptTableMeta)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate table meta", K(ret));
+  } else {
+    table_meta = new (ptr) OptTableMeta(allocator_);
+    if (OB_FAIL(table_metas_.push_back(table_meta))) {
+      LOG_WARN("failed to push back table meta", K(ret));
+    } else if (OB_FAIL(table_meta->init_lake_table(table_id, ref_table_id, rows, last_analyzed, stat_type,
+                                                   column_ids, column_stats, ctx, base_meta_info))) {
+      LOG_WARN("failed to init new tstat", K(ret));
+    } else {
+      LOG_TRACE("add base table meta info success", K(*table_meta));
+    }
+  }
+
+  return ret;
 }
 
 int ObOptSelectivity::calculate_conditional_selectivity(const OptTableMetas &table_metas,
@@ -2412,6 +2553,11 @@ int ObOptSelectivity::get_column_basic_sel(const OptTableMetas &table_metas,
   } else {
     double null_sel = row_count <= OB_DOUBLE_EPSINON ? 0.0 : revise_between_0_1(num_null / row_count);
     double distinct_sel = ndv <= OB_DOUBLE_EPSINON ? 0.0 : revise_between_0_1((1 - null_sel) / ndv);
+    if (1.0 == ndv && 1.0 == row_count && ctx.check_opt_compat_version(COMPAT_VERSION_4_2_5_BP7, COMPAT_VERSION_4_3_0,
+                                                                       COMPAT_VERSION_4_3_5_BP4, COMPAT_VERSION_4_4_0,
+                                                                       COMPAT_VERSION_4_4_1)) {
+      distinct_sel = DEFAULT_EQ_SEL;
+    }
     assign_value(distinct_sel, distinct_sel_ptr);
     assign_value(null_sel, null_sel_ptr);
     LOG_TRACE("column basic sel info", K(distinct_sel), K(null_sel));

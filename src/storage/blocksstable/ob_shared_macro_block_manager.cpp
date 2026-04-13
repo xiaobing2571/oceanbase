@@ -51,7 +51,7 @@ bool ObBlockInfo::is_valid() const
 
 bool ObBlockInfo::is_small_sstable() const
 {
-  return OB_DEFAULT_MACRO_BLOCK_SIZE != nested_size_;
+  return nested_offset_ > 0 && OB_DEFAULT_MACRO_BLOCK_SIZE != nested_size_;
 }
 
 /**
@@ -61,8 +61,8 @@ ObSharedMacroBlockMgr::ObSharedMacroBlockMgr()
   : offset_(OB_DEFAULT_MACRO_BLOCK_SIZE),
     common_header_buf_(nullptr),
     header_size_(0),
-    mutex_(),
-    blocks_mutex_(),
+    mutex_(common::ObLatchIds::SHARED_MACRO_BLOCK_MGR_MUTEX),
+    blocks_mutex_(common::ObLatchIds::SHARED_MACRO_BLOCK_MGR_BLOCKS_MUTEX),
     block_used_size_(),
     defragmentation_task_(*this),
     tg_id_(-1),
@@ -280,7 +280,9 @@ int ObSharedMacroBlockMgr::write_block(
     ret = OB_ALLOCATE_MEMORY_FAILED;
     STORAGE_LOG(WARN, "failed to alloc macro read info buffer", K(ret), K(read_info.size_));
   } else {
-    if (OB_FAIL(ObBlockManager::async_read_block(read_info, read_handle))) {
+    if (!GCTX.is_shared_storage_mode() && OB_FAIL(LOCAL_DEVICE_INSTANCE.fsync_block())) {
+      LOG_WARN("fail to fsync_block", K(ret));
+    } else if (OB_FAIL(ObBlockManager::async_read_block(read_info, read_handle))) {
       LOG_WARN("fail to async read macro block", K(ret), K(read_info));
     } else if (OB_FAIL(read_handle.wait())) {
       LOG_WARN("fail to wait io finish", K(ret), K(read_info));
@@ -289,6 +291,13 @@ int ObSharedMacroBlockMgr::write_block(
         read_handle.get_data_size(),
         CHECK_LEVEL_PHYSICAL))) {
       LOG_WARN("fail to verify macro block", K(ret), K(macro_id));
+    } else if (OB_FAIL(ObSSTableMacroBlockChecker::check_data_macro_block_rows_and_index(
+      read_handle.get_buffer(),
+      read_handle.get_data_size(),
+      CHECK_LEVEL_PHYSICAL))) {
+      STORAGE_LOG(WARN, "fail to check data macro block rows and index", K(ret), K(macro_id));
+    } else {
+      STORAGE_LOG(INFO, "succeed to check write complete", K(ret), K(macro_id), K(offset), K(size));
     }
   }
   return ret;
@@ -707,7 +716,7 @@ int ObSharedMacroBlockMgr::rebuild_sstable(
     LOG_WARN("fail to read old_sstable's block", K(ret), K(old_sstable));
   } else if (OB_FAIL(write_block(
       block_handle.get_buffer(), block_handle.get_data_size(), block_info, write_ctx))) {
-    LOG_WARN("fail to write old_sstable's buf to new block", K(ret));
+    LOG_WARN("fail to write old_sstable's buf to new block", K(ret), K(old_sstable), KP(&old_sstable));
   } else if (OB_FAIL(index_block_rebuilder.append_macro_row(
       block_handle.get_buffer(), block_handle.get_data_size(),
       block_info.macro_id_, -1 /*absolute_row_offset*/))) {
@@ -773,7 +782,10 @@ int ObSharedMacroBlockMgr::prepare_data_desc(
 {
   int ret = OB_SUCCESS;
   data_desc.reset();
-  if (is_mds_merge(merge_type)) {
+  int32_t private_transfer_epoch = -1;
+  if (OB_FAIL(tablet.get_private_transfer_epoch(private_transfer_epoch))) {
+      LOG_WARN("failed to get private transfer epoch", K(ret), "tablet_meta", tablet.get_tablet_meta());
+  } else if (is_mds_merge(merge_type)) {
     const ObStorageSchema *storage_schema = ObMdsSchemaHelper::get_instance().get_storage_schema();
     if (OB_ISNULL(storage_schema)) {
       ret = OB_ERR_UNEXPECTED;
@@ -781,7 +793,7 @@ int ObSharedMacroBlockMgr::prepare_data_desc(
     } else if (OB_UNLIKELY(!storage_schema->is_valid())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("mds storage schema is invalid", K(ret), KP(storage_schema), KPC(storage_schema));
-    } else if (OB_FAIL(data_desc.init(
+    }  else if (OB_FAIL(data_desc.init(
           false/*is_ddl*/,
           *storage_schema,
           tablet.get_tablet_meta().ls_id_,
@@ -790,7 +802,8 @@ int ObSharedMacroBlockMgr::prepare_data_desc(
           snapshot_version,
           cluster_version,
           tablet.get_tablet_meta().micro_index_clustered_,
-          tablet.get_transfer_seq(),
+          private_transfer_epoch,
+          0/*concurrent_cnt*/,
           tablet.get_reorganization_scn(),
           end_scn))) {
       LOG_WARN("failed to init static desc", K(ret), KPC(storage_schema),
@@ -823,7 +836,8 @@ int ObSharedMacroBlockMgr::prepare_data_desc(
           snapshot_version,
           cluster_version,
           tablet.get_tablet_meta().micro_index_clustered_,
-          tablet.get_transfer_seq(),
+          private_transfer_epoch,
+          0/*concurrent_cnt*/,
           tablet.get_reorganization_scn(),
           end_scn,
           cg_schema,
@@ -857,6 +871,8 @@ int ObSharedMacroBlockMgr::parse_merge_type(const ObSSTable &sstable, ObMergeTyp
     merge_type = ObMergeType::MDS_MINI_MERGE;
   } else if (sstable.is_mds_minor_sstable()) {
     merge_type = ObMergeType::MDS_MINOR_MERGE;
+  } else if (sstable.is_inc_major_type_sstable()) {
+    merge_type = ObMergeType::MAJOR_MERGE;
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("sstable type is unexpected", K(ret), K(sstable));
@@ -919,6 +935,11 @@ int ObSharedMacroBlockMgr::read_sstable_block(
             || sstable.get_macro_read_size() != block_handle.get_data_size())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("block handle is invalid", K(ret), K(block_handle));
+      } else if (MICRO_BLOCK_MERGE_VERIFY_LEVEL::ENCODING_AND_COMPRESSION_AND_WRITE_COMPLETE == GCONF.micro_block_merge_verify_level) {
+        if (OB_FAIL(check_write_complete(macro_id, read_info.offset_, read_info.size_))) {
+          LOG_WARN("fail to check write completion", K(ret), K(sstable), KP(&sstable), K(macro_id),
+                                                     K(read_info.offset_), K(read_info.size_));
+        }
       }
     }
   }

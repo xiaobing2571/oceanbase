@@ -253,6 +253,9 @@ public:
     audit_ctx_ = nullptr;
     has_fts_index_ = false;
     fts_ctx_ = nullptr;
+    is_ttl_delete_ = false;
+    io_read_batch_size_ = 0;
+    io_read_gap_size_ = 0;
   }
 
   void reset()
@@ -312,6 +315,8 @@ public:
     is_tablegroup_req_ = false;
     binlog_row_image_type_ = ObBinlogRowImage::FULL;
     is_full_table_scan_ = false;
+    io_read_batch_size_ = 0;
+    io_read_gap_size_ = 0;
     // others
     agg_cell_proj_.reset();
     is_count_all_ = false;
@@ -335,13 +340,25 @@ public:
     is_redis_ttl_table_ = false;
     redis_ttl_ctx_ = nullptr;
     has_fts_index_ = false;
+    is_ttl_delete_ = false;
     if (OB_NOT_NULL(fts_ctx_)) {
       fts_ctx_->reset();
     }
   }
 
   virtual ~ObTableCtx()
-  {}
+  {
+    // async query 中可能提前析构session, 因此exec_ctx这里必须先解绑, 不然可能 use after free
+    exec_ctx_.set_my_session(nullptr);
+    // session在其他线程回收, 也可能提前被回收,
+    // 但 exec_ctx_ 的生命周期一定比 session 短, 因此需要把session的exec_ctx_置空
+    // 上层需要保证使用时, 如果提前回收 session, 要把 tb_ctx 的绑定 session_guard 设置为空指针
+    // 此处只要判断sess_guard不为空, 我们可以认为上层还没有主动析构 session
+    if (OB_NOT_NULL(get_sess_guard())) {
+      typedef ObSQLSessionInfo::ExecCtxSessionRegister MyExecCtxSessionRegister;
+      MyExecCtxSessionRegister ctx_unregister(get_session_info(), nullptr);
+    }
+  }
   TO_STRING_KV(K_(is_init),
                K_(tenant_id),
                K_(database_id),
@@ -381,7 +398,10 @@ public:
                K_(need_dist_das),
                KPC_(credential),
                K_(has_fts_index),
-               K_(fts_ctx));
+               K_(fts_ctx),
+               K_(is_ttl_delete),
+               K_(io_read_batch_size),
+               K_(io_read_gap_size));
 public:
   //////////////////////////////////////// getter ////////////////////////////////////////////////
   // for common
@@ -441,7 +461,7 @@ public:
   OB_INLINE const ObIArray<ObTableIndexInfo>& get_table_index_info() const { return table_index_info_; }
   OB_INLINE const ObTableApiCredential* get_credential() const { return credential_; }
   OB_INLINE ObTableAuditCtx* get_audit_ctx() { return audit_ctx_; }
-
+  OB_INLINE int64_t get_lob_inrow_threshold() const { return schema_cache_guard_->get_lob_inrow_threshold(); }
   // for scan
   OB_INLINE bool is_scan() const { return is_scan_; }
   OB_INLINE bool is_index_scan() const { return is_index_scan_; }
@@ -467,6 +487,8 @@ public:
   OB_INLINE const common::ObIArray<common::ObString>& get_query_col_names() const { return query_col_names_; }
   OB_INLINE bool is_total_quantity_log() const { return binlog_row_image_type_ == ObBinlogRowImage::FULL; }
   OB_INLINE bool is_full_table_scan() const { return is_full_table_scan_; }
+  OB_INLINE int64_t get_io_read_batch_size() const { return io_read_batch_size_; }
+  OB_INLINE int64_t get_io_read_gap_size() const { return io_read_gap_size_; }
   // for update
   OB_INLINE bool is_for_update() const { return is_for_update_; }
   OB_INLINE bool is_inc_or_append() const
@@ -545,7 +567,7 @@ public:
   OB_INLINE bool is_inc_append_update() const { return is_inc_or_append() && inc_append_stage_ == ObTableIncAppendStage::TABLE_INCR_APPEND_UPDATE; }
   OB_INLINE bool is_inc_append_insert() const { return is_inc_or_append() && inc_append_stage_ == ObTableIncAppendStage::TABLE_INCR_APPEND_INSERT; }
   OB_INLINE const common::ObIArray<common::ObTabletID>* get_batch_tablet_ids() const { return batch_tablet_ids_; }
-  OB_INLINE const common::ObIArray<ObITableEntity*>* get_batch_entities() const { return batch_entities_; }
+  OB_INLINE const common::ObIArray<const ObITableEntity*>* get_batch_entities() const { return batch_entities_; }
   OB_INLINE bool is_multi_tablets() const
   {
     return OB_NOT_NULL(batch_tablet_ids_) && batch_tablet_ids_->count() > 1;
@@ -572,6 +594,7 @@ public:
   OB_INLINE void set_audit_ctx(ObTableAuditCtx *ctx) { audit_ctx_ = ctx; }
   OB_INLINE void set_tablet_id(const common::ObTabletID &tablet_id) { tablet_id_ = tablet_id; }
   OB_INLINE void set_index_tablet_id(common::ObTabletID &tablet_id) { index_tablet_id_ = tablet_id; }
+  OB_INLINE void set_is_ttl_delete(bool is_ttl_delete) { is_ttl_delete_ = is_ttl_delete; }
   // for scan
   OB_INLINE void set_scan(const bool &is_scan) { is_scan_ = is_scan; }
   OB_INLINE void set_scan_order(const common::ObQueryFlag::ScanOrder scan_order) {  scan_order_ = scan_order; }
@@ -586,7 +609,7 @@ public:
   OB_INLINE void set_batch_operation(const ObIArray<table::ObTableOperation> *ops) { ops_ = ops; }
   // for multi tablets batch
   OB_INLINE void set_batch_tablet_ids(const ObIArray<common::ObTabletID> *tablet_ids) { batch_tablet_ids_ = tablet_ids; }
-  OB_INLINE void set_batch_entities(const ObIArray<ObITableEntity*> *entities) { batch_entities_ = entities; }
+  OB_INLINE void set_batch_entities(const ObIArray<const ObITableEntity*> *entities) { batch_entities_ = entities; }
   // for auto inc
   OB_INLINE bool need_auto_inc_expr()
   {
@@ -640,13 +663,18 @@ public:
   {
     return ttl_definition_;
   }
+  OB_INLINE bool is_time_series_mode() { return schema_cache_guard_->get_hbase_mode_type() == ObHbaseModeType::OB_HBASE_SERIES_TYPE; }
+  OB_INLINE bool is_heap_table() const { return flags_.is_heap_table_; }
+  OB_INLINE bool is_ttl_delete() const { return is_ttl_delete_; }
 public:
   // 基于 table name 初始化common部分(不包括expr_info_, exec_ctx_)
   int init_common(ObTableApiCredential &credential,
                   const common::ObTabletID &arg_tablet_id,
                   const int64_t &timeout_ts);
   int init_common_without_check(ObTableApiCredential &credential,
+                                const ObTabletID &arg_tablet_id,
                                 const int64_t &timeout_ts);
+  int check_tablet_id_valid();
   // 初始化 insert 相关
   int init_insert();
   // init put
@@ -654,7 +682,8 @@ public:
   // 初始化scan相关(不包括表达分类)
   int init_scan(const ObTableQuery &query,
                 const bool &is_wead_read,
-                const uint64_t arg_table_id);
+                const uint64_t arg_table_id,
+                bool skip_get_ls = false);
   // 初始化update相关
   int init_update();
   // 初始化delete相关
@@ -664,7 +693,7 @@ public:
   // 初始化insert_up相关
   int init_insert_up(bool is_client_set_put);
   // 初始化get相关
-  int init_get();
+  int init_get(bool is_weak_read = false);
   // 初始化increment相关
   int init_increment(bool return_affected_entity, bool return_rowkey);
   // 初始化append相关
@@ -673,6 +702,10 @@ public:
   int classify_scan_exprs();
   // 初始化exec_ctx_和exec_ctx_.das_ctx_
   int init_exec_ctx(bool need_das_ctx = true);
+  // init expr_info_ and exec_ctx_.expr_op_ctx_store_
+  int init_expr_frame_info(ObExprFrameInfo *expr_info);
+  // reset expr_frame_info and exec_ctx_.expr_op_ctx_store_
+  void reset_expr_frame_info();
   // init exec_ctx_.my_session_.tx_desc_
   int init_trans(transaction::ObTxDesc *trans_desc,
                  const transaction::ObTxReadSnapshot &tx_snapshot);
@@ -685,7 +718,7 @@ public:
   bool is_ttl_table() const { return is_ttl_table_; }
 
   void set_is_ttl_table(bool is_ttl_table) { is_ttl_table_ = is_ttl_table; }
-  int init_ttl_delete(const ObIArray<ObNewRange> &scan_range);
+  int init_ttl_scan(ObTableQuery &query);
   int get_column_item_by_column_id(uint64_t column_id, const ObTableColumnItem *&item) const;
   int get_column_item_by_expr(sql::ObRawExpr *raw_expr, const ObTableColumnItem *&item) const;
   int get_column_item_by_expr(sql::ObColumnRefRawExpr *expr, const ObTableColumnItem *&item) const;
@@ -703,12 +736,14 @@ public:
   int init_insert_when_inc_append();
   // only use for fts scan cg stage
   int prepare_text_retrieval_scan();
+  int init_scan_io_opt_params();
 public:
   // convert lob的allocator需要保证obj写入表达式后才能析构
   static int convert_lob(common::ObIAllocator &allocator, ObObj &obj);
   // read lob的allocator需要保证obj序列化到rpc buffer后才能析构
   static int read_real_lob(common::ObIAllocator &allocator, ObObj &obj);
   int adjust_entity();
+  int adjust_hkv_v2_entity();
   int adjust_column_type(const ObTableColumnInfo &column_info, ObObj &ob);
 public:
   // for column store replica query
@@ -735,7 +770,7 @@ private:
   int init_dml_index_info();
   int check_if_can_skip_update_index(const share::schema::ObTableSchema *index_schema, bool &is_exist);
   // for update
-  int init_assignments(const ObTableEntity &entity);
+  int init_assignments();
   int add_generated_column_assignment();
   // Init size of aggregation project array.
   //
@@ -750,7 +785,7 @@ private:
   int add_aggregate_proj(int64_t cell_idx, const common::ObString &column_name, const ObIArray<ObTableAggregation> &aggregations);
 
   int add_auto_inc_param();
-  int check_legality(const common::ObTabletID &arg_tablet_id);
+  int check_legality();
 
 private:
   int init_schema_info_from_cache();
@@ -815,6 +850,8 @@ private:
   int64_t offset_;
   int64_t limit_;
   common::ObSEArray<common::ObNewRange, 16> key_ranges_;
+  int64_t io_read_batch_size_;
+  int64_t io_read_gap_size_;
   // for update
   bool is_for_update_;
   ObTableOperationType::Type operation_type_;
@@ -829,7 +866,7 @@ private:
   bool return_rowkey_;
   // for multi tablets batch
   const ObIArray<common::ObTabletID> *batch_tablet_ids_;
-  const ObIArray<ObITableEntity*> *batch_entities_;
+  const ObIArray<const ObITableEntity*> *batch_entities_;
   // for dml
   bool is_for_insertup_;
   ObTableEntityType entity_type_;
@@ -865,6 +902,7 @@ private:
   // for fulltext index
   bool has_fts_index_;
   ObTableFtsCtx *fts_ctx_;
+  bool is_ttl_delete_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTableCtx);
 };

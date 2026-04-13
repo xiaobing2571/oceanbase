@@ -317,7 +317,7 @@ int ObStorageInfoOperator::parse_storage_path(const char *storage_path, char *ro
     LOG_WARN("invalid args", KR(ret), KP(storage_path));
   } else if (OB_FAIL(get_storage_type_from_path(storage_path_str, type))) {
     LOG_WARN("failed to get storage type", KR(ret));
-  } else if (OB_STORAGE_OSS != type && OB_STORAGE_S3 != type && OB_STORAGE_COS != type) {
+  } else if (OB_STORAGE_OSS != type && OB_STORAGE_S3 != type && OB_STORAGE_AZBLOB != type) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("cannot support this storage type", KR(ret), K(type));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "cannot support this storage type, it is");
@@ -612,12 +612,15 @@ int ObStorageInfoOperator::get_ls_leader_addr(const uint64_t tenant_id, const in
       } else if (OB_SUCC(result->next())) {
         EXTRACT_STRBUF_FIELD_MYSQL(*result, "svr_ip", svr_ip, OB_IP_STR_BUFF, tmp_real_str_len);
         EXTRACT_INT_FIELD_MYSQL(*result, "svr_port", svr_port, int64_t);
-        (void)server.set_ip_addr(svr_ip, static_cast<int32_t>(svr_port));
+        if (OB_UNLIKELY(!server.set_ip_addr(svr_ip, static_cast<int32_t>(svr_port)))) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("fail to set ip addr", KR(ret), K(svr_ip), K(svr_port));
+        }
       } else if (OB_ITER_END == ret) {
         ret = OB_ENTRY_NOT_EXIST;
         LOG_WARN("no exist row", KR(ret), K(sql));
       } else {
-        LOG_WARN("fail to get next row", KR(ret));
+        LOG_WARN("fail to get next row", KR(ret), K(sql));
       }
     }
   }
@@ -727,7 +730,20 @@ int ObStorageInfoOperator::get_zone_storage_table_info(
   SMART_VAR(ObMySQLProxy::MySQLResult, res)
   {
     sqlclient::ObMySQLResult *result = NULL;
-    if (OB_FAIL(sql_string.assign_fmt("SELECT * FROM %s", OB_ALL_ZONE_STORAGE_TNAME))) {
+    // Need sub_op_id for in-progress operations (e.g. CHANGING). sub_op_id is stored in
+    // __all_zone_storage_operation, not in __all_zone_storage, so we query it here to make
+    // reload() able to continue state transition checks after RS reload.
+    if (OB_FAIL(sql_string.assign_fmt(
+        "SELECT A.*, "
+        "IFNULL((SELECT MAX(B.%s) FROM %s AS B "
+        "        WHERE B.%s = A.%s AND B.%s = A.%s AND B.%s = A.%s), 0) AS %s "
+        "FROM %s AS A",
+        OB_STR_STORAGE_SUB_OP_ID, OB_ALL_ZONE_STORAGE_OPERATION_TNAME,
+        OB_STR_STORAGE_ID, OB_STR_STORAGE_ID,
+        OB_STR_STORAGE_OP_ID, OB_STR_STORAGE_OP_ID,
+        OB_STR_STORAGE_ZONE, OB_STR_STORAGE_ZONE,
+        OB_STR_STORAGE_SUB_OP_ID,
+        OB_ALL_ZONE_STORAGE_TNAME))) {
       LOG_WARN("assign sql string failed", KR(ret));
     } else if (OB_FAIL(proxy.read(res, sql_string.ptr()))) {
       LOG_WARN("query zone storage record failed", KR(ret), K(sql_string));
@@ -766,6 +782,8 @@ int ObStorageInfoOperator::get_zone_storage_table_info(
           EXTRACT_STRBUF_FIELD_MYSQL(*result, OB_STR_STORAGE_STATE, state,
                                      OB_MAX_STORAGE_STATE_LENGTH, tmp_str_len);
           EXTRACT_INT_FIELD_MYSQL(*result, OB_STR_STORAGE_OP_ID, storage_table_info.op_id_,
+                                  uint64_t);
+          EXTRACT_INT_FIELD_MYSQL(*result, OB_STR_STORAGE_SUB_OP_ID, storage_table_info.sub_op_id_,
                                   uint64_t);
           EXTRACT_INT_FIELD_MYSQL(*result, OB_STR_STORAGE_MAX_IOPS, storage_table_info.max_iops_,
                                   uint64_t);
@@ -926,6 +944,39 @@ int ObStorageInfoOperator::update_storage_bandwidth(common::ObISQLClient &proxy,
     LOG_WARN("error unexpected, invalid affected rows", KR(ret), K(affected_rows));
   } else {
     LOG_INFO("update storage max_bandwidth in zone storage table", K(sql), K(max_bandwidth));
+  }
+  return ret;
+}
+
+int ObStorageInfoOperator::update_storage_extension(common::ObISQLClient &proxy,
+                                                    const common::ObZone &zone,
+                                                    const share::ObBackupDest &storage_dest,
+                                                    const uint64_t op_id,
+                                                    const ObStorageUsedType::TYPE used_for,
+                                                    const char *extension)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  if (OB_UNLIKELY(!storage_dest.is_valid() || !ObStorageUsedType::is_valid(used_for) || OB_INVALID_ID == op_id) || OB_ISNULL(extension)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", KR(ret), K(storage_dest), K(extension), K(op_id), K(used_for));
+  } else if (OB_FAIL(sql.assign_fmt(
+               "UPDATE %s SET %s = '%s' WHERE %s = '%s' AND %s = '%s' AND "
+               "%s = '%s' AND %s = '%s' AND %s = %lu",
+               OB_ALL_ZONE_STORAGE_TNAME, OB_STR_STORAGE_EXTENSION, extension,
+               OB_STR_STORAGE_ZONE, zone.ptr(), OB_STR_STORAGE_DEST_PATH,
+               storage_dest.get_root_path().ptr(), OB_STR_STORAGE_USEDFOR,
+               ObStorageUsedType::get_str(used_for), OB_STR_STORAGE_DEST_ENDPOINT,
+               storage_dest.get_storage_info()->endpoint_, OB_STR_STORAGE_OP_ID, op_id))) {
+    LOG_WARN("assign sql string failed", KR(ret), K(zone), K(used_for), K(storage_dest));
+  } else if (OB_FAIL(proxy.write(sql.ptr(), affected_rows))) {
+    LOG_WARN("fail to execute sql", KR(ret), K(sql));
+  } else if (OB_UNLIKELY(!(is_single_row(affected_rows) || is_zero_row(affected_rows)))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("error unexpected, invalid affected rows", KR(ret), K(affected_rows));
+  } else {
+    LOG_INFO("update storage extension in zone storage table", K(sql), K(extension));
   }
   return ret;
 }

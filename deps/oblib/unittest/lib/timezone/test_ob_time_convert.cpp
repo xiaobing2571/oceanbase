@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 #include "lib/timezone/ob_timezone_info.h"
+#include "lib/worker.h"
 
 using namespace oceanbase;
 using namespace oceanbase::common;
@@ -60,7 +61,7 @@ static bool ob_interval_eq(const ObInterval& ans, int64_t year, int64_t month, i
               && (ans.parts_[DT_SEC] == second || -1 == second)
               && (ans.parts_[DT_USEC] == usecond || -1 == usecond);
   if (!ret) {
-    printf("%04u-%02u-%02u %02u:%02u:%02u.%06u\n",
+    printf("%04lu-%02lu-%02lu %02lu:%02lu:%02lu.%06lu\n",
            ans.parts_[DT_YEAR], ans.parts_[DT_MON], ans.parts_[DT_MIN],
            ans.parts_[DT_HOUR], ans.parts_[DT_MIN], ans.parts_[DT_SEC], ans.parts_[DT_USEC]);
   }
@@ -184,6 +185,9 @@ TEST(ObTimeConvertTest, str_to_datetime)
 
 TEST(ObTimeConvertTest, str_to_otimestamp)
 {
+  // Save current mode and set to Oracle mode for this test
+  lib::Worker::CompatMode saved_mode = lib::get_compat_mode();
+  lib::set_compat_mode(lib::Worker::CompatMode::ORACLE);
 //  ObTimezoneUtils zone;
   ObTimeZoneInfo tz_info;
   char buf[50] = {0};
@@ -320,6 +324,8 @@ TEST(ObTimeConvertTest, str_to_otimestamp)
   str.assign(buf, static_cast<int32_t>(strlen(buf)));
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::str_to_datetime(str, cvrt_ctx, value, nullptr, 0));
   EXPECT_EQ(value, 253402300799 * static_cast<int64_t>(USECS_PER_SEC));
+  // Restore original mode
+  lib::set_compat_mode(saved_mode);
 }
 
 #define STR_TO_DATE_SUCC(str, day) \
@@ -539,7 +545,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   cvrt_ctx.oracle_nls_format_ = ObTimeConverter::COMPAT_OLD_NLS_TIMESTAMP_FORMAT;
   const ObDataTypeCastParams dtc_params(&tz_info);
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampLTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "1000-01-01 00:00:00."));
+  EXPECT_TRUE(0 == strcmp(buf, "1000-01-01 00:00:00"));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampLTZType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -550,7 +556,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   pos = 0;
   memset(buf, 0, sizeof(buf));
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampNanoType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:00:00."));
+  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:00:00"));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampNanoType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -562,7 +568,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   pos = 0;
   memset(buf, 0, sizeof(buf));
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:00:00. +00:00 "));
+  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:00:00 +00:00 "));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampTZType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -574,7 +580,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   memset(buf, 0, sizeof(buf));
   ot_data.time_ctx_.set_offset_min(540);
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "1000-01-01 01:00:00. +09:00 "));
+  EXPECT_TRUE(0 == strcmp(buf, "1000-01-01 01:00:00 +09:00 "));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampTZType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -591,7 +597,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   ot_data.reset();
   ot_data.time_us_ = 1435950720 * static_cast<int64_t>(USECS_PER_SEC);
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampLTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "2015-07-03 11:12:00."));
+  EXPECT_TRUE(0 == strcmp(buf, "2015-07-03 11:12:00"));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampLTZType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -602,7 +608,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   pos = 0;
   memset(buf, 0, sizeof(buf));
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampNanoType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "2015-07-03 19:12:00."));
+  EXPECT_TRUE(0 == strcmp(buf, "2015-07-03 19:12:00"));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampNanoType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -614,7 +620,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   pos = 0;
   memset(buf, 0, sizeof(buf));
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "2015-07-03 19:12:00. +00:00 "));
+  EXPECT_TRUE(0 == strcmp(buf, "2015-07-03 19:12:00 +00:00 "));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampTZType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -626,7 +632,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   memset(buf, 0, sizeof(buf));
   ot_data.time_ctx_.set_offset_min(-420);
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "2015-07-03 12:12:00. -07:00 "));
+  EXPECT_TRUE(0 == strcmp(buf, "2015-07-03 12:12:00 -07:00 "));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampTZType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -644,7 +650,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   ot_data.time_ctx_.set_offset_min(0);
   ot_data.time_us_ = 253402300799 * static_cast<int64_t>(USECS_PER_SEC);
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampLTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "9999-12-31 23:59:59."));
+  EXPECT_TRUE(0 == strcmp(buf, "9999-12-31 23:59:59"));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampLTZType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -656,7 +662,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   pos = 0;
   memset(buf, 0, sizeof(buf));
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "9999-12-31 23:59:59. +00:00 "));
+  EXPECT_TRUE(0 == strcmp(buf, "9999-12-31 23:59:59 +00:00 "));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampTZType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -668,7 +674,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   pos = 0;
   memset(buf, 0, sizeof(buf));
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampNanoType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "9999-12-31 23:59:59."));
+  EXPECT_TRUE(0 == strcmp(buf, "9999-12-31 23:59:59"));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampNanoType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -684,7 +690,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   ot_data.reset();
   ot_data.time_us_ = -30610252800 * USECS_PER_SEC;
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampLTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 15:50:00."));
+  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 15:50:00"));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampLTZType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -697,7 +703,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   memset(buf, 0, sizeof(buf));
   ot_data.time_ctx_.set_offset_min(-10);
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 15:50:00. -00:10 "));
+  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 15:50:00 -00:10 "));
   pos = 0;
   memset(buf, 0, sizeof(buf));
   otimestamp_out.reset();
@@ -712,7 +718,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   memset(buf, 0, sizeof(buf));
   ot_data.time_ctx_.set_offset_min(0);
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampNanoType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:00:00."));
+  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:00:00"));
   pos = 0;
   memset(buf, 0, sizeof(buf));
   otimestamp_out.reset();
@@ -730,7 +736,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   ot_data.reset();
   ot_data.time_us_ = -30610252800 * USECS_PER_SEC;
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampLTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:10:00."));
+  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:10:00"));
   pos = 0;
   otimestamp_out.reset();
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::encode_otimestamp(ObTimestampLTZType, encode_buf, encode_buf_len, pos, &tz_info, ot_data, scale));
@@ -744,7 +750,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   memset(buf, 0, sizeof(buf));
   ot_data.time_ctx_.set_offset_min(10);
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampTZType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:10:00. +00:10 "));
+  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:10:00 +00:10 "));
   pos = 0;
   memset(buf, 0, sizeof(buf));
   otimestamp_out.reset();
@@ -759,7 +765,7 @@ TEST(ObTimeConvertTest, otimestamp_to_str)
   memset(buf, 0, sizeof(buf));
   ot_data.time_ctx_.set_offset_min(0);
   EXPECT_EQ(OB_SUCCESS, ObTimeConverter::otimestamp_to_str(ot_data, dtc_params, 0, ObTimestampNanoType, buf, sizeof(buf), pos));
-  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:00:00."));
+  EXPECT_TRUE(0 == strcmp(buf, "0999-12-31 16:00:00"));
   pos = 0;
   memset(buf, 0, sizeof(buf));
   otimestamp_out.reset();

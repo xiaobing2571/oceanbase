@@ -174,8 +174,7 @@ int ObExprElementAt::eval_element_at_batch(const ObExpr &expr, ObEvalCtx &ctx,
       if (skip.at(j) || eval_flags.at(j)) {
         continue;
       }
-      eval_flags.set(j);
-      if (arr_array.at(j)->is_null()) {
+      if (arr_array.at(j)->is_null() || idx_array.at(j)->is_null()) {
         res_datum.at(j)->set_null();
       } else if (OB_FAIL(ObArrayExprUtils::get_array_obj(tmp_allocator, ctx, subschema_id, arr_array.at(j)->get_string(), src_arr))) {
         LOG_WARN("construct array obj failed", K(ret));
@@ -257,7 +256,7 @@ int ObExprElementAt::eval_element_at_vector(const ObExpr &expr, ObEvalCtx &ctx,
       if (skip.at(idx) || eval_flags.at(idx)) {
         continue;
       }
-      if (arr_vec->is_null(idx)) {
+      if (arr_vec->is_null(idx) || idx_vec->is_null(idx)) {
         is_null_res = true;
       } else {
         ObString arr_str = arr_vec->get_string(idx);
@@ -302,9 +301,6 @@ int ObExprElementAt::eval_element_at_vector(const ObExpr &expr, ObEvalCtx &ctx,
         } else if (OB_FAIL(ObArrayExprUtils::set_obj_to_vector(res_vec, idx, elem_obj, res_alloc))) {
           LOG_WARN("failed to set object value to result vector", K(ret), K(idx), K(elem_obj));
         }
-      }
-      if (OB_SUCC(ret)) {
-        eval_flags.set(idx);
       }
     } // end for
   }

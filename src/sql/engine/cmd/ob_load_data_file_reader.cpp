@@ -269,7 +269,7 @@ int ObRandomOSSReader::open(const share::ObBackupStorageInfo &storage_info, cons
     ret = OB_INIT_TWICE;
     LOG_WARN("ObRandomOSSReader init twice", KR(ret), KP(this));
   } else if (OB_FAIL(
-        util.get_and_init_device(device_handle_, &storage_info, filename, ObStorageIdMod(table::OB_STORAGE_ID_DDL, ObStorageUsedMod::STORAGE_USED_DDL)))) {
+        util.get_and_init_device(device_handle_, &storage_info, filename, ObStorageIdMod::get_default_ddl_id_mod()))) {
     LOG_WARN("fail to get device manager", KR(ret), K(filename));
   } else if (OB_FAIL(util.set_access_type(&iod_opts, false, 1))) {
     LOG_WARN("fail to set access type", KR(ret));
@@ -505,7 +505,7 @@ int ObPacketStreamFileReader::receive_packet()
       // sleep can reduce cpu usage while the network is not so good.
       // We need not worry about the speed while the speed of load data core is lower than
       // file receiver's.
-      usleep(100 * 1000); // 100 ms
+      ob_usleep(100 * 1000); // 100 ms
       ret = packet_handle_->read_packet(mem_pool, pkt);
       cached_packet_ = static_cast<obmysql::ObMySQLRawPacket *>(pkt);
     }
@@ -580,6 +580,10 @@ int ObDecompressor::create(ObCSVGeneralFormat::ObCSVCompression format,
 
     case ObCSVGeneralFormat::ObCSVCompression::ZSTD: {
       decompressor = OB_NEW(ObZstdDecompressor, MEMORY_ATTR, allocator);
+    } break;
+
+    case ObCSVGeneralFormat::ObCSVCompression::SNAPPY: {
+      decompressor = OB_NEW(ObSnappyDecompressor, MEMORY_ATTR, allocator);
     } break;
 
     default: {
@@ -892,6 +896,89 @@ int ObZstdDecompressor::decompress(const char *src, int64_t src_size, int64_t &c
     consumed_size = static_cast<int64_t>(tmp_consumed_size);
     decompressed_size = static_cast<int64_t>(tmp_decompressed_size);
   }
+  return ret;
+}
+
+/**
+ * snappy decompressor
+ */
+ObSnappyDecompressor::ObSnappyDecompressor(ObIAllocator &allocator)
+    : ObDecompressor(allocator),
+      snappy_compressor_(allocator)
+{}
+
+ObSnappyDecompressor::~ObSnappyDecompressor()
+{
+  this->destroy();
+}
+
+void ObSnappyDecompressor::destroy()
+{
+  if (OB_NOT_NULL(buffer_)) {
+    allocator_.free(buffer_);
+    buffer_ = nullptr;
+  }
+  read_size_ = 0;
+  data_size_ = 0;
+  buffer_capacity_ = 0;
+  is_decompressed_ = false;
+}
+
+int ObSnappyDecompressor::init()
+{
+  return OB_SUCCESS;
+}
+
+int ObSnappyDecompressor::decompress(const char *src, int64_t src_size, int64_t &consumed_size,
+                                     char *dest, int64_t dest_capacity, int64_t &decompressed_size)
+{
+  int ret = OB_SUCCESS;
+  consumed_size = 0;
+  decompressed_size = 0;
+  if (OB_ISNULL(src) || src_size <= 0
+      || OB_ISNULL(dest) || dest_capacity <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KP(src), K(src_size), KP(dest), K(dest_capacity));
+  } else if (!is_decompressed_) {
+    size_t uncompressed_size = 0;
+    if (OB_FAIL(snappy_compressor_.get_uncompressed_length(src, src_size, uncompressed_size))) {
+      LOG_WARN("failed to get uncompressed length", K(ret));
+    } else if (uncompressed_size > static_cast<size_t>(buffer_capacity_)) {
+      if (OB_NOT_NULL(buffer_)) {
+        allocator_.free(buffer_);
+        buffer_ = nullptr;
+      }
+      buffer_capacity_ = static_cast<int64_t>(uncompressed_size);
+      if (OB_ISNULL(buffer_ = static_cast<char *>(allocator_.alloc(buffer_capacity_)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate buffer", K(buffer_capacity_));
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(snappy_compressor_.decompress(src, src_size, buffer_, buffer_capacity_, data_size_))) {
+      LOG_WARN("failed to decompress", K(ret));
+    } else {
+      is_decompressed_ = true;
+    }
+  }
+
+  if (OB_SUCC(ret) && is_decompressed_) {
+    int64_t available = data_size_ - read_size_;
+    int64_t copy_size = min(available, dest_capacity);
+    if (copy_size > 0) {
+      MEMCPY(dest, buffer_ + read_size_, copy_size);
+      read_size_ += copy_size;
+      decompressed_size = copy_size;
+    } else {
+      decompressed_size = 0;
+    }
+    if (read_size_ >= data_size_) {
+      consumed_size = src_size;
+      destroy();
+    }
+  }
+
   return ret;
 }
 

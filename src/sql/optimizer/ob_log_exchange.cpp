@@ -336,6 +336,9 @@ int ObLogExchange::print_annotation_keys(char *buf,
       LOG_WARN("failed to BUF_PRINTF", K(ret));
     }
   }
+  if (OB_SUCC(ret) && encoded_dup_expr_ != NULL) {
+    ret = BUF_PRINTF("use encoding shuffle opt, ");
+  }
   return ret;
 }
 
@@ -423,11 +426,7 @@ int ObLogExchange::compute_op_parallel_and_server_info()
       static_cast<ObLogExchange*>(child)->set_in_server_cnt(get_server_cnt());
     }
     if (OB_SUCC(ret) && ObGlobalHint::DEFAULT_PARALLEL > get_parallel()) {
-      // parallel not set when allocate exchange, and not pull to local
-      if (OB_UNLIKELY(child->is_match_all())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("get unexpected exchange above match all sharding", K(ret));
-      } else if (child->is_single()) {
+      if (child->is_single()) {
         set_parallel(child->get_available_parallel());
         set_available_parallel(child->get_available_parallel());
       } else {
@@ -592,6 +591,7 @@ int ObLogExchange::set_exchange_info(const ObExchangeInfo &exch_info)
       LOG_WARN("array assign failed", K(ret));
     } else if (OB_FAIL(popular_values_.assign(exch_info.popular_values_))) {
       LOG_WARN("array assign failed", K(ret));
+    } else if (OB_FALSE_IT(hidden_pk_expr_ = exch_info.hidden_pk_expr_)) {
     } else if ((dist_method_ == ObPQDistributeMethod::RANGE ||
                 dist_method_ == ObPQDistributeMethod::PARTITION_RANGE) &&
                 OB_FAIL(sort_keys_.assign(exch_info.sort_keys_))) {
@@ -601,6 +601,7 @@ int ObLogExchange::set_exchange_info(const ObExchangeInfo &exch_info)
       need_null_aware_shuffle_ = exch_info.need_null_aware_shuffle_;
       calc_part_id_expr_ = exch_info.calc_part_id_expr_;
       is_wf_hybrid_ = exch_info.is_wf_hybrid_;
+      use_scatter_channel_for_pkey_hash_ = exch_info.use_scatter_channel_for_pkey_hash_;
       if (is_wf_hybrid_) {
         wf_hybrid_aggr_status_expr_ = exch_info.wf_hybrid_aggr_status_expr_;
         if (OB_FAIL(wf_hybrid_pby_exprs_cnt_array_.assign(
@@ -651,6 +652,8 @@ int ObLogExchange::get_op_exprs(ObIArray<ObRawExpr*> &all_exprs)
     LOG_WARN("failed to push back exprs", K(ret));
   } else if (NULL != random_expr_ && OB_FAIL(all_exprs.push_back(random_expr_))) {
     LOG_WARN("failed to push back expr", K(ret));
+  } else if (NULL != encoded_dup_expr_ && OB_FAIL(all_exprs.push_back(encoded_dup_expr_))) {
+    LOG_WARN("failed to push back expr", K(ret));
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < hash_dist_exprs_.count(); i++) {
       if (OB_ISNULL(hash_dist_exprs_.at(i).expr_)) {
@@ -669,6 +672,11 @@ int ObLogExchange::get_op_exprs(ObIArray<ObRawExpr*> &all_exprs)
           LOG_WARN("failed to push back exprs", K(ret));
         } else { /*do nothing*/ }
       }
+    }
+    // Add hidden pk expression for PDML heap table insert
+    if (OB_SUCC(ret) && nullptr != hidden_pk_expr_ &&
+        OB_FAIL(all_exprs.push_back(hidden_pk_expr_))) {
+      LOG_WARN("failed to push back hidden pk expr", K(ret));
     }
     if (OB_SUCC(ret)) {
       if (OB_FAIL(ObLogicalOperator::get_op_exprs(all_exprs))) {
@@ -882,7 +890,8 @@ int ObLogExchange::add_px_table_location(ObLogicalOperator *op,
     bool has_exec_param = false;
     OZ(find_table_location_exprs(drop_expr_idxs, table_scan->get_range_conditions(), exprs, has_exec_param));
     OZ(find_table_location_exprs(drop_expr_idxs, table_scan->get_filter_exprs(), exprs, has_exec_param));
-    if (OB_SUCC(ret) && !exprs.empty() && has_exec_param) {
+    if (OB_SUCC(ret) && !exprs.empty() && has_exec_param &&
+        (ObTableType::EXTERNAL_TABLE != table_scan->get_table_type())) {
       SMART_VAR(ObTableLocation, table_location) {
         const ObDMLStmt *cur_stmt = NULL;
         const ObDataTypeCastParams dtc_params = ObBasicSessionInfo::create_dtc_params(
@@ -1047,7 +1056,8 @@ int ObLogExchange::is_my_fixed_expr(const ObRawExpr *expr, bool &is_fixed)
                expr == partition_id_expr_ ||
                expr == ddl_slice_id_expr_ ||
                expr == random_expr_ ||
-               T_OP_OUTPUT_PACK == expr->get_expr_type();
+               T_OP_OUTPUT_PACK == expr->get_expr_type() ||
+               expr == encoded_dup_expr_;
     for (int64_t i = 0; OB_SUCC(ret) && !is_fixed && i < hash_dist_exprs_.count(); i++) {
       if (OB_ISNULL(hash_dist_exprs_.at(i).expr_)) {
         ret = OB_ERR_UNEXPECTED;
@@ -1120,6 +1130,33 @@ int ObLogExchange::check_use_child_ordering(bool &used, int64_t &inherit_child_o
   inherit_child_ordering_index = first_child;
   if (is_producer() || !is_merge_sort()) {
     used = false;
+  }
+  return ret;
+}
+
+int ObLogExchange::generate_final_shuffle_exprs(common::ObIArray<ObRawExpr *> &real_shuffle_exprs)
+{
+  int ret = OB_SUCCESS;
+  if (encoded_dup_expr_ == nullptr || dup_expr_list_.empty()) {
+    ret = real_shuffle_exprs.assign(get_output_exprs());
+  } else {
+    real_shuffle_exprs.reset();
+    for (int i = 0; i < get_output_exprs().count() && OB_SUCC(ret); ++i) {
+      ObRawExpr *expr = get_output_exprs().at(i);
+      if (OB_ISNULL(expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get_output_exprs().at(i) is null", K(ret));
+      } else if (has_exist_in_array(dup_expr_list_, expr)) {
+        // do nothing
+      } else if (OB_FAIL(real_shuffle_exprs.push_back(expr))) {
+        LOG_WARN("fail to push back real_shuffle_exprs", K(ret));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (!has_exist_in_array(real_shuffle_exprs, encoded_dup_expr_)
+               && OB_FAIL(real_shuffle_exprs.push_back(encoded_dup_expr_))) {
+      LOG_WARN("fail to push back encoded_dup_expr_", K(ret));
+    }
   }
   return ret;
 }

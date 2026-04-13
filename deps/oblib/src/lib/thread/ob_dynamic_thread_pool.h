@@ -97,12 +97,13 @@ public:
   static const int64_t MAX_THREAD_NUM = 1024;
   ObSimpleDynamicThreadPool()
     : has_bind_(false), min_thread_cnt_(OB_INVALID_COUNT), max_thread_cnt_(OB_INVALID_COUNT),
-      running_thread_cnt_(0), threads_idle_time_(0), update_threads_lock_(), ref_cnt_(0), name_("unknown"), tenant_id_(OB_SERVER_TENANT_ID)
+      running_thread_cnt_(0), threads_idle_time_(0), update_threads_lock_(common::ObLatchIds::OB_DYNAMIC_THREAD_POOL_LOCK), ref_cnt_(0), name_("unknown"), tenant_id_(OB_SERVER_TENANT_ID)
   {}
   virtual ~ObSimpleDynamicThreadPool();
   int init(const int64_t thread_num, const char* name, const int64_t tenant_id);
   virtual void stop() override;
   void destroy();
+  void wait();
   int set_adaptive_thread(int64_t min_thread_num, int64_t max_thread_num);
   virtual int64_t get_queue_num() const = 0;
   void try_expand_thread_count();
@@ -141,9 +142,9 @@ private:
 
 class ObSimpleThreadPoolDynamicMgr : public lib::TGRunnable {
 public:
-  static const int64_t SHRINK_INTERVAL_US = 1 * 1000 * 1000;
+  static const int64_t SHRINK_INTERVAL_US = 3 * 1000 * 1000;
   static const int64_t CHECK_INTERVAL_US = 200 * 1000;
-  ObSimpleThreadPoolDynamicMgr() : simple_thread_pool_list_(), simple_thread_pool_list_lock_(), is_inited_(false) {}
+  ObSimpleThreadPoolDynamicMgr() : simple_thread_pool_list_(), simple_thread_pool_list_lock_(common::ObLatchIds::OB_DYNAMIC_MGR_LIST_LOCK), is_inited_(false) {}
   virtual ~ObSimpleThreadPoolDynamicMgr();
   int init();
   void stop();

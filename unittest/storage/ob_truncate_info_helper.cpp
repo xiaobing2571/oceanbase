@@ -15,11 +15,12 @@
 #include "storage/truncate_info/ob_mds_info_distinct_mgr.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/ls/ob_ls.h"
+#include "mittest/env/ob_simple_server_helper.h"
+#include "share/schema/ob_tenant_schema_service.h"
 namespace oceanbase
 {
 namespace storage
 {
-
 static int64_t inc_seq = 0;
 void TruncateInfoHelper::mock_truncate_info(
     common::ObIAllocator &allocator,
@@ -154,18 +155,22 @@ int TruncateInfoHelper::mock_part_key_idxs(
 
 int TruncateInfoHelper::read_distinct_truncate_info_array(
     common::ObArenaAllocator &allocator,
-    ObTablet &tablet,
+    const share::ObLSID &ls_id,
+    const common::ObTabletID &tablet_id,
     const ObVersionRange &read_version_range,
     ObTruncateInfoArray &truncate_info_array)
 {
   int ret = OB_SUCCESS;
-  ObMdsInfoDistinctMgr distinct_mgr;
+  ObTabletHandle tablet_handle;
+  ObTruncateInfoDistinctMgr distinct_mgr;
   truncate_info_array.reset();
-  if (OB_FAIL(distinct_mgr.init(allocator, tablet, nullptr, read_version_range, false/*access*/))) {
+  if (OB_FAIL(TruncateInfoHelper::get_tablet(ls_id, tablet_id, tablet_handle))) {
+    COMMON_LOG(WARN, "failed to get tablet", KR(ret), K(ls_id), K(tablet_id));
+  } else if (OB_FAIL(distinct_mgr.init(allocator, *tablet_handle.get_obj(), nullptr, read_version_range, false/*access*/))) {
     COMMON_LOG(WARN, "failed to init distinct mgr", KR(ret), K(read_version_range));
   } else if (OB_FAIL(truncate_info_array.init_for_first_creation(allocator))) {
     COMMON_LOG(WARN, "failed to init truncate info array", KR(ret));
-  } else if (OB_FAIL(distinct_mgr.get_distinct_truncate_info_array(truncate_info_array))) {
+  } else if (OB_FAIL(distinct_mgr.get_distinct_mds_info_array(truncate_info_array))) {
     COMMON_LOG(WARN, "failed to get array from distinct mgr", KR(ret), K(distinct_mgr));
   }
   return ret;
@@ -196,12 +201,43 @@ int TruncateInfoHelper::batch_mock_truncate_info(
       COMMON_LOG(WARN, "failed to mock truncate partition", KR(ret));
     } else if (OB_FAIL(TruncateInfoHelper::mock_part_key_idxs(allocator, 1/*part_key_idx*/, truncate_info.truncate_part_))) {
       COMMON_LOG(WARN, "failed to mock part key index", KR(ret));
-    } else if (OB_FAIL(truncate_info_array.append(truncate_info))) {
+    } else if (OB_FAIL(truncate_info_array.append_with_deep_copy(truncate_info))) {
       COMMON_LOG(WARN, "failed to append truncate info", KR(ret), K(truncate_info));
     }
     #undef GET_INT
   }
   return ret;
 }
+
+int TruncateInfoHelper::get_table_schema(
+    const uint64_t tenant_id,
+    schema::ObSchemaGetterGuard &schema_guard,
+    const int64_t table_id,
+    const ObTableSchema *&table_schema)
+{
+  int ret = OB_SUCCESS;
+  ObMultiVersionSchemaService *schema_service = nullptr;
+  table_schema = nullptr;
+  int64_t schema_version = 0;
+  if (OB_ISNULL(schema_service = MTL(ObTenantSchemaService *)->get_schema_service())) {
+    ret = OB_ERR_UNEXPECTED;
+    COMMON_LOG(WARN, "failed to get schema service from MTL", K(ret));
+  } else if (OB_FAIL(schema_service->get_tenant_refreshed_schema_version(
+                    tenant_id, schema_version))) {
+    COMMON_LOG(WARN, "fail to get tenant local schema version", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(schema_service->retry_get_schema_guard(tenant_id,
+                                                          schema_version,
+                                                          table_id,
+                                                          schema_guard,
+                                                          schema_version))) {
+    COMMON_LOG(WARN, "failed to get schema guard", KR(ret));
+  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, table_id, table_schema))) {
+    COMMON_LOG(WARN, "Fail to get table schema", K(ret), K(table_id));
+  } else {
+    COMMON_LOG(INFO, "get table schema", K(table_id), KPC(table_schema), K(table_schema->get_ttl_definition()));
+  }
+  return ret;
+}
+
 } // namespace storage
 } // namespace oceanbase

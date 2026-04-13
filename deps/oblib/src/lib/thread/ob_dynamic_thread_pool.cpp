@@ -381,11 +381,23 @@ void ObSimpleDynamicThreadPool::destroy()
   int64_t ref_cnt = 0;
   while ((ref_cnt = get_ref_cnt()) > 0) {
     if (REACH_TIME_INTERVAL(1000L * 1000L)) {
-      COMMON_LOG(INFO, "wait tenant io manager quit", K(*this), K(ref_cnt));
+      COMMON_LOG(INFO, "wait ObSimpleDynamicThreadPool ref cnt", K(*this), K(ref_cnt));
     }
     ob_usleep((useconds_t)10L * 1000L);
   }
   lib::ThreadPool::stop();
+  lib::ThreadPool::wait();
+}
+
+void ObSimpleDynamicThreadPool::wait()
+{
+  int64_t ref_cnt = 0;
+  while ((ref_cnt = get_ref_cnt()) > 0) {
+    if (REACH_TIME_INTERVAL(1000L * 1000L)) {
+      COMMON_LOG(INFO, "wait ObSimpleDynamicThreadPool ref cnt", K(*this), K(ref_cnt));
+    }
+    ob_usleep((useconds_t)10L * 1000L);
+  }
   lib::ThreadPool::wait();
 }
 
@@ -415,7 +427,7 @@ int ObSimpleDynamicThreadPool::set_adaptive_thread(int64_t min_thread_num, int64
 int ObSimpleDynamicThreadPool::set_max_thread_count(int64_t max_thread_cnt)
 {
   int ret = OB_SUCCESS;
-  if (max_thread_cnt > MAX_THREAD_NUM || max_thread_cnt <= 0) {
+  if (max_thread_cnt < 0 || max_thread_cnt < min_thread_cnt_) {
     ret = OB_INVALID_ARGUMENT;
     COMMON_LOG(WARN, "set_adaptive_thread failed", KP(this), K(max_thread_cnt));
   } else {
@@ -464,29 +476,30 @@ void ObSimpleDynamicThreadPool::try_expand_thread_count()
     // unneed to expand thread count
   } else if (OB_SUCC(update_threads_lock_.trylock())) {
     int64_t cur_thread_count = get_thread_count();
-    int inc_cnt = 0;
-    if (cur_thread_count > 0) {
-      inc_cnt = queue_size / cur_thread_count;
-    } else {
-      inc_cnt = queue_size;
-    }
+    int inc_cnt = queue_size;
     inc_cnt = min(inc_cnt, max_thread_cnt_ - cur_thread_count);
     if (inc_cnt > 0) {
       DISABLE_SQL_MEMLEAK_GUARD;
       COMMON_LOG(INFO, "expand thread count", KP(this), K_(max_thread_cnt), K(cur_thread_count), K(inc_cnt), K(queue_size));
-      if (is_server_tenant(tenant_id_)) {
-        // temporarily reset ob_get_tenant_id() and run_wrapper
-        // avoid the newly created thread to use the memory or run_wrapper of user tenant
-        lib::IRunWrapper *run_wrapper = lib::Threads::get_expect_run_wrapper();
-        lib::Threads::get_expect_run_wrapper() = NULL;
-        DEFER(lib::Threads::get_expect_run_wrapper() = run_wrapper);
-        ObResetThreadTenantIdGuard guard;
-        ret = set_thread_count_and_try_recycle(cur_thread_count + inc_cnt);
-      } else {
-        ret = set_thread_count_and_try_recycle(cur_thread_count + inc_cnt);
+      int64_t old_thread_count = cur_thread_count;
+      for (int i = 1; OB_SUCC(ret) && i <= inc_cnt; ++i) {
+        // we need to make sure only one thread is created when executing set_thread_count_and_try_recycle,
+        // to avoid calling pthread_join when creating multiple threads fails, which could trigger a deadlock
+        cur_thread_count = get_thread_count();
+        if (is_server_tenant(tenant_id_)) {
+          // temporarily reset ob_get_tenant_id() and run_wrapper
+          // avoid the newly created thread to use the memory or run_wrapper of user tenant
+          lib::IRunWrapper *run_wrapper = lib::Threads::get_expect_run_wrapper();
+          lib::Threads::get_expect_run_wrapper() = NULL;
+          DEFER(lib::Threads::get_expect_run_wrapper() = run_wrapper);
+          ObResetThreadTenantIdGuard guard;
+          ret = set_thread_count_and_try_recycle(cur_thread_count + 1);
+        } else {
+          ret = set_thread_count_and_try_recycle(cur_thread_count + 1);
+        }
       }
       if (OB_FAIL(ret)) {
-        COMMON_LOG(ERROR, "set thread count failed", KP(this), K(cur_thread_count), K(inc_cnt));
+        COMMON_LOG(ERROR, "set thread count failed", KP(this), K(old_thread_count), "cur_thread_count", get_thread_count(), K(inc_cnt));
       }
     }
     update_threads_lock_.unlock();

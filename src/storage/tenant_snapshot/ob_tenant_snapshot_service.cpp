@@ -14,6 +14,7 @@
 #include "storage/meta_store/ob_server_storage_meta_service.h"
 #include "storage/tenant_snapshot/ob_tenant_snapshot_service.h"
 #include "storage/tenant_snapshot/ob_tenant_snapshot_task.h"
+#include "storage/high_availability/ob_tenant_startup_status.h"
 
 namespace oceanbase
 {
@@ -129,7 +130,7 @@ void ObTenantSnapshotService::wait()
 {
   int ret = OB_SUCCESS;
   while(OB_FAIL(wait_())) {
-    usleep(100000);
+    ob_usleep(100000);
   }
 }
 
@@ -246,9 +247,9 @@ int ObTenantSnapshotService::common_env_check_()
   } else if (!ATOMIC_LOAD(&is_running_)) {
     ret = OB_NOT_RUNNING;
     LOG_WARN("ObTenantSnapshotService is not running", KR(ret), KPC(this));
-  } else if (OB_UNLIKELY(!SERVER_STORAGE_META_SERVICE.is_started())) {
+  } else if (OB_UNLIKELY(!TENANT_STARTUP_STATUS.is_in_service())) {
     ret = OB_NOT_RUNNING;
-    LOG_INFO("ObTenantSnapshotService does not work before server slog replay finished",
+    LOG_INFO("ObTenantSnapshotService does not work before tenant in service",
         KR(ret), KPC(this));
   }
 

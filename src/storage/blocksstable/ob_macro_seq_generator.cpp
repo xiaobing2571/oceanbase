@@ -23,6 +23,14 @@ using namespace oceanbase::common;
 using namespace oceanbase::storage;
 using namespace oceanbase::blocksstable;
 
+void ObMacroSeqParam::reset()
+{
+  seq_type_ = SEQ_TYPE_MAX;
+  start_ = 0;
+  interval_ = 0;
+  step_ = 0;
+}
+
 bool ObMacroSeqParam::is_valid() const
 {
   bool bret = seq_type_ < SEQ_TYPE_MAX && start_ >= 0;
@@ -30,6 +38,14 @@ bool ObMacroSeqParam::is_valid() const
     bret = interval_ > 0 && step_ > 0;
   }
   return bret;
+}
+
+void ObMacroIncSeqGenerator::reset()
+{
+  is_inited_ = false;
+  start_ = 0;
+  current_ = -1;
+  seq_threshold_ = 0;
 }
 
 int ObMacroIncSeqGenerator::init(const ObMacroSeqParam &seq_param)
@@ -87,6 +103,11 @@ int ObMacroIncSeqGenerator::preview_next(const int64_t current_val, int64_t &nex
     }
   }
   return ret;
+}
+
+void ObMacroSkipSeqGenerator::reset()
+{
+  ddl_seq_generator_.reset();
 }
 
 int ObMacroSkipSeqGenerator::init(const ObMacroSeqParam &seq_param)

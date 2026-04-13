@@ -14,16 +14,18 @@
 #include "ob_storage_ha_dag.h"
 #include "observer/ob_server_event_history_table_operator.h"
 #include "storage/high_availability/ob_cs_replica_migration.h"
+#include "storage/high_availability/ob_storage_ha_src_provider.h"
 
 namespace oceanbase
 {
 using namespace share;
+using namespace transaction;
 namespace storage
 {
 
 /******************ObStorageHAResultMgr*********************/
 ObStorageHAResultMgr::ObStorageHAResultMgr()
-  : lock_(),
+  : lock_(common::ObLatchIds::OB_STORAGE_H_A_RESULT_MGR_LOCK),
     result_(OB_SUCCESS),
     retry_count_(0),
     allow_retry_(true),
@@ -129,6 +131,12 @@ void ObStorageHAResultMgr::reset()
   allow_retry_ = true;
 }
 
+void ObStorageHAResultMgr::reset_result()
+{
+  common::SpinWLockGuard guard(lock_);
+  result_ = OB_SUCCESS;
+}
+
 int ObStorageHAResultMgr::get_retry_count(int32_t &retry_count)
 {
   int ret = OB_SUCCESS;
@@ -214,6 +222,12 @@ void ObIHADagNetCtx::reuse()
 void ObIHADagNetCtx::reset()
 {
   result_mgr_.reset();
+}
+
+void ObIHADagNetCtx::reset_result()
+{
+  result_mgr_.reset_result();
+  LOG_INFO("reset result");
 }
 
 int ObIHADagNetCtx::check_is_in_retry(bool &is_in_retry)
@@ -366,7 +380,6 @@ int ObStorageHADagUtils::deal_with_fo(
 {
   int ret = OB_SUCCESS;
   ObStorageHADag *ha_dag = nullptr;
-
   if (OB_SUCCESS == err || OB_ISNULL(dag)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("deal with fo get invalid argument", K(ret), K(err), KP(dag));
@@ -374,7 +387,8 @@ int ObStorageHADagUtils::deal_with_fo(
       && 0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "RESTORE")
       && 0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "BACKFILL_TX")
       && 0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "TRANSFER")
-      && 0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "REBUILD_TABLET")) {
+      && 0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "REBUILD_TABLET")
+      && 0 != STRCMP(OB_DAG_TYPES[dag->get_type()].dag_module_str_, "BACKUP_CLEAN")) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("dag type is unexpected", K(ret), KPC(dag));
   } else if (OB_ISNULL(ha_dag = static_cast<ObStorageHADag *>(dag))) {
@@ -421,7 +435,6 @@ int ObStorageHADagUtils::check_self_is_valid_member(
   obrpc::ObFetchLSMemberAndLearnerListInfo member_info;
   storage::ObStorageHASrcInfo src_info;
   src_info.cluster_id_ = GCONF.cluster_id;
-  const ObAddr &self_addr = GCONF.self_addr_;
   ObLSHandle ls_handle;
   ObLS *ls = nullptr;
 
@@ -455,28 +468,276 @@ int ObStorageHADagUtils::check_self_is_valid_member(
     LOG_WARN("storage rpc should not be NULL", K(ret), K(tenant_id), K(ls_id));
   } else if (OB_FAIL(storage_rpc->fetch_ls_member_and_learner_list(tenant_id, ls_id, src_info, member_info))) {
     LOG_WARN("failed to check ls is valid member", K(ret), K(tenant_id), K(ls_id));
-  } else if (member_info.member_list_.contains(self_addr)) {
+  } else if (OB_FAIL(inner_check_self_is_valid_member_(ls_id,
+                                                       member_info.member_list_,
+                                                       member_info.learner_list_,
+                                                       is_valid_member))) {
+    LOG_WARN("failed to inner check self is valid member", K(ret));
+  }
+
+  return ret;
+}
+
+int ObStorageHADagUtils::inner_check_self_is_valid_member_(
+    const share::ObLSID &ls_id,
+    const common::ObMemberList &member_list,
+    const common::GlobalLearnerList &learner_list,
+    bool &is_valid_member)
+{
+  int ret = OB_SUCCESS;
+  is_valid_member = false;
+  const ObAddr &self_addr = GCONF.self_addr_;
+  if (member_list.contains(self_addr)) {
     is_valid_member = true;
-  } else if (!member_info.learner_list_.contains(self_addr)) {
+  } else if (!learner_list.contains(self_addr)) {
     is_valid_member = false;
   } else {
     ObMember member;
-    if (OB_FAIL(member_info.learner_list_.get_learner_by_addr(self_addr, member))) {
-      LOG_WARN("failed to get_learner_by_addr", K(ret));
+    if (OB_FAIL(learner_list.get_learner_by_addr(self_addr, member))) {
+      LOG_WARN("failed to get_learner_by_addr", K(ret), K(learner_list));
     } else if (member.is_migrating()) {
       is_valid_member = false;
-      LOG_INFO("self is not valid member", K(ret), K(member), K(member_info), K(self_addr), K(ls_id));
+      LOG_INFO("self is not valid member", K(ret), K(ls_id), K(member_list), K(learner_list), K(self_addr));
     } else {
       is_valid_member = true;
     }
   }
+
+  return ret;
+}
+
+int ObStorageHADagUtils::get_migration_src_info(
+    const ObMigrationOpArg &arg,
+    const uint64_t tenant_id,
+    const share::SCN &local_clog_checkpoint_scn,
+    storage::ObStorageRpc *storage_rpc,
+    ObStorageHASrcInfo &src_info)
+{
+  int ret = OB_SUCCESS;
+  ObStorageHAChooseSrcHelper choose_src_helper;
+  ObMigrationChooseSourcePolicy policy(ObMigrationChooseSourcePolicy::IDC);
+  ObStorageHAGetMemberHelper member_helper;
+  bool enable_choose_source_policy = true;
+  SMART_VAR(ObMigrationChooseSrcHelperInitParam, param) {
+    omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
+    const char *str = "idc";
+    ObLS* ls = nullptr;
+    ObLSHandle ls_handle;
+    bool use_c_replica_policy = false;
+    src_info.reset();
+    if (!arg.is_valid() || OB_INVALID_ID == tenant_id || !local_clog_checkpoint_scn.is_valid() || OB_ISNULL(storage_rpc)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("get migration src info get invalid argument", K(ret), K(tenant_id), K(local_clog_checkpoint_scn));
+    } else if (!tenant_config.is_valid()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("tenant config is invalid", K(ret));
+    } else if (FALSE_IT(str = tenant_config->choose_migration_source_policy.str())) {
+    } else if (FALSE_IT(enable_choose_source_policy = tenant_config->_enable_choose_migration_source_policy)) {
+    } else if (FALSE_IT(param.tenant_id_ = tenant_id)) {
+    } else if (FALSE_IT(param.ls_id_ = arg.ls_id_)) {
+    } else if (FALSE_IT(param.local_clog_checkpoint_scn_ = local_clog_checkpoint_scn)) {
+    } else if (FALSE_IT(param.arg_ = arg)) {
+    } else if (OB_FAIL(member_helper.init(storage_rpc))) {
+      LOG_WARN("failed to init member helper", K(ret), KP(storage_rpc));
+    } else if (OB_FAIL(member_helper.get_member_list_by_replica_type(tenant_id, arg.ls_id_,
+        arg.dst_, param.info_, param.is_first_c_replica_))) {
+      LOG_WARN("failed to get member list.", K(ret), K(tenant_id), "ls_id", arg.ls_id_, "dst", arg.dst_);
+    } else if (OB_FAIL(ObStorageHAChooseSrcHelper::get_policy_type(arg, tenant_id,
+        enable_choose_source_policy, str, param.info_.learner_list_, param.policy_, param.use_c_replica_policy_))) {
+      LOG_WARN("failed to get policy type", K(ret), K(arg), K(tenant_id),
+          K(enable_choose_source_policy), K(str), K(param));
+    } else if (OB_FAIL(choose_src_helper.init(param, storage_rpc, &member_helper))) {
+      LOG_WARN("failed to init src provider.", K(ret), K(param), KP(storage_rpc));
+    } else if (OB_FAIL(choose_src_helper.get_available_src(arg, src_info))) {
+      LOG_WARN("failed to choose ob src", K(ret), K(tenant_id), K(local_clog_checkpoint_scn), K(arg));
+    } else {
+      FLOG_INFO("choose src", K(src_info), K(arg));
+    }
+  } // end smart var
+  return ret;
+}
+
+int ObStorageHADagUtils::check_self_is_valid_member_after_inc_config_version(
+    const share::ObLSID &ls_id,
+    const bool with_leader,
+    bool &is_valid_member)
+{
+  int ret = OB_SUCCESS;
+  if (!ls_id.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("check self in member list get invalid argument", K(ret), K(ls_id));
+  } else if (!GCTX.is_shared_storage_mode()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("not support for sn", K(ret));
+#ifdef OB_BUILD_SHARED_STORAGE
+  } else if (with_leader) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("not support with leader", K(ret));
+  } else {
+    // inc config version with log service
+    if (OB_FAIL(inc_config_version_with_log_service(ls_id))) {
+      LOG_WARN("failed inc config version with log service", K(ret));
+    } else if (OB_FAIL(check_self_is_valid_member_with_log_service(ls_id, is_valid_member))) {
+      LOG_WARN("failed check self is valid member with log service", K(ret));
+    }
+#endif
+  }
+
+  return ret;
+}
+
+int ObStorageHADagUtils::inc_member_list_config_version(
+    const share::ObLSID &ls_id,
+    const bool with_leader)
+{
+  int ret = OB_SUCCESS;
+  if (!ls_id.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("inc member list config version get invalid argument", K(ret), K(ls_id));
+  } else if (!GCTX.is_shared_storage_mode()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("not support for sn", K(ret));
+#ifdef OB_BUILD_SHARED_STORAGE
+  } else if (with_leader) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("not support with leader", K(ret));
+  } else {
+    // inc config version with log service
+    if (OB_FAIL(inc_config_version_with_log_service(ls_id))) {
+      LOG_WARN("failed inc config version with log service", K(ret));
+    } else {
+      LOG_INFO("succeed inc config version with log service", K(ls_id));
+    }
+#endif
+  }
+
+  return ret;
+}
+
+#ifdef OB_BUILD_SHARED_STORAGE
+int ObStorageHADagUtils::check_self_is_valid_member_with_log_service(
+    const share::ObLSID &ls_id,
+    bool &is_valid_member)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = MTL_ID();
+
+  if (!ls_id.is_valid_with_tenant(tenant_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(ls_id));
+  } else if (!GCONF.enable_logservice) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("log service not support", KR(ret));
+  } else {
+    palf::LogConfigVersion config_version;
+    common::ObMemberList member_list;
+    common::GlobalLearnerList learner_list;
+    libpalf::LibPalfMemberInfoReaderWrapper palf_wrapper(tenant_id, ls_id.id());
+    if (OB_FAIL(palf_wrapper.get_member_info(config_version, member_list, learner_list))) {
+      LOG_WARN("failed to get member info", K(ret));
+    } else if (OB_FAIL(inner_check_self_is_valid_member_(ls_id,
+                                                         member_list,
+                                                         learner_list,
+                                                         is_valid_member))) {
+      LOG_WARN("failed to inner check self is valid member", K(ret));
+    }
+  }
+
+  return ret;
+}
+
+int ObStorageHADagUtils::inc_config_version_with_log_service(
+    const share::ObLSID &ls_id)
+{
+  int ret = OB_SUCCESS;
+  ObLSService *ls_service = nullptr;
+  ObLSHandle ls_handle;
+  ObLS *ls = nullptr;
+  const int64_t timeout_us = GCONF.sys_bkgd_migration_change_member_list_timeout;
+
+  if (!ls_id.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("check self in member list get invalid argument", K(ret), K(ls_id));
+  } else if (!GCONF.enable_logservice) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("log service not support", KR(ret));
+  } else if (OB_ISNULL(ls_service = MTL(ObLSService *))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ls service should not be NULL", K(ret), K(ls_id));
+  } else if (OB_FAIL(ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::HA_MOD))) {
+    LOG_WARN("failed to get ls", K(ret), K(ls_id));
+  } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ls should not be NULL", K(ret), KP(ls), K(ls_id));
+  } else if (OB_FAIL(ls->get_log_handler()->inc_config_version(timeout_us))) {
+    LOG_WARN("failed to inc config version", K(ret), K(ls_id), K(timeout_us));
+  } else {
+    LOG_INFO("succeed to inc config version", K(ls_id), K(timeout_us));
+  }
+  return ret;
+}
+#endif
+
+int ObStorageHADagUtils::deal_with_non_migrated_tablet(
+  const ObLSHandle &ls_handle,
+  const ObLogicTabletID &logic_tablet_id,
+  ObHATabletGroupCtx *tablet_group_ctx,
+  ObMigrationCtx *ctx,
+  ObTabletHandle &tablet_handle,
+  bool &need_migrate)
+{
+  int ret = OB_SUCCESS;
+  ObLSService *ls_svr = nullptr;
+  ObLS *ls = nullptr;
+  tablet_handle.reset();
+  ObTablet *tablet = nullptr;
+  need_migrate = true;
+
+  if (!ls_handle.is_valid() || !logic_tablet_id.is_valid()
+        || OB_ISNULL(tablet_group_ctx) || OB_ISNULL(ctx) || !ctx->is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("deal with non migrated tablet get invalid argument", K(ret), K(ls_handle), K(logic_tablet_id), KP(tablet_group_ctx), KPC(ctx));
+  } else if (OB_ISNULL(ls_svr = (MTL(ObLSService *)))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ls service should not be NULL", K(ret), KP(ls_svr));
+  } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ls should not be NULL", KR(ret), K(ls_handle));
+  } else if (OB_FAIL(ls->ha_get_tablet(logic_tablet_id.tablet_id_, tablet_handle))) {
+    if (OB_TABLET_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+      need_migrate = false;
+    } else {
+      LOG_WARN("failed to get tablet", K(ret), K(logic_tablet_id));
+    }
+  } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tablet should not be NULL", K(ret), K(tablet_handle), K(logic_tablet_id));
+  } else if (logic_tablet_id.transfer_seq_ > tablet->get_tablet_meta().transfer_info_.transfer_seq_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("local tablet transfer seq is smaller than remote tablet transfer seq, unexpected",
+        K(ret), K(logic_tablet_id), KPC(tablet));
+  } else if (logic_tablet_id.transfer_seq_ < tablet->get_tablet_meta().transfer_info_.transfer_seq_) {
+    need_migrate = false;
+    LOG_INFO("local tablet transfer seq is bigger than remote tablet, no need copy", K(logic_tablet_id), KPC(tablet));
+  }
+
+  if (OB_SUCC(ret) && !need_migrate) {
+    if (ls->is_cs_replica()
+          && OB_FAIL(ObHATabletGroupCOConvertCtx::update_deleted_data_tablet_status(tablet_group_ctx, logic_tablet_id.tablet_id_))) {
+      LOG_WARN("failed to update deleted tablet status", K(ret));
+    } else if (OB_FAIL(ctx->tablet_dep_mgr_.remove_tablet_dependency(logic_tablet_id.tablet_id_))) {
+      LOG_WARN("failed to remove tablet dependency", K(ret), K(logic_tablet_id));
+    }
+  }
+
   return ret;
 }
 
 /******************ObHATabletGroupCtx*********************/
 ObHATabletGroupCtx::ObHATabletGroupCtx(const TabletGroupCtxType type)
   : is_inited_(false),
-    lock_(),
+    lock_(common::ObLatchIds::OB_STORAGE_HA_DAG_TABLET_GROUP_CTX_LOCK),
     tablet_id_array_(),
     index_(0),
     type_(type)
@@ -568,7 +829,7 @@ void ObHATabletGroupCtx::inner_reuse()
 /******************ObHATabletGroupCtx*********************/
 ObHATabletGroupMgr::ObHATabletGroupMgr()
   : is_inited_(false),
-    lock_(),
+    lock_(common::ObLatchIds::OB_STORAGE_HA_DAG_TABLET_GROUP_ARRAY_LOCK),
     allocator_("HATGMgr", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
     tablet_group_ctx_array_(),
     index_(0)
@@ -664,7 +925,7 @@ int ObHATabletGroupMgr::alloc_and_new_tablet_group_ctx(
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to alloc memory", K(ret), KP(buf));
     } else {
-      tablet_group_ctx = new (buf) ObHATabletGroupCtx();
+      tablet_group_ctx = new (buf) ObHATabletGroupCtx(type);
     }
   } else if (ObHATabletGroupCtx::TabletGroupCtxType::CS_REPLICA_TYPE == type) {
     if (OB_ISNULL(buf = allocator_.alloc(sizeof(ObHATabletGroupCOConvertCtx)))) {
@@ -751,8 +1012,14 @@ int ObStorageHATaskUtils::check_need_copy_sstable(
     if (OB_FAIL(check_ddl_sstable_need_copy_(param, tablet_handle, need_copy))) {
       LOG_WARN("failed to check ddl sstable need copy", K(ret), K(param), K(tablet_handle));
     }
+  } else if (param.table_key_.is_inc_major_ddl_dump_sstable()) {
+    if (OB_FAIL(check_inc_major_ddl_sstable_need_copy_(param, tablet_handle, need_copy))) {
+      LOG_WARN("failed to check inc major ddl sstable need copy", K(ret), K(param), K(tablet_handle));
+    }
   } else if (param.table_key_.is_mds_sstable()) {
     need_copy = true;
+  } else if (param.table_key_.is_inc_major_type_sstable()) {
+    need_copy = true; // always copy all inc major, including abortive inc major which maybe exist
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("copy sstable table type is unexpected", K(ret), K(param));
@@ -898,6 +1165,79 @@ int ObStorageHATaskUtils::check_ddl_sstable_need_copy_(
     } else {
       need_copy = false;
     }
+  }
+  return ret;
+}
+
+int ObStorageHATaskUtils::check_inc_major_ddl_sstable_need_copy_(
+    const ObMigrationSSTableParam &param,
+    ObTabletHandle &tablet_handle,
+    bool &need_copy)
+{
+  int ret = OB_SUCCESS;
+  ObTablet *tablet = nullptr;
+  ObSSTableWrapper sstable_wrapper;
+  ObTabletMemberWrapper<ObTabletTableStore> table_store_wrapper;
+  ObSSTableMetaHandle sst_meta_hdl;
+
+  if (!param.table_key_.is_inc_major_ddl_dump_sstable()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("check ddl sstable need copy get invalid argument", K(ret), K(param));
+  } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tablet should not be NULL", K(ret), K(param), K(tablet_handle));
+  } else if (OB_FAIL(tablet->fetch_table_store(table_store_wrapper))) {
+    LOG_WARN("fail to fetch table store", K(ret));
+  } else if (param.uncommit_tx_info_.is_valid() && (1 == param.uncommit_tx_info_.get_info_count())) {
+    // currently the count of inc_major_ddl_sstable's uncommit_tx_info must be 1
+    const ObSSTableArray &ddl_sstable_array = table_store_wrapper.get_member()->get_inc_major_ddl_sstables();
+    const ObTransID &trans_id = param.uncommit_tx_info_.tx_infos_[0].tx_id_;
+    const ObTxSEQ &seq_no = ObTxSEQ::cast_from_int(param.uncommit_tx_info_.tx_infos_[0].sql_seq_);
+    ObTableStoreIterator inc_major_iter;
+    ObTableStoreIterator inc_major_ddl_iter;
+    // inc_major_ddl_sstables / inc_major_sstables may contain multiple times of direct-load, which is identified by (trans_id, seq_no)
+    // for each direct-load, the relationship between inc_major_ddl_sstables and inc_major_sstable is similar to that of ddl_sstables and major_sstable
+    // therefore, once we found a direct-load's inc_major_sstable, all its inc_major_ddl_sstables can be skipped
+    if (OB_FAIL(table_store_wrapper.get_member()->get_inc_major_sstables(inc_major_iter, trans_id, seq_no))) {
+      LOG_WARN("failed to get inc major sstables", KR(ret), K(trans_id), K(seq_no));
+    } else if (OB_FAIL(table_store_wrapper.get_member()->get_inc_major_ddl_sstables(inc_major_ddl_iter, trans_id, seq_no))) {
+      LOG_WARN("failed to get inc major ddl sstables", KR(ret), K(trans_id), K(seq_no));
+    } else if (inc_major_iter.count() > 0) {
+      need_copy = false;
+    } else if (0 == inc_major_ddl_iter.count()) {
+      need_copy = true;
+    } else if (OB_FAIL(ddl_sstable_array.get_table(param.table_key_, sstable_wrapper))) {
+      LOG_WARN("failed to get table", K(ret), K(param), K(ddl_sstable_array));
+    } else if (nullptr == sstable_wrapper.get_sstable()) {
+      ObITable *trans_first_inc_major_ddl_sstable = nullptr;
+      ObITable *trans_last_inc_major_ddl_sstable = nullptr;
+      if (OB_FAIL(inc_major_ddl_iter.get_boundary_table(false/*is_last*/, trans_first_inc_major_ddl_sstable))) {
+        LOG_WARN("failed to get boundary table", KR(ret));
+      } else if (OB_FAIL(inc_major_ddl_iter.get_boundary_table(true/*is_last*/, trans_last_inc_major_ddl_sstable))) {
+        LOG_WARN("failed to get boundary table", KR(ret));
+      } else if (OB_ISNULL(trans_first_inc_major_ddl_sstable) || OB_ISNULL(trans_last_inc_major_ddl_sstable)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null inc major ddl sstable", KR(ret), KP(trans_first_inc_major_ddl_sstable), KP(trans_last_inc_major_ddl_sstable));
+      } else {
+        const SCN start_scn = trans_first_inc_major_ddl_sstable->get_start_scn();
+        const SCN end_scn = trans_last_inc_major_ddl_sstable->get_end_scn();
+        if (param.table_key_.scn_range_.start_scn_ >= start_scn
+            && param.table_key_.scn_range_.end_scn_ <= end_scn) {
+          need_copy = false;
+        } else {
+          need_copy = true;
+        }
+      }
+    } else if (OB_FAIL(sstable_wrapper.get_sstable()->get_meta(sst_meta_hdl))) {
+      LOG_WARN("failed to get sstable meta handle", K(ret));
+    } else if (OB_FAIL(ObSSTableMetaChecker::check_sstable_meta(param, sst_meta_hdl.get_sstable_meta()))) {
+      LOG_WARN("failed to check sstable meta", K(ret), K(param), K(sstable_wrapper));
+    } else {
+      need_copy = false;
+    }
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("an inc_major_ddl_sstable must have one uncommit_tx_info", KR(ret), K(param.uncommit_tx_info_));
   }
   return ret;
 }

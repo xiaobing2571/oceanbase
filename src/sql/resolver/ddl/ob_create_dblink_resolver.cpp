@@ -82,15 +82,16 @@ int ObCreateDbLinkResolver::resolve(const ParseNode &parse_tree)
   }
   if (OB_SUCC(ret)) {
     ObString dblink_name;
+    bool is_reverse_link = false;  // unuse
     ParseNode *name_node = node->children_[DBLINK_NAME];
     if (OB_ISNULL(name_node)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid parse tree", K(ret));
-    } else if (name_node->str_len_ >= OB_MAX_DBLINK_NAME_LENGTH) {
+    } else if (OB_FAIL(resolve_dblink_name(name_node, dblink_name, is_reverse_link))) {
+      LOG_WARN("failed to resolve dblink name", K(ret));
+    } else if (dblink_name.length() > OB_MAX_DBLINK_NAME_LENGTH) {
       ret = OB_ERR_TOO_LONG_IDENT;
-      LOG_USER_ERROR(OB_ERR_TOO_LONG_IDENT, static_cast<int32_t>(name_node->str_len_), name_node->str_value_);
-    } else if (FALSE_IT(dblink_name.assign_ptr(name_node->str_value_, static_cast<int32_t>(name_node->str_len_)))) {
-      // do nothing
+      LOG_USER_ERROR(OB_ERR_TOO_LONG_IDENT, dblink_name.length(), dblink_name.ptr());
     } else if (OB_FAIL(create_dblink_stmt->set_dblink_name(dblink_name))) {
       LOG_WARN("set dblink name failed", K(ret));
     }
@@ -137,6 +138,9 @@ int ObCreateDbLinkResolver::resolve(const ParseNode &parse_tree)
       LOG_WARN("invalid parse tree", K(ret));
     } else if (FALSE_IT(user_name.assign_ptr(name_node->str_value_, static_cast<int32_t>(name_node->str_len_)))) {
       // do nothing
+    } else if (user_name.length() > OB_MAX_USER_NAME_LENGTH) {
+      ret = OB_WRONG_USER_NAME_LENGTH;
+      LOG_USER_ERROR(OB_WRONG_USER_NAME_LENGTH, user_name.length(), user_name.ptr());
     } else if (OB_FAIL(create_dblink_stmt->set_user_name(user_name))) {
       LOG_WARN("set user name failed", K(ret));
     }
@@ -149,15 +153,15 @@ int ObCreateDbLinkResolver::resolve(const ParseNode &parse_tree)
       LOG_WARN("invalid parse tree", K(ret));
     } else if (FALSE_IT(password.assign_ptr(pwd_node->str_value_, static_cast<int32_t>(pwd_node->str_len_)))) {
       // do nothing
-    } else if (password.empty()) {
+    } else if (password.empty() || password.length() > OB_MAX_PASSWORD_LENGTH) {
       if (lib::is_oracle_mode()) {
         ret = OB_ERR_MISSING_OR_INVALID_PASSWORD;
         LOG_USER_ERROR(OB_ERR_MISSING_OR_INVALID_PASSWORD);
       } else {
         ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "create dblink with empty password");
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "create a database link with an empty or excessively long password");
       }
-      LOG_WARN("create dblink with empty password", K(ret));
+      LOG_WARN("create a database link with an empty or excessively long password", K(ret));
     } else if (OB_FAIL(create_dblink_stmt->set_password(password))) {
       LOG_WARN("set password failed", K(ret));
     }
@@ -352,8 +356,9 @@ int ObCreateDbLinkResolver::resolve_hostname_port_str(const ObString &ip_port_st
   int ret = OB_SUCCESS;
   char buf[OB_MAX_DOMIN_NAME_LENGTH + 1] = "";
   if (ip_port_str.empty()) {
-    ret = OB_ERR_UNEXPECTED;
+    ret = OB_INVALID_ARGUMENT;
     LOG_WARN("unexpected empty ip_port_str", K(ret));
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "host");
   } else {
     int64_t data_len = MIN(ip_port_str.length(), sizeof (buf) - 1);
     MEMCPY(buf, ip_port_str.ptr(), data_len);

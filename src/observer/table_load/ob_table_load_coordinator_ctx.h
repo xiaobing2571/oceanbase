@@ -57,17 +57,17 @@ public:
   }
   OB_INLINE table::ObTableLoadStatusType get_status() const
   {
-    obsys::ObRLockGuard guard(status_lock_);
+    obsys::ObRLockGuard<> guard(status_lock_);
     return status_;
   }
   OB_INLINE int get_error_code() const
   {
-    obsys::ObRLockGuard guard(status_lock_);
+    obsys::ObRLockGuard<> guard(status_lock_);
     return error_code_;
   }
   OB_INLINE void get_status(table::ObTableLoadStatusType &status, int &error_code) const
   {
-    obsys::ObRLockGuard guard(status_lock_);
+    obsys::ObRLockGuard<> guard(status_lock_);
     status = status_;
     error_code = error_code_;
   }
@@ -132,7 +132,7 @@ private:
   int init_session_ctx_array();
   int generate_autoinc_params(share::AutoincParam &autoinc_param);
   int init_sequence();
-  void add_to_all_server_event();
+  void add_to_all_server_event(int ret_code);
   int init_partition_ids(const ObIArray<ObTabletID> &tablet_ids);
   int init_empty_insert_tablet_ctx_manager();
 public:
@@ -193,10 +193,10 @@ private:
   uint64_t last_trans_gid_ CACHE_ALIGNED;
   uint64_t next_session_id_ CACHE_ALIGNED;
   lib::ObMutex op_lock_;
-  mutable obsys::ObRWLock status_lock_;
+  mutable obsys::ObRWLock<> status_lock_;
   table::ObTableLoadStatusType status_;
   int error_code_;
-  mutable obsys::ObRWLock rwlock_;
+  mutable obsys::ObRWLock<> rwlock_;
   TransMap trans_map_;
   TransCtxMap trans_ctx_map_;
   SegmentCtxMap segment_ctx_map_;

@@ -17,7 +17,7 @@ namespace oceanbase
 namespace logservice
 {
 ObLogHandlerBase::ObLogHandlerBase() :
-  lock_(),
+  lock_(common::ObLatchIds::OB_LOG_HANDLER_BASE_LOCK),
   role_(common::FOLLOWER),
   proposal_id_(palf::INVALID_PROPOSAL_ID),
   id_(-1),
@@ -118,6 +118,12 @@ int ObLogHandlerBase::get_role_atomically(common::ObRole &role) const
   int ret = OB_SUCCESS;
   role = ATOMIC_LOAD(&role_);
   return ret;
+}
+
+bool ObLogHandlerBase::is_in_stop_state() const
+{
+  RLockGuard guard(lock_);
+  return is_in_stop_state_;
 }
 } // end namespace logservice
 } // end namespace oceanbase

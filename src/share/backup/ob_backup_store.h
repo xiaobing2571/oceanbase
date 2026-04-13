@@ -16,28 +16,12 @@
 #include "share/backup/ob_backup_struct.h"
 #include "share/backup/ob_backup_serialize_provider.h"
 #include "share/ob_srv_rpc_proxy.h"
+#include "share/backup/ob_backup_path.h"
 
 namespace oceanbase
 {
 namespace share
 {
-
-struct ObBackupDestType final
-{
-  enum TYPE : int64_t
-  {
-    DEST_TYPE_BACKUP_DATA = 0,
-    DEST_TYPE_ARCHIVE_LOG,
-    DEST_TYPE_BACKUP_KEY,
-    DEST_TYPE_RESTORE_DATA,
-    DEST_TYPE_RESTORE_LOG,
-    DEST_TYPE_MAX
-  };
-  static const char *get_str(const TYPE &type);
-  static TYPE get_type(const char *type_str);
-  static OB_INLINE bool is_valid(const TYPE &type) { return type >= 0 && type < TYPE::DEST_TYPE_MAX; } 
-};
-
 struct ObBackupFormatDesc final : public ObIBackupSerializeProvider
 {
   OB_UNIS_VERSION_V(1); // virtual
@@ -102,6 +86,31 @@ public:
     K_(tenant_id), K_(incarnation));
 };
 
+struct ObBackupConsistencyCheckDesc final : public ObIBackupSerializeProvider
+{
+  OB_UNIS_VERSION_V(1); // virtual
+  static const uint8_t FILE_VERSION = 1;
+public:
+  ObBackupConsistencyCheckDesc();
+  bool is_valid() const override;
+  uint16_t get_data_type() const override;
+  uint16_t get_data_version() const override;
+  uint16_t get_compressor_type() const override
+  {
+    return ObCompressorType::NONE_COMPRESSOR;
+  }
+  int init(const uint64_t tenant_id);
+  void reset();
+  uint64_t get_tenant_id() const { return tenant_id_; }
+  TO_STRING_KV(K_(tenant_id));
+private:
+  static const int64_t RANDOM_CONTENT_LENGTH = 256;
+  int generate_random_content_();
+private:
+  uint64_t tenant_id_;
+  char random_content_[RANDOM_CONTENT_LENGTH];
+};
+
 class ObExternBackupDataDesc : public share::ObIBackupSerializeProvider
 {
 public:
@@ -134,17 +143,26 @@ public:
 
   // oss://backup_dest/format
   int get_format_file_path(ObBackupPathString &path) const;
+  int get_single_backup_set_info_path(ObBackupPathString &path) const;
   int is_format_file_exist(bool &is_exist) const;
+  int is_single_backup_set_info_exist(bool &is_exist) const;
   int dest_is_empty_directory(bool &is_empty) const;
   int read_format_file(ObBackupFormatDesc &desc) const;
   int write_format_file(const ObBackupFormatDesc &desc) const;
   int write_check_file(const ObBackupPathString &full_path, const ObBackupCheckDesc &desc) const;
   int read_check_file(const ObBackupPathString &full_path, ObBackupCheckDesc &desc) const;
+  int write_rw_consistency_check_file(const ObBackupPathString &full_path, const ObBackupConsistencyCheckDesc &desc) const;
+  int read_rw_consistency_check_file(const ObBackupPathString &full_path, ObBackupConsistencyCheckDesc &desc);
+  int is_file_list_file_exist(const ObBackupPath &path, const ObBackupFileSuffix &suffix, bool &is_exist) const;
   TO_STRING_KV(K_(is_inited), K_(backup_dest));
 
 protected:
   int write_single_file(const ObBackupPathString &full_path, const ObIBackupSerializeProvider &serializer) const;
   int read_single_file(const ObBackupPathString &full_path, ObIBackupSerializeProvider &serializer) const;
+  int read_single_file_with_allocator(
+      const ObBackupPathString &full_path,
+      common::ObIAllocator &allocator,
+      ObIBackupSerializeProvider &serializer) const;
 
 private:
   bool is_inited_;
@@ -157,6 +175,11 @@ private:
 class ObBackupDestMgr final
 {
 public:
+  enum RemoteExecuteType {
+    CHECK_DEST_VALIDITY = 0,
+    WRITE_FORMAT_FILE = 1,
+    MAX
+  };
   ObBackupDestMgr();
   ~ObBackupDestMgr() {}
 
@@ -165,17 +188,27 @@ public:
       const ObBackupDestType::TYPE &dest_type,
       const share::ObBackupPathString &backup_dest_str,
       common::ObISQLClient &sql_proxy);
+  int init_for_rpc(
+      const uint64_t tenant_id,
+      const ObBackupDestType::TYPE &dest_type,
+      const share::ObBackupPathString &backup_dest_str,
+      common::ObISQLClient &sql_proxy);
   int check_dest_connectivity(obrpc::ObSrvRpcProxy &rpc_proxy);
-  int check_dest_validity(obrpc::ObSrvRpcProxy &rpc_proxy, const bool need_format_file);
+  int check_dest_validity(obrpc::ObSrvRpcProxy &rpc_proxy, const bool need_format_file, const bool need_check_permission);
   int write_format_file();
   void reset();
+  bool is_valid_type(const RemoteExecuteType type) const { return CHECK_DEST_VALIDITY <= type && type < MAX; }
 private:
   int generate_format_desc_(
       const int64_t dest_id,
       const ObBackupDestType::TYPE &dest_type,
       share::ObBackupFormatDesc &format_desc);
   int updata_backup_file_status_();
-
+  int remote_execute_if_need_(obrpc::ObSrvRpcProxy &rpc_proxy,
+                              const bool need_format_file,
+                              const bool need_check_permission,
+                              const RemoteExecuteType type,
+                              bool &need_remote_execute);
 private:
   bool is_inited_;
   uint64_t tenant_id_;
@@ -184,6 +217,7 @@ private:
   ObBackupDestType::TYPE dest_type_;
   share::ObBackupDest backup_dest_;
   common::ObISQLClient *sql_proxy_;
+  bool is_remote_execute_;
   DISALLOW_COPY_AND_ASSIGN(ObBackupDestMgr);
 };
 

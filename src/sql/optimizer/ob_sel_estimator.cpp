@@ -16,11 +16,11 @@
 
 using namespace oceanbase::common;
 using namespace oceanbase::share::schema;
+
 namespace oceanbase
 {
 namespace sql
 {
-inline double revise_ndv(double ndv) { return ndv < 1.0 ? 1.0 : ndv; }
 
 void SimpleRange::set_whole_range()
 {
@@ -1791,6 +1791,8 @@ int ObBoolOpSelEstimator::create_estimator(ObSelEstimatorFactory &factory,
   estimator = NULL;
   ObBoolOpSelEstimator *bool_estimator = NULL;
   ObSEArray<ObRawExpr *, 4> exprs;
+  const int64_t DEDUP_THRESHOLD = 10;
+  bool need_dedup = true;
   if (T_OP_NOT != expr.get_expr_type() &&
       T_OP_AND != expr.get_expr_type() &&
       T_OP_OR != expr.get_expr_type() &&
@@ -1803,12 +1805,13 @@ int ObBoolOpSelEstimator::create_estimator(ObSelEstimatorFactory &factory,
     bool_estimator->expr_ = &expr;
     estimator = bool_estimator;
     for (int64_t i = 0; OB_SUCC(ret) && i < expr.get_param_count(); ++i) {
+      need_dedup = exprs.count() <= DEDUP_THRESHOLD; // avoid costy deduplication for big or query
       const ObRawExpr *child_expr = expr.get_param_expr(i);
       ObSelEstimator *child_estimator = NULL;
       if (OB_ISNULL(child_expr)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("get null expr", K(ret));
-      } else if (ObOptimizerUtil::find_equal_expr(exprs, child_expr)) {
+      } else if (need_dedup && ObOptimizerUtil::find_equal_expr(exprs, child_expr)) {
         // do nothing
       } else if (OB_FAIL(SMART_CALL(factory.create_estimator(ctx, child_expr, child_estimator)))) {
         LOG_WARN("failed to create estimator", KPC(child_expr));
@@ -2666,12 +2669,12 @@ double ObInequalJoinSelEstimator::get_equal_sel(double min1,
     overlap = 0.0;
   }
   if (max1 - min1 > OB_DOUBLE_EPSINON) {
-    overlap_ndv1 = revise_ndv(ndv1 * overlap / (max1 - min1)) ;
+    overlap_ndv1 = ObOptSelectivity::revise_ndv(ndv1 * overlap / (max1 - min1)) ;
   } else {
     overlap_ndv1 = 1;
   }
   if (max2 - min2 > OB_DOUBLE_EPSINON) {
-    overlap_ndv2 = revise_ndv(ndv2 * overlap / (max2 - min2)) ;
+    overlap_ndv2 = ObOptSelectivity::revise_ndv(ndv2 * overlap / (max2 - min2)) ;
   } else {
     overlap_ndv2 = 1;
   }

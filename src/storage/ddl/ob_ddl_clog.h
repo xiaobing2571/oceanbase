@@ -124,7 +124,8 @@ public:
   int init(const share::ObLSID &ls_id,
            const storage::ObDDLMacroBlockRedoInfo &redo_info,
            const blocksstable::MacroBlockId &macro_block_id,
-           ObTabletHandle &tablet_handle);
+           ObTabletHandle &tablet_handle,
+           const ObDirectLoadType &direct_load_type);
   virtual int on_success() override;
   virtual int on_failure() override;
   inline bool is_success() const { return status_.is_success(); }
@@ -145,6 +146,9 @@ private:
   int64_t snapshot_version_;
   uint64_t data_format_version_;
   bool with_cs_replica_;
+  ObDirectLoadType direct_load_type_;
+  int64_t block_checksum_;
+  bool is_macro_block_exist_;
 };
 
 class ObDDLCommitClogCb : public logservice::AppendCb
@@ -271,13 +275,11 @@ public:
            const ObITable::TableKey &table_key,
            const char* buf,
            const int64_t buf_len,
-           const blocksstable::MacroBlockId &macro_block_id,
            const uint64_t data_format_version);
   int assign(const storage::ObDDLFinishLogInfo &other);
 
   bool is_valid() const { return finish_info_.is_valid(); }
   ObITable::TableKey get_table_key() const { return finish_info_.table_key_; }
-  blocksstable::MacroBlockId get_macro_block_id() const { return finish_info_.macro_block_id_; }
   ObString get_data_buffer() const { return finish_info_.data_buffer_; }
   share::ObLSID get_ls_id() const { return finish_info_.ls_id_; }
   storage::ObDDLFinishLogInfo get_log_info() const { return finish_info_; }
@@ -292,7 +294,7 @@ class ObDDLFinishClogCb : public logservice::AppendCb
 public:
   ObDDLFinishClogCb();
   virtual ~ObDDLFinishClogCb() = default;
-  int init(const ObDDLFinishLog &finish_log);
+  int init(const ObDDLFinishLog &finish_log, ObTabletHandle &tablet_handle);
   virtual int on_success() override;
   virtual int on_failure() override;
   inline bool is_success() const { return status_.is_success(); }
@@ -306,6 +308,7 @@ private:
   bool is_inited_;
   ObDDLClogCbStatus status_;
   ObDDLFinishLog finish_log_;
+  ObTabletHandle tablet_handle_;
 };
 #endif
 

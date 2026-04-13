@@ -159,7 +159,7 @@ int ObCollectMV::do_balance_inner_(uint64_t tenant_id)
     ObBalanceJob job;
     if (OB_FAIL(b_svr->gather_stat_())) {
       LOG_WARN("failed to gather stat", KR(ret));
-    } else if (OB_FAIL(b_svr->gather_ls_status_stat(tenant_id, b_svr->ls_array_))) {
+    } else if (OB_FAIL(b_svr->gather_ls_status_stat(tenant_id, b_svr->ls_array_, true))) {
       LOG_WARN("failed to gather stat", KR(ret));
     } else if (OB_FAIL(ObBalanceJobTableOperator::get_balance_job(
                    tenant_id, false, *GCTX.sql_proxy_, job, start_time, finish_time))) {
@@ -323,7 +323,7 @@ TEST_F(ObCollectMV, update_full_column)
                                              true  /*end_exclusive*/));
   {
     int ret = OB_SUCCESS;
-    blocksstable::ObRowReader row_reader;
+    blocksstable::ObCompatRowReader row_reader;
     blocksstable::ObDatumRow datum_row;
     SMART_VAR(ObCStringHelper, helper) {
       for (int64_t row_idx = 0; OB_SUCC(ret) && OB_SUCC(iter.next_internal()); row_idx++) {

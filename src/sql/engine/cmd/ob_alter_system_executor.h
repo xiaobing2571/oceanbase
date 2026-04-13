@@ -52,6 +52,7 @@ DEF_SIMPLE_EXECUTOR(ObFlushIlogCache);
 DEF_SIMPLE_EXECUTOR(ObFlushDagWarnings);
 
 DEF_SIMPLE_EXECUTOR(ObFlushSSMicroCache);
+DEF_SIMPLE_EXECUTOR(ObFlushSSLocalCache);
 
 DEF_SIMPLE_EXECUTOR(ObSwitchReplicaRole);
 
@@ -75,8 +76,6 @@ DEF_SIMPLE_EXECUTOR(ObWashMemFragmentation);
 
 DEF_SIMPLE_EXECUTOR(ObRefreshIOCalibraiton);
 
-DEF_SIMPLE_EXECUTOR(ObSetConfig);
-
 DEF_SIMPLE_EXECUTOR(ObChangeExternalStorageDest);
 
 DEF_SIMPLE_EXECUTOR(ObClearLocationCache);
@@ -90,6 +89,8 @@ DEF_SIMPLE_EXECUTOR(ObReloadZone);
 DEF_SIMPLE_EXECUTOR(ObClearMergeError);
 
 DEF_SIMPLE_EXECUTOR(ObMigrateUnit);
+
+DEF_SIMPLE_EXECUTOR(ObReplaceTenant);
 
 DEF_SIMPLE_EXECUTOR(ObAlterLSReplica);
 
@@ -111,6 +112,7 @@ DEF_SIMPLE_EXECUTOR(ObStopUpgradeJob);
 
 DEF_SIMPLE_EXECUTOR(ObSetTP);
 
+
 DEF_SIMPLE_EXECUTOR(ObEnableSqlThrottle);
 
 DEF_SIMPLE_EXECUTOR(ObDisableSqlThrottle);
@@ -124,6 +126,7 @@ DEF_SIMPLE_EXECUTOR(ObDropDisk);
 
 DEF_SIMPLE_EXECUTOR(ObArchiveLog);
 DEF_SIMPLE_EXECUTOR(ObBackupDatabase);
+DEF_SIMPLE_EXECUTOR(ObBackupValidate);
 DEF_SIMPLE_EXECUTOR(ObCancelRestore);
 DEF_SIMPLE_EXECUTOR(ObBackupManage);
 DEF_SIMPLE_EXECUTOR(ObBackupClean);
@@ -147,10 +150,8 @@ DEF_SIMPLE_EXECUTOR(ObBootstrap);
 DEF_SIMPLE_EXECUTOR(ObResetConfig);
 
 DEF_SIMPLE_EXECUTOR(ObCancelClone);
-
-DEF_SIMPLE_EXECUTOR(ObTransferPartition);
-DEF_SIMPLE_EXECUTOR(ObServiceName);
 DEF_SIMPLE_EXECUTOR(ObRebuildTablet);
+DEF_SIMPLE_EXECUTOR(ObLoadLicense);
 class ObCancelTaskExecutor
 {
 public:
@@ -240,7 +241,33 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObAdminZoneExecutor);
 };
 
+class ObPrewarmSSLocalCacheExecutor
+{
+public:
+  ObPrewarmSSLocalCacheExecutor() {}
+  virtual ~ObPrewarmSSLocalCacheExecutor() {}
+  int execute(ObExecContext &ctx, ObPrewarmSSLocalCacheStmt &stmt);
+private:
+  int get_tenant_server_list(const uint64_t tenant_id, common::ObIArray<common::ObAddr> &server_list);
+  #ifdef OB_BUILD_SHARED_STORAGE
+  int send_prewarm_cache_rpc(const uint64_t tenant_id, const obrpc::ObPrewarmSSLocalCacheArg &arg);
+  #endif
+
+  DISALLOW_COPY_AND_ASSIGN(ObPrewarmSSLocalCacheExecutor);
+};
+
 DEF_SIMPLE_EXECUTOR(ObModuleData);
+
+class ObSetConfigExecutor
+{
+public:
+  ObSetConfigExecutor() {}
+  virtual ~ObSetConfigExecutor() {}
+  int execute(ObExecContext &ctx, ObSetConfigStmt &stmt);
+private:
+  int wait_config_sync(const obrpc::ObAdminSetConfigArg &arg);
+  DISALLOW_COPY_AND_ASSIGN(ObSetConfigExecutor);
+};
 
 #undef DEF_SIMPLE_EXECUTOR
 

@@ -60,6 +60,13 @@ private:
                         uint64_t real_tenant_id,
                         ObShowResolverContext &show_resv_ctx,
                         uint64_t &show_db_id);
+  int get_database_info_with_catalog(uint64_t &catalog_id,
+                        const ParseNode *database_node,
+                        const common::ObString &session_database_name,
+                        uint64_t real_tenant_id,
+                        ObShowResolverContext &show_resv_ctx,
+                        uint64_t &show_db_id);
+
 
   int check_desc_priv_if_ness(uint64_t real_tenant_id,
                               const share::schema::ObTableSchema *table_schema,
@@ -224,6 +231,12 @@ struct ObShowResolver::ObShowSqlSet
   DECLARE_SHOW_CLAUSE_SET(SHOW_CREATE_USER);
   DECLARE_SHOW_CLAUSE_SET(SHOW_CATALOGS);
   DECLARE_SHOW_CLAUSE_SET(SHOW_CREATE_CATALOG);
+  DECLARE_SHOW_CLAUSE_SET(SHOW_LOCATIONS);
+  DECLARE_SHOW_CLAUSE_SET(SHOW_CREATE_LOCATION);
+  DECLARE_SHOW_CLAUSE_SET(LOCATION_UTILS_LIST);
+  DECLARE_SHOW_CLAUSE_SET(SHOW_SENSITIVE_RULES);
+  DECLARE_SHOW_CLAUSE_SET(SHOW_SENSITIVE_RULES_FROM_TABLE);
+  DECLARE_SHOW_CLAUSE_SET(SHOW_SENSITIVE_RULES_FROM_DATABASE);
 };// ObShowSqlSet
 
 class ObShowResolver::ObSqlStrGenerator

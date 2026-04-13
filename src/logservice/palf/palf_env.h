@@ -112,6 +112,13 @@ public:
   virtual int update_replayable_point(const SCN &replayable_scn) override final;
 
   virtual int64_t get_tenant_id() override final;
+
+  virtual int advance_base_lsn(int64_t id, palf::LSN lsn) override final;
+
+  virtual int flashback(const uint64_t tenant_id,
+                        const share::SCN &flashback_scn,
+                        const int64_t timeout_us,
+                        const share::ObLSStatusInfoArray &ls_array) override final;
 public:
   // just for LogRpc
   palf::IPalfEnvImpl *get_palf_env_impl() { return &palf_env_impl_; }
@@ -137,11 +144,25 @@ public:
 
   bool check_disk_space_enough();
   // for failure detector
-  // @brief get last io worker start time
+  // @brief get io statistic info
   // @param [out] last working time
   // last_working_time will be set as current time when a io task begins,
   // and will be reset as OB_INVALID_TIMESTAMP when an io task ends, atomically.
-  int get_io_start_time(int64_t &last_working_time);
+  // @param [out] pending_write_size: size of pending IO
+  // @param [out] pending_write_count: number of pending IO
+  // @param [out] pending_write_rt: rt of pending IO
+  // @param [out] accum_write_size: accumulating write size
+  // @param [out] accum_write_count: accumulating write count
+  // @param [out] accum_write_rt: accumulating write latency
+  int get_io_statistic_info(int64_t &last_working_time,
+                            int64_t &pending_write_size,
+                            int64_t &pending_write_count,
+                            int64_t &pending_write_rt,
+                            int64_t &accum_write_size,
+                            int64_t &accum_write_count,
+                            int64_t &accum_write_rt);
+  // @brief iterate each PalfHandle of PalfEnv and execute 'func'
+  int for_each(const ObFunction<int(const PalfHandle&)> &func);
 private:
   void stop_();
   void wait_();

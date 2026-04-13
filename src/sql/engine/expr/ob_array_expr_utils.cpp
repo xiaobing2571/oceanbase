@@ -14,6 +14,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "common/object/ob_obj_compare.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
+#include "sql/engine/expr/ob_expr_vector.h"
 #include "sql/engine/expr/ob_expr_result_type_util.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/expr/ob_array_cast.h"
@@ -82,6 +83,15 @@ int ObArrayExprUtils::get_type_vector(
       LOG_WARN("construct array obj failed", K(ret), K(*coll_info));
     } else if (OB_FAIL(result->init(blob_data))) {
       LOG_WARN("failed to init array", K(ret));
+    } else {
+      const bool is_dense_vector = (coll_info != NULL
+                                    && coll_info->collection_meta_ != NULL
+                                    && coll_info->collection_meta_->type_id_ == ObNestedType::OB_VECTOR_TYPE);
+      if (is_dense_vector && result->size() > ObExprVector::MAX_VECTOR_DIM) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("vector dimension exceeds maximum limit for dense vector", K(ret), K(result->size()));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "vector dimension exceeds maximum limit of 16000");
+      }
     }
   }
   return ret;
@@ -1122,8 +1132,14 @@ int ObArrayExprUtils::calc_nested_expr_data_size(const ObExpr &expr, ObEvalCtx &
   ObIVector *root_vec = expr.get_vector(ctx);
   const char *payload = NULL;
   ObLength payload_len = 0;
+  ObCollectionTypeBase *coll_type = NULL;
   root_vec->get_payload(batch_idx, payload, payload_len);
   if (root_vec->is_null(batch_idx)) {
+  } else if (payload_len == 0 && OB_FAIL(get_coll_type_by_subschema_id(&ctx.exec_ctx_, expr.obj_meta_.get_subschema_id(), coll_type))) {
+    LOG_WARN("failed to get array type by subschema id", K(ret), K(expr));
+  } else if ((OB_NOT_NULL(coll_type) && coll_type->type_id_ == ObNestedType::OB_VECTOR_TYPE)) {
+    size = payload_len;
+    LOG_DEBUG("skip one row with vector type and length is 0", K(ret));
   } else if (ObCollectionExprUtil::is_compact_fmt_cell(payload)) {
     size = payload_len;
   } else if (payload_len != sizeof(ObCollectionExprCell)) {
@@ -1239,6 +1255,44 @@ int ObArrayExprUtils::get_array_obj(ObIAllocator &alloc, ObEvalCtx &ctx, const u
     LOG_WARN("fail to get real data.", K(ret), K(data_str));
   } else if (OB_FAIL(res->init(data_str))) {
     LOG_WARN("failed to init array", K(ret));
+  }
+  return ret;
+}
+
+int ObArrayExprUtils::canonicalize_map_compact_payload(ObIAllocator &tmp_alloc, ObEvalCtx &ctx, const ObExpr &map_expr,
+                                                       ObIVector &root_vec, const int64_t start_row, const int64_t end_row)
+{
+  int ret = OB_SUCCESS;
+  const uint16_t subschema_id = map_expr.obj_meta_.get_subschema_id();
+  ObCollectionTypeBase *coll_type = NULL;
+  ObCollectionMapType *map_type = NULL;
+  if (OB_FAIL(get_coll_type_by_subschema_id(&ctx.exec_ctx_, subschema_id, coll_type))) {
+    LOG_WARN("failed to get coll type by subschema id", K(ret), K(subschema_id));
+  } else if (OB_ISNULL(map_type = dynamic_cast<ObCollectionMapType *>(coll_type))) {
+    // not a map, do nothing
+  } else if (OB_UNLIKELY(root_vec.get_format() != VEC_DISCRETE)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("only support discrete vector", K(ret), K(root_vec.get_format()));
+  } else {
+    ObDiscreteFormat *discrete = static_cast<ObDiscreteFormat *>(&root_vec);
+    ObIArrayType *map_obj = NULL;
+    for (int64_t row_idx = start_row; OB_SUCC(ret) && row_idx < end_row; ++row_idx) {
+      if (discrete->is_null(row_idx)) {
+        continue;
+      }
+      const char *payload = NULL;
+      ObLength payload_len = 0;
+      discrete->get_payload(row_idx, payload, payload_len);
+      ObString raw_data(payload_len, payload);
+      ObIArrayType *sorted_obj = NULL;
+      if (OB_FAIL(get_array_obj(tmp_alloc, ctx, subschema_id, raw_data, map_obj))) {
+        LOG_WARN("init map obj from compact payload failed", K(ret), K(subschema_id), K(row_idx));
+      } else if (OB_FAIL(map_obj->distinct(tmp_alloc, sorted_obj))) {
+        LOG_WARN("map distinct(canonicalize) failed", K(ret), K(row_idx));
+      } else if (OB_FAIL(set_array_res<ObDiscreteFormat>(sorted_obj, map_expr, ctx, discrete, row_idx))) {
+        LOG_WARN("rewrite compact map payload failed", K(ret), K(row_idx));
+      }
+    }
   }
   return ret;
 }
@@ -1534,6 +1588,8 @@ int ObArrayExprUtils::deduce_array_type(ObExecContext *exec_ctx, ObExprResType &
              && coll_info->collection_meta_->type_id_ != ObNestedType::OB_VECTOR_TYPE) {
     ret = OB_ERR_INVALID_TYPE_FOR_OP;
     LOG_WARN("invalid collection type", K(ret), K(coll_info->collection_meta_->type_id_));
+  } else if (type2.is_null()) {
+    // do nothing
   } else if (!ob_is_collection_sql_type(type2.get_type())) {
     ObCollectionArrayType *arr_type = static_cast<ObCollectionArrayType *>(coll_info->collection_meta_);
     ObCollectionTypeBase *elem_type = arr_type->element_type_;
@@ -1575,6 +1631,16 @@ int ObArrayExprUtils::deduce_array_type(ObExecContext *exec_ctx, ObExprResType &
             type2.set_calc_meta(calc_meta);
             subschema_id = deduce_type.get_subschema_id();
           }
+        }
+      } else if (ob_is_string_tc(type2.get_type())) {
+        // Array uses memcmp for string comparison (binary comparison semantics).
+        // For case-insensitive collations (e.g., UTF8MB4_GENERAL_CI), we need to convert
+        // to the corresponding binary collation (e.g., UTF8MB4_BIN) of the same charset.
+        // This ensures consistent comparison behavior without charset conversion issues.
+        ObCharsetType cs_type = ObCharset::charset_type_by_coll(type2.get_collation_type());
+        ObCollationType bin_coll_type = ObCharset::get_bin_collation(cs_type);
+        if (CS_TYPE_INVALID != bin_coll_type && type2.get_collation_type() != bin_coll_type) {
+          type2.set_calc_collation_type(bin_coll_type);
         }
       }
     } else {
@@ -1743,98 +1809,6 @@ int ObArrayExprUtils::set_obj_to_vector(ObIVector *vec, int64_t idx, ObObj obj, 
     ret = OB_ERR_UNEXPECTED;
     OB_LOG(WARN, "unexpected object type", K(ret), K(obj.get_type()));
   }
-  return ret;
-}
-
-template <typename T1, typename T>
-int ObArrayExprUtils::calc_array_sum_by_type(uint32_t data_len, uint32_t len, const char *data_ptr,
-                                             uint8_t *null_bitmaps, T &sum)
-{
-  int ret = OB_SUCCESS;
-  if (data_len / sizeof(T1) != len) {
-    ret = OB_ERR_UNEXPECTED;
-    OB_LOG(WARN, "unexpected array length", K(ret), K(len), K(data_len));
-  } else {
-    T1 *data = reinterpret_cast<T1 *>(const_cast<char *>(data_ptr));
-    for (uint32_t i = 0; i < len; ++i) {
-      if (null_bitmaps != nullptr && null_bitmaps[i] > 0) {
-        /* do nothing */
-      } else if (OB_FAIL(raw_check_add<T>(sum + data[i], static_cast<T>(data[i]), sum))) {
-        LOG_WARN("array_sum overflow", K(ret), K(sum), K(data[i]));
-        break;
-      } else {
-        sum += static_cast<T>(data[i]);
-      }
-    }
-  }
-  return ret;
-}
-
-template <typename T>
-int ObArrayExprUtils::calc_array_sum(uint32_t len, uint8_t *nullbitmaps, const char *data_ptr,
-                                   uint32_t data_len, ObCollectionArrayType *arr_type, T &sum)
-{
-  int ret = OB_SUCCESS;
-
-  ObCollectionBasicType *elem_type = NULL;
-  if (OB_ISNULL(elem_type = static_cast<ObCollectionBasicType *>(arr_type->element_type_))) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("source array collection element type is null", K(ret));
-  } else if (arr_type->element_type_->type_id_ != ObNestedType::OB_BASIC_TYPE) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_WARN("not supported element type", K(ret), K(arr_type->element_type_->type_id_));
-  } else {
-    ObObjType obj_type = elem_type->basic_meta_.get_obj_type();
-    switch (obj_type) {
-    case ObTinyIntType: {
-      ret = calc_array_sum_by_type<int8_t>(data_len, len, data_ptr, nullbitmaps, sum);
-      break;
-    }
-    case ObSmallIntType: {
-      ret = calc_array_sum_by_type<int16_t>(data_len, len, data_ptr, nullbitmaps, sum);
-      break;
-    }
-    case ObInt32Type: {
-      ret = calc_array_sum_by_type<int32_t>(data_len, len, data_ptr, nullbitmaps, sum);
-      break;
-    }
-    case ObIntType: {
-      ret = calc_array_sum_by_type<int64_t>(data_len, len, data_ptr, nullbitmaps, sum);
-      break;
-    }
-    case ObUTinyIntType: {
-      ret = calc_array_sum_by_type<uint8_t>(data_len, len, data_ptr, nullbitmaps, sum);
-      break;
-    }
-    case ObUSmallIntType: {
-      ret = calc_array_sum_by_type<uint16_t>(data_len, len, data_ptr, nullbitmaps, sum);
-      break;
-    }
-    case ObUInt32Type: {
-      ret = calc_array_sum_by_type<uint32_t>(data_len, len, data_ptr, nullbitmaps, sum);
-      break;
-    }
-    case ObUInt64Type: {
-      ret = calc_array_sum_by_type<uint64_t>(data_len, len, data_ptr, nullbitmaps, sum);
-      break;
-    }
-    case ObUFloatType:
-    case ObFloatType: {
-      ret = calc_array_sum_by_type<float>(data_len, len, data_ptr, nullbitmaps, sum);
-      break;
-    }
-    case ObUDoubleType:
-    case ObDoubleType: {
-      ret = calc_array_sum_by_type<double>(data_len, len, data_ptr, nullbitmaps, sum);
-      break;
-    }
-    default: {
-      ret = OB_NOT_SUPPORTED;
-      OB_LOG(WARN, "not supported element type", K(ret), K(elem_type->basic_meta_.get_type_class()));
-    }
-    } // end switch
-  }
-
   return ret;
 }
 
@@ -2097,6 +2071,22 @@ int ObArrayExprUtils::get_collection_raw_data(ObIAllocator &allocator, const ObO
   return ret;
 }
 
+int ObArrayExprUtils::convert_to_string(common::ObIAllocator &allocator, ObEvalCtx &ctx, const uint16_t subschema_id, const common::ObString &data, ObString &res_str)
+{
+  int ret = OB_SUCCESS;
+  common::ObArenaAllocator tmp_allocator;
+  ObIArrayType *arr_obj = NULL;
+  ObStringBuffer buf(&allocator);
+  if (OB_FAIL(ObArrayExprUtils::get_array_obj(tmp_allocator, ctx, subschema_id, data, arr_obj))) {
+    LOG_WARN("get array failed", K(ret));
+  } else if (OB_FAIL(arr_obj->print(buf))) {
+    LOG_WARN("failed to format array", K(ret));
+  } else {
+    res_str.assign_ptr(buf.ptr(), buf.length());
+  }
+  return ret;
+}
+
 template <typename ColumnFmt>
 static int inner_cast_compact2vector_fmt(ColumnFmt *column, ObExpr *coll_expr, ObEvalCtx *eval_ctx,
                                          const int64_t size, const ObBitVector &skip)
@@ -2169,21 +2159,41 @@ int ObArrayExprUtils::calc_collection_hash_val(const ObObjMeta &meta, const void
 
 template <typename ColumnFmt>
 static int inner_cast_vector2compact_fmt(ColumnFmt *column, ObExpr *coll_expr, ObEvalCtx *eval_ctx,
-                                         const int64_t size, const ObBitVector &skip)
+                                    const int64_t start, const int64_t end, const ObBitVector *skip)
 {
   int ret = OB_SUCCESS;
   int32_t len = 0;
   bool is_null = false;
   const char *payload = nullptr;
   bool has_null = false;
-  for (int i = 0; OB_SUCC(ret) && i < size; i++) {
-    if (skip.at(i)) { continue; }
+  common::ObArenaAllocator tmp_allocator;
+  for (int i = start; OB_SUCC(ret) && i < end; i++) {
+    if (skip != nullptr && skip->at(i)) { continue; }
     column->get_payload(i, is_null, payload, len);
     if (is_null) {
       has_null = true;
     } else if (ObCollectionExprUtil::is_vector_fmt_cell(payload)) {
       // tonghui TODO: read attr expr and assemble lob
       // call set_payload_shallow to shadow copy
+      const uint16_t meta_id = coll_expr->obj_meta_.get_subschema_id();
+      ObIArrayType *arr_obj = NULL;
+      const ObCollectionExprCell* coll_cell = reinterpret_cast<const ObCollectionExprCell*>(payload);
+      if (len != sizeof(ObCollectionExprCell)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected data", K(ret), K(len));
+      } else if (OB_ISNULL(coll_cell->eval_ctx_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("eval_ctx is null", K(ret), K(coll_cell->row_idx_));
+      } else if (OB_ISNULL(coll_cell->expr_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("expr is null", K(ret), K(coll_cell->row_idx_));
+      } else if (OB_FAIL(ObNestedVectorFunc::construct_attr_param(tmp_allocator, *coll_cell->eval_ctx_, *coll_cell->expr_,
+                         meta_id, coll_cell->row_idx_, arr_obj))) {
+        LOG_WARN("construct array failed", K(ret), K(coll_cell->row_idx_));
+      } else if (OB_FAIL(ObArrayExprUtils::set_array_res<ColumnFmt>(arr_obj, *coll_expr, *eval_ctx, static_cast<ColumnFmt *>(column), i))) {
+        LOG_WARN("set array res failed", K(ret));
+      }
+      tmp_allocator.reuse();
     }
   }
   if (OB_SUCC(ret)) {
@@ -2279,7 +2289,8 @@ int ObArrayExprUtils::get_collection_obj(ObEvalCtx &ctx, const uint16_t subschem
   return ret;
 }
 
-int ObCollectionExprUtil::cast_vector2compact_fmt(ObIVector *column, const int64_t size, const ObBitVector &skip)
+int ObCollectionExprUtil::cast_vector2compact_fmt(ObIVector *column, const int64_t start,
+                                                  const int64_t end, const ObBitVector *skip)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(column)) {
@@ -2293,6 +2304,22 @@ int ObCollectionExprUtil::cast_vector2compact_fmt(ObIVector *column, const int64
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid ivector", K(ret), K(array_expr), K(eval_ctx));
     } else {
+      switch (fmt) {
+      case common::VEC_UNIFORM: {
+        ret = inner_cast_vector2compact_fmt(static_cast<ObUniformFormat<false> *>(column),
+                                            array_expr, eval_ctx, start, end, skip);
+        break;
+      }
+      case common::VEC_DISCRETE: {
+        ret = inner_cast_vector2compact_fmt(static_cast<ObDiscreteFormat *>(column), array_expr,
+                                            eval_ctx, start, end, skip);
+        break;
+      }
+      default: {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("not supported format", K(ret));
+      }
+      }
     }
   }
   return ret;

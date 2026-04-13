@@ -19,6 +19,7 @@
 #include "storage/multi_data_source/compile_utility/mds_dummy_key.h"
 #include "storage/multi_data_source/mds_node.h"
 #include "storage/multi_data_source/mds_table_base.h"
+#include "storage/multi_data_source/adapter_define/mds_dump_node.h"
 #include "storage/multi_data_source/runtime_utility/common_define.h"
 #include "storage/multi_data_source/runtime_utility/mds_tenant_service.h"
 #include "storage/tx/ob_tx_seq.h"
@@ -237,11 +238,11 @@ int MdsRow<K, V>::construct_insert_record_user_mds_node_(MdsRowBase<K, V> *mds_r
       OB_NOT_NULL(mds_row->p_mds_unit_->p_mds_table_)) {
     last_inner_recycled_scn = mds_row->p_mds_unit_->p_mds_table_->last_inner_recycled_scn_;
   }
+  if (!ctx.get_seq_no().is_valid()) {
+    ctx.set_seq_no(transaction::ObTxSEQ::MIN_VAL());
+    MDS_LOG_SET(WARN, "seq no on mds ctx is invalid, maybe meet old version CLOG or upgrade, convert to min scn");
+  }
   if (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_3_0_0) {
-    if (!scn.is_max() && !ctx.get_seq_no().is_valid()) {
-      ctx.set_seq_no(transaction::ObTxSEQ::MIN_VAL());
-      MDS_LOG_SET(WARN, "seq no on mds ctx is invalid, maybe meet old version CLOG, convert to min scn");
-    }
     if (scn.is_max()) {// write operation on leader after upgrade
       if (OB_FAIL(sorted_list_.reverse_for_each_node(CheckNodeInSameWriterSeqIncLogicOp(ctx)))) {// can not assert here, cause some modules maynot adapt this logic yet
         MDS_LOG_SET(WARN, "seq_no is not satisfied inc logic");

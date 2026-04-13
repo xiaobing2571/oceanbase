@@ -151,6 +151,11 @@ int ObMPPacketSender::do_init(rpc::ObRequest *req,
     comp_context_.seq_ = comp_seq;
     comp_context_.sessid_ = sessid_;
     comp_context_.conn_ = conn;
+    // init compress seq
+    bool is_compress_proto = (OB_MYSQL_COMPRESS_CS_TYPE == conn->get_cs_protocol_type());
+    if (is_compress_proto) {
+      comp_context_.seq_ = conn->compressed_pkt_context_.last_pkt_seq_ + 1;
+    }
 
     // init proto20 context
     bool is_proto20_supported = (OB_2_0_CS_TYPE == conn->get_cs_protocol_type());
@@ -367,11 +372,7 @@ int ObMPPacketSender::send_error_packet(int err,
   sql::ObSQLSessionInfo *session = NULL;
   BACKTRACE(ERROR, (OB_SUCCESS == err), "BUG send error packet but err code is 0");
   if (OB_ERR_PROXY_REROUTE != err) {
-    int client_error = lib::is_oracle_mode() ? common::ob_oracle_errno(err) :
-                      common::ob_mysql_errno(err);
-    // OB error codes that are not compatible with mysql will be displayed using
-    // OB error codes
-    client_error = lib::is_mysql_mode() && client_error == -1 ? err : client_error;
+    int client_error = ob_errpkt_errno(err, lib::is_oracle_mode());
     LOG_INFO("sending error packet", "ob_error", err, "client error", client_error,
             K(extra_err_info), K(lbt()));
   }
@@ -496,8 +497,12 @@ int ObMPPacketSender::send_error_packet(int err,
         } else {
           ObSQLSessionInfo::LockGuard lock_guard(session->get_query_lock());
           if (lib::is_oracle_mode() && 0 < session->get_pl_exact_err_msg().length()) {
-            if (OB_FAIL(fin_msg.append(session->get_pl_exact_err_msg().string()))) {
-              LOG_WARN("append pl exact err msg fail", K(ret), K(session->get_pl_exact_err_msg().string()));
+            ObArenaAllocator allocator(ObMemAttr(conn_->tenant_id_, "WARN_MSG"));
+            ObString convert_pl_exact_err_msg;
+            if (OB_FAIL(ObCharset::charset_convert(allocator, session->get_pl_exact_err_msg().string(), session->get_nls_collation(), session->get_local_collation_connection(), convert_pl_exact_err_msg))) {
+              LOG_WARN("convert pl exact err msg fail", K(ret));
+            } else if (OB_FAIL(fin_msg.append(convert_pl_exact_err_msg))) {
+              LOG_WARN("append pl exact err msg fail", K(ret), K(convert_pl_exact_err_msg));
             }
           }
         }
@@ -632,6 +637,16 @@ int ObMPPacketSender::send_ok_packet(ObSQLSessionInfo &session, ObOKPParam &ok_p
   int ret = OB_SUCCESS;
   LOG_DEBUG("send-ok-packet", K(lbt()));
   ObSQLSessionInfo::LockGuard lock_guard(session.get_query_lock());
+  if (OB_FAIL(send_ok_packet_without_lock(session, ok_param, pkt))) {
+    LOG_WARN("send ok packet fail", K(ret));
+  }
+  return ret;
+}
+
+int ObMPPacketSender::send_ok_packet_without_lock(ObSQLSessionInfo &session,
+                                                  ObOKPParam &ok_param,
+                                                  obmysql::ObMySQLPacket* pkt) {
+  int ret = OB_SUCCESS;
   OMPKOK okp;
   if (!conn_valid_ || OB_ISNULL(conn_)) {
     ret = OB_CONNECT_ERROR;
@@ -703,6 +718,13 @@ int ObMPPacketSender::send_ok_packet(ObSQLSessionInfo &session, ObOKPParam &ok_p
           } else if (ok_param.is_on_connect_
                      && OB_FAIL(ObMPUtils::add_min_cluster_version(okp, session))) {
             LOG_WARN("fail to add all session system variables", K(ret));
+          } else if (ok_param.is_on_change_user_) {
+            if (OB_FAIL(ObMPUtils::add_changed_session_info(okp, session))) {
+              SERVER_LOG(WARN, "fail to add changed session info", K(ret));
+            } else if (ok_param.reroute_info_ != NULL
+                       && OB_FAIL(ObMPUtils::add_client_reroute_info(okp, session, *ok_param.reroute_info_))) {
+              LOG_WARN("failed to add reroute info", K(ret));
+            }
           }
         }
       } else {
@@ -1062,7 +1084,9 @@ int ObMPPacketSender::flush_buffer(const bool is_last)
       if (comp_context_.use_compress()) {
         ObEasyBuffer orig_send_buf(*ez_buf_);
         if (OB_FAIL(ObMySQLRequestUtils::flush_compressed_buffer(is_last, comp_context_, orig_send_buf, *req_))) {
-          LOG_WARN("failed to flush buffer for compressed sql nio", K(ret));
+          LOG_ERROR("failed to flush buffer for compressed sql nio, need disconnect", K(ret));
+          disconnect();
+          conn_valid_ = false;
         }
       } else {
         if (is_last) {

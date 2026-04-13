@@ -504,6 +504,7 @@ public:
     int swizzling(int64_t *col_cnt);
     inline bool magic_check() { return MAGIC == magic_; }
     int get_store_row(int64_t &cur_pos, const StoredRow *&sr);
+    int get_cur_row(int64_t cur_pos, const StoredRow *&sr);
     inline Block* get_next() const { return next_; }
     inline bool is_empty() { return get_buffer()->is_empty(); }
     inline void set_block_size(uint32 blk_size) { blk_size_ = blk_size; }
@@ -659,6 +660,7 @@ public:
 
     /* from StoredRow to NewRow */
     int get_next_row(const StoredRow *&sr);
+    int get_cur_row(const StoredRow *&sr);
     int get_next_batch(const StoredRow **rows, const int64_t max_rows, int64_t &read_rows);
     int get_next_batch(const common::ObIArray<ObExpr*> &exprs, ObEvalCtx &ctx,
                        const int64_t max_rows, int64_t &read_rows, const StoredRow **rows);
@@ -771,6 +773,7 @@ public:
                      const StoredRow **sr = nullptr);
     int get_next_row(common::ObDatum **datums);
     int get_next_row(const StoredRow *&sr);
+    int get_cur_row(const StoredRow *&sr);
     template <bool fill_invariable_res_buf = false>
     int get_next_row(ObEvalCtx &ctx, const common::ObIArray<ObExpr*> &exprs);
 
@@ -1047,7 +1050,7 @@ public:
   inline int64_t get_mem_used() const { return mem_used_; }
   inline int64_t get_max_hold_mem() const { return max_hold_mem_; }
   inline int64_t get_file_fd() const { return io_.fd_; }
-  inline int64_t get_file_dir_id() const { return io_.dir_id_; }
+  inline int64_t get_file_dir_id() const { return dir_id_; }
   inline int64_t get_file_size() const { return file_size_; }
   inline int64_t min_blk_size(const int64_t row_store_size)
   {
@@ -1071,7 +1074,7 @@ public:
   }
   int dump(bool reuse, bool all_dump, int64_t dumped_size = INT64_MAX);
   // 目前dir id 的策略是上层逻辑（一般是算子）统一申请，然后再set过来
-  void set_dir_id(int64_t dir_id) { io_.dir_id_ = dir_id; }
+  void set_dir_id(int64_t dir_id) { dir_id_ = dir_id; }
   int alloc_dir_id();
   TO_STRING_KV(K_(tenant_id), K_(label), K_(ctx_id),  K_(mem_limit),
       K_(row_cnt), K_(file_size), K_(enable_dump));
@@ -1151,6 +1154,8 @@ private:
   static void set_io(int64_t size, char *buf, tmp_file::ObTmpFileIOInfo &io) { io.size_ = size; io.buf_ = buf; }
   bool find_block_can_hold(const int64_t size, bool &need_shrink);
   int get_store_row(RowIterator &it, const StoredRow *&sr);
+  int get_cur_row(RowIterator &it, const StoredRow *&sr);
+
   inline void callback_alloc(int64_t size) { if (callback_ != nullptr) callback_->alloc(size); }
   inline void callback_free(int64_t size) { if (callback_ != nullptr) callback_->free(size); }
 
@@ -1178,8 +1183,6 @@ private:
   int64_t row_cnt_;
   int64_t col_count_;
 
-  tmp_file::ObTmpFileIOHandle aio_write_handle_;
-
   bool enable_dump_;
   bool has_dumped_;
   int64_t dumped_row_cnt_;
@@ -1188,6 +1191,7 @@ private:
 
   //int fd_;
   tmp_file::ObTmpFileIOInfo io_;
+  int64_t dir_id_;
   int64_t file_size_;
   int64_t n_block_in_file_;
 
@@ -1361,7 +1365,7 @@ int ObChunkDatumStore::Iterator::get_next_batch(
     const int64_t max_rows, int64_t &read_rows, const StoredRow **rows)
 {
   int ret = OB_SUCCESS;
-  int64_t max_batch_size = ctx.max_batch_size_;
+  int64_t max_batch_size = MAX(ctx.max_batch_size_, 1);
   const StoredRow **srows = rows;
   if (NULL == rows) {
     if (!is_valid()) {
@@ -1432,8 +1436,8 @@ void ObChunkDatumStore::Iterator::attach_rows(
       }
       e->set_evaluated_projected(ctx);
       ObEvalInfo &info = e->get_eval_info(ctx);
-      info.notnull_ = false;
-      info.point_to_frame_ = false;
+      info.set_notnull(false);
+      info.set_point_to_frame(false);
     }
   }
 }
